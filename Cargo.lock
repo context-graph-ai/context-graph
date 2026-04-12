@@ -249,9 +249,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-core"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72113b138cf0d3601cdaff3a828a60473541c346278d207bcaeb3bfd27acca92"
+checksum = "9a3610f43c8df08e3a978384d81478143618e3bf5816fb1a3607a3b075e7ff5e"
 dependencies = [
  "roaring",
  "serde",
@@ -262,9 +262,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-engine"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43109afd1a00102dc7909f645c6a5cbd0d4a20e55cfbd1e6c0de72a078e7208d"
+checksum = "9954577116ba3c9b84b4fc64f8108fa95e83a63c3f14cc231c062a47d08f0181"
 dependencies = [
  "bincode 2.0.1",
  "contextdb-core",
@@ -287,9 +287,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-graph"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "444c57c507b8713dcfd833b444629606b3f8ce7c72f6c779eca22dc77aec9878"
+checksum = "7311b1c812b628d85b15ad9bbfaee71f5a57addb17ca3460a5f9e59193ef1a14"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -299,9 +299,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-parser"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20666b06fc013732ee1bbe770260758ffc3c3848135958112d1096e25d60497f"
+checksum = "cd93296be3d50ed5e2caa4b1a1fc217e9c567a4f64c87f0e90ca3a42296c30d2"
 dependencies = [
  "contextdb-core",
  "pest",
@@ -310,9 +310,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-planner"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7da6c5aaf8d4d842798695d2ce70aab847412f383f1b0579ecb008cf08a588db"
+checksum = "865172d19c4c95d31b62701d188734c321f90313d516fed0b72ea7751195ac4a"
 dependencies = [
  "contextdb-core",
  "contextdb-parser",
@@ -320,9 +320,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-relational"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f03ea14863f0830869588f95a6e579bac5dd106b924f833047e903345bfa04e3"
+checksum = "ddb4740c29a1cf17fa5884e545509fcadd5093c5d20ecfb213938ccb50a01f2e"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -332,9 +332,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-tx"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa03281550301c135cbaefbc0b426e49811ea351383b7cf66616f0457b928606"
+checksum = "f369b7556724269750933aa0430f55eed117daafba7a890d3983d7f219f011ca"
 dependencies = [
  "contextdb-core",
  "parking_lot",
@@ -342,9 +342,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-vector"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30cee0aea9a0a3c9024d3b0d6b2354f9e0af8ab4fe714e06b7397635f95d871e"
+checksum = "b83559a7bdc8ab77f8c9432eafba881bf61acefe6913214f6a7af845149fa94c"
 dependencies = [
  "anndists",
  "contextdb-core",

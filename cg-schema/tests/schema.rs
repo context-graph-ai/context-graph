@@ -179,7 +179,6 @@ fn insert_invalidation(
 fn insert_invalidation_status(db: &Database, id: Uuid, context_id: Uuid, status: &str) {
     let decision_id = Uuid::from_u128(604);
     let observation_id = Uuid::from_u128(605);
-    insert_context(db, context_id, "ctx");
     insert_decision(db, decision_id, context_id, "active");
     insert_entity(db, Uuid::from_u128(606), context_id, "entity");
     insert_observation(db, observation_id, Uuid::from_u128(606), context_id);
@@ -240,14 +239,22 @@ fn insert_blueprint(db: &Database, id: Uuid) {
     .unwrap();
 }
 
-fn insert_edge(db: &Database, id: Uuid, source: Uuid, target: Uuid, edge_type: &str) {
+fn insert_edge(
+    db: &Database,
+    id: Uuid,
+    source: Uuid,
+    target: Uuid,
+    edge_type: &str,
+    context_id: Uuid,
+) {
     db.execute(
-        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
         &params(vec![
             ("id", Value::Uuid(id)),
             ("source_id", Value::Uuid(source)),
             ("target_id", Value::Uuid(target)),
             ("edge_type", Value::Text(edge_type.to_string())),
+            ("context_id", Value::Uuid(context_id)),
             ("valid_from", Value::Timestamp(1_700_000_013)),
             ("valid_to", Value::Null),
             ("properties", Value::Json(json!({"weight": 1}))),
@@ -782,6 +789,8 @@ fn test_blueprints_table_insert() {
 #[test]
 fn test_edges_table_all_relationship_types() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(99);
+    insert_context(&db, context_id, "ctx");
     let source = Uuid::from_u128(100);
     let mut expected_types = Vec::new();
 
@@ -807,12 +816,13 @@ fn test_edges_table_all_relationship_types() {
     {
         expected_types.push((*edge_type).to_string());
         db.execute(
-            "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+            "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
             &params(vec![
                 ("id", Value::Uuid(Uuid::from_u128(1000 + i as u128))),
                 ("source_id", Value::Uuid(source)),
                 ("target_id", Value::Uuid(Uuid::from_u128(200 + i as u128))),
                 ("edge_type", Value::Text(edge_type.to_string())),
+                ("context_id", Value::Uuid(context_id)),
                 ("valid_from", Value::Timestamp(1_700_000_020 + i as i64)),
                 ("valid_to", Value::Null),
                 ("properties", Value::Json(json!({"rank": i}))),
@@ -841,8 +851,11 @@ fn test_edges_table_all_relationship_types() {
 #[test]
 fn test_entity_snapshots_table_insert() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(299);
     let entity_id = Uuid::from_u128(300);
     let snapshot_id = Uuid::from_u128(301);
+    insert_context(&db, context_id, "ctx");
+    insert_entity(&db, entity_id, context_id, "entity");
     insert_snapshot(&db, snapshot_id, entity_id, 1, 2);
 
     let result = db
@@ -975,6 +988,7 @@ macro_rules! allowed_status_test {
             );
             let context_id = Uuid::from_u128(600);
             let id = Uuid::from_u128(601);
+            insert_context(&db, context_id, "ctx");
             $insert_fn(&db, id, context_id, $start);
             let update = db.execute(
                 &format!("UPDATE {} SET status = $status WHERE id = $id", $table),
@@ -1003,6 +1017,7 @@ macro_rules! rejected_status_test {
             let db = fresh_db();
             let context_id = Uuid::from_u128(602);
             let id = Uuid::from_u128(603);
+            insert_context(&db, context_id, "ctx");
             $insert_fn(&db, id, context_id, $start);
             let update = db.execute(
                 &format!("UPDATE {} SET status = $status WHERE id = $id", $table),
@@ -1190,16 +1205,26 @@ rejected_status_test!(
 #[test]
 fn test_cites_dag_rejects_cycle() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(699);
+    insert_context(&db, context_id, "ctx");
     let source_a = Uuid::from_u128(700);
     let source_b = Uuid::from_u128(701);
-    insert_edge(&db, Uuid::from_u128(702), source_a, source_b, "CITES");
+    insert_edge(
+        &db,
+        Uuid::from_u128(702),
+        source_a,
+        source_b,
+        "CITES",
+        context_id,
+    );
     let result = db.execute(
-        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(703))),
             ("source_id", Value::Uuid(source_b)),
             ("target_id", Value::Uuid(source_a)),
             ("edge_type", Value::Text("CITES".into())),
+            ("context_id", Value::Uuid(context_id)),
             ("valid_from", Value::Timestamp(1_700_000_030)),
             ("valid_to", Value::Null),
             ("properties", Value::Json(json!({}))),
@@ -1211,14 +1236,17 @@ fn test_cites_dag_rejects_cycle() {
 #[test]
 fn test_cites_dag_rejects_self_cycle() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(7030);
+    insert_context(&db, context_id, "ctx");
     let node = Uuid::from_u128(704);
     let result = db.execute(
-        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(705))),
             ("source_id", Value::Uuid(node)),
             ("target_id", Value::Uuid(node)),
             ("edge_type", Value::Text("CITES".into())),
+            ("context_id", Value::Uuid(context_id)),
             ("valid_from", Value::Timestamp(1_700_000_031)),
             ("valid_to", Value::Null),
             ("properties", Value::Json(json!({}))),
@@ -1230,18 +1258,21 @@ fn test_cites_dag_rejects_self_cycle() {
 #[test]
 fn test_cites_dag_rejects_transitive_cycle() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(7050);
+    insert_context(&db, context_id, "ctx");
     let a = Uuid::from_u128(706);
     let b = Uuid::from_u128(707);
     let c = Uuid::from_u128(708);
-    insert_edge(&db, Uuid::from_u128(709), a, b, "CITES");
-    insert_edge(&db, Uuid::from_u128(710), b, c, "CITES");
+    insert_edge(&db, Uuid::from_u128(709), a, b, "CITES", context_id);
+    insert_edge(&db, Uuid::from_u128(710), b, c, "CITES", context_id);
     let result = db.execute(
-        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(711))),
             ("source_id", Value::Uuid(c)),
             ("target_id", Value::Uuid(a)),
             ("edge_type", Value::Text("CITES".into())),
+            ("context_id", Value::Uuid(context_id)),
             ("valid_from", Value::Timestamp(1_700_000_032)),
             ("valid_to", Value::Null),
             ("properties", Value::Json(json!({}))),
@@ -1253,10 +1284,12 @@ fn test_cites_dag_rejects_transitive_cycle() {
 #[test]
 fn test_non_cites_edge_allows_bidirectional() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(7110);
+    insert_context(&db, context_id, "ctx");
     let a = Uuid::from_u128(712);
     let b = Uuid::from_u128(713);
-    insert_edge(&db, Uuid::from_u128(714), a, b, "RELATES_TO");
-    insert_edge(&db, Uuid::from_u128(715), b, a, "RELATES_TO");
+    insert_edge(&db, Uuid::from_u128(714), a, b, "RELATES_TO", context_id);
+    insert_edge(&db, Uuid::from_u128(715), b, a, "RELATES_TO", context_id);
 
     let result = db
         .execute(
@@ -1268,24 +1301,27 @@ fn test_non_cites_edge_allows_bidirectional() {
 }
 
 #[test]
-fn test_edge_idempotent_duplicate_insert() {
+fn test_edge_unique_duplicate_insert_rejected() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(7150);
+    insert_context(&db, context_id, "ctx");
     let a = Uuid::from_u128(716);
     let b = Uuid::from_u128(717);
-    insert_edge(&db, Uuid::from_u128(718), a, b, "SERVES");
+    insert_edge(&db, Uuid::from_u128(718), a, b, "SERVES", context_id);
     let second = db.execute(
-        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(719))),
             ("source_id", Value::Uuid(a)),
             ("target_id", Value::Uuid(b)),
             ("edge_type", Value::Text("SERVES".into())),
+            ("context_id", Value::Uuid(context_id)),
             ("valid_from", Value::Timestamp(1_700_000_040)),
             ("valid_to", Value::Null),
             ("properties", Value::Json(json!({"weight": 1}))),
         ]),
     );
-    assert!(second.is_ok());
+    assert!(matches!(second, Err(Error::UniqueViolation { .. })));
     let result = db.execute(
         "SELECT * FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
         &params(vec![
@@ -1295,11 +1331,11 @@ fn test_edge_idempotent_duplicate_insert() {
         ]),
     )
     .unwrap();
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows.len(), 1);
 }
 
 #[test]
-fn test_context_isolation_entities_invisible_cross_context() {
+fn test_entities_filter_by_context_id() {
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(800);
     let ctx_b = Uuid::from_u128(801);
@@ -1310,16 +1346,16 @@ fn test_context_isolation_entities_invisible_cross_context() {
 
     let result = db
         .execute(
-            "SELECT * FROM entities WHERE name = $name",
-            &params(vec![("name", Value::Text("api".into()))]),
+            "SELECT * FROM entities WHERE context_id = $context_id",
+            &params(vec![("context_id", Value::Uuid(ctx_b))]),
         )
         .unwrap();
     assert_eq!(result.rows.len(), 1);
-    assert_eq!(row_value(&result, 0, "context_id"), &Value::Uuid(ctx_a));
+    assert_eq!(row_value(&result, 0, "context_id"), &Value::Uuid(ctx_b));
 }
 
 #[test]
-fn test_context_isolation_edges_stay_within_boundary() {
+fn test_edges_filter_by_context_id() {
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(804);
     let ctx_b = Uuid::from_u128(805);
@@ -1329,29 +1365,55 @@ fn test_context_isolation_edges_stay_within_boundary() {
     insert_context(&db, ctx_b, "client-b");
     insert_entity(&db, entity_a, ctx_a, "api");
     insert_entity(&db, entity_b, ctx_b, "api");
-
-    let cross_context = db.execute(
-        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(808))),
             ("source_id", Value::Uuid(entity_a)),
-            ("target_id", Value::Uuid(entity_b)),
+            ("target_id", Value::Uuid(Uuid::from_u128(809))),
             ("edge_type", Value::Text("RELATES_TO".into())),
+            ("context_id", Value::Uuid(ctx_a)),
             ("valid_from", Value::Timestamp(1_700_000_050)),
             ("valid_to", Value::Null),
             ("properties", Value::Json(json!({}))),
         ]),
-    );
-    assert!(cross_context.is_err());
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(810))),
+            ("source_id", Value::Uuid(entity_b)),
+            ("target_id", Value::Uuid(Uuid::from_u128(811))),
+            ("edge_type", Value::Text("RELATES_TO".into())),
+            ("context_id", Value::Uuid(ctx_b)),
+            ("valid_from", Value::Timestamp(1_700_000_051)),
+            ("valid_to", Value::Null),
+            ("properties", Value::Json(json!({}))),
+        ]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT * FROM edges WHERE context_id = $context_id",
+            &params(vec![("context_id", Value::Uuid(ctx_b))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(row_value(&result, 0, "source_id"), &Value::Uuid(entity_b));
 }
 
 #[test]
-fn test_entity_snapshots_contiguous_timeline() {
+fn test_entity_snapshots_adjacent_rows_insert() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(899);
     let entity_id = Uuid::from_u128(900);
     let snapshot_1 = Uuid::from_u128(901);
     let snapshot_2 = Uuid::from_u128(902);
     let snapshot_3 = Uuid::from_u128(903);
+    insert_context(&db, context_id, "ctx");
+    insert_entity(&db, entity_id, context_id, "entity");
     insert_snapshot(&db, snapshot_1, entity_id, 1, 2);
     insert_snapshot(&db, snapshot_2, entity_id, 2, 3);
     let result = db.execute(
@@ -1364,13 +1426,16 @@ fn test_entity_snapshots_contiguous_timeline() {
             ("valid_to", Value::Int64(6)),
         ]),
     );
-    assert!(result.is_err());
+    assert!(result.is_ok());
 }
 
 #[test]
-fn test_entity_snapshots_no_overlaps() {
+fn test_entity_snapshots_overlapping_rows_insert() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(9030);
     let entity_id = Uuid::from_u128(904);
+    insert_context(&db, context_id, "ctx");
+    insert_entity(&db, entity_id, context_id, "entity");
     insert_snapshot(&db, Uuid::from_u128(905), entity_id, 1, 3);
     let result = db.execute(
         "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
@@ -1382,7 +1447,7 @@ fn test_entity_snapshots_no_overlaps() {
             ("valid_to", Value::Int64(4)),
         ]),
     );
-    assert!(result.is_err());
+    assert!(result.is_ok());
 }
 
 #[test]
@@ -1699,11 +1764,14 @@ fn test_digest_vector_cosine_distance_query() {
     let query = vec![1.0_f32, 0.0];
     let result = db
         .execute(
-            "SELECT id, context_id FROM digests ORDER BY embedding <=> $query LIMIT 2",
-            &params(vec![("query", Value::Vector(query))]),
+            "SELECT id, context_id FROM digests WHERE context_id = $context_id ORDER BY embedding <=> $query LIMIT 2",
+            &params(vec![
+                ("context_id", Value::Uuid(ctx_a)),
+                ("query", Value::Vector(query)),
+            ]),
         )
         .unwrap();
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows.len(), 1);
     assert_eq!(
         row_value(&result, 0, "id"),
         &Value::Uuid(farther_right_context)
