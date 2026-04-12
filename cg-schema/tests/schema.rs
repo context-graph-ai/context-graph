@@ -1,0 +1,1728 @@
+use std::collections::HashMap;
+
+use cg_schema::{ddl::DIGEST_VECTOR_DIMENSION, init::initialize_schema};
+use contextdb_core::{Error, Value};
+use contextdb_engine::{Database, QueryResult};
+use serde_json::json;
+use uuid::Uuid;
+
+fn fresh_db() -> Database {
+    let db = Database::open_memory();
+    initialize_schema(&db).expect("schema initializes");
+    db
+}
+
+fn uuid(n: u128) -> String {
+    Uuid::from_u128(n).to_string()
+}
+
+fn now_ts() -> String {
+    "2026-01-02T03:04:05Z".to_string()
+}
+
+fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
+    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+}
+
+fn row_value<'a>(result: &'a QueryResult, row: usize, col: &str) -> &'a Value {
+    let idx = result
+        .columns
+        .iter()
+        .position(|name| name == col)
+        .unwrap_or_else(|| panic!("missing column {col}"));
+    &result.rows[row][idx]
+}
+
+fn assert_one_row(result: &QueryResult) {
+    assert_eq!(result.rows.len(), 1, "expected exactly one row");
+}
+
+fn assert_error_is_fk(result: contextdb_core::Result<QueryResult>) {
+    assert!(matches!(result, Err(Error::ForeignKeyViolation { .. })));
+}
+
+fn assert_error_is_unique(result: contextdb_core::Result<QueryResult>) {
+    assert!(matches!(result, Err(Error::UniqueViolation { .. })));
+}
+
+fn insert_context(db: &Database, id: Uuid, name: &str) {
+    db.execute(
+        "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text(name.to_string())),
+            ("labels", Value::Json(json!({"org": "acme"}))),
+            ("properties", Value::Json(json!({"tier": "gold"}))),
+            ("created_at", Value::Timestamp(1_700_000_000)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_entity(db: &Database, id: Uuid, context_id: Uuid, name: &str) {
+    db.execute(
+        "INSERT INTO entities (id, entity_type, name, context_id, properties, created_at) VALUES ($id, $entity_type, $name, $context_id, $properties, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("entity_type", Value::Text("SERVICE".into())),
+            ("name", Value::Text(name.to_string())),
+            ("context_id", Value::Uuid(context_id)),
+            ("properties", Value::Json(json!({"owner": "team-a"}))),
+            ("created_at", Value::Timestamp(1_700_000_001)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_intention(db: &Database, id: Uuid, context_id: Uuid, status: &str) {
+    db.execute(
+        "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $properties, $tags, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("description", Value::Text("Protect children from unauthorized pickup".into())),
+            ("status", Value::Text(status.to_string())),
+            ("context_id", Value::Uuid(context_id)),
+            ("origin", Value::Text("human".into())),
+            ("origin_ref", Value::Null),
+            ("blueprint_id", Value::Null),
+            ("bindings", Value::Json(json!({"slot": "value"}))),
+            ("blueprint_proposal", Value::Text("proposal text".into())),
+            ("properties", Value::Json(json!({"priority": "high"}))),
+            ("tags", Value::Json(json!(["safety", "family"]))),
+            ("created_at", Value::Timestamp(1_700_000_002)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_decision(db: &Database, id: Uuid, context_id: Uuid, status: &str) {
+    db.execute(
+        "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("decision_type", Value::Text("architecture".into())),
+            ("description", Value::Text("Use abstraction layer for fault isolation".into())),
+            ("reasoning", Value::Json(json!([{
+                "operation": "analyzed",
+                "details": "compared latency distributions",
+                "result": "threshold too low",
+                "agent_id": "agent-1",
+                "timestamp": "2026-01-02T03:04:05Z"
+            }]))),
+            ("confidence", Value::Float64(0.7)),
+            ("status", Value::Text(status.to_string())),
+            ("agent_id", Value::Text("agent-1".into())),
+            ("context_id", Value::Uuid(context_id)),
+            ("properties", Value::Json(json!({"owner": "platform"}))),
+            ("tags", Value::Json(json!(["decision", "ops"]))),
+            ("created_at", Value::Timestamp(1_700_000_003)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_observation(db: &Database, id: Uuid, entity_id: Uuid, context_id: Uuid) {
+    db.execute(
+        "INSERT INTO observations (id, observation_type, data, source, entity_id, context_id, timestamp) VALUES ($id, $observation_type, $data, $source, $entity_id, $context_id, $timestamp)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("observation_type", Value::Text("config_change".into())),
+            ("data", Value::Json(json!({"field": "version", "old": "1.0", "new": "2.0"}))),
+            ("source", Value::Text("git-hook".into())),
+            ("entity_id", Value::Uuid(entity_id)),
+            ("context_id", Value::Uuid(context_id)),
+            ("timestamp", Value::Timestamp(1_700_000_004)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_outcome(db: &Database, id: Uuid, decision_id: Uuid) {
+    db.execute(
+        "INSERT INTO outcomes (id, decision_id, success, notes, recorded_at) VALUES ($id, $decision_id, $success, $notes, $recorded_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("decision_id", Value::Uuid(decision_id)),
+            ("success", Value::Bool(true)),
+            ("notes", Value::Text("works as expected".into())),
+            ("recorded_at", Value::Timestamp(1_700_000_005)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_invalidation(
+    db: &Database,
+    id: Uuid,
+    status: &str,
+    affected_decision_id: Uuid,
+    trigger_observation_id: Uuid,
+) {
+    db.execute(
+        "INSERT INTO invalidations (id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("status", Value::Text(status.to_string())),
+            ("affected_decision_id", Value::Uuid(affected_decision_id)),
+            ("trigger_observation_id", Value::Uuid(trigger_observation_id)),
+            ("basis_diff", Value::Json(json!({"field": "version", "old": "1.0", "new": "2.0"}))),
+            ("severity", Value::Text("warning".into())),
+            ("detected_at", Value::Timestamp(1_700_000_006)),
+            ("resolved_at", Value::Timestamp(1_700_000_007)),
+            ("resolution_action", Value::Text("new_decision_created".into())),
+            ("resolution_decision_id", Value::Null),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_invalidation_status(db: &Database, id: Uuid, context_id: Uuid, status: &str) {
+    let decision_id = Uuid::from_u128(604);
+    let observation_id = Uuid::from_u128(605);
+    insert_context(db, context_id, "ctx");
+    insert_decision(db, decision_id, context_id, "active");
+    insert_entity(db, Uuid::from_u128(606), context_id, "entity");
+    insert_observation(db, observation_id, Uuid::from_u128(606), context_id);
+    insert_invalidation(db, id, status, decision_id, observation_id);
+}
+
+fn insert_signature(db: &Database, id: Uuid, status: &str) {
+    db.execute(
+        "INSERT INTO signatures (id, signature_type, description, match_criteria, scope_labels, confidence, origin_context_ids, status, created_at, last_matched_at) VALUES ($id, $signature_type, $description, $match_criteria, $scope_labels, $confidence, $origin_context_ids, $status, $created_at, $last_matched_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("signature_type", Value::Text("frequency_anomaly".into())),
+            ("description", Value::Text("Same person at multiple locations".into())),
+            ("match_criteria", Value::Json(json!({"observation_types": ["person_detected"]}))),
+            ("scope_labels", Value::Json(json!({"org": "bank-x"}))),
+            ("confidence", Value::Float64(0.75)),
+            ("origin_context_ids", Value::Json(json!([uuid(1)]))),
+            ("status", Value::Text(status.to_string())),
+            ("created_at", Value::Timestamp(1_700_000_008)),
+            ("last_matched_at", Value::Timestamp(1_700_000_009)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_digest(db: &Database, id: Uuid, context_id: Uuid, embedding: Vec<f32>) {
+    db.execute(
+        "INSERT INTO digests (id, source, session_ref, summary, embedding, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $embedding, $context_id, $properties, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("source", Value::Text("claude-cli".into())),
+            ("session_ref", Value::Text("session-1".into())),
+            ("summary", Value::Text("Discussed auth module refactoring".into())),
+            ("embedding", Value::Vector(embedding)),
+            ("context_id", Value::Uuid(context_id)),
+            ("properties", Value::Json(json!({"modality": "text"}))),
+            ("created_at", Value::Timestamp(1_700_000_010)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_blueprint(db: &Database, id: Uuid) {
+    db.execute(
+        "INSERT INTO blueprints (id, canonical_description, category, slots, default_config_shape, version, status, created_at, updated_at) VALUES ($id, $canonical_description, $category, $slots, $default_config_shape, $version, $status, $created_at, $updated_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("canonical_description", Value::Text("Detect entity at location during time window".into())),
+            ("category", Value::Text("detection".into())),
+            ("slots", Value::Json(json!({"entity_type": "SERVICE"}))),
+            ("default_config_shape", Value::Json(json!({"window": "PT5M"}))),
+            ("version", Value::Text("1.0.0".into())),
+            ("status", Value::Text("active".into())),
+            ("created_at", Value::Timestamp(1_700_000_011)),
+            ("updated_at", Value::Timestamp(1_700_000_012)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_edge(db: &Database, id: Uuid, source: Uuid, target: Uuid, edge_type: &str) {
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("source_id", Value::Uuid(source)),
+            ("target_id", Value::Uuid(target)),
+            ("edge_type", Value::Text(edge_type.to_string())),
+            ("valid_from", Value::Timestamp(1_700_000_013)),
+            ("valid_to", Value::Null),
+            ("properties", Value::Json(json!({"weight": 1}))),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_snapshot(db: &Database, id: Uuid, entity_id: Uuid, valid_from: i64, valid_to: i64) {
+    db.execute(
+        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("entity_id", Value::Uuid(entity_id)),
+            ("data", Value::Json(json!({"version": valid_from}))),
+            ("valid_from", Value::Int64(valid_from)),
+            ("valid_to", Value::Int64(valid_to)),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_approval(db: &Database, id: Uuid, decision_id: Uuid) {
+    db.execute(
+        "INSERT INTO approvals (id, decision_id, approver_id, level, rationale, created_at) VALUES ($id, $decision_id, $approver_id, $level, $rationale, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("decision_id", Value::Uuid(decision_id)),
+            ("approver_id", Value::Text("approver-1".into())),
+            ("level", Value::Text("team".into())),
+            ("rationale", Value::Text("looks good".into())),
+            ("created_at", Value::Timestamp(1_700_000_014)),
+        ]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_contexts_table_insert() {
+    let db = fresh_db();
+    let _ = now_ts();
+    let id = Uuid::from_u128(1);
+    db.execute(
+        "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("name", Value::Text("project-alpha".into())),
+            ("labels", Value::Json(json!({"org": "acme", "tier": "prod"}))),
+            ("properties", Value::Json(json!({"retention_days": 30}))),
+            ("created_at", Value::Timestamp(1_700_001_000)),
+        ]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT * FROM contexts WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "name"),
+        &Value::Text("project-alpha".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "labels"),
+        &Value::Json(json!({"org": "acme", "tier": "prod"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "properties"),
+        &Value::Json(json!({"retention_days": 30}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "created_at"),
+        &Value::Timestamp(1_700_001_000)
+    );
+}
+
+#[test]
+fn test_intentions_table_insert() {
+    let db = fresh_db();
+    let id = Uuid::from_u128(2);
+    let context_id = Uuid::from_u128(20);
+    insert_context(&db, context_id, "ctx");
+    db.execute(
+        "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $properties, $tags, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("description", Value::Text("Protect children from unauthorized pickup".into())),
+            ("status", Value::Text("active".into())),
+            ("context_id", Value::Uuid(context_id)),
+            ("origin", Value::Text("human".into())),
+            ("origin_ref", Value::Uuid(Uuid::from_u128(21))),
+            ("blueprint_id", Value::Uuid(Uuid::from_u128(22))),
+            ("bindings", Value::Json(json!({"slot": "value"}))),
+            ("blueprint_proposal", Value::Text("proposal text".into())),
+            ("properties", Value::Json(json!({"priority": "high"}))),
+            ("tags", Value::Json(json!(["safety", "family"]))),
+            ("created_at", Value::Timestamp(1_700_001_001)),
+        ]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT * FROM intentions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "description"),
+        &Value::Text("Protect children from unauthorized pickup".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "status"),
+        &Value::Text("active".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "context_id"),
+        &Value::Uuid(context_id)
+    );
+    assert_eq!(
+        row_value(&result, 0, "origin"),
+        &Value::Text("human".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "origin_ref"),
+        &Value::Uuid(Uuid::from_u128(21))
+    );
+    assert_eq!(
+        row_value(&result, 0, "blueprint_id"),
+        &Value::Uuid(Uuid::from_u128(22))
+    );
+    assert_eq!(
+        row_value(&result, 0, "bindings"),
+        &Value::Json(json!({"slot": "value"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "blueprint_proposal"),
+        &Value::Text("proposal text".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "properties"),
+        &Value::Json(json!({"priority": "high"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "tags"),
+        &Value::Json(json!(["safety", "family"]))
+    );
+    assert_eq!(
+        row_value(&result, 0, "created_at"),
+        &Value::Timestamp(1_700_001_001)
+    );
+}
+
+#[test]
+fn test_decisions_table_insert() {
+    let db = fresh_db();
+    let id = Uuid::from_u128(3);
+    let context_id = Uuid::from_u128(30);
+    insert_context(&db, context_id, "ctx");
+    db.execute(
+        "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("decision_type", Value::Text("architecture".into())),
+            ("description", Value::Text("Use abstraction layer for fault isolation".into())),
+            ("reasoning", Value::Json(json!([{ "operation": "analyzed", "details": "compared", "result": "threshold too low", "agent_id": "agent-1", "timestamp": "2026-01-02T03:04:05Z" }]))),
+            ("confidence", Value::Float64(0.7)),
+            ("status", Value::Text("active".into())),
+            ("agent_id", Value::Text("agent-1".into())),
+            ("context_id", Value::Uuid(context_id)),
+            ("properties", Value::Json(json!({"owner": "platform"}))),
+            ("tags", Value::Json(json!(["decision", "ops"]))),
+            ("created_at", Value::Timestamp(1_700_001_002)),
+        ]),
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT * FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "decision_type"),
+        &Value::Text("architecture".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "description"),
+        &Value::Text("Use abstraction layer for fault isolation".into())
+    );
+    assert_eq!(row_value(&result, 0, "confidence"), &Value::Float64(0.7));
+    assert_eq!(
+        row_value(&result, 0, "status"),
+        &Value::Text("active".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "agent_id"),
+        &Value::Text("agent-1".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "context_id"),
+        &Value::Uuid(context_id)
+    );
+    assert_eq!(
+        row_value(&result, 0, "properties"),
+        &Value::Json(json!({"owner": "platform"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "tags"),
+        &Value::Json(json!(["decision", "ops"]))
+    );
+    assert_eq!(
+        row_value(&result, 0, "created_at"),
+        &Value::Timestamp(1_700_001_002)
+    );
+}
+
+#[test]
+fn test_entities_table_insert() {
+    let db = fresh_db();
+    let id = Uuid::from_u128(4);
+    let context_id = Uuid::from_u128(40);
+    insert_context(&db, context_id, "ctx");
+    insert_entity(&db, id, context_id, "payment-service");
+
+    let result = db
+        .execute(
+            "SELECT * FROM entities WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "entity_type"),
+        &Value::Text("SERVICE".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "name"),
+        &Value::Text("payment-service".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "context_id"),
+        &Value::Uuid(context_id)
+    );
+    assert_eq!(
+        row_value(&result, 0, "properties"),
+        &Value::Json(json!({"owner": "team-a"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "created_at"),
+        &Value::Timestamp(1_700_000_001)
+    );
+}
+
+#[test]
+fn test_observations_table_insert() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(50);
+    let entity_id = Uuid::from_u128(51);
+    insert_context(&db, context_id, "ctx");
+    insert_entity(&db, entity_id, context_id, "config");
+    let id = Uuid::from_u128(5);
+    insert_observation(&db, id, entity_id, context_id);
+
+    let result = db
+        .execute(
+            "SELECT * FROM observations WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "observation_type"),
+        &Value::Text("config_change".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "data"),
+        &Value::Json(json!({"field": "version", "old": "1.0", "new": "2.0"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "source"),
+        &Value::Text("git-hook".into())
+    );
+    assert_eq!(row_value(&result, 0, "entity_id"), &Value::Uuid(entity_id));
+    assert_eq!(
+        row_value(&result, 0, "context_id"),
+        &Value::Uuid(context_id)
+    );
+    assert_eq!(
+        row_value(&result, 0, "timestamp"),
+        &Value::Timestamp(1_700_000_004)
+    );
+}
+
+#[test]
+fn test_outcomes_table_insert() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(60);
+    insert_context(&db, context_id, "ctx");
+    let decision_id = Uuid::from_u128(61);
+    insert_decision(&db, decision_id, context_id, "active");
+    let id = Uuid::from_u128(6);
+    insert_outcome(&db, id, decision_id);
+
+    let result = db
+        .execute(
+            "SELECT * FROM outcomes WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "decision_id"),
+        &Value::Uuid(decision_id)
+    );
+    assert_eq!(row_value(&result, 0, "success"), &Value::Bool(true));
+    assert_eq!(
+        row_value(&result, 0, "notes"),
+        &Value::Text("works as expected".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "recorded_at"),
+        &Value::Timestamp(1_700_000_005)
+    );
+}
+
+#[test]
+fn test_invalidations_table_insert() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(70);
+    insert_context(&db, context_id, "ctx");
+    let decision_id = Uuid::from_u128(71);
+    let observation_id = Uuid::from_u128(72);
+    insert_decision(&db, decision_id, context_id, "active");
+    insert_entity(&db, Uuid::from_u128(73), context_id, "entity");
+    insert_observation(&db, observation_id, Uuid::from_u128(73), context_id);
+    let id = Uuid::from_u128(7);
+    insert_invalidation(&db, id, "pending", decision_id, observation_id);
+
+    let result = db
+        .execute(
+            "SELECT * FROM invalidations WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "status"),
+        &Value::Text("pending".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "affected_decision_id"),
+        &Value::Uuid(decision_id)
+    );
+    assert_eq!(
+        row_value(&result, 0, "trigger_observation_id"),
+        &Value::Uuid(observation_id)
+    );
+    assert_eq!(
+        row_value(&result, 0, "basis_diff"),
+        &Value::Json(json!({"field": "version", "old": "1.0", "new": "2.0"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "severity"),
+        &Value::Text("warning".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "detected_at"),
+        &Value::Timestamp(1_700_000_006)
+    );
+    assert_eq!(
+        row_value(&result, 0, "resolved_at"),
+        &Value::Timestamp(1_700_000_007)
+    );
+    assert_eq!(
+        row_value(&result, 0, "resolution_action"),
+        &Value::Text("new_decision_created".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "resolution_decision_id"),
+        &Value::Null
+    );
+}
+
+#[test]
+fn test_signatures_table_insert() {
+    let db = fresh_db();
+    let id = Uuid::from_u128(8);
+    insert_signature(&db, id, "active");
+
+    let result = db
+        .execute(
+            "SELECT * FROM signatures WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "signature_type"),
+        &Value::Text("frequency_anomaly".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "description"),
+        &Value::Text("Same person at multiple locations".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "match_criteria"),
+        &Value::Json(json!({"observation_types": ["person_detected"]}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "scope_labels"),
+        &Value::Json(json!({"org": "bank-x"}))
+    );
+    assert_eq!(row_value(&result, 0, "confidence"), &Value::Float64(0.75));
+    assert_eq!(
+        row_value(&result, 0, "origin_context_ids"),
+        &Value::Json(json!([uuid(1)]))
+    );
+    assert_eq!(
+        row_value(&result, 0, "status"),
+        &Value::Text("active".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "created_at"),
+        &Value::Timestamp(1_700_000_008)
+    );
+    assert_eq!(
+        row_value(&result, 0, "last_matched_at"),
+        &Value::Timestamp(1_700_000_009)
+    );
+}
+
+#[test]
+fn test_digests_table_insert() {
+    let db = fresh_db();
+    let id = Uuid::from_u128(9);
+    let context_id = Uuid::from_u128(90);
+    insert_context(&db, context_id, "ctx");
+    let embedding = vec![0.1_f32; DIGEST_VECTOR_DIMENSION];
+    insert_digest(&db, id, context_id, embedding.clone());
+
+    let result = db
+        .execute(
+            "SELECT * FROM digests WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "source"),
+        &Value::Text("claude-cli".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "session_ref"),
+        &Value::Text("session-1".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "summary"),
+        &Value::Text("Discussed auth module refactoring".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "embedding"),
+        &Value::Vector(embedding)
+    );
+    assert_eq!(
+        row_value(&result, 0, "context_id"),
+        &Value::Uuid(context_id)
+    );
+    assert_eq!(
+        row_value(&result, 0, "properties"),
+        &Value::Json(json!({"modality": "text"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "created_at"),
+        &Value::Timestamp(1_700_000_010)
+    );
+}
+
+#[test]
+fn test_blueprints_table_insert() {
+    let db = fresh_db();
+    let id = Uuid::from_u128(10);
+    insert_blueprint(&db, id);
+
+    let result = db
+        .execute(
+            "SELECT * FROM blueprints WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "canonical_description"),
+        &Value::Text("Detect entity at location during time window".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "category"),
+        &Value::Text("detection".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "slots"),
+        &Value::Json(json!({"entity_type": "SERVICE"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "default_config_shape"),
+        &Value::Json(json!({"window": "PT5M"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "version"),
+        &Value::Text("1.0.0".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "status"),
+        &Value::Text("active".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "created_at"),
+        &Value::Timestamp(1_700_000_011)
+    );
+    assert_eq!(
+        row_value(&result, 0, "updated_at"),
+        &Value::Timestamp(1_700_000_012)
+    );
+}
+
+#[test]
+fn test_edges_table_all_relationship_types() {
+    let db = fresh_db();
+    let source = Uuid::from_u128(100);
+    let mut expected_types = Vec::new();
+
+    for (i, edge_type) in [
+        "SERVES",
+        "BASED_ON",
+        "ABOUT",
+        "CITES",
+        "SUPERSEDES",
+        "RELATES_TO",
+        "OBSERVED_ON",
+        "HAS_OUTCOME",
+        "INVALIDATES",
+        "TRIGGERED_BY",
+        "MATCHED_BY",
+        "GENERATED",
+        "EXTRACTED_FROM",
+        "INSTANTIATES",
+        "REFINES",
+    ]
+    .iter()
+    .enumerate()
+    {
+        expected_types.push((*edge_type).to_string());
+        db.execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(1000 + i as u128))),
+                ("source_id", Value::Uuid(source)),
+                ("target_id", Value::Uuid(Uuid::from_u128(200 + i as u128))),
+                ("edge_type", Value::Text(edge_type.to_string())),
+                ("valid_from", Value::Timestamp(1_700_000_020 + i as i64)),
+                ("valid_to", Value::Null),
+                ("properties", Value::Json(json!({"rank": i}))),
+            ]),
+        )
+        .unwrap();
+    }
+
+    let result = db.execute("SELECT * FROM edges", &HashMap::new()).unwrap();
+    assert_eq!(result.rows.len(), 15);
+    for edge_type in expected_types {
+        assert!(result.rows.iter().any(|row| {
+            row_value(
+                &result,
+                result
+                    .rows
+                    .iter()
+                    .position(|candidate| candidate == row)
+                    .unwrap(),
+                "edge_type",
+            ) == &Value::Text(edge_type.clone())
+        }));
+    }
+}
+
+#[test]
+fn test_entity_snapshots_table_insert() {
+    let db = fresh_db();
+    let entity_id = Uuid::from_u128(300);
+    let snapshot_id = Uuid::from_u128(301);
+    insert_snapshot(&db, snapshot_id, entity_id, 1, 2);
+
+    let result = db
+        .execute(
+            "SELECT * FROM entity_snapshots WHERE id = $id",
+            &params(vec![("id", Value::Uuid(snapshot_id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(row_value(&result, 0, "entity_id"), &Value::Uuid(entity_id));
+    assert_eq!(row_value(&result, 0, "valid_from"), &Value::Int64(1));
+    assert_eq!(row_value(&result, 0, "valid_to"), &Value::Int64(2));
+}
+
+#[test]
+fn test_approvals_table_insert() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(400);
+    insert_context(&db, context_id, "ctx");
+    let decision_id = Uuid::from_u128(401);
+    insert_decision(&db, decision_id, context_id, "active");
+    let id = Uuid::from_u128(11);
+    insert_approval(&db, id, decision_id);
+
+    let result = db
+        .execute(
+            "SELECT * FROM approvals WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    assert_eq!(
+        row_value(&result, 0, "decision_id"),
+        &Value::Uuid(decision_id)
+    );
+    assert_eq!(
+        row_value(&result, 0, "approver_id"),
+        &Value::Text("approver-1".into())
+    );
+    assert_eq!(row_value(&result, 0, "level"), &Value::Text("team".into()));
+    assert_eq!(
+        row_value(&result, 0, "rationale"),
+        &Value::Text("looks good".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "created_at"),
+        &Value::Timestamp(1_700_000_014)
+    );
+}
+
+#[test]
+fn test_observation_immutable_rejects_update() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(500);
+    let entity_id = Uuid::from_u128(501);
+    let obs_id = Uuid::from_u128(502);
+    insert_context(&db, context_id, "ctx");
+    insert_entity(&db, entity_id, context_id, "entity");
+    insert_observation(&db, obs_id, entity_id, context_id);
+
+    let result = db.execute(
+        "UPDATE observations SET source = $source WHERE id = $id",
+        &params(vec![
+            ("source", Value::Text("other".into())),
+            ("id", Value::Uuid(obs_id)),
+        ]),
+    );
+    assert!(matches!(result, Err(Error::ImmutableTable(_))));
+}
+
+#[test]
+fn test_observation_immutable_rejects_delete() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(503);
+    let entity_id = Uuid::from_u128(504);
+    let obs_id = Uuid::from_u128(505);
+    insert_context(&db, context_id, "ctx");
+    insert_entity(&db, entity_id, context_id, "entity");
+    insert_observation(&db, obs_id, entity_id, context_id);
+
+    let result = db.execute(
+        "DELETE FROM observations WHERE id = $id",
+        &params(vec![("id", Value::Uuid(obs_id))]),
+    );
+    assert!(matches!(result, Err(Error::ImmutableTable(_))));
+}
+
+#[test]
+fn test_digest_immutable_rejects_update() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(506);
+    let id = Uuid::from_u128(507);
+    insert_context(&db, context_id, "ctx");
+    insert_digest(&db, id, context_id, vec![0.1; DIGEST_VECTOR_DIMENSION]);
+
+    let result = db.execute(
+        "UPDATE digests SET summary = $summary WHERE id = $id",
+        &params(vec![
+            ("summary", Value::Text("changed".into())),
+            ("id", Value::Uuid(id)),
+        ]),
+    );
+    assert!(matches!(result, Err(Error::ImmutableTable(_))));
+}
+
+#[test]
+fn test_digest_immutable_rejects_delete() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(508);
+    let id = Uuid::from_u128(509);
+    insert_context(&db, context_id, "ctx");
+    insert_digest(&db, id, context_id, vec![0.1; DIGEST_VECTOR_DIMENSION]);
+
+    let result = db.execute(
+        "DELETE FROM digests WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id))]),
+    );
+    assert!(matches!(result, Err(Error::ImmutableTable(_))));
+}
+
+macro_rules! allowed_status_test {
+    ($name:ident, $insert_fn:ident, $table:literal, $start:literal, $next:literal) => {
+        #[test]
+        fn $name() {
+            let db = fresh_db();
+            assert!(
+                db.table_meta($table).unwrap().state_machine.is_some(),
+                "expected {} to define a state machine",
+                $table
+            );
+            let context_id = Uuid::from_u128(600);
+            let id = Uuid::from_u128(601);
+            $insert_fn(&db, id, context_id, $start);
+            let update = db.execute(
+                &format!("UPDATE {} SET status = $status WHERE id = $id", $table),
+                &params(vec![
+                    ("status", Value::Text($next.into())),
+                    ("id", Value::Uuid(id)),
+                ]),
+            );
+            assert!(update.is_ok());
+            let result = db
+                .execute(
+                    &format!("SELECT status FROM {} WHERE id = $id", $table),
+                    &params(vec![("id", Value::Uuid(id))]),
+                )
+                .unwrap();
+            assert_one_row(&result);
+            assert_eq!(row_value(&result, 0, "status"), &Value::Text($next.into()));
+        }
+    };
+}
+
+macro_rules! rejected_status_test {
+    ($name:ident, $insert_fn:ident, $table:literal, $start:literal, $next:literal) => {
+        #[test]
+        fn $name() {
+            let db = fresh_db();
+            let context_id = Uuid::from_u128(602);
+            let id = Uuid::from_u128(603);
+            $insert_fn(&db, id, context_id, $start);
+            let update = db.execute(
+                &format!("UPDATE {} SET status = $status WHERE id = $id", $table),
+                &params(vec![
+                    ("status", Value::Text($next.into())),
+                    ("id", Value::Uuid(id)),
+                ]),
+            );
+            assert!(update.is_err());
+        }
+    };
+}
+
+allowed_status_test!(
+    test_intention_status_active_to_paused,
+    insert_intention,
+    "intentions",
+    "active",
+    "paused"
+);
+allowed_status_test!(
+    test_intention_status_active_to_archived,
+    insert_intention,
+    "intentions",
+    "active",
+    "archived"
+);
+allowed_status_test!(
+    test_intention_status_active_to_superseded,
+    insert_intention,
+    "intentions",
+    "active",
+    "superseded"
+);
+allowed_status_test!(
+    test_intention_status_paused_to_active,
+    insert_intention,
+    "intentions",
+    "paused",
+    "active"
+);
+allowed_status_test!(
+    test_intention_status_paused_to_superseded,
+    insert_intention,
+    "intentions",
+    "paused",
+    "superseded"
+);
+allowed_status_test!(
+    test_intention_status_paused_to_archived,
+    insert_intention,
+    "intentions",
+    "paused",
+    "archived"
+);
+rejected_status_test!(
+    test_intention_status_archived_to_active_rejected,
+    insert_intention,
+    "intentions",
+    "archived",
+    "active"
+);
+rejected_status_test!(
+    test_intention_status_superseded_to_active_rejected,
+    insert_intention,
+    "intentions",
+    "superseded",
+    "active"
+);
+rejected_status_test!(
+    test_intention_status_superseded_to_paused_rejected,
+    insert_intention,
+    "intentions",
+    "superseded",
+    "paused"
+);
+rejected_status_test!(
+    test_intention_status_archived_to_superseded_rejected,
+    insert_intention,
+    "intentions",
+    "archived",
+    "superseded"
+);
+
+allowed_status_test!(
+    test_decision_status_active_to_superseded,
+    insert_decision,
+    "decisions",
+    "active",
+    "superseded"
+);
+allowed_status_test!(
+    test_decision_status_active_to_invalidated,
+    insert_decision,
+    "decisions",
+    "active",
+    "invalidated"
+);
+rejected_status_test!(
+    test_decision_status_superseded_to_active_rejected,
+    insert_decision,
+    "decisions",
+    "superseded",
+    "active"
+);
+rejected_status_test!(
+    test_decision_status_invalidated_to_active_rejected,
+    insert_decision,
+    "decisions",
+    "invalidated",
+    "active"
+);
+rejected_status_test!(
+    test_decision_status_invalidated_to_superseded_rejected,
+    insert_decision,
+    "decisions",
+    "invalidated",
+    "superseded"
+);
+rejected_status_test!(
+    test_decision_status_superseded_to_invalidated_rejected,
+    insert_decision,
+    "decisions",
+    "superseded",
+    "invalidated"
+);
+
+allowed_status_test!(
+    test_invalidation_status_pending_to_acknowledged,
+    insert_invalidation_status,
+    "invalidations",
+    "pending",
+    "acknowledged"
+);
+allowed_status_test!(
+    test_invalidation_status_acknowledged_to_resolved,
+    insert_invalidation_status,
+    "invalidations",
+    "acknowledged",
+    "resolved"
+);
+allowed_status_test!(
+    test_invalidation_status_acknowledged_to_dismissed,
+    insert_invalidation_status,
+    "invalidations",
+    "acknowledged",
+    "dismissed"
+);
+rejected_status_test!(
+    test_invalidation_status_resolved_to_pending_rejected,
+    insert_invalidation_status,
+    "invalidations",
+    "resolved",
+    "pending"
+);
+rejected_status_test!(
+    test_invalidation_status_dismissed_to_acknowledged_rejected,
+    insert_invalidation_status,
+    "invalidations",
+    "dismissed",
+    "acknowledged"
+);
+rejected_status_test!(
+    test_invalidation_status_pending_to_resolved_rejected,
+    insert_invalidation_status,
+    "invalidations",
+    "pending",
+    "resolved"
+);
+rejected_status_test!(
+    test_invalidation_status_pending_to_dismissed_rejected,
+    insert_invalidation_status,
+    "invalidations",
+    "pending",
+    "dismissed"
+);
+rejected_status_test!(
+    test_invalidation_status_dismissed_to_resolved_rejected,
+    insert_invalidation_status,
+    "invalidations",
+    "dismissed",
+    "resolved"
+);
+
+#[test]
+fn test_cites_dag_rejects_cycle() {
+    let db = fresh_db();
+    let source_a = Uuid::from_u128(700);
+    let source_b = Uuid::from_u128(701);
+    insert_edge(&db, Uuid::from_u128(702), source_a, source_b, "CITES");
+    let result = db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(703))),
+            ("source_id", Value::Uuid(source_b)),
+            ("target_id", Value::Uuid(source_a)),
+            ("edge_type", Value::Text("CITES".into())),
+            ("valid_from", Value::Timestamp(1_700_000_030)),
+            ("valid_to", Value::Null),
+            ("properties", Value::Json(json!({}))),
+        ]),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cites_dag_rejects_self_cycle() {
+    let db = fresh_db();
+    let node = Uuid::from_u128(704);
+    let result = db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(705))),
+            ("source_id", Value::Uuid(node)),
+            ("target_id", Value::Uuid(node)),
+            ("edge_type", Value::Text("CITES".into())),
+            ("valid_from", Value::Timestamp(1_700_000_031)),
+            ("valid_to", Value::Null),
+            ("properties", Value::Json(json!({}))),
+        ]),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cites_dag_rejects_transitive_cycle() {
+    let db = fresh_db();
+    let a = Uuid::from_u128(706);
+    let b = Uuid::from_u128(707);
+    let c = Uuid::from_u128(708);
+    insert_edge(&db, Uuid::from_u128(709), a, b, "CITES");
+    insert_edge(&db, Uuid::from_u128(710), b, c, "CITES");
+    let result = db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(711))),
+            ("source_id", Value::Uuid(c)),
+            ("target_id", Value::Uuid(a)),
+            ("edge_type", Value::Text("CITES".into())),
+            ("valid_from", Value::Timestamp(1_700_000_032)),
+            ("valid_to", Value::Null),
+            ("properties", Value::Json(json!({}))),
+        ]),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_non_cites_edge_allows_bidirectional() {
+    let db = fresh_db();
+    let a = Uuid::from_u128(712);
+    let b = Uuid::from_u128(713);
+    insert_edge(&db, Uuid::from_u128(714), a, b, "RELATES_TO");
+    insert_edge(&db, Uuid::from_u128(715), b, a, "RELATES_TO");
+
+    let result = db
+        .execute(
+            "SELECT * FROM edges WHERE edge_type = $edge_type",
+            &params(vec![("edge_type", Value::Text("RELATES_TO".into()))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
+fn test_edge_idempotent_duplicate_insert() {
+    let db = fresh_db();
+    let a = Uuid::from_u128(716);
+    let b = Uuid::from_u128(717);
+    insert_edge(&db, Uuid::from_u128(718), a, b, "SERVES");
+    let second = db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(719))),
+            ("source_id", Value::Uuid(a)),
+            ("target_id", Value::Uuid(b)),
+            ("edge_type", Value::Text("SERVES".into())),
+            ("valid_from", Value::Timestamp(1_700_000_040)),
+            ("valid_to", Value::Null),
+            ("properties", Value::Json(json!({"weight": 1}))),
+        ]),
+    );
+    assert!(second.is_ok());
+    let result = db.execute(
+        "SELECT * FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
+        &params(vec![
+            ("source_id", Value::Uuid(a)),
+            ("target_id", Value::Uuid(b)),
+            ("edge_type", Value::Text("SERVES".into())),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[test]
+fn test_context_isolation_entities_invisible_cross_context() {
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(800);
+    let ctx_b = Uuid::from_u128(801);
+    insert_context(&db, ctx_a, "client-a");
+    insert_context(&db, ctx_b, "client-b");
+    insert_entity(&db, Uuid::from_u128(802), ctx_a, "api");
+    insert_entity(&db, Uuid::from_u128(803), ctx_b, "api");
+
+    let result = db
+        .execute(
+            "SELECT * FROM entities WHERE name = $name",
+            &params(vec![("name", Value::Text("api".into()))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(row_value(&result, 0, "context_id"), &Value::Uuid(ctx_a));
+}
+
+#[test]
+fn test_context_isolation_edges_stay_within_boundary() {
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(804);
+    let ctx_b = Uuid::from_u128(805);
+    let entity_a = Uuid::from_u128(806);
+    let entity_b = Uuid::from_u128(807);
+    insert_context(&db, ctx_a, "client-a");
+    insert_context(&db, ctx_b, "client-b");
+    insert_entity(&db, entity_a, ctx_a, "api");
+    insert_entity(&db, entity_b, ctx_b, "api");
+
+    let cross_context = db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $valid_from, $valid_to, $properties)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(808))),
+            ("source_id", Value::Uuid(entity_a)),
+            ("target_id", Value::Uuid(entity_b)),
+            ("edge_type", Value::Text("RELATES_TO".into())),
+            ("valid_from", Value::Timestamp(1_700_000_050)),
+            ("valid_to", Value::Null),
+            ("properties", Value::Json(json!({}))),
+        ]),
+    );
+    assert!(cross_context.is_err());
+}
+
+#[test]
+fn test_entity_snapshots_contiguous_timeline() {
+    let db = fresh_db();
+    let entity_id = Uuid::from_u128(900);
+    let snapshot_1 = Uuid::from_u128(901);
+    let snapshot_2 = Uuid::from_u128(902);
+    let snapshot_3 = Uuid::from_u128(903);
+    insert_snapshot(&db, snapshot_1, entity_id, 1, 2);
+    insert_snapshot(&db, snapshot_2, entity_id, 2, 3);
+    let result = db.execute(
+        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        &params(vec![
+            ("id", Value::Uuid(snapshot_3)),
+            ("entity_id", Value::Uuid(entity_id)),
+            ("data", Value::Json(json!({"version": 5}))),
+            ("valid_from", Value::Int64(5)),
+            ("valid_to", Value::Int64(6)),
+        ]),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_entity_snapshots_no_overlaps() {
+    let db = fresh_db();
+    let entity_id = Uuid::from_u128(904);
+    insert_snapshot(&db, Uuid::from_u128(905), entity_id, 1, 3);
+    let result = db.execute(
+        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(906))),
+            ("entity_id", Value::Uuid(entity_id)),
+            ("data", Value::Json(json!({"version": 2}))),
+            ("valid_from", Value::Int64(2)),
+            ("valid_to", Value::Int64(4)),
+        ]),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_fk_outcome_invalid_decision_id_rejected() {
+    let db = fresh_db();
+    assert_error_is_fk(db.execute(
+        "INSERT INTO outcomes (id, decision_id, success, notes, recorded_at) VALUES ($id, $decision_id, $success, $notes, $recorded_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1000))),
+            ("decision_id", Value::Uuid(Uuid::from_u128(1001))),
+            ("success", Value::Bool(true)),
+            ("notes", Value::Text("n".into())),
+            ("recorded_at", Value::Timestamp(1_700_000_060)),
+        ]),
+    ));
+}
+
+#[test]
+fn test_fk_observation_invalid_entity_id_rejected() {
+    let db = fresh_db();
+    let ctx = Uuid::from_u128(1002);
+    insert_context(&db, ctx, "ctx");
+    assert_error_is_fk(db.execute(
+        "INSERT INTO observations (id, observation_type, data, source, entity_id, context_id, timestamp) VALUES ($id, $observation_type, $data, $source, $entity_id, $context_id, $timestamp)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1003))),
+            ("observation_type", Value::Text("config_change".into())),
+            ("data", Value::Json(json!({"field": "x"}))),
+            ("source", Value::Text("source".into())),
+            ("entity_id", Value::Uuid(Uuid::from_u128(1004))),
+            ("context_id", Value::Uuid(ctx)),
+            ("timestamp", Value::Timestamp(1_700_000_061)),
+        ]),
+    ));
+}
+
+#[test]
+fn test_fk_invalidation_invalid_decision_id_rejected() {
+    let db = fresh_db();
+    assert_error_is_fk(db.execute(
+        "INSERT INTO invalidations (id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1005))),
+            ("status", Value::Text("pending".into())),
+            ("affected_decision_id", Value::Uuid(Uuid::from_u128(1006))),
+            ("trigger_observation_id", Value::Uuid(Uuid::from_u128(1007))),
+            ("basis_diff", Value::Json(json!({"field": "x"}))),
+            ("severity", Value::Text("warning".into())),
+            ("detected_at", Value::Timestamp(1_700_000_062)),
+            ("resolved_at", Value::Null),
+            ("resolution_action", Value::Null),
+            ("resolution_decision_id", Value::Null),
+        ]),
+    ));
+}
+
+#[test]
+fn test_fk_approval_invalid_decision_id_rejected() {
+    let db = fresh_db();
+    assert_error_is_fk(db.execute(
+        "INSERT INTO approvals (id, decision_id, approver_id, level, rationale, created_at) VALUES ($id, $decision_id, $approver_id, $level, $rationale, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1008))),
+            ("decision_id", Value::Uuid(Uuid::from_u128(1009))),
+            ("approver_id", Value::Text("approver".into())),
+            ("level", Value::Text("team".into())),
+            ("rationale", Value::Text("no".into())),
+            ("created_at", Value::Timestamp(1_700_000_063)),
+        ]),
+    ));
+}
+
+#[test]
+fn test_fk_intention_invalid_context_id_rejected() {
+    let db = fresh_db();
+    assert_error_is_fk(db.execute(
+        "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $properties, $tags, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1010))),
+            ("description", Value::Text("test".into())),
+            ("status", Value::Text("active".into())),
+            ("context_id", Value::Uuid(Uuid::from_u128(1011))),
+            ("origin", Value::Text("human".into())),
+            ("origin_ref", Value::Null),
+            ("blueprint_id", Value::Null),
+            ("bindings", Value::Json(json!({}))),
+            ("blueprint_proposal", Value::Null),
+            ("properties", Value::Json(json!({}))),
+            ("tags", Value::Json(json!([]))),
+            ("created_at", Value::Timestamp(1_700_000_064)),
+        ]),
+    ));
+}
+
+#[test]
+fn test_fk_decision_invalid_context_id_rejected() {
+    let db = fresh_db();
+    assert_error_is_fk(db.execute(
+        "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1012))),
+            ("decision_type", Value::Text("architecture".into())),
+            ("description", Value::Text("test".into())),
+            ("reasoning", Value::Json(json!([]))),
+            ("confidence", Value::Float64(0.5)),
+            ("status", Value::Text("active".into())),
+            ("agent_id", Value::Text("agent".into())),
+            ("context_id", Value::Uuid(Uuid::from_u128(1013))),
+            ("properties", Value::Json(json!({}))),
+            ("tags", Value::Json(json!([]))),
+            ("created_at", Value::Timestamp(1_700_000_065)),
+        ]),
+    ));
+}
+
+#[test]
+fn test_fk_entity_invalid_context_id_rejected() {
+    let db = fresh_db();
+    assert_error_is_fk(db.execute(
+        "INSERT INTO entities (id, entity_type, name, context_id, properties, created_at) VALUES ($id, $entity_type, $name, $context_id, $properties, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1014))),
+            ("entity_type", Value::Text("SERVICE".into())),
+            ("name", Value::Text("entity".into())),
+            ("context_id", Value::Uuid(Uuid::from_u128(1015))),
+            ("properties", Value::Json(json!({}))),
+            ("created_at", Value::Timestamp(1_700_000_066)),
+        ]),
+    ));
+}
+
+#[test]
+fn test_fk_digest_invalid_context_id_rejected() {
+    let db = fresh_db();
+    assert_error_is_fk(db.execute(
+        "INSERT INTO digests (id, source, session_ref, summary, embedding, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $embedding, $context_id, $properties, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1016))),
+            ("source", Value::Text("source".into())),
+            ("session_ref", Value::Null),
+            ("summary", Value::Text("summary".into())),
+            ("embedding", Value::Vector(vec![0.0; DIGEST_VECTOR_DIMENSION])),
+            ("context_id", Value::Uuid(Uuid::from_u128(1017))),
+            ("properties", Value::Json(json!({}))),
+            ("created_at", Value::Timestamp(1_700_000_067)),
+        ]),
+    ));
+}
+
+#[test]
+fn test_fk_invalidation_invalid_observation_id_rejected() {
+    let db = fresh_db();
+    assert_error_is_fk(db.execute(
+        "INSERT INTO invalidations (id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(1018))),
+            ("status", Value::Text("pending".into())),
+            ("affected_decision_id", Value::Uuid(Uuid::from_u128(1019))),
+            ("trigger_observation_id", Value::Uuid(Uuid::from_u128(1020))),
+            ("basis_diff", Value::Json(json!({"field": "x"}))),
+            ("severity", Value::Text("warning".into())),
+            ("detected_at", Value::Timestamp(1_700_000_068)),
+            ("resolved_at", Value::Null),
+            ("resolution_action", Value::Null),
+            ("resolution_decision_id", Value::Null),
+        ]),
+    ));
+}
+
+#[test]
+fn test_not_null_required_fields_rejected() {
+    let db = fresh_db();
+    let ctx = Uuid::from_u128(1030);
+    insert_context(&db, ctx, "ctx");
+    let entity_id = Uuid::from_u128(1031);
+    insert_entity(&db, entity_id, ctx, "entity");
+    let decision_id = Uuid::from_u128(1032);
+    insert_decision(&db, decision_id, ctx, "active");
+
+    let cases = [
+        db.execute(
+            "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $properties, $tags, $created_at)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(1033))),
+                ("description", Value::Null),
+                ("status", Value::Text("active".into())),
+                ("context_id", Value::Uuid(ctx)),
+                ("origin", Value::Text("human".into())),
+                ("origin_ref", Value::Null),
+                ("blueprint_id", Value::Null),
+                ("bindings", Value::Json(json!({}))),
+                ("blueprint_proposal", Value::Null),
+                ("properties", Value::Json(json!({}))),
+                ("tags", Value::Json(json!([]))),
+                ("created_at", Value::Timestamp(1_700_000_070)),
+            ]),
+        ),
+        db.execute(
+            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(1034))),
+                ("decision_type", Value::Null),
+                ("description", Value::Text("test".into())),
+                ("reasoning", Value::Json(json!([]))),
+                ("confidence", Value::Float64(0.2)),
+                ("status", Value::Text("active".into())),
+                ("agent_id", Value::Null),
+                ("context_id", Value::Uuid(ctx)),
+                ("properties", Value::Json(json!({}))),
+                ("tags", Value::Json(json!([]))),
+                ("created_at", Value::Timestamp(1_700_000_071)),
+            ]),
+        ),
+        db.execute(
+            "INSERT INTO entities (id, entity_type, name, context_id, properties, created_at) VALUES ($id, $entity_type, $name, $context_id, $properties, $created_at)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(1035))),
+                ("entity_type", Value::Text("SERVICE".into())),
+                ("name", Value::Null),
+                ("context_id", Value::Uuid(ctx)),
+                ("properties", Value::Json(json!({}))),
+                ("created_at", Value::Timestamp(1_700_000_072)),
+            ]),
+        ),
+        db.execute(
+            "INSERT INTO observations (id, observation_type, data, source, entity_id, context_id, timestamp) VALUES ($id, $observation_type, $data, $source, $entity_id, $context_id, $timestamp)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(1036))),
+                ("observation_type", Value::Text("config_change".into())),
+                ("data", Value::Json(json!({}))),
+                ("source", Value::Null),
+                ("entity_id", Value::Uuid(entity_id)),
+                ("context_id", Value::Uuid(ctx)),
+                ("timestamp", Value::Timestamp(1_700_000_073)),
+            ]),
+        ),
+        db.execute(
+            "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::from_u128(1037))),
+                ("name", Value::Null),
+                ("labels", Value::Json(json!({}))),
+                ("properties", Value::Json(json!({}))),
+                ("created_at", Value::Timestamp(1_700_000_074)),
+            ]),
+        ),
+    ];
+
+    for result in cases {
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+fn test_unique_context_name_rejected() {
+    let db = fresh_db();
+    let id1 = Uuid::from_u128(1040);
+    let id2 = Uuid::from_u128(1041);
+    insert_context(&db, id1, "project-alpha");
+    let result = db.execute(
+        "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(id2)),
+            ("name", Value::Text("project-alpha".into())),
+            ("labels", Value::Json(json!({"org": "acme"}))),
+            ("properties", Value::Json(json!({"tier": "gold"}))),
+            ("created_at", Value::Timestamp(1_700_000_075)),
+        ]),
+    );
+    assert_error_is_unique(result);
+}
+
+#[test]
+fn test_digest_vector_column_accepts_embedding() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(1050);
+    insert_context(&db, context_id, "ctx");
+    let id = Uuid::from_u128(1051);
+    let embedding = vec![0.0_f32; DIGEST_VECTOR_DIMENSION];
+    insert_digest(&db, id, context_id, embedding.clone());
+
+    let result = db
+        .execute(
+            "SELECT * FROM digests WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    match row_value(&result, 0, "embedding") {
+        Value::Vector(v) => assert_eq!(v.len(), DIGEST_VECTOR_DIMENSION),
+        other => panic!("expected vector embedding, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_digest_vector_cosine_distance_query() {
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(1060);
+    let ctx_b = Uuid::from_u128(1061);
+    insert_context(&db, ctx_a, "ctx-a");
+    insert_context(&db, ctx_b, "ctx-b");
+
+    let close_other_context = Uuid::from_u128(1062);
+    let farther_right_context = Uuid::from_u128(1063);
+    let mut close_vec = vec![0.0_f32; DIGEST_VECTOR_DIMENSION];
+    close_vec[0] = 0.99;
+    close_vec[1] = 0.01;
+    let mut far_vec = vec![0.0_f32; DIGEST_VECTOR_DIMENSION];
+    far_vec[0] = 0.5;
+    far_vec[1] = 0.5;
+    insert_digest(&db, close_other_context, ctx_b, close_vec);
+    insert_digest(&db, farther_right_context, ctx_a, far_vec);
+
+    let query = vec![1.0_f32, 0.0];
+    let result = db
+        .execute(
+            "SELECT id, context_id FROM digests ORDER BY embedding <=> $query LIMIT 2",
+            &params(vec![("query", Value::Vector(query))]),
+        )
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(
+        row_value(&result, 0, "id"),
+        &Value::Uuid(farther_right_context)
+    );
+    assert_eq!(row_value(&result, 0, "context_id"), &Value::Uuid(ctx_a));
+}
+
+#[test]
+fn test_initialize_schema_idempotent() {
+    let db = Database::open_memory();
+    initialize_schema(&db).unwrap();
+    initialize_schema(&db).unwrap();
+
+    insert_context(&db, Uuid::from_u128(1070), "project-alpha");
+    let result = db
+        .execute(
+            "SELECT * FROM contexts WHERE name = $name",
+            &params(vec![("name", Value::Text("project-alpha".into()))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+}
