@@ -1,25 +1,78 @@
-#![allow(clippy::too_many_arguments, clippy::new_without_default)]
+#![allow(clippy::too_many_arguments)]
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-pub type IntentionId = Uuid;
-pub type DecisionId = Uuid;
-pub type EntityId = Uuid;
-pub type ObservationId = Uuid;
-pub type OutcomeId = Uuid;
-pub type InvalidationId = Uuid;
-pub type SignatureId = Uuid;
-pub type DigestId = Uuid;
-pub type BlueprintId = Uuid;
-pub type ContextId = Uuid;
+macro_rules! id_newtype {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub struct $name(pub Uuid);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfidenceError;
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl From<Uuid> for $name {
+            fn from(value: Uuid) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<$name> for Uuid {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+
+id_newtype!(IntentionId);
+id_newtype!(DecisionId);
+id_newtype!(EntityId);
+id_newtype!(ObservationId);
+id_newtype!(OutcomeId);
+id_newtype!(InvalidationId);
+id_newtype!(SignatureId);
+id_newtype!(DigestId);
+id_newtype!(BlueprintId);
+id_newtype!(ContextId);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfidenceError {
+    pub value: f64,
+}
+
+impl fmt::Display for ConfidenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "confidence must be between 0.0 and 1.0 inclusive: {}",
+            self.value
+        )
+    }
+}
+
+impl Error for ConfidenceError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentionStatus {
@@ -30,7 +83,7 @@ pub enum IntentionStatus {
 }
 
 impl IntentionStatus {
-    pub const ALL: [Self; 3] = [Self::Active, Self::Superseded, Self::Archived];
+    pub const ALL: [Self; 4] = [Self::Active, Self::Paused, Self::Superseded, Self::Archived];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,7 +94,7 @@ pub enum DecisionStatus {
 }
 
 impl DecisionStatus {
-    pub const ALL: [Self; 2] = [Self::Active, Self::Superseded];
+    pub const ALL: [Self; 3] = [Self::Active, Self::Superseded, Self::Invalidated];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +106,12 @@ pub enum InvalidationStatus {
 }
 
 impl InvalidationStatus {
-    pub const ALL: [Self; 3] = [Self::Pending, Self::Acknowledged, Self::Dismissed];
+    pub const ALL: [Self; 4] = [
+        Self::Pending,
+        Self::Acknowledged,
+        Self::Dismissed,
+        Self::Resolved,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,7 +122,7 @@ pub enum Severity {
 }
 
 impl Severity {
-    pub const ALL: [Self; 2] = [Self::Warning, Self::Critical];
+    pub const ALL: [Self; 3] = [Self::Info, Self::Warning, Self::Critical];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +132,7 @@ pub enum SignatureStatus {
 }
 
 impl SignatureStatus {
-    pub const ALL: [Self; 1] = [Self::Active];
+    pub const ALL: [Self; 2] = [Self::Active, Self::Retired];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +142,7 @@ pub enum BlueprintStatus {
 }
 
 impl BlueprintStatus {
-    pub const ALL: [Self; 1] = [Self::Active];
+    pub const ALL: [Self; 2] = [Self::Active, Self::Deprecated];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,7 +154,7 @@ pub enum IntentionOrigin {
 }
 
 impl IntentionOrigin {
-    pub const ALL: [Self; 3] = [Self::Human, Self::Agent, Self::Signature];
+    pub const ALL: [Self; 4] = [Self::Human, Self::Agent, Self::Signature, Self::Blueprint];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +177,7 @@ pub enum RelationshipType {
 }
 
 impl RelationshipType {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 15] = [
         Self::Serves,
         Self::BasedOn,
         Self::About,
@@ -132,6 +190,9 @@ impl RelationshipType {
         Self::TriggeredBy,
         Self::MatchedBy,
         Self::Generated,
+        Self::ExtractedFrom,
+        Self::Instantiates,
+        Self::Refines,
     ];
 }
 
@@ -149,16 +210,11 @@ pub enum RelationshipEndpoint {
     Context(ContextId),
 }
 
-fn wrong_timestamp() -> DateTime<Utc> {
-    Utc.timestamp_opt(0, 0).single().expect("epoch is valid")
-}
-
-fn empty_map() -> HashMap<String, Value> {
-    HashMap::new()
-}
-
-fn empty_string_map() -> HashMap<String, String> {
-    HashMap::new()
+fn validate_confidence(value: f64) -> Result<f64, ConfidenceError> {
+    if !(0.0..=1.0).contains(&value) {
+        return Err(ConfidenceError { value });
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,18 +228,18 @@ pub struct ReasoningStep {
 
 impl ReasoningStep {
     pub fn new(
-        _operation: String,
-        _details: String,
-        _result: String,
-        _agent_id: Option<String>,
-        _timestamp: DateTime<Utc>,
+        operation: String,
+        details: String,
+        result: String,
+        agent_id: Option<String>,
+        timestamp: DateTime<Utc>,
     ) -> Self {
         Self {
-            operation: "stub-operation".into(),
-            details: "stub-details".into(),
-            result: "stub-result".into(),
-            agent_id: Some("stub-agent".into()),
-            timestamp: wrong_timestamp(),
+            operation,
+            details,
+            result,
+            agent_id,
+            timestamp,
         }
     }
 }
@@ -205,32 +261,31 @@ pub struct Intention {
 }
 
 impl Intention {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        _description: String,
-        _context_id: ContextId,
-        _origin: IntentionOrigin,
-        _origin_ref: Option<SignatureId>,
-        _blueprint_id: Option<BlueprintId>,
-        _bindings: Option<HashMap<String, Value>>,
-        _blueprint_proposal: Option<String>,
-        _properties: Option<HashMap<String, Value>>,
-        _tags: Option<Vec<String>>,
-        _created_at: DateTime<Utc>,
+        description: String,
+        context_id: ContextId,
+        origin: IntentionOrigin,
+        origin_ref: Option<SignatureId>,
+        blueprint_id: Option<BlueprintId>,
+        bindings: Option<HashMap<String, Value>>,
+        blueprint_proposal: Option<String>,
+        properties: Option<HashMap<String, Value>>,
+        tags: Option<Vec<String>>,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: Uuid::nil(),
-            description: "stub-intention".into(),
-            status: IntentionStatus::Archived,
-            context_id: Uuid::nil(),
-            origin: IntentionOrigin::Human,
-            origin_ref: Some(Uuid::nil()),
-            blueprint_id: Some(Uuid::nil()),
-            bindings: Some(empty_map()),
-            blueprint_proposal: Some("stub-blueprint".into()),
-            properties: Some(empty_map()),
-            tags: Some(vec!["stub".into()]),
-            created_at: wrong_timestamp(),
+            id: IntentionId::new(),
+            description,
+            status: IntentionStatus::Active,
+            context_id,
+            origin,
+            origin_ref,
+            blueprint_id,
+            bindings,
+            blueprint_proposal,
+            properties,
+            tags,
+            created_at,
         }
     }
 }
@@ -251,30 +306,31 @@ pub struct Decision {
 }
 
 impl Decision {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        _decision_type: String,
-        _description: String,
-        _reasoning: Option<Vec<ReasoningStep>>,
-        _confidence: Option<f64>,
-        _agent_id: Option<String>,
-        _context_id: ContextId,
-        _properties: Option<HashMap<String, Value>>,
-        _tags: Option<Vec<String>>,
-        _created_at: DateTime<Utc>,
+        decision_type: String,
+        description: String,
+        reasoning: Option<Vec<ReasoningStep>>,
+        confidence: Option<f64>,
+        agent_id: Option<String>,
+        context_id: ContextId,
+        properties: Option<HashMap<String, Value>>,
+        tags: Option<Vec<String>>,
+        created_at: DateTime<Utc>,
     ) -> Result<Self, ConfidenceError> {
+        let confidence = confidence.map(validate_confidence).transpose()?;
+
         Ok(Self {
-            id: Uuid::nil(),
-            decision_type: "stub-decision-type".into(),
-            description: "stub-decision".into(),
-            reasoning: Some(vec![]),
-            confidence: Some(0.123),
-            status: DecisionStatus::Superseded,
-            agent_id: Some("stub-agent".into()),
-            context_id: Uuid::nil(),
-            properties: Some(empty_map()),
-            tags: Some(vec!["stub".into()]),
-            created_at: wrong_timestamp(),
+            id: DecisionId::new(),
+            decision_type,
+            description,
+            reasoning,
+            confidence,
+            status: DecisionStatus::Active,
+            agent_id,
+            context_id,
+            properties,
+            tags,
+            created_at,
         })
     }
 }
@@ -291,19 +347,19 @@ pub struct Entity {
 
 impl Entity {
     pub fn new(
-        _entity_type: String,
-        _name: String,
-        _context_id: ContextId,
-        _properties: Option<HashMap<String, Value>>,
-        _created_at: DateTime<Utc>,
+        entity_type: String,
+        name: String,
+        context_id: ContextId,
+        properties: Option<HashMap<String, Value>>,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: Uuid::nil(),
-            entity_type: "stub-entity-type".into(),
-            name: "stub-entity".into(),
-            context_id: Uuid::nil(),
-            properties: Some(empty_map()),
-            created_at: wrong_timestamp(),
+            id: EntityId::new(),
+            entity_type,
+            name,
+            context_id,
+            properties,
+            created_at,
         }
     }
 }
@@ -321,21 +377,21 @@ pub struct Observation {
 
 impl Observation {
     pub fn new(
-        _observation_type: String,
-        _data: HashMap<String, Value>,
-        _source: String,
-        _entity_id: EntityId,
-        _context_id: ContextId,
-        _timestamp: DateTime<Utc>,
+        observation_type: String,
+        data: HashMap<String, Value>,
+        source: String,
+        entity_id: EntityId,
+        context_id: ContextId,
+        timestamp: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: Uuid::nil(),
-            observation_type: "stub-observation-type".into(),
-            data: empty_map(),
-            source: "stub-source".into(),
-            entity_id: Uuid::nil(),
-            context_id: Uuid::nil(),
-            timestamp: wrong_timestamp(),
+            id: ObservationId::new(),
+            observation_type,
+            data,
+            source,
+            entity_id,
+            context_id,
+            timestamp,
         }
     }
 }
@@ -351,17 +407,17 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn new(
-        _decision_id: DecisionId,
+        decision_id: DecisionId,
         success: bool,
-        _notes: Option<String>,
-        _recorded_at: DateTime<Utc>,
+        notes: Option<String>,
+        recorded_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: Uuid::nil(),
-            decision_id: Uuid::nil(),
-            success: !success,
-            notes: Some("stub-notes".into()),
-            recorded_at: wrong_timestamp(),
+            id: OutcomeId::new(),
+            decision_id,
+            success,
+            notes,
+            recorded_at,
         }
     }
 }
@@ -381,28 +437,27 @@ pub struct Invalidation {
 }
 
 impl Invalidation {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        _affected_decision_id: DecisionId,
-        _trigger_observation_id: ObservationId,
-        _basis_diff: HashMap<String, Value>,
-        _severity: Severity,
-        _resolved_at: Option<DateTime<Utc>>,
-        _resolution_action: Option<String>,
-        _resolution_decision_id: Option<DecisionId>,
-        _detected_at: DateTime<Utc>,
+        affected_decision_id: DecisionId,
+        trigger_observation_id: ObservationId,
+        basis_diff: HashMap<String, Value>,
+        severity: Severity,
+        resolved_at: Option<DateTime<Utc>>,
+        resolution_action: Option<String>,
+        resolution_decision_id: Option<DecisionId>,
+        detected_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: Uuid::nil(),
-            status: InvalidationStatus::Acknowledged,
-            affected_decision_id: Uuid::nil(),
-            trigger_observation_id: Uuid::nil(),
-            basis_diff: empty_map(),
-            severity: Severity::Info,
-            detected_at: wrong_timestamp(),
-            resolved_at: Some(wrong_timestamp()),
-            resolution_action: Some("stub-resolution".into()),
-            resolution_decision_id: Some(Uuid::nil()),
+            id: InvalidationId::new(),
+            status: InvalidationStatus::Pending,
+            affected_decision_id,
+            trigger_observation_id,
+            basis_diff,
+            severity,
+            detected_at,
+            resolved_at,
+            resolution_action,
+            resolution_decision_id,
         }
     }
 }
@@ -422,28 +477,29 @@ pub struct Signature {
 }
 
 impl Signature {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        _signature_type: String,
-        _description: String,
-        _match_criteria: HashMap<String, Value>,
-        _scope_labels: HashMap<String, String>,
+        signature_type: String,
+        description: String,
+        match_criteria: HashMap<String, Value>,
+        scope_labels: HashMap<String, String>,
         confidence: f64,
-        _origin_context_ids: Option<Vec<ContextId>>,
-        _last_matched_at: Option<DateTime<Utc>>,
-        _created_at: DateTime<Utc>,
+        origin_context_ids: Option<Vec<ContextId>>,
+        last_matched_at: Option<DateTime<Utc>>,
+        created_at: DateTime<Utc>,
     ) -> Result<Self, ConfidenceError> {
+        let confidence = validate_confidence(confidence)?;
+
         Ok(Self {
-            id: Uuid::nil(),
-            signature_type: "stub-signature-type".into(),
-            description: "stub-signature".into(),
-            match_criteria: empty_map(),
-            scope_labels: empty_string_map(),
-            confidence: confidence + 0.123,
-            origin_context_ids: Some(vec![]),
-            status: SignatureStatus::Retired,
-            created_at: wrong_timestamp(),
-            last_matched_at: Some(wrong_timestamp()),
+            id: SignatureId::new(),
+            signature_type,
+            description,
+            match_criteria,
+            scope_labels,
+            confidence,
+            origin_context_ids,
+            status: SignatureStatus::Active,
+            created_at,
+            last_matched_at,
         })
     }
 }
@@ -462,23 +518,23 @@ pub struct Digest {
 
 impl Digest {
     pub fn new(
-        _source: String,
-        _session_ref: Option<String>,
-        _summary: String,
-        _embedding: Vec<f32>,
-        _context_id: ContextId,
-        _properties: Option<HashMap<String, Value>>,
-        _created_at: DateTime<Utc>,
+        source: String,
+        session_ref: Option<String>,
+        summary: String,
+        embedding: Vec<f32>,
+        context_id: ContextId,
+        properties: Option<HashMap<String, Value>>,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: Uuid::nil(),
-            source: "stub-source".into(),
-            session_ref: Some("stub-session".into()),
-            summary: "stub-summary".into(),
-            embedding: vec![],
-            context_id: Uuid::nil(),
-            properties: Some(empty_map()),
-            created_at: wrong_timestamp(),
+            id: DigestId::new(),
+            source,
+            session_ref,
+            summary,
+            embedding,
+            context_id,
+            properties,
+            created_at,
         }
     }
 }
@@ -497,26 +553,25 @@ pub struct Blueprint {
 }
 
 impl Blueprint {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        _canonical_description: String,
-        _category: String,
-        _slots: HashMap<String, Value>,
-        _default_config_shape: Option<HashMap<String, Value>>,
-        _version: String,
-        _updated_at: Option<DateTime<Utc>>,
-        _created_at: DateTime<Utc>,
+        canonical_description: String,
+        category: String,
+        slots: HashMap<String, Value>,
+        default_config_shape: Option<HashMap<String, Value>>,
+        version: String,
+        updated_at: Option<DateTime<Utc>>,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: Uuid::nil(),
-            canonical_description: "stub-blueprint".into(),
-            category: "stub-category".into(),
-            slots: empty_map(),
-            default_config_shape: Some(empty_map()),
-            version: "0.0.0-stub".into(),
-            status: BlueprintStatus::Deprecated,
-            created_at: wrong_timestamp(),
-            updated_at: Some(wrong_timestamp()),
+            id: BlueprintId::new(),
+            canonical_description,
+            category,
+            slots,
+            default_config_shape,
+            version,
+            status: BlueprintStatus::Active,
+            created_at,
+            updated_at,
         }
     }
 }
@@ -532,17 +587,17 @@ pub struct Context {
 
 impl Context {
     pub fn new(
-        _name: String,
-        _labels: Option<HashMap<String, String>>,
-        _properties: Option<HashMap<String, Value>>,
-        _created_at: DateTime<Utc>,
+        name: String,
+        labels: Option<HashMap<String, String>>,
+        properties: Option<HashMap<String, Value>>,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            id: Uuid::nil(),
-            name: "stub-context".into(),
-            labels: Some(empty_string_map()),
-            properties: Some(empty_map()),
-            created_at: wrong_timestamp(),
+            id: ContextId::new(),
+            name,
+            labels,
+            properties,
+            created_at,
         }
     }
 }
@@ -558,18 +613,18 @@ pub struct Relationship {
 
 impl Relationship {
     pub fn new(
-        _source: RelationshipEndpoint,
-        _target: RelationshipEndpoint,
-        _relationship_type: RelationshipType,
-        _valid_from: DateTime<Utc>,
-        _valid_to: Option<DateTime<Utc>>,
+        source: RelationshipEndpoint,
+        target: RelationshipEndpoint,
+        relationship_type: RelationshipType,
+        valid_from: DateTime<Utc>,
+        valid_to: Option<DateTime<Utc>>,
     ) -> Self {
         Self {
-            source: RelationshipEndpoint::Context(Uuid::nil()),
-            target: RelationshipEndpoint::Context(Uuid::nil()),
-            relationship_type: RelationshipType::RelatesTo,
-            valid_from: wrong_timestamp(),
-            valid_to: Some(wrong_timestamp()),
+            source,
+            target,
+            relationship_type,
+            valid_from,
+            valid_to,
         }
     }
 }
