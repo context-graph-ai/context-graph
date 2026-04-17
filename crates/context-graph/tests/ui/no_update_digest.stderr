@@ -1,0 +1,8 @@
+error[E0599]: no method named `update_digest` found for struct `Store` in the current scope
+ --> $DIR/no_update_digest.rs:5:19
+  |
+5 |     let _ = store.update_digest();
+  |                   ^^^^^^^^^^^^^
+  |
+help: there is a method `create_digest` with a similar name, but with different arguments
+ --> src/lib.rs:624:4

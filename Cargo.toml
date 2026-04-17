@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cg-core", "cg-schema"]
+members = ["cg-core", "cg-schema", "crates/context-graph"]
 
 [workspace.package]
 version = "0.1.0"
