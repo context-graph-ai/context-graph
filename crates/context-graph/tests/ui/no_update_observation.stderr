@@ -1,11 +1,11 @@
 error[E0599]: no method named `update_observation` found for struct `Store` in the current scope
- --> $DIR/no_update_observation.rs:5:19
+ --> tests/ui/no_update_observation.rs:6:19
   |
-5 |     let _ = store.update_observation(ObservationId::new_v7());
+6 |     let _ = store.update_observation(ObservationId::new_v7());
   |                   ^^^^^^^^^^^^^^^^^^
   |
 help: there is a method `get_observation` with a similar name
   |
-5 -     let _ = store.update_observation(ObservationId::new_v7());
-5 +     let _ = store.get_observation(ObservationId::new_v7());
+6 -     let _ = store.update_observation(ObservationId::new_v7());
+6 +     let _ = store.get_observation(ObservationId::new_v7());
   |

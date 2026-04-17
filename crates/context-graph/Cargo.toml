@@ -4,8 +4,8 @@ version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Acceptance-test scaffold for context-graph CRUD surfaces"
-edition = "2021"
+description = "Agentic memory graph — Intention-centric ontology, contextdb-backed"
+edition = "2024"
 
 [lib]
 name = "context_graph"
@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 chrono = { workspace = true, features = ["serde"] }
+contextdb-core.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
@@ -20,3 +21,4 @@ uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 [dev-dependencies]
 tempfile = "3.23.0"
 trybuild = "1.0.112"
+contextdb-engine.workspace = true

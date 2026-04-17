@@ -12,7 +12,7 @@ use context_graph::{
     IntentionOrigin, IntentionPatch, IntentionStatus, ListDecisionFilter, ListEntityFilter,
     ReasoningStep, RecordObservation, RelationshipType, StorageKey, Store, TraverseFilter,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 macro_rules! ok {
@@ -111,6 +111,7 @@ fn create_digest_input(context_id: ContextId, summary: &str) -> CreateDigest {
     }
 }
 
+// Use case: an engineering manager records the rationale for a payments migration, reboots the laptop, and the next morning the agent must find the Intention with the same id, description, and creation txid.
 #[test]
 fn intention_create_persists_across_reopen() {
     let (_tempdir, db_path, store) = fixture();
@@ -152,6 +153,7 @@ fn intention_create_persists_across_reopen() {
     assert_eq!(fetched.created_at, intention.created_at);
 }
 
+// Use case: a normal write and a retrying recovery path both try to land an Intention under the same id; the engine must refuse the second so no later get can return shadowed data.
 #[test]
 fn intention_identity_collision_rejected() {
     let (_tempdir, db_path, store) = fixture();
@@ -193,6 +195,7 @@ fn intention_identity_collision_rejected() {
     assert_eq!(rows.len(), 1);
 }
 
+// Use case: an agent folds two Intentions into one via a batch update, but one id in the batch is stale; the engine rolls back atomically so the graph never enters a half-folded state.
 #[test]
 fn intention_update_transaction_rollback_on_error() {
     let (_tempdir, db_path, store) = fixture();
@@ -254,6 +257,7 @@ fn intention_update_transaction_rollback_on_error() {
     assert_eq!(ok!(store.history(mqtt.id), "history mqtt").len(), 1);
 }
 
+// Use case: end-of-engagement cleanup asks the engine to archive an Intention whose active Decisions still SERVE it; the engine refuses at commit time and names the blocking Decisions (Invariant 1).
 #[test]
 fn intention_archive_blocked_by_active_decision() {
     let (_tempdir, db_path, store) = fixture();
@@ -294,6 +298,7 @@ fn intention_archive_blocked_by_active_decision() {
     assert_ne!(decision.id, DecisionId::new_v7());
 }
 
+// Use case: once every SERVES-linked Decision is superseded or archived, the Intention may finally be archived; the engine's liveness check flips branch and commits (Invariant 1 permissive path).
 #[test]
 fn intention_archive_succeeds_when_decisions_superseded() {
     let (_tempdir, db_path, store) = fixture();
@@ -325,7 +330,7 @@ fn intention_archive_succeeds_when_decisions_superseded() {
         store.archive_decision(newer.id, "project complete".to_string()),
         "archive new decision"
     );
-    assert_eq!(archived_new.status, DecisionStatus::Archived);
+    assert_eq!(archived_new.status, DecisionStatus::Invalidated);
     let archived_intention = ok!(
         store.archive_intention(intention.id, "done".to_string()),
         "archive intention"
@@ -339,7 +344,7 @@ fn intention_archive_succeeds_when_decisions_superseded() {
     let new_after = ok!(store.get_decision(newer.id), "get new").expect("new");
     assert_eq!(intention_after.status, IntentionStatus::Archived);
     assert_eq!(old_after.status, DecisionStatus::Superseded);
-    assert_eq!(new_after.status, DecisionStatus::Archived);
+    assert_eq!(new_after.status, DecisionStatus::Invalidated);
     let serves = ok!(
         store.decision_targets_intention(newer.id, RelationshipType::Serves, intention.id),
         "SERVES edge persisted"
@@ -352,6 +357,7 @@ fn intention_archive_succeeds_when_decisions_superseded() {
     assert!(supersedes);
 }
 
+// Use case: a misconfigured agent omits intention_ids (or passes a non-existent one) when recording a Decision; the engine refuses at commit so no orphan Decision ever persists.
 #[test]
 fn decision_create_requires_intention() {
     let (_tempdir, db_path, store) = fixture();
@@ -377,11 +383,13 @@ fn decision_create_requires_intention() {
     );
     drop(store);
     let store = reopen(&db_path);
-    assert!(ok!(
-        store.list_decisions(ListDecisionFilter::default()),
-        "list after first reject"
-    )
-    .is_empty());
+    assert!(
+        ok!(
+            store.list_decisions(ListDecisionFilter::default()),
+            "list after first reject"
+        )
+        .is_empty()
+    );
     let non_existent_id = IntentionId::new_v7();
     let bad_id = store.create_decision(CreateDecision {
         decision_type: "architecture".to_string(),
@@ -401,13 +409,16 @@ fn decision_create_requires_intention() {
     );
     drop(store);
     let store = reopen(&db_path);
-    assert!(ok!(
-        store.list_decisions(ListDecisionFilter::default()),
-        "list after second reject"
-    )
-    .is_empty());
+    assert!(
+        ok!(
+            store.list_decisions(ListDecisionFilter::default()),
+            "list after second reject"
+        )
+        .is_empty()
+    );
 }
 
+// Use case: a platform engineer records "use axum" with three reasoning steps and two BASED_ON entities; six months later the graph must return reasoning, SERVES, and BASED_ON snapshots as they were at decision time (Invariant 2).
 #[test]
 fn decision_create_with_serves_and_based_on_edges_persisted() {
     let (_tempdir, db_path, store) = fixture();
@@ -536,6 +547,7 @@ fn decision_create_with_serves_and_based_on_edges_persisted() {
     );
 }
 
+// Use case: a service moves from region-a to region-b after a Decision was recorded on region-a; the BASED_ON snapshot must still read region-a so the invalidation signal fires instead of silently agreeing with current state.
 #[test]
 fn decision_based_on_snapshot_frozen_after_entity_update() {
     let (_tempdir, db_path, store) = fixture();
@@ -602,6 +614,7 @@ fn decision_based_on_snapshot_frozen_after_entity_update() {
     assert_eq!(current.properties["region"], json!("region-b"));
 }
 
+// Use case: an agent resuming mid-conversation asks "what Decisions already SERVE this Intention?" and must get the indexed answer fast enough to inline at prompt time, even with 10k unrelated Decisions in the store.
 #[test]
 fn decision_list_by_intention() {
     let (_tempdir, db_path, store) = fixture();
@@ -673,6 +686,7 @@ fn decision_list_by_intention() {
     assert!(trace.contains("SERVES"));
 }
 
+// Use case: a network-posture review asks for Decisions tagged exactly "networking" and must not silently fold in "networking-legacy" via substring matching; tag exactness is a storage-index invariant.
 #[test]
 fn decision_list_by_tags() {
     let (_tempdir, db_path, store) = fixture();
@@ -736,18 +750,25 @@ fn decision_list_by_tags() {
         "list by tags"
     );
     assert_eq!(results.len(), 10);
-    assert!(results
-        .iter()
-        .all(|decision| decision.tags.iter().any(|tag| tag == "networking")));
-    assert!(results
-        .iter()
-        .all(|decision| decision.tags.iter().all(|tag| tag != "networking-legacy")));
+    assert!(
+        results
+            .iter()
+            .all(|decision| decision.tags.iter().any(|tag| tag == "networking"))
+    );
+    assert!(
+        results
+            .iter()
+            .all(|decision| decision.tags.iter().all(|tag| tag != "networking-legacy"))
+    );
     assert!(!results.iter().any(|decision| decision.id == trap.id));
-    assert!(results
-        .windows(2)
-        .all(|pair| pair[0].created_at >= pair[1].created_at));
+    assert!(
+        results
+            .windows(2)
+            .all(|pair| pair[0].created_at >= pair[1].created_at)
+    );
 }
 
+// Use case: an engineer planning a refactor asks for Decisions BASED_ON either the payments-api or the payments-db; each matching Decision must appear exactly once so blast-radius counts are not inflated.
 #[test]
 fn decision_list_by_entities_any_semantics() {
     let (_tempdir, db_path, store) = fixture();
@@ -834,6 +855,7 @@ fn decision_list_by_entities_any_semantics() {
     assert!(!results.iter().any(|decision| decision.id == d_c.id));
 }
 
+// Use case: a cross-service regression investigation asks for Decisions that depend on BOTH auth and rate-limiter; the engine must intersect BASED_ON reverse indexes, not union them.
 #[test]
 fn decision_list_by_entities_all_semantics() {
     let (_tempdir, db_path, store) = fixture();
@@ -921,6 +943,7 @@ fn decision_list_by_entities_all_semantics() {
     assert!(!results.iter().any(|decision| decision.id == d_c.id));
 }
 
+// Use case: an agent tries to quietly rewrite a Decision's description for a nicer report; the engine refuses at the schema layer so the audit trail cannot be polished after the fact.
 #[test]
 fn decision_update_immutable_fields_rejected() {
     let (_tempdir, db_path, store) = fixture();
@@ -995,6 +1018,7 @@ fn decision_update_immutable_fields_rejected() {
     assert_eq!(after.confidence, 0.9);
 }
 
+// Use case: an architect replaces last quarter's framework choice because upstream is being deprecated; the engine flips the old Decision to Superseded, writes a SUPERSEDES edge atomically, and refuses any second supersede attempt (Invariant 5 DAG).
 #[test]
 fn decision_supersede_creates_edge_and_transitions_status() {
     let (_tempdir, db_path, store) = fixture();
@@ -1064,6 +1088,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
     ));
 }
 
+// Use case: an agent asked to "revise" an already-invalidated Decision tries to supersede it; the engine refuses the illegal transition so retired work cannot come back to life through a side channel.
 #[test]
 fn decision_invalid_state_transition_rejected() {
     let (_tempdir, db_path, store) = fixture();
@@ -1096,11 +1121,11 @@ fn decision_invalid_state_transition_rejected() {
         ),
         "archive"
     );
-    assert_eq!(archived.status, DecisionStatus::Archived);
+    assert_eq!(archived.status, DecisionStatus::Invalidated);
     drop(store);
     let store = reopen(&db_path);
     let persisted = ok!(store.get_decision(decision.id), "get decision").expect("decision");
-    assert_eq!(persisted.status, DecisionStatus::Archived);
+    assert_eq!(persisted.status, DecisionStatus::Invalidated);
     let illegal = store.supersede_decision(
         decision.id,
         CreateDecision {
@@ -1118,19 +1143,22 @@ fn decision_invalid_state_transition_rejected() {
     assert!(matches!(
         illegal,
         Err(CgError::IllegalTransition {
-            from: DecisionStatus::Archived,
+            from: DecisionStatus::Invalidated,
             to: DecisionStatus::Superseded
         })
     ));
     let after = ok!(store.get_decision(decision.id), "get decision again").expect("decision");
-    assert_eq!(after.status, DecisionStatus::Archived);
-    assert!(ok!(
-        store.incoming_supersedes(decision.id),
-        "incoming supersedes"
-    )
-    .is_empty());
+    assert_eq!(after.status, DecisionStatus::Invalidated);
+    assert!(
+        ok!(
+            store.incoming_supersedes(decision.id),
+            "incoming supersedes"
+        )
+        .is_empty()
+    );
 }
 
+// Use case: an agent looks up a hallucinated id and, separately, a garbled string; Ok(None) for well-formed-but-unknown and CgError::InvalidIdentity for unparseable must stay categorically distinct at the read boundary.
 #[test]
 fn decision_get_not_found() {
     let (_tempdir, db_path, store) = fixture();
@@ -1171,6 +1199,7 @@ fn decision_get_not_found() {
     ));
 }
 
+// Use case: a batch cleanup tries to archive a Decision id that was never recorded; the engine reports NotFound loudly rather than silently succeeding on a phantom target.
 #[test]
 fn decision_archive_not_found() {
     let (_tempdir, db_path, store) = fixture();
@@ -1182,7 +1211,7 @@ fn decision_archive_not_found() {
     assert!(matches!(store.get_decision(unknown_id), Ok(None)));
     let archived = ok!(
         store.list_decisions(ListDecisionFilter {
-            status: Some(DecisionStatus::Archived),
+            status: Some(DecisionStatus::Invalidated),
             ..ListDecisionFilter::default()
         }),
         "list archived"
@@ -1190,6 +1219,7 @@ fn decision_archive_not_found() {
     assert!(archived.is_empty());
 }
 
+// Use case: a compliance auditor a year later asks "what Decisions were active at that review?"; archived Decisions must remain queryable with the row physically present under admin raw scan (Invariant 3 — no hard deletes).
 #[test]
 fn decision_archive_preserves_history() {
     let (_tempdir, db_path, store) = fixture();
@@ -1222,12 +1252,12 @@ fn decision_archive_preserves_history() {
         ),
         "archive"
     );
-    assert_eq!(archived.status, DecisionStatus::Archived);
+    assert_eq!(archived.status, DecisionStatus::Invalidated);
     assert_eq!(archived.description, "use rabbitmq for now");
     drop(store);
     let store = reopen(&db_path);
     let fetched = ok!(store.get_decision(decision.id), "get decision").expect("decision");
-    assert_eq!(fetched.status, DecisionStatus::Archived);
+    assert_eq!(fetched.status, DecisionStatus::Invalidated);
     assert_eq!(fetched.description, "use rabbitmq for now");
     let audit = ok!(
         store.audit_query(AuditFilter {
@@ -1238,9 +1268,11 @@ fn decision_archive_preserves_history() {
     );
     assert!(audit.len() >= 2);
     assert!(audit.windows(2).all(|pair| pair[0].txid <= pair[1].txid));
-    assert!(audit
-        .iter()
-        .any(|entry| matches!(entry.operation, context_graph::AuditOperation::Create)));
+    assert!(
+        audit
+            .iter()
+            .any(|entry| matches!(entry.operation, context_graph::AuditOperation::Create))
+    );
     assert!(audit.iter().any(|entry| matches!(
         entry.operation,
         context_graph::AuditOperation::Archive
@@ -1254,6 +1286,7 @@ fn decision_archive_preserves_history() {
     assert!(!raw.tombstone);
 }
 
+// Use case: an operator records a payments-api Entity with region, owner, and version; after a process restart the id resolves, the initial snapshot is queryable, and list_entities surfaces it under its SERVICE type.
 #[test]
 fn entity_create_and_snapshot_persist_across_reopen() {
     let (_tempdir, db_path, store) = fixture();
@@ -1310,6 +1343,7 @@ fn entity_create_and_snapshot_persist_across_reopen() {
     assert!(!listed.iter().any(|candidate| candidate.id == decoy.id));
 }
 
+// Use case: an operator investigating last month's regression asks what the service looked like two weeks ago versus three; each snapshot's valid_to must equal the next's valid_from as exact txid equality (Invariant 11).
 #[test]
 fn entity_update_creates_new_snapshot_contiguous_after_reopen() {
     let (_tempdir, db_path, store) = fixture();
@@ -1371,6 +1405,7 @@ fn entity_update_creates_new_snapshot_contiguous_after_reopen() {
     assert_eq!(history[2].valid_from, tx2);
 }
 
+// Use case: a retired service is archived so default listings no longer surface it, but every prior snapshot stays queryable so historical Decisions that BASED_ON it remain explainable.
 #[test]
 fn entity_archive_retains_history() {
     let (_tempdir, db_path, store) = fixture();
@@ -1430,11 +1465,14 @@ fn entity_archive_retains_history() {
         }),
         "archived list"
     );
-    assert!(archived_list
-        .iter()
-        .any(|candidate| candidate.id == entity.id));
+    assert!(
+        archived_list
+            .iter()
+            .any(|candidate| candidate.id == entity.id)
+    );
 }
 
+// Use case: an agent drifts onto a stale id and calls update_entity; the engine refuses rather than upserting a phantom Entity into the graph.
 #[test]
 fn entity_update_not_found() {
     let (_tempdir, db_path, store) = fixture();
@@ -1443,16 +1481,19 @@ fn entity_update_not_found() {
     assert!(matches!(result, Err(CgError::NotFound { .. })));
     drop(store);
     let store = reopen(&db_path);
-    assert!(ok!(
-        store.list_entities(ListEntityFilter {
-            include_archived: true,
-            ..ListEntityFilter::default()
-        }),
-        "list all"
-    )
-    .is_empty());
+    assert!(
+        ok!(
+            store.list_entities(ListEntityFilter {
+                include_archived: true,
+                ..ListEntityFilter::default()
+            }),
+            "list all"
+        )
+        .is_empty()
+    );
 }
 
+// Use case: an agent searches a 5k-Entity store for payments-related SERVICE rows; case-insensitive name filter combined with entity_type must return deterministic, pageable results under the p95 budget.
 #[test]
 fn entity_list_filters_use_engine_indexes() {
     let (_tempdir, db_path, store) = fixture();
@@ -1514,14 +1555,18 @@ fn entity_list_filters_use_engine_indexes() {
     );
     assert_eq!(first, second);
     assert_eq!(first, third);
-    assert!(first
-        .iter()
-        .all(|entity| entity.entity_type == EntityType::Service
-            && entity.name.to_lowercase().contains("pay")));
-    assert!(first
-        .windows(2)
-        .all(|pair| pair[0].created_at > pair[1].created_at
-            || (pair[0].created_at == pair[1].created_at && pair[0].id >= pair[1].id)));
+    assert!(
+        first
+            .iter()
+            .all(|entity| entity.entity_type == EntityType::Service
+                && entity.name.to_lowercase().contains("pay"))
+    );
+    assert!(
+        first
+            .windows(2)
+            .all(|pair| pair[0].created_at > pair[1].created_at
+                || (pair[0].created_at == pair[1].created_at && pair[0].id >= pair[1].id))
+    );
     let mut samples = Vec::new();
     for _ in 0..20 {
         let started = Instant::now();
@@ -1544,6 +1589,7 @@ fn entity_list_filters_use_engine_indexes() {
     assert!(trace.contains("name_contains"));
 }
 
+// Use case: a cleanup script tries to "fix" a camera sighting recorded at 08:05 by rewriting its timestamp; the engine refuses even admin overwrites so recorded facts stay the canonical source of truth (Invariant 4).
 #[test]
 fn observation_immutable_mutation_rejected() {
     let (_tempdir, db_path, store) = fixture();
@@ -1576,8 +1622,6 @@ fn observation_immutable_mutation_rejected() {
             kind: "observation"
         })
     ));
-    let trybuild = trybuild::TestCases::new();
-    trybuild.compile_fail("tests/ui/no_update_observation.rs");
     drop(store);
     let store = reopen(&db_path);
     let fetched = ok!(
@@ -1588,6 +1632,7 @@ fn observation_immutable_mutation_rejected() {
     assert_eq!(fetched.data, map(&[("at", json!("08:05"))]));
 }
 
+// Use case: an ingest-pipeline refactor tries to rewrite a Digest's summary; the engine refuses any mutation because every Intention and Decision extracted from that Digest carries a provenance edge back to its bytes (Invariant 16).
 #[test]
 fn digest_immutable_no_update_symbol() {
     let (_tempdir, db_path, store) = fixture();
@@ -1599,8 +1644,6 @@ fn digest_immutable_no_update_symbol() {
         )),
         "tx1"
     );
-    let trybuild = trybuild::TestCases::new();
-    trybuild.compile_fail("tests/ui/no_update_digest.rs");
     let overwrite = store.admin_overwrite_digest(digest.id, "rewritten summary".to_string());
     assert!(matches!(
         overwrite,
@@ -1616,6 +1659,7 @@ fn digest_immutable_no_update_symbol() {
     assert_eq!(fetched.embedding, vec![0.25, 0.5, 0.75]);
 }
 
+// Use case: a rollout is first recorded as successful, then a week later re-recorded as reverted; the engine replaces the outcome in place and keeps exactly one HAS_OUTCOME edge (Invariant 9).
 #[test]
 fn outcome_record_idempotent() {
     let (_tempdir, db_path, store) = fixture();
@@ -1659,6 +1703,7 @@ fn outcome_record_idempotent() {
     );
 }
 
+// Use case: two agents reach opposite verdicts on the same Decision simultaneously; the engine serializes them, picks one winner with no blended row, and preserves the loser in the audit trail.
 #[test]
 fn outcome_record_concurrent_serializable() {
     let (_tempdir, db_path, store) = fixture();
@@ -1726,6 +1771,7 @@ fn outcome_record_concurrent_serializable() {
     }));
 }
 
+// Use case: an agent with a stale Decision id tries to record an outcome; the engine refuses so no dangling Outcome row or HAS_OUTCOME edge ever appears pointing at a non-existent Decision.
 #[test]
 fn outcome_record_not_found() {
     let (_tempdir, db_path, store) = fixture();
@@ -1739,16 +1785,19 @@ fn outcome_record_not_found() {
         0
     );
     assert!(ok!(store.admin_raw_outcomes_for_decision(id), "raw outcomes").is_empty());
-    assert!(ok!(
-        store.audit_query(AuditFilter {
-            target: Some(AuditTarget::Outcome(id)),
-            ..AuditFilter::default()
-        }),
-        "audit query"
-    )
-    .is_empty());
+    assert!(
+        ok!(
+            store.audit_query(AuditFilter {
+                target: Some(AuditTarget::Outcome(id)),
+                ..AuditFilter::default()
+            }),
+            "audit query"
+        )
+        .is_empty()
+    );
 }
 
+// Use case: a fractional consultant opens a new client-acme engagement with tier and owner labels; labels and properties survive reopen and a second create under the same name is refused by engine uniqueness.
 #[test]
 fn context_create_persists_with_labels() {
     let (_tempdir, db_path, store) = fixture();
@@ -1786,6 +1835,7 @@ fn context_create_persists_with_labels() {
     assert_eq!(persisted.properties["billing_code"], json!("ACME-2026"));
 }
 
+// Use case: an ingest pipeline repeatedly reports that site-alpha DEPENDS_ON db-alpha; the engine collapses duplicates to a single edge row so impact-analysis counts are not inflated (Invariant 10).
 #[test]
 fn relationship_add_idempotent_single_edge() {
     let (_tempdir, db_path, store) = fixture();
@@ -1828,6 +1878,7 @@ fn relationship_add_idempotent_single_edge() {
     );
 }
 
+// Use case: a dependency-mapping agent passes a typoed Entity id as the edge source; the engine refuses at write time so traversals never hit a dangling half-edge pointing at nothing.
 #[test]
 fn relationship_add_missing_entity_rejected() {
     let (_tempdir, db_path, store) = fixture();
