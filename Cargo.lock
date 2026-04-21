@@ -136,9 +136,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "2.11.0"
+version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
+checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "block-buffer"
@@ -241,9 +241,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-core"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a3610f43c8df08e3a978384d81478143618e3bf5816fb1a3607a3b075e7ff5e"
+checksum = "c5499282acd179407332a4bf2a7bdf92c68985b1071496d34b139bfdaadd87a6"
 dependencies = [
  "roaring",
  "serde",
@@ -254,9 +254,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-engine"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9954577116ba3c9b84b4fc64f8108fa95e83a63c3f14cc231c062a47d08f0181"
+checksum = "4fa037a071db21ae5cb3fdce6f2e1604ce0ce154cc04a1f40d8a44199a09a9be"
 dependencies = [
  "bincode 2.0.1",
  "contextdb-core",
@@ -272,6 +272,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "smallvec",
  "time",
  "tracing",
  "uuid",
@@ -279,9 +280,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-graph"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7311b1c812b628d85b15ad9bbfaee71f5a57addb17ca3460a5f9e59193ef1a14"
+checksum = "d1ceb0363658bd71d77f20e7f7add04a60826d9c8c93605f49d88ed76ba60703"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -291,9 +292,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-parser"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd93296be3d50ed5e2caa4b1a1fc217e9c567a4f64c87f0e90ca3a42296c30d2"
+checksum = "237d5d9a9907087c39970354812cc2f2c8e34d838bd42f6fb815b6981a463b19"
 dependencies = [
  "contextdb-core",
  "pest",
@@ -302,9 +303,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-planner"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "865172d19c4c95d31b62701d188734c321f90313d516fed0b72ea7751195ac4a"
+checksum = "3c68a517b67df8a8eb09fbd4c3388d2032f4a2f7c4811a06b5bbcaadbd4a2fad"
 dependencies = [
  "contextdb-core",
  "contextdb-parser",
@@ -312,9 +313,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-relational"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddb4740c29a1cf17fa5884e545509fcadd5093c5d20ecfb213938ccb50a01f2e"
+checksum = "17efc339943335080a115b3e8aa8e137f0f800b6c218b04076068ffcce7ff65c"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -324,9 +325,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-tx"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f369b7556724269750933aa0430f55eed117daafba7a890d3983d7f219f011ca"
+checksum = "c6658eee6fae3cf2bee40fd4ddee1fd7e2fa666a455d5df220f16e38ee1540ad"
 dependencies = [
  "contextdb-core",
  "parking_lot",
@@ -334,9 +335,9 @@ dependencies = [
 
 [[package]]
 name = "contextdb-vector"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b83559a7bdc8ab77f8c9432eafba881bf61acefe6913214f6a7af845149fa94c"
+checksum = "2acad0b407d053a893ef9d4a99fca2748cb627eb4504d0cf476df0a2fb1914e1"
 dependencies = [
  "anndists",
  "contextdb-core",
@@ -697,9 +698,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.184"
+version = "0.2.185"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
+checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
 name = "linux-raw-sys"
@@ -883,9 +884,9 @@ checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "portable-atomic-util"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "091397be61a01d4be58e7841595bd4bfedb15f1cd54977d79b8271e94ed799a3"
+checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
 dependencies = [
  "portable-atomic",
 ]
@@ -947,9 +948,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166"
+checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
  "rand_chacha",
  "rand_core",
@@ -976,9 +977,9 @@ dependencies = [
 
 [[package]]
 name = "rayon"
-version = "1.11.0"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "368f01d005bf8fd9b1206fb6fa653e6c4a81ceb1466406b81792d87c5677a58f"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
 dependencies = [
  "either",
  "rayon-core",
@@ -1396,9 +1397,9 @@ dependencies = [
 
 [[package]]
 name = "typenum"
-version = "1.19.0"
+version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
+checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
 name = "ucd-trie"
@@ -1432,9 +1433,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.23.0"
+version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ac8b6f42ead25368cf5b098aeb3dc8a1a2c05a3eee8a9a1a68c640edbfc79d9"
+checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -1466,11 +1467,11 @@ dependencies = [
 
 [[package]]
 name = "wasip2"
-version = "1.0.2+wasi-0.2.9"
+version = "1.0.3+wasi-0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9517f9239f02c069db75e65f174b3da828fe5f5b945c4dd26bd25d89c03ebcf5"
+checksum = "20064672db26d7cdc89c7798c48a0fdfac8213434a1186e5ef29fd560ae223d6"
 dependencies = [
- "wit-bindgen",
+ "wit-bindgen 0.57.1",
 ]
 
 [[package]]
@@ -1479,7 +1480,7 @@ version = "0.4.0+wasi-0.3.0-rc-2026-01-06"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5428f8bf88ea5ddc08faddef2ac4a67e390b88186c703ce6dbd955e1c145aca5"
 dependencies = [
- "wit-bindgen",
+ "wit-bindgen 0.51.0",
 ]
 
 [[package]]
@@ -1734,9 +1735,9 @@ checksum = "ed94fce61571a4006852b7389a063ab983c02eb1bb37b47f8272ce92d06d9538"
 
 [[package]]
 name = "winnow"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
+checksum = "2ee1708bef14716a11bae175f579062d4554d95be2c6829f518df847b7b3fdd0"
 
 [[package]]
 name = "wit-bindgen"
@@ -1746,6 +1747,12 @@ checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 dependencies = [
  "wit-bindgen-rust-macro",
 ]
+
+[[package]]
+name = "wit-bindgen"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wit-bindgen-core"

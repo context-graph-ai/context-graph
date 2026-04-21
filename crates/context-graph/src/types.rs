@@ -84,6 +84,7 @@ id_type!(EntityId);
 id_type!(ObservationId);
 id_type!(OutcomeId);
 id_type!(DigestId);
+id_type!(AuditId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum IntentionStatus {
@@ -116,11 +117,11 @@ pub enum DecisionStatus {
     #[default]
     Active,
     Superseded,
-    Invalidated,
+    Archived,
 }
 
 impl DecisionStatus {
-    pub const ALL: [Self; 3] = [Self::Active, Self::Superseded, Self::Invalidated];
+    pub const ALL: [Self; 3] = [Self::Active, Self::Superseded, Self::Archived];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -188,15 +189,37 @@ pub enum RelationshipType {
     Supersedes,
     HasOutcome,
     DependsOn,
+    Cites,
+    About,
+    RelatesTo,
+    ObservedOn,
+    Invalidates,
+    TriggeredBy,
+    ExtractedFrom,
+    MatchedBy,
+    Generated,
+    Instantiates,
+    Refines,
 }
 
 impl RelationshipType {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 16] = [
         Self::Serves,
         Self::BasedOn,
         Self::Supersedes,
         Self::HasOutcome,
         Self::DependsOn,
+        Self::Cites,
+        Self::About,
+        Self::RelatesTo,
+        Self::ObservedOn,
+        Self::Invalidates,
+        Self::TriggeredBy,
+        Self::ExtractedFrom,
+        Self::MatchedBy,
+        Self::Generated,
+        Self::Instantiates,
+        Self::Refines,
     ];
 }
 
@@ -223,11 +246,39 @@ impl AuditOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditTarget {
+    Context(ContextId),
     Decision(DecisionId),
     Intention(IntentionId),
     Entity(EntityId),
     Observation(ObservationId),
     Outcome(DecisionId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Principal {
+    System,
+    Agent(AgentId),
+    Human(String),
+}
+
+impl Principal {
+    pub fn encode(&self) -> String {
+        match self {
+            Principal::System => "System".to_string(),
+            Principal::Agent(a) => a.clone(),
+            Principal::Human(h) => h.clone(),
+        }
+    }
+
+    pub fn decode(raw: &str) -> Self {
+        if raw == "System" {
+            return Principal::System;
+        }
+        if raw.starts_with("agent:") || raw.starts_with("claude-code-instance-") {
+            return Principal::Agent(raw.to_string());
+        }
+        Principal::Human(raw.to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,9 +329,10 @@ pub struct Decision {
     pub decision_type: String,
     pub description: String,
     pub reasoning: Vec<ReasoningStep>,
-    pub confidence: f32,
+    pub confidence: Option<f32>,
     pub status: DecisionStatus,
     pub agent_id: Option<AgentId>,
+    pub context_id: ContextId,
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, Value>,
     pub created_at: TxId,
@@ -339,11 +391,13 @@ pub struct Outcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
+    pub id: AuditId,
     pub txid: TxId,
     pub operation: AuditOperation,
-    pub actor: AgentId,
+    pub actor: Principal,
     pub reason: Option<String>,
     pub target: AuditTarget,
+    pub context_id: ContextId,
     pub outcome: Option<Outcome>,
 }
 
@@ -468,6 +522,7 @@ pub struct ListDecisionFilter {
     pub based_on_entity_ids: Vec<EntityId>,
     pub entity_match_policy: EntityMatchPolicy,
     pub status: Option<DecisionStatus>,
+    pub context_id: Option<ContextId>,
     pub limit: Option<u32>,
     pub after: Option<DecisionId>,
 }
@@ -475,7 +530,7 @@ pub struct ListDecisionFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TraverseFilter {
     pub depth: u32,
-    pub rel: Option<String>,
+    pub rel: Option<RelationshipType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -486,6 +541,15 @@ pub struct AuditFilter {
     pub since_txid: Option<TxId>,
     pub until_txid: Option<TxId>,
     pub target: Option<AuditTarget>,
+    pub context_id: Option<ContextId>,
+    // consumed by plan 9 (cg-governance) joining audit_log with approvals; ignored here.
+    pub approver: Option<String>,
+    // consumed by plan 9 (cg-governance); ignored here until approval levels flow through audit_log.
+    pub level: Option<String>,
+    // consumed by plan 9 (cg-governance); ignored here until audit rows carry tags.
+    pub tags: Vec<String>,
+    pub limit: Option<u32>,
+    pub after: Option<AuditId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

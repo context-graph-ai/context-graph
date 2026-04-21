@@ -23,7 +23,7 @@ fn test_intention_status_has_exactly_four_variants() {
     );
 }
 
-// Pins the Decision state machine to {Active, Superseded, Invalidated}; any drift breaks archive and supersede transitions.
+// Pins the Decision state machine to {Active, Superseded, Archived}; any drift breaks archive and supersede transitions.
 #[test]
 fn test_decision_status_has_exactly_three_variants() {
     let variants = DecisionStatus::ALL;
@@ -33,7 +33,7 @@ fn test_decision_status_has_exactly_three_variants() {
         &[
             DecisionStatus::Active,
             DecisionStatus::Superseded,
-            DecisionStatus::Invalidated,
+            DecisionStatus::Archived,
         ],
     );
 }
@@ -58,7 +58,7 @@ fn test_intention_origin_has_exactly_four_variants() {
 #[test]
 fn test_relationship_type_variants() {
     let variants = RelationshipType::ALL;
-    assert_eq!(variants.len(), 5);
+    assert_eq!(variants.len(), 16);
     assert_eq!(
         &variants[..],
         &[
@@ -67,6 +67,17 @@ fn test_relationship_type_variants() {
             RelationshipType::Supersedes,
             RelationshipType::HasOutcome,
             RelationshipType::DependsOn,
+            RelationshipType::Cites,
+            RelationshipType::About,
+            RelationshipType::RelatesTo,
+            RelationshipType::ObservedOn,
+            RelationshipType::Invalidates,
+            RelationshipType::TriggeredBy,
+            RelationshipType::ExtractedFrom,
+            RelationshipType::MatchedBy,
+            RelationshipType::Generated,
+            RelationshipType::Instantiates,
+            RelationshipType::Refines,
         ],
     );
 }

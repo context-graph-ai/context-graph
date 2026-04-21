@@ -5,7 +5,7 @@ error[E0599]: no method named `update_digest` found for struct `Store` in the cu
   |                   ^^^^^^^^^^^^^
   |
 help: there is a method `create_digest` with a similar name, but with different arguments
- --> src/store.rs
+ --> src/store/digest.rs
   |
-  |     pub fn create_digest(&self, _input: CreateDigest) -> Result<Digest> {
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     pub fn create_digest(&self, input: CreateDigest) -> Result<Digest> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

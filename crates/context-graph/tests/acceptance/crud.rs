@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use context_graph::schema::DIGEST_VECTOR_DIMENSION;
 use context_graph::{
     AuditFilter, AuditTarget, CgError, ContextId, CreateContext, CreateDecision, CreateDigest,
     CreateEntity, CreateIntention, DecisionId, DecisionPatch, DecisionStatus, EntityId,
@@ -100,11 +101,23 @@ fn create_entity_input(context_id: ContextId, entity_type: EntityType, name: &st
     }
 }
 
+fn digest_embedding_fixture(seed: &str) -> Vec<f32> {
+    let mut v = vec![0.0_f32; DIGEST_VECTOR_DIMENSION];
+    let mut h: u32 = 2_166_136_261;
+    for b in seed.bytes() {
+        h = h.wrapping_mul(16_777_619) ^ b as u32;
+    }
+    v[h as usize % DIGEST_VECTOR_DIMENSION] = 1.0;
+    v[h.wrapping_mul(2).wrapping_add(1) as usize % DIGEST_VECTOR_DIMENSION] = 0.5;
+    v[h.wrapping_mul(3).wrapping_add(2) as usize % DIGEST_VECTOR_DIMENSION] = 0.25;
+    v
+}
+
 fn create_digest_input(context_id: ContextId, summary: &str) -> CreateDigest {
     CreateDigest {
         source: "claude-web".to_string(),
         summary: summary.to_string(),
-        embedding: vec![0.25, 0.5, 0.75],
+        embedding: digest_embedding_fixture(summary),
         context_id,
         session_ref: Some("session-7".to_string()),
         properties: BTreeMap::new(),
@@ -115,7 +128,11 @@ fn create_digest_input(context_id: ContextId, summary: &str) -> CreateDigest {
 #[test]
 fn intention_create_persists_across_reopen() {
     let (_tempdir, db_path, store) = fixture();
-    let ctx = ContextId::new_v7();
+    let ctx = ok!(
+        store.create_context(context_input("engineering")),
+        "create context"
+    )
+    .id;
     let intention = ok!(
         store.create_intention(CreateIntention {
             id: None,
@@ -157,7 +174,11 @@ fn intention_create_persists_across_reopen() {
 #[test]
 fn intention_identity_collision_rejected() {
     let (_tempdir, db_path, store) = fixture();
-    let ctx = ContextId::new_v7();
+    let ctx = ok!(
+        store.create_context(context_input("engineering")),
+        "create context"
+    )
+    .id;
     let original = ok!(
         store.create_intention(create_intention_input(ctx, "original")),
         "tx1: create original intention"
@@ -199,7 +220,11 @@ fn intention_identity_collision_rejected() {
 #[test]
 fn intention_update_transaction_rollback_on_error() {
     let (_tempdir, db_path, store) = fixture();
-    let ctx = ContextId::new_v7();
+    let ctx = ok!(
+        store.create_context(context_input("engineering")),
+        "create context"
+    )
+    .id;
     let http = ok!(
         store.create_intention(create_intention_input(
             ctx,
@@ -330,7 +355,7 @@ fn intention_archive_succeeds_when_decisions_superseded() {
         store.archive_decision(newer.id, "project complete".to_string()),
         "archive new decision"
     );
-    assert_eq!(archived_new.status, DecisionStatus::Invalidated);
+    assert_eq!(archived_new.status, DecisionStatus::Archived);
     let archived_intention = ok!(
         store.archive_intention(intention.id, "done".to_string()),
         "archive intention"
@@ -344,7 +369,7 @@ fn intention_archive_succeeds_when_decisions_superseded() {
     let new_after = ok!(store.get_decision(newer.id), "get new").expect("new");
     assert_eq!(intention_after.status, IntentionStatus::Archived);
     assert_eq!(old_after.status, DecisionStatus::Superseded);
-    assert_eq!(new_after.status, DecisionStatus::Invalidated);
+    assert_eq!(new_after.status, DecisionStatus::Archived);
     let serves = ok!(
         store.decision_targets_intention(newer.id, RelationshipType::Serves, intention.id),
         "SERVES edge persisted"
@@ -985,7 +1010,7 @@ fn decision_update_immutable_fields_rejected() {
         updated.tags,
         vec!["framework".to_string(), "rust".to_string()]
     );
-    assert_eq!(updated.confidence, 0.9);
+    assert_eq!(updated.confidence, Some(0.9));
     assert_eq!(updated.description, "use axum for the HTTP layer");
     assert_eq!(updated.decision_type, "framework_choice");
     let bad_type = store.admin_raw_update_decision_immutable_fields(
@@ -1015,7 +1040,7 @@ fn decision_update_immutable_fields_rejected() {
         after.tags,
         vec!["framework".to_string(), "rust".to_string()]
     );
-    assert_eq!(after.confidence, 0.9);
+    assert_eq!(after.confidence, Some(0.9));
 }
 
 // Use case: an architect replaces last quarter's framework choice because upstream is being deprecated; the engine flips the old Decision to Superseded, writes a SUPERSEDES edge atomically, and refuses any second supersede attempt (Invariant 5 DAG).
@@ -1073,7 +1098,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
         "edge exists"
     );
     assert!(edge);
-    let chain = ok!(store.precedent_chain(d2.id, 10), "precedent chain");
+    let chain = ok!(store.supersede_history(d2.id, 10), "supersede history");
     assert_eq!(chain, vec![d2_after.clone(), d1_after.clone()]);
     let second = store.supersede_decision(
         d1.id,
@@ -1088,7 +1113,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
     ));
 }
 
-// Use case: an agent asked to "revise" an already-invalidated Decision tries to supersede it; the engine refuses the illegal transition so retired work cannot come back to life through a side channel.
+// Use case: an agent asked to "revise" an already-archived Decision tries to supersede it; the engine refuses the illegal transition so retired work cannot come back to life through a side channel.
 #[test]
 fn decision_invalid_state_transition_rejected() {
     let (_tempdir, db_path, store) = fixture();
@@ -1121,11 +1146,11 @@ fn decision_invalid_state_transition_rejected() {
         ),
         "archive"
     );
-    assert_eq!(archived.status, DecisionStatus::Invalidated);
+    assert_eq!(archived.status, DecisionStatus::Archived);
     drop(store);
     let store = reopen(&db_path);
     let persisted = ok!(store.get_decision(decision.id), "get decision").expect("decision");
-    assert_eq!(persisted.status, DecisionStatus::Invalidated);
+    assert_eq!(persisted.status, DecisionStatus::Archived);
     let illegal = store.supersede_decision(
         decision.id,
         CreateDecision {
@@ -1143,12 +1168,12 @@ fn decision_invalid_state_transition_rejected() {
     assert!(matches!(
         illegal,
         Err(CgError::IllegalTransition {
-            from: DecisionStatus::Invalidated,
+            from: DecisionStatus::Archived,
             to: DecisionStatus::Superseded
         })
     ));
     let after = ok!(store.get_decision(decision.id), "get decision again").expect("decision");
-    assert_eq!(after.status, DecisionStatus::Invalidated);
+    assert_eq!(after.status, DecisionStatus::Archived);
     assert!(
         ok!(
             store.incoming_supersedes(decision.id),
@@ -1211,7 +1236,7 @@ fn decision_archive_not_found() {
     assert!(matches!(store.get_decision(unknown_id), Ok(None)));
     let archived = ok!(
         store.list_decisions(ListDecisionFilter {
-            status: Some(DecisionStatus::Invalidated),
+            status: Some(DecisionStatus::Archived),
             ..ListDecisionFilter::default()
         }),
         "list archived"
@@ -1252,12 +1277,12 @@ fn decision_archive_preserves_history() {
         ),
         "archive"
     );
-    assert_eq!(archived.status, DecisionStatus::Invalidated);
+    assert_eq!(archived.status, DecisionStatus::Archived);
     assert_eq!(archived.description, "use rabbitmq for now");
     drop(store);
     let store = reopen(&db_path);
     let fetched = ok!(store.get_decision(decision.id), "get decision").expect("decision");
-    assert_eq!(fetched.status, DecisionStatus::Invalidated);
+    assert_eq!(fetched.status, DecisionStatus::Archived);
     assert_eq!(fetched.description, "use rabbitmq for now");
     let audit = ok!(
         store.audit_query(AuditFilter {
@@ -1290,6 +1315,7 @@ fn decision_archive_preserves_history() {
 #[test]
 fn entity_create_and_snapshot_persist_across_reopen() {
     let (_tempdir, db_path, store) = fixture();
+    let ctx = ok!(store.create_context(context_input("platform")), "context").id;
     let entity = ok!(
         store.create_entity(CreateEntity {
             entity_type: EntityType::Service,
@@ -1300,7 +1326,7 @@ fn entity_create_and_snapshot_persist_across_reopen() {
                 ("version", json!("1.4.2")),
             ]),
             tags: vec!["tier-1".to_string(), "customer-facing".to_string()],
-            context_id: ContextId::new_v7(),
+            context_id: ctx,
         }),
         "create entity"
     );
@@ -1328,7 +1354,8 @@ fn entity_create_and_snapshot_persist_across_reopen() {
         vec!["tier-1".to_string(), "customer-facing".to_string()]
     );
     assert_eq!(fetched.created_at, entity.created_at);
-    let snapshot = ok!(store.snapshot_at(entity.id, Utc::now()), "snapshot").expect("snapshot");
+    let snapshot =
+        ok!(store.snapshot_at(entity.id, entity.created_at), "snapshot").expect("snapshot");
     assert_eq!(snapshot.entity_id, entity.id);
     assert_eq!(snapshot.properties, entity.properties);
     assert_eq!(snapshot.captured_at, entity.created_at);
@@ -1347,13 +1374,14 @@ fn entity_create_and_snapshot_persist_across_reopen() {
 #[test]
 fn entity_update_creates_new_snapshot_contiguous_after_reopen() {
     let (_tempdir, db_path, store) = fixture();
+    let ctx = ok!(store.create_context(context_input("platform")), "context").id;
     let entity = ok!(
         store.create_entity(CreateEntity {
             entity_type: EntityType::Service,
             name: "payments-api".to_string(),
             properties: map(&[("region", json!("us-east-1")), ("version", json!("1.4.2"))]),
             tags: vec![],
-            context_id: ContextId::new_v7(),
+            context_id: ctx,
         }),
         "tx1"
     );
@@ -1409,13 +1437,14 @@ fn entity_update_creates_new_snapshot_contiguous_after_reopen() {
 #[test]
 fn entity_archive_retains_history() {
     let (_tempdir, db_path, store) = fixture();
+    let ctx = ok!(store.create_context(context_input("platform")), "context").id;
     let entity = ok!(
         store.create_entity(CreateEntity {
             entity_type: EntityType::Service,
             name: "payments-v1".to_string(),
             properties: BTreeMap::new(),
             tags: vec![],
-            context_id: ContextId::new_v7(),
+            context_id: ctx,
         }),
         "tx1"
     );
@@ -1430,7 +1459,6 @@ fn entity_archive_retains_history() {
         ),
         "tx2"
     );
-    let mid_point = Utc::now();
     ok!(
         store.update_entity(
             entity.id,
@@ -1448,7 +1476,11 @@ fn entity_archive_retains_history() {
     let store = reopen(&db_path);
     let history = ok!(store.entity_history(entity.id), "history");
     assert_eq!(history.len(), 3);
-    let snapshot = ok!(store.snapshot_at(entity.id, mid_point), "snapshot").expect("snapshot");
+    let snapshot = ok!(
+        store.snapshot_at(entity.id, history[1].valid_from),
+        "snapshot"
+    )
+    .expect("snapshot");
     assert_eq!(snapshot.entity_id, entity.id);
     assert_eq!(snapshot.name, "payments-v1");
     assert_eq!(snapshot.properties["region"], json!("us-east"));
@@ -1497,7 +1529,7 @@ fn entity_update_not_found() {
 #[test]
 fn entity_list_filters_use_engine_indexes() {
     let (_tempdir, db_path, store) = fixture();
-    let ctx = ContextId::new_v7();
+    let ctx = ok!(store.create_context(context_input("platform")), "context").id;
     for i in 0..5_000 {
         let entity_type = if i % 2 == 0 {
             EntityType::Service
@@ -1593,13 +1625,18 @@ fn entity_list_filters_use_engine_indexes() {
 #[test]
 fn observation_immutable_mutation_rejected() {
     let (_tempdir, db_path, store) = fixture();
+    let ctx = ok!(
+        store.create_context(context_input("surveillance")),
+        "context"
+    )
+    .id;
     let entity = ok!(
         store.create_entity(CreateEntity {
             entity_type: EntityType::Service,
             name: "camera-target".to_string(),
             properties: BTreeMap::new(),
             tags: vec![],
-            context_id: ContextId::new_v7(),
+            context_id: ctx,
         }),
         "tx1"
     );
@@ -1636,7 +1673,11 @@ fn observation_immutable_mutation_rejected() {
 #[test]
 fn digest_immutable_no_update_symbol() {
     let (_tempdir, db_path, store) = fixture();
-    let ctx = ContextId::new_v7();
+    let ctx = ok!(
+        store.create_context(context_input("engineering")),
+        "context"
+    )
+    .id;
     let digest = ok!(
         store.create_digest(create_digest_input(
             ctx,
@@ -1656,7 +1697,10 @@ fn digest_immutable_no_update_symbol() {
         fetched.summary,
         "chose nats for transport after NAT-survival discussion"
     );
-    assert_eq!(fetched.embedding, vec![0.25, 0.5, 0.75]);
+    assert_eq!(
+        fetched.embedding,
+        digest_embedding_fixture("chose nats for transport after NAT-survival discussion")
+    );
 }
 
 // Use case: a rollout is first recorded as successful, then a week later re-recorded as reverted; the engine replaces the outcome in place and keeps exactly one HAS_OUTCOME edge (Invariant 9).
@@ -1839,7 +1883,11 @@ fn context_create_persists_with_labels() {
 #[test]
 fn relationship_add_idempotent_single_edge() {
     let (_tempdir, db_path, store) = fixture();
-    let ctx = ContextId::new_v7();
+    let ctx = ok!(
+        store.create_context(context_input("ingest-site")),
+        "context"
+    )
+    .id;
     let e1 = ok!(
         store.create_entity(create_entity_input(ctx, EntityType::Service, "site-alpha")),
         "E1"
@@ -1863,7 +1911,7 @@ fn relationship_add_idempotent_single_edge() {
             e1.id,
             TraverseFilter {
                 depth: 1,
-                rel: Some("DEPENDS_ON".to_string()),
+                rel: Some(RelationshipType::DependsOn),
             },
         ),
         "traverse"
@@ -1882,7 +1930,11 @@ fn relationship_add_idempotent_single_edge() {
 #[test]
 fn relationship_add_missing_entity_rejected() {
     let (_tempdir, db_path, store) = fixture();
-    let ctx = ContextId::new_v7();
+    let ctx = ok!(
+        store.create_context(context_input("ingest-site")),
+        "context"
+    )
+    .id;
     let e2 = ok!(
         store.create_entity(create_entity_input(ctx, EntityType::Database, "db-alpha")),
         "E2"

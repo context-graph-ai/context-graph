@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{DecisionStatus, IntentionId, TxId};
+use crate::{DecisionStatus, IntentionId, IntentionStatus, TxId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CgError {
@@ -32,16 +32,33 @@ pub enum CgError {
         from: DecisionStatus,
         to: DecisionStatus,
     },
+    IntentionIllegalTransition {
+        from: IntentionStatus,
+        to: IntentionStatus,
+    },
     ActiveDecisionsReference {
         intention_id: IntentionId,
         decision_ids: Vec<String>,
     },
     CrossContextRelationship,
     CrossContextObservation,
+    CrossContextViolation,
     ActiveIntentionProtection,
+    AcyclicCitesViolation,
+    VectorDimensionMismatch {
+        expected: usize,
+        got: usize,
+    },
+    EngineStateMachineError(String),
+    ForeignKeyViolation {
+        table: &'static str,
+        column: &'static str,
+        ref_table: &'static str,
+    },
     Rollback {
         txid: TxId,
     },
+    Engine(String),
 }
 
 impl fmt::Display for CgError {
