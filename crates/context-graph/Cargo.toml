@@ -28,3 +28,8 @@ trybuild = "1.0.112"
 name = "cg_crud"
 harness = false
 path = "../../benches/cg_crud.rs"
+
+[[bench]]
+name = "cg_graph"
+harness = false
+path = "../../benches/cg_graph.rs"

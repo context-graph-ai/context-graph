@@ -137,6 +137,23 @@ impl Store {
         Ok(Some(decode_intention(&result.columns, &result.rows[0])?))
     }
 
+    pub fn intention_tree(&self, intention_id: IntentionId) -> Result<IntentionTree> {
+        // Wrong: return the intention with empty collections. Drives every
+        // intention_tree_* assertion (decisions, entities, outcomes, invalidations
+        // all have concrete non-empty expected shapes).
+        let intention = self.get_intention(intention_id)?.ok_or(CgError::NotFound {
+            id: Some(intention_id.as_uuid().to_string()),
+            missing: Some("intention"),
+        })?;
+        Ok(IntentionTree {
+            intention,
+            decisions: Vec::new(),
+            entities: Vec::new(),
+            outcomes: Vec::new(),
+            invalidations: Vec::new(),
+        })
+    }
+
     pub fn update_intention(&self, id: IntentionId, patch: IntentionPatch) -> Result<Intention> {
         let results = self.update_intentions_batch(vec![(id, patch)])?;
         results.into_iter().next().ok_or(CgError::NotFound {

@@ -85,6 +85,7 @@ id_type!(ObservationId);
 id_type!(OutcomeId);
 id_type!(DigestId);
 id_type!(AuditId);
+id_type!(InvalidationId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum IntentionStatus {
@@ -339,6 +340,7 @@ pub struct Decision {
     pub intention_ids: Vec<IntentionId>,
     pub based_on_snapshots: BTreeMap<EntityId, EntitySnapshot>,
     pub outcome: Option<Outcome>,
+    pub precedent_ids: Vec<DecisionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,6 +471,7 @@ pub struct CreateDecision {
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, Value>,
     pub context_id: ContextId,
+    pub precedent_ids: Vec<DecisionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -529,8 +532,65 @@ pub struct ListDecisionFilter {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TraverseFilter {
-    pub depth: u32,
+    pub depth: u8,
     pub rel: Option<RelationshipType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TraversalResult {
+    pub nodes: Vec<TraversalNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraversalNode {
+    pub entity_id: EntityId,
+    pub hop: u8,
+    pub relationship: Option<RelationshipType>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntentionTree {
+    pub intention: Intention,
+    pub decisions: Vec<Decision>,
+    pub entities: Vec<Entity>,
+    pub outcomes: Vec<Outcome>,
+    pub invalidations: Vec<Invalidation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Neighborhood {
+    pub entities: Vec<Entity>,
+    pub decisions: Vec<Decision>,
+    pub intentions: Vec<Intention>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InvalidationStatus {
+    Pending,
+    Acknowledged,
+    Resolved,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InvalidationSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Invalidation {
+    pub id: InvalidationId,
+    pub status: InvalidationStatus,
+    pub affected_decision_id: DecisionId,
+    pub trigger_observation_id: ObservationId,
+    pub basis_diff: BTreeMap<String, Value>,
+    pub severity: InvalidationSeverity,
+    pub detected_at: TxId,
+    pub resolved_at: Option<TxId>,
+    pub resolution_action: Option<String>,
+    pub resolution_decision_id: Option<DecisionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

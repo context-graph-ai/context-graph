@@ -92,6 +92,7 @@ fn create_decision_input(
         tags: vec!["architecture".to_string()],
         properties: BTreeMap::new(),
         context_id,
+        precedent_ids: vec![],
     }
 }
 
@@ -404,6 +405,7 @@ fn decision_create_requires_intention() {
         tags: vec![],
         properties: BTreeMap::new(),
         context_id: ctx.id,
+        precedent_ids: vec![],
     });
     assert!(
         matches!(missing, Err(CgError::MissingIntention)),
@@ -430,6 +432,7 @@ fn decision_create_requires_intention() {
         tags: vec![],
         properties: BTreeMap::new(),
         context_id: ctx.id,
+        precedent_ids: vec![],
     });
     assert!(
         matches!(bad_id, Err(CgError::IntentionNotFound { id }) if id == non_existent_id),
@@ -500,6 +503,7 @@ fn decision_create_with_serves_and_based_on_edges_persisted() {
             tags: vec!["architecture".to_string()],
             properties: BTreeMap::new(),
             context_id: ctx.id,
+            precedent_ids: vec![],
         }),
         "decision"
     );
@@ -612,6 +616,7 @@ fn decision_based_on_snapshot_frozen_after_entity_update() {
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
+            precedent_ids: vec![],
         }),
         "decision"
     );
@@ -737,6 +742,7 @@ fn decision_list_by_tags() {
                 tags: vec![bucket.to_string()],
                 properties: BTreeMap::new(),
                 context_id: ctx.id,
+                precedent_ids: vec![],
             }),
             "seed decision"
         );
@@ -752,6 +758,7 @@ fn decision_list_by_tags() {
             tags: vec!["networking-legacy".to_string()],
             properties: BTreeMap::new(),
             context_id: ctx.id,
+            precedent_ids: vec![],
         }),
         "trap decision"
     );
@@ -981,6 +988,7 @@ fn decision_update_immutable_fields_rejected() {
             tags: vec!["framework".to_string()],
             properties: BTreeMap::new(),
             context_id: ctx.id,
+            precedent_ids: vec![],
         }),
         "decision"
     );
@@ -1056,6 +1064,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
+            precedent_ids: vec![],
         }),
         "D1"
     );
@@ -1073,6 +1082,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
                 tags: vec![],
                 properties: BTreeMap::new(),
                 context_id: ctx.id,
+                precedent_ids: vec![],
             },
         ),
         "D2"
@@ -1126,6 +1136,7 @@ fn decision_invalid_state_transition_rejected() {
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
+            precedent_ids: vec![],
         }),
         "decision"
     );
@@ -1153,6 +1164,7 @@ fn decision_invalid_state_transition_rejected() {
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
+            precedent_ids: vec![],
         },
     );
     assert!(matches!(
@@ -1257,6 +1269,7 @@ fn decision_archive_preserves_history() {
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
+            precedent_ids: vec![],
         }),
         "decision"
     );
@@ -1854,7 +1867,7 @@ fn relationship_add_idempotent_single_edge() {
     );
     drop(store);
     let store = reopen(&db_path);
-    let neighbours = ok!(
+    let result = ok!(
         store.traverse(
             e1.id,
             TraverseFilter {
@@ -1864,7 +1877,13 @@ fn relationship_add_idempotent_single_edge() {
         ),
         "traverse"
     );
-    assert_eq!(neighbours, vec![e2.id]);
+    let neighbour_ids: Vec<EntityId> = result
+        .nodes
+        .iter()
+        .filter(|n| n.hop > 0)
+        .map(|n| n.entity_id)
+        .collect();
+    assert_eq!(neighbour_ids, vec![e2.id]);
     assert_eq!(
         ok!(
             store.admin_raw_edge_count(e1.id, "DEPENDS_ON".to_string(), e2.id),

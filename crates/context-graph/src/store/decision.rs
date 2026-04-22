@@ -199,6 +199,7 @@ impl Store {
             intention_ids: input.intention_ids,
             based_on_snapshots: out_basis,
             outcome: None,
+            precedent_ids: Vec::new(),
         })
     }
 
@@ -790,6 +791,7 @@ impl Store {
             intention_ids: new.intention_ids,
             based_on_snapshots: out_basis,
             outcome: None,
+            precedent_ids: Vec::new(),
         })
     }
 
@@ -826,34 +828,27 @@ impl Store {
         Ok(out)
     }
 
-    pub fn precedent_chain(&self, id: DecisionId, depth: u32) -> Result<Vec<Decision>> {
-        let mut out: Vec<Decision> = Vec::new();
-        let mut cursor = id;
-        for _ in 0..=depth {
-            let d = match self.get_decision(cursor)? {
-                Some(d) => d,
-                None => break,
-            };
-            out.push(d);
-            let params: HashMap<String, Value> = [
-                ("source_id".to_string(), Value::Uuid(cursor.as_uuid())),
-                ("edge_type".to_string(), Value::Text("CITES".to_string())),
-            ]
-            .into_iter()
-            .collect();
-            let result = self
-                .db
-                .execute(
-                    "SELECT target_id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type",
-                    &params,
-                )
-                .map_err(map_engine_err)?;
-            match result.rows.first().and_then(|r| r.first()) {
-                Some(Value::Uuid(u)) => cursor = DecisionId::from(*u),
-                _ => break,
-            }
-        }
-        Ok(out)
+    pub fn precedent_chain(
+        &self,
+        decision_id: DecisionId,
+        _max_depth: u8,
+    ) -> Result<Vec<Decision>> {
+        // Wrong: return the start decision only (ignoring max_depth validation
+        // AND the chain). Drives precedent_chain_walks_cites (len != 2),
+        // precedent_chain_deep (len != 8), precedent_chain_depth_cap_rejects_over_ten
+        // (InvalidDepth match fails since Ok is returned), and
+        // precedent_chain_cycle_rejected_at_create (post-reopen chain shape fails).
+        let d = self.get_decision(decision_id)?.ok_or(CgError::NotFound {
+            id: Some(decision_id.as_uuid().to_string()),
+            missing: Some("decision"),
+        })?;
+        Ok(vec![d])
+    }
+
+    pub fn admin_raw_insert_cites(&self, _from: DecisionId, _to: DecisionId) -> Result<()> {
+        // Wrong: accept the cycle-closing edge without refusal. Drives
+        // precedent_chain_cycle_rejected_at_create on the CyclicCitation match.
+        Ok(())
     }
 
     pub fn archive_decision(&self, id: DecisionId, reason: String) -> Result<Decision> {
@@ -1031,6 +1026,7 @@ fn decode_decision(columns: &[String], row: &[Value]) -> Result<Decision> {
         intention_ids: Vec::new(),
         based_on_snapshots: BTreeMap::new(),
         outcome: None,
+        precedent_ids: Vec::new(),
     })
 }
 

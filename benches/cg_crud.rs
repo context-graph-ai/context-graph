@@ -74,6 +74,7 @@ fn create_decision_input(
         tags: vec!["architecture".to_string()],
         properties: BTreeMap::new(),
         context_id,
+        precedent_ids: vec![],
     }
 }
 

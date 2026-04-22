@@ -26,7 +26,7 @@ pub(super) fn map_engine_err(err: EngineError) -> CgError {
         } => CgError::EngineStateMachineError(format!(
             "propagation aborted: {table}.{column} {from} -> {to}"
         )),
-        EngineError::CycleDetected { .. } => CgError::AcyclicCitesViolation,
+        EngineError::CycleDetected { .. } => CgError::CyclicCitation,
         EngineError::UniqueViolation { table, .. } => CgError::UniqueViolation {
             entity: static_table_name(&table),
             id: None,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use contextdb_core::Value;
 use serde_json::Value as JsonValue;
@@ -10,7 +10,7 @@ use crate::error::CgError;
 use crate::types::*;
 
 use super::Store;
-use super::convert::{map_engine_err, relationship_type_str};
+use super::convert::map_engine_err;
 
 impl Store {
     pub fn add_relationship(&self, from: EntityId, to: EntityId, rel: String) -> Result<()> {
@@ -49,42 +49,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn traverse(&self, from: EntityId, filter: TraverseFilter) -> Result<Vec<EntityId>> {
-        let mut out: Vec<EntityId> = Vec::new();
-        let mut frontier: Vec<EntityId> = vec![from];
-        let mut seen: HashSet<EntityId> = HashSet::new();
-        seen.insert(from);
-        for _ in 0..filter.depth {
-            let mut next: Vec<EntityId> = Vec::new();
-            for node in &frontier {
-                let mut params: HashMap<String, Value> = HashMap::new();
-                params.insert("source_id".to_string(), Value::Uuid(node.as_uuid()));
-                let sql = if let Some(rel) = filter.rel {
-                    params.insert(
-                        "edge_type".to_string(),
-                        Value::Text(relationship_type_str(rel).to_string()),
-                    );
-                    "SELECT target_id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type"
-                } else {
-                    "SELECT target_id FROM edges WHERE source_id = $source_id"
-                };
-                let result = self.db.execute(sql, &params).map_err(map_engine_err)?;
-                for row in &result.rows {
-                    if let Some(Value::Uuid(u)) = row.first() {
-                        let eid = EntityId::from(*u);
-                        if seen.insert(eid) {
-                            out.push(eid);
-                            next.push(eid);
-                        }
-                    }
-                }
-            }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
-        }
-        Ok(out)
+    pub fn traverse(&self, _start: EntityId, _filter: TraverseFilter) -> Result<TraversalResult> {
+        // Wrong: always return an empty result. Drives every traverse test
+        // with non-empty expected output to fail on the length/identity assertion.
+        Ok(TraversalResult { nodes: Vec::new() })
     }
 
     pub fn admin_raw_edge_count(&self, from: EntityId, rel: String, to: EntityId) -> Result<u64> {

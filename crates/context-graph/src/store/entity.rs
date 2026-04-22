@@ -458,6 +458,18 @@ impl Store {
             ..current
         })
     }
+
+    pub fn entity_neighborhood(&self, _entity_id: EntityId, _depth: u8) -> Result<Neighborhood> {
+        // Wrong: return empty collections and skip the depth-cap check.
+        // Drives entity_neighborhood_returns_everything_connected (set mismatch),
+        // subgraph_decisions_by_depth (entity set mismatch),
+        // and subgraph_hard_cap_ten (Ok instead of InvalidDepth).
+        Ok(Neighborhood {
+            entities: Vec::new(),
+            decisions: Vec::new(),
+            intentions: Vec::new(),
+        })
+    }
 }
 
 fn decode_entity(columns: &[String], row: &[Value]) -> Result<Entity> {

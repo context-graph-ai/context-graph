@@ -44,7 +44,11 @@ pub enum CgError {
     CrossContextObservation,
     CrossContextViolation,
     ActiveIntentionProtection,
-    AcyclicCitesViolation,
+    CyclicCitation,
+    InvalidDepth {
+        requested: u32,
+        cap: u8,
+    },
     VectorDimensionMismatch {
         expected: usize,
         got: usize,
