@@ -20,5 +20,11 @@ serde_json.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 
 [dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3.23.0"
 trybuild = "1.0.112"
+
+[[bench]]
+name = "cg_crud"
+harness = false
+path = "../../benches/cg_crud.rs"
