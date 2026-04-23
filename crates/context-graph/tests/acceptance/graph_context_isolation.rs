@@ -87,6 +87,7 @@ fn create_decision_input(
         properties: BTreeMap::new(),
         context_id,
         precedent_ids,
+        agent_id: None,
     }
 }
 

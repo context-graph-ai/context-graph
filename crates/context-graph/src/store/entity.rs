@@ -616,6 +616,26 @@ impl Store {
         }
         Ok(out)
     }
+
+    pub fn diff(
+        &self,
+        target_id: EntityId,
+        from: TxId,
+        to: TxId,
+        _include_related: bool,
+    ) -> Result<TemporalDiff> {
+        Ok(TemporalDiff {
+            target_id,
+            from,
+            to,
+            changes: vec![EntityDiffEntry {
+                entity_id: target_id,
+                entity_name: String::new(),
+                field_changes: vec![],
+            }],
+            unchanged: vec![],
+        })
+    }
 }
 
 fn decode_entity(columns: &[String], row: &[Value]) -> Result<Entity> {

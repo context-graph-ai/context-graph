@@ -93,6 +93,7 @@ fn create_decision_input(
         properties: BTreeMap::new(),
         context_id,
         precedent_ids: vec![],
+        agent_id: None,
     }
 }
 
@@ -406,6 +407,7 @@ fn decision_create_requires_intention() {
         properties: BTreeMap::new(),
         context_id: ctx.id,
         precedent_ids: vec![],
+        agent_id: None,
     });
     assert!(
         matches!(missing, Err(CgError::MissingIntention)),
@@ -433,6 +435,7 @@ fn decision_create_requires_intention() {
         properties: BTreeMap::new(),
         context_id: ctx.id,
         precedent_ids: vec![],
+        agent_id: None,
     });
     assert!(
         matches!(bad_id, Err(CgError::IntentionNotFound { id }) if id == non_existent_id),
@@ -504,6 +507,7 @@ fn decision_create_with_serves_and_based_on_edges_persisted() {
             properties: BTreeMap::new(),
             context_id: ctx.id,
             precedent_ids: vec![],
+            agent_id: None,
         }),
         "decision"
     );
@@ -617,6 +621,7 @@ fn decision_based_on_snapshot_frozen_after_entity_update() {
             properties: BTreeMap::new(),
             context_id: ctx.id,
             precedent_ids: vec![],
+            agent_id: None,
         }),
         "decision"
     );
@@ -743,6 +748,7 @@ fn decision_list_by_tags() {
                 properties: BTreeMap::new(),
                 context_id: ctx.id,
                 precedent_ids: vec![],
+                agent_id: None,
             }),
             "seed decision"
         );
@@ -759,6 +765,7 @@ fn decision_list_by_tags() {
             properties: BTreeMap::new(),
             context_id: ctx.id,
             precedent_ids: vec![],
+            agent_id: None,
         }),
         "trap decision"
     );
@@ -989,6 +996,7 @@ fn decision_update_immutable_fields_rejected() {
             properties: BTreeMap::new(),
             context_id: ctx.id,
             precedent_ids: vec![],
+            agent_id: None,
         }),
         "decision"
     );
@@ -1065,6 +1073,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
             properties: BTreeMap::new(),
             context_id: ctx.id,
             precedent_ids: vec![],
+            agent_id: None,
         }),
         "D1"
     );
@@ -1083,6 +1092,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
                 properties: BTreeMap::new(),
                 context_id: ctx.id,
                 precedent_ids: vec![],
+                agent_id: None,
             },
         ),
         "D2"
@@ -1137,6 +1147,7 @@ fn decision_invalid_state_transition_rejected() {
             properties: BTreeMap::new(),
             context_id: ctx.id,
             precedent_ids: vec![],
+            agent_id: None,
         }),
         "decision"
     );
@@ -1165,6 +1176,7 @@ fn decision_invalid_state_transition_rejected() {
             properties: BTreeMap::new(),
             context_id: ctx.id,
             precedent_ids: vec![],
+            agent_id: None,
         },
     );
     assert!(matches!(
@@ -1270,6 +1282,7 @@ fn decision_archive_preserves_history() {
             properties: BTreeMap::new(),
             context_id: ctx.id,
             precedent_ids: vec![],
+            agent_id: None,
         }),
         "decision"
     );

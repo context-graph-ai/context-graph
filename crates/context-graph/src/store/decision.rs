@@ -96,6 +96,10 @@ impl Store {
             Some(c) => Value::Float64(c as f64),
             None => Value::Null,
         };
+        let agent_id_value = match &input.agent_id {
+            Some(a) => Value::Text(a.clone()),
+            None => Value::Null,
+        };
         let decision_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             (
@@ -109,7 +113,7 @@ impl Store {
             ("reasoning".to_string(), Value::Json(reasoning_json)),
             ("confidence".to_string(), confidence_value),
             ("status".to_string(), Value::Text("active".to_string())),
-            ("agent_id".to_string(), Value::Null),
+            ("agent_id".to_string(), agent_id_value),
             (
                 "context_id".to_string(),
                 Value::Uuid(input.context_id.as_uuid()),
@@ -219,7 +223,7 @@ impl Store {
             reasoning: input.reasoning,
             confidence: input.confidence,
             status: DecisionStatus::Active,
-            agent_id: None,
+            agent_id: input.agent_id,
             context_id: input.context_id,
             tags: input.tags,
             properties: input.properties,
@@ -707,6 +711,10 @@ impl Store {
             Some(c) => Value::Float64(c as f64),
             None => Value::Null,
         };
+        let agent_id_value = match &new.agent_id {
+            Some(a) => Value::Text(a.clone()),
+            None => Value::Null,
+        };
         let decision_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(new_id.as_uuid())),
             (
@@ -720,7 +728,7 @@ impl Store {
             ("reasoning".to_string(), Value::Json(reasoning_json)),
             ("confidence".to_string(), confidence_value),
             ("status".to_string(), Value::Text("active".to_string())),
-            ("agent_id".to_string(), Value::Null),
+            ("agent_id".to_string(), agent_id_value),
             (
                 "context_id".to_string(),
                 Value::Uuid(new.context_id.as_uuid()),
@@ -849,7 +857,7 @@ impl Store {
             reasoning: new.reasoning,
             confidence: new.confidence,
             status: DecisionStatus::Active,
-            agent_id: None,
+            agent_id: new.agent_id,
             context_id: new.context_id,
             tags: new.tags,
             properties: new.properties,
@@ -1114,6 +1122,18 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    pub fn replay(&self, id: DecisionId) -> Result<ReplayResult> {
+        Ok(ReplayResult {
+            decision_id: id,
+            original_outcome: None,
+            inputs_changed: false,
+            changed_input_count: 0,
+            unchanged_input_count: 0,
+            input_diffs: vec![],
+            cited_intention_snapshots: vec![],
+        })
     }
 }
 

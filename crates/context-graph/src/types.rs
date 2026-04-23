@@ -472,6 +472,50 @@ pub struct CreateDecision {
     pub properties: BTreeMap<String, Value>,
     pub context_id: ContextId,
     pub precedent_ids: Vec<DecisionId>,
+    pub agent_id: Option<AgentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldChange {
+    pub field: String,
+    pub old_value: Option<Value>,
+    pub new_value: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityDiffEntry {
+    pub entity_id: EntityId,
+    pub entity_name: String,
+    pub field_changes: Vec<FieldChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalDiff {
+    pub target_id: EntityId,
+    pub from: TxId,
+    pub to: TxId,
+    pub changes: Vec<EntityDiffEntry>,
+    pub unchanged: Vec<EntityDiffEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDiff {
+    pub entity_id: EntityId,
+    pub entity_name: String,
+    pub changed: bool,
+    pub field_changes: Vec<FieldChange>,
+    pub changed_at: Option<TxId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayResult {
+    pub decision_id: DecisionId,
+    pub original_outcome: Option<bool>,
+    pub inputs_changed: bool,
+    pub changed_input_count: u32,
+    pub unchanged_input_count: u32,
+    pub input_diffs: Vec<InputDiff>,
+    pub cited_intention_snapshots: Vec<IntentionSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
