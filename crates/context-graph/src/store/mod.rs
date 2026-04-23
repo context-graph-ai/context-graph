@@ -19,10 +19,12 @@ use contextdb_engine::Database;
 
 use crate::Result;
 use crate::error::CgError;
-use crate::schema::TABLES;
+use crate::schema::{INDEXES, TABLES};
 use crate::types::*;
 
 use self::convert::map_engine_err;
+
+const MAX_GRAPH_DEPTH: u8 = 10;
 
 #[derive(Clone)]
 pub struct Store {
@@ -90,6 +92,16 @@ impl Store {
         }
         Ok(())
     }
+
+    pub(super) fn validate_graph_depth(&self, requested: u8) -> Result<()> {
+        if requested > MAX_GRAPH_DEPTH {
+            return Err(CgError::InvalidDepth {
+                requested: requested as u32,
+                cap: MAX_GRAPH_DEPTH,
+            });
+        }
+        Ok(())
+    }
 }
 
 fn initialize_schema(db: &Database) {
@@ -100,5 +112,19 @@ fn initialize_schema(db: &Database) {
         }
         db.execute(table.ddl, &HashMap::new())
             .expect("initialize schema");
+    }
+    for index in INDEXES {
+        let Some(meta) = db.table_meta(index.table) else {
+            continue;
+        };
+        if meta
+            .indexes
+            .iter()
+            .any(|existing| existing.name == index.name)
+        {
+            continue;
+        }
+        db.execute(index.ddl, &HashMap::new())
+            .expect("initialize schema index");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use contextdb_core::Value;
 use serde_json::Value as JsonValue;
@@ -10,7 +10,7 @@ use crate::error::CgError;
 use crate::types::*;
 
 use super::Store;
-use super::convert::map_engine_err;
+use super::convert::{map_engine_err, relationship_type_from_str, relationship_type_str};
 
 impl Store {
     pub fn add_relationship(&self, from: EntityId, to: EntityId, rel: String) -> Result<()> {
@@ -49,10 +49,45 @@ impl Store {
         Ok(())
     }
 
-    pub fn traverse(&self, _start: EntityId, _filter: TraverseFilter) -> Result<TraversalResult> {
-        // Wrong: always return an empty result. Drives every traverse test
-        // with non-empty expected output to fail on the length/identity assertion.
-        Ok(TraversalResult { nodes: Vec::new() })
+    pub fn traverse(&self, start: EntityId, filter: TraverseFilter) -> Result<TraversalResult> {
+        self.validate_graph_depth(filter.depth)?;
+        let start_entity = match self.get_entity(start)? {
+            Some(entity) => entity,
+            None => return Ok(TraversalResult { nodes: Vec::new() }),
+        };
+
+        let mut nodes = vec![TraversalNode {
+            entity_id: start,
+            hop: 0,
+            relationship: None,
+        }];
+        if filter.depth == 0 {
+            return Ok(TraversalResult { nodes });
+        }
+
+        let mut visited: HashSet<EntityId> = [start].into_iter().collect();
+        let mut frontier = vec![start.as_uuid()];
+        for hop in 1..=filter.depth {
+            let edges = self.edges_from_sources(start_entity.context_id, &frontier, filter.rel)?;
+            let mut next_frontier = Vec::new();
+            for (_source, target, rel) in edges {
+                let target_id = EntityId::from(target);
+                if visited.insert(target_id) {
+                    nodes.push(TraversalNode {
+                        entity_id: target_id,
+                        hop,
+                        relationship: Some(rel),
+                    });
+                    next_frontier.push(target);
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        Ok(TraversalResult { nodes })
     }
 
     pub fn admin_raw_edge_count(&self, from: EntityId, rel: String, to: EntityId) -> Result<u64> {
@@ -190,6 +225,72 @@ impl Store {
         Ok(())
     }
 
+    pub(super) fn edges_from_sources(
+        &self,
+        context_id: ContextId,
+        sources: &[Uuid],
+        rel: Option<RelationshipType>,
+    ) -> Result<Vec<(Uuid, Uuid, RelationshipType)>> {
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut params: HashMap<String, Value> =
+            [("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]
+                .into_iter()
+                .collect();
+        let source_clause = uuid_or_clause("source_id", "source", sources, &mut params);
+        let mut sql = format!(
+            "SELECT source_id, target_id, edge_type FROM edges WHERE ({source_clause}) AND context_id = $context_id"
+        );
+        if let Some(rel) = rel {
+            sql.push_str(" AND edge_type = $edge_type");
+            params.insert(
+                "edge_type".to_string(),
+                Value::Text(relationship_type_str(rel).to_string()),
+            );
+        }
+        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            let source = match row.first() {
+                Some(Value::Uuid(u)) => *u,
+                _ => continue,
+            };
+            let target = match row.get(1) {
+                Some(Value::Uuid(u)) => *u,
+                _ => continue,
+            };
+            let rel = match row.get(2) {
+                Some(Value::Text(t)) => relationship_type_from_str(t)?,
+                _ => continue,
+            };
+            out.push((source, target, rel));
+        }
+        if sources.len() <= 64 {
+            let source_order: HashMap<Uuid, usize> =
+                sources.iter().enumerate().map(|(i, u)| (*u, i)).collect();
+            out.sort_by(|a, b| {
+                source_order
+                    .get(&a.0)
+                    .unwrap_or(&usize::MAX)
+                    .cmp(source_order.get(&b.0).unwrap_or(&usize::MAX))
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| relationship_type_str(a.2).cmp(relationship_type_str(b.2)))
+            });
+        }
+        Ok(out)
+    }
+
+    pub(super) fn edge_targets(
+        &self,
+        context_id: ContextId,
+        source: Uuid,
+        rel: RelationshipType,
+    ) -> Result<Vec<Uuid>> {
+        let edges = self.edges_from_sources(context_id, &[source], Some(rel))?;
+        Ok(edges.into_iter().map(|(_, target, _)| target).collect())
+    }
+
     pub(super) fn delete_edges_in_tx(
         &self,
         tx: TxId,
@@ -234,4 +335,23 @@ impl Store {
             params,
         ))
     }
+}
+
+pub(super) fn uuid_or_clause(
+    column: &str,
+    prefix: &str,
+    values: &[Uuid],
+    params: &mut HashMap<String, Value>,
+) -> String {
+    let placeholders = values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            let name = format!("{prefix}_{idx}");
+            params.insert(name.clone(), Value::Uuid(*value));
+            format!("${name}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{column} IN ({placeholders})")
 }

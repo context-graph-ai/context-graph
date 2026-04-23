@@ -205,6 +205,30 @@ pub(super) fn relationship_type_str(rel: RelationshipType) -> &'static str {
     }
 }
 
+pub(super) fn relationship_type_from_str(s: &str) -> Result<RelationshipType> {
+    match s {
+        "SERVES" => Ok(RelationshipType::Serves),
+        "BASED_ON" => Ok(RelationshipType::BasedOn),
+        "SUPERSEDES" => Ok(RelationshipType::Supersedes),
+        "HAS_OUTCOME" => Ok(RelationshipType::HasOutcome),
+        "DEPENDS_ON" => Ok(RelationshipType::DependsOn),
+        "CITES" => Ok(RelationshipType::Cites),
+        "ABOUT" => Ok(RelationshipType::About),
+        "RELATES_TO" => Ok(RelationshipType::RelatesTo),
+        "OBSERVED_ON" => Ok(RelationshipType::ObservedOn),
+        "INVALIDATES" => Ok(RelationshipType::Invalidates),
+        "TRIGGERED_BY" => Ok(RelationshipType::TriggeredBy),
+        "EXTRACTED_FROM" => Ok(RelationshipType::ExtractedFrom),
+        "MATCHED_BY" => Ok(RelationshipType::MatchedBy),
+        "GENERATED" => Ok(RelationshipType::Generated),
+        "INSTANTIATES" => Ok(RelationshipType::Instantiates),
+        "REFINES" => Ok(RelationshipType::Refines),
+        other => Err(CgError::Engine(format!(
+            "unknown relationship type: {other}"
+        ))),
+    }
+}
+
 pub(super) fn audit_operation_str(op: AuditOperation) -> &'static str {
     match op {
         AuditOperation::Create => "create",

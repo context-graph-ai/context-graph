@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use contextdb_core::{Error as EngineError, Value};
 use serde_json::Value as JsonValue;
@@ -14,9 +14,10 @@ use super::convert::{
     intention_status_str, map_engine_err,
 };
 use super::encode::{
-    get_json, get_optional_txid, get_text, get_txid, get_uuid, properties_from_json,
-    properties_to_json, tags_from_json,
+    decode_outcome, get_json, get_optional_text, get_optional_txid, get_text, get_txid, get_uuid,
+    properties_from_json, properties_to_json, tags_from_json,
 };
+use super::relationship::uuid_or_clause;
 
 impl Store {
     pub fn create_intention(&self, input: CreateIntention) -> Result<Intention> {
@@ -138,20 +139,184 @@ impl Store {
     }
 
     pub fn intention_tree(&self, intention_id: IntentionId) -> Result<IntentionTree> {
-        // Wrong: return the intention with empty collections. Drives every
-        // intention_tree_* assertion (decisions, entities, outcomes, invalidations
-        // all have concrete non-empty expected shapes).
         let intention = self.get_intention(intention_id)?.ok_or(CgError::NotFound {
             id: Some(intention_id.as_uuid().to_string()),
             missing: Some("intention"),
         })?;
+        let mut decisions = self.decisions_serving_intention(intention.id, intention.context_id)?;
+        decisions = self.sort_decisions_topologically(decisions)?;
+
+        let mut entity_ids = BTreeMap::new();
+        for decision in &decisions {
+            for entity_id in decision.based_on_snapshots.keys() {
+                entity_ids.insert(*entity_id, ());
+            }
+        }
+        let mut entities = Vec::new();
+        for entity_id in entity_ids.keys() {
+            if let Some(entity) = self.get_entity(*entity_id)?
+                && entity.context_id == intention.context_id
+            {
+                entities.push(entity);
+            }
+        }
+        entities.sort_by(|a, b| {
+            a.created_at
+                .0
+                .cmp(&b.created_at.0)
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+        });
+
+        let decision_ids: Vec<DecisionId> = decisions.iter().map(|d| d.id).collect();
+        let mut outcomes = self.outcomes_for_decisions(&decision_ids)?;
+        outcomes.sort_by(|a, b| {
+            a.recorded_at
+                .0
+                .cmp(&b.recorded_at.0)
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+        });
+        let mut invalidations = self.pending_invalidations_for_decisions(&decision_ids)?;
+        invalidations.sort_by(|a, b| {
+            severity_rank(b.severity)
+                .cmp(&severity_rank(a.severity))
+                .then_with(|| a.detected_at.0.cmp(&b.detected_at.0))
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+        });
+
         Ok(IntentionTree {
             intention,
-            decisions: Vec::new(),
-            entities: Vec::new(),
-            outcomes: Vec::new(),
-            invalidations: Vec::new(),
+            decisions,
+            entities,
+            outcomes,
+            invalidations,
         })
+    }
+
+    pub(super) fn decisions_serving_intention(
+        &self,
+        intention_id: IntentionId,
+        context_id: ContextId,
+    ) -> Result<Vec<Decision>> {
+        let params: HashMap<String, Value> = [
+            ("target_id".to_string(), Value::Uuid(intention_id.as_uuid())),
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+            ("edge_type".to_string(), Value::Text("SERVES".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT source_id FROM edges WHERE target_id = $target_id AND context_id = $context_id AND edge_type = $edge_type",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if let Some(Value::Uuid(u)) = row.first() {
+                let id = DecisionId::from(*u);
+                if let Some(decision) = self.get_decision(id)?
+                    && decision.context_id == context_id
+                {
+                    out.push(decision);
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            a.created_at
+                .0
+                .cmp(&b.created_at.0)
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+        });
+        Ok(out)
+    }
+
+    pub(super) fn sort_decisions_topologically(
+        &self,
+        decisions: Vec<Decision>,
+    ) -> Result<Vec<Decision>> {
+        let by_id: HashMap<DecisionId, Decision> =
+            decisions.into_iter().map(|d| (d.id, d)).collect();
+        let ids: HashSet<DecisionId> = by_id.keys().copied().collect();
+        let mut remaining_precedents: HashMap<DecisionId, HashSet<DecisionId>> = HashMap::new();
+        for id in &ids {
+            let decision = by_id.get(id).expect("id from map keys");
+            let precedents = self
+                .precedents_for_decision(*id, decision.context_id)?
+                .into_iter()
+                .filter(|pid| ids.contains(pid))
+                .collect();
+            remaining_precedents.insert(*id, precedents);
+        }
+
+        let mut out = Vec::with_capacity(by_id.len());
+        while out.len() < by_id.len() {
+            let mut ready: Vec<DecisionId> = remaining_precedents
+                .iter()
+                .filter_map(|(id, precedents)| precedents.is_empty().then_some(*id))
+                .collect();
+            if ready.is_empty() {
+                ready = remaining_precedents.keys().copied().collect();
+            }
+            ready.sort_by(|a, b| {
+                let da = by_id.get(a).expect("ready id");
+                let db = by_id.get(b).expect("ready id");
+                da.created_at
+                    .0
+                    .cmp(&db.created_at.0)
+                    .then_with(|| da.id.as_uuid().cmp(&db.id.as_uuid()))
+            });
+            let next = ready[0];
+            let decision = by_id.get(&next).expect("next id").clone();
+            remaining_precedents.remove(&next);
+            for precedents in remaining_precedents.values_mut() {
+                precedents.remove(&next);
+            }
+            out.push(decision);
+        }
+        Ok(out)
+    }
+
+    fn outcomes_for_decisions(&self, decision_ids: &[DecisionId]) -> Result<Vec<Outcome>> {
+        if decision_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uuids: Vec<Uuid> = decision_ids.iter().map(|id| id.as_uuid()).collect();
+        let mut params = HashMap::new();
+        let clause = uuid_or_clause("decision_id", "decision", &uuids, &mut params);
+        let sql = format!(
+            "SELECT id, decision_id, success, notes, recorded_at FROM outcomes WHERE {clause}"
+        );
+        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            out.push(decode_outcome(&result.columns, row)?);
+        }
+        Ok(out)
+    }
+
+    fn pending_invalidations_for_decisions(
+        &self,
+        decision_ids: &[DecisionId],
+    ) -> Result<Vec<Invalidation>> {
+        if decision_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uuids: Vec<Uuid> = decision_ids.iter().map(|id| id.as_uuid()).collect();
+        let mut params: HashMap<String, Value> =
+            [("status".to_string(), Value::Text("pending".to_string()))]
+                .into_iter()
+                .collect();
+        let clause = uuid_or_clause("affected_decision_id", "decision", &uuids, &mut params);
+        let sql = format!(
+            "SELECT id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE status = $status AND ({clause})"
+        );
+        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            out.push(decode_invalidation(&result.columns, row)?);
+        }
+        Ok(out)
     }
 
     pub fn update_intention(&self, id: IntentionId, patch: IntentionPatch) -> Result<Intention> {
@@ -717,4 +882,62 @@ fn decode_intention_snapshot(columns: &[String], row: &[Value]) -> Result<Intent
         valid_from,
         valid_to,
     })
+}
+
+fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation> {
+    let resolution_decision_id =
+        match super::encode::column_index(columns, "resolution_decision_id")
+            .ok()
+            .and_then(|idx| row.get(idx))
+        {
+            Some(Value::Uuid(u)) => Some(DecisionId::from(*u)),
+            _ => None,
+        };
+    Ok(Invalidation {
+        id: InvalidationId::from(get_uuid(row, columns, "id")?),
+        status: invalidation_status_from_str(&get_text(row, columns, "status")?)?,
+        affected_decision_id: DecisionId::from(get_uuid(row, columns, "affected_decision_id")?),
+        trigger_observation_id: ObservationId::from(get_uuid(
+            row,
+            columns,
+            "trigger_observation_id",
+        )?),
+        basis_diff: properties_from_json(&get_json(row, columns, "basis_diff")?),
+        severity: invalidation_severity_from_str(&get_text(row, columns, "severity")?)?,
+        detected_at: get_txid(row, columns, "detected_at")?,
+        resolved_at: get_optional_txid(row, columns, "resolved_at")?,
+        resolution_action: get_optional_text(row, columns, "resolution_action")?,
+        resolution_decision_id,
+    })
+}
+
+fn invalidation_status_from_str(s: &str) -> Result<InvalidationStatus> {
+    match s {
+        "pending" => Ok(InvalidationStatus::Pending),
+        "acknowledged" => Ok(InvalidationStatus::Acknowledged),
+        "resolved" => Ok(InvalidationStatus::Resolved),
+        "dismissed" => Ok(InvalidationStatus::Dismissed),
+        other => Err(CgError::Engine(format!(
+            "unknown invalidation status: {other}"
+        ))),
+    }
+}
+
+fn invalidation_severity_from_str(s: &str) -> Result<InvalidationSeverity> {
+    match s {
+        "info" => Ok(InvalidationSeverity::Info),
+        "warning" => Ok(InvalidationSeverity::Warning),
+        "critical" => Ok(InvalidationSeverity::Critical),
+        other => Err(CgError::Engine(format!(
+            "unknown invalidation severity: {other}"
+        ))),
+    }
+}
+
+fn severity_rank(severity: InvalidationSeverity) -> u8 {
+    match severity {
+        InvalidationSeverity::Info => 0,
+        InvalidationSeverity::Warning => 1,
+        InvalidationSeverity::Critical => 2,
+    }
 }

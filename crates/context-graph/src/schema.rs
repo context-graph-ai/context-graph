@@ -6,6 +6,13 @@ pub struct TableSpec {
     pub ddl: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IndexSpec {
+    pub table: &'static str,
+    pub name: &'static str,
+    pub ddl: &'static str,
+}
+
 pub const TABLES: &[TableSpec] = &[
     TableSpec {
         name: "contexts",
@@ -66,5 +73,18 @@ pub const TABLES: &[TableSpec] = &[
     TableSpec {
         name: "audit_log",
         ddl: "CREATE TABLE audit_log (id UUID PRIMARY KEY, txid TXID NOT NULL, operation TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, target_kind TEXT NOT NULL, target_id UUID NOT NULL, context_id UUID NOT NULL REFERENCES contexts(id), payload JSON)",
+    },
+];
+
+pub const INDEXES: &[IndexSpec] = &[
+    IndexSpec {
+        table: "edges",
+        name: "idx_edges_source_context_type",
+        ddl: "CREATE INDEX idx_edges_source_context_type ON edges (source_id, context_id, edge_type)",
+    },
+    IndexSpec {
+        table: "edges",
+        name: "idx_edges_target_context_type",
+        ddl: "CREATE INDEX idx_edges_target_context_type ON edges (target_id, context_id, edge_type)",
     },
 ];

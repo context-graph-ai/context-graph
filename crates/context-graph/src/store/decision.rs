@@ -64,6 +64,20 @@ impl Store {
                 })?;
             basis_snapshots.insert(*eid, snap);
         }
+        for pid in &input.precedent_ids {
+            if !pid.is_valid() {
+                return Err(CgError::InvalidIdentity {
+                    context: "DecisionId",
+                });
+            }
+            let precedent_context = self.decision_context_id(*pid)?.ok_or(CgError::NotFound {
+                id: Some(pid.as_uuid().to_string()),
+                missing: Some("decision"),
+            })?;
+            if precedent_context != input.context_id {
+                return Err(CgError::CrossContextRelationship);
+            }
+        }
 
         let id = DecisionId::new_v7();
         let reasoning_json = serde_json::to_value(&input.reasoning)
@@ -157,6 +171,19 @@ impl Store {
                 return Err(e);
             }
         }
+        for pid in &input.precedent_ids {
+            if let Err(e) = self.insert_edge_in_tx(
+                tx,
+                id.as_uuid(),
+                pid.as_uuid(),
+                "CITES",
+                input.context_id,
+                None,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+        }
         if let Err(e) = self.record_audit_in_tx(
             tx,
             AuditOperation::Create,
@@ -184,6 +211,7 @@ impl Store {
             );
         }
 
+        let precedent_ids = self.precedents_for_decision(id, input.context_id)?;
         Ok(Decision {
             id,
             decision_type: input.decision_type,
@@ -199,7 +227,7 @@ impl Store {
             intention_ids: input.intention_ids,
             based_on_snapshots: out_basis,
             outcome: None,
-            precedent_ids: Vec::new(),
+            precedent_ids,
         })
     }
 
@@ -226,6 +254,7 @@ impl Store {
         decision.intention_ids = self.intentions_for_decision(id)?;
         decision.based_on_snapshots = self.basis_snapshots_for_decision(id)?;
         decision.outcome = self.outcome_for_decision(id)?;
+        decision.precedent_ids = self.precedents_for_decision(id, decision.context_id)?;
         Ok(Some(decision))
     }
 
@@ -314,6 +343,15 @@ impl Store {
             return Ok(None);
         }
         Some(decode_outcome(&result.columns, &result.rows[0])).transpose()
+    }
+
+    pub(super) fn precedents_for_decision(
+        &self,
+        id: DecisionId,
+        context_id: ContextId,
+    ) -> Result<Vec<DecisionId>> {
+        let targets = self.edge_targets(context_id, id.as_uuid(), RelationshipType::Cites)?;
+        Ok(targets.into_iter().map(DecisionId::from).collect())
     }
 
     pub fn list_decisions(&self, filter: ListDecisionFilter) -> Result<Vec<Decision>> {
@@ -614,6 +652,20 @@ impl Store {
                 })?;
             basis_snapshots.insert(*eid, snap);
         }
+        for pid in &new.precedent_ids {
+            if !pid.is_valid() {
+                return Err(CgError::InvalidIdentity {
+                    context: "DecisionId",
+                });
+            }
+            let precedent_context = self.decision_context_id(*pid)?.ok_or(CgError::NotFound {
+                id: Some(pid.as_uuid().to_string()),
+                missing: Some("decision"),
+            })?;
+            if precedent_context != new.context_id {
+                return Err(CgError::CrossContextRelationship);
+            }
+        }
 
         let new_id = DecisionId::new_v7();
         let reasoning_json = serde_json::to_value(&new.reasoning)
@@ -729,6 +781,19 @@ impl Store {
                 return Err(e);
             }
         }
+        for pid in &new.precedent_ids {
+            if let Err(e) = self.insert_edge_in_tx(
+                tx,
+                new_id.as_uuid(),
+                pid.as_uuid(),
+                "CITES",
+                new.context_id,
+                None,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+        }
         if let Err(e) = self.insert_edge_in_tx(
             tx,
             new_id.as_uuid(),
@@ -776,6 +841,7 @@ impl Store {
                 },
             );
         }
+        let precedent_ids = self.precedents_for_decision(new_id, new.context_id)?;
         Ok(Decision {
             id: new_id,
             decision_type: new.decision_type,
@@ -791,7 +857,7 @@ impl Store {
             intention_ids: new.intention_ids,
             based_on_snapshots: out_basis,
             outcome: None,
-            precedent_ids: Vec::new(),
+            precedent_ids,
         })
     }
 
@@ -828,26 +894,73 @@ impl Store {
         Ok(out)
     }
 
-    pub fn precedent_chain(
-        &self,
-        decision_id: DecisionId,
-        _max_depth: u8,
-    ) -> Result<Vec<Decision>> {
-        // Wrong: return the start decision only (ignoring max_depth validation
-        // AND the chain). Drives precedent_chain_walks_cites (len != 2),
-        // precedent_chain_deep (len != 8), precedent_chain_depth_cap_rejects_over_ten
-        // (InvalidDepth match fails since Ok is returned), and
-        // precedent_chain_cycle_rejected_at_create (post-reopen chain shape fails).
-        let d = self.get_decision(decision_id)?.ok_or(CgError::NotFound {
+    pub fn precedent_chain(&self, decision_id: DecisionId, max_depth: u8) -> Result<Vec<Decision>> {
+        self.validate_graph_depth(max_depth)?;
+        let start = self.get_decision(decision_id)?.ok_or(CgError::NotFound {
             id: Some(decision_id.as_uuid().to_string()),
             missing: Some("decision"),
         })?;
-        Ok(vec![d])
+        let context_id = start.context_id;
+        let mut out = vec![start];
+        if max_depth == 0 {
+            return Ok(out);
+        }
+
+        let mut visited: HashSet<DecisionId> = [decision_id].into_iter().collect();
+        let mut frontier = vec![decision_id.as_uuid()];
+        for _hop in 1..=max_depth {
+            let edges =
+                self.edges_from_sources(context_id, &frontier, Some(RelationshipType::Cites))?;
+            let mut candidates = Vec::new();
+            for (_source, target, _) in edges {
+                let target_id = DecisionId::from(target);
+                if visited.insert(target_id)
+                    && let Some(decision) = self.get_decision(target_id)?
+                    && decision.context_id == context_id
+                {
+                    candidates.push(decision);
+                }
+            }
+            if candidates.is_empty() {
+                break;
+            }
+            candidates.sort_by(|a, b| {
+                a.created_at
+                    .0
+                    .cmp(&b.created_at.0)
+                    .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+            });
+            frontier = candidates.iter().map(|d| d.id.as_uuid()).collect();
+            out.extend(candidates);
+        }
+        Ok(out)
     }
 
-    pub fn admin_raw_insert_cites(&self, _from: DecisionId, _to: DecisionId) -> Result<()> {
-        // Wrong: accept the cycle-closing edge without refusal. Drives
-        // precedent_chain_cycle_rejected_at_create on the CyclicCitation match.
+    pub fn admin_raw_insert_cites(&self, from: DecisionId, to: DecisionId) -> Result<()> {
+        let from_context = self.decision_context_id(from)?.ok_or(CgError::NotFound {
+            id: Some(from.as_uuid().to_string()),
+            missing: Some("from"),
+        })?;
+        let to_context = self.decision_context_id(to)?.ok_or(CgError::NotFound {
+            id: Some(to.as_uuid().to_string()),
+            missing: Some("to"),
+        })?;
+        if from_context != to_context {
+            return Err(CgError::CrossContextRelationship);
+        }
+        let tx = self.db.begin();
+        if let Err(e) = self.insert_edge_in_tx(
+            tx,
+            from.as_uuid(),
+            to.as_uuid(),
+            "CITES",
+            from_context,
+            None,
+        ) {
+            let _ = self.db.rollback(tx);
+            return Err(e);
+        }
+        self.db.commit(tx).map_err(map_engine_err)?;
         Ok(())
     }
 

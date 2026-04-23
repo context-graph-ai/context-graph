@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use contextdb_core::Value;
 use serde_json::Value as JsonValue;
@@ -16,6 +16,7 @@ use super::encode::{
     get_json, get_optional_txid, get_text, get_txid, get_uuid, properties_from_json,
     properties_to_json, tags_from_json,
 };
+use super::relationship::uuid_or_clause;
 
 impl Store {
     pub fn create_entity(&self, input: CreateEntity) -> Result<Entity> {
@@ -459,16 +460,161 @@ impl Store {
         })
     }
 
-    pub fn entity_neighborhood(&self, _entity_id: EntityId, _depth: u8) -> Result<Neighborhood> {
-        // Wrong: return empty collections and skip the depth-cap check.
-        // Drives entity_neighborhood_returns_everything_connected (set mismatch),
-        // subgraph_decisions_by_depth (entity set mismatch),
-        // and subgraph_hard_cap_ten (Ok instead of InvalidDepth).
+    pub fn entity_neighborhood(&self, entity_id: EntityId, depth: u8) -> Result<Neighborhood> {
+        self.validate_graph_depth(depth)?;
+        let hub = self.get_entity(entity_id)?.ok_or(CgError::NotFound {
+            id: Some(entity_id.as_uuid().to_string()),
+            missing: Some("entity"),
+        })?;
+        let mut visited: HashSet<EntityId> = [entity_id].into_iter().collect();
+        let mut frontier = vec![entity_id.as_uuid()];
+        for _hop in 1..=depth {
+            let edges = self.edges_touching_entities(hub.context_id, &frontier)?;
+            let mut next_frontier = Vec::new();
+            for (source, target) in edges {
+                let other = if frontier.contains(&source) {
+                    target
+                } else if frontier.contains(&target) {
+                    source
+                } else {
+                    continue;
+                };
+                let other_id = EntityId::from(other);
+                if visited.contains(&other_id) {
+                    continue;
+                }
+                if let Some(entity) = self.get_entity(other_id)?
+                    && entity.context_id == hub.context_id
+                {
+                    visited.insert(other_id);
+                    next_frontier.push(other);
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        let mut entities = Vec::with_capacity(visited.len());
+        for id in &visited {
+            if let Some(entity) = self.get_entity(*id)?
+                && entity.context_id == hub.context_id
+            {
+                entities.push(entity);
+            }
+        }
+        entities.sort_by(|a, b| {
+            a.created_at
+                .0
+                .cmp(&b.created_at.0)
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+        });
+
+        let mut decisions = self.decisions_based_on_entities(hub.context_id, &visited)?;
+        decisions.sort_by(|a, b| {
+            a.created_at
+                .0
+                .cmp(&b.created_at.0)
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+        });
+
+        let mut intention_ids = BTreeMap::new();
+        for decision in &decisions {
+            for iid in &decision.intention_ids {
+                intention_ids.insert(*iid, ());
+            }
+        }
+        let mut intentions = Vec::new();
+        for iid in intention_ids.keys() {
+            if let Some(intention) = self.get_intention(*iid)?
+                && intention.context_id == hub.context_id
+            {
+                intentions.push(intention);
+            }
+        }
+        intentions.sort_by(|a, b| {
+            a.created_at
+                .0
+                .cmp(&b.created_at.0)
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+        });
+
         Ok(Neighborhood {
-            entities: Vec::new(),
-            decisions: Vec::new(),
-            intentions: Vec::new(),
+            entities,
+            decisions,
+            intentions,
         })
+    }
+
+    fn edges_touching_entities(
+        &self,
+        context_id: ContextId,
+        entity_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Uuid)>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut params: HashMap<String, Value> =
+            [("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]
+                .into_iter()
+                .collect();
+        let source_clause = uuid_or_clause("source_id", "source", entity_ids, &mut params);
+        let target_clause = uuid_or_clause("target_id", "target", entity_ids, &mut params);
+        let sql = format!(
+            "SELECT source_id, target_id FROM edges WHERE context_id = $context_id AND (({source_clause}) OR ({target_clause}))"
+        );
+        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            let source = match row.first() {
+                Some(Value::Uuid(u)) => *u,
+                _ => continue,
+            };
+            let target = match row.get(1) {
+                Some(Value::Uuid(u)) => *u,
+                _ => continue,
+            };
+            out.push((source, target));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    fn decisions_based_on_entities(
+        &self,
+        context_id: ContextId,
+        entity_ids: &HashSet<EntityId>,
+    ) -> Result<Vec<Decision>> {
+        if entity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uuids: Vec<Uuid> = entity_ids.iter().map(|id| id.as_uuid()).collect();
+        let mut params: HashMap<String, Value> = [
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+            ("edge_type".to_string(), Value::Text("BASED_ON".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let target_clause = uuid_or_clause("target_id", "entity", &uuids, &mut params);
+        let sql = format!(
+            "SELECT source_id FROM edges WHERE context_id = $context_id AND edge_type = $edge_type AND ({target_clause})"
+        );
+        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for row in &result.rows {
+            if let Some(Value::Uuid(u)) = row.first() {
+                let decision_id = DecisionId::from(*u);
+                if seen.insert(decision_id)
+                    && let Some(decision) = self.get_decision(decision_id)?
+                    && decision.context_id == context_id
+                {
+                    out.push(decision);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
