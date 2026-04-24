@@ -42,7 +42,6 @@ impl Store {
             }
         }
 
-        let mut basis_snapshots: BTreeMap<EntityId, EntitySnapshot> = BTreeMap::new();
         for eid in &input.based_on_entity_ids {
             if !eid.is_valid() {
                 return Err(CgError::InvalidIdentity {
@@ -56,13 +55,6 @@ impl Store {
             if entity.context_id != input.context_id {
                 return Err(CgError::CrossContextViolation);
             }
-            let snap = self
-                .current_entity_snapshot(*eid)?
-                .ok_or(CgError::NotFound {
-                    id: Some(eid.as_uuid().to_string()),
-                    missing: Some("entity_snapshot"),
-                })?;
-            basis_snapshots.insert(*eid, snap);
         }
         for pid in &input.precedent_ids {
             if !pid.is_valid() {
@@ -92,6 +84,16 @@ impl Store {
         let properties_json = properties_to_json(&input.properties);
 
         let tx = self.db.begin();
+        let mut basis_snapshots: BTreeMap<EntityId, EntitySnapshot> = BTreeMap::new();
+        for eid in &input.based_on_entity_ids {
+            let snap = self
+                .current_entity_snapshot_in_tx(tx, *eid)?
+                .ok_or(CgError::NotFound {
+                    id: Some(eid.as_uuid().to_string()),
+                    missing: Some("entity_snapshot"),
+                })?;
+            basis_snapshots.insert(*eid, snap);
+        }
         let confidence_value = match input.confidence {
             Some(c) => Value::Float64(c as f64),
             None => Value::Null,
@@ -634,7 +636,6 @@ impl Store {
                 None => return Err(CgError::IntentionNotFound { id: *iid }),
             }
         }
-        let mut basis_snapshots: BTreeMap<EntityId, EntitySnapshot> = BTreeMap::new();
         for eid in &new.based_on_entity_ids {
             if !eid.is_valid() {
                 return Err(CgError::InvalidIdentity {
@@ -648,13 +649,6 @@ impl Store {
             if entity.context_id != new.context_id {
                 return Err(CgError::CrossContextViolation);
             }
-            let snap = self
-                .current_entity_snapshot(*eid)?
-                .ok_or(CgError::NotFound {
-                    id: Some(eid.as_uuid().to_string()),
-                    missing: Some("entity_snapshot"),
-                })?;
-            basis_snapshots.insert(*eid, snap);
         }
         for pid in &new.precedent_ids {
             if !pid.is_valid() {
@@ -683,6 +677,16 @@ impl Store {
         let properties_json = properties_to_json(&new.properties);
 
         let tx = self.db.begin();
+        let mut basis_snapshots: BTreeMap<EntityId, EntitySnapshot> = BTreeMap::new();
+        for eid in &new.based_on_entity_ids {
+            let snap = self
+                .current_entity_snapshot_in_tx(tx, *eid)?
+                .ok_or(CgError::NotFound {
+                    id: Some(eid.as_uuid().to_string()),
+                    missing: Some("entity_snapshot"),
+                })?;
+            basis_snapshots.insert(*eid, snap);
+        }
         // Transition old decision to superseded.
         let transition_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(old.as_uuid())),
@@ -1125,16 +1129,106 @@ impl Store {
     }
 
     pub fn replay(&self, id: DecisionId) -> Result<ReplayResult> {
+        let decision = self.get_decision(id)?.ok_or(CgError::NotFound {
+            id: Some(id.as_uuid().to_string()),
+            missing: Some("decision"),
+        })?;
+
+        let mut input_diffs = Vec::with_capacity(decision.based_on_snapshots.len());
+        let mut changed_input_count = 0_u32;
+        for (entity_id, basis_snapshot) in &decision.based_on_snapshots {
+            if let Some(entity) = self.get_entity(*entity_id)?
+                && entity.context_id != decision.context_id
+            {
+                return Err(CgError::CrossContextViolation);
+            }
+
+            let latest_snapshot = match self.current_entity_snapshot(*entity_id)? {
+                Some(snapshot) => Some(snapshot),
+                None => self.entity_history(*entity_id)?.into_iter().last(),
+            };
+            let field_changes =
+                replay_field_changes(Some(basis_snapshot), latest_snapshot.as_ref());
+            let changed = !field_changes.is_empty();
+            if changed {
+                changed_input_count += 1;
+            }
+            input_diffs.push(InputDiff {
+                entity_id: *entity_id,
+                entity_name: basis_snapshot.name.clone(),
+                changed,
+                field_changes,
+                changed_at: changed.then(|| {
+                    latest_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.valid_from)
+                        .unwrap_or(decision.created_at)
+                }),
+            });
+        }
+        input_diffs.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+
+        let mut cited_intention_snapshots = Vec::with_capacity(decision.intention_ids.len());
+        for intention_id in &decision.intention_ids {
+            if let Some(intention) = self.get_intention(*intention_id)?
+                && intention.context_id != decision.context_id
+            {
+                return Err(CgError::CrossContextViolation);
+            }
+            let snapshot = self
+                .intention_at(*intention_id, decision.created_at)?
+                .ok_or_else(|| {
+                    CgError::Engine(format!(
+                        "data-integrity: SERVES edge to intention {} has no snapshot covering decision {}.created_at {}",
+                        intention_id,
+                        decision.id,
+                        decision.created_at.0
+                    ))
+                })?;
+            cited_intention_snapshots.push(snapshot);
+        }
+        cited_intention_snapshots.sort_by(|a, b| a.intention_id.cmp(&b.intention_id));
+
+        let unchanged_input_count = input_diffs.len() as u32 - changed_input_count;
         Ok(ReplayResult {
             decision_id: id,
-            original_outcome: None,
-            inputs_changed: false,
-            changed_input_count: 0,
-            unchanged_input_count: 0,
-            input_diffs: vec![],
-            cited_intention_snapshots: vec![],
+            original_outcome: decision.outcome.as_ref().map(|outcome| outcome.success),
+            inputs_changed: changed_input_count > 0,
+            changed_input_count,
+            unchanged_input_count,
+            input_diffs,
+            cited_intention_snapshots,
         })
     }
+}
+
+fn replay_field_changes(
+    basis_snapshot: Option<&EntitySnapshot>,
+    latest_snapshot: Option<&EntitySnapshot>,
+) -> Vec<FieldChange> {
+    let mut fields = std::collections::BTreeSet::new();
+    if let Some(snapshot) = basis_snapshot {
+        fields.extend(snapshot.properties.keys().cloned());
+    }
+    if let Some(snapshot) = latest_snapshot {
+        fields.extend(snapshot.properties.keys().cloned());
+    }
+
+    let mut changes = Vec::new();
+    for field in fields {
+        let old_value =
+            basis_snapshot.and_then(|snapshot| snapshot.properties.get(&field).cloned());
+        let new_value =
+            latest_snapshot.and_then(|snapshot| snapshot.properties.get(&field).cloned());
+        if old_value != new_value {
+            changes.push(FieldChange {
+                field,
+                old_value,
+                new_value,
+            });
+        }
+    }
+    changes
 }
 
 fn decode_decision(columns: &[String], row: &[Value]) -> Result<Decision> {

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use contextdb_core::Value;
 use serde_json::Value as JsonValue;
@@ -256,6 +256,35 @@ impl Store {
         Ok(None)
     }
 
+    pub(super) fn current_entity_snapshot_in_tx(
+        &self,
+        tx: TxId,
+        id: EntityId,
+    ) -> Result<Option<EntitySnapshot>> {
+        if !id.is_valid() {
+            return Err(CgError::InvalidIdentity {
+                context: "EntityId",
+            });
+        }
+        let params: HashMap<String, Value> = [("entity_id".to_string(), Value::Uuid(id.as_uuid()))]
+            .into_iter()
+            .collect();
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut snaps: Vec<EntitySnapshot> = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            snaps.push(decode_snapshot(&result.columns, row)?);
+        }
+        snaps.sort_by_key(|s| s.valid_from.0);
+        Ok(snaps.into_iter().rev().find(|snap| snap.valid_to.is_none()))
+    }
+
     pub fn state_at(&self, id: EntityId, txid: TxId) -> Result<Option<EntitySnapshot>> {
         if !id.is_valid() {
             return Err(CgError::InvalidIdentity {
@@ -376,9 +405,15 @@ impl Store {
         }
         self.db.commit(tx).map_err(map_engine_err)?;
 
-        self.get_entity(id)?.ok_or(CgError::NotFound {
-            id: Some(id.as_uuid().to_string()),
-            missing: Some("entity"),
+        Ok(Entity {
+            id,
+            entity_type: current.entity_type,
+            name: new_name,
+            properties: new_properties,
+            tags: new_tags,
+            context_id: current.context_id,
+            status: current.status,
+            created_at: current.created_at,
         })
     }
 
@@ -622,20 +657,154 @@ impl Store {
         target_id: EntityId,
         from: TxId,
         to: TxId,
-        _include_related: bool,
+        include_related: bool,
     ) -> Result<TemporalDiff> {
+        let target = self.get_entity(target_id)?.ok_or(CgError::NotFound {
+            id: Some(target_id.as_uuid().to_string()),
+            missing: Some("entity"),
+        })?;
+
+        let mut candidate_ids = BTreeSet::new();
+        if include_related {
+            let related =
+                self.edges_from_sources(target.context_id, &[target_id.as_uuid()], None)?;
+            for (_source, target, _rel) in related {
+                candidate_ids.insert(EntityId::from(target));
+            }
+        } else {
+            candidate_ids.insert(target_id);
+        }
+
+        let mut changes = Vec::new();
+        let mut unchanged = Vec::new();
+        for entity_id in candidate_ids {
+            let before = self.state_at(entity_id, from)?;
+            let after = self.state_at(entity_id, to)?;
+            let window_activity = self.snapshot_activity_in_window(entity_id, from, to)?;
+            let Some(entry) = build_entity_diff_entry(
+                entity_id,
+                before.as_ref(),
+                after.as_ref(),
+                &window_activity,
+            ) else {
+                continue;
+            };
+            if entry.field_changes.is_empty() {
+                if include_related {
+                    unchanged.push(entry);
+                }
+            } else {
+                changes.push(entry);
+            }
+        }
+
         Ok(TemporalDiff {
             target_id,
             from,
             to,
-            changes: vec![EntityDiffEntry {
-                entity_id: target_id,
-                entity_name: String::new(),
-                field_changes: vec![],
-            }],
-            unchanged: vec![],
+            changes,
+            unchanged,
         })
     }
+
+    fn snapshot_activity_in_window(
+        &self,
+        entity_id: EntityId,
+        from: TxId,
+        to: TxId,
+    ) -> Result<Vec<EntitySnapshot>> {
+        let start = from.0.min(to.0);
+        let end = from.0.max(to.0);
+        let params: HashMap<String, Value> =
+            [("entity_id".to_string(), Value::Uuid(entity_id.as_uuid()))]
+                .into_iter()
+                .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut snaps = Vec::new();
+        for row in &result.rows {
+            let snap = decode_snapshot(&result.columns, row)?;
+            let created_in_window = snap.valid_from.0 > start && snap.valid_from.0 <= end;
+            let archived_in_window = snap
+                .valid_to
+                .map(|valid_to| valid_to.0 > start && valid_to.0 <= end)
+                .unwrap_or(false);
+            if created_in_window || archived_in_window {
+                snaps.push(snap);
+            }
+        }
+        snaps.sort_by_key(|snap| snap.valid_from.0);
+        Ok(snaps)
+    }
+}
+
+fn build_entity_diff_entry(
+    entity_id: EntityId,
+    before: Option<&EntitySnapshot>,
+    after: Option<&EntitySnapshot>,
+    window_activity: &[EntitySnapshot],
+) -> Option<EntityDiffEntry> {
+    let entity_name = before
+        .map(|snapshot| snapshot.name.clone())
+        .or_else(|| after.map(|snapshot| snapshot.name.clone()))
+        .or_else(|| window_activity.last().map(|snapshot| snapshot.name.clone()))?;
+    let field_changes = entity_field_changes(before, after, window_activity);
+    Some(EntityDiffEntry {
+        entity_id,
+        entity_name,
+        field_changes,
+    })
+}
+
+fn entity_field_changes(
+    before: Option<&EntitySnapshot>,
+    after: Option<&EntitySnapshot>,
+    window_activity: &[EntitySnapshot],
+) -> Vec<FieldChange> {
+    let mut fields = BTreeSet::new();
+    if let Some(snapshot) = before {
+        fields.extend(snapshot.properties.keys().cloned());
+    }
+    if let Some(snapshot) = after {
+        fields.extend(snapshot.properties.keys().cloned());
+    }
+    for snapshot in window_activity {
+        fields.extend(snapshot.properties.keys().cloned());
+    }
+
+    let mut changes = Vec::new();
+    for field in fields {
+        let old_value = before.and_then(|snapshot| snapshot.properties.get(&field).cloned());
+        let new_value = after.and_then(|snapshot| snapshot.properties.get(&field).cloned());
+        if old_value != new_value {
+            changes.push(FieldChange {
+                field,
+                old_value,
+                new_value,
+            });
+            continue;
+        }
+
+        if old_value.is_none() && new_value.is_none() && !window_activity.is_empty() {
+            let transitioned_value = window_activity
+                .iter()
+                .rev()
+                .find_map(|snapshot| snapshot.properties.get(&field).cloned());
+            if transitioned_value.is_some() {
+                changes.push(FieldChange {
+                    field,
+                    old_value: transitioned_value,
+                    new_value: None,
+                });
+            }
+        }
+    }
+    changes
 }
 
 fn decode_entity(columns: &[String], row: &[Value]) -> Result<Entity> {
