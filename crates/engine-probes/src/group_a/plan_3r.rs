@@ -359,6 +359,11 @@ fn evidence_availability_log_txid_column_auto_advances_per_engine_clock() {
     let db = open_3r_schema();
     let evidence_id = Uuid::new_v4();
 
+    // Capture watermark BEFORE the inserts. Each stamped TxId must satisfy
+    // pre.0 < t.0 <= post.0 — i.e., come from the engine's TX-manager
+    // clock, NOT a wall-clock or caller-supplied source.
+    let pre = db.committed_watermark();
+
     db.execute(
         "INSERT INTO evidence_availability_log (id, evidence_id, status) VALUES ($id, $eid, 'present')",
         &params(vec![
@@ -375,6 +380,8 @@ fn evidence_availability_log_txid_column_auto_advances_per_engine_clock() {
         ]),
     )
     .unwrap();
+
+    let post = db.committed_watermark();
 
     let rows = db
         .execute(
@@ -394,10 +401,29 @@ fn evidence_availability_log_txid_column_auto_advances_per_engine_clock() {
             ),
         })
         .collect();
+    // Strict monotonic per insert order — wall-clock-derived stamps would
+    // happen to be distinct but cannot be guaranteed monotonic w.r.t. tx
+    // commit order. Tx-manager clock IS monotonic by construction.
     assert!(
-        ts[0] != ts[1],
-        "two distinct commits must produce distinct TxIds; got {ts:?}"
+        ts[1] > ts[0],
+        "stamped TxIds must be strictly monotonic per insert order; got {ts:?}"
     );
+    // Each stamped TxId must lie in (pre, post] — the bounds set by the
+    // engine's TX-manager around the two commits. This binds the stamp to
+    // the TX manager's clock, ruling out wall-clock or arbitrary-u64
+    // sources that happen to produce distinct increasing values.
+    for (i, t) in ts.iter().enumerate() {
+        assert!(
+            *t > pre.0,
+            "stamped TxId[{i}]={t} must be > pre-insert watermark={}; engine clock did not advance",
+            pre.0
+        );
+        assert!(
+            *t <= post.0,
+            "stamped TxId[{i}]={t} must be <= post-insert watermark={}; stamp came from outside the TX manager's clock",
+            post.0
+        );
+    }
 }
 
 /// 3R single-primitive: writer-supplied TXID column round-trips. If the
@@ -488,6 +514,118 @@ fn decisions_based_on_snapshots_json_round_trip() {
         ),
         "JSON array order must round-trip"
     );
+}
+
+/// 3R concurrent JSON column round-trip: N concurrent UPDATEs against the
+/// SAME decision row, each writer supplying a distinct JSON payload. The
+/// final read-back JSON must equal exactly ONE writer's input — no torn
+/// JSON value (lens (c) for JSON column class). Wrong-impl shapes caught:
+///   - byte-level interleaving: read-back JSON parses but contains
+///     fragments from multiple writers (e.g. half of writer-A's array
+///     prefix joined to half of writer-B's array suffix).
+///   - silent key-level merge: engine's JSON storage merges keys across
+///     concurrent UPDATEs, producing a JSON object with both writers'
+///     "snapshots" arrays concatenated rather than one winning.
+///   - parse failure on read: torn bytes produce a JSON that fails to
+///     deserialize — surfaced as panic in the unwrap below.
+#[test]
+fn decisions_based_on_snapshots_json_round_trip_concurrent_writers() {
+    let db = Arc::new(open_3r_schema());
+    let id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO decisions (id, status, based_on_snapshots) VALUES ($id, 'active', $j)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            (
+                "j",
+                Value::Json(serde_json::json!({"snapshots": [], "writer": "seed"})),
+            ),
+        ]),
+    )
+    .unwrap();
+
+    const N: usize = 6;
+    let barrier = Arc::new(Barrier::new(N));
+    // Each writer's payload is uniquely identifiable: snapshots-array of
+    // length i+1 carrying its own marker UUIDs; "writer" key tags source.
+    let payloads: Vec<serde_json::Value> = (0..N)
+        .map(|i| {
+            let snap_ids: Vec<String> =
+                (0..(i + 1)).map(|_| Uuid::new_v4().to_string()).collect();
+            serde_json::json!({
+                "snapshots": snap_ids,
+                "writer": format!("writer_{i}"),
+            })
+        })
+        .collect();
+    let payloads_arc = Arc::new(payloads.clone());
+
+    let mut handles = vec![];
+    for i in 0..N {
+        let db = db.clone();
+        let barrier = barrier.clone();
+        let payloads = payloads_arc.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            db.execute(
+                "UPDATE decisions SET based_on_snapshots = $j WHERE id = $id",
+                &params(vec![
+                    ("id", Value::Uuid(id)),
+                    ("j", Value::Json(payloads[i].clone())),
+                ]),
+            )
+        }));
+    }
+    for h in handles {
+        let _ = h.join().unwrap();
+    }
+
+    let rows = db
+        .execute(
+            "SELECT based_on_snapshots FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_eq!(rows.rows.len(), 1, "single decision row must persist");
+    let read = match &rows.rows[0][0] {
+        Value::Json(v) => v.clone(),
+        other => panic!("expected JSON column, got {other:?}"),
+    };
+
+    // The read-back value must equal exactly one writer's input — no
+    // partial merge, no torn fragments. structural equality across the
+    // candidate set rules out both byte-level torn JSON and silent
+    // key-level merge.
+    let matches = payloads.iter().any(|p| p == &read);
+    assert!(
+        matches,
+        "concurrent UPDATEs to JSON column must yield one writer's input verbatim; \
+         read-back={read} matched no writer payload — torn JSON or silent merge"
+    );
+
+    // Additional guard: read-back must NOT contain a "writer" value of
+    // "seed" (the initial INSERT's marker). If it does, no writer's
+    // UPDATE took effect — silent loss of all six concurrent UPDATEs.
+    let writer_tag = read.get("writer").and_then(|v| v.as_str()).unwrap_or("");
+    assert_ne!(
+        writer_tag, "seed",
+        "read-back retained the seed payload; no concurrent UPDATE took effect"
+    );
+
+    // Guard against torn-array shape: snapshots must be an Array (not a
+    // half-formed object), and every element must be a String UUID-shape.
+    let snaps = read
+        .get("snapshots")
+        .expect("snapshots key must round-trip");
+    let snap_arr = snaps
+        .as_array()
+        .expect("snapshots must be a JSON Array, not torn into another type");
+    for elem in snap_arr {
+        assert!(
+            elem.is_string(),
+            "snapshot elements must be String UUIDs; got {elem} — torn array element"
+        );
+    }
 }
 
 /// 3R single-primitive: STATE MACHINE rejects `invalidated -> active`.
@@ -701,10 +839,14 @@ fn evidence_vector_dimension_mismatch_rejected_at_write() {
 // ---------- Concurrent-semantics probes ----------
 
 /// C-RT2 evidence_availability_log concurrent appends: four concurrent
-/// `update_evidence_retention_status` calls against the same evidence_id
-/// (each writer supplies its own TxId from `committed_watermark`). All
-/// four must persist; all four TxIds must be distinct. Wrong-impl: row
-/// loss, or two writers writing the same TxId.
+/// `update_evidence_retention_status` calls against the same evidence_id.
+/// Each writer obtains an engine-allocated TxId via `db.begin()` and stamps
+/// `recorded_at` with that TxId verbatim. All four must persist; all four
+/// TxIds MUST be pairwise distinct (since `begin()` allocates a fresh TxId
+/// per call from the TX manager's monotonic clock). Wrong-impl shapes
+/// caught: (i) row loss; (ii) engine accepts duplicate caller-supplied
+/// u64 values into a TXID column without uniqueness check; (iii) engine
+/// silently coerces one writer's TxId to match another.
 #[test]
 fn evidence_availability_log_concurrent_appends_both_persist() {
     let db = Arc::new(open_3r_schema());
@@ -720,40 +862,52 @@ fn evidence_availability_log_concurrent_appends_both_persist() {
         .unwrap();
     }
     let evidence_id = Uuid::new_v4();
+    let pre = db.committed_watermark();
     let barrier = Arc::new(Barrier::new(4));
 
     let mut handles = vec![];
     for i in 0..4 {
         let db = db.clone();
         let barrier = barrier.clone();
-        handles.push(thread::spawn(move || {
+        handles.push(thread::spawn(move || -> Result<TxId, Error> {
             let id = Uuid::new_v4();
             let status = format!("status_{i}");
-            // Each writer reads the watermark independently — concurrent
-            // writers will race the watermark advance.
-            let watermark = db.committed_watermark();
+            // Each writer obtains a fresh engine-allocated TxId via
+            // db.begin() — the TX manager guarantees these are pairwise
+            // distinct across all four writers, regardless of contention.
+            let tx = db.begin();
             barrier.wait();
-            db.execute(
+            let res = db.execute_in_tx(
+                tx,
                 "INSERT INTO evidence_availability_log (id, evidence_id, status, recorded_at) VALUES ($id, $eid, $st, $rec)",
                 &params(vec![
                     ("id", Value::Uuid(id)),
                     ("eid", Value::Uuid(evidence_id)),
                     ("st", Value::Text(status)),
-                    ("rec", Value::TxId(TxId(watermark.0))),
+                    ("rec", Value::TxId(tx)),
                 ]),
-            )
+            );
+            if let Err(e) = res {
+                let _ = db.rollback(tx);
+                return Err(e);
+            }
+            db.commit(tx).map(|_| tx)
         }));
     }
     let mut ok_count = 0;
+    let mut allocated_txids: Vec<u64> = vec![];
     for h in handles {
-        if h.join().unwrap().is_ok() {
+        if let Ok(tx) = h.join().unwrap() {
             ok_count += 1;
+            allocated_txids.push(tx.0);
         }
     }
     assert_eq!(
         ok_count, 4,
-        "all four concurrent appends must succeed (append-only no contention on row PK)"
+        "all four concurrent appends must succeed (append-only, no contention on row PK)"
     );
+
+    let post = db.committed_watermark();
 
     let rows = db
         .execute(
@@ -762,13 +916,35 @@ fn evidence_availability_log_concurrent_appends_both_persist() {
         )
         .unwrap();
     assert_eq!(rows.rows.len(), 4, "all four rows must be persisted");
+    let mut persisted_txids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for r in &rows.rows {
-        assert!(
-            matches!(r[0], Value::TxId(_)),
-            "recorded_at must round-trip as TxId, got {:?}",
-            r[0]
-        );
+        match r[0] {
+            Value::TxId(t) => {
+                persisted_txids.insert(t.0);
+                // Each persisted TxId must lie in (pre, post] — the bounds
+                // set by the TX manager around the four commits.
+                assert!(
+                    t.0 > pre.0,
+                    "persisted TxId={} must be > pre-spawn watermark={}",
+                    t.0, pre.0
+                );
+                assert!(
+                    t.0 <= post.0,
+                    "persisted TxId={} must be <= post-join watermark={}",
+                    t.0, post.0
+                );
+            }
+            ref other => panic!("recorded_at must round-trip as TxId, got {other:?}"),
+        }
     }
+    // Pairwise distinctness across all four writers. Wrong-impl that
+    // accepts duplicate caller-supplied u64 collapses HashSet to <4.
+    assert_eq!(
+        persisted_txids.len(),
+        4,
+        "all four persisted TxIds must be pairwise distinct; got {persisted_txids:?}; \
+         allocated by db.begin()={allocated_txids:?}"
+    );
 }
 
 /// C-RT3 conditional UPDATE under contention: 6 concurrent
@@ -986,32 +1162,48 @@ fn evidence_immutable_bypass_via_execute_in_tx_refused() {
     );
 }
 
-/// C-RT1 `record_observation` Serializable isolation: two concurrent
-/// observation+snapshot pipelines against the same entity_id must
-/// serialize. We model the snapshot constraint as `valid_to` non-overlap.
-/// This probe inserts two snapshots concurrently against the same entity
-/// and asserts no torn snapshot rows: every snapshot has a unique row_id
-/// and consistent valid_from/valid_to ordering.
+/// C-RT1 `record_observation` Serializable isolation: N concurrent
+/// observation+snapshot pipelines against the SAME entity_id with the
+/// SAME valid_from..valid_to range — overlap is forced by construction.
+/// The engine's snapshot contract for entity_snapshots is one of:
+///   (a) **contiguous-snapshot**: every writer creates a new row →
+///       N final rows, each with the same (valid_from, valid_to);
+///   (b) **merge-on-overlap**: engine deduplicates overlapping snapshots
+///       to a single canonical row → exactly 1 final row;
+///   (c) **conflict-rejection**: engine rejects all but one writer with
+///       a typed conflict error → exactly 1 final row + N-1 errors.
+/// Wrong-impl shapes caught:
+///   - torn rows: row carries thread-A's valid_from with thread-B's
+///     valid_to (cross-thread cell mixing — possible if inserts are not
+///     row-atomic under contention); detected by per-row width check.
+///   - row-count drift: engine commits some writers and silently drops
+///     others without an error signal; detected by reconciling
+///     ok_count vs final row count.
 #[test]
 fn record_observation_concurrent_snapshots_no_torn_rows() {
     let db = Arc::new(open_3r_schema());
     let entity_id = Uuid::new_v4();
     const N: usize = 4;
+    const VF: i64 = 100;
+    const VT: i64 = 200;
+    const WIDTH: i64 = VT - VF;
 
     let barrier = Arc::new(Barrier::new(N));
     let mut handles = vec![];
-    for i in 0..N as i64 {
+    for _ in 0..N {
         let db = db.clone();
         let barrier = barrier.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
+            // ALL writers target the same logical row (same entity_id,
+            // same valid_from, same valid_to) — overlap is forced.
             db.execute(
                 "INSERT INTO entity_snapshots (id, entity_id, valid_from, valid_to) VALUES ($id, $eid, $vf, $vt)",
                 &params(vec![
                     ("id", Value::Uuid(Uuid::new_v4())),
                     ("eid", Value::Uuid(entity_id)),
-                    ("vf", Value::Int64(i * 100)),
-                    ("vt", Value::Int64(i * 100 + 100)),
+                    ("vf", Value::Int64(VF)),
+                    ("vt", Value::Int64(VT)),
                 ]),
             )
         }));
@@ -1022,15 +1214,49 @@ fn record_observation_concurrent_snapshots_no_torn_rows() {
             ok_count += 1;
         }
     }
-    assert_eq!(ok_count, N, "all N concurrent snapshot inserts must succeed");
 
-    // No torn rows: row count equals N, all rows are visible at the latest snapshot.
+    // Read back every column; per-row width and entity_id must hold —
+    // this rules out cross-thread cell-mixing under contention regardless
+    // of which contract (a/b/c) the engine implements.
     let snap = db.snapshot();
     let rows = db.scan("entity_snapshots", snap).unwrap();
-    assert_eq!(
-        rows.len(),
-        N,
-        "all snapshot rows must be visible at the post-commit snapshot"
+    for r in &rows {
+        let vf = match r.values.get("valid_from") {
+            Some(Value::Int64(v)) => *v,
+            other => panic!("valid_from must round-trip as Int64; got {other:?}"),
+        };
+        let vt = match r.values.get("valid_to") {
+            Some(Value::Int64(v)) => *v,
+            other => panic!("valid_to must round-trip as Int64; got {other:?}"),
+        };
+        let eid = match r.values.get("entity_id") {
+            Some(Value::Uuid(u)) => *u,
+            other => panic!("entity_id must round-trip as Uuid; got {other:?}"),
+        };
+        assert_eq!(eid, entity_id, "entity_id must match the test entity; cross-row leakage detected");
+        assert_eq!(
+            vt - vf,
+            WIDTH,
+            "row width vt-vf must equal {WIDTH}; cross-thread cell mixing produced (vf={vf}, vt={vt})"
+        );
+        assert_eq!(vf, VF, "valid_from must equal {VF}; cross-thread cell mixing detected");
+        assert_eq!(vt, VT, "valid_to must equal {VT}; cross-thread cell mixing detected");
+    }
+
+    // Verify the actual contract the engine delivers. Exactly one of:
+    //   (a) contiguous: rows.len() == N AND ok_count == N
+    //   (b) merge:      rows.len() == 1 AND ok_count == N (silent dedup)
+    //   (c) reject:     rows.len() == 1 AND ok_count == 1 (N-1 errors)
+    let contract_a = rows.len() == N && ok_count == N;
+    let contract_b = rows.len() == 1 && ok_count == N;
+    let contract_c = rows.len() == 1 && ok_count == 1;
+    assert!(
+        contract_a || contract_b || contract_c,
+        "engine must deliver one of: contiguous-snapshot ({N} rows, {N} ok), \
+         merge-on-overlap (1 row, {N} ok), or conflict-rejection (1 row, 1 ok); \
+         got {} rows, {ok_count} ok — neither contract holds, which signals \
+         partial commit / silent row drop / row-count drift",
+        rows.len()
     );
 }
 
@@ -1159,23 +1385,33 @@ fn evidence_availability_log_reader_snapshot_consistent_under_writer() {
     let writer_db = db.clone();
     let writer_eid = evidence_id;
     let writer = thread::spawn(move || {
+        let mut emitted: Vec<u64> = vec![];
         for i in 0..32 {
-            let watermark = writer_db.committed_watermark();
+            // Each writer-step opens a fresh tx via begin() — engine
+            // allocates the next monotonic TxId; we stamp recorded_at
+            // with that value verbatim so the persisted column reflects
+            // the engine's TX-manager clock for THIS commit.
+            let tx = writer_db.begin();
             writer_db
-                .execute(
+                .execute_in_tx(
+                    tx,
                     "INSERT INTO evidence_availability_log (id, evidence_id, status, recorded_at) VALUES ($id, $eid, $st, $rec)",
                     &params(vec![
                         ("id", Value::Uuid(Uuid::new_v4())),
                         ("eid", Value::Uuid(writer_eid)),
                         ("st", Value::Text(format!("step_{i}"))),
-                        ("rec", Value::TxId(TxId(watermark.0))),
+                        ("rec", Value::TxId(tx)),
                     ]),
                 )
                 .unwrap();
+            writer_db.commit(tx).unwrap();
+            emitted.push(tx.0);
         }
+        emitted
     });
     let reader_db = db.clone();
     let reader = thread::spawn(move || {
+        let mut max_seen = 0u64;
         for _ in 0..16 {
             let rows = reader_db
                 .execute(
@@ -1183,26 +1419,93 @@ fn evidence_availability_log_reader_snapshot_consistent_under_writer() {
                     &params(vec![("eid", Value::Uuid(evidence_id))]),
                 )
                 .unwrap();
+            // Reader observation count must be monotonically non-decreasing
+            // in real-time (writer is append-only). Capture the highest
+            // TxId visible at each observation; max must never regress.
+            let mut local_max = 0u64;
             for r in &rows.rows {
-                assert!(
-                    matches!(r[0], Value::TxId(_)),
-                    "concurrent reader must see TxId column type, never torn variant; got {:?}",
-                    r[0]
-                );
+                match r[0] {
+                    Value::TxId(t) => {
+                        if t.0 > local_max {
+                            local_max = t.0;
+                        }
+                    }
+                    ref other => panic!(
+                        "concurrent reader must see TxId column type, never torn variant; got {other:?}"
+                    ),
+                }
             }
+            assert!(
+                local_max >= max_seen,
+                "reader's max-visible TxId must be monotonically non-decreasing; \
+                 prev={max_seen}, now={local_max} — snapshot regressed under concurrent writer"
+            );
+            max_seen = local_max;
         }
     });
 
-    writer.join().unwrap();
+    let writer_emitted = writer.join().unwrap();
     reader.join().unwrap();
 
     let final_rows = db
         .execute(
-            "SELECT recorded_at FROM evidence_availability_log WHERE evidence_id = $eid",
+            "SELECT id, status, recorded_at FROM evidence_availability_log WHERE evidence_id = $eid",
             &params(vec![("eid", Value::Uuid(evidence_id))]),
         )
         .unwrap();
     assert_eq!(final_rows.rows.len(), 33, "writer must commit all 32 rows + 1 seed");
+
+    // Sort all persisted recorded_at TxIds; assert strict-monotonic
+    // (no duplicates) and contiguity (no gaps larger than the engine's
+    // TX-allocation step). We bound the allocation step by the actual
+    // span over the 32 writer commits / 32 — gap > 4x mean step is the
+    // wrong-impl signal (TxIds non-monotonic w.r.t. commit order, or
+    // engine is allocating from a non-contiguous source).
+    let mut all_txids: Vec<u64> = final_rows
+        .rows
+        .iter()
+        .map(|r| match &r[2] {
+            Value::TxId(t) => t.0,
+            other => panic!("recorded_at must be TxId, got {other:?}"),
+        })
+        .collect();
+    all_txids.sort();
+    let n = all_txids.len();
+    // Strict-monotonic: no duplicates. Each commit allocates a unique TxId.
+    for w in all_txids.windows(2) {
+        assert!(
+            w[1] > w[0],
+            "persisted TxIds must be strictly monotonic when sorted; got duplicate at {w:?}"
+        );
+    }
+    // Contiguity: span / count gives mean allocation step. No gap may
+    // exceed 4x the mean step. (Engine may interleave allocations from
+    // unrelated test-internal work — observations table seeds; loose
+    // upper bound rules out only ordering violations.)
+    let span = all_txids[n - 1].saturating_sub(all_txids[0]);
+    let mean_step = (span / n as u64).max(1);
+    let max_gap_allowed = mean_step * 4;
+    for w in all_txids.windows(2) {
+        let gap = w[1] - w[0];
+        assert!(
+            gap <= max_gap_allowed,
+            "persisted TxId gap={gap} exceeds 4x mean allocation step={mean_step}; \
+             holes greater than tx-allocation-step signal non-contiguous engine clock; \
+             all_txids={all_txids:?}"
+        );
+    }
+
+    // Cross-check: every TxId the writer emitted via db.begin() appears
+    // in the persisted set. Wrong-impl that silently drops or rewrites
+    // committed TxIds would show as a missing entry.
+    let persisted_set: std::collections::HashSet<u64> = all_txids.iter().copied().collect();
+    for emitted_tx in &writer_emitted {
+        assert!(
+            persisted_set.contains(emitted_tx),
+            "writer-emitted TxId={emitted_tx} not present in persisted recorded_at column; \
+             engine silently dropped or rewrote the stamp"
+        );
+    }
 }
 
 // ---------- BLOCKED entries ----------

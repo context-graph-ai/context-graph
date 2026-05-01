@@ -569,11 +569,16 @@ fn rank_policy_under_concurrent_outcome_writer_snapshot_consistent() {
                 // rank must be in a sensible range — formula is
                 // coalesce(conf,1)*coalesce(sr,1), confidence=0.5,
                 // success_rate ∈ {0.5, 0.99} → rank ∈ {0.25, 0.495}.
+                // Snapshot-consistent reads must observe one of those two
+                // discrete pre-/post-update values; any rank outside
+                // [0.20, 0.55] (or NaN, since NaN is not contained) signals
+                // a torn join under contention (e.g., rank computed against
+                // a half-written success_rate row).
                 assert!(
-                    (0.20..=0.55).contains(&rank) || rank.is_nan() == false,
-                    "rank must be deterministic per snapshot; got {rank}"
+                    !rank.is_nan() && (0.20..=0.55).contains(&rank),
+                    "rank {rank} outside expected snapshot-consistent range [0.20, 0.55] \
+                     — torn join under concurrent outcomes writer"
                 );
-                assert!(!rank.is_nan(), "no NaN under contention");
             }
         }
     });
