@@ -231,6 +231,28 @@ fn sync_edge_cursor_strict_greater_than_correct() {
         "high-water cursor leaked rows: {}",
         r_high.rows.len()
     );
+
+    // TXID read-back type: SELECT the column directly and assert the
+    // returned `Value` is `Value::TxId`, not `Value::Integer`. A wrong engine
+    // that internally widens TxId to Integer for storage but still resolves
+    // the comparison would pass the predicate-filter assertions above; only
+    // a direct variant match catches it.
+    let r_typed = db
+        .execute(
+            "SELECT last_matched_at FROM signatures_propagate",
+            &HashMap::new(),
+        )
+        .expect("typed scan");
+    assert_eq!(r_typed.rows.len(), 10);
+    for row in &r_typed.rows {
+        match row[0] {
+            Value::TxId(_) => {}
+            ref other => panic!(
+                "last_matched_at read back as wrong variant: {:?} (expected Value::TxId)",
+                other
+            ),
+        }
+    }
 }
 
 /// C-SP4: match_signature concurrent edges — two edges concurrently match
@@ -313,6 +335,66 @@ fn matched_by_composite_unique_distinct_edges_succeed_duplicate_rejected() {
         .execute("SELECT edge_id FROM matched_by", &HashMap::new())
         .expect("scan");
     assert_eq!(r.rows.len(), n_edges, "matched_by stored row count");
+
+    // Composite UNIQUE second-column-must-matter sub-case: same edge_id
+    // with different signature_ids MUST both succeed. A wrong engine that
+    // enforces UNIQUE only on the first column (edge_id) would reject the
+    // second insert — fail on that shape.
+    let sig2 = uuid::Uuid::new_v4();
+    let sig3 = uuid::Uuid::new_v4();
+    {
+        let tx = db.begin();
+        let mut row = HashMap::new();
+        row.insert("id".into(), Value::Uuid(sig2));
+        row.insert("scope_labels".into(), Value::Json(serde_json::json!({})));
+        row.insert("last_matched_at".into(), Value::TxId(tx));
+        db.insert_row(tx, "signatures_propagate", row).expect("ins sig2");
+        db.commit(tx).expect("commit");
+    }
+    {
+        let tx = db.begin();
+        let mut row = HashMap::new();
+        row.insert("id".into(), Value::Uuid(sig3));
+        row.insert("scope_labels".into(), Value::Json(serde_json::json!({})));
+        row.insert("last_matched_at".into(), Value::TxId(tx));
+        db.insert_row(tx, "signatures_propagate", row).expect("ins sig3");
+        db.commit(tx).expect("commit");
+    }
+    // First (shared-edge-id, sig2)
+    {
+        let tx = db.begin();
+        let mut row = HashMap::new();
+        row.insert("id".into(), Value::Uuid(uuid::Uuid::new_v4()));
+        row.insert("edge_id".into(), Value::Text("edge-shared".into()));
+        row.insert("signature_id".into(), Value::Uuid(sig2));
+        row.insert("matched_at".into(), Value::TxId(tx));
+        db.insert_row(tx, "matched_by", row).expect("first shared-edge / sig2");
+        db.commit(tx).expect("commit");
+    }
+    // Second (shared-edge-id, sig3) MUST succeed — composite UNIQUE permits.
+    {
+        let tx = db.begin();
+        let mut row = HashMap::new();
+        row.insert("id".into(), Value::Uuid(uuid::Uuid::new_v4()));
+        row.insert("edge_id".into(), Value::Text("edge-shared".into()));
+        row.insert("signature_id".into(), Value::Uuid(sig3));
+        row.insert("matched_at".into(), Value::TxId(tx));
+        db.insert_row(tx, "matched_by", row)
+            .expect("second shared-edge / sig3 must succeed (composite UNIQUE permits)");
+        db.commit(tx).expect("commit");
+    }
+    let r2 = db
+        .execute(
+            "SELECT signature_id FROM matched_by WHERE edge_id = $e",
+            &HashMap::from([("e".to_string(), Value::Text("edge-shared".to_string()))]),
+        )
+        .expect("scan shared-edge");
+    assert_eq!(
+        r2.rows.len(),
+        2,
+        "expected 2 rows under shared edge_id; got {} — composite UNIQUE may be first-column-only",
+        r2.rows.len()
+    );
 }
 
 /// match_signature_atomic: vector hit + INSERT new Intention + INSERT
@@ -393,18 +475,34 @@ fn match_atomic_intention_and_matched_by_rollback_together() {
 /// SELECT-time MUST exclude rows whose `scope_labels` does not match.
 /// Failure mode: predicate ignored or evaluated post-fetch.
 ///
-/// (The cross-tenant / scope-isolation server-side gating is the
-/// HandleScopeConstraint subset and is catalogued, not probed.)
+/// Uses a multi-key JSON value AND queries with the keys in a different
+/// order than they were inserted, asserting structural (not positional /
+/// canonical-string) equality. A wrong engine implementing JSON equality
+/// as canonical-string comparison would alphabetise both sides and the test
+/// would still pass — so we ALSO assert the alpha-only count is correct
+/// AND assert that a query whose JSON only matches one of the two keys is
+/// NOT accepted as equal.
+///
+/// Lens: lens-question row "JSON column round-trip" shape (b) field-order
+/// canonicalisation; predicate-bypass shape "filter ignored or evaluated
+/// post-fetch".
 #[test]
 fn scope_label_predicate_filter_excludes_nonmatching_rows() {
     let db = make_db();
+    // alpha rows: insertion order tenant, region
+    let mut alpha_payload = serde_json::Map::new();
+    alpha_payload.insert("tenant".into(), serde_json::Value::String("alpha".into()));
+    alpha_payload.insert("region".into(), serde_json::Value::String("us".into()));
+    let alpha_payload = serde_json::Value::Object(alpha_payload);
+    // beta rows: insertion order tenant, region (different tenant)
+    let mut beta_payload = serde_json::Map::new();
+    beta_payload.insert("tenant".into(), serde_json::Value::String("beta".into()));
+    beta_payload.insert("region".into(), serde_json::Value::String("us".into()));
+    let beta_payload = serde_json::Value::Object(beta_payload);
+
     for i in 0..10 {
         let id = uuid::Uuid::new_v4();
-        let scope = if i < 5 {
-            serde_json::json!({"tenant": "alpha"})
-        } else {
-            serde_json::json!({"tenant": "beta"})
-        };
+        let scope = if i < 5 { alpha_payload.clone() } else { beta_payload.clone() };
         let tx = db.begin();
         let mut row = HashMap::new();
         row.insert("id".into(), Value::Uuid(id));
@@ -414,23 +512,50 @@ fn scope_label_predicate_filter_excludes_nonmatching_rows() {
         db.commit(tx).expect("commit");
     }
 
-    // Equality on JSON path — engine surface for scope filtering is the
-    // standard JSON column equality; the cg layer uses a JSON-equality
-    // predicate so we probe that shape.
+    // Query with the SAME key order as the writer.
     let r = db
         .execute(
             "SELECT id FROM signatures_propagate WHERE scope_labels = $s",
-            &HashMap::from([(
-                "s".to_string(),
-                Value::Json(serde_json::json!({"tenant": "alpha"})),
-            )]),
+            &HashMap::from([("s".to_string(), Value::Json(alpha_payload.clone()))]),
         )
-        .expect("scan");
+        .expect("scan same-order");
+    assert_eq!(r.rows.len(), 5, "scope_labels equality filter wrong count: {}", r.rows.len());
+
+    // Query with REVERSED key order — region, tenant. Structural equality
+    // MUST still match. A wrong engine using canonical-string equality
+    // without first canonicalising both sides would miss this.
+    let mut alpha_reversed = serde_json::Map::new();
+    alpha_reversed.insert("region".into(), serde_json::Value::String("us".into()));
+    alpha_reversed.insert("tenant".into(), serde_json::Value::String("alpha".into()));
+    let alpha_reversed = serde_json::Value::Object(alpha_reversed);
+    let r_rev = db
+        .execute(
+            "SELECT id FROM signatures_propagate WHERE scope_labels = $s",
+            &HashMap::from([("s".to_string(), Value::Json(alpha_reversed))]),
+        )
+        .expect("scan reversed");
     assert_eq!(
-        r.rows.len(),
+        r_rev.rows.len(),
         5,
-        "scope_labels equality filter wrong count: {}",
-        r.rows.len()
+        "JSON equality not structural — reversed-key-order query returned {}",
+        r_rev.rows.len()
+    );
+
+    // Query with a missing key MUST NOT match. Filter must consider the full
+    // JSON value, not just one key.
+    let mut alpha_partial = serde_json::Map::new();
+    alpha_partial.insert("tenant".into(), serde_json::Value::String("alpha".into()));
+    let alpha_partial = serde_json::Value::Object(alpha_partial);
+    let r_part = db
+        .execute(
+            "SELECT id FROM signatures_propagate WHERE scope_labels = $s",
+            &HashMap::from([("s".to_string(), Value::Json(alpha_partial))]),
+        )
+        .expect("scan partial");
+    assert_eq!(
+        r_part.rows.len(),
+        0,
+        "single-key JSON query matched two-key rows — JSON equality is not deep",
     );
 }
 
@@ -466,8 +591,11 @@ fn registered_at_txids_strictly_monotonic_across_concurrent_commits() {
     }
 
     let mut all_txids: Vec<TxId> = vec![];
+    let mut per_thread: Vec<Vec<TxId>> = vec![];
     for h in handles {
-        all_txids.extend(h.join().expect("worker"));
+        let v = h.join().expect("worker");
+        all_txids.extend(v.iter().copied());
+        per_thread.push(v);
     }
 
     // All TxIds must be unique (TX manager uniqueness)
@@ -479,6 +607,24 @@ fn registered_at_txids_strictly_monotonic_across_concurrent_commits() {
         s.len()
     };
     assert_eq!(sorted.len(), dedup_len, "duplicate TXIDs across commits");
+
+    // STRICT monotonicity per-thread: each thread's successive commits must
+    // have strictly increasing TxIds. A wrong manager that issued unique-but-
+    // non-monotonic ids (e.g. random with collision detection) would dedup
+    // but fail this check.
+    for (tid, ts) in per_thread.iter().enumerate() {
+        for i in 1..ts.len() {
+            assert!(
+                ts[i].0 > ts[i - 1].0,
+                "thread {} TxIds not strictly monotonic: ts[{}]={:?} <= ts[{}]={:?}",
+                tid,
+                i,
+                ts[i],
+                i - 1,
+                ts[i - 1]
+            );
+        }
+    }
 
     // The DB-stored `registered_at` values, sorted, must equal the sorted
     // collected commit TXIDs — proving the engine wrote each row's TXID at
@@ -503,4 +649,45 @@ fn registered_at_txids_strictly_monotonic_across_concurrent_commits() {
         stored_txids,
         "TXIDs reported on commit do not match TXIDs persisted in registered_at"
     );
+}
+
+/// TXID manager bypass: caller fabricates `Value::TxId(huge)` (a u64 the
+/// manager did not allocate via `db.begin()`) and engine MUST reject the
+/// INSERT. Catches the lens shape "TXID column accepts arbitrary u64 instead
+/// of advancing the manager's monotonic clock".
+///
+/// Lens: lens-question row "TXID column type" shape (b).
+#[test]
+fn registered_at_rejects_fabricated_txid_not_issued_by_manager() {
+    let db = make_db();
+    // Allocate one real tx so we know the watermark is small.
+    let real_tx = db.begin();
+    let _ = db.rollback(real_tx);
+
+    // Fabricate a TxId far above the manager's current watermark (and above
+    // any tx we'll allocate inside this probe). The engine validates
+    // `Value::TxId(n)` against `max(committed_watermark, active_tx)` in
+    // `coerce_value_for_column` and surfaces `Error::TxIdOutOfRange`.
+    let bad_tx_value = TxId(u64::MAX - 1);
+    let real_tx2 = db.begin();
+    let mut row = HashMap::new();
+    row.insert("id".into(), Value::Uuid(uuid::Uuid::new_v4()));
+    row.insert("edge_id".into(), Value::Text("edge-fab".into()));
+    row.insert("scope_labels".into(), Value::Json(serde_json::json!({})));
+    row.insert("registered_at".into(), Value::TxId(bad_tx_value));
+    let r = db.insert_row(real_tx2, "edges_registry", row);
+    let _ = db.rollback(real_tx2);
+    match r {
+        Err(Error::TxIdOutOfRange { value, .. }) => {
+            assert_eq!(value, bad_tx_value.0, "wrong value reported");
+        }
+        Err(other) => panic!(
+            "expected TxIdOutOfRange for fabricated TxId; got {:?}",
+            other
+        ),
+        Ok(_) => panic!(
+            "engine accepted Value::TxId({}) which the manager never allocated — TXID-manager-bypass wrong-impl",
+            bad_tx_value.0
+        ),
+    }
 }
