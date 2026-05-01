@@ -26,6 +26,7 @@
 //!   (line ~1082) — internal sync-apply path; we mirror its ordering by
 //!   driving `insert_row` and `upsert_row` from concurrent threads.
 
+use contextdb_core::error::Error;
 use contextdb_core::types::{TxId, Value};
 use contextdb_engine::Database;
 use std::collections::HashMap;
@@ -99,8 +100,11 @@ fn concurrent_sync_deliveries_txid_strictly_monotonic() {
     }
 
     let mut all_txids: Vec<TxId> = vec![];
+    let mut per_thread_txids: Vec<Vec<TxId>> = vec![];
     for h in handles {
-        all_txids.extend(h.join().expect("worker"));
+        let v = h.join().expect("worker");
+        all_txids.extend(v.iter().copied());
+        per_thread_txids.push(v);
     }
 
     // All TXIDs must be unique
@@ -113,6 +117,23 @@ fn concurrent_sync_deliveries_txid_strictly_monotonic() {
         sorted.len(),
         "TXID collision across concurrent commits"
     );
+
+    // STRICT per-thread monotonicity: each thread's successive commits
+    // must have strictly increasing TxIds. Catches the wrong-impl that
+    // issues unique-but-non-monotonic ids.
+    for (tid, ts) in per_thread_txids.iter().enumerate() {
+        for i in 1..ts.len() {
+            assert!(
+                ts[i].0 > ts[i - 1].0,
+                "thread {} TxIds not strictly monotonic: ts[{}]={:?} <= ts[{}]={:?}",
+                tid,
+                i,
+                ts[i],
+                i - 1,
+                ts[i - 1]
+            );
+        }
+    }
 
     // The committed_at column read back from the DB MUST round-trip the
     // exact TXID values used at commit time (TXID column type round-trip).
@@ -132,6 +153,53 @@ fn concurrent_sync_deliveries_txid_strictly_monotonic() {
         sorted, stored,
         "stored TXIDs do not match the TXIDs returned by `db.begin()` — TXID round-trip broken"
     );
+
+    // TXID column read-back type assertion: every read-back row MUST be
+    // Value::TxId, not Value::Integer. (Already implicit via the panic in
+    // the map() above — make it explicit and named for the lens shape.)
+    let r2 = db
+        .execute("SELECT committed_at FROM replicated_rows", &HashMap::new())
+        .expect("scan2");
+    for row in &r2.rows {
+        match row[0] {
+            Value::TxId(_) => {}
+            ref other => panic!(
+                "committed_at read back as wrong variant: {:?} (expected Value::TxId)",
+                other
+            ),
+        }
+    }
+}
+
+/// TXID manager bypass: caller fabricates a `Value::TxId(huge)` not allocated
+/// by `db.begin()` and the engine MUST reject the INSERT with `TxIdOutOfRange`.
+/// Catches the wrong-impl that accepts arbitrary u64 into a TXID column,
+/// allowing a peer or buggy caller to inject TXIDs that break ordering.
+///
+/// Lens: lens-question row "TXID column type" shape (b) "TXID column accepts
+/// arbitrary u64 instead of advancing the TX manager's monotonic clock".
+#[test]
+fn committed_at_rejects_fabricated_txid_not_issued_by_manager() {
+    let db = make_db();
+    let bad_tx = TxId(u64::MAX - 1);
+    let real = db.begin();
+    let mut row = HashMap::new();
+    row.insert("id".into(), Value::Uuid(uuid::Uuid::new_v4()));
+    row.insert("natural_key".into(), Value::Text("nk-fab".into()));
+    row.insert("value".into(), Value::Text("v".into()));
+    row.insert("committed_at".into(), Value::TxId(bad_tx));
+    let r = db.insert_row(real, "replicated_rows", row);
+    let _ = db.rollback(real);
+    match r {
+        Err(Error::TxIdOutOfRange { value, .. }) => {
+            assert_eq!(value, bad_tx.0);
+        }
+        Err(other) => panic!("expected TxIdOutOfRange; got {:?}", other),
+        Ok(_) => panic!(
+            "engine accepted Value::TxId({}) which the manager never allocated — TXID-manager-bypass wrong-impl",
+            bad_tx.0
+        ),
+    }
 }
 
 /// C-SC2 partition heal LWW per TXID: when two NATS messages target the
@@ -188,12 +256,17 @@ fn upsert_last_writer_wins_natural_key() {
 }
 
 /// Concurrent upsert race on the same natural key — engine MUST conflict-
-/// serialize so that the final state corresponds to exactly ONE writer's
-/// payload (whichever committed last). It must NOT silently accept both
-/// inserts and end up with two rows under the same natural_key.
+/// serialize so the final state corresponds to exactly ONE writer's payload,
+/// AND that writer MUST be the one with the highest allocated TxId at the
+/// time it committed (last-writer-wins per TxId).
 ///
-/// Lens: lens-question row "Concurrent UPDATE / conditional UPDATE" — engine
-/// returning Ok(rows_affected = 1) for both concurrent UPDATEs is wrong-impl.
+/// Each thread captures (its own TxId, its own value) on success. After the
+/// race, the surviving row's `value` MUST equal the value of the writer
+/// with the maximum success-TxId. A wrong engine that picks an arbitrary
+/// committer (e.g. first-committer-wins) would fail this.
+///
+/// Lens: lens-question row "Concurrent UPDATE / conditional UPDATE" shape (b),
+/// plus the LWW-by-TxId contract that "last_writer_wins" claims.
 #[test]
 fn concurrent_upsert_same_natural_key_collapses_to_one_row() {
     let db = make_db();
@@ -208,21 +281,32 @@ fn concurrent_upsert_same_natural_key_collapses_to_one_row() {
             bar.wait();
             let id = uuid::Uuid::new_v4();
             let tx = db_t.begin();
+            let value = format!("tid-{}", tid);
             let mut row = HashMap::new();
             row.insert("id".into(), Value::Uuid(id));
             row.insert("natural_key".into(), Value::Text("hot-key".into()));
-            row.insert("value".into(), Value::Text(format!("tid-{}", tid)));
+            row.insert("value".into(), Value::Text(value.clone()));
             row.insert("committed_at".into(), Value::TxId(tx));
             let res = db_t.upsert_row(tx, "replicated_rows", "natural_key", row);
-            if res.is_ok() {
-                let _ = db_t.commit(tx);
+            let committed = match res {
+                Ok(_) => db_t.commit(tx).is_ok(),
+                Err(_) => {
+                    let _ = db_t.rollback(tx);
+                    false
+                }
+            };
+            if committed {
+                Some((tx, value))
             } else {
-                let _ = db_t.rollback(tx);
+                None
             }
         }));
     }
+    let mut successes: Vec<(TxId, String)> = vec![];
     for h in handles {
-        h.join().expect("worker");
+        if let Some(s) = h.join().expect("worker") {
+            successes.push(s);
+        }
     }
 
     // After all writers race, exactly one row visible under hot-key.
@@ -239,21 +323,35 @@ fn concurrent_upsert_same_natural_key_collapses_to_one_row() {
         r.rows.len()
     );
 
-    // The surviving committed_at must be the highest TXID among any committed
-    // attempts — last-writer-wins per TXID. We can't enumerate all attempts'
-    // TxIds (some rolled back), but the surviving committed_at must be ≤
-    // the final committed_watermark and ≥ any earlier TXID we already saw.
-    let cw = db.snapshot();
+    let stored_value = r.rows[0][0].as_text().expect("value text").to_string();
     let stored_txid = match r.rows[0][1] {
         Value::TxId(t) => t,
         ref other => panic!("committed_at not TxId: {:?}", other),
     };
+    let cw = db.snapshot();
     assert!(
         stored_txid.0 <= cw.0,
         "stored committed_at TXID {} > current snapshot {}",
         stored_txid.0,
         cw.0
     );
+
+    // LWW-by-TxId bind: the surviving writer MUST be the one with the
+    // maximum committed TxId. If the engine instead picked an arbitrary
+    // committer (first-wins, last-aborts-wins, etc.) this would fail.
+    if !successes.is_empty() {
+        let winner = successes.iter().max_by_key(|(t, _)| t.0).unwrap();
+        assert_eq!(
+            stored_value, winner.1,
+            "LWW-by-TxId broken: surviving value `{}` not from highest-TxId committer (TxId={:?}, value `{}`); successes were {:?}",
+            stored_value, winner.0, winner.1, successes
+        );
+        assert_eq!(
+            stored_txid, winner.0,
+            "LWW-by-TxId broken: surviving committed_at TxId {:?} not max success TxId {:?}",
+            stored_txid, winner.0
+        );
+    }
 }
 
 /// C-SC4 cross-context isolation under sync: a SELECT filtered by
