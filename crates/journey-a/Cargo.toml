@@ -1,0 +1,19 @@
+[package]
+name = "journey-a"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "R0 Track 2 Journey A vertical-slice spike — U1 Physical Security Operator. Spike code; never merged to main."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+contextdb-core = "1.0.0"
+contextdb-engine = "1.0.0"
+tempfile = "3"
+uuid = { version = "1", features = ["v7", "v4"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

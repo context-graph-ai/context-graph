@@ -795,6 +795,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "journey-a"
+version = "0.0.0"
+dependencies = [
+ "contextdb-core 1.0.0",
+ "contextdb-engine 1.0.0",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "journey-b"
+version = "0.0.0"
+dependencies = [
+ "contextdb-core 1.0.0",
+ "contextdb-engine 1.0.0",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
