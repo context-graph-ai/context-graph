@@ -1,0 +1,17 @@
+[package]
+name = "engine-probes"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "R0 derisking probes against released contextdb engine. Spike code; never merged to main."
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+contextdb-core = "1.0.0"
+contextdb-engine = "1.0.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
+uuid = { version = "1", features = ["v7", "v4"] }
+serde_json = "1"

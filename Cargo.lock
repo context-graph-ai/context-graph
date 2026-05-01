@@ -230,8 +230,8 @@ name = "context-graph"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "contextdb-core",
- "contextdb-engine",
+ "contextdb-core 0.3.4",
+ "contextdb-engine 0.3.4",
  "serde",
  "serde_json",
  "tempfile",
@@ -253,19 +253,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "contextdb-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26d4bebd05c24a39d6e3c49eac18f9ff9e0dcb8f155f0ec1357ba84f81418467"
+dependencies = [
+ "roaring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "contextdb-engine"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fa037a071db21ae5cb3fdce6f2e1604ce0ce154cc04a1f40d8a44199a09a9be"
 dependencies = [
  "bincode 2.0.1",
- "contextdb-core",
- "contextdb-graph",
- "contextdb-parser",
- "contextdb-planner",
- "contextdb-relational",
- "contextdb-tx",
- "contextdb-vector",
+ "contextdb-core 0.3.4",
+ "contextdb-graph 0.3.4",
+ "contextdb-parser 0.3.4",
+ "contextdb-planner 0.3.4",
+ "contextdb-relational 0.3.4",
+ "contextdb-tx 0.3.4",
+ "contextdb-vector 0.3.4",
+ "parking_lot",
+ "redb",
+ "rmp-serde",
+ "roaring",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "contextdb-engine"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b7642ff04280a903d221b70a1e6bba835b4733cb204da7baf798726ecac804"
+dependencies = [
+ "bincode 2.0.1",
+ "contextdb-core 1.0.0",
+ "contextdb-graph 1.0.0",
+ "contextdb-parser 1.0.0",
+ "contextdb-planner 1.0.0",
+ "contextdb-relational 1.0.0",
+ "contextdb-tx 1.0.0",
+ "contextdb-vector 1.0.0",
  "parking_lot",
  "redb",
  "rmp-serde",
@@ -284,8 +323,20 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1ceb0363658bd71d77f20e7f7add04a60826d9c8c93605f49d88ed76ba60703"
 dependencies = [
- "contextdb-core",
- "contextdb-tx",
+ "contextdb-core 0.3.4",
+ "contextdb-tx 0.3.4",
+ "parking_lot",
+ "uuid",
+]
+
+[[package]]
+name = "contextdb-graph"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c6d2b2d310d25b1f0740ea13e3e62c45e9351bf696132cb0ef7ac9190367a79"
+dependencies = [
+ "contextdb-core 1.0.0",
+ "contextdb-tx 1.0.0",
  "parking_lot",
  "uuid",
 ]
@@ -296,7 +347,18 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "237d5d9a9907087c39970354812cc2f2c8e34d838bd42f6fb815b6981a463b19"
 dependencies = [
- "contextdb-core",
+ "contextdb-core 0.3.4",
+ "pest",
+ "pest_derive",
+]
+
+[[package]]
+name = "contextdb-parser"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91b27789a19bd0b1ed876d5ebca596db84c5ecefe77bf918d585bfce0b708755"
+dependencies = [
+ "contextdb-core 1.0.0",
  "pest",
  "pest_derive",
 ]
@@ -307,8 +369,18 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c68a517b67df8a8eb09fbd4c3388d2032f4a2f7c4811a06b5bbcaadbd4a2fad"
 dependencies = [
- "contextdb-core",
- "contextdb-parser",
+ "contextdb-core 0.3.4",
+ "contextdb-parser 0.3.4",
+]
+
+[[package]]
+name = "contextdb-planner"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7b088e8f2c6908dab7926755c4b99dcedc1d02678600ee0804eddb7ccaed6d4"
+dependencies = [
+ "contextdb-core 1.0.0",
+ "contextdb-parser 1.0.0",
 ]
 
 [[package]]
@@ -317,8 +389,20 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17efc339943335080a115b3e8aa8e137f0f800b6c218b04076068ffcce7ff65c"
 dependencies = [
- "contextdb-core",
- "contextdb-tx",
+ "contextdb-core 0.3.4",
+ "contextdb-tx 0.3.4",
+ "parking_lot",
+ "uuid",
+]
+
+[[package]]
+name = "contextdb-relational"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fe0ef1290d5fc47aa03d28746ca5b319a39fa0fbe52d7936e06c86f7c1179c1"
+dependencies = [
+ "contextdb-core 1.0.0",
+ "contextdb-tx 1.0.0",
  "parking_lot",
  "uuid",
 ]
@@ -329,7 +413,17 @@ version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6658eee6fae3cf2bee40fd4ddee1fd7e2fa666a455d5df220f16e38ee1540ad"
 dependencies = [
- "contextdb-core",
+ "contextdb-core 0.3.4",
+ "parking_lot",
+]
+
+[[package]]
+name = "contextdb-tx"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61c773b51c997f9e0e8a2303adf11ef0b16e4e88a067ffd55f46ce73fa52b8c0"
+dependencies = [
+ "contextdb-core 1.0.0",
  "parking_lot",
 ]
 
@@ -340,8 +434,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acad0b407d053a893ef9d4a99fca2748cb627eb4504d0cf476df0a2fb1914e1"
 dependencies = [
  "anndists",
- "contextdb-core",
- "contextdb-tx",
+ "contextdb-core 0.3.4",
+ "contextdb-tx 0.3.4",
+ "hnsw_rs",
+ "parking_lot",
+ "roaring",
+]
+
+[[package]]
+name = "contextdb-vector"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09f63d95acc85f9f96d3b6928c8a77881995ae38389f96c81cc05a7b4648b6f7"
+dependencies = [
+ "anndists",
+ "contextdb-core 1.0.0",
+ "contextdb-tx 1.0.0",
  "hnsw_rs",
  "parking_lot",
  "roaring",
@@ -431,6 +539,18 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "engine-probes"
+version = "0.0.0"
+dependencies = [
+ "contextdb-core 1.0.0",
+ "contextdb-engine 1.0.0",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "enum-as-inner"
@@ -1308,6 +1428,27 @@ checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tokio"
+version = "1.52.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+dependencies = [
+ "pin-project-lite",
+ "tokio-macros",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
