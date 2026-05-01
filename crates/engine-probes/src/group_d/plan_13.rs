@@ -168,6 +168,25 @@ fn concurrent_signature_creation_unique_composite_one_winner() {
         )
         .expect("scan");
     assert_eq!(r.rows.len(), n_pairs);
+
+    // Composite UNIQUE second-column-must-matter sub-case: same
+    // `embedding_space_id` with different `signature_kind` values MUST both
+    // succeed. A wrong engine that enforces UNIQUE only on the first column
+    // would reject the second insert.
+    insert_signature(&db, "shared-space", "kind-A", serde_json::json!({}), "tenant-x", vec![1.0, 0.0, 0.0, 0.0]).expect("first shared-space / kind-A");
+    insert_signature(&db, "shared-space", "kind-B", serde_json::json!({}), "tenant-x", vec![0.0, 1.0, 0.0, 0.0]).expect("second shared-space / kind-B must succeed (composite UNIQUE permits)");
+    let r2 = db
+        .execute(
+            "SELECT signature_kind FROM signatures WHERE embedding_space_id = $s",
+            &HashMap::from([("s".to_string(), Value::Text("shared-space".to_string()))]),
+        )
+        .expect("scan shared-space");
+    assert_eq!(r2.rows.len(), 2, "expected 2 rows under shared-space; got {} — composite UNIQUE may be first-column-only", r2.rows.len());
+
+    // Symmetric: same `signature_kind` with different `embedding_space_id`
+    // values MUST both succeed.
+    insert_signature(&db, "space-X", "shared-kind", serde_json::json!({}), "tenant-x", vec![0.0, 0.0, 1.0, 0.0]).expect("space-X / shared-kind");
+    insert_signature(&db, "space-Y", "shared-kind", serde_json::json!({}), "tenant-x", vec![0.0, 0.0, 0.0, 1.0]).expect("space-Y / shared-kind must succeed");
 }
 
 /// C-SD2: signatures.centroid index disjoint from observations.embedding index.
@@ -332,6 +351,73 @@ fn space_upgrade_atomic_delete_then_insert() {
     assert_eq!(r_post.rows.len(), 3, "rollback failed to restore rows");
 }
 
+/// Mid-tx atomicity hole on space-upgrade: DELETE old rows + INSERT new rows
+/// in one tx, but the INSERT phase fails (UV against a pre-staged row).
+/// Rolling back must restore the deleted rows AND must not orphan any vector
+/// entry from partial inserts. Catches the lens shape "vector-index write
+/// succeeds but row INSERT fails — vector orphaned" plus the multi-step DELETE
+/// + INSERT rollback path.
+#[test]
+fn space_upgrade_rollback_after_partial_inserts_no_orphan() {
+    let db = make_db();
+    for i in 0..4 {
+        let v = vec![1.0_f32 - i as f32 * 0.01, 0.0, 0.0, 0.0];
+        insert_signature(&db, "v1", &format!("k{}", i), serde_json::json!({}), "t", v).expect("v1");
+    }
+    insert_signature(&db, "v2", "collide", serde_json::json!({}), "t", vec![0.5, 0.5, 0.5, 0.5]).expect("v2 collide");
+
+    let upgrade_vec = vec![0.9_f32, 0.1, 0.0, 0.0];
+    let pre_search = db.semantic_search(SemanticQuery::new("signatures", "centroid", upgrade_vec.clone(), 100)).expect("pre");
+    let pre_count = pre_search.len();
+
+    let temp_row_id = {
+        let tx = db.begin();
+        db.execute_in_tx(tx, "DELETE FROM signatures WHERE embedding_space_id = 'v1'", &HashMap::new()).expect("delete v1");
+
+        let temp_id = uuid::Uuid::new_v4();
+        let mut ok_row = HashMap::new();
+        ok_row.insert("id".into(), Value::Uuid(temp_id));
+        ok_row.insert("embedding_space_id".into(), Value::Text("v2".into()));
+        ok_row.insert("signature_kind".into(), Value::Text("k-good".into()));
+        ok_row.insert("scope_labels".into(), Value::Json(serde_json::json!({})));
+        ok_row.insert("tenant_id".into(), Value::Text("t".into()));
+        ok_row.insert("member_count".into(), Value::Int64(5));
+        ok_row.insert("variance".into(), Value::Float64(0.1));
+        ok_row.insert("last_matched_at".into(), Value::TxId(TxId(0)));
+        ok_row.insert("centroid".into(), Value::Vector(upgrade_vec.clone()));
+        let temp_row_id = db.insert_row(tx, "signatures", ok_row).expect("ok ins");
+        db.insert_vector(tx, VectorIndexRef::new("signatures", "centroid"), temp_row_id, upgrade_vec.clone()).expect("ok vec");
+
+        let mut bad_row = HashMap::new();
+        bad_row.insert("id".into(), Value::Uuid(uuid::Uuid::new_v4()));
+        bad_row.insert("embedding_space_id".into(), Value::Text("v2".into()));
+        bad_row.insert("signature_kind".into(), Value::Text("collide".into()));
+        bad_row.insert("scope_labels".into(), Value::Json(serde_json::json!({})));
+        bad_row.insert("tenant_id".into(), Value::Text("t".into()));
+        bad_row.insert("member_count".into(), Value::Int64(5));
+        bad_row.insert("variance".into(), Value::Float64(0.1));
+        bad_row.insert("last_matched_at".into(), Value::TxId(TxId(0)));
+        bad_row.insert("centroid".into(), Value::Vector(vec![0.7, 0.7, 0.7, 0.7]));
+        let r = db.insert_row(tx, "signatures", bad_row);
+        match r {
+            Err(Error::UniqueViolation { .. }) => {}
+            Ok(_) => panic!("expected UV"),
+            Err(other) => panic!("expected UV; got {:?}", other),
+        }
+        db.rollback(tx).expect("rollback");
+        temp_row_id
+    };
+
+    let r_v1 = db.execute("SELECT signature_kind FROM signatures WHERE embedding_space_id = $s", &HashMap::from([("s".to_string(), Value::Text("v1".to_string()))])).expect("scan v1");
+    assert_eq!(r_v1.rows.len(), 4, "rollback failed to restore v1 rows: got {}", r_v1.rows.len());
+
+    let post_search = db.semantic_search(SemanticQuery::new("signatures", "centroid", upgrade_vec, 100)).expect("post");
+    for sr in &post_search {
+        assert_ne!(sr.row_id, temp_row_id, "rolled-back row_id surfaced — vector orphan");
+    }
+    assert_eq!(post_search.len(), pre_count, "post-rollback vector hits {} != pre {} — orphan", post_search.len(), pre_count);
+}
+
 /// C-SD5: cross-tenant filter at engine level.
 #[test]
 fn cross_tenant_signature_filter_engine_enforced() {
@@ -395,22 +481,28 @@ fn embedding_space_filter_composes_with_vector_search() {
     assert_eq!(kinds.len(), 3, "modality count: {:?}", kinds);
 }
 
-/// C-SD6: aggregate fields round-trip; JSON round-trip preserves all keys.
+/// C-SD6: aggregate fields round-trip; multi-key JSON round-trip preserves
+/// keys AND insertion order; TXID column reads back as `Value::TxId`, not
+/// `Value::Integer`.
+///
+/// Lens: lens-question rows "JSON column round-trip" shape (b) field-order
+/// canonicalisation, and "TXID column type" shape (a) "TxId round-trips
+/// through INSERT but reads back as Integer".
 #[test]
 fn signature_aggregate_fields_persist_and_round_trip() {
     let db = make_db();
-    insert_signature(
-        &db,
-        "space-A",
-        "face-cluster",
-        serde_json::json!({"detector": "v1"}),
-        "t",
-        vec![0.5, 0.5, 0.5, 0.5],
-    )
-    .expect("ins");
+    let mut scope = serde_json::Map::new();
+    scope.insert("detector".into(), serde_json::Value::String("v1".into()));
+    scope.insert("zeta".into(), serde_json::Value::Number(7.into()));
+    scope.insert("alpha".into(), serde_json::Value::Bool(true));
+    let scope_payload = serde_json::Value::Object(scope);
+    let scope_serialised = serde_json::to_string(&scope_payload).expect("ser");
+    assert!(scope_serialised.starts_with("{\"detector\""), "fixture order broken: {}", scope_serialised);
+
+    insert_signature(&db, "space-A", "face-cluster", scope_payload, "t", vec![0.5, 0.5, 0.5, 0.5]).expect("ins");
     let r = db
         .execute(
-            "SELECT member_count, variance, scope_labels FROM signatures WHERE embedding_space_id = $s",
+            "SELECT member_count, variance, scope_labels, last_matched_at FROM signatures WHERE embedding_space_id = $s",
             &HashMap::from([("s".to_string(), Value::Text("space-A".to_string()))]),
         )
         .expect("select");
@@ -424,70 +516,93 @@ fn signature_aggregate_fields_persist_and_round_trip() {
     match &row[2] {
         Value::Json(v) => {
             assert_eq!(v.get("detector").and_then(|x| x.as_str()), Some("v1"));
+            assert_eq!(v.get("zeta").and_then(|x| x.as_u64()), Some(7));
+            assert_eq!(v.get("alpha").and_then(|x| x.as_bool()), Some(true));
+            let stored_serialised = serde_json::to_string(v).expect("ser stored");
+            assert_eq!(stored_serialised, scope_serialised, "JSON round-trip canonicalised key order: input `{}`, stored `{}`", scope_serialised, stored_serialised);
+            if let serde_json::Value::Object(map) = v {
+                let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                assert_eq!(keys, vec!["detector", "zeta", "alpha"], "key iteration order broken: {:?}", keys);
+            }
         }
         other => panic!("not JSON: {:?}", other),
     }
+    // TXID column read-back type: MUST be Value::TxId, not Value::Integer.
+    match row[3] {
+        Value::TxId(_) => {}
+        ref other => panic!("last_matched_at read back as wrong variant: {:?} (expected Value::TxId)", other),
+    }
 }
 
-/// C-SD4: scope_labels JSON round-trip atomicity under concurrent UPDATE.
+/// C-SD4: scope_labels JSON round-trip atomicity under concurrent UPDATE,
+/// using multi-key payloads with non-alphabetical insertion order. Readers
+/// assert (i) no torn key combinations and (ii) byte-canonical-form equality
+/// with the writer's exact serialisation — catches re-ordering wrong-impls.
 #[test]
 fn signature_scope_labels_json_torn_check_under_concurrent_update() {
     let db = make_db();
+    // Initial payload IS payload_v1 — every existing row is already in
+    // the v1 state when the writer race begins. This avoids a transient
+    // window where the reader sees an "initial" payload distinct from
+    // either writer variant.
+    let mut p_v1 = serde_json::Map::new();
+    p_v1.insert("version".into(), serde_json::Value::String("v1".into()));
+    p_v1.insert("region".into(), serde_json::Value::String("eu".into()));
+    p_v1.insert("alpha".into(), serde_json::Value::Bool(false));
+    let payload_v1 = serde_json::Value::Object(p_v1);
     for i in 0..6 {
-        insert_signature(
-            &db,
-            &format!("space-{}", i),
-            "k",
-            serde_json::json!({"version": "v1"}),
-            "t",
-            vec![0.0, 0.0, 0.0, i as f32 * 0.01],
-        )
-        .expect("ins");
+        insert_signature(&db, &format!("space-{}", i), "k", payload_v1.clone(), "t", vec![0.0, 0.0, 0.0, i as f32 * 0.01]).expect("ins");
     }
+    let canonical_v1 = serde_json::to_string(&payload_v1).expect("ser v1");
+    assert!(canonical_v1.starts_with("{\"version\""), "v1 fixture broken");
+
+    let mut p_v2 = serde_json::Map::new();
+    p_v2.insert("version".into(), serde_json::Value::String("v2".into()));
+    p_v2.insert("region".into(), serde_json::Value::String("eu".into()));
+    p_v2.insert("alpha".into(), serde_json::Value::Bool(true));
+    p_v2.insert("extra".into(), serde_json::Value::String("x".into()));
+    let payload_v2 = serde_json::Value::Object(p_v2);
+    let canonical_v2 = serde_json::to_string(&payload_v2).expect("ser v2");
+    assert!(canonical_v2.starts_with("{\"version\""), "v2 fixture broken");
+
     let barrier = Arc::new(Barrier::new(3));
     let db_u = db.clone();
     let b_u = barrier.clone();
+    let pv1 = payload_v1.clone();
+    let pv2 = payload_v2.clone();
     let updater = thread::spawn(move || {
         b_u.wait();
         for _ in 0..50 {
-            db_u.execute(
-                "UPDATE signatures SET scope_labels = $j",
-                &HashMap::from([(
-                    "j".to_string(),
-                    Value::Json(serde_json::json!({"version": "v2", "extra": "x"})),
-                )]),
-            )
-            .ok();
-            db_u.execute(
-                "UPDATE signatures SET scope_labels = $j",
-                &HashMap::from([(
-                    "j".to_string(),
-                    Value::Json(serde_json::json!({"version": "v1"})),
-                )]),
-            )
-            .ok();
+            db_u.execute("UPDATE signatures SET scope_labels = $j", &HashMap::from([("j".to_string(), Value::Json(pv2.clone()))])).ok();
+            db_u.execute("UPDATE signatures SET scope_labels = $j", &HashMap::from([("j".to_string(), Value::Json(pv1.clone()))])).ok();
         }
     });
     let mut readers = vec![];
     for _ in 0..2 {
         let db_r = db.clone();
         let b_r = barrier.clone();
+        let cv1 = canonical_v1.clone();
+        let cv2 = canonical_v2.clone();
         readers.push(thread::spawn(move || {
             b_r.wait();
             for _ in 0..100 {
-                let r = db_r
-                    .execute("SELECT scope_labels FROM signatures", &HashMap::new())
-                    .expect("select");
+                let r = db_r.execute("SELECT scope_labels FROM signatures", &HashMap::new()).expect("select");
                 for row in &r.rows {
                     if let Value::Json(v) = &row[0] {
-                        let version =
-                            v.get("version").and_then(|x| x.as_str()).unwrap_or_default();
+                        let version = v.get("version").and_then(|x| x.as_str()).unwrap_or_default();
                         assert!(version == "v1" || version == "v2", "torn: `{}`", version);
                         let has_extra = v.get("extra").is_some();
+                        let alpha = v.get("alpha").and_then(|x| x.as_bool());
                         if version == "v2" {
-                            assert!(has_extra, "v2 missing 'extra'");
+                            assert!(has_extra, "v2 missing 'extra' — torn JSON across keys");
+                            assert_eq!(alpha, Some(true), "v2 wrong alpha");
+                            let observed = serde_json::to_string(v).expect("ser obs");
+                            assert_eq!(observed, cv2, "v2 round-trip canonicalised key order: stored `{}`", observed);
                         } else {
                             assert!(!has_extra, "v1 has 'extra'");
+                            assert_eq!(alpha, Some(false), "v1 wrong alpha");
+                            let observed = serde_json::to_string(v).expect("ser obs");
+                            assert_eq!(observed, cv1, "v1 round-trip canonicalised key order: stored `{}`", observed);
                         }
                     }
                 }
