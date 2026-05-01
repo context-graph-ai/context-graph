@@ -328,87 +328,228 @@ fn reindex_atomic_delete_insert_same_tx() {
 /// C-E1 concurrent reindex vs read: while a reindex tx is in flight, a
 /// reader queries the index. Reader must see either pre- or post-reindex
 /// state — never a torn vector (e.g., wrong-dim).
+///
+/// Round-3 reviewer fix: previous version asserted only `hits.len() <= 16`
+/// and `score.is_finite()` per observation. This passes under (a) the
+/// canonical lens-(a) wrong-impl that silently drops every concurrent
+/// `insert_vector` after `delete_vector` (the index drains to <16 vectors,
+/// every observation passes the upper bound; never asserts a lower bound)
+/// and (b) the torn-vector lens shape the docstring names — a half-
+/// overwritten vector produces a finite-but-wrong score that still passes
+/// `is_finite`.
+///
+/// Strengthened per the reviewer's prescription:
+///   1. Bind observed scores to the legal pre/post cosine set: per-
+///      observation, every score must equal `cos(q, v_pre[i])` for some
+///      `i` OR `cos(q, v_post)`, within float tolerance. A score not in
+///      this set is a torn vector.
+///   2. Bind the post-join state: `final_hits.len() == 16` (catches lens
+///      (a) silent drop — every reindexed row vanishing leaves <16) AND
+///      every score in `final_hits` equals `cos(q, v_post)` within
+///      tolerance (catches a wrong-impl that retains pre-reindex vectors
+///      after reindex commits).
+///
+/// Vector geometry (chosen so the legal pre/post cosines are distinct,
+/// non-degenerate, and a torn intermediate is detectable):
+///   - query `q = [1, 0, 0, 0]` (unit vector along axis 0).
+///   - pre-reindex vectors `v_pre[i] = [cos(theta_i), sin(theta_i), 0, 0]`
+///     for `i` in 0..16 with `theta_i = (i + 1) * PI / 64`. Each is a unit
+///     vector with `cos(q, v_pre[i]) = cos(theta_i)`, distinct in
+///     [cos(PI/4), cos(PI/64)] = roughly [0.7071, 0.9988].
+///   - post-reindex vector `v_post = [0, 0, 1, 0]` (unit vector along axis
+///     2). `cos(q, v_post) = 0` exactly. A wrong-impl that leaves the
+///     pre-reindex vector in place after reindex commits would yield a
+///     final score in [0.7071, 0.9988], failing the post-join score check.
+///
+/// Loop: 30 rounds of (re-seed → spawn writer + reader → join) to surface
+/// the contention window across schedules.
 #[test]
 fn reindex_under_concurrent_reader_no_torn_vector() {
-    let db = Arc::new(open_embedding_schema());
-    let mut row_ids: Vec<RowId> = vec![];
-    // Seed 16 rows.
-    {
-        let tx = db.begin();
-        for i in 0..16 {
-            let id = Uuid::new_v4();
-            let row_id = db
-                .insert_row(
-                    tx,
-                    "evidence",
-                    vals(vec![
-                        ("id", Value::Uuid(id)),
-                        ("embedding_space_id", Value::Text("text_default".into())),
-                    ]),
-                )
-                .unwrap();
-            db.insert_vector(
-                tx,
-                VectorIndexRef::new("evidence", "vector_text"),
-                row_id,
-                vec![i as f32 / 16.0, 0.0, 0.0, 0.0],
-            )
-            .unwrap();
-            row_ids.push(row_id);
-        }
-        db.commit(tx).unwrap();
-    }
+    use std::f32::consts::PI;
 
-    let writer_db = db.clone();
-    let writer_rows = row_ids.clone();
-    let writer = thread::spawn(move || {
-        for rid in writer_rows {
-            let tx = writer_db.begin();
-            writer_db
-                .delete_vector(tx, VectorIndexRef::new("evidence", "vector_text"), rid)
-                .unwrap();
-            writer_db
-                .insert_vector(
+    const TOL: f32 = 1e-5;
+    const ROUNDS: usize = 30;
+    const N: usize = 16;
+
+    // Pre-reindex vectors: v_pre[i] = [cos(theta_i), sin(theta_i), 0, 0].
+    // theta_i = (i+1) * PI / 64 — 16 distinct angles in (0, PI/4].
+    let pre_vectors: Vec<Vec<f32>> = (0..N)
+        .map(|i| {
+            let theta = (i as f32 + 1.0) * PI / 64.0;
+            vec![theta.cos(), theta.sin(), 0.0, 0.0]
+        })
+        .collect();
+    let post_vector: Vec<f32> = vec![0.0, 0.0, 1.0, 0.0];
+    let query: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+
+    // Legal cosine set (pre + post) — each observed score must lie in this
+    // set within `TOL`. q is a unit vector along axis 0, so cos(q, v) = v[0]
+    // (since |q| = 1 and each v[i] has |v| = 1 by construction).
+    let pre_cosines: Vec<f32> = pre_vectors.iter().map(|v| v[0]).collect();
+    let post_cosine: f32 = post_vector[0]; // 0.0
+    let in_legal_set = |score: f32| -> bool {
+        if (score - post_cosine).abs() <= TOL {
+            return true;
+        }
+        pre_cosines.iter().any(|c| (score - c).abs() <= TOL)
+    };
+
+    for round in 0..ROUNDS {
+        let db = Arc::new(open_embedding_schema());
+        let mut row_ids: Vec<RowId> = vec![];
+        // Seed N rows with v_pre[i].
+        {
+            let tx = db.begin();
+            for v_pre in &pre_vectors {
+                let id = Uuid::new_v4();
+                let row_id = db
+                    .insert_row(
+                        tx,
+                        "evidence",
+                        vals(vec![
+                            ("id", Value::Uuid(id)),
+                            ("embedding_space_id", Value::Text("text_default".into())),
+                        ]),
+                    )
+                    .unwrap();
+                db.insert_vector(
                     tx,
                     VectorIndexRef::new("evidence", "vector_text"),
-                    rid,
-                    vec![1.0, 0.0, 0.0, 0.0],
+                    row_id,
+                    v_pre.clone(),
                 )
                 .unwrap();
-            writer_db.commit(tx).unwrap();
+                row_ids.push(row_id);
+            }
+            db.commit(tx).unwrap();
         }
-    });
-    let reader_db = db.clone();
-    let reader = thread::spawn(move || {
-        for _ in 0..32 {
-            let snap = reader_db.snapshot();
-            let hits = reader_db
+
+        // Sanity: pre-reindex query returns exactly N hits with scores in
+        // the pre-cosine set. (Catches a setup bug before the contention
+        // window opens.)
+        {
+            let snap = db.snapshot();
+            let pre_hits = db
                 .query_vector(
                     VectorIndexRef::new("evidence", "vector_text"),
-                    &[0.5, 0.0, 0.0, 0.0],
+                    &query,
                     50,
                     None,
                     snap,
                 )
                 .unwrap();
-            // hits.len() must always be in [0, 16] — never more (no
-            // duplicate vectors per row).
-            assert!(
-                hits.len() <= 16,
-                "duplicate vectors per row would indicate non-atomic reindex; got {} hits",
-                hits.len()
+            assert_eq!(
+                pre_hits.len(),
+                N,
+                "round {round}: pre-reindex hit count must equal {N}; got {}",
+                pre_hits.len()
             );
-            // Each hit's score must be in [-1.0, 1.0] (cosine).
-            for (_, score) in &hits {
+            for (_, score) in &pre_hits {
                 assert!(
-                    score.is_finite(),
-                    "torn vector or wrong-dim read produces NaN; got {score}"
+                    pre_cosines.iter().any(|c| (score - c).abs() <= TOL),
+                    "round {round}: pre-reindex score {score} not in pre-cosine set"
                 );
             }
         }
-    });
-    writer.join().unwrap();
-    reader.join().unwrap();
+
+        let writer_db = db.clone();
+        let writer_rows = row_ids.clone();
+        let writer_post_vector = post_vector.clone();
+        let writer = thread::spawn(move || {
+            for rid in writer_rows {
+                let tx = writer_db.begin();
+                writer_db
+                    .delete_vector(tx, VectorIndexRef::new("evidence", "vector_text"), rid)
+                    .unwrap();
+                writer_db
+                    .insert_vector(
+                        tx,
+                        VectorIndexRef::new("evidence", "vector_text"),
+                        rid,
+                        writer_post_vector.clone(),
+                    )
+                    .unwrap();
+                writer_db.commit(tx).unwrap();
+            }
+        });
+
+        let reader_db = db.clone();
+        let reader_query = query.clone();
+        let reader_pre_cosines = pre_cosines.clone();
+        let reader_post_cosine = post_cosine;
+        let reader = thread::spawn(move || {
+            for _ in 0..64 {
+                let snap = reader_db.snapshot();
+                let hits = reader_db
+                    .query_vector(
+                        VectorIndexRef::new("evidence", "vector_text"),
+                        &reader_query,
+                        50,
+                        None,
+                        snap,
+                    )
+                    .unwrap();
+                // No duplicate vectors per row (upper bound).
+                assert!(
+                    hits.len() <= N,
+                    "duplicate vectors per row would indicate non-atomic reindex; got {} hits",
+                    hits.len()
+                );
+                // Per-observation legal-set binding: every score must be in
+                // the pre/post cosine set within tolerance. A torn vector
+                // (half-overwritten) would yield a finite-but-wrong score
+                // that fails this membership.
+                for (_, score) in &hits {
+                    assert!(
+                        score.is_finite(),
+                        "torn vector or wrong-dim read produces NaN; got {score}"
+                    );
+                    let in_set = (score - reader_post_cosine).abs() <= TOL
+                        || reader_pre_cosines
+                            .iter()
+                            .any(|c| (score - c).abs() <= TOL);
+                    assert!(
+                        in_set,
+                        "score {score} not in legal pre/post cosine set — torn vector"
+                    );
+                }
+            }
+        });
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        // Post-join: the reindex completed; the index must reflect the
+        // post-reindex state for ALL N rows.
+        let snap = db.snapshot();
+        let final_hits = db
+            .query_vector(
+                VectorIndexRef::new("evidence", "vector_text"),
+                &query,
+                50,
+                None,
+                snap,
+            )
+            .unwrap();
+        assert_eq!(
+            final_hits.len(),
+            N,
+            "round {round}: post-reindex hit count must equal {N}; got {} \
+             — wrong-impl silently dropped insert_vector after delete_vector",
+            final_hits.len()
+        );
+        for (rid, score) in &final_hits {
+            // Use legal-set check too to surface torn-vector residuals.
+            assert!(
+                in_legal_set(*score),
+                "round {round}: rid {rid:?} post-join score {score} not in legal set"
+            );
+            assert!(
+                (score - post_cosine).abs() <= TOL,
+                "round {round}: rid {rid:?} post-join score {score} != post-reindex cosine {post_cosine} \
+                 — wrong-impl retained pre-reindex vector or fabricated a torn intermediate"
+            );
+        }
+    }
 }
 
 /// C-E2 concurrent inserts with mixed-dim precomputed embeddings: each tx
