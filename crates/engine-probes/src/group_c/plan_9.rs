@@ -12,8 +12,8 @@
 
 use contextdb_core::{Direction, Error, TxId, Value};
 use contextdb_engine::Database;
-use std::collections::HashMap;
-use std::sync::{Arc, Barrier};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use uuid::Uuid;
 
@@ -462,12 +462,15 @@ fn audit_log_tags_json_round_trip() {
 /// Plan 9 single-primitive: BFS reverse-edge traversal for `full_provenance`.
 /// Build a small graph: Intention -[CITES]-> Decision; Decision -[BASED_ON]-> Entity.
 /// Walking outgoing CITES from intention reaches the decision; outgoing
-/// BASED_ON from decision reaches the entity. Probe covers the
-/// GRAPH_TABLE traversal lens question (a) cross-context leak — we use
-/// distinct context_ids and confirm the traversal returns the expected nodes
-/// (BFS itself does not enforce context-id; the probe verifies the engine
-/// surfaces the underlying nodes so cg can apply context filtering on the
-/// returned id set).
+/// BASED_ON from decision reaches the entity, NOT the intention — edge-type
+/// filter must discriminate.
+///
+/// Engine boundary: `query_bfs` does NOT enforce `context_id` isolation. The
+/// engine surfaces graph nodes regardless of their owning context; cross-
+/// context filtering is a consumer-layer concern (cg applies context_id
+/// filtering on the returned id set). This probe therefore does NOT exercise
+/// GRAPH_TABLE lens question (a) cross-context leak — that gap, if any,
+/// surfaces at the consumer surface, not the engine surface.
 /// Cites: contextdb/crates/contextdb-engine/src/database.rs::query_bfs.
 #[test]
 fn full_provenance_reverse_edge_traversal() {
@@ -856,12 +859,41 @@ fn audit_query_snapshot_isolation_under_concurrent_insert() {
     );
 }
 
-/// C-G3 audit_log txid monotonicity under concurrent commits: N concurrent
-/// writers each INSERT one audit_log row stamped with the watermark each
-/// reads. The set of resulting `txid` values across the N writers must be
-/// such that the engine's commit order is strictly monotonic — distinct
-/// commits produce non-decreasing TxIds. Wrong-impl per TXID lens: (c)
-/// concurrent inserts produce same TxId, breaking causal ordering.
+/// C-G3 audit_log txid monotonicity under concurrent commits.
+///
+/// cg-governance contract: `audit_log.txid` reflects causal commit order.
+/// Auditors paginate the audit log by `WHERE txid > $cursor` and rely on:
+///   1. Every committed audit row has a unique TxId.
+///   2. Walking by ascending TxId visits every row exactly once.
+///   3. Sort by TxId == sort by commit order.
+///
+/// If concurrent committers stamp the same TxId, pagination either skips
+/// rows (cursor lands on a duplicate, the duplicate gets dropped on the
+/// `>` predicate) or duplicates them across pages (cursor returns to
+/// previous duplicate). Either breaks audit replay.
+///
+/// Wrong-impl shapes from the TXID lens this probe binds:
+///   (c) TXID comparisons (`<`, `>`) on the column return wrong ordering
+///       under concurrent inserts. → Surfaces if two writers stamp the
+///       same TxId (pairwise distinctness fails) OR if commit-order sort
+///       does not match TxId-ascending sort (monotonicity fails).
+///   (b) TXID column accepts arbitrary u64 instead of advancing the TX
+///       manager's monotonic clock. → Surfaces if stamped values lie
+///       outside [0, final_watermark) range or are non-monotonic in
+///       commit order.
+///   (a) `Value::TxId(_)` round-trips as `Value::Integer(_)`. → Surfaces
+///       on the type-match panic.
+///
+/// Each writer:
+///   1. Reads pre-commit watermark, stamps the row with it.
+///   2. Reads post-commit watermark after its commit returns.
+/// Commit order is established by sorting writers' results on the
+/// post-commit watermark (strictly increasing across distinct commits).
+/// We then assert the stamped values are (a) pairwise distinct and (b)
+/// strictly monotonic when iterated in commit order. We also re-page the
+/// audit log via `WHERE txid > $cursor` and assert exactly N-1 rows
+/// remain after the smallest stamped value, exactly 0 rows remain after
+/// the largest — surfacing duplicate stamps as missed/duplicated rows.
 #[test]
 fn audit_log_txid_monotonic_under_concurrent_commits() {
     let db = Arc::new(open_governance_schema());
@@ -869,57 +901,131 @@ fn audit_log_txid_monotonic_under_concurrent_commits() {
 
     const N: usize = 8;
     let barrier = Arc::new(Barrier::new(N));
+    // (post_commit_watermark, stamped_txid, row_id)
+    let collected: Arc<Mutex<Vec<(u64, u64, Uuid)>>> = Arc::new(Mutex::new(Vec::with_capacity(N)));
     let mut handles = vec![];
     for i in 0..N {
         let db = db.clone();
         let barrier = barrier.clone();
+        let collected = collected.clone();
         let ctx = ctx;
         handles.push(thread::spawn(move || {
+            let row_id = Uuid::new_v4();
             barrier.wait();
+            // Stamp with the pre-commit watermark observed by THIS writer.
+            let stamped = db.committed_watermark().0;
             db.execute(
                 "INSERT INTO audit_log (id, txid, operation, actor, target_kind, target_id, context_id) \
                  VALUES ($id, $tx, $op, 'alice', 'decision', $tid, $cx)",
                 &params(vec![
-                    ("id", Value::Uuid(Uuid::new_v4())),
-                    ("tx", Value::TxId(TxId(db.committed_watermark().0))),
+                    ("id", Value::Uuid(row_id)),
+                    ("tx", Value::TxId(TxId(stamped))),
                     ("op", Value::Text(format!("op_{i}"))),
                     ("tid", Value::Uuid(Uuid::new_v4())),
                     ("cx", Value::Uuid(ctx)),
                 ]),
             )
             .unwrap();
+            // Post-commit watermark establishes commit order between writers.
+            let post_commit = db.committed_watermark().0;
+            collected.lock().unwrap().push((post_commit, stamped, row_id));
         }));
     }
     for h in handles {
         h.join().unwrap();
     }
 
-    // Every row must have a TxId-typed `txid` column (no torn variant) and
-    // the *post-commit* watermark must strictly exceed every recorded value
-    // (because the writer's stamp was the watermark BEFORE its own commit).
+    let mut by_commit_order: Vec<(u64, u64, Uuid)> = collected.lock().unwrap().clone();
+    assert_eq!(by_commit_order.len(), N);
+    // Sort writers by the post-commit watermark each observed; this gives
+    // us a stable commit-order ranking even though writers ran concurrently.
+    by_commit_order.sort_by_key(|(post, _, _)| *post);
+
+    // Read every audit row's stored txid and id back from the engine.
     let result = db
-        .execute(
-            "SELECT txid FROM audit_log",
-            &HashMap::new(),
-        )
+        .execute("SELECT id, txid FROM audit_log", &HashMap::new())
         .unwrap();
     assert_eq!(result.rows.len(), N);
+    let stored: HashMap<Uuid, u64> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let id = match &row[0] {
+                Value::Uuid(u) => *u,
+                other => panic!("expected Value::Uuid for audit_log.id, got {other:?}"),
+            };
+            let tx = match &row[1] {
+                Value::TxId(tx) => tx.0,
+                other => panic!("expected Value::TxId for audit_log.txid, got {other:?}"),
+            };
+            (id, tx)
+        })
+        .collect();
+
+    // Lens (a): every row round-trips as Value::TxId — covered by the panic
+    // arms above.
+    // Lens (b): every stamped value < final watermark.
     let final_watermark = db.committed_watermark().0;
-    for row in &result.rows {
-        match row[0] {
-            Value::TxId(tx) => assert!(
-                tx.0 < final_watermark,
-                "every writer-stamped txid must precede the final watermark; got tx={tx:?}, final={final_watermark}"
-            ),
-            ref other => panic!("expected Value::TxId, got {other:?}"),
-        }
-    }
-    // The committed_watermark must have advanced by at least N (each commit
-    // advances at least once).
     assert!(
         final_watermark >= N as u64,
         "final_watermark {final_watermark} must reflect at least {N} commits"
     );
+    for (_, tx) in &stored {
+        assert!(
+            *tx < final_watermark,
+            "every writer-stamped txid must precede the final watermark; got tx={tx}, final={final_watermark}"
+        );
+    }
+
+    // Lens (c) — pairwise distinctness across N concurrent commits.
+    let stamped_values: Vec<u64> = by_commit_order.iter().map(|(_, stamped, _)| *stamped).collect();
+    let distinct: HashSet<u64> = stamped_values.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        N,
+        "concurrent committers must each receive a distinct TxId; collected (post_commit, stamped, id) = {by_commit_order:?}, \
+         distinct stamped values = {distinct:?}"
+    );
+
+    // Lens (c) — strict monotonicity in commit order. Walking writers in the
+    // order their commits returned, the stored txids on the rows they wrote
+    // must strictly increase. Anything else means TxId comparisons disagree
+    // with causal commit order.
+    let stored_in_commit_order: Vec<u64> = by_commit_order
+        .iter()
+        .map(|(_, _, id)| *stored.get(id).expect("audit_log row id missing from SELECT"))
+        .collect();
+    for w in stored_in_commit_order.windows(2) {
+        assert!(
+            w[0] < w[1],
+            "audit_log.txid must be strictly monotonic in commit order; \
+             got window {w:?}; full commit-ordered stored txids = {stored_in_commit_order:?}; \
+             collected (post_commit, stamped, id) = {by_commit_order:?}"
+        );
+    }
+
+    // Lens (c) cont. — paginated `WHERE txid > $cursor` must surface any
+    // duplicate or out-of-order stamp as a missed or duplicated row at the
+    // engine read path. Walk by ascending stored txid; after each cursor
+    // step the count of remaining rows must drop by exactly one.
+    let mut sorted_txids = stored_in_commit_order.clone();
+    sorted_txids.sort();
+    for (k, cursor) in sorted_txids.iter().enumerate() {
+        let page = db
+            .execute(
+                "SELECT id FROM audit_log WHERE txid > $c",
+                &params(vec![("c", Value::TxId(TxId(*cursor)))]),
+            )
+            .unwrap();
+        let expected = N - k - 1;
+        assert_eq!(
+            page.rows.len(),
+            expected,
+            "pagination by txid > {cursor} must return exactly {expected} rows (N={N}, position={k}); \
+             got {} rows; sorted_txids = {sorted_txids:?}",
+            page.rows.len()
+        );
+    }
 }
 
 /// C-G4 full_provenance under concurrent edge insert: while a BFS traversal

@@ -348,70 +348,129 @@ fn write_plus_audit_atomic_rollback_on_write_failure() {
     );
 }
 
-/// 22a multi-primitive: ACL update under cross-row contention. UPDATE
-/// `permission` for `(alice, ctx)`. Wrong-impl per UPDATE lens: engine
-/// short-circuits if `old == new` and skips the conflict check. Probe sets
-/// permission='read' first, then concurrent UPDATEs to 'write' from N writers.
+/// 22a multi-primitive: ACL update under cross-row contention.
+///
+/// The cg-auth contract is that the engine conflict-serializes concurrent
+/// UPDATEs to a single row protected by a composite UNIQUE: of N writers
+/// contending each round, exactly one observes `rows_affected = 1` and the
+/// remaining `N-1` observe `rows_affected = 0`. This binds:
+///   - lens (a) short-circuit on `old == new`: a CAS-style `WHERE permission = 'read'`
+///     forces the WHERE to genuinely match the current state. After the first
+///     winner flips the row to 'write' or 'admin', every subsequent writer's
+///     WHERE must NO LONGER match → rows_affected = 0. A short-circuit impl
+///     that returns `Ok(rows_affected = 1)` despite the WHERE not matching
+///     would push max_total above 1.
+///   - lens (b) both-Ok-with-rows_affected=1: max_total > 1 surfaces.
+///   - lens (c) commit-lock serialization that's so coarse the contention
+///     never fires: still required to deliver the contract — exactly one
+///     winner per round. (And the test runs ROUNDS=30 to give torn cases a
+///     reasonable shot at firing.)
+///   - lens (d) WHERE clause ignored: the CAS WHERE on `permission = 'read'`
+///     would match all writers if ignored → max_total = N.
+///
+/// The post-round assertion that exactly one ACL row remains and its final
+/// permission is the winner's value pins the at-most-one invariant cg's ACL
+/// contract depends on.
 #[test]
 fn context_acl_concurrent_permission_update_serializes() {
     let db = Arc::new(open_auth_schema());
     let ctx = seed_context(&db, "ctx22a-concurrent-update", "system");
-    db.execute(
-        "INSERT INTO context_acl (id, principal, context_id, permission, created_at) \
-         VALUES ($id, 'alice', $cx, 'read', $ts)",
-        &params(vec![
-            ("id", Value::Uuid(Uuid::new_v4())),
-            ("cx", Value::Uuid(ctx)),
-            ("ts", Value::TxId(TxId(db.committed_watermark().0))),
-        ]),
-    )
-    .unwrap();
 
+    const ROUNDS: usize = 30;
     const N: usize = 6;
-    let barrier = Arc::new(Barrier::new(N));
-    let mut handles = vec![];
-    for i in 0..N {
-        let db = db.clone();
-        let barrier = barrier.clone();
-        let ctx = ctx;
-        handles.push(thread::spawn(move || -> u64 {
-            barrier.wait();
-            let new_perm = if i % 2 == 0 { "write" } else { "admin" };
-            db.execute(
-                "UPDATE context_acl SET permission = $p WHERE principal = 'alice' AND context_id = $cx",
-                &params(vec![
-                    ("p", Value::Text(new_perm.into())),
-                    ("cx", Value::Uuid(ctx)),
-                ]),
-            )
-            .map(|qr| qr.rows_affected)
-            .unwrap_or(0)
-        }));
-    }
-    let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-    // Each writer's UPDATE is unconditional (no WHERE on existing permission)
-    // so all should succeed. The contract is: the row remains in a consistent
-    // state after all writers finish — no torn row, exactly one final value.
-    assert!(
-        total >= 1,
-        "at least one writer must succeed; got {total} successful updates"
-    );
+    let mut max_total = 0u64;
+    let mut all_rounds: Vec<(usize, u64, Vec<u64>)> = vec![];
 
-    let rows = db
-        .execute(
-            "SELECT permission FROM context_acl WHERE principal = 'alice' AND context_id = $cx",
+    for r in 0..ROUNDS {
+        // Reset the row to permission='read' at the start of each round so
+        // every round contends from the same baseline. Use DELETE + INSERT
+        // (rather than UPDATE-back-to-read) to ensure a single committed row
+        // version exists at round start; this avoids any prior-round MVCC
+        // history leaking into the contention semantics under test.
+        db.execute(
+            "DELETE FROM context_acl WHERE principal = 'alice' AND context_id = $cx",
             &params(vec![("cx", Value::Uuid(ctx))]),
         )
         .unwrap();
-    assert_eq!(rows.rows.len(), 1, "exactly one ACL row must exist after contention");
-    let final_perm = match &rows.rows[0][0] {
-        Value::Text(s) => s.clone(),
-        other => panic!("expected Text permission, got {other:?}"),
-    };
-    // Final permission must be one of the values writers attempted.
-    assert!(
-        final_perm == "write" || final_perm == "admin",
-        "final permission must equal one of the writers' values; got {final_perm:?}"
+        db.execute(
+            "INSERT INTO context_acl (id, principal, context_id, permission, created_at) \
+             VALUES ($id, 'alice', $cx, 'read', $ts)",
+            &params(vec![
+                ("id", Value::Uuid(Uuid::new_v4())),
+                ("cx", Value::Uuid(ctx)),
+                ("ts", Value::TxId(TxId(db.committed_watermark().0))),
+            ]),
+        )
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(N));
+        let mut handles = vec![];
+        for i in 0..N {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let ctx = ctx;
+            handles.push(thread::spawn(move || -> u64 {
+                let new_perm = if i % 2 == 0 { "write" } else { "admin" };
+                barrier.wait();
+                // CAS-style: only update if current permission is still 'read'.
+                // After the first winner commits, the WHERE no longer matches
+                // for any subsequent writer, so the engine MUST report
+                // rows_affected = 0 — distinguishing genuine update from any
+                // short-circuit-on-old==new path.
+                db.execute(
+                    "UPDATE context_acl SET permission = $p WHERE principal = 'alice' \
+                     AND context_id = $cx AND permission = 'read'",
+                    &params(vec![
+                        ("p", Value::Text(new_perm.into())),
+                        ("cx", Value::Uuid(ctx)),
+                    ]),
+                )
+                .map(|qr| qr.rows_affected)
+                .unwrap_or(0)
+            }));
+        }
+        let inserts: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let total: u64 = inserts.iter().sum();
+        if total > max_total {
+            max_total = total;
+        }
+        all_rounds.push((r, total, inserts));
+
+        // Per-round contract: the winning writer's UPDATE flipped the row,
+        // every other writer's CAS WHERE missed → exactly one row in the
+        // table, and exactly one writer reported rows_affected = 1.
+        let rows = db
+            .execute(
+                "SELECT permission FROM context_acl WHERE principal = 'alice' AND context_id = $cx",
+                &params(vec![("cx", Value::Uuid(ctx))]),
+            )
+            .unwrap();
+        assert_eq!(
+            rows.rows.len(),
+            1,
+            "round {r}: exactly one ACL row must exist after contention; got {} rows",
+            rows.rows.len()
+        );
+        let final_perm = match &rows.rows[0][0] {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected Text permission, got {other:?}"),
+        };
+        assert!(
+            final_perm == "write" || final_perm == "admin",
+            "round {r}: final permission must equal one of the writers' values; got {final_perm:?}"
+        );
+        // Stop at the first observed contract break to keep the failure log
+        // compact; assertion below pins max_total == 1 across all rounds.
+        if max_total > 1 {
+            break;
+        }
+    }
+
+    assert_eq!(
+        max_total, 1,
+        "concurrent CAS UPDATEs against single ACL row: exactly one writer per round must report \
+         rows_affected = 1 and the rest must report 0; max observed total across {ROUNDS} rounds = \
+         {max_total}; round results = {all_rounds:?}"
     );
 }
 
