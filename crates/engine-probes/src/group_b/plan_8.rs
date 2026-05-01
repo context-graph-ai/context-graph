@@ -224,6 +224,24 @@ fn invalidation_state_machine_rejects_resolved_to_dismissed() {
         matches!(result, Err(Error::InvalidStateTransition(_))),
         "Resolved -> Dismissed must be rejected; got {result:?}"
     );
+
+    // Wrong-impl shape (lens STATE MACHINE rows a/b/c): validator surfaces
+    // `InvalidStateTransition` from an audit-only side channel while a
+    // separate write path persists the `Dismissed` update. Mirror probe 2's
+    // tail and re-read the row to confirm status is still `Resolved`.
+    let rows = db
+        .execute(
+            "SELECT status FROM invalidations WHERE id = $id",
+            &params(vec![("id", Value::Uuid(iid))]),
+        )
+        .unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        Value::Text("Resolved".into()),
+        "rejected Resolved -> Dismissed transition must leave the row in Resolved; \
+         a validator-vs-writer split-brain that surfaces the error but persists the \
+         Dismissed write would silently corrupt cg's invalidation surface"
+    );
 }
 
 /// Plan 8 single-primitive: STATE MACHINE rejects `Detected -> Detected`
@@ -345,7 +363,7 @@ fn audit_log_insert_round_trips_and_immutable_blocks_update_delete() {
     assert_eq!(rows.rows[0][1], Value::Text("invalidation_acknowledge".into()));
     assert_eq!(rows.rows[0][2], Value::Uuid(target_id));
 
-    // IMMUTABLE: UPDATE and DELETE both rejected.
+    // IMMUTABLE: UPDATE and DELETE both rejected on direct `db.execute`.
     let upd = db.execute(
         "UPDATE audit_log SET actor = 'attacker' WHERE id = $id",
         &params(vec![("id", Value::Uuid(id))]),
@@ -356,13 +374,43 @@ fn audit_log_insert_round_trips_and_immutable_blocks_update_delete() {
     );
     assert!(
         matches!(upd, Err(Error::ImmutableTable(_))),
-        "audit_log UPDATE must be rejected as ImmutableTable; got {upd:?}"
+        "audit_log UPDATE must be rejected as ImmutableTable on db.execute; got {upd:?}"
     );
     assert!(
         matches!(del, Err(Error::ImmutableTable(_))),
-        "audit_log DELETE must be rejected as ImmutableTable; got {del:?}"
+        "audit_log DELETE must be rejected as ImmutableTable on db.execute; got {del:?}"
     );
-    // Row still present.
+
+    // IMMUTABLE bypass path (lens row IMMUTABLE b): the same UPDATE/DELETE
+    // submitted via `execute_in_tx` MUST also be rejected. cg's audit_log is
+    // the integrity foundation for the entire invalidation lifecycle; a
+    // divergent code path that rejects on db.execute but accepts on
+    // execute_in_tx would let any in-tx mutation silently rewrite audit
+    // history. Cites: contextdb/crates/contextdb-engine/src/database.rs:642
+    // execute_in_tx; schema_enforcer IMMUTABLE validation must be invoked on
+    // both paths.
+    let tx = db.begin();
+    let upd_tx = db.execute_in_tx(
+        tx,
+        "UPDATE audit_log SET actor = 'attacker' WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id))]),
+    );
+    let del_tx = db.execute_in_tx(
+        tx,
+        "DELETE FROM audit_log WHERE id = $id",
+        &params(vec![("id", Value::Uuid(id))]),
+    );
+    let _ = db.rollback(tx);
+    assert!(
+        matches!(upd_tx, Err(Error::ImmutableTable(_))),
+        "audit_log UPDATE via execute_in_tx must be rejected as ImmutableTable; got {upd_tx:?}"
+    );
+    assert!(
+        matches!(del_tx, Err(Error::ImmutableTable(_))),
+        "audit_log DELETE via execute_in_tx must be rejected as ImmutableTable; got {del_tx:?}"
+    );
+
+    // Row still present and unchanged after both bypass attempts.
     let after = db
         .execute(
             "SELECT actor FROM audit_log WHERE id = $id",
@@ -1306,6 +1354,166 @@ fn invalidation_fk_holds_when_decision_concurrently_archived() {
         )
         .unwrap();
     assert_eq!(dec_rows.rows[0][0], Value::Text("archived".into()));
+}
+
+/// Plan 8 multi-primitive: FK validation under concurrent decision DELETE.
+/// Lens for "FK validation at commit" row c verbatim: "FK against a row
+/// deleted concurrently in another tx accepted at commit."
+///
+/// One tx DELETEs a decision; another tx INSERTs an invalidation that
+/// references it. The two txs race the commit-validate ordering. The probe
+/// REJECTS the outcome where both succeed (which would leave an invalidation
+/// referencing a deleted decision — exactly the wrong-impl shape lens row c
+/// names). Acceptable outcomes:
+///   (i) deleter wins -> insert fails with `Error::ForeignKeyViolation`;
+///   (ii) inserter wins -> delete fails (FK-restrict / fk-cascade / row
+///        contention error of any variant).
+/// We run several rounds because the race window is timing-dependent; any
+/// single round that yields "both succeed" is the gap.
+///
+/// Cites: contextdb/crates/contextdb-engine/src/database.rs::commit_validate
+/// (FK validation at commit); database.rs::execute_in_tx; database.rs::commit.
+#[test]
+fn invalidation_fk_delete_race_rejects_both_succeed_outcome() {
+    let db = Arc::new(open_invalidation_schema());
+
+    const ROUNDS: usize = 30;
+    let mut violations: Vec<String> = vec![];
+
+    for r in 0..ROUNDS {
+        // Each round gets a fresh decision so prior-round outcomes don't
+        // confound the next race.
+        let did = seed_decision(&db, "ctxA");
+        let watermark = db.committed_watermark();
+        let new_inv_id = Uuid::new_v4();
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Tx A: DELETE the decision.
+        let db_d = db.clone();
+        let barrier_d = barrier.clone();
+        let deleter = thread::spawn(move || -> (bool, String) {
+            let tx = db_d.begin();
+            barrier_d.wait();
+            let exec_res = db_d.execute_in_tx(
+                tx,
+                "DELETE FROM decisions WHERE id = $id",
+                &params(vec![("id", Value::Uuid(did))]),
+            );
+            let exec_repr = format!("{exec_res:?}");
+            if exec_res.is_err() {
+                let _ = db_d.rollback(tx);
+                return (false, format!("delete exec failed: {exec_repr}"));
+            }
+            match db_d.commit(tx) {
+                Ok(()) => (true, "delete committed".into()),
+                Err(e) => (false, format!("delete commit failed: {e:?}")),
+            }
+        });
+
+        // Tx B: INSERT an invalidation referencing the same decision.
+        let db_i = db.clone();
+        let barrier_i = barrier.clone();
+        let inserter = thread::spawn(move || -> (bool, String) {
+            let tx = db_i.begin();
+            barrier_i.wait();
+            let exec_res = db_i.execute_in_tx(
+                tx,
+                "INSERT INTO invalidations (id, decision_id, status, context_id, severity, detected_at) \
+                 VALUES ($id, $did, 'Detected', 'ctxA', 'Warning', $rec)",
+                &params(vec![
+                    ("id", Value::Uuid(new_inv_id)),
+                    ("did", Value::Uuid(did)),
+                    ("rec", Value::TxId(TxId(watermark.0))),
+                ]),
+            );
+            let exec_repr = format!("{exec_res:?}");
+            if exec_res.is_err() {
+                let _ = db_i.rollback(tx);
+                return (false, format!("insert exec failed: {exec_repr}"));
+            }
+            match db_i.commit(tx) {
+                Ok(()) => (true, "insert committed".into()),
+                Err(e) => (false, format!("insert commit failed: {e:?}")),
+            }
+        });
+
+        let (deleter_ok, deleter_msg) = deleter.join().unwrap();
+        let (inserter_ok, inserter_msg) = inserter.join().unwrap();
+
+        // The unacceptable outcome: both succeed. That leaves an
+        // invalidation row referencing a deleted decision.
+        if deleter_ok && inserter_ok {
+            // Cross-check the on-disk state before recording the violation —
+            // we want the evidence to capture both rows exist.
+            let inv_rows = db
+                .execute(
+                    "SELECT id FROM invalidations WHERE id = $iid",
+                    &params(vec![("iid", Value::Uuid(new_inv_id))]),
+                )
+                .unwrap();
+            let dec_rows = db
+                .execute(
+                    "SELECT id FROM decisions WHERE id = $did",
+                    &params(vec![("did", Value::Uuid(did))]),
+                )
+                .unwrap();
+            violations.push(format!(
+                "round {r}: both succeeded — deleter={deleter_msg}, inserter={inserter_msg}; \
+                 post-race invalidation_present={}, decision_present={} (FK references a \
+                 deleted decision)",
+                inv_rows.rows.len() == 1,
+                dec_rows.rows.len() == 1
+            ));
+        }
+
+        // Acceptable outcomes — at least one tx must fail. Capture the
+        // outcome shape so reviewers can verify the race actually fired.
+        if !deleter_ok && !inserter_ok {
+            // Both failed is also acceptable (engine refused either side
+            // because of detected contention) — record but do not violate.
+            // This branch exists so the assertion message above is precise:
+            // the only rejected outcome is "both succeeded".
+        }
+
+        // If only one succeeded, verify the on-disk state is consistent
+        // with FK integrity: the surviving side's row exists, the failed
+        // side's row does not.
+        if deleter_ok && !inserter_ok {
+            let inv_rows = db
+                .execute(
+                    "SELECT id FROM invalidations WHERE id = $iid",
+                    &params(vec![("iid", Value::Uuid(new_inv_id))]),
+                )
+                .unwrap();
+            if !inv_rows.rows.is_empty() {
+                violations.push(format!(
+                    "round {r}: deleter won but invalidation row is present \
+                     (insert committed despite returning failure?)"
+                ));
+            }
+        }
+        if inserter_ok && !deleter_ok {
+            let dec_rows = db
+                .execute(
+                    "SELECT id FROM decisions WHERE id = $did",
+                    &params(vec![("did", Value::Uuid(did))]),
+                )
+                .unwrap();
+            if dec_rows.rows.is_empty() {
+                violations.push(format!(
+                    "round {r}: inserter won but decision is absent \
+                     (delete committed despite returning failure?)"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "FK delete-race must never leave an invalidation referencing a deleted decision. \
+         Lens row FK c violations across {ROUNDS} rounds: {violations:?}"
+    );
 }
 
 // ================================================================
