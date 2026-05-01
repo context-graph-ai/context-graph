@@ -412,6 +412,19 @@ fn vector_topk_with_filter_and_rank_policy() {
 /// C-S2 HNSW read under concurrent insert: writer inserts new evidence
 /// while reader queries vector_text. Reader must not panic, and every
 /// returned row must be either pre-insert or post-insert (not torn).
+///
+/// Round-2 reviewer fix: the prior assertions (counts in [seed, k]) were
+/// satisfied even by a wrong-impl that silently dropped every concurrent
+/// HNSW write (reader sees seed-only ≥8, no panic). Strengthening:
+///   (a) Use a Barrier(2) to align reader and writer so the reader's
+///       16 snapshots overlap with the writer's 32 commits, then have
+///       the reader spin until it observes the writer's final commit
+///       (count == 40) or hits a generous iteration cap. At least one
+///       reader observation MUST have c > 8 — this proves writer
+///       commits became visible during the contention window.
+///   (b) Post-join, query_vector against the same index must return
+///       exactly 8 seed + 32 writer = 40 rows. A wrong-impl that drops
+///       any writer vector insert would return <40.
 #[test]
 fn vector_search_under_concurrent_insert_no_panic() {
     let db = Arc::new(open_search_schema_with_rank_policy());
@@ -432,8 +445,11 @@ fn vector_search_under_concurrent_insert_no_panic() {
         .unwrap();
     }
 
+    let barrier = Arc::new(Barrier::new(2));
     let writer_db = db.clone();
+    let writer_b = barrier.clone();
     let writer = thread::spawn(move || {
+        writer_b.wait();
         for i in 0..32 {
             writer_db
                 .execute(
@@ -454,28 +470,77 @@ fn vector_search_under_concurrent_insert_no_panic() {
         }
     });
     let reader_db = db.clone();
+    let reader_b = barrier.clone();
     let reader = thread::spawn(move || {
+        reader_b.wait();
         let mut counts = vec![];
-        for _ in 0..16 {
+        // Spin until we observe the final writer commit, or hit the cap.
+        // The cap is generous enough that we will definitely overlap with
+        // some, but not necessarily all, of the 32 writer commits — the
+        // contract is that AT LEAST ONE mid-contention observation must
+        // have c > 8 (writer commit became visible).
+        for _ in 0..2048 {
             let snap = reader_db.snapshot();
             let hits = reader_db
                 .query_vector(
                     VectorIndexRef::new("evidence", "vector_text"),
                     &[1.0, 0.0, 0.0, 0.0],
-                    50,
+                    64,
                     None,
                     snap,
                 )
                 .unwrap();
             counts.push(hits.len());
+            // Early-exit once we've observed the final commit, so we
+            // don't spin forever after the writer is done.
+            if hits.len() == 8 + 32 {
+                break;
+            }
         }
         counts
     });
 
     writer.join().unwrap();
     let counts = reader.join().unwrap();
-    assert!(counts.iter().all(|&c| c <= 50));
-    assert!(counts.iter().all(|&c| c >= 8), "reader must always see seed rows; got counts {counts:?}");
+    // Sanity: bounded by k.
+    assert!(
+        counts.iter().all(|&c| c <= 64),
+        "all hits bounded by k=64; got {counts:?}"
+    );
+    // Sanity: reader always sees at least the 8 seed rows.
+    assert!(
+        counts.iter().all(|&c| c >= 8),
+        "reader must always see seed rows; got counts {counts:?}"
+    );
+    // Round-2 strengthening (a): at least one reader observation must have
+    // observed a writer commit during the contention window. A wrong-impl
+    // that silently drops every concurrent HNSW write would never see c > 8.
+    assert!(
+        counts.iter().any(|&c| c > 8),
+        "no mid-contention reader observation saw a writer commit (counts {counts:?}); \
+         a wrong-impl that drops every concurrent HNSW vector write would also pass \
+         the seed-floor / k-ceil bounds — this assertion proves writes were visible"
+    );
+    // Round-2 strengthening (b): post-join, the index must contain exactly
+    // 8 seed + 32 writer = 40 rows. A wrong-impl that drops any writer
+    // vector insert would return <40.
+    let final_snap = db.snapshot();
+    let final_hits = db
+        .query_vector(
+            VectorIndexRef::new("evidence", "vector_text"),
+            &[1.0, 0.0, 0.0, 0.0],
+            128,
+            None,
+            final_snap,
+        )
+        .unwrap();
+    assert_eq!(
+        final_hits.len(),
+        8 + 32,
+        "post-join, vector index must contain exactly 8 seed + 32 writer rows; \
+         got {} (writes dropped silently?)",
+        final_hits.len()
+    );
 }
 
 /// C-S6 semantic_search on empty corpus returns empty without panic.

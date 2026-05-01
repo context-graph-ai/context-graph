@@ -97,11 +97,29 @@ fn evidence_text_and_vision_indexes_coexist() {
 /// 11 single-primitive: digests.vector_text and evidence.vector_text are
 /// distinct named indexes — same column name, different table. Inserting
 /// into one does not appear in the other.
+///
+/// Round-2 reviewer fix: the previous version inserted DIFFERENT vectors
+/// into the two tables and asserted each top-1 returned a different RowId.
+/// A wrong-impl that merges all `vector_text` columns into one global
+/// index keyed by column-name only (ignoring the table component of
+/// VectorIndexRef) would still pass — the two RowIds differ regardless.
+///
+/// This version inserts the SAME vector `[1,0,0,0]` into BOTH
+/// `evidence.vector_text` AND `digests.vector_text`, then queries each
+/// per-table index with that exact vector. Per-table top-k must return
+/// ONLY that table's row — never the other table's row, even though both
+/// rows are equally close to the query. A merged-index wrong-impl would
+/// return both rows in the top-2 of each query.
 #[test]
 fn digests_and_evidence_vector_text_are_distinct_indexes() {
     let db = open_embedding_schema();
     let evi_id = Uuid::new_v4();
     let dig_id = Uuid::new_v4();
+
+    // Same vector value in both tables. The per-(table, column) routing
+    // contract requires that querying evidence/vector_text never returns
+    // the digests row, and vice versa.
+    let shared_vec = vec![1.0_f32, 0.0, 0.0, 0.0];
 
     let tx = db.begin();
     let evi_row = db
@@ -118,7 +136,7 @@ fn digests_and_evidence_vector_text_are_distinct_indexes() {
         tx,
         VectorIndexRef::new("evidence", "vector_text"),
         evi_row,
-        vec![1.0, 0.0, 0.0, 0.0],
+        shared_vec.clone(),
     )
     .unwrap();
     let dig_row = db
@@ -135,16 +153,19 @@ fn digests_and_evidence_vector_text_are_distinct_indexes() {
         tx,
         VectorIndexRef::new("digests", "vector_text"),
         dig_row,
-        vec![0.0, 1.0, 0.0, 0.0],
+        shared_vec.clone(),
     )
     .unwrap();
     db.commit(tx).unwrap();
 
     let snap = db.snapshot();
+    // Query each per-table index with the SHARED vector. A correct engine
+    // returns exactly the one row that lives in that table's index. A
+    // merged-index wrong-impl returns both rows.
     let evi_hits = db
         .query_vector(
             VectorIndexRef::new("evidence", "vector_text"),
-            &[1.0, 0.0, 0.0, 0.0],
+            &shared_vec,
             10,
             None,
             snap,
@@ -153,17 +174,37 @@ fn digests_and_evidence_vector_text_are_distinct_indexes() {
     let dig_hits = db
         .query_vector(
             VectorIndexRef::new("digests", "vector_text"),
-            &[0.0, 1.0, 0.0, 0.0],
+            &shared_vec,
             10,
             None,
             snap,
         )
         .unwrap();
-    assert_eq!(evi_hits.len(), 1, "evidence text index has 1 row");
-    assert_eq!(dig_hits.len(), 1, "digests text index has 1 row");
+    assert_eq!(
+        evi_hits.len(),
+        1,
+        "evidence/vector_text query must return exactly 1 row (the evidence row); \
+         got {} rows — merged-index wrong-impl would return both tables' rows",
+        evi_hits.len()
+    );
+    assert_eq!(
+        dig_hits.len(),
+        1,
+        "digests/vector_text query must return exactly 1 row (the digests row); \
+         got {} rows — merged-index wrong-impl would return both tables' rows",
+        dig_hits.len()
+    );
+    assert_eq!(
+        evi_hits[0].0, evi_row,
+        "evidence/vector_text top-1 must be the evidence row, not the digests row"
+    );
+    assert_eq!(
+        dig_hits[0].0, dig_row,
+        "digests/vector_text top-1 must be the digests row, not the evidence row"
+    );
     assert_ne!(
         evi_hits[0].0, dig_hits[0].0,
-        "different tables must produce different RowIds (each table has its own row id space)"
+        "per-(table, column) routing: each index must return only its own table's row"
     );
 }
 

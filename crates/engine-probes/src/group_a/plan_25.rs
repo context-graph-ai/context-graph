@@ -324,25 +324,20 @@ fn rejected_webhook_no_partial_audit_trace() {
     assert_eq!(db.scan("observations", db.snapshot()).unwrap().len(), 0);
 }
 
-/// C-OB6 large-payload refusal does not require engine work — refusal at
-/// the HTTP layer before any engine call. We catalogue this as a probe
-/// asserting that the engine NEVER sees a partial insert when the cg
-/// server refuses upstream.
-#[test]
-fn engine_never_sees_inserts_when_caller_skips_them() {
-    let db = open_observe_schema();
-    // Caller "refuses" to call insert_row at all — stand-in for HTTP-layer
-    // rejection of large payloads.
-    let snap = db.snapshot();
-    assert_eq!(db.scan("observations", snap).unwrap().len(), 0);
-    assert_eq!(db.scan("evidence", snap).unwrap().len(), 0);
-}
+// Round-2 reviewer fix: the former probe `engine_never_sees_inserts_when_caller_skips_them`
+// was a tautology (open empty schema, scan, assert empty — no engine
+// behaviour under test). Deleted. C-OB6 large-payload refusal is covered
+// by the BLOCKED entry below.
 
 // ---------- BLOCKED entries ----------
 // C-OB2 scheduled cron + webhook concurrency — `observe_scheduled_via_contextdb_cron`
 // requires ObservationTrigger (engine-gaps-for-cg.md §3 Pending). Cron
 // scheduling is a server-layer plugin, not an engine primitive.
 // BLOCKED on ObservationTrigger.
+//
+// C-OB6 large-payload / HTTP-layer refusal — refusal happens before any
+// engine call. The engine has no payload-size primitive. Out of engine
+// probe scope.
 //
 // HMAC verification and HTTP routing — server-layer; engine has no
 // HMAC primitive. Out of engine probe scope.
