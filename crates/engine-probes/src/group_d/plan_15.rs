@@ -259,6 +259,7 @@ fn deprecate_vs_instantiate_conflict_serializable() {
         let r_a = h_a.join().expect("a");
         let r_b = h_b.join().expect("b");
 
+        let b_succeeded = r_b.is_ok();
         match (r_a, r_b) {
             (Ok(()), Ok(())) => {
                 instantiate_count += 1;
@@ -284,6 +285,17 @@ fn deprecate_vs_instantiate_conflict_serializable() {
             "blueprint status not Active/Deprecated: `{}` — STATE MACHINE accepted bogus state",
             status
         );
+        // Success-implies-state-changed bind: if B's deprecate UPDATE
+        // returned Ok, the row MUST read as "Deprecated". Catches the
+        // lost-update wrong-impl where UPDATE returns Ok(rows_affected=1)
+        // but the column stays "Active".
+        if b_succeeded {
+            assert_eq!(
+                status, "Deprecated",
+                "deprecate UPDATE returned Ok but status remained `{}` — lost-update wrong-impl",
+                status
+            );
+        }
     }
 
     assert!(
@@ -337,31 +349,68 @@ fn state_machine_deprecated_terminal_no_revival() {
         .expect("scan");
     let status = s.rows[0][0].as_text().expect("text");
     assert_eq!(status, "Deprecated");
+
+    // Parameterised variant: SET status = $s with parameter binding instead
+    // of a static string literal. STATE MACHINE validation MUST apply on
+    // ALL UPDATE paths, including parameterised. Catches a wrong engine
+    // that validates static SQL but bypasses validation when the new value
+    // is a bound parameter.
+    let r3 = db.execute(
+        "UPDATE blueprints SET status = $s WHERE name = 'bp'",
+        &HashMap::from([("s".to_string(), Value::Text("Active".to_string()))]),
+    );
+    match r3 {
+        Err(Error::InvalidStateTransition(_)) | Err(Error::PropagationAborted { .. }) => {}
+        Ok(_) => panic!("parameterised UPDATE Deprecated->Active accepted by engine — STATE MACHINE bypass on parameterised path"),
+        Err(other) => panic!("expected InvalidStateTransition on parameterised UPDATE; got {:?}", other),
+    }
+
+    let s2 = db
+        .execute(
+            "SELECT status FROM blueprints WHERE name = 'bp'",
+            &HashMap::new(),
+        )
+        .expect("scan2");
+    assert_eq!(s2.rows[0][0].as_text(), Some("Deprecated"), "param UPDATE leaked through STATE MACHINE");
 }
 
-/// STATE MACHINE: arbitrary undeclared state ('Quarantined', 'Foo') rejected.
+/// STATE MACHINE: arbitrary undeclared state ('Quarantined', 'Foo') rejected,
+/// on BOTH static SQL and parameterised SET status = $s paths.
 ///
 /// Lens: lens-question row "STATE MACHINE transition" — engine rejecting at
 /// parse but accepting via raw `Database::execute` is a wrong-impl shape.
-/// All paths through `execute` must apply the state-machine validator.
+/// All paths through `execute` must apply the state-machine validator,
+/// regardless of whether the new value is a string literal or a bound parameter.
 #[test]
 fn state_machine_arbitrary_unknown_state_rejected() {
     let db = make_db();
     create_blueprint(&db, "bp", "1.0.0", serde_json::json!({})).expect("bp");
 
-    // Active -> Quarantined: undeclared
+    // Active -> Quarantined: undeclared (static SQL path).
     let r = db.execute(
         "UPDATE blueprints SET status = 'Quarantined' WHERE name = 'bp'",
         &HashMap::new(),
     );
     match r {
         Err(Error::InvalidStateTransition(_)) | Err(Error::PropagationAborted { .. }) => {}
-        Ok(_) => panic!("engine accepted undeclared 'Quarantined' state"),
-        Err(other) => panic!(
-            "expected InvalidStateTransition; got {:?}",
-            other
-        ),
+        Ok(_) => panic!("engine accepted undeclared 'Quarantined' state on static SQL path"),
+        Err(other) => panic!("expected InvalidStateTransition; got {:?}", other),
     }
+
+    // Parameterised path: SET status = $s with $s = "Foo".
+    let r2 = db.execute(
+        "UPDATE blueprints SET status = $s WHERE name = 'bp'",
+        &HashMap::from([("s".to_string(), Value::Text("Foo".to_string()))]),
+    );
+    match r2 {
+        Err(Error::InvalidStateTransition(_)) | Err(Error::PropagationAborted { .. }) => {}
+        Ok(_) => panic!("parameterised UPDATE accepted undeclared 'Foo' state — STATE MACHINE bypass on parameterised path"),
+        Err(other) => panic!("expected InvalidStateTransition on parameterised path; got {:?}", other),
+    }
+
+    // State must remain Active throughout.
+    let s = db.execute("SELECT status FROM blueprints WHERE name = 'bp'", &HashMap::new()).expect("scan");
+    assert_eq!(s.rows[0][0].as_text(), Some("Active"), "STATE MACHINE leaked an undeclared transition");
 }
 
 /// C-BP1 / UNIQUE composite contention: concurrent create_blueprint with
