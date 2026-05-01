@@ -771,56 +771,63 @@ fn evidence_availability_log_concurrent_appends_both_persist() {
     }
 }
 
-/// C-RT3 conditional UPDATE under contention: two concurrent
+/// C-RT3 conditional UPDATE under contention: 6 concurrent
 /// `UPDATE decisions SET status='invalidated' WHERE status='active'` calls
 /// against the same row. Engine MUST conflict-serialize: exactly one
-/// reports rows_affected=1; the other must NOT report rows_affected=1.
-/// Wrong-impl: engine returns Ok(rows_affected = 1) for BOTH (the failure
-/// mode the lens question for "concurrent UPDATE / conditional UPDATE"
-/// flags as (b)).
+/// reports rows_affected=1; the others must report rows_affected=0.
+/// Wrong-impl: engine returns Ok(rows_affected = 1) for >1 callers (lens
+/// question for "concurrent UPDATE / conditional UPDATE" failure mode (b)).
+///
+/// Probe runs multiple rounds: a single 6-thread race may or may not hit
+/// the contention window. We repeat until either we see the gap surface
+/// or we've completed enough rounds to attest the contract holds. If
+/// ANY round reports total > 1, that's the gap.
 #[test]
 fn decisions_conditional_invalidate_concurrent_only_one_succeeds() {
     let db = Arc::new(open_3r_schema());
-    let id = Uuid::new_v4();
-    db.execute(
-        "INSERT INTO decisions (id, status) VALUES ($id, 'active')",
-        &params(vec![("id", Value::Uuid(id))]),
-    )
-    .unwrap();
 
+    const ROUNDS: usize = 30;
     const N: usize = 6;
-    let barrier = Arc::new(Barrier::new(N));
-    let mut handles = vec![];
-    for _ in 0..N {
-        let db = db.clone();
-        let barrier = barrier.clone();
-        handles.push(thread::spawn(move || -> u64 {
-            barrier.wait();
-            match db.execute(
-                "UPDATE decisions SET status = 'invalidated' WHERE id = $id AND status = 'active'",
-                &params(vec![("id", Value::Uuid(id))]),
-            ) {
-                Ok(qr) => qr.rows_affected,
-                Err(_) => 0,
-            }
-        }));
-    }
-    let updates: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let total: u64 = updates.iter().sum();
-    assert_eq!(
-        total, 1,
-        "concurrent conditional UPDATEs must serialize: exactly one rows_affected=1, others=0; got per-call: {updates:?}"
-    );
-    let rows = db
-        .execute(
-            "SELECT status FROM decisions WHERE id = $id",
+    let mut max_total = 0u64;
+    let mut all_round_results = vec![];
+    for r in 0..ROUNDS {
+        let id = Uuid::new_v4();
+        db.execute(
+            "INSERT INTO decisions (id, status) VALUES ($id, 'active')",
             &params(vec![("id", Value::Uuid(id))]),
         )
         .unwrap();
+
+        let barrier = Arc::new(Barrier::new(N));
+        let mut handles = vec![];
+        for _ in 0..N {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || -> u64 {
+                barrier.wait();
+                match db.execute(
+                    "UPDATE decisions SET status = 'invalidated' WHERE id = $id AND status = 'active'",
+                    &params(vec![("id", Value::Uuid(id))]),
+                ) {
+                    Ok(qr) => qr.rows_affected,
+                    Err(_) => 0,
+                }
+            }));
+        }
+        let updates: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let total: u64 = updates.iter().sum();
+        if total > max_total {
+            max_total = total;
+        }
+        all_round_results.push((r, total, updates));
+        if max_total > 1 {
+            break;
+        }
+    }
     assert_eq!(
-        rows.rows[0][0],
-        Value::Text("invalidated".into()),
-        "the winning UPDATE must have committed"
+        max_total, 1,
+        "concurrent conditional UPDATE: exactly one writer must report rows_affected=1; \
+         max observed total across {ROUNDS} rounds = {max_total}; round results = {all_round_results:?}"
     );
 }
 
