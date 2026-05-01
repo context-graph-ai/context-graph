@@ -105,7 +105,12 @@ fn connect_disconnect_race_settles_to_deterministic_state() {
         h.join().unwrap();
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = reader.join();
+    // Propagate the reader thread's panic. `let _ = reader.join();` would
+    // capture the panic into a `Result::Err` and immediately discard it,
+    // making the reader's torn-write detection non-load-bearing.
+    reader
+        .join()
+        .expect("reader thread panicked or detected race violation");
 
     // Final-state contract: the file is either fully present with the
     // payload, or absent. Never partial.

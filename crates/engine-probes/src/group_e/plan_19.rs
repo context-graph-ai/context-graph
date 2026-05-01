@@ -70,13 +70,13 @@ fn hook_config_write_via_temp_plus_rename_is_atomic_under_contention() {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(writer_count + 1));
 
-    let mut handles = vec![];
+    let mut writers = vec![];
     for w in 0..writer_count {
         let b = barrier.clone();
         let p = payloads.clone();
         let dir_path = dir.path().to_path_buf();
         let final_path = final_path.clone();
-        handles.push(thread::spawn(move || {
+        writers.push(thread::spawn(move || {
             b.wait();
             for i in 0..32 {
                 // temp + rename — the contract every connector must use.
@@ -94,12 +94,16 @@ fn hook_config_write_via_temp_plus_rename_is_atomic_under_contention() {
     // Reader thread: while writers race, every successful read of the final
     // path MUST equal one of the well-known full payloads (or the initial
     // seed). A torn write would surface as bytes belonging to no payload.
+    // The reader handle is captured in its own variable so the test runner
+    // can join it and propagate any panic — an unjoined / detached reader
+    // panic is silently swallowed by the test harness, which would defeat
+    // the entire torn-write detection contract.
     let stop_reader = stop.clone();
     let payloads_reader = payloads.clone();
     let final_path_reader = final_path.clone();
     let initial_owned = initial.to_vec();
     let b = barrier.clone();
-    handles.push(thread::spawn(move || {
+    let reader = thread::spawn(move || {
         b.wait();
         let mut clean_observations = 0u64;
         while !stop_reader.load(std::sync::atomic::Ordering::Relaxed) {
@@ -122,19 +126,18 @@ fn hook_config_write_via_temp_plus_rename_is_atomic_under_contention() {
                 break;
             }
         }
-    }));
+    });
 
-    // Wait briefly for writers to make progress, then stop the reader.
-    // Writers finish on their own; reader is bounded by the observation
-    // counter above to ensure the test terminates.
-    for h in handles.into_iter().take(writer_count) {
-        h.join().unwrap();
+    // Drain writers, then stop the reader, then join it and propagate any
+    // panic. The reader's torn-write assertion is load-bearing — a
+    // detached / discarded join result silently hides the failure.
+    for h in writers {
+        h.join().expect("writer thread panicked");
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    // The reader thread is the last one in the vec; we already drained the
-    // writers above. Reader self-terminates via observation counter or stop
-    // flag. Leave it to detach — its assertion fired during the run if
-    // anything was wrong.
+    reader
+        .join()
+        .expect("reader detected torn write or panicked");
 }
 
 /// connect_claude_code_writes_hook_idempotent (engine-independent). The

@@ -30,7 +30,9 @@
 
 use contextdb_core::Value;
 use contextdb_engine::Database;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+// `Uuid` is hashable and used to dedup the primary-key column inside the
+// shared-handle reader probe.
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
@@ -217,12 +219,38 @@ fn shared_handle_internal_workers_consistent_under_writer() {
             for _ in 0..16 {
                 let p = HashMap::new();
                 let r = db.execute("SELECT id, name FROM tools", &p).unwrap();
-                // Reader observes monotonically growing row count: at least
-                // 32, never duplicates beyond what the writer has committed.
+                // Reader observes a row count bounded on BOTH sides: at least
+                // the seeded 32 rows, never more than the seeded + writer
+                // total (32 + 16 = 48). A snapshot-isolation violation that
+                // yields a transient duplicate row mid-contention (e.g., the
+                // writer's row visible in two index pages mid-rebalance)
+                // would surface here as len > 48.
+                let len = r.rows.len();
                 assert!(
-                    r.rows.len() >= 32,
-                    "reader must observe at least the seeded 32 rows; saw {}",
-                    r.rows.len()
+                    len >= 32 && len <= 48,
+                    "reader must observe between 32 and 48 rows; saw {len}"
+                );
+                // Snapshot must be free of duplicates by primary key. A
+                // mid-write duplicate (e.g., row visible in two index pages)
+                // would land the same `id` twice in a single result set even
+                // when the row count looks reasonable. The PK column is
+                // `Uuid`, which implements `Hash + Eq`; `Value` itself does
+                // not, so we extract the Uuid for the uniqueness check.
+                let pk_set: HashSet<Uuid> = r
+                    .rows
+                    .iter()
+                    .map(|row| match &row[0] {
+                        Value::Uuid(u) => *u,
+                        other => panic!(
+                            "primary key column 0 must be Uuid; saw {other:?}"
+                        ),
+                    })
+                    .collect();
+                assert_eq!(
+                    pk_set.len(),
+                    len,
+                    "reader observed duplicate primary keys in a single snapshot; \
+                     snapshot-isolation violation under contention"
                 );
             }
         }));
