@@ -1,4 +1,4 @@
-pub const DIGEST_VECTOR_DIMENSION: usize = 384;
+pub const DIGEST_VECTOR_DIMENSION: usize = 768;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TableSpec {
@@ -15,6 +15,10 @@ pub struct IndexSpec {
 
 pub const TABLES: &[TableSpec] = &[
     TableSpec {
+        name: "cg_schema_version",
+        ddl: "CREATE TABLE cg_schema_version (id INTEGER PRIMARY KEY, version INTEGER NOT NULL, installed_at TXID NOT NULL)",
+    },
+    TableSpec {
         name: "contexts",
         ddl: "CREATE TABLE contexts (id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE, labels JSON, properties JSON, created_at TXID NOT NULL)",
     },
@@ -24,15 +28,35 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "decisions",
-        ddl: "CREATE TABLE decisions (id UUID PRIMARY KEY, decision_type TEXT NOT NULL IMMUTABLE, description TEXT NOT NULL IMMUTABLE, reasoning JSON, confidence REAL, status TEXT NOT NULL DEFAULT 'active', agent_id TEXT, context_id UUID NOT NULL REFERENCES contexts(id), properties JSON, tags JSON, created_at TXID NOT NULL) STATE MACHINE (status: active -> [superseded, archived])",
+        ddl: "CREATE TABLE decisions (id UUID PRIMARY KEY, decision_type TEXT NOT NULL IMMUTABLE, description TEXT NOT NULL IMMUTABLE, reasoning JSON, confidence REAL, status TEXT NOT NULL DEFAULT 'active', agent_id TEXT, context_id UUID NOT NULL REFERENCES contexts(id), based_on_snapshots JSON, properties JSON, tags JSON, created_at TXID NOT NULL, UNIQUE (context_id, id)) STATE MACHINE (status: active -> [superseded, archived, invalidated])",
     },
     TableSpec {
         name: "entities",
-        ddl: "CREATE TABLE entities (id UUID PRIMARY KEY, entity_type TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', context_id UUID NOT NULL REFERENCES contexts(id), properties JSON, tags JSON, created_at TXID NOT NULL) STATE MACHINE (status: active -> [archived])",
+        ddl: "CREATE TABLE entities (id UUID PRIMARY KEY, entity_type TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', context_id UUID NOT NULL REFERENCES contexts(id), properties JSON, tags JSON, created_at TXID NOT NULL, UNIQUE (context_id, id)) STATE MACHINE (status: active -> [archived])",
     },
     TableSpec {
         name: "observations",
-        ddl: "CREATE TABLE observations (id UUID PRIMARY KEY, observation_type TEXT NOT NULL, data JSON NOT NULL, source TEXT NOT NULL, entity_id UUID NOT NULL REFERENCES entities(id), context_id UUID NOT NULL REFERENCES contexts(id), timestamp TIMESTAMP NOT NULL) IMMUTABLE",
+        ddl: "CREATE TABLE observations (id UUID PRIMARY KEY, observation_type TEXT NOT NULL, observed_properties JSON NOT NULL, state_delta JSON NOT NULL, properties JSON, source TEXT NOT NULL, entity_id UUID NOT NULL REFERENCES entities(id), context_id UUID NOT NULL REFERENCES contexts(id), timestamp TIMESTAMP NOT NULL, created_at TXID NOT NULL, UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id)) IMMUTABLE",
+    },
+    TableSpec {
+        name: "evidence",
+        ddl: "CREATE TABLE evidence (id UUID PRIMARY KEY, observation_id UUID NOT NULL REFERENCES observations(id), context_id UUID NOT NULL REFERENCES contexts(id), kind TEXT NOT NULL, source_ref TEXT NOT NULL, mime_type TEXT, content_hash TEXT, captured_at TIMESTAMP, byte_range JSON, time_range_ms JSON, frame_index INTEGER, region JSON, producer JSON, text_projection TEXT, derived_from UUID REFERENCES evidence(id), retention_status TEXT NOT NULL, media_retention_until TIMESTAMP, properties JSON, supply_order INTEGER NOT NULL, vector_text VECTOR(768), vector_vision VECTOR(512), UNIQUE (context_id, id), FOREIGN KEY (context_id, observation_id) REFERENCES observations(context_id, id), FOREIGN KEY (context_id, derived_from) REFERENCES evidence(context_id, id)) IMMUTABLE",
+    },
+    TableSpec {
+        name: "embedding_spaces",
+        ddl: "CREATE TABLE embedding_spaces (embedding_space_id TEXT PRIMARY KEY, dimension INTEGER NOT NULL, metric TEXT NOT NULL, model_family TEXT, model_name TEXT, model_version TEXT, supported_evidence_kinds JSON, default_for_evidence_kind TEXT, bindings JSON)",
+    },
+    TableSpec {
+        name: "embedding_space_bindings",
+        ddl: "CREATE TABLE embedding_space_bindings (embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), table_name TEXT NOT NULL, vector_column TEXT NOT NULL, UNIQUE (embedding_space_id, table_name, vector_column))",
+    },
+    TableSpec {
+        name: "embedding_handles",
+        ddl: "CREATE TABLE embedding_handles (id UUID PRIMARY KEY, context_id UUID NOT NULL REFERENCES contexts(id), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), target_kind TEXT NOT NULL, target_id UUID NOT NULL, dimension INTEGER NOT NULL, produced_by JSON, created_at TXID NOT NULL)",
+    },
+    TableSpec {
+        name: "evidence_availability_log",
+        ddl: "CREATE TABLE evidence_availability_log (id UUID PRIMARY KEY, evidence_id UUID NOT NULL REFERENCES evidence(id), status TEXT NOT NULL, recorded_at_txid TXID NOT NULL, recorded_at TIMESTAMP) IMMUTABLE",
     },
     TableSpec {
         name: "outcomes",
@@ -40,7 +64,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "invalidations",
-        ddl: "CREATE TABLE invalidations (id UUID PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', affected_decision_id UUID NOT NULL REFERENCES decisions(id), trigger_observation_id UUID NOT NULL REFERENCES observations(id), basis_diff JSON NOT NULL, severity TEXT NOT NULL, detected_at TXID NOT NULL, resolved_at TXID, resolution_action TEXT, resolution_decision_id UUID) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed])",
+        ddl: "CREATE TABLE invalidations (id UUID PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', context_id UUID NOT NULL REFERENCES contexts(id), affected_decision_id UUID NOT NULL REFERENCES decisions(id), trigger_observation_id UUID NOT NULL REFERENCES observations(id), reason TEXT, basis_diff JSON NOT NULL, severity TEXT NOT NULL, detected_at TXID NOT NULL, resolved_at TXID, resolution_action TEXT, resolution_decision_id UUID, FOREIGN KEY (context_id, affected_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, trigger_observation_id) REFERENCES observations(context_id, id), FOREIGN KEY (context_id, resolution_decision_id) REFERENCES decisions(context_id, id)) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed])",
     },
     TableSpec {
         name: "signatures",
@@ -48,7 +72,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "digests",
-        ddl: "CREATE TABLE digests (id UUID PRIMARY KEY, source TEXT NOT NULL, session_ref TEXT, summary TEXT NOT NULL, embedding VECTOR(384) NOT NULL, context_id UUID NOT NULL REFERENCES contexts(id), properties JSON, created_at TXID NOT NULL) IMMUTABLE",
+        ddl: "CREATE TABLE digests (id UUID PRIMARY KEY, source TEXT NOT NULL, session_ref TEXT, summary TEXT NOT NULL, kind TEXT NOT NULL, vector_text VECTOR(768), dimension INTEGER NOT NULL, context_id UUID NOT NULL REFERENCES contexts(id), properties JSON, created_at TXID NOT NULL) IMMUTABLE",
     },
     TableSpec {
         name: "blueprints",
@@ -60,7 +84,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "entity_snapshots",
-        ddl: "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, entity_id UUID NOT NULL REFERENCES entities(id), data JSON NOT NULL, valid_from TXID NOT NULL, valid_to TXID)",
+        ddl: "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, entity_id UUID NOT NULL REFERENCES entities(id), data JSON NOT NULL, evidenced_by JSON, valid_from TXID NOT NULL, valid_to TXID)",
     },
     TableSpec {
         name: "intention_snapshots",

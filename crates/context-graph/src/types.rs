@@ -9,6 +9,17 @@ use crate::{AgentId, TxId};
 
 macro_rules! id_type {
     ($name:ident) => {
+        id_type!($name, { Self::new_v7() });
+    };
+    ($name:ident, nil_default) => {
+        id_type!($name, {
+            Self {
+                raw: Uuid::nil(),
+                valid: true,
+            }
+        });
+    };
+    ($name:ident, $default:block) => {
         #[derive(
             Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
         )]
@@ -49,9 +60,7 @@ macro_rules! id_type {
         }
 
         impl Default for $name {
-            fn default() -> Self {
-                Self::new_v7()
-            }
+            fn default() -> Self $default
         }
 
         impl std::fmt::Display for $name {
@@ -81,11 +90,14 @@ id_type!(ContextId);
 id_type!(IntentionId);
 id_type!(DecisionId);
 id_type!(EntityId);
-id_type!(ObservationId);
+id_type!(ObservationId, nil_default);
 id_type!(OutcomeId);
 id_type!(DigestId);
 id_type!(AuditId);
 id_type!(InvalidationId);
+id_type!(EvidenceId, nil_default);
+id_type!(EmbeddingId, nil_default);
+id_type!(EntitySnapshotId, nil_default);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum IntentionStatus {
@@ -119,10 +131,16 @@ pub enum DecisionStatus {
     Active,
     Superseded,
     Archived,
+    Invalidated,
 }
 
 impl DecisionStatus {
-    pub const ALL: [Self; 3] = [Self::Active, Self::Superseded, Self::Archived];
+    pub const ALL: [Self; 4] = [
+        Self::Active,
+        Self::Superseded,
+        Self::Archived,
+        Self::Invalidated,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -282,6 +300,214 @@ impl Principal {
     }
 }
 
+pub type Region = Value;
+
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum EvidenceKind {
+    #[default]
+    Text,
+    ImageFrame,
+    AudioSegment,
+    VideoSegment,
+    StructuredSignal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionStatus {
+    NotStored,
+    Ephemeral,
+    RetainedExternal,
+    Expired,
+    Unavailable,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceProducer {
+    pub system: String,
+    pub model_name: String,
+    pub model_version: String,
+    pub pipeline_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceRef {
+    pub id: EvidenceId,
+    pub observation_id: ObservationId,
+    pub context_id: ContextId,
+    pub kind: EvidenceKind,
+    pub source_ref: String,
+    pub mime_type: Option<String>,
+    pub content_hash: Option<String>,
+    pub captured_at: Option<DateTime<Utc>>,
+    pub byte_range: Option<(u64, u64)>,
+    pub time_range_ms: Option<(u64, u64)>,
+    pub frame_index: Option<u64>,
+    pub region: Option<Region>,
+    pub producer: EvidenceProducer,
+    pub text_projection: Option<String>,
+    pub derived_from: Option<EvidenceId>,
+    pub retention_status: RetentionStatus,
+    pub media_retention_until: Option<DateTime<Utc>>,
+    pub properties: BTreeMap<String, Value>,
+}
+
+impl Default for EvidenceRef {
+    fn default() -> Self {
+        Self {
+            id: EvidenceId::default(),
+            observation_id: ObservationId::default(),
+            context_id: ContextId::default(),
+            kind: EvidenceKind::Text,
+            source_ref: String::new(),
+            mime_type: None,
+            content_hash: None,
+            captured_at: None,
+            byte_range: None,
+            time_range_ms: None,
+            frame_index: None,
+            region: None,
+            producer: EvidenceProducer::default(),
+            text_projection: None,
+            derived_from: None,
+            retention_status: RetentionStatus::NotStored,
+            media_retention_until: None,
+            properties: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DistanceMetric {
+    Cosine,
+    Euclidean,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingSpaceBinding {
+    pub embedding_space_id: String,
+    pub table_name: String,
+    pub vector_column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingSpace {
+    pub embedding_space_id: String,
+    pub dimension: usize,
+    pub metric: DistanceMetric,
+    pub model_family: String,
+    pub model_name: String,
+    pub model_version: String,
+    pub supported_evidence_kinds: Vec<EvidenceKind>,
+    pub default_for_evidence_kind: Option<EvidenceKind>,
+    pub bindings: Vec<EmbeddingSpaceBinding>,
+}
+
+impl Default for EmbeddingSpace {
+    fn default() -> Self {
+        Self {
+            embedding_space_id: String::new(),
+            dimension: 0,
+            metric: DistanceMetric::Cosine,
+            model_family: String::new(),
+            model_name: String::new(),
+            model_version: String::new(),
+            supported_evidence_kinds: Vec::new(),
+            default_for_evidence_kind: None,
+            bindings: Vec::new(),
+        }
+    }
+}
+
+pub type EmbeddingSpaceDecl = EmbeddingSpace;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmbeddingTarget {
+    Evidence(EvidenceId),
+    Digest(DigestId),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredEmbedding {
+    pub id: EmbeddingId,
+    pub context_id: ContextId,
+    pub embedding_space_id: String,
+    pub vector: Vec<f32>,
+    pub dimension: usize,
+    pub produced_by: EvidenceProducer,
+    pub target: EmbeddingTarget,
+    pub created_at: TxId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrecomputedEmbedding {
+    pub id: EmbeddingId,
+    pub embedding_space_id: String,
+    pub vector: Vec<f32>,
+    pub target: EmbeddingTarget,
+    pub produced_by: EvidenceProducer,
+}
+
+impl Default for PrecomputedEmbedding {
+    fn default() -> Self {
+        Self {
+            id: EmbeddingId::default(),
+            embedding_space_id: String::new(),
+            vector: Vec::new(),
+            target: EmbeddingTarget::Evidence(EvidenceId::default()),
+            produced_by: EvidenceProducer::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueDiff {
+    pub field: String,
+    pub basis_value: Option<Value>,
+    pub current_value: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityDivergence {
+    pub basis_snapshot_id: EntitySnapshotId,
+    pub entity_id: EntityId,
+    pub value_diffs: Vec<ValueDiff>,
+    pub read_txid: TxId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BasisDiffResult {
+    pub is_invalidated_candidate: bool,
+    pub divergences: Vec<EntityDivergence>,
+    pub read_txid: TxId,
+    pub current_snapshot_read_txid: TxId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionInvalidationResult {
+    pub previous_status: DecisionStatus,
+    pub new_status: DecisionStatus,
+    pub reason: Option<String>,
+    pub invalidation_id: InvalidationId,
+    pub transitioned_at: TxId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceHandle {
+    pub evidence_id: EvidenceId,
+    pub source_ref: String,
+    pub byte_range: Option<(u64, u64)>,
+    pub time_range_ms: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceAvailabilityLogRow {
+    pub evidence_id: EvidenceId,
+    pub status: RetentionStatus,
+    pub recorded_at_txid: TxId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningStep {
     pub operation: String,
@@ -338,7 +564,7 @@ pub struct Decision {
     pub properties: BTreeMap<String, Value>,
     pub created_at: TxId,
     pub intention_ids: Vec<IntentionId>,
-    pub based_on_snapshots: BTreeMap<EntityId, EntitySnapshot>,
+    pub based_on_snapshots: Vec<EntitySnapshotId>,
     pub outcome: Option<Outcome>,
     pub precedent_ids: Vec<DecisionId>,
 }
@@ -357,10 +583,12 @@ pub struct Entity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntitySnapshot {
+    pub id: EntitySnapshotId,
     pub entity_id: EntityId,
     pub entity_type: EntityType,
     pub name: String,
     pub properties: BTreeMap<String, Value>,
+    pub evidenced_by: Vec<ObservationId>,
     pub captured_at: TxId,
     pub valid_from: TxId,
     pub valid_to: Option<TxId>,
@@ -369,17 +597,24 @@ pub struct EntitySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
     pub id: ObservationId,
+    pub observation_type: String,
+    pub evidence: Vec<EvidenceRef>,
+    pub observed_properties: BTreeMap<String, Value>,
+    pub state_delta: BTreeMap<String, Option<Value>>,
+    pub properties: BTreeMap<String, Value>,
+    pub source: String,
     pub entity_id: EntityId,
     pub context_id: ContextId,
-    pub observation_type: String,
-    pub source: String,
-    pub data: BTreeMap<String, Value>,
     pub observed_at: DateTime<Utc>,
+    pub created_at: TxId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordObservationResult {
     pub observation_id: ObservationId,
+    pub evidence_ids: Vec<EvidenceId>,
+    pub embedding_ids: Vec<EmbeddingId>,
+    pub snapshot_id: Option<EntitySnapshotId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,7 +643,8 @@ pub struct Digest {
     pub id: DigestId,
     pub source: String,
     pub summary: String,
-    pub embedding: Vec<f32>,
+    pub vector_text: Option<Vec<f32>>,
+    pub dimension: usize,
     pub context_id: ContextId,
     pub session_ref: Option<String>,
     pub properties: BTreeMap<String, Value>,
@@ -468,6 +704,7 @@ pub struct CreateDecision {
     pub confidence: Option<f32>,
     pub intention_ids: Vec<IntentionId>,
     pub based_on_entity_ids: Vec<EntityId>,
+    pub based_on_snapshots: Vec<EntitySnapshotId>,
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, Value>,
     pub context_id: ContextId,
@@ -508,13 +745,25 @@ pub struct InputDiff {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayEvidenceLineage {
+    pub basis_snapshot_id: EntitySnapshotId,
+    pub observation_id: Option<ObservationId>,
+    pub evidence: Vec<EvidenceRef>,
+    pub read_txid: TxId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayResult {
     pub decision_id: DecisionId,
+    pub decision_status: DecisionStatus,
     pub original_outcome: Option<bool>,
     pub inputs_changed: bool,
     pub changed_input_count: u32,
     pub unchanged_input_count: u32,
+    pub read_txid: TxId,
     pub input_diffs: Vec<InputDiff>,
+    pub evidence_lineage: Vec<ReplayEvidenceLineage>,
+    pub invalidations_at_read: Vec<Invalidation>,
     pub cited_intention_snapshots: Vec<IntentionSnapshot>,
 }
 
@@ -552,14 +801,19 @@ pub struct ListEntityFilter {
     pub context_id: Option<ContextId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecordObservation {
+    pub id: ObservationId,
     pub entity_id: EntityId,
     pub context_id: ContextId,
     pub observation_type: String,
     pub source: String,
-    pub data: BTreeMap<String, Value>,
-    pub observed_at: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+    pub evidence: Vec<EvidenceRef>,
+    pub observed_properties: BTreeMap<String, Value>,
+    pub state_delta: BTreeMap<String, Option<Value>>,
+    pub properties: BTreeMap<String, Value>,
+    pub embeddings: Vec<PrecomputedEmbedding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -623,12 +877,14 @@ pub enum InvalidationSeverity {
     Critical,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invalidation {
     pub id: InvalidationId,
     pub status: InvalidationStatus,
+    pub context_id: ContextId,
     pub affected_decision_id: DecisionId,
     pub trigger_observation_id: ObservationId,
+    pub reason: Option<String>,
     pub basis_diff: BTreeMap<String, Value>,
     pub severity: InvalidationSeverity,
     pub detected_at: TxId,
@@ -646,22 +902,54 @@ pub struct AuditFilter {
     pub until_txid: Option<TxId>,
     pub target: Option<AuditTarget>,
     pub context_id: Option<ContextId>,
-    // consumed by plan 9 (cg-governance) joining audit_log with approvals; ignored here.
+    // Reserved for governance approval queries joining audit_log with approvals.
     pub approver: Option<String>,
-    // consumed by plan 9 (cg-governance); ignored here until approval levels flow through audit_log.
+    // Reserved until approval levels flow through audit_log.
     pub level: Option<String>,
-    // consumed by plan 9 (cg-governance); ignored here until audit rows carry tags.
+    // Reserved until audit rows carry tags.
     pub tags: Vec<String>,
     pub limit: Option<u32>,
     pub after: Option<AuditId>,
 }
 
+pub const CG_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreConfig {
+    pub db_path: std::path::PathBuf,
+    pub https_allowed_hosts: Vec<String>,
+    pub file_uri_allowed: bool,
+    pub extra_embedding_spaces: Vec<EmbeddingSpaceDecl>,
+    pub expected_schema_version: u32,
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            db_path: std::env::temp_dir().join("context-graph.db"),
+            https_allowed_hosts: Vec::new(),
+            file_uri_allowed: false,
+            extra_embedding_spaces: Vec::new(),
+            expected_schema_version: CG_SCHEMA_VERSION,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegacySchemaFixture {
+    LegacyDigest384,
+    NoVersionRowButTablesExist,
+    MultipleVersionRows,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CreateDigest {
+    pub id: DigestId,
     pub source: String,
-    pub summary: String,
-    pub embedding: Vec<f32>,
-    pub context_id: ContextId,
     pub session_ref: Option<String>,
+    pub summary: String,
+    pub kind: EvidenceKind,
+    pub embedding: PrecomputedEmbedding,
+    pub context_id: ContextId,
     pub properties: BTreeMap<String, Value>,
 }

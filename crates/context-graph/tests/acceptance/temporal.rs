@@ -5,6 +5,7 @@ use chrono::Utc;
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, EntityId,
     EntityType, IntentionOrigin, IntentionPatch, IntentionStatus, ReasoningStep, Store,
+    StoreConfig,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -20,12 +21,20 @@ macro_rules! ok {
 fn fixture() -> (TempDir, PathBuf, Store) {
     let tempdir = TempDir::new().expect("tempdir");
     let db_path = tempdir.path().join("context-graph.db");
-    let store = Store::open(&db_path);
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
     (tempdir, db_path, store)
 }
 
 fn reopen(db_path: &Path) -> Store {
-    Store::open(db_path)
+    Store::open(StoreConfig {
+        db_path: db_path.to_path_buf(),
+        ..Default::default()
+    })
+    .expect("open")
 }
 
 fn map(entries: &[(&str, Value)]) -> BTreeMap<String, Value> {
@@ -93,6 +102,7 @@ fn decision_input(
         confidence: Some(0.9),
         intention_ids,
         based_on_entity_ids,
+        based_on_snapshots: vec![],
         tags: vec![],
         properties: BTreeMap::new(),
         context_id,
@@ -1445,6 +1455,7 @@ fn temporal_reads_are_agent_id_agnostic() -> Result<(), CgError> {
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![e.id],
+            based_on_snapshots: vec![],
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx,
@@ -1472,6 +1483,7 @@ fn temporal_reads_are_agent_id_agnostic() -> Result<(), CgError> {
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![e.id],
+            based_on_snapshots: vec![],
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx,
@@ -1483,7 +1495,11 @@ fn temporal_reads_are_agent_id_agnostic() -> Result<(), CgError> {
     drop(store);
 
     // Sequential pass: open, read, drop, reopen, read, compare.
-    let store_a = Store::open(&db_path);
+    let store_a = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open a");
     let a_state_claude = ok!(
         store_a.state_at(e.id, d_claude.created_at),
         "state_at D_claude tx (a)"
@@ -1497,7 +1513,11 @@ fn temporal_reads_are_agent_id_agnostic() -> Result<(), CgError> {
     let a_replay_codex = ok!(store_a.replay(d_codex.id), "replay D_codex (a)");
     drop(store_a);
 
-    let store_b = Store::open(&db_path);
+    let store_b = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open b");
     let b_state_claude = ok!(
         store_b.state_at(e.id, d_claude.created_at),
         "state_at D_claude tx (b)"
@@ -1523,8 +1543,16 @@ fn temporal_reads_are_agent_id_agnostic() -> Result<(), CgError> {
     assert_eq!(a_replay_codex, b_replay_codex, "replay D_codex invariant");
 
     // Concurrent pass: two Store handles on the same on-disk path, both held simultaneously.
-    let store_c = Store::open(&db_path);
-    let store_d = Store::open(&db_path);
+    let store_c = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open c");
+    let store_d = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open d");
     let pc_c = ok!(store_c.replay(d_claude.id), "replay D_claude (c)");
     let pc_d = ok!(store_d.replay(d_claude.id), "replay D_claude (d)");
     assert_eq!(pc_c, pc_d, "concurrent-handle replay invariant");

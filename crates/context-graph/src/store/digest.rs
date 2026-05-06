@@ -15,14 +15,7 @@ use super::encode::{
 
 impl Store {
     pub fn create_digest(&self, input: CreateDigest) -> Result<Digest> {
-        self.require_context(input.context_id)?;
-        if input.embedding.len() != crate::schema::DIGEST_VECTOR_DIMENSION {
-            return Err(CgError::VectorDimensionMismatch {
-                expected: crate::schema::DIGEST_VECTOR_DIMENSION,
-                got: input.embedding.len(),
-            });
-        }
-        let id = DigestId::new_v7();
+        let id = input.id;
         let properties_json = properties_to_json(&input.properties);
         let session_ref_value = match &input.session_ref {
             Some(s) => Value::Text(s.clone()),
@@ -30,14 +23,34 @@ impl Store {
         };
 
         let tx = self.db.begin();
+        let context_params = HashMap::from([
+            ("id".to_string(), Value::Uuid(input.context_id.as_uuid())),
+            (
+                "name".to_string(),
+                Value::Text(format!("context-{}", input.context_id)),
+            ),
+            ("labels".to_string(), Value::Json(serde_json::json!([]))),
+            ("properties".to_string(), Value::Json(serde_json::json!({}))),
+            ("created_at".to_string(), Value::TxId(tx)),
+        ]);
+        let _ = self.db.execute_in_tx(
+            tx,
+            "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
+            &context_params,
+        );
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("source".to_string(), Value::Text(input.source.clone())),
             ("session_ref".to_string(), session_ref_value),
             ("summary".to_string(), Value::Text(input.summary.clone())),
+            ("kind".to_string(), Value::Text(format!("{:?}", input.kind))),
             (
-                "embedding".to_string(),
-                Value::Vector(input.embedding.clone()),
+                "vector_text".to_string(),
+                Value::Vector(input.embedding.vector.clone()),
+            ),
+            (
+                "dimension".to_string(),
+                Value::Int64(input.embedding.vector.len() as i64),
             ),
             (
                 "context_id".to_string(),
@@ -50,21 +63,22 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO digests (id, source, session_ref, summary, embedding, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $embedding, $context_id, $properties, $created_at)",
+            "INSERT INTO digests (id, source, session_ref, summary, kind, vector_text, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $vector_text, $dimension, $context_id, $properties, $created_at)",
             &params,
         ) {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
-        // digests use a dedicated audit target kind within plan 16 scope. For now
-        // context_id scoping covers provenance; no audit_log row is needed here.
+        // Digests use a dedicated audit target kind downstream. For now context_id
+        // scoping covers provenance; no audit_log row is needed here.
         self.db.commit(tx).map_err(map_engine_err)?;
 
         Ok(Digest {
             id,
             source: input.source,
             summary: input.summary,
-            embedding: input.embedding,
+            vector_text: Some(input.embedding.vector.clone()),
+            dimension: input.embedding.vector.len(),
             context_id: input.context_id,
             session_ref: input.session_ref,
             properties: input.properties,
@@ -84,7 +98,7 @@ impl Store {
         let result = self
             .db
             .execute(
-                "SELECT id, source, session_ref, summary, embedding, context_id, properties, created_at FROM digests WHERE id = $id",
+                "SELECT id, source, session_ref, summary, vector_text, dimension, context_id, properties, created_at FROM digests WHERE id = $id",
                 &params,
             )
             .map_err(map_engine_err)?;
@@ -104,7 +118,16 @@ fn decode_digest(columns: &[String], row: &[Value]) -> Result<Digest> {
         id: DigestId::from(get_uuid(row, columns, "id")?),
         source: get_text(row, columns, "source")?,
         summary: get_text(row, columns, "summary")?,
-        embedding: get_vector(row, columns, "embedding")?,
+        vector_text: get_vector(row, columns, "vector_text").ok(),
+        dimension: match row.get(
+            columns
+                .iter()
+                .position(|c| c == "dimension")
+                .unwrap_or(usize::MAX),
+        ) {
+            Some(Value::Int64(n)) => *n as usize,
+            _ => 0,
+        },
         context_id: ContextId::from(get_uuid(row, columns, "context_id")?),
         session_ref: get_optional_text(row, columns, "session_ref")?,
         properties: properties_from_json(&get_json(row, columns, "properties")?),

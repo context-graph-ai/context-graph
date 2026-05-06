@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use context_graph::{
     CgError, ContextId, CreateContext, CreateEntity, EntityId, EntityType, RelationshipType, Store,
-    TraverseFilter,
+    StoreConfig, TraverseFilter,
 };
 use tempfile::TempDir;
 
@@ -23,12 +23,20 @@ macro_rules! ok {
 fn fixture() -> (TempDir, PathBuf, Store) {
     let tempdir = TempDir::new().expect("tempdir");
     let db_path = tempdir.path().join("context-graph.db");
-    let store = Store::open(&db_path);
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
     (tempdir, db_path, store)
 }
 
 fn reopen(db_path: &Path) -> Store {
-    Store::open(db_path)
+    Store::open(StoreConfig {
+        db_path: db_path.to_path_buf(),
+        ..Default::default()
+    })
+    .expect("open")
 }
 
 fn context_input(name: &str) -> CreateContext {

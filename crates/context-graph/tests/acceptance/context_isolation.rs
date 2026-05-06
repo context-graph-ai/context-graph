@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use context_graph::{
-    CgError, CreateContext, CreateEntity, EntityType, ListEntityFilter, RecordObservation,
-    StorageKey, Store,
+    CgError, ContextId, CreateContext, CreateEntity, EntityType, EvidenceId, EvidenceKind,
+    EvidenceProducer, EvidenceRef, ListEntityFilter, ObservationId, RecordObservation,
+    RetentionStatus, StorageKey, Store, StoreConfig,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -20,12 +21,20 @@ macro_rules! ok {
 fn fixture() -> (TempDir, PathBuf, Store) {
     let tempdir = TempDir::new().expect("tempdir");
     let db_path = tempdir.path().join("context-graph.db");
-    let store = Store::open(&db_path);
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
     (tempdir, db_path, store)
 }
 
 fn reopen(db_path: &Path) -> Store {
-    Store::open(db_path)
+    Store::open(StoreConfig {
+        db_path: db_path.to_path_buf(),
+        ..Default::default()
+    })
+    .expect("open")
 }
 
 fn map(entries: &[(&str, Value)]) -> BTreeMap<String, Value> {
@@ -33,6 +42,34 @@ fn map(entries: &[(&str, Value)]) -> BTreeMap<String, Value> {
         .iter()
         .map(|(key, value)| ((*key).to_string(), value.clone()))
         .collect()
+}
+
+fn text_evidence(observation_id: ObservationId) -> EvidenceRef {
+    EvidenceRef {
+        id: EvidenceId::new_v7(),
+        observation_id,
+        context_id: ContextId::default(),
+        kind: EvidenceKind::Text,
+        source_ref: "webhook://agent/context-isolation".to_string(),
+        mime_type: Some("text/plain".to_string()),
+        content_hash: None,
+        captured_at: Some(Utc::now()),
+        byte_range: None,
+        time_range_ms: None,
+        frame_index: None,
+        region: None,
+        producer: EvidenceProducer {
+            system: "acceptance".to_string(),
+            model_name: "fixture".to_string(),
+            model_version: "1".to_string(),
+            pipeline_version: "1".to_string(),
+        },
+        text_projection: None,
+        derived_from: None,
+        retention_status: RetentionStatus::RetainedExternal,
+        media_retention_until: None,
+        properties: BTreeMap::new(),
+    }
 }
 
 fn context_input(name: &str) -> CreateContext {
@@ -145,13 +182,19 @@ fn context_isolation_observation_leak_blocked() {
         }),
         "create beta entity"
     );
+    let observation_id = ObservationId::new_v7();
     let result = store.record_observation(RecordObservation {
+        id: observation_id,
         entity_id: entity.id,
         context_id: ctx_acme.id,
         observation_type: "latency_spike".to_string(),
         source: "agent".to_string(),
-        data: map(&[("p99_ms", json!(450))]),
-        observed_at: Some(Utc::now()),
+        observed_at: Utc::now(),
+        evidence: vec![text_evidence(observation_id)],
+        observed_properties: map(&[("p99_ms", json!(450))]),
+        state_delta: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        embeddings: Vec::new(),
     });
     assert!(matches!(result, Err(CgError::CrossContextObservation)));
     drop(store);

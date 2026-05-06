@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use context_graph::{
     ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId, EntityId,
-    EntityType, IntentionId, IntentionOrigin, IntentionStatus, InvalidationSeverity,
-    InvalidationStatus, ObservationId, ReasoningStep, RecordObservation, Store,
+    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionId,
+    IntentionOrigin, IntentionStatus, InvalidationSeverity, InvalidationStatus, ObservationId,
+    ReasoningStep, RecordObservation, RetentionStatus, Store, StoreConfig,
 };
 use contextdb_core::{TxId, Value};
 use contextdb_engine::Database;
@@ -23,12 +24,20 @@ macro_rules! ok {
 fn fixture() -> (TempDir, PathBuf, Store) {
     let tempdir = TempDir::new().expect("tempdir");
     let db_path = tempdir.path().join("context-graph.db");
-    let store = Store::open(&db_path);
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
     (tempdir, db_path, store)
 }
 
 fn reopen(db_path: &Path) -> Store {
-    Store::open(db_path)
+    Store::open(StoreConfig {
+        db_path: db_path.to_path_buf(),
+        ..Default::default()
+    })
+    .expect("open")
 }
 
 fn context_input(name: &str) -> CreateContext {
@@ -71,6 +80,34 @@ fn reasoning(label: &str) -> Vec<ReasoningStep> {
     }]
 }
 
+fn text_evidence(observation_id: ObservationId, label: &str) -> EvidenceRef {
+    EvidenceRef {
+        id: EvidenceId::new_v7(),
+        observation_id,
+        context_id: ContextId::default(),
+        kind: EvidenceKind::Text,
+        source_ref: format!("webhook://seed/{label}"),
+        mime_type: Some("text/plain".to_string()),
+        content_hash: None,
+        captured_at: Some(Utc::now()),
+        byte_range: None,
+        time_range_ms: None,
+        frame_index: None,
+        region: None,
+        producer: EvidenceProducer {
+            system: "acceptance".to_string(),
+            model_name: "fixture".to_string(),
+            model_version: "1".to_string(),
+            pipeline_version: "1".to_string(),
+        },
+        text_projection: None,
+        derived_from: None,
+        retention_status: RetentionStatus::RetainedExternal,
+        media_retention_until: None,
+        properties: BTreeMap::new(),
+    }
+}
+
 fn create_decision_input(
     context_id: ContextId,
     description: &str,
@@ -85,6 +122,7 @@ fn create_decision_input(
         confidence: Some(0.9),
         intention_ids,
         based_on_entity_ids,
+        based_on_snapshots: vec![],
         tags: vec![],
         properties: BTreeMap::new(),
         context_id,
@@ -99,14 +137,20 @@ fn seed_observation(
     entity_id: EntityId,
     label: &str,
 ) -> ObservationId {
+    let observation_id = ObservationId::new_v7();
     ok!(
         store.record_observation(RecordObservation {
+            id: observation_id,
             entity_id,
             context_id: ctx,
             observation_type: format!("seed-{label}"),
             source: "test-seed".to_string(),
-            data: BTreeMap::new(),
-            observed_at: None,
+            observed_at: Utc::now(),
+            evidence: vec![text_evidence(observation_id, label)],
+            observed_properties: BTreeMap::new(),
+            state_delta: BTreeMap::new(),
+            properties: BTreeMap::new(),
+            embeddings: Vec::new(),
         }),
         "record_observation seed"
     )
@@ -118,6 +162,7 @@ fn seed_observation(
 // only the read path, so rows are seeded via a direct contextdb INSERT.
 fn seed_invalidation(
     db_path: &Path,
+    context_id: ContextId,
     affected_decision: DecisionId,
     trigger_observation: ObservationId,
     status: &str,
@@ -128,6 +173,7 @@ fn seed_invalidation(
     let params: HashMap<String, Value> = [
         ("id".to_string(), Value::Uuid(Uuid::now_v7())),
         ("status".to_string(), Value::Text(status.to_string())),
+        ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
         (
             "affected".to_string(),
             Value::Uuid(affected_decision.as_uuid()),
@@ -143,7 +189,7 @@ fn seed_invalidation(
     .into_iter()
     .collect();
     db.execute(
-        "INSERT INTO invalidations (id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at) VALUES ($id, $status, $affected, $trigger, $basis_diff, $severity, $detected_at)",
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at) VALUES ($id, $status, $context_id, $affected, $trigger, $basis_diff, $severity, $detected_at)",
         &params,
     )
     .expect("seed invalidation row");
@@ -233,8 +279,8 @@ fn intention_tree_expands_decisions_entities_outcomes_invalidations() {
     let obs_for_d1 = seed_observation(&store, ctx, e1.id, "d1-acknowledged");
 
     drop(store);
-    seed_invalidation(&db_path, d2.id, obs_for_d2, "pending", "warning", 1);
-    seed_invalidation(&db_path, d1.id, obs_for_d1, "acknowledged", "info", 2);
+    seed_invalidation(&db_path, ctx, d2.id, obs_for_d2, "pending", "warning", 1);
+    seed_invalidation(&db_path, ctx, d1.id, obs_for_d1, "acknowledged", "info", 2);
     let store = reopen(&db_path);
     let tree = ok!(store.intention_tree(i.id), "tx11: intention_tree I");
     assert_eq!(tree.intention.id, i.id);
@@ -246,6 +292,7 @@ fn intention_tree_expands_decisions_entities_outcomes_invalidations() {
     assert_eq!(tree.outcomes.len(), 1);
     assert_eq!(tree.outcomes[0].decision_id, d1.id);
     assert_eq!(tree.invalidations.len(), 1);
+    assert_eq!(tree.invalidations[0].context_id, ctx);
     assert_eq!(tree.invalidations[0].affected_decision_id, d2.id);
     assert_eq!(tree.invalidations[0].status, InvalidationStatus::Pending);
 
@@ -290,8 +337,8 @@ fn intention_tree_orders_invalidations_by_severity() {
     let obs_critical = seed_observation(&store, ctx, e1.id, "d1-critical");
 
     drop(store);
-    seed_invalidation(&db_path, d1.id, obs_info, "pending", "info", 1);
-    seed_invalidation(&db_path, d1.id, obs_critical, "pending", "critical", 2);
+    seed_invalidation(&db_path, ctx, d1.id, obs_info, "pending", "info", 1);
+    seed_invalidation(&db_path, ctx, d1.id, obs_critical, "pending", "critical", 2);
     let store = reopen(&db_path);
     let tree = ok!(store.intention_tree(i.id), "tx4: intention_tree");
     assert_eq!(tree.invalidations.len(), 2);
@@ -300,6 +347,8 @@ fn intention_tree_orders_invalidations_by_severity() {
         InvalidationSeverity::Critical
     );
     assert_eq!(tree.invalidations[1].severity, InvalidationSeverity::Info);
+    assert_eq!(tree.invalidations[0].context_id, ctx);
+    assert_eq!(tree.invalidations[1].context_id, ctx);
     assert_eq!(tree.invalidations[0].affected_decision_id, d1.id);
     assert_eq!(tree.invalidations[1].affected_decision_id, d1.id);
 }

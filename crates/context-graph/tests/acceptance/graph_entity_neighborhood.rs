@@ -5,6 +5,7 @@ use chrono::Utc;
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId,
     EntityId, EntityType, IntentionId, IntentionOrigin, IntentionStatus, ReasoningStep, Store,
+    StoreConfig,
 };
 use tempfile::TempDir;
 
@@ -19,12 +20,20 @@ macro_rules! ok {
 fn fixture() -> (TempDir, PathBuf, Store) {
     let tempdir = TempDir::new().expect("tempdir");
     let db_path = tempdir.path().join("context-graph.db");
-    let store = Store::open(&db_path);
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
     (tempdir, db_path, store)
 }
 
 fn reopen(db_path: &Path) -> Store {
-    Store::open(db_path)
+    Store::open(StoreConfig {
+        db_path: db_path.to_path_buf(),
+        ..Default::default()
+    })
+    .expect("open")
 }
 
 fn context_input(name: &str) -> CreateContext {
@@ -81,6 +90,7 @@ fn create_decision_input(
         confidence: Some(0.9),
         intention_ids,
         based_on_entity_ids,
+        based_on_snapshots: vec![],
         tags: vec![],
         properties: BTreeMap::new(),
         context_id,

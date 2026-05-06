@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use contextdb_core::{Error as EngineError, Value};
 use serde_json::Value as JsonValue;
@@ -146,26 +146,24 @@ impl Store {
         let mut decisions = self.decisions_serving_intention(intention.id, intention.context_id)?;
         decisions = self.sort_decisions_topologically(decisions)?;
 
-        let mut entity_ids = BTreeMap::new();
+        let mut entity_ids = BTreeSet::new();
         for decision in &decisions {
-            for entity_id in decision.based_on_snapshots.keys() {
-                entity_ids.insert(*entity_id, ());
+            for entity_id in self.edge_targets(
+                intention.context_id,
+                decision.id.as_uuid(),
+                RelationshipType::BasedOn,
+            )? {
+                entity_ids.insert(EntityId::from(entity_id));
             }
         }
         let mut entities = Vec::new();
-        for entity_id in entity_ids.keys() {
-            if let Some(entity) = self.get_entity(*entity_id)?
+        for entity_id in entity_ids {
+            if let Some(entity) = self.get_entity(entity_id)?
                 && entity.context_id == intention.context_id
             {
                 entities.push(entity);
             }
         }
-        entities.sort_by(|a, b| {
-            a.created_at
-                .0
-                .cmp(&b.created_at.0)
-                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
-        });
 
         let decision_ids: Vec<DecisionId> = decisions.iter().map(|d| d.id).collect();
         let mut outcomes = self.outcomes_for_decisions(&decision_ids)?;
@@ -309,7 +307,7 @@ impl Store {
                 .collect();
         let clause = uuid_or_clause("affected_decision_id", "decision", &uuids, &mut params);
         let sql = format!(
-            "SELECT id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE status = $status AND ({clause})"
+            "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE status = $status AND ({clause})"
         );
         let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
         let mut out = Vec::with_capacity(result.rows.len());
@@ -896,12 +894,14 @@ fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation
     Ok(Invalidation {
         id: InvalidationId::from(get_uuid(row, columns, "id")?),
         status: invalidation_status_from_str(&get_text(row, columns, "status")?)?,
+        context_id: ContextId::from(get_uuid(row, columns, "context_id")?),
         affected_decision_id: DecisionId::from(get_uuid(row, columns, "affected_decision_id")?),
         trigger_observation_id: ObservationId::from(get_uuid(
             row,
             columns,
             "trigger_observation_id",
         )?),
+        reason: get_optional_text(row, columns, "reason")?,
         basis_diff: properties_from_json(&get_json(row, columns, "basis_diff")?),
         severity: invalidation_severity_from_str(&get_text(row, columns, "severity")?)?,
         detected_at: get_txid(row, columns, "detected_at")?,

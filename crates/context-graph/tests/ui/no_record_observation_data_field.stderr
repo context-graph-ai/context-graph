@@ -1,0 +1,7 @@
+error[E0560]: struct `context_graph::RecordObservation` has no field named `data`
+  --> tests/ui/no_record_observation_data_field.rs:19:9
+   |
+19 |         data: BTreeMap::new(),
+   |         ^^^^ `context_graph::RecordObservation` does not have this field
+   |
+   = note: all struct fields are already assigned

@@ -1,0 +1,7 @@
+error[E0560]: struct `context_graph::Digest` has no field named `embedding`
+  --> tests/ui/no_digest_embedding_field.rs:16:9
+   |
+16 |         embedding: vec![0.0; 384],
+   |         ^^^^^^^^^ `context_graph::Digest` does not have this field
+   |
+   = note: all struct fields are already assigned

@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::fanout_fixture::seed_fanout_fixture;
-use context_graph::{CreateContext, EntityId, RelationshipType, Store, TraverseFilter};
+use context_graph::{
+    CreateContext, EntityId, RelationshipType, Store, StoreConfig, TraverseFilter,
+};
 use criterion::{Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
@@ -23,12 +25,20 @@ const FANOUT_BUDGET: Duration = Duration::from_millis(100);
 fn fixture() -> (TempDir, PathBuf, Store) {
     let tempdir = TempDir::new().expect("tempdir");
     let db_path = tempdir.path().join("context-graph.db");
-    let store = Store::open(&db_path);
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
     (tempdir, db_path, store)
 }
 
 fn reopen(db_path: &Path) -> Store {
-    Store::open(db_path)
+    Store::open(StoreConfig {
+        db_path: db_path.to_path_buf(),
+        ..Default::default()
+    })
+    .expect("open")
 }
 
 fn context_input(name: &str) -> CreateContext {

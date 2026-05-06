@@ -32,6 +32,47 @@ pub enum CgError {
         from: DecisionStatus,
         to: DecisionStatus,
     },
+    MissingEvidenceRef,
+    InvalidEvidenceHash {
+        hash: String,
+    },
+    EmbeddingSpaceMismatch {
+        conflicting_field: &'static str,
+    },
+    UnsupportedEvidenceKind {
+        kind: crate::EvidenceKind,
+    },
+    RawMediaNotStored,
+    EvidenceUnavailable,
+    InvalidMimeForEvidenceKind,
+    InvalidSourceRefScheme {
+        scheme: String,
+        host: Option<String>,
+    },
+    InvalidEvidenceRegionBounds {
+        field: &'static str,
+    },
+    EmbeddingTargetNotFound {
+        id: crate::EvidenceId,
+    },
+    LegacyVectorStoreDetected,
+    LegacySchemaDetected {
+        found: u32,
+        expected: u32,
+    },
+    MissingVectorColumnForSpace {
+        table: String,
+        column: String,
+    },
+    InvalidDerivedFromReference,
+    AmbiguousEmbeddingSpace,
+    DuplicateEvidenceId {
+        id: crate::EvidenceId,
+    },
+    CrossSpaceQueryRejected {
+        query_space: String,
+        target_space: String,
+    },
     IntentionIllegalTransition {
         from: IntentionStatus,
         to: IntentionStatus,

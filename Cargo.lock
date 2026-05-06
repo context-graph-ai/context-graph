@@ -315,9 +315,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-core"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5499282acd179407332a4bf2a7bdf92c68985b1071496d34b139bfdaadd87a6"
+version = "1.0.0"
 dependencies = [
  "roaring",
  "serde",
@@ -328,9 +326,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-engine"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fa037a071db21ae5cb3fdce6f2e1604ce0ce154cc04a1f40d8a44199a09a9be"
+version = "1.0.0"
 dependencies = [
  "bincode 2.0.1",
  "contextdb-core",
@@ -340,6 +336,7 @@ dependencies = [
  "contextdb-relational",
  "contextdb-tx",
  "contextdb-vector",
+ "fs2",
  "parking_lot",
  "redb",
  "rmp-serde",
@@ -354,9 +351,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-graph"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1ceb0363658bd71d77f20e7f7add04a60826d9c8c93605f49d88ed76ba60703"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -366,9 +361,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-parser"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "237d5d9a9907087c39970354812cc2f2c8e34d838bd42f6fb815b6981a463b19"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "pest",
@@ -377,9 +370,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-planner"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c68a517b67df8a8eb09fbd4c3388d2032f4a2f7c4811a06b5bbcaadbd4a2fad"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "contextdb-parser",
@@ -387,9 +378,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-relational"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17efc339943335080a115b3e8aa8e137f0f800b6c218b04076068ffcce7ff65c"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -399,9 +388,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-tx"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6658eee6fae3cf2bee40fd4ddee1fd7e2fa666a455d5df220f16e38ee1540ad"
+version = "1.0.0"
 dependencies = [
  "contextdb-core",
  "parking_lot",
@@ -409,9 +396,7 @@ dependencies = [
 
 [[package]]
 name = "contextdb-vector"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acad0b407d053a893ef9d4a99fca2748cb627eb4504d0cf476df0a2fb1914e1"
+version = "1.0.0"
 dependencies = [
  "anndists",
  "contextdb-core",
@@ -615,6 +600,16 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
 
 [[package]]
 name = "generic-array"

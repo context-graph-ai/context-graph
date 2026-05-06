@@ -1,7 +1,7 @@
 // Observations are immutable recorded facts (Invariant 4); a public Store::update_observation would let well-intentioned cleanup code rewrite history the Decisions rest on.
-use context_graph::{ObservationId, Store};
+use context_graph::{ObservationId, Store, StoreConfig};
 
 fn main() {
-    let store = Store::open("tmp");
+    let store = Store::open(StoreConfig::default()).expect("open");
     let _ = store.update_observation(ObservationId::new_v7());
 }

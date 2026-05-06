@@ -1,10 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Barrier};
 
 use context_graph::schema::{DIGEST_VECTOR_DIMENSION, TABLES};
 use contextdb_core::{Error, TxId, Value};
 use contextdb_engine::{Database, QueryResult};
 use serde_json::json;
 use uuid::Uuid;
+
+const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
 
 fn initialize_schema(db: &Database) {
     let existing: HashSet<_> = db.table_names().into_iter().collect();
@@ -20,6 +25,168 @@ fn fresh_db() -> Database {
     let db = Database::open_memory();
     initialize_schema(&db);
     db
+}
+
+fn cg_observation(
+    observation_id: context_graph::ObservationId,
+    evidence_id: context_graph::EvidenceId,
+    entity_id: context_graph::EntityId,
+    context_id: context_graph::ContextId,
+    writer: usize,
+) -> context_graph::RecordObservation {
+    context_graph::RecordObservation {
+        id: observation_id,
+        entity_id,
+        context_id,
+        observation_type: format!("writer_{writer}"),
+        source: "schema".to_string(),
+        observed_at: chrono::Utc::now(),
+        evidence: vec![context_graph::EvidenceRef {
+            id: evidence_id,
+            observation_id,
+            context_id,
+            kind: context_graph::EvidenceKind::Text,
+            source_ref:
+                "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            content_hash: Some(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            retention_status: context_graph::RetentionStatus::RetainedExternal,
+            ..Default::default()
+        }],
+        observed_properties: BTreeMap::new(),
+        state_delta: BTreeMap::from([(format!("writer_{writer}"), Some(json!(writer)))]),
+        properties: BTreeMap::new(),
+        embeddings: Vec::new(),
+    }
+}
+
+fn cg_observation_with_text_embedding(
+    observation_id: context_graph::ObservationId,
+    evidence_id: context_graph::EvidenceId,
+    embedding_id: context_graph::EmbeddingId,
+    entity_id: context_graph::EntityId,
+    context_id: context_graph::ContextId,
+    vector: Vec<f32>,
+) -> context_graph::RecordObservation {
+    let mut observation = cg_observation(observation_id, evidence_id, entity_id, context_id, 0);
+    observation.state_delta = BTreeMap::from([("risk".to_string(), Some(json!("elevated")))]);
+    observation.embeddings = vec![context_graph::PrecomputedEmbedding {
+        id: embedding_id,
+        embedding_space_id: TEXT_SPACE.to_string(),
+        vector,
+        target: context_graph::EmbeddingTarget::Evidence(evidence_id),
+        produced_by: context_graph::EvidenceProducer {
+            system: "schema".to_string(),
+            model_name: "embeddinggemma-300m".to_string(),
+            model_version: "default".to_string(),
+            pipeline_version: "1".to_string(),
+        },
+    }];
+    observation
+}
+
+fn text_vector_with_axis(axis: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; 768];
+    vector[axis % 768] = 1.0;
+    vector
+}
+
+fn vision_vector_with_axis(axis: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; 512];
+    vector[axis % 512] = 1.0;
+    vector
+}
+
+fn vision_embedding_space_decl(id: &str) -> context_graph::EmbeddingSpaceDecl {
+    context_graph::EmbeddingSpaceDecl {
+        embedding_space_id: id.to_string(),
+        dimension: 512,
+        metric: context_graph::DistanceMetric::Cosine,
+        model_family: "vision".to_string(),
+        model_name: "vigil-face".to_string(),
+        model_version: "1".to_string(),
+        supported_evidence_kinds: vec![context_graph::EvidenceKind::ImageFrame],
+        default_for_evidence_kind: Some(context_graph::EvidenceKind::ImageFrame),
+        bindings: vec![context_graph::EmbeddingSpaceBinding {
+            embedding_space_id: id.to_string(),
+            table_name: "evidence".to_string(),
+            vector_column: "vector_vision".to_string(),
+        }],
+    }
+}
+
+fn seed_store_context_entity(
+    store: &context_graph::Store,
+) -> (context_graph::ContextId, context_graph::EntityId) {
+    let context = store
+        .create_context(context_graph::CreateContext {
+            name: format!("schema-{}", uuid::Uuid::now_v7()),
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        })
+        .expect("context");
+    let entity = store
+        .create_entity(context_graph::CreateEntity {
+            entity_type: context_graph::EntityType::Service,
+            name: format!("entity-{}", uuid::Uuid::now_v7()),
+            properties: BTreeMap::new(),
+            tags: Vec::new(),
+            context_id: context.id,
+        })
+        .expect("entity");
+    (context.id, entity.id)
+}
+
+fn seed_store_decision(
+    config: &context_graph::StoreConfig,
+) -> (context_graph::DecisionId, context_graph::ObservationId) {
+    let store = context_graph::Store::open(config.clone()).expect("open");
+    let (context_id, entity_id) = seed_store_context_entity(&store);
+    let intention = store
+        .create_intention(context_graph::CreateIntention {
+            id: None,
+            description: "schema intention".to_string(),
+            status: context_graph::IntentionStatus::Active,
+            origin: context_graph::IntentionOrigin::Human,
+            context_id,
+            properties: BTreeMap::new(),
+            tags: Vec::new(),
+        })
+        .expect("intention");
+    let observation_id = context_graph::ObservationId::new_v7();
+    let record = store
+        .record_observation(cg_observation(
+            observation_id,
+            context_graph::EvidenceId::new_v7(),
+            entity_id,
+            context_id,
+            0,
+        ))
+        .expect("observation");
+    let snapshot_id = record
+        .snapshot_id
+        .or_else(|| {
+            store
+                .current_entity_snapshot(entity_id)
+                .expect("current snapshot")
+                .map(|snapshot| snapshot.id)
+        })
+        .expect("basis snapshot");
+    let decision = store
+        .create_decision(context_graph::CreateDecision {
+            decision_type: "schema".to_string(),
+            description: "schema decision".to_string(),
+            intention_ids: vec![intention.id],
+            based_on_entity_ids: vec![entity_id],
+            based_on_snapshots: vec![snapshot_id],
+            context_id,
+            ..Default::default()
+        })
+        .expect("decision");
+    (decision.id, observation_id)
 }
 
 fn uuid(n: u128) -> String {
@@ -49,6 +216,15 @@ fn assert_one_row(result: &QueryResult) {
 
 fn assert_error_is_fk(result: contextdb_core::Result<QueryResult>) {
     assert!(matches!(result, Err(Error::ForeignKeyViolation { .. })));
+}
+
+fn scalar_count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
+    let result = db.execute(sql, params).expect("count query");
+    assert_one_row(&result);
+    match row_value(&result, 0, "n") {
+        Value::Int64(n) => *n,
+        other => panic!("expected integer count, got {other:?}"),
+    }
 }
 
 fn insert_context(db: &Database, id: Uuid, name: &str) {
@@ -131,15 +307,54 @@ fn insert_decision(db: &Database, id: Uuid, context_id: Uuid, status: &str) {
 
 fn insert_observation(db: &Database, id: Uuid, entity_id: Uuid, context_id: Uuid) {
     db.execute(
-        "INSERT INTO observations (id, observation_type, data, source, entity_id, context_id, timestamp) VALUES ($id, $observation_type, $data, $source, $entity_id, $context_id, $timestamp)",
+        "INSERT INTO observations (id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at) VALUES ($id, $observation_type, $observed_properties, $state_delta, $properties, $source, $entity_id, $context_id, $timestamp, $created_at)",
         &params(vec![
             ("id", Value::Uuid(id)),
             ("observation_type", Value::Text("config_change".into())),
-            ("data", Value::Json(json!({"field": "version", "old": "1.0", "new": "2.0"}))),
+            (
+                "observed_properties",
+                Value::Json(json!({"version": "2.0"})),
+            ),
+            (
+                "state_delta",
+                Value::Json(json!({"version": {"old": "1.0", "new": "2.0"}})),
+            ),
+            ("properties", Value::Json(json!({"field": "version"}))),
             ("source", Value::Text("git-hook".into())),
             ("entity_id", Value::Uuid(entity_id)),
             ("context_id", Value::Uuid(context_id)),
             ("timestamp", Value::Timestamp(1_700_000_004)),
+            ("created_at", Value::TxId(TxId(1_u64))),
+        ]),
+    )
+    .unwrap();
+}
+
+fn insert_evidence(
+    db: &Database,
+    id: Uuid,
+    observation_id: Uuid,
+    context_id: Uuid,
+    supply_order: i64,
+    derived_from: Option<Uuid>,
+) {
+    db.execute(
+        "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, derived_from, retention_status, supply_order) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $derived_from, $retention_status, $supply_order)",
+        &params(vec![
+            ("id", Value::Uuid(id)),
+            ("observation_id", Value::Uuid(observation_id)),
+            ("context_id", Value::Uuid(context_id)),
+            ("kind", Value::Text("text".into())),
+            (
+                "source_ref",
+                Value::Text("cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            ),
+            (
+                "derived_from",
+                derived_from.map(Value::Uuid).unwrap_or(Value::Null),
+            ),
+            ("retention_status", Value::Text("retained_external".into())),
+            ("supply_order", Value::Int64(supply_order)),
         ]),
     )
     .unwrap();
@@ -162,15 +377,17 @@ fn insert_outcome(db: &Database, id: Uuid, decision_id: Uuid) {
 fn insert_invalidation(
     db: &Database,
     id: Uuid,
+    context_id: Uuid,
     status: &str,
     affected_decision_id: Uuid,
     trigger_observation_id: Uuid,
 ) {
     db.execute(
-        "INSERT INTO invalidations (id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
         &params(vec![
             ("id", Value::Uuid(id)),
             ("status", Value::Text(status.to_string())),
+            ("context_id", Value::Uuid(context_id)),
             ("affected_decision_id", Value::Uuid(affected_decision_id)),
             ("trigger_observation_id", Value::Uuid(trigger_observation_id)),
             ("basis_diff", Value::Json(json!({"field": "version", "old": "1.0", "new": "2.0"}))),
@@ -190,7 +407,7 @@ fn insert_invalidation_status(db: &Database, id: Uuid, context_id: Uuid, status:
     insert_decision(db, decision_id, context_id, "active");
     insert_entity(db, Uuid::from_u128(606), context_id, "entity");
     insert_observation(db, observation_id, Uuid::from_u128(606), context_id);
-    insert_invalidation(db, id, status, decision_id, observation_id);
+    insert_invalidation(db, id, context_id, status, decision_id, observation_id);
 }
 
 fn insert_signature(db: &Database, id: Uuid, status: &str) {
@@ -214,13 +431,15 @@ fn insert_signature(db: &Database, id: Uuid, status: &str) {
 
 fn insert_digest(db: &Database, id: Uuid, context_id: Uuid, embedding: Vec<f32>) {
     db.execute(
-        "INSERT INTO digests (id, source, session_ref, summary, embedding, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $embedding, $context_id, $properties, $created_at)",
+        "INSERT INTO digests (id, source, session_ref, summary, kind, vector_text, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $vector_text, $dimension, $context_id, $properties, $created_at)",
         &params(vec![
             ("id", Value::Uuid(id)),
             ("source", Value::Text("claude-cli".into())),
             ("session_ref", Value::Text("session-1".into())),
             ("summary", Value::Text("Discussed auth module refactoring".into())),
-            ("embedding", Value::Vector(embedding)),
+            ("kind", Value::Text("Text".into())),
+            ("dimension", Value::Int64(embedding.len() as i64)),
+            ("vector_text", Value::Vector(embedding)),
             ("context_id", Value::Uuid(context_id)),
             ("properties", Value::Json(json!({"modality": "text"}))),
             ("created_at", Value::TxId(TxId(1_u64))),
@@ -526,7 +745,7 @@ fn test_entities_table_insert() {
     );
 }
 
-// observations table round-trip: observation_type, data JSON, source, entity_id and context_id FKs, and timestamp persist.
+// observations table round-trip: observation_type, property JSON, source, entity_id and context_id FKs, and timestamp persist.
 #[test]
 fn test_observations_table_insert() {
     let db = fresh_db();
@@ -549,8 +768,12 @@ fn test_observations_table_insert() {
         &Value::Text("config_change".into())
     );
     assert_eq!(
-        row_value(&result, 0, "data"),
-        &Value::Json(json!({"field": "version", "old": "1.0", "new": "2.0"}))
+        row_value(&result, 0, "observed_properties"),
+        &Value::Json(json!({"version": "2.0"}))
+    );
+    assert_eq!(
+        row_value(&result, 0, "state_delta"),
+        &Value::Json(json!({"version": {"old": "1.0", "new": "2.0"}}))
     );
     assert_eq!(
         row_value(&result, 0, "source"),
@@ -612,7 +835,7 @@ fn test_invalidations_table_insert() {
     insert_entity(&db, Uuid::from_u128(73), context_id, "entity");
     insert_observation(&db, observation_id, Uuid::from_u128(73), context_id);
     let id = Uuid::from_u128(7);
-    insert_invalidation(&db, id, "pending", decision_id, observation_id);
+    insert_invalidation(&db, id, context_id, "pending", decision_id, observation_id);
 
     let result = db
         .execute(
@@ -624,6 +847,10 @@ fn test_invalidations_table_insert() {
     assert_eq!(
         row_value(&result, 0, "status"),
         &Value::Text("pending".into())
+    );
+    assert_eq!(
+        row_value(&result, 0, "context_id"),
+        &Value::Uuid(context_id)
     );
     assert_eq!(
         row_value(&result, 0, "affected_decision_id"),
@@ -708,7 +935,7 @@ fn test_signatures_table_insert() {
     );
 }
 
-// digests table round-trip: source, session_ref, summary, embedding vector, context_id FK, properties, and created_at persist.
+// digests table round-trip: source, session_ref, summary, text vector, context_id FK, properties, and created_at persist.
 #[test]
 fn test_digests_table_insert() {
     let db = fresh_db();
@@ -738,8 +965,12 @@ fn test_digests_table_insert() {
         &Value::Text("Discussed auth module refactoring".into())
     );
     assert_eq!(
-        row_value(&result, 0, "embedding"),
+        row_value(&result, 0, "vector_text"),
         &Value::Vector(embedding)
+    );
+    assert_eq!(
+        row_value(&result, 0, "dimension"),
+        &Value::Int64(DIGEST_VECTOR_DIMENSION as i64)
     );
     assert_eq!(
         row_value(&result, 0, "context_id"),
@@ -1615,15 +1846,18 @@ fn test_fk_observation_invalid_entity_id_rejected() {
     let ctx = Uuid::from_u128(1002);
     insert_context(&db, ctx, "ctx");
     assert_error_is_fk(db.execute(
-        "INSERT INTO observations (id, observation_type, data, source, entity_id, context_id, timestamp) VALUES ($id, $observation_type, $data, $source, $entity_id, $context_id, $timestamp)",
+        "INSERT INTO observations (id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at) VALUES ($id, $observation_type, $observed_properties, $state_delta, $properties, $source, $entity_id, $context_id, $timestamp, $created_at)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(1003))),
             ("observation_type", Value::Text("config_change".into())),
-            ("data", Value::Json(json!({"field": "x"}))),
+            ("observed_properties", Value::Json(json!({"field": "x"}))),
+            ("state_delta", Value::Json(json!({}))),
+            ("properties", Value::Json(json!({}))),
             ("source", Value::Text("source".into())),
             ("entity_id", Value::Uuid(Uuid::from_u128(1004))),
             ("context_id", Value::Uuid(ctx)),
             ("timestamp", Value::Timestamp(1_700_000_061)),
+            ("created_at", Value::TxId(TxId(1_u64))),
         ]),
     ));
 }
@@ -1632,13 +1866,20 @@ fn test_fk_observation_invalid_entity_id_rejected() {
 #[test]
 fn test_fk_invalidation_invalid_decision_id_rejected() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(1004);
+    let entity_id = Uuid::from_u128(1005);
+    let observation_id = Uuid::from_u128(1007);
+    insert_context(&db, context_id, "ctx");
+    insert_entity(&db, entity_id, context_id, "entity");
+    insert_observation(&db, observation_id, entity_id, context_id);
     assert_error_is_fk(db.execute(
-        "INSERT INTO invalidations (id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
         &params(vec![
-            ("id", Value::Uuid(Uuid::from_u128(1005))),
+            ("id", Value::Uuid(Uuid::from_u128(1008))),
             ("status", Value::Text("pending".into())),
+            ("context_id", Value::Uuid(context_id)),
             ("affected_decision_id", Value::Uuid(Uuid::from_u128(1006))),
-            ("trigger_observation_id", Value::Uuid(Uuid::from_u128(1007))),
+            ("trigger_observation_id", Value::Uuid(observation_id)),
             ("basis_diff", Value::Json(json!({"field": "x"}))),
             ("severity", Value::Text("warning".into())),
             ("detected_at", Value::TxId(TxId(1_u64))),
@@ -1735,13 +1976,18 @@ fn test_fk_entity_invalid_context_id_rejected() {
 fn test_fk_digest_invalid_context_id_rejected() {
     let db = fresh_db();
     assert_error_is_fk(db.execute(
-        "INSERT INTO digests (id, source, session_ref, summary, embedding, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $embedding, $context_id, $properties, $created_at)",
+        "INSERT INTO digests (id, source, session_ref, summary, kind, vector_text, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $vector_text, $dimension, $context_id, $properties, $created_at)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(1016))),
             ("source", Value::Text("source".into())),
             ("session_ref", Value::Null),
             ("summary", Value::Text("summary".into())),
-            ("embedding", Value::Vector(vec![0.0; DIGEST_VECTOR_DIMENSION])),
+            ("kind", Value::Text("Text".into())),
+            (
+                "vector_text",
+                Value::Vector(vec![0.0; DIGEST_VECTOR_DIMENSION]),
+            ),
+            ("dimension", Value::Int64(DIGEST_VECTOR_DIMENSION as i64)),
             ("context_id", Value::Uuid(Uuid::from_u128(1017))),
             ("properties", Value::Json(json!({}))),
             ("created_at", Value::TxId(TxId(1_u64))),
@@ -1753,12 +1999,17 @@ fn test_fk_digest_invalid_context_id_rejected() {
 #[test]
 fn test_fk_invalidation_invalid_observation_id_rejected() {
     let db = fresh_db();
+    let context_id = Uuid::from_u128(1018);
+    let decision_id = Uuid::from_u128(1019);
+    insert_context(&db, context_id, "ctx");
+    insert_decision(&db, decision_id, context_id, "active");
     assert_error_is_fk(db.execute(
-        "INSERT INTO invalidations (id, status, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
         &params(vec![
-            ("id", Value::Uuid(Uuid::from_u128(1018))),
+            ("id", Value::Uuid(Uuid::from_u128(1021))),
             ("status", Value::Text("pending".into())),
-            ("affected_decision_id", Value::Uuid(Uuid::from_u128(1019))),
+            ("context_id", Value::Uuid(context_id)),
+            ("affected_decision_id", Value::Uuid(decision_id)),
             ("trigger_observation_id", Value::Uuid(Uuid::from_u128(1020))),
             ("basis_diff", Value::Json(json!({"field": "x"}))),
             ("severity", Value::Text("warning".into())),
@@ -1856,15 +2107,18 @@ fn test_not_null_observation_source_rejected() {
     let entity_id = Uuid::from_u128(1331);
     insert_entity(&db, entity_id, ctx, "entity");
     let result = db.execute(
-        "INSERT INTO observations (id, observation_type, data, source, entity_id, context_id, timestamp) VALUES ($id, $observation_type, $data, $source, $entity_id, $context_id, $timestamp)",
+        "INSERT INTO observations (id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at) VALUES ($id, $observation_type, $observed_properties, $state_delta, $properties, $source, $entity_id, $context_id, $timestamp, $created_at)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(1036))),
             ("observation_type", Value::Text("config_change".into())),
-            ("data", Value::Json(json!({}))),
+            ("observed_properties", Value::Json(json!({}))),
+            ("state_delta", Value::Json(json!({}))),
+            ("properties", Value::Json(json!({}))),
             ("source", Value::Null),
             ("entity_id", Value::Uuid(entity_id)),
             ("context_id", Value::Uuid(ctx)),
             ("timestamp", Value::Timestamp(1_700_000_073)),
+            ("created_at", Value::TxId(TxId(1_u64))),
         ]),
     );
     assert!(
@@ -1920,7 +2174,7 @@ fn test_unique_context_name_noop() {
     assert_eq!(rows.rows.len(), 1);
 }
 
-// digests.embedding is a fixed-dimension vector column (DIGEST_VECTOR_DIMENSION); the engine must round-trip a full-dimension embedding without truncation or dimension drift.
+// digests.vector_text is a fixed-dimension vector column (DIGEST_VECTOR_DIMENSION); the engine must round-trip a full-dimension embedding without truncation or dimension drift.
 #[test]
 fn test_digest_vector_column_accepts_embedding() {
     let db = fresh_db();
@@ -1937,13 +2191,13 @@ fn test_digest_vector_column_accepts_embedding() {
         )
         .unwrap();
     assert_one_row(&result);
-    match row_value(&result, 0, "embedding") {
+    match row_value(&result, 0, "vector_text") {
         Value::Vector(v) => assert_eq!(v.len(), DIGEST_VECTOR_DIMENSION),
         other => panic!("expected vector embedding, got {other:?}"),
     }
 }
 
-// the cosine-distance operator on digests.embedding must honor context_id scoping during ANN ordering so semantic search never surfaces a closer digest from a sibling context.
+// the cosine-distance operator on digests.vector_text must honor context_id scoping during ANN ordering so semantic search never surfaces a closer digest from a sibling context.
 #[test]
 fn test_digest_vector_cosine_distance_query() {
     let db = fresh_db();
@@ -1963,10 +2217,11 @@ fn test_digest_vector_cosine_distance_query() {
     insert_digest(&db, close_other_context, ctx_b, close_vec);
     insert_digest(&db, farther_right_context, ctx_a, far_vec);
 
-    let query = vec![1.0_f32, 0.0];
+    let mut query = vec![0.0_f32; DIGEST_VECTOR_DIMENSION];
+    query[0] = 1.0;
     let result = db
         .execute(
-            "SELECT id, context_id FROM digests WHERE context_id = $context_id ORDER BY embedding <=> $query LIMIT 2",
+            "SELECT id, context_id FROM digests WHERE context_id = $context_id ORDER BY vector_text <=> $query LIMIT 2",
             &params(vec![
                 ("context_id", Value::Uuid(ctx_a)),
                 ("query", Value::Vector(query)),
@@ -1996,4 +2251,1293 @@ fn test_initialize_schema_idempotent() {
         )
         .unwrap();
     assert_one_row(&result);
+}
+
+fn assert_table_present(db: &Database, table: &str) {
+    assert!(
+        db.table_names().iter().any(|name| name == table),
+        "{table} table must be present in the evidence schema"
+    );
+}
+
+#[test]
+fn combination_record_observation_observation_evidence_snapshot_embedding_atomic_one_tx() {
+    let _dir = tempfile::tempdir().expect("tempdir");
+    let config = context_graph::StoreConfig {
+        db_path: _dir.path().join("cg.db"),
+        ..Default::default()
+    };
+    let store = context_graph::Store::open(config.clone()).expect("open");
+    let (context_id, entity_id) = seed_store_context_entity(&store);
+    let observation_id = context_graph::ObservationId::new_v7();
+    let evidence_id = context_graph::EvidenceId::new_v7();
+    let embedding_id = context_graph::EmbeddingId::new_v7();
+    let vector = text_vector_with_axis(0);
+    let recorded = store
+        .record_observation(cg_observation_with_text_embedding(
+            observation_id,
+            evidence_id,
+            embedding_id,
+            entity_id,
+            context_id,
+            vector.clone(),
+        ))
+        .expect("record observation");
+    assert_eq!(recorded.observation_id, observation_id);
+    assert_eq!(
+        recorded.evidence_ids,
+        vec![evidence_id],
+        "record_observation must surface the evidence ids it committed"
+    );
+    assert_eq!(
+        recorded.embedding_ids,
+        vec![embedding_id],
+        "record_observation must surface the embedding ids it committed"
+    );
+    let snapshot_id = recorded
+        .snapshot_id
+        .expect("non-empty state_delta must commit an entity snapshot");
+    drop(store);
+
+    let db = Database::open(&config.db_path).expect("raw open");
+    let observation = db
+        .execute(
+            "SELECT id, created_at FROM observations WHERE id = $id",
+            &params(vec![("id", Value::Uuid(observation_id.as_uuid()))]),
+        )
+        .expect("observation row");
+    assert_one_row(&observation);
+    let created_at = row_value(&observation, 0, "created_at").clone();
+
+    let evidence = db
+        .execute(
+            "SELECT id, observation_id FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
+        )
+        .expect("evidence row");
+    assert_one_row(&evidence);
+    assert_eq!(
+        row_value(&evidence, 0, "observation_id"),
+        &Value::Uuid(observation_id.as_uuid())
+    );
+
+    let snapshot = db
+        .execute(
+            "SELECT id, entity_id, evidenced_by, valid_from FROM entity_snapshots WHERE id = $id",
+            &params(vec![("id", Value::Uuid(snapshot_id.as_uuid()))]),
+        )
+        .expect("snapshot row");
+    assert_one_row(&snapshot);
+    assert_eq!(
+        row_value(&snapshot, 0, "entity_id"),
+        &Value::Uuid(entity_id.as_uuid())
+    );
+    assert_eq!(row_value(&snapshot, 0, "valid_from"), &created_at);
+    assert!(
+        matches!(row_value(&snapshot, 0, "evidenced_by"), Value::Json(value)
+            if value.to_string().contains(&observation_id.as_uuid().to_string())),
+        "snapshot must point back to the observation committed in the same transaction"
+    );
+
+    let embedding = db
+        .execute(
+            "SELECT id, embedding_space_id, target_kind, target_id, dimension, created_at FROM embedding_handles WHERE id = $id",
+            &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
+        )
+        .expect("embedding handle row");
+    assert_one_row(&embedding);
+    assert_eq!(
+        row_value(&embedding, 0, "embedding_space_id"),
+        &Value::Text(TEXT_SPACE.to_string())
+    );
+    assert_eq!(
+        row_value(&embedding, 0, "target_kind"),
+        &Value::Text("evidence".to_string())
+    );
+    assert_eq!(
+        row_value(&embedding, 0, "target_id"),
+        &Value::Uuid(evidence_id.as_uuid())
+    );
+    assert_eq!(row_value(&embedding, 0, "dimension"), &Value::Int64(768));
+    assert_eq!(row_value(&embedding, 0, "created_at"), &created_at);
+
+    let vector_hits = db
+        .execute(
+            "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(vector))]),
+        )
+        .expect("vector search");
+    assert_one_row(&vector_hits);
+    assert_eq!(
+        row_value(&vector_hits, 0, "id"),
+        &Value::Uuid(evidence_id.as_uuid())
+    );
+}
+
+#[test]
+fn combination_record_observation_rollback_on_validation_error_after_tx_open_leaves_zero_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = context_graph::StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    };
+    let store = context_graph::Store::open(config.clone()).expect("open");
+    let (context_id, entity_id) = seed_store_context_entity(&store);
+    let observation_id = context_graph::ObservationId::new_v7();
+    let valid_evidence_id = context_graph::EvidenceId::new_v7();
+    let invalid_evidence_id = context_graph::EvidenceId::new_v7();
+    let embedding_id = context_graph::EmbeddingId::new_v7();
+    let vector = text_vector_with_axis(5);
+    let mut input = cg_observation_with_text_embedding(
+        observation_id,
+        valid_evidence_id,
+        embedding_id,
+        entity_id,
+        context_id,
+        vector.clone(),
+    );
+    input.evidence.push(context_graph::EvidenceRef {
+        id: invalid_evidence_id,
+        observation_id,
+        context_id,
+        kind: context_graph::EvidenceKind::ImageFrame,
+        source_ref: "vigil-edge://camera-1/frame/invalid".to_string(),
+        mime_type: Some("image/jpeg".to_string()),
+        region: Some(json!({"x": 1.4, "y": 0.0, "w": 0.2, "h": 0.2})),
+        retention_status: context_graph::RetentionStatus::RetainedExternal,
+        ..Default::default()
+    });
+
+    let result = store.record_observation(input);
+    drop(store);
+    let db = Database::open(&config.db_path).expect("raw open");
+    let observation_rows = scalar_count(
+        &db,
+        "SELECT COUNT(*) AS n FROM observations WHERE id = $id",
+        &params(vec![("id", Value::Uuid(observation_id.as_uuid()))]),
+    );
+    let evidence_rows = scalar_count(
+        &db,
+        "SELECT COUNT(*) AS n FROM evidence WHERE id = $valid OR id = $invalid",
+        &params(vec![
+            ("valid", Value::Uuid(valid_evidence_id.as_uuid())),
+            ("invalid", Value::Uuid(invalid_evidence_id.as_uuid())),
+        ]),
+    );
+    let snapshot_rows = scalar_count(
+        &db,
+        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE entity_id = $id",
+        &params(vec![("id", Value::Uuid(entity_id.as_uuid()))]),
+    );
+    let embedding_rows = scalar_count(
+        &db,
+        "SELECT COUNT(*) AS n FROM embedding_handles WHERE id = $id",
+        &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
+    );
+    let vector_hits = db
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("evidence", "vector_text"),
+            &vector,
+            10,
+            None,
+            db.snapshot(),
+        )
+        .expect("vector query");
+
+    assert!(matches!(
+        result,
+        Err(context_graph::CgError::InvalidEvidenceRegionBounds { .. })
+    ));
+    assert_eq!(observation_rows, 0);
+    assert_eq!(evidence_rows, 0);
+    assert_eq!(snapshot_rows, 0);
+    assert_eq!(embedding_rows, 0);
+    assert!(
+        vector_hits.is_empty(),
+        "failed record_observation must not leave vector_text entries behind"
+    );
+}
+
+#[test]
+fn combination_evidence_table_immutable_rejects_update_and_delete() {
+    let db = fresh_db();
+    assert_table_present(&db, "evidence");
+    let update = db.execute(
+        "UPDATE evidence SET source_ref = $source_ref WHERE id = $id",
+        &params(vec![
+            ("source_ref", Value::Text("s3://mutated".into())),
+            ("id", Value::Uuid(Uuid::from_u128(20_003))),
+        ]),
+    );
+    let delete = db.execute(
+        "DELETE FROM evidence WHERE id = $id",
+        &params(vec![("id", Value::Uuid(Uuid::from_u128(20_003)))]),
+    );
+    assert!(matches!(
+        update,
+        Err(Error::ImmutableTable { .. } | Error::ImmutableColumn { .. })
+    ));
+    assert!(matches!(
+        delete,
+        Err(Error::ImmutableTable { .. } | Error::ImmutableColumn { .. })
+    ));
+}
+
+#[test]
+fn combination_evidence_availability_log_immutable_rejects_update_and_delete() {
+    let db = fresh_db();
+    assert_table_present(&db, "evidence_availability_log");
+    let update = db.execute(
+        "UPDATE evidence_availability_log SET status = $status WHERE evidence_id = $id",
+        &params(vec![
+            ("status", Value::Text("expired".into())),
+            ("id", Value::Uuid(Uuid::from_u128(20_004))),
+        ]),
+    );
+    let delete = db.execute(
+        "DELETE FROM evidence_availability_log WHERE evidence_id = $id",
+        &params(vec![("id", Value::Uuid(Uuid::from_u128(20_004)))]),
+    );
+    assert!(matches!(
+        update,
+        Err(Error::ImmutableTable { .. } | Error::ImmutableColumn { .. })
+    ));
+    assert!(matches!(
+        delete,
+        Err(Error::ImmutableTable { .. } | Error::ImmutableColumn { .. })
+    ));
+}
+
+#[test]
+fn combination_evidence_availability_log_concurrent_appends_persist_distinct_rows_last_writer_wins_by_txid()
+ {
+    let db = Arc::new(fresh_db());
+    let evidence_id = Uuid::from_u128(20_005);
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = ["expired", "unavailable"]
+        .into_iter()
+        .map(|status| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let tx = db.begin();
+                barrier.wait();
+                let result = db.execute_in_tx(
+                    tx,
+                    "INSERT INTO evidence_availability_log (evidence_id, status, recorded_at_txid) VALUES ($evidence_id, $status, $recorded_at_txid)",
+                    &params(vec![
+                        ("evidence_id", Value::Uuid(evidence_id)),
+                        ("status", Value::Text(status.into())),
+                        ("recorded_at_txid", Value::TxId(tx)),
+                    ]),
+                );
+                if result.is_ok() {
+                    let _ = db.commit(tx);
+                } else {
+                    let _ = db.rollback(tx);
+                }
+                result.map(|_| tx)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("writer joined"))
+        .collect();
+    assert!(
+        results.iter().all(|result| result.is_ok()),
+        "both append-only log writes must persist"
+    );
+    let txids: BTreeSet<_> = results
+        .iter()
+        .filter_map(|result| result.as_ref().ok().copied())
+        .collect();
+    assert_eq!(txids.len(), 2, "log TXIDs must be distinct");
+    let rows = db
+        .execute(
+            "SELECT status, recorded_at_txid FROM evidence_availability_log WHERE evidence_id = $id",
+            &params(vec![("id", Value::Uuid(evidence_id))]),
+        )
+        .expect("select log");
+    assert_eq!(rows.rows.len(), 2);
+    let latest_txid = txids.iter().next_back().copied().expect("latest txid");
+    assert!(
+        rows.rows
+            .iter()
+            .any(|row| row.contains(&Value::TxId(latest_txid)))
+    );
+}
+
+#[test]
+fn combination_decision_status_state_machine_active_to_invalidated_accepted() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(20_006);
+    insert_context(&db, context_id, "ctx");
+    let decision_id = Uuid::from_u128(20_007);
+    insert_decision(&db, decision_id, context_id, "active");
+    let result = db
+        .execute(
+            "UPDATE decisions SET status = $status WHERE id = $id AND status = $from",
+            &params(vec![
+                ("status", Value::Text("invalidated".into())),
+                ("from", Value::Text("active".into())),
+                ("id", Value::Uuid(decision_id)),
+            ]),
+        )
+        .expect("active to invalidated");
+    assert_eq!(result.rows_affected, 1);
+}
+
+#[test]
+fn combination_decision_status_state_machine_invalidated_to_active_rejected() {
+    assert_invalidated_terminal_transition_rejected("active");
+}
+
+#[test]
+fn combination_decision_status_state_machine_invalidated_to_archived_rejected() {
+    assert_invalidated_terminal_transition_rejected("archived");
+}
+
+#[test]
+fn combination_decision_status_state_machine_invalidated_to_superseded_rejected() {
+    assert_invalidated_terminal_transition_rejected("superseded");
+}
+
+fn assert_invalidated_terminal_transition_rejected(to: &str) {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(20_008);
+    insert_context(&db, context_id, "ctx");
+    let decision_id = Uuid::from_u128(20_009);
+    insert_decision(&db, decision_id, context_id, "invalidated");
+    let result = db.execute(
+        "UPDATE decisions SET status = $status WHERE id = $id",
+        &params(vec![
+            ("status", Value::Text(to.into())),
+            ("id", Value::Uuid(decision_id)),
+        ]),
+    );
+    assert!(
+        matches!(result, Err(Error::InvalidStateTransition(_))),
+        "invalidated -> {to} must be a typed state-machine error"
+    );
+}
+
+#[test]
+fn combination_invalidate_decision_with_invalidation_row_atomic_or_neither_visible() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = context_graph::StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    };
+    let (decision_id, trigger_id) = seed_store_decision(&config);
+    let barrier = Arc::new(Barrier::new(2));
+    let done = Arc::new(AtomicBool::new(false));
+    let torn = Arc::new(AtomicBool::new(false));
+
+    let reader_config = config.clone();
+    let reader_barrier = Arc::clone(&barrier);
+    let reader_done = Arc::clone(&done);
+    let reader_torn = Arc::clone(&torn);
+    let reader = std::thread::spawn(move || {
+        let store = context_graph::Store::open(reader_config).expect("reader open");
+        reader_barrier.wait();
+        while !reader_done.load(Ordering::SeqCst) {
+            let status = store
+                .get_decision(decision_id)
+                .expect("decision")
+                .expect("decision row")
+                .status;
+            let invalidation_count = store
+                .list_invalidations(Some(decision_id), None)
+                .expect("invalidations")
+                .len();
+            if (status == context_graph::DecisionStatus::Active && invalidation_count > 0)
+                || (status == context_graph::DecisionStatus::Invalidated && invalidation_count == 0)
+            {
+                reader_torn.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+
+    let writer = context_graph::Store::open(config).expect("writer open");
+    barrier.wait();
+    let invalidation = writer
+        .invalidate_decision(decision_id, trigger_id, "basis drift")
+        .expect("invalidate");
+    done.store(true, Ordering::SeqCst);
+    reader.join().expect("reader joined");
+    assert!(
+        !torn.load(Ordering::SeqCst),
+        "reader must not see decision status and invalidation row at different visibility horizons"
+    );
+    assert_eq!(
+        invalidation.previous_status,
+        context_graph::DecisionStatus::Active
+    );
+    assert_eq!(
+        invalidation.new_status,
+        context_graph::DecisionStatus::Invalidated
+    );
+    assert_eq!(
+        writer
+            .get_decision(decision_id)
+            .expect("decision")
+            .expect("decision row")
+            .status,
+        context_graph::DecisionStatus::Invalidated
+    );
+    assert_eq!(
+        writer
+            .list_invalidations(Some(decision_id), None)
+            .expect("invalidations")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidations_equals_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = context_graph::StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    };
+    let (decision_id, trigger_id) = seed_store_decision(&config);
+    let barrier = Arc::new(Barrier::new(4));
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let config = config.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = context_graph::Store::open(config).expect("writer open");
+                barrier.wait();
+                store.invalidate_decision(decision_id, trigger_id, "basis drift")
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("writer joined"))
+        .collect();
+    let ok_count = results.iter().filter(|result| result.is_ok()).count();
+    let illegal_count = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result,
+                Err(context_graph::CgError::IllegalTransition { .. })
+            )
+        })
+        .count();
+    let invalidation_rows = context_graph::Store::open(config)
+        .expect("reader")
+        .list_invalidations(Some(decision_id), None)
+        .expect("invalidations");
+    assert_eq!(
+        ok_count, 1,
+        "conditional invalidation must have exactly one winner"
+    );
+    assert_eq!(illegal_count, 3);
+    assert_eq!(invalidation_rows.len(), 1);
+}
+
+#[test]
+fn combination_decisions_based_on_snapshots_json_round_trip_concurrent_writers_winning_writer_value_pinned_by_txid()
+ {
+    let db = Arc::new(fresh_db());
+    let context_id = Uuid::from_u128(20_011);
+    insert_context(&db, context_id, "ctx");
+    let decision_id = Uuid::from_u128(20_012);
+    insert_decision(&db, decision_id, context_id, "active");
+    let supplied: Vec<_> = (0..6)
+        .map(|writer| {
+            json!([
+                Uuid::from_u128(20_013 + writer).to_string(),
+                Uuid::from_u128(20_113 + writer).to_string()
+            ])
+        })
+        .collect();
+    let barrier = Arc::new(Barrier::new(6));
+    let handles: Vec<_> = supplied
+        .clone()
+        .into_iter()
+        .map(|basis| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let tx = db.begin();
+                barrier.wait();
+                let result = db.execute_in_tx(
+                    tx,
+                    "UPDATE decisions SET based_on_snapshots = $based_on_snapshots, created_at = $created_at WHERE id = $id",
+                    &params(vec![
+                        ("based_on_snapshots", Value::Json(basis.clone())),
+                        ("created_at", Value::TxId(tx)),
+                        ("id", Value::Uuid(decision_id)),
+                    ]),
+                );
+                if result.is_ok() {
+                    let _ = db.commit(tx);
+                } else {
+                    let _ = db.rollback(tx);
+                }
+                result.map(|_| (basis, tx))
+            })
+        })
+        .collect();
+    let committed: Vec<_> = handles
+        .into_iter()
+        .filter_map(|handle| handle.join().expect("writer joined").ok())
+        .collect();
+    let row = db
+        .execute(
+            "SELECT based_on_snapshots, created_at FROM decisions WHERE id = $id",
+            &params(vec![("id", Value::Uuid(decision_id))]),
+        )
+        .expect("select basis");
+    assert_one_row(&row);
+    let row_basis = row_value(&row, 0, "based_on_snapshots");
+    let row_txid = row_value(&row, 0, "created_at");
+    assert!(
+        committed
+            .iter()
+            .any(|(basis, txid)| row_basis == &Value::Json(basis.clone())
+                && row_txid == &Value::TxId(*txid))
+    );
+}
+
+#[test]
+fn combination_embedding_spaces_table_unique_on_embedding_space_id_concurrent_seed_collapses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = context_graph::StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        extra_embedding_spaces: vec![vision_embedding_space_decl("vision_v1")],
+        ..Default::default()
+    };
+    let barrier = Arc::new(Barrier::new(4));
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let config = config.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                context_graph::Store::open(config)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("writer joined"))
+        .collect();
+    assert!(
+        results.iter().all(Result::is_ok),
+        "idempotent concurrent Store::open declarations must not surface unique violations"
+    );
+    drop(results);
+    let db = Database::open(&config.db_path).expect("raw open");
+    let count = scalar_count(
+        &db,
+        "SELECT COUNT(*) AS n FROM embedding_spaces WHERE embedding_space_id = $id",
+        &params(vec![("id", Value::Text("vision_v1".to_string()))]),
+    );
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn combination_embedding_space_bindings_unique_composite_table_column_space() {
+    let db = fresh_db();
+    assert_table_present(&db, "embedding_space_bindings");
+    db.execute(
+        "INSERT INTO embedding_spaces (embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings) VALUES ($embedding_space_id, $dimension, $metric, $model_family, $model_name, $model_version, $supported_evidence_kinds, $default_for_evidence_kind, $bindings)",
+        &params(vec![
+            (
+                "embedding_space_id",
+                Value::Text("text_default_embeddinggemma_300m_768".into()),
+            ),
+            ("dimension", Value::Int64(768)),
+            ("metric", Value::Text("cosine".into())),
+            ("model_family", Value::Text("embeddinggemma".into())),
+            ("model_name", Value::Text("embeddinggemma-300m".into())),
+            ("model_version", Value::Text("default".into())),
+            ("supported_evidence_kinds", Value::Json(json!(["text"]))),
+            ("default_for_evidence_kind", Value::Text("text".into())),
+            (
+                "bindings",
+                Value::Json(json!([{"table_name": "evidence", "vector_column": "vector_text"}])),
+            ),
+        ]),
+    )
+    .expect("seed embedding space");
+    let params = params(vec![
+        (
+            "embedding_space_id",
+            Value::Text("text_default_embeddinggemma_300m_768".into()),
+        ),
+        ("table_name", Value::Text("evidence".into())),
+        ("vector_column", Value::Text("vector_text".into())),
+    ]);
+    let first = db.execute(
+        "INSERT INTO embedding_space_bindings (embedding_space_id, table_name, vector_column) VALUES ($embedding_space_id, $table_name, $vector_column)",
+        &params,
+    );
+    let second = db.execute(
+        "INSERT INTO embedding_space_bindings (embedding_space_id, table_name, vector_column) VALUES ($embedding_space_id, $table_name, $vector_column)",
+        &params,
+    );
+    assert!(first.is_ok());
+    assert!(second.is_ok());
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT COUNT(*) AS n FROM embedding_space_bindings WHERE embedding_space_id = $embedding_space_id AND table_name = $table_name AND vector_column = $vector_column",
+            &params,
+        ),
+        1
+    );
+}
+
+#[test]
+fn combination_evidence_multi_vector_columns_per_row_text_and_vision_independently_indexed() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(20_050);
+    let entity_id = Uuid::from_u128(20_051);
+    let observation_id = Uuid::from_u128(20_052);
+    let target_id = Uuid::from_u128(20_053);
+    let decoy_id = Uuid::from_u128(20_054);
+    insert_context(&db, context_id, "ctx-multi-vector");
+    insert_entity(&db, entity_id, context_id, "entity-multi-vector");
+    insert_observation(&db, observation_id, entity_id, context_id);
+
+    let target_text = text_vector_with_axis(0);
+    let target_vision = vision_vector_with_axis(1);
+    let decoy_text = text_vector_with_axis(1);
+    let decoy_vision = vision_vector_with_axis(0);
+    for (supply_order, id, vector_text, vector_vision) in [
+        (0_i64, target_id, target_text.clone(), target_vision.clone()),
+        (1_i64, decoy_id, decoy_text, decoy_vision),
+    ] {
+        db.execute(
+            "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order, vector_text, vector_vision) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order, $vector_text, $vector_vision)",
+            &params(vec![
+                ("id", Value::Uuid(id)),
+                ("observation_id", Value::Uuid(observation_id)),
+                ("context_id", Value::Uuid(context_id)),
+                ("kind", Value::Text("image_frame".into())),
+                ("source_ref", Value::Text(format!("vigil-edge://camera-1/frame/{supply_order}"))),
+                ("retention_status", Value::Text("retained_external".into())),
+                ("supply_order", Value::Int64(supply_order)),
+                ("vector_text", Value::Vector(vector_text)),
+                ("vector_vision", Value::Vector(vector_vision)),
+            ]),
+        )
+        .expect("insert vector-backed evidence");
+    }
+
+    let text_hit = db
+        .execute(
+            "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(target_text))]),
+        )
+        .expect("text vector query");
+    assert_one_row(&text_hit);
+    assert_eq!(row_value(&text_hit, 0, "id"), &Value::Uuid(target_id));
+
+    let vision_hit = db
+        .execute(
+            "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+            &params(vec![("query", Value::Vector(target_vision))]),
+        )
+        .expect("vision vector query");
+    assert_one_row(&vision_hit);
+    assert_eq!(row_value(&vision_hit, 0, "id"), &Value::Uuid(target_id));
+
+    let text_wrong_dimension = db.execute(
+        "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+        &params(vec![("query", Value::Vector(vec![0.0; 512]))]),
+    );
+    assert!(matches!(
+        text_wrong_dimension,
+        Err(Error::VectorIndexDimensionMismatch {
+            expected: 768,
+            actual: 512,
+            ..
+        })
+    ));
+    let vision_wrong_dimension = db.execute(
+        "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+        &params(vec![("query", Value::Vector(vec![0.0; 768]))]),
+    );
+    assert!(matches!(
+        vision_wrong_dimension,
+        Err(Error::VectorIndexDimensionMismatch {
+            expected: 512,
+            actual: 768,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn combination_cg_schema_version_table_single_row_invariant_multiple_rows_returns_legacy_schema_detected()
+ {
+    let dir = tempfile::tempdir().expect("tempdir");
+    context_graph::Store::admin_raw_install_legacy_schema_for_tests(
+        dir.path().join("cg.db"),
+        context_graph::LegacySchemaFixture::MultipleVersionRows,
+    )
+    .expect("install legacy fixture");
+    let result = context_graph::Store::open(context_graph::StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    });
+    assert!(matches!(
+        result,
+        Err(context_graph::CgError::LegacySchemaDetected { .. })
+    ));
+}
+
+#[test]
+fn combination_observation_with_evidence_atomic_insert_under_fk_violation_rolls_back_at_commit() {
+    let db = fresh_db();
+    assert_table_present(&db, "evidence");
+    let evidence_id = Uuid::from_u128(20_016);
+    let observation_id = Uuid::from_u128(20_017);
+    let entity_id = Uuid::from_u128(20_018);
+    let context_id = Uuid::from_u128(20_019);
+    let invalid_evidence_id = Uuid::from_u128(20_020);
+    let missing_parent_evidence = Uuid::from_u128(20_021);
+    insert_context(&db, context_id, "ctx-evidence-fk-rollback");
+    insert_entity(&db, entity_id, context_id, "rollback-entity");
+
+    let tx = db.begin();
+    let observation = db.execute_in_tx(
+        tx,
+        "INSERT INTO observations (id, entity_id, context_id, observation_type, observed_properties, state_delta, properties, source, timestamp, created_at) VALUES ($id, $entity_id, $context_id, $observation_type, $observed_properties, $state_delta, $properties, $source, $timestamp, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(observation_id)),
+            ("entity_id", Value::Uuid(entity_id)),
+            ("context_id", Value::Uuid(context_id)),
+            ("observation_type", Value::Text("config_change".into())),
+            ("observed_properties", Value::Json(json!({}))),
+            ("state_delta", Value::Json(json!({}))),
+            ("properties", Value::Json(json!({}))),
+            ("source", Value::Text("git-hook".into())),
+            ("timestamp", Value::Timestamp(1_700_000_004)),
+            ("created_at", Value::TxId(TxId(1_u64))),
+        ]),
+    );
+    assert!(observation.is_ok());
+    let evidence = db.execute_in_tx(
+        tx,
+        "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order)",
+        &params(vec![
+            ("id", Value::Uuid(evidence_id)),
+            ("observation_id", Value::Uuid(observation_id)),
+            ("context_id", Value::Uuid(context_id)),
+            ("kind", Value::Text("text".into())),
+            (
+                "source_ref",
+                Value::Text("cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            ),
+            ("retention_status", Value::Text("retained_external".into())),
+            ("supply_order", Value::Int64(0)),
+        ]),
+    );
+    assert!(evidence.is_ok());
+    let invalid_evidence = db.execute_in_tx(
+        tx,
+        "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, derived_from, retention_status, supply_order) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $derived_from, $retention_status, $supply_order)",
+        &params(vec![
+            ("id", Value::Uuid(invalid_evidence_id)),
+            ("observation_id", Value::Uuid(observation_id)),
+            ("context_id", Value::Uuid(context_id)),
+            ("kind", Value::Text("text_projection".into())),
+            (
+                "source_ref",
+                Value::Text("cas://sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+            ),
+            ("derived_from", Value::Uuid(missing_parent_evidence)),
+            ("retention_status", Value::Text("retained_external".into())),
+            ("supply_order", Value::Int64(1)),
+        ]),
+    );
+    assert!(invalid_evidence.is_ok());
+    assert!(matches!(
+        db.commit(tx),
+        Err(Error::ForeignKeyViolation { .. })
+    ));
+    let observation_rows = db
+        .execute(
+            "SELECT id FROM observations WHERE id = $id",
+            &params(vec![("id", Value::Uuid(observation_id))]),
+        )
+        .expect("select observation");
+    assert!(observation_rows.rows.is_empty());
+    let evidence_rows = db
+        .execute(
+            "SELECT id FROM evidence WHERE id = $id OR id = $invalid_id",
+            &params(vec![
+                ("id", Value::Uuid(evidence_id)),
+                ("invalid_id", Value::Uuid(invalid_evidence_id)),
+            ]),
+        )
+        .expect("select evidence");
+    assert!(evidence_rows.rows.is_empty());
+}
+
+#[test]
+fn combination_evidence_self_fk_derived_from_validated_at_commit_against_committed_snapshot() {
+    let db = Arc::new(fresh_db());
+    db.execute(
+        "CREATE TABLE evidence_delete_race (id UUID PRIMARY KEY, derived_from UUID REFERENCES evidence_delete_race(id))",
+        &HashMap::new(),
+    )
+    .expect("create mutable fk fixture");
+    let parent = Uuid::from_u128(20_020);
+    let child = Uuid::from_u128(20_021);
+    db.execute(
+        "INSERT INTO evidence_delete_race (id) VALUES ($id)",
+        &params(vec![("id", Value::Uuid(parent))]),
+    )
+    .expect("seed parent");
+
+    let (tx2_started_send, tx2_started_recv) = mpsc::channel();
+    let (delete_committed_send, delete_committed_recv) = mpsc::channel();
+    let deleter_db = Arc::clone(&db);
+    let deleter = std::thread::spawn(move || {
+        tx2_started_recv.recv().expect("child tx started");
+        let tx = deleter_db.begin();
+        let deleted = deleter_db.execute_in_tx(
+            tx,
+            "DELETE FROM evidence_delete_race WHERE id = $id",
+            &params(vec![("id", Value::Uuid(parent))]),
+        );
+        let result = match deleted {
+            Ok(_) => deleter_db.commit(tx),
+            Err(err) => {
+                let _ = deleter_db.rollback(tx);
+                Err(err)
+            }
+        };
+        delete_committed_send
+            .send(())
+            .expect("notify delete committed");
+        result
+    });
+
+    let child_db = Arc::clone(&db);
+    let child_writer = std::thread::spawn(move || {
+        let tx = child_db.begin();
+        tx2_started_send.send(()).expect("notify tx started");
+        delete_committed_recv
+            .recv()
+            .expect("delete commit notification");
+        let inserted = child_db.execute_in_tx(
+            tx,
+            "INSERT INTO evidence_delete_race (id, derived_from) VALUES ($id, $derived_from)",
+            &params(vec![
+                ("id", Value::Uuid(child)),
+                ("derived_from", Value::Uuid(parent)),
+            ]),
+        );
+        match inserted {
+            Ok(_) => child_db.commit(tx),
+            Err(err) => {
+                let _ = child_db.rollback(tx);
+                Err(err)
+            }
+        }
+    });
+
+    assert!(
+        deleter.join().expect("deleter joined").is_ok(),
+        "parent delete must win the overlapping transaction"
+    );
+    assert!(matches!(
+        child_writer.join().expect("child writer joined"),
+        Err(Error::ForeignKeyViolation { .. })
+    ));
+}
+
+#[test]
+fn combination_observation_entity_cross_context_raw_insert_rejected_by_schema() {
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(20_022);
+    let ctx_b = Uuid::from_u128(20_023);
+    let entity_a = Uuid::from_u128(20_024);
+    let observation = Uuid::from_u128(20_025);
+    insert_context(&db, ctx_a, "ctx-observation-parent-a");
+    insert_context(&db, ctx_b, "ctx-observation-child-b");
+    insert_entity(&db, entity_a, ctx_a, "entity-a");
+
+    let result = db.execute(
+        "INSERT INTO observations (id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at) VALUES ($id, $observation_type, $observed_properties, $state_delta, $properties, $source, $entity_id, $context_id, $timestamp, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(observation)),
+            ("observation_type", Value::Text("config_change".into())),
+            ("observed_properties", Value::Json(json!({"version": "2.0"}))),
+            ("state_delta", Value::Json(json!({"version": "2.0"}))),
+            ("properties", Value::Json(json!({}))),
+            ("source", Value::Text("git-hook".into())),
+            ("entity_id", Value::Uuid(entity_a)),
+            ("context_id", Value::Uuid(ctx_b)),
+            ("timestamp", Value::Timestamp(1_700_000_004)),
+            ("created_at", Value::TxId(TxId(1_u64))),
+        ]),
+    );
+
+    assert_error_is_fk(result);
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT count(*) AS n FROM observations WHERE id = $id",
+            &params(vec![("id", Value::Uuid(observation))]),
+        ),
+        0
+    );
+}
+
+#[test]
+fn combination_evidence_observation_cross_context_raw_insert_rejected_by_schema() {
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(20_026);
+    let ctx_b = Uuid::from_u128(20_027);
+    let entity_a = Uuid::from_u128(20_028);
+    let observation_a = Uuid::from_u128(20_029);
+    let evidence = Uuid::from_u128(20_030);
+    insert_context(&db, ctx_a, "ctx-evidence-observation-a");
+    insert_context(&db, ctx_b, "ctx-evidence-child-b");
+    insert_entity(&db, entity_a, ctx_a, "entity-a");
+    insert_observation(&db, observation_a, entity_a, ctx_a);
+
+    let result = db.execute(
+        "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order)",
+        &params(vec![
+            ("id", Value::Uuid(evidence)),
+            ("observation_id", Value::Uuid(observation_a)),
+            ("context_id", Value::Uuid(ctx_b)),
+            ("kind", Value::Text("text".into())),
+            (
+                "source_ref",
+                Value::Text("cas://sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+            ),
+            ("retention_status", Value::Text("retained_external".into())),
+            ("supply_order", Value::Int64(0)),
+        ]),
+    );
+
+    assert_error_is_fk(result);
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT count(*) AS n FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(evidence))]),
+        ),
+        0
+    );
+}
+
+#[test]
+fn combination_evidence_derived_from_cross_context_raw_insert_rejected_by_schema() {
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(20_031);
+    let ctx_b = Uuid::from_u128(20_032);
+    let entity_a = Uuid::from_u128(20_033);
+    let entity_b = Uuid::from_u128(20_034);
+    let observation_a = Uuid::from_u128(20_035);
+    let observation_b = Uuid::from_u128(20_036);
+    let parent_evidence = Uuid::from_u128(20_037);
+    let child_evidence = Uuid::from_u128(20_038);
+    insert_context(&db, ctx_a, "ctx-derived-parent-a");
+    insert_context(&db, ctx_b, "ctx-derived-child-b");
+    insert_entity(&db, entity_a, ctx_a, "entity-a");
+    insert_entity(&db, entity_b, ctx_b, "entity-b");
+    insert_observation(&db, observation_a, entity_a, ctx_a);
+    insert_observation(&db, observation_b, entity_b, ctx_b);
+    insert_evidence(&db, parent_evidence, observation_a, ctx_a, 0, None);
+
+    let result = db.execute(
+        "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, derived_from, retention_status, supply_order) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $derived_from, $retention_status, $supply_order)",
+        &params(vec![
+            ("id", Value::Uuid(child_evidence)),
+            ("observation_id", Value::Uuid(observation_b)),
+            ("context_id", Value::Uuid(ctx_b)),
+            ("kind", Value::Text("text_projection".into())),
+            (
+                "source_ref",
+                Value::Text("cas://sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into()),
+            ),
+            ("derived_from", Value::Uuid(parent_evidence)),
+            ("retention_status", Value::Text("retained_external".into())),
+            ("supply_order", Value::Int64(0)),
+        ]),
+    );
+
+    assert_error_is_fk(result);
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT count(*) AS n FROM evidence WHERE id = $id",
+            &params(vec![("id", Value::Uuid(child_evidence))]),
+        ),
+        0
+    );
+}
+
+#[test]
+fn combination_invalidation_cross_context_raw_insert_rejected_by_schema() {
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(20_039);
+    let ctx_b = Uuid::from_u128(20_040);
+    let entity_a = Uuid::from_u128(20_041);
+    let entity_b = Uuid::from_u128(20_042);
+    let observation_a = Uuid::from_u128(20_043);
+    let observation_b = Uuid::from_u128(20_044);
+    let decision_a = Uuid::from_u128(20_045);
+    let decision_b = Uuid::from_u128(20_046);
+    let mismatch_decision = Uuid::from_u128(20_047);
+    let mismatch_observation = Uuid::from_u128(20_048);
+    let mismatch_resolution = Uuid::from_u128(20_049);
+    insert_context(&db, ctx_a, "ctx-invalidation-a");
+    insert_context(&db, ctx_b, "ctx-invalidation-b");
+    insert_entity(&db, entity_a, ctx_a, "entity-a");
+    insert_entity(&db, entity_b, ctx_b, "entity-b");
+    insert_observation(&db, observation_a, entity_a, ctx_a);
+    insert_observation(&db, observation_b, entity_b, ctx_b);
+    insert_decision(&db, decision_a, ctx_a, "active");
+    insert_decision(&db, decision_b, ctx_b, "active");
+
+    let affected_mismatch = db.execute(
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        &params(vec![
+            ("id", Value::Uuid(mismatch_decision)),
+            ("status", Value::Text("pending".into())),
+            ("context_id", Value::Uuid(ctx_b)),
+            ("affected_decision_id", Value::Uuid(decision_a)),
+            ("trigger_observation_id", Value::Uuid(observation_b)),
+            ("basis_diff", Value::Json(json!({"field": "risk"}))),
+            ("severity", Value::Text("warning".into())),
+            ("detected_at", Value::TxId(TxId(1_u64))),
+            ("resolved_at", Value::Null),
+            ("resolution_action", Value::Null),
+            ("resolution_decision_id", Value::Null),
+        ]),
+    );
+    assert_error_is_fk(affected_mismatch);
+
+    let trigger_mismatch = db.execute(
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        &params(vec![
+            ("id", Value::Uuid(mismatch_observation)),
+            ("status", Value::Text("pending".into())),
+            ("context_id", Value::Uuid(ctx_b)),
+            ("affected_decision_id", Value::Uuid(decision_b)),
+            ("trigger_observation_id", Value::Uuid(observation_a)),
+            ("basis_diff", Value::Json(json!({"field": "risk"}))),
+            ("severity", Value::Text("warning".into())),
+            ("detected_at", Value::TxId(TxId(1_u64))),
+            ("resolved_at", Value::Null),
+            ("resolution_action", Value::Null),
+            ("resolution_decision_id", Value::Null),
+        ]),
+    );
+    assert_error_is_fk(trigger_mismatch);
+
+    let resolution_mismatch = db.execute(
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        &params(vec![
+            ("id", Value::Uuid(mismatch_resolution)),
+            ("status", Value::Text("acknowledged".into())),
+            ("context_id", Value::Uuid(ctx_b)),
+            ("affected_decision_id", Value::Uuid(decision_b)),
+            ("trigger_observation_id", Value::Uuid(observation_b)),
+            ("basis_diff", Value::Json(json!({"field": "risk"}))),
+            ("severity", Value::Text("warning".into())),
+            ("detected_at", Value::TxId(TxId(1_u64))),
+            ("resolved_at", Value::TxId(TxId(2_u64))),
+            ("resolution_action", Value::Text("new_decision_created".into())),
+            ("resolution_decision_id", Value::Uuid(decision_a)),
+        ]),
+    );
+    assert_error_is_fk(resolution_mismatch);
+
+    for id in [mismatch_decision, mismatch_observation, mismatch_resolution] {
+        assert_eq!(
+            scalar_count(
+                &db,
+                "SELECT count(*) AS n FROM invalidations WHERE id = $id",
+                &params(vec![("id", Value::Uuid(id))]),
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+fn combination_record_observation_concurrent_against_same_entity_snapshot_timeline_contiguous() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = context_graph::StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    };
+    let store = context_graph::Store::open(config.clone()).expect("open");
+    let (context, entity) = seed_store_context_entity(&store);
+    drop(store);
+    let barrier = Arc::new(Barrier::new(6));
+    let handles: Vec<_> = (0..6)
+        .map(|writer| {
+            let config = config.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = context_graph::Store::open(config).expect("writer open");
+                barrier.wait();
+                store.record_observation(cg_observation(
+                    context_graph::ObservationId::new_v7(),
+                    context_graph::EvidenceId::new_v7(),
+                    entity,
+                    context,
+                    writer,
+                ))
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("writer joined").expect("record");
+    }
+    let snapshots = context_graph::Store::open(config)
+        .expect("reader")
+        .entity_history(entity)
+        .expect("history");
+    assert_eq!(snapshots.len(), 7);
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.captured_at)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        snapshots.len()
+    );
+    for pair in snapshots.windows(2) {
+        assert_eq!(pair[0].valid_to, Some(pair[1].valid_from));
+        assert!(pair[0].valid_from < pair[1].valid_from);
+    }
+}
+
+#[test]
+fn combination_invalidate_decision_observation_atomic_visibility_no_torn_reader() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = context_graph::StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    };
+    let (decision_id, trigger_id) = seed_store_decision(&config);
+    let barrier = Arc::new(Barrier::new(2));
+    let done = Arc::new(AtomicBool::new(false));
+    let torn = Arc::new(AtomicBool::new(false));
+    let reader_config = config.clone();
+    let reader_barrier = Arc::clone(&barrier);
+    let reader_done = Arc::clone(&done);
+    let reader_torn = Arc::clone(&torn);
+    let reader = std::thread::spawn(move || {
+        let store = context_graph::Store::open(reader_config).expect("reader open");
+        reader_barrier.wait();
+        while !reader_done.load(Ordering::SeqCst) {
+            let status = store
+                .get_decision(decision_id)
+                .expect("decision")
+                .map(|decision| decision.status)
+                .unwrap_or(context_graph::DecisionStatus::Active);
+            let invalidation_count = store
+                .list_invalidations(Some(decision_id), None)
+                .expect("invalidations")
+                .len();
+            if (status == context_graph::DecisionStatus::Active && invalidation_count > 0)
+                || (status == context_graph::DecisionStatus::Invalidated && invalidation_count == 0)
+            {
+                reader_torn.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+    let writer = context_graph::Store::open(config).expect("writer open");
+    barrier.wait();
+    writer
+        .invalidate_decision(decision_id, trigger_id, "basis drift")
+        .expect("invalidate");
+    done.store(true, Ordering::SeqCst);
+    reader.join().expect("reader joined");
+    assert!(!torn.load(Ordering::SeqCst));
+    assert_eq!(
+        writer
+            .list_invalidations(Some(decision_id), None)
+            .expect("invalidations")
+            .len(),
+        1,
+        "decision status and invalidation row must become visible at one horizon"
+    );
+}
+
+#[test]
+fn combination_record_observation_text_evidence_vector_text_hnsw_atomic_with_row_insert_rollback_reverts_index()
+ {
+    let db = fresh_db();
+    assert_table_present(&db, "evidence");
+    let context_id = Uuid::from_u128(20_032);
+    let entity_id = Uuid::from_u128(20_033);
+    let evidence_id = Uuid::from_u128(20_030);
+    let observation_id = Uuid::from_u128(20_031);
+    insert_context(&db, context_id, "ctx-vector-rollback");
+    insert_entity(&db, entity_id, context_id, "entity-vector-rollback");
+    insert_observation(&db, observation_id, entity_id, context_id);
+    let tx = db.begin();
+    let row_id = db
+        .insert_row(
+            tx,
+            "evidence",
+            params(vec![
+                ("id", Value::Uuid(evidence_id)),
+                ("observation_id", Value::Uuid(observation_id)),
+                ("context_id", Value::Uuid(context_id)),
+                ("kind", Value::Text("text".into())),
+                ("source_ref", Value::Text("cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())),
+                ("retention_status", Value::Text("retained_external".into())),
+                ("supply_order", Value::Int64(0)),
+            ]),
+        )
+        .expect("insert evidence row");
+    let query = vec![0.0; 768];
+    let vector_insert = db.insert_vector(
+        tx,
+        contextdb_core::VectorIndexRef::new("evidence", "vector_text"),
+        row_id,
+        query.clone(),
+    );
+    assert!(vector_insert.is_ok());
+    let violation = db.execute_in_tx(
+        tx,
+        "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order)",
+        &params(vec![
+            ("id", Value::Uuid(evidence_id)),
+            ("observation_id", Value::Uuid(observation_id)),
+            ("context_id", Value::Uuid(context_id)),
+            ("kind", Value::Text("text".into())),
+            ("source_ref", Value::Text("cas://sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into())),
+            ("retention_status", Value::Text("retained_external".into())),
+            ("supply_order", Value::Int64(1)),
+        ]),
+    );
+    assert!(violation.is_err());
+    db.rollback(tx).expect("rollback");
+    let hits = db
+        .query_vector(
+            contextdb_core::VectorIndexRef::new("evidence", "vector_text"),
+            &query,
+            10,
+            None,
+            db.snapshot(),
+        )
+        .expect("query");
+    assert!(
+        hits.is_empty(),
+        "vector writes must be committed and rolled back with their evidence row"
+    );
 }

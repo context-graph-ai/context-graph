@@ -1,17 +1,14 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use contextdb_core::{Error as EngineError, Value};
 use serde_json::Value as JsonValue;
 
+use crate::Result;
 use crate::error::CgError;
 use crate::types::*;
-use crate::{Result, TxId};
 
 use super::Store;
-use super::convert::{
-    decision_status_from_str, entity_type_from_str, entity_type_str, map_engine_err,
-    relationship_type_str,
-};
+use super::convert::{decision_status_from_str, map_engine_err, relationship_type_str};
 use super::encode::{
     decode_outcome, get_json, get_optional_float, get_optional_text, get_text, get_txid, get_uuid,
     properties_from_json, properties_to_json, tags_from_json,
@@ -82,18 +79,26 @@ impl Store {
                 .collect(),
         );
         let properties_json = properties_to_json(&input.properties);
+        let mut basis_snapshot_ids = input.based_on_snapshots.clone();
+        let mut basis_snapshots = Vec::with_capacity(input.based_on_entity_ids.len());
+        for eid in &input.based_on_entity_ids {
+            let basis_snapshot = match self.current_entity_snapshot(*eid) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    return Err(CgError::NotFound {
+                        id: Some(eid.as_uuid().to_string()),
+                        missing: Some("entity_snapshot"),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
+            if !basis_snapshot_ids.contains(&basis_snapshot.id) {
+                basis_snapshot_ids.push(basis_snapshot.id);
+            }
+            basis_snapshots.push((*eid, basis_snapshot));
+        }
 
         let tx = self.db.begin();
-        let mut basis_snapshots: BTreeMap<EntityId, EntitySnapshot> = BTreeMap::new();
-        for eid in &input.based_on_entity_ids {
-            let snap = self
-                .current_entity_snapshot_in_tx(tx, *eid)?
-                .ok_or(CgError::NotFound {
-                    id: Some(eid.as_uuid().to_string()),
-                    missing: Some("entity_snapshot"),
-                })?;
-            basis_snapshots.insert(*eid, snap);
-        }
         let confidence_value = match input.confidence {
             Some(c) => Value::Float64(c as f64),
             None => Value::Null,
@@ -120,6 +125,10 @@ impl Store {
                 "context_id".to_string(),
                 Value::Uuid(input.context_id.as_uuid()),
             ),
+            (
+                "based_on_snapshots".to_string(),
+                Value::Json(serde_json::to_value(&basis_snapshot_ids).unwrap_or_default()),
+            ),
             ("properties".to_string(), Value::Json(properties_json)),
             ("tags".to_string(), Value::Json(tags_json)),
             ("created_at".to_string(), Value::TxId(tx)),
@@ -128,7 +137,7 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, based_on_snapshots, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $based_on_snapshots, $properties, $tags, $created_at)",
             &decision_params,
         ) {
             let _ = self.db.rollback(tx);
@@ -148,30 +157,14 @@ impl Store {
                 return Err(e);
             }
         }
-        for eid in &input.based_on_entity_ids {
-            let snapshot = basis_snapshots
-                .get(eid)
-                .expect("basis snapshot recorded pre-insert");
-            let valid_to_json = match snapshot.valid_to {
-                Some(t) => serde_json::Value::Number(t.0.into()),
-                None => serde_json::Value::Null,
-            };
-            let snap_json = serde_json::json!({
-                "entity_id": eid.as_uuid().to_string(),
-                "entity_type": entity_type_str(snapshot.entity_type),
-                "name": snapshot.name,
-                "properties": properties_to_json(&snapshot.properties),
-                "captured_at": tx.0,
-                "valid_from": snapshot.valid_from.0,
-                "valid_to": valid_to_json,
-            });
+        for (eid, basis_snapshot) in &basis_snapshots {
             if let Err(e) = self.insert_edge_in_tx(
                 tx,
                 id.as_uuid(),
                 eid.as_uuid(),
                 "BASED_ON",
                 input.context_id,
-                Some(snap_json),
+                Some(basis_snapshot_edge_properties(basis_snapshot)),
             ) {
                 let _ = self.db.rollback(tx);
                 return Err(e);
@@ -205,18 +198,6 @@ impl Store {
 
         self.db.commit(tx).map_err(map_engine_err)?;
 
-        // Reflect tx-captured basis snapshots in the returned value.
-        let mut out_basis: BTreeMap<EntityId, EntitySnapshot> = BTreeMap::new();
-        for (eid, snap) in basis_snapshots.into_iter() {
-            out_basis.insert(
-                eid,
-                EntitySnapshot {
-                    captured_at: tx,
-                    ..snap
-                },
-            );
-        }
-
         let precedent_ids = self.precedents_for_decision(id, input.context_id)?;
         Ok(Decision {
             id,
@@ -231,7 +212,7 @@ impl Store {
             properties: input.properties,
             created_at: tx,
             intention_ids: input.intention_ids,
-            based_on_snapshots: out_basis,
+            based_on_snapshots: basis_snapshot_ids,
             outcome: None,
             precedent_ids,
         })
@@ -249,7 +230,7 @@ impl Store {
         let result = self
             .db
             .execute(
-                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at FROM decisions WHERE id = $id",
+                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, based_on_snapshots, properties, tags, created_at FROM decisions WHERE id = $id",
                 &params,
             )
             .map_err(map_engine_err)?;
@@ -284,38 +265,21 @@ impl Store {
         Ok(out)
     }
 
-    fn basis_snapshots_for_decision(
-        &self,
-        id: DecisionId,
-    ) -> Result<BTreeMap<EntityId, EntitySnapshot>> {
-        let params: HashMap<String, Value> = [
-            ("source_id".to_string(), Value::Uuid(id.as_uuid())),
-            ("edge_type".to_string(), Value::Text("BASED_ON".to_string())),
-        ]
-        .into_iter()
-        .collect();
+    fn basis_snapshots_for_decision(&self, id: DecisionId) -> Result<Vec<EntitySnapshotId>> {
+        let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
+            .into_iter()
+            .collect();
         let result = self
             .db
             .execute(
-                "SELECT target_id, properties FROM edges WHERE source_id = $source_id AND edge_type = $edge_type",
+                "SELECT based_on_snapshots FROM decisions WHERE id = $id",
                 &params,
             )
             .map_err(map_engine_err)?;
-        let mut out = BTreeMap::new();
-        for row in &result.rows {
-            let entity_uuid = match row.first() {
-                Some(Value::Uuid(u)) => *u,
-                _ => continue,
-            };
-            let props = match row.get(1) {
-                Some(Value::Json(v)) => v.clone(),
-                _ => continue,
-            };
-            let entity_id = EntityId::from(entity_uuid);
-            let snap = decode_basis_snapshot(entity_id, &props)?;
-            out.insert(entity_id, snap);
+        if let Some(Value::Json(v)) = result.rows.first().and_then(|row| row.first()) {
+            return Ok(serde_json::from_value(v.clone()).unwrap_or_default());
         }
-        Ok(out)
+        Ok(Vec::new())
     }
 
     pub(super) fn decision_context_id(&self, id: DecisionId) -> Result<Option<ContextId>> {
@@ -447,7 +411,7 @@ impl Store {
                 params.insert("context_id".to_string(), Value::Uuid(ctx.as_uuid()));
             }
             let mut sql = String::from(
-                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at FROM decisions",
+                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, based_on_snapshots, properties, tags, created_at FROM decisions",
             );
             if !clauses.is_empty() {
                 sql.push_str(" WHERE ");
@@ -675,18 +639,26 @@ impl Store {
                 .collect(),
         );
         let properties_json = properties_to_json(&new.properties);
+        let mut basis_snapshot_ids = new.based_on_snapshots.clone();
+        let mut basis_snapshots = Vec::with_capacity(new.based_on_entity_ids.len());
+        for eid in &new.based_on_entity_ids {
+            let basis_snapshot = match self.current_entity_snapshot(*eid) {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    return Err(CgError::NotFound {
+                        id: Some(eid.as_uuid().to_string()),
+                        missing: Some("entity_snapshot"),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
+            if !basis_snapshot_ids.contains(&basis_snapshot.id) {
+                basis_snapshot_ids.push(basis_snapshot.id);
+            }
+            basis_snapshots.push((*eid, basis_snapshot));
+        }
 
         let tx = self.db.begin();
-        let mut basis_snapshots: BTreeMap<EntityId, EntitySnapshot> = BTreeMap::new();
-        for eid in &new.based_on_entity_ids {
-            let snap = self
-                .current_entity_snapshot_in_tx(tx, *eid)?
-                .ok_or(CgError::NotFound {
-                    id: Some(eid.as_uuid().to_string()),
-                    missing: Some("entity_snapshot"),
-                })?;
-            basis_snapshots.insert(*eid, snap);
-        }
         // Transition old decision to superseded.
         let transition_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(old.as_uuid())),
@@ -737,6 +709,10 @@ impl Store {
                 "context_id".to_string(),
                 Value::Uuid(new.context_id.as_uuid()),
             ),
+            (
+                "based_on_snapshots".to_string(),
+                Value::Json(serde_json::to_value(&basis_snapshot_ids).unwrap_or_default()),
+            ),
             ("properties".to_string(), Value::Json(properties_json)),
             ("tags".to_string(), Value::Json(tags_json)),
             ("created_at".to_string(), Value::TxId(tx)),
@@ -745,7 +721,7 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, based_on_snapshots, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $based_on_snapshots, $properties, $tags, $created_at)",
             &decision_params,
         ) {
             let _ = self.db.rollback(tx);
@@ -764,30 +740,14 @@ impl Store {
                 return Err(e);
             }
         }
-        for eid in &new.based_on_entity_ids {
-            let snapshot = basis_snapshots
-                .get(eid)
-                .expect("basis snapshot recorded pre-insert");
-            let valid_to_json = match snapshot.valid_to {
-                Some(t) => serde_json::Value::Number(t.0.into()),
-                None => serde_json::Value::Null,
-            };
-            let snap_json = serde_json::json!({
-                "entity_id": eid.as_uuid().to_string(),
-                "entity_type": entity_type_str(snapshot.entity_type),
-                "name": snapshot.name,
-                "properties": properties_to_json(&snapshot.properties),
-                "captured_at": tx.0,
-                "valid_from": snapshot.valid_from.0,
-                "valid_to": valid_to_json,
-            });
+        for (eid, basis_snapshot) in &basis_snapshots {
             if let Err(e) = self.insert_edge_in_tx(
                 tx,
                 new_id.as_uuid(),
                 eid.as_uuid(),
                 "BASED_ON",
                 new.context_id,
-                Some(snap_json),
+                Some(basis_snapshot_edge_properties(basis_snapshot)),
             ) {
                 let _ = self.db.rollback(tx);
                 return Err(e);
@@ -843,16 +803,6 @@ impl Store {
         }
         self.db.commit(tx).map_err(map_engine_err)?;
 
-        let mut out_basis: BTreeMap<EntityId, EntitySnapshot> = BTreeMap::new();
-        for (eid, snap) in basis_snapshots.into_iter() {
-            out_basis.insert(
-                eid,
-                EntitySnapshot {
-                    captured_at: tx,
-                    ..snap
-                },
-            );
-        }
         let precedent_ids = self.precedents_for_decision(new_id, new.context_id)?;
         Ok(Decision {
             id: new_id,
@@ -867,7 +817,7 @@ impl Store {
             properties: new.properties,
             created_at: tx,
             intention_ids: new.intention_ids,
-            based_on_snapshots: out_basis,
+            based_on_snapshots: basis_snapshot_ids,
             outcome: None,
             precedent_ids,
         })
@@ -1133,40 +1083,54 @@ impl Store {
             id: Some(id.as_uuid().to_string()),
             missing: Some("decision"),
         })?;
+        let read_txid = crate::TxId::from_snapshot(self.db.snapshot());
 
-        let mut input_diffs = Vec::with_capacity(decision.based_on_snapshots.len());
-        let mut changed_input_count = 0_u32;
-        for (entity_id, basis_snapshot) in &decision.based_on_snapshots {
-            if let Some(entity) = self.get_entity(*entity_id)?
-                && entity.context_id != decision.context_id
-            {
-                return Err(CgError::CrossContextViolation);
+        let basis_snapshots = self.basis_snapshot_entities_for_decision(id, decision.context_id)?;
+        let mut input_diffs = Vec::with_capacity(basis_snapshots.len());
+        let mut evidence_lineage = Vec::new();
+        for (entity_id, basis_snapshot) in basis_snapshots {
+            if basis_snapshot.evidenced_by.is_empty() {
+                evidence_lineage.push(ReplayEvidenceLineage {
+                    basis_snapshot_id: basis_snapshot.id,
+                    observation_id: None,
+                    evidence: Vec::new(),
+                    read_txid,
+                });
+            } else {
+                evidence_lineage.extend(basis_snapshot.evidenced_by.iter().map(|observation_id| {
+                    ReplayEvidenceLineage {
+                        basis_snapshot_id: basis_snapshot.id,
+                        observation_id: Some(*observation_id),
+                        evidence: Vec::new(),
+                        read_txid,
+                    }
+                }));
             }
-
-            let latest_snapshot = match self.current_entity_snapshot(*entity_id)? {
-                Some(snapshot) => Some(snapshot),
-                None => self.entity_history(*entity_id)?.into_iter().last(),
-            };
+            let current_snapshot = self.latest_entity_snapshot(entity_id)?;
             let field_changes =
-                replay_field_changes(Some(basis_snapshot), latest_snapshot.as_ref());
+                replay_field_changes(Some(&basis_snapshot), current_snapshot.as_ref());
             let changed = !field_changes.is_empty();
-            if changed {
-                changed_input_count += 1;
-            }
+            let changed_at = if changed {
+                current_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.valid_from)
+                    .or(Some(basis_snapshot.valid_from))
+            } else {
+                None
+            };
             input_diffs.push(InputDiff {
-                entity_id: *entity_id,
-                entity_name: basis_snapshot.name.clone(),
+                entity_id,
+                entity_name: current_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.name.clone())
+                    .unwrap_or_else(|| basis_snapshot.name.clone()),
                 changed,
                 field_changes,
-                changed_at: changed.then(|| {
-                    latest_snapshot
-                        .as_ref()
-                        .map(|snapshot| snapshot.valid_from)
-                        .unwrap_or(decision.created_at)
-                }),
+                changed_at,
             });
         }
         input_diffs.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+        let changed_input_count = input_diffs.iter().filter(|diff| diff.changed).count() as u32;
 
         let mut cited_intention_snapshots = Vec::with_capacity(decision.intention_ids.len());
         for intention_id in &decision.intention_ids {
@@ -1192,34 +1156,77 @@ impl Store {
         let unchanged_input_count = input_diffs.len() as u32 - changed_input_count;
         Ok(ReplayResult {
             decision_id: id,
+            decision_status: decision.status,
             original_outcome: decision.outcome.as_ref().map(|outcome| outcome.success),
             inputs_changed: changed_input_count > 0,
             changed_input_count,
             unchanged_input_count,
+            read_txid,
             input_diffs,
+            evidence_lineage,
+            invalidations_at_read: Vec::new(),
             cited_intention_snapshots,
         })
     }
+
+    fn basis_snapshot_entities_for_decision(
+        &self,
+        id: DecisionId,
+        context_id: ContextId,
+    ) -> Result<BTreeMap<EntityId, EntitySnapshot>> {
+        let params: HashMap<String, Value> = [
+            ("source_id".to_string(), Value::Uuid(id.as_uuid())),
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+            ("edge_type".to_string(), Value::Text("BASED_ON".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT target_id, properties FROM edges WHERE source_id = $source_id AND context_id = $context_id AND edge_type = $edge_type",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut out = BTreeMap::new();
+        for row in &result.rows {
+            let entity_id = EntityId::from(get_uuid(row, &result.columns, "target_id")?);
+            let properties = get_json(row, &result.columns, "properties")?;
+            let snapshot = match properties.get("basis_snapshot") {
+                Some(value) => serde_json::from_value(value.clone())
+                    .map_err(|e| CgError::Engine(format!("basis snapshot deserialize: {e}")))?,
+                None => continue,
+            };
+            out.insert(entity_id, snapshot);
+        }
+        Ok(out)
+    }
+
+    fn latest_entity_snapshot(&self, entity_id: EntityId) -> Result<Option<EntitySnapshot>> {
+        Ok(self.entity_history(entity_id)?.into_iter().last())
+    }
+}
+
+fn basis_snapshot_edge_properties(snapshot: &EntitySnapshot) -> JsonValue {
+    serde_json::json!({ "basis_snapshot": snapshot })
 }
 
 fn replay_field_changes(
-    basis_snapshot: Option<&EntitySnapshot>,
-    latest_snapshot: Option<&EntitySnapshot>,
+    basis: Option<&EntitySnapshot>,
+    current: Option<&EntitySnapshot>,
 ) -> Vec<FieldChange> {
-    let mut fields = std::collections::BTreeSet::new();
-    if let Some(snapshot) = basis_snapshot {
+    let mut fields = BTreeSet::new();
+    if let Some(snapshot) = basis {
         fields.extend(snapshot.properties.keys().cloned());
     }
-    if let Some(snapshot) = latest_snapshot {
+    if let Some(snapshot) = current {
         fields.extend(snapshot.properties.keys().cloned());
     }
 
     let mut changes = Vec::new();
     for field in fields {
-        let old_value =
-            basis_snapshot.and_then(|snapshot| snapshot.properties.get(&field).cloned());
-        let new_value =
-            latest_snapshot.and_then(|snapshot| snapshot.properties.get(&field).cloned());
+        let old_value = basis.and_then(|snapshot| snapshot.properties.get(&field).cloned());
+        let new_value = current.and_then(|snapshot| snapshot.properties.get(&field).cloned());
         if old_value != new_value {
             changes.push(FieldChange {
                 field,
@@ -1251,52 +1258,11 @@ fn decode_decision(columns: &[String], row: &[Value]) -> Result<Decision> {
         properties: properties_from_json(&get_json(row, columns, "properties")?),
         created_at: get_txid(row, columns, "created_at")?,
         intention_ids: Vec::new(),
-        based_on_snapshots: BTreeMap::new(),
+        based_on_snapshots: serde_json::from_value(
+            get_json(row, columns, "based_on_snapshots").unwrap_or(JsonValue::Array(Vec::new())),
+        )
+        .unwrap_or_default(),
         outcome: None,
         precedent_ids: Vec::new(),
-    })
-}
-
-fn decode_basis_snapshot(entity_id: EntityId, properties: &JsonValue) -> Result<EntitySnapshot> {
-    let name = properties
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| CgError::Engine("basis snapshot missing name".to_string()))?
-        .to_string();
-    let entity_type_s = properties
-        .get("entity_type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| CgError::Engine("basis snapshot missing entity_type".to_string()))?;
-    let entity_type = entity_type_from_str(entity_type_s)?;
-    let props = match properties.get("properties") {
-        Some(JsonValue::Object(m)) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        _ => BTreeMap::new(),
-    };
-    let captured_at = properties
-        .get("captured_at")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| CgError::Engine("basis snapshot missing captured_at".to_string()))?;
-    let valid_from = properties
-        .get("valid_from")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| CgError::Engine("basis snapshot missing valid_from".to_string()))?;
-    let valid_to = match properties.get("valid_to") {
-        Some(JsonValue::Number(n)) => n.as_u64().map(TxId),
-        Some(JsonValue::Null) => None,
-        None => None,
-        other => {
-            return Err(CgError::Engine(format!(
-                "basis snapshot valid_to must be number or null, got {other:?}"
-            )));
-        }
-    };
-    Ok(EntitySnapshot {
-        entity_id,
-        entity_type,
-        name,
-        properties: props,
-        captured_at: TxId(captured_at),
-        valid_from: TxId(valid_from),
-        valid_to,
     })
 }

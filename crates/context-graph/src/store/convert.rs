@@ -32,17 +32,21 @@ pub(super) fn map_engine_err(err: EngineError) -> CgError {
             id: None,
         },
         EngineError::ForeignKeyViolation {
-            table,
-            column,
-            ref_table,
+            child_table,
+            child_columns,
+            parent_table,
+            parent_columns: _,
         } => CgError::ForeignKeyViolation {
-            table: static_table_name(&table),
-            column: static_column_name(&column),
-            ref_table: static_table_name(&ref_table),
+            table: static_table_name(&child_table),
+            column: static_column_name(foreign_key_display_column(&child_columns)),
+            ref_table: static_table_name(&parent_table),
         },
-        EngineError::VectorDimensionMismatch { expected, got } => {
-            CgError::VectorDimensionMismatch { expected, got }
-        }
+        EngineError::VectorIndexDimensionMismatch {
+            expected, actual, ..
+        } => CgError::VectorDimensionMismatch {
+            expected,
+            got: actual,
+        },
         EngineError::BfsDepthExceeded(d) => CgError::Engine(format!("bfs depth exceeded: {d}")),
         other => CgError::Engine(format!("unexpected engine error: {other}")),
     }
@@ -55,6 +59,11 @@ fn static_table_name(name: &str) -> &'static str {
         "decisions" => "decision",
         "entities" => "entity",
         "observations" => "observation",
+        "evidence" => "evidence",
+        "embedding_spaces" => "embedding_space",
+        "embedding_space_bindings" => "embedding_space_binding",
+        "embedding_handles" => "embedding_handle",
+        "evidence_availability_log" => "evidence_availability_log",
         "outcomes" => "outcome",
         "digests" => "digest",
         "invalidations" => "invalidation",
@@ -84,8 +93,20 @@ fn static_column_name(name: &str) -> &'static str {
         "resolution_decision_id" => "resolution_decision_id",
         "origin_ref" => "origin_ref",
         "blueprint_id" => "blueprint_id",
+        "derived_from" => "derived_from",
+        "evidence_id" => "evidence_id",
+        "embedding_space_id" => "embedding_space_id",
         _ => "unknown",
     }
+}
+
+fn foreign_key_display_column(columns: &[String]) -> &str {
+    columns
+        .iter()
+        .find(|column| column.as_str() != "context_id")
+        .or_else(|| columns.first())
+        .map(String::as_str)
+        .unwrap_or("unknown")
 }
 
 pub(super) fn intention_status_str(status: IntentionStatus) -> &'static str {
@@ -135,6 +156,7 @@ pub(super) fn decision_status_from_str(s: &str) -> Result<DecisionStatus> {
         "active" => Ok(DecisionStatus::Active),
         "superseded" => Ok(DecisionStatus::Superseded),
         "archived" => Ok(DecisionStatus::Archived),
+        "invalidated" => Ok(DecisionStatus::Invalidated),
         other => Err(CgError::Engine(format!("unknown decision status: {other}"))),
     }
 }

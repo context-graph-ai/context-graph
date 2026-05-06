@@ -1,0 +1,9 @@
+error[E0308]: mismatched types
+  --> tests/ui/no_create_digest_embedding_field.rs:14:20
+   |
+14 |         embedding: vec![0.0; 384],
+   |                    ^^^^^^^^^^^^^^ expected `PrecomputedEmbedding`, found `Vec<{float}>`
+   |
+   = note: expected struct `PrecomputedEmbedding`
+              found struct `Vec<{float}>`
+   = note: this error originates in the macro `vec` (in Nightly builds, run with -Z macro-backtrace for more info)

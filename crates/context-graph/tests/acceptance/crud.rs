@@ -7,10 +7,12 @@ use chrono::Utc;
 use context_graph::schema::DIGEST_VECTOR_DIMENSION;
 use context_graph::{
     AuditFilter, AuditTarget, CgError, ContextId, CreateContext, CreateDecision, CreateDigest,
-    CreateEntity, CreateIntention, DecisionId, DecisionPatch, DecisionStatus, EntityId,
-    EntityMatchPolicy, EntityPatch, EntityStatus, EntityType, Intention, IntentionId,
+    CreateEntity, CreateIntention, DecisionId, DecisionPatch, DecisionStatus, DigestId,
+    EmbeddingId, EmbeddingTarget, EntityId, EntityMatchPolicy, EntityPatch, EntityStatus,
+    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, Intention, IntentionId,
     IntentionOrigin, IntentionPatch, IntentionStatus, ListDecisionFilter, ListEntityFilter,
-    ReasoningStep, RecordObservation, RelationshipType, StorageKey, Store, TraverseFilter,
+    ObservationId, PrecomputedEmbedding, ReasoningStep, RecordObservation, RelationshipType,
+    RetentionStatus, StorageKey, Store, StoreConfig, TraverseFilter,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -31,12 +33,20 @@ macro_rules! ok {
 fn fixture() -> (TempDir, PathBuf, Store) {
     let tempdir = TempDir::new().expect("tempdir");
     let db_path = tempdir.path().join("context-graph.db");
-    let store = Store::open(&db_path);
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
     (tempdir, db_path, store)
 }
 
 fn reopen(db_path: &Path) -> Store {
-    Store::open(db_path)
+    Store::open(StoreConfig {
+        db_path: db_path.to_path_buf(),
+        ..Default::default()
+    })
+    .expect("open")
 }
 
 fn map(entries: &[(&str, Value)]) -> BTreeMap<String, Value> {
@@ -44,6 +54,34 @@ fn map(entries: &[(&str, Value)]) -> BTreeMap<String, Value> {
         .iter()
         .map(|(key, value)| ((*key).to_string(), value.clone()))
         .collect()
+}
+
+fn text_evidence(observation_id: ObservationId, source: &str) -> EvidenceRef {
+    EvidenceRef {
+        id: EvidenceId::new_v7(),
+        observation_id,
+        context_id: ContextId::default(),
+        kind: EvidenceKind::Text,
+        source_ref: source.to_string(),
+        mime_type: Some("text/plain".to_string()),
+        content_hash: None,
+        captured_at: Some(Utc::now()),
+        byte_range: None,
+        time_range_ms: None,
+        frame_index: None,
+        region: None,
+        producer: EvidenceProducer {
+            system: "acceptance".to_string(),
+            model_name: "fixture".to_string(),
+            model_version: "1".to_string(),
+            pipeline_version: "1".to_string(),
+        },
+        text_projection: None,
+        derived_from: None,
+        retention_status: RetentionStatus::RetainedExternal,
+        media_retention_until: None,
+        properties: BTreeMap::new(),
+    }
 }
 
 fn context_input(name: &str) -> CreateContext {
@@ -89,6 +127,7 @@ fn create_decision_input(
         confidence: Some(0.9),
         intention_ids,
         based_on_entity_ids,
+        based_on_snapshots: vec![],
         tags: vec!["architecture".to_string()],
         properties: BTreeMap::new(),
         context_id,
@@ -120,12 +159,21 @@ fn digest_embedding_fixture(seed: &str) -> Vec<f32> {
 }
 
 fn create_digest_input(context_id: ContextId, summary: &str) -> CreateDigest {
+    let id = DigestId::new_v7();
     CreateDigest {
+        id,
         source: "claude-web".to_string(),
-        summary: summary.to_string(),
-        embedding: digest_embedding_fixture(summary),
-        context_id,
         session_ref: Some("session-7".to_string()),
+        summary: summary.to_string(),
+        kind: EvidenceKind::Text,
+        embedding: PrecomputedEmbedding {
+            id: EmbeddingId::new_v7(),
+            embedding_space_id: "text_default_embeddinggemma_300m_768".to_string(),
+            vector: digest_embedding_fixture(summary),
+            target: EmbeddingTarget::Digest(id),
+            produced_by: EvidenceProducer::default(),
+        },
+        context_id,
         properties: BTreeMap::new(),
     }
 }
@@ -311,7 +359,6 @@ fn intention_archive_blocked_by_active_decision() {
     );
     drop(store);
     let store = reopen(&db_path);
-    store.disable_app_decision_scan_for_tests();
     let archived = store.archive_intention(intention.id, "done".to_string());
     assert!(
         matches!(
@@ -403,6 +450,7 @@ fn decision_create_requires_intention() {
         confidence: Some(0.9),
         intention_ids: vec![],
         based_on_entity_ids: vec![],
+        based_on_snapshots: vec![],
         tags: vec![],
         properties: BTreeMap::new(),
         context_id: ctx.id,
@@ -431,6 +479,7 @@ fn decision_create_requires_intention() {
         confidence: Some(0.9),
         intention_ids: vec![non_existent_id],
         based_on_entity_ids: vec![],
+        based_on_snapshots: vec![],
         tags: vec![],
         properties: BTreeMap::new(),
         context_id: ctx.id,
@@ -503,6 +552,7 @@ fn decision_create_with_serves_and_based_on_edges_persisted() {
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![e1.id, e2.id],
+            based_on_snapshots: vec![],
             tags: vec!["architecture".to_string()],
             properties: BTreeMap::new(),
             context_id: ctx.id,
@@ -563,23 +613,33 @@ fn decision_create_with_serves_and_based_on_edges_persisted() {
     assert!(serves);
     assert!(based_on_e1);
     assert!(based_on_e2);
+    assert_eq!(fetched.based_on_snapshots, decision.based_on_snapshots);
+    assert_eq!(fetched.based_on_snapshots.len(), 2);
+    let e1_basis = ok!(store.entity_history(e1.id), "E1 history")
+        .into_iter()
+        .find(|snapshot| fetched.based_on_snapshots.contains(&snapshot.id))
+        .expect("E1 basis snapshot");
+    let e2_basis = ok!(store.entity_history(e2.id), "E2 history")
+        .into_iter()
+        .find(|snapshot| fetched.based_on_snapshots.contains(&snapshot.id))
+        .expect("E2 basis snapshot");
     assert_eq!(
-        fetched.based_on_snapshots[&e1.id].properties,
+        e1_basis.properties,
         map(&[
             ("language", json!("rust")),
             ("deployment", json!("kubernetes"))
         ])
     );
     assert_eq!(
-        fetched.based_on_snapshots[&e2.id].properties,
+        e2_basis.properties,
         map(&[("size", json!("4")), ("skill", json!("rust-heavy"))])
     );
     assert_ne!(
-        fetched.based_on_snapshots[&e1.id].properties,
+        e1_basis.properties,
         map(&[("language", json!("go")), ("deployment", json!("ecs"))])
     );
     assert_ne!(
-        fetched.based_on_snapshots[&e2.id].properties,
+        e2_basis.properties,
         map(&[("size", json!("7")), ("skill", json!("polyglot"))])
     );
 }
@@ -617,6 +677,7 @@ fn decision_based_on_snapshot_frozen_after_entity_update() {
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
+            based_on_snapshots: vec![],
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
@@ -645,10 +706,13 @@ fn decision_based_on_snapshot_frozen_after_entity_update() {
     let historical =
         ok!(store.state_at(entity.id, decision.created_at), "state_at").expect("history");
     let current = ok!(store.get_entity(entity.id), "current entity").expect("entity");
-    assert_eq!(
-        fetched.based_on_snapshots[&entity.id].properties["region"],
-        json!("region-a")
-    );
+    assert_eq!(fetched.based_on_snapshots, decision.based_on_snapshots);
+    assert_eq!(fetched.based_on_snapshots.len(), 1);
+    let basis = ok!(store.entity_history(entity.id), "entity history")
+        .into_iter()
+        .find(|snapshot| fetched.based_on_snapshots.contains(&snapshot.id))
+        .expect("basis snapshot");
+    assert_eq!(basis.properties["region"], json!("region-a"));
     assert_eq!(historical.properties["region"], json!("region-a"));
     assert_eq!(current.properties["region"], json!("region-b"));
 }
@@ -744,6 +808,7 @@ fn decision_list_by_tags() {
                 confidence: Some(0.9),
                 intention_ids: vec![intention.id],
                 based_on_entity_ids: vec![],
+                based_on_snapshots: vec![],
                 tags: vec![bucket.to_string()],
                 properties: BTreeMap::new(),
                 context_id: ctx.id,
@@ -761,6 +826,7 @@ fn decision_list_by_tags() {
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![],
+            based_on_snapshots: vec![],
             tags: vec!["networking-legacy".to_string()],
             properties: BTreeMap::new(),
             context_id: ctx.id,
@@ -992,6 +1058,7 @@ fn decision_update_immutable_fields_rejected() {
             confidence: Some(0.8),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![],
+            based_on_snapshots: vec![],
             tags: vec!["framework".to_string()],
             properties: BTreeMap::new(),
             context_id: ctx.id,
@@ -1069,6 +1136,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
             confidence: Some(0.8),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![],
+            based_on_snapshots: vec![],
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
@@ -1088,6 +1156,7 @@ fn decision_supersede_creates_edge_and_transitions_status() {
                 confidence: Some(0.8),
                 intention_ids: vec![intention.id],
                 based_on_entity_ids: vec![],
+                based_on_snapshots: vec![],
                 tags: vec![],
                 properties: BTreeMap::new(),
                 context_id: ctx.id,
@@ -1143,6 +1212,7 @@ fn decision_invalid_state_transition_rejected() {
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![],
+            based_on_snapshots: vec![],
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
@@ -1172,6 +1242,7 @@ fn decision_invalid_state_transition_rejected() {
             confidence: Some(0.7),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![],
+            based_on_snapshots: vec![],
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
@@ -1278,6 +1349,7 @@ fn decision_archive_preserves_history() {
             confidence: Some(0.7),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![],
+            based_on_snapshots: vec![],
             tags: vec![],
             properties: BTreeMap::new(),
             context_id: ctx.id,
@@ -1614,14 +1686,20 @@ fn observation_immutable_mutation_rejected() {
         }),
         "tx1"
     );
+    let observation_id = ObservationId::new_v7();
     let observation = ok!(
         store.record_observation(RecordObservation {
+            id: observation_id,
             entity_id: entity.id,
             context_id: entity.context_id,
             observation_type: "camera.sighting".to_string(),
             source: "cam-3".to_string(),
-            data: map(&[("at", json!("08:05"))]),
-            observed_at: Some(Utc::now()),
+            observed_at: Utc::now(),
+            evidence: vec![text_evidence(observation_id, "webhook://camera/3")],
+            observed_properties: map(&[("at", json!("08:05"))]),
+            state_delta: BTreeMap::new(),
+            properties: BTreeMap::new(),
+            embeddings: Vec::new(),
         }),
         "tx2"
     );
@@ -1638,9 +1716,8 @@ fn observation_immutable_mutation_rejected() {
     let fetched = ok!(
         store.get_observation(observation.observation_id),
         "get observation"
-    )
-    .expect("observation");
-    assert_eq!(fetched.data, map(&[("at", json!("08:05"))]));
+    );
+    assert_eq!(fetched.observed_properties, map(&[("at", json!("08:05"))]));
 }
 
 // Use case: an ingest-pipeline refactor tries to rewrite a Digest's summary; the engine refuses any mutation because every Intention and Decision extracted from that Digest carries a provenance edge back to its bytes (Invariant 16).
@@ -1672,8 +1749,10 @@ fn digest_immutable_no_update_symbol() {
         "chose nats for transport after NAT-survival discussion"
     );
     assert_eq!(
-        fetched.embedding,
-        digest_embedding_fixture("chose nats for transport after NAT-survival discussion")
+        fetched.vector_text,
+        Some(digest_embedding_fixture(
+            "chose nats for transport after NAT-survival discussion"
+        ))
     );
 }
 

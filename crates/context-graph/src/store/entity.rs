@@ -227,7 +227,7 @@ impl Store {
         Ok(None)
     }
 
-    pub(super) fn current_entity_snapshot(&self, id: EntityId) -> Result<Option<EntitySnapshot>> {
+    pub fn current_entity_snapshot(&self, id: EntityId) -> Result<Option<EntitySnapshot>> {
         if !id.is_valid() {
             return Err(CgError::InvalidIdentity {
                 context: "EntityId",
@@ -254,35 +254,6 @@ impl Store {
             }
         }
         Ok(None)
-    }
-
-    pub(super) fn current_entity_snapshot_in_tx(
-        &self,
-        tx: TxId,
-        id: EntityId,
-    ) -> Result<Option<EntitySnapshot>> {
-        if !id.is_valid() {
-            return Err(CgError::InvalidIdentity {
-                context: "EntityId",
-            });
-        }
-        let params: HashMap<String, Value> = [("entity_id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
-        let result = self
-            .db
-            .execute_in_tx(
-                tx,
-                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        let mut snaps: Vec<EntitySnapshot> = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            snaps.push(decode_snapshot(&result.columns, row)?);
-        }
-        snaps.sort_by_key(|s| s.valid_from.0);
-        Ok(snaps.into_iter().rev().find(|snap| snap.valid_to.is_none()))
     }
 
     pub fn state_at(&self, id: EntityId, txid: TxId) -> Result<Option<EntitySnapshot>> {
@@ -840,10 +811,15 @@ fn decode_snapshot(columns: &[String], row: &[Value]) -> Result<EntitySnapshot> 
     let valid_from = get_txid(row, columns, "valid_from")?;
     let valid_to = get_optional_txid(row, columns, "valid_to")?;
     Ok(EntitySnapshot {
+        id: EntitySnapshotId::from(get_uuid(row, columns, "id")?),
         entity_id,
         entity_type,
         name,
         properties,
+        evidenced_by: match data.get("evidenced_by") {
+            Some(value) => serde_json::from_value(value.clone()).unwrap_or_default(),
+            None => Vec::new(),
+        },
         captured_at: valid_from,
         valid_from,
         valid_to,

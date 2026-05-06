@@ -23,17 +23,18 @@ fn test_intention_status_has_exactly_four_variants() {
     );
 }
 
-// Pins the Decision state machine to {Active, Superseded, Archived}; any drift breaks archive and supersede transitions.
+// Pins the Decision state machine to {Active, Superseded, Archived, Invalidated}; any drift breaks archive, supersede, and invalidation transitions.
 #[test]
-fn test_decision_status_has_exactly_three_variants() {
+fn test_decision_status_has_exactly_four_variants() {
     let variants = DecisionStatus::ALL;
-    assert_eq!(variants.len(), 3);
+    assert_eq!(variants.len(), 4);
     assert_eq!(
         &variants[..],
         &[
             DecisionStatus::Active,
             DecisionStatus::Superseded,
             DecisionStatus::Archived,
+            DecisionStatus::Invalidated,
         ],
     );
 }
