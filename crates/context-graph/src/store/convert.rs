@@ -64,6 +64,8 @@ fn static_table_name(name: &str) -> &'static str {
         "embedding_space_bindings" => "embedding_space_binding",
         "embedding_handles" => "embedding_handle",
         "evidence_availability_log" => "evidence_availability_log",
+        "entity_snapshot_observations" => "entity_snapshot_observation",
+        "decision_basis_snapshots" => "decision_basis_snapshot",
         "outcomes" => "outcome",
         "digests" => "digest",
         "invalidations" => "invalidation",
@@ -95,6 +97,7 @@ fn static_column_name(name: &str) -> &'static str {
         "blueprint_id" => "blueprint_id",
         "derived_from" => "derived_from",
         "evidence_id" => "evidence_id",
+        "snapshot_id" => "snapshot_id",
         "embedding_space_id" => "embedding_space_id",
         _ => "unknown",
     }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use contextdb_core::Value;
+use contextdb_core::{Value, VectorIndexRef};
 
 use crate::Result;
 use crate::error::CgError;
@@ -12,9 +12,30 @@ use super::encode::{
     get_json, get_optional_text, get_text, get_txid, get_uuid, get_vector, properties_from_json,
     properties_to_json,
 };
+use super::evidence::{
+    embedding_target_kind, embedding_target_uuid, producer_value, validate_space_kind,
+    vector_binding_for_target,
+};
+use super::evidence_kind_str;
 
 impl Store {
     pub fn create_digest(&self, input: CreateDigest) -> Result<Digest> {
+        if input.kind != EvidenceKind::Text {
+            return Err(CgError::UnsupportedEvidenceKind { kind: input.kind });
+        }
+        if input.embedding.target != EmbeddingTarget::Digest(input.id) {
+            return Err(CgError::EmbeddingSpaceMismatch {
+                conflicting_field: "target",
+            });
+        }
+        let space = self.embedding_space_for_id(&input.embedding.embedding_space_id)?;
+        if input.embedding.vector.len() != space.dimension {
+            return Err(CgError::EmbeddingSpaceMismatch {
+                conflicting_field: "dimension",
+            });
+        }
+        validate_space_kind(&space, input.kind)?;
+        let binding = vector_binding_for_target(&space, "digest")?;
         let id = input.id;
         let properties_json = properties_to_json(&input.properties);
         let session_ref_value = match &input.session_ref {
@@ -43,14 +64,17 @@ impl Store {
             ("source".to_string(), Value::Text(input.source.clone())),
             ("session_ref".to_string(), session_ref_value),
             ("summary".to_string(), Value::Text(input.summary.clone())),
-            ("kind".to_string(), Value::Text(format!("{:?}", input.kind))),
+            (
+                "kind".to_string(),
+                Value::Text(evidence_kind_str(input.kind).to_string()),
+            ),
             (
                 "vector_text".to_string(),
                 Value::Vector(input.embedding.vector.clone()),
             ),
             (
                 "dimension".to_string(),
-                Value::Int64(input.embedding.vector.len() as i64),
+                Value::Int64(space.dimension as i64),
             ),
             (
                 "context_id".to_string(),
@@ -61,10 +85,54 @@ impl Store {
         ]
         .into_iter()
         .collect();
+        let row_id = match self.db.insert_row(tx, "digests", params) {
+            Ok(row_id) => row_id,
+            Err(e) => {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(e));
+            }
+        };
+        let handle_params = HashMap::from([
+            ("id".to_string(), Value::Uuid(input.embedding.id.as_uuid())),
+            (
+                "context_id".to_string(),
+                Value::Uuid(input.context_id.as_uuid()),
+            ),
+            (
+                "embedding_space_id".to_string(),
+                Value::Text(input.embedding.embedding_space_id.clone()),
+            ),
+            (
+                "target_kind".to_string(),
+                Value::Text(embedding_target_kind(&input.embedding.target).to_string()),
+            ),
+            (
+                "target_id".to_string(),
+                Value::Uuid(embedding_target_uuid(&input.embedding.target)),
+            ),
+            (
+                "dimension".to_string(),
+                Value::Int64(space.dimension as i64),
+            ),
+            (
+                "produced_by".to_string(),
+                producer_value(&input.embedding.produced_by),
+            ),
+            ("created_at".to_string(), Value::TxId(tx)),
+        ]);
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO digests (id, source, session_ref, summary, kind, vector_text, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $vector_text, $dimension, $context_id, $properties, $created_at)",
-            &params,
+            "INSERT INTO embedding_handles (id, context_id, embedding_space_id, target_kind, target_id, dimension, produced_by, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_kind, $target_id, $dimension, $produced_by, $created_at)",
+            &handle_params,
+        ) {
+            let _ = self.db.rollback(tx);
+            return Err(map_engine_err(e));
+        }
+        if let Err(e) = self.db.insert_vector(
+            tx,
+            VectorIndexRef::new(&binding.table_name, &binding.vector_column),
+            row_id,
+            input.embedding.vector.clone(),
         ) {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
@@ -78,7 +146,7 @@ impl Store {
             source: input.source,
             summary: input.summary,
             vector_text: Some(input.embedding.vector.clone()),
-            dimension: input.embedding.vector.len(),
+            dimension: space.dimension,
             context_id: input.context_id,
             session_ref: input.session_ref,
             properties: input.properties,

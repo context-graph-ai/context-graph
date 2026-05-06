@@ -1,18 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use contextdb_core::{Error as EngineError, Value};
+use contextdb_core::{Error as EngineError, SnapshotId, Value};
 use serde_json::Value as JsonValue;
 
-use crate::Result;
 use crate::error::CgError;
 use crate::types::*;
+use crate::{Result, TxId};
 
 use super::Store;
-use super::convert::{decision_status_from_str, map_engine_err, relationship_type_str};
-use super::encode::{
-    decode_outcome, get_json, get_optional_float, get_optional_text, get_text, get_txid, get_uuid,
-    properties_from_json, properties_to_json, tags_from_json,
+use super::convert::{
+    decision_status_from_str, intention_origin_from_str, intention_status_from_str, map_engine_err,
+    relationship_type_str,
 };
+use super::encode::{
+    decode_outcome, get_json, get_optional_float, get_optional_text, get_optional_txid, get_text,
+    get_txid, get_uuid, properties_from_json, properties_to_json, tags_from_json,
+};
+use super::evidence::decode_evidence;
 
 impl Store {
     pub fn create_decision(&self, input: CreateDecision) -> Result<Decision> {
@@ -80,7 +84,6 @@ impl Store {
         );
         let properties_json = properties_to_json(&input.properties);
         let mut basis_snapshot_ids = input.based_on_snapshots.clone();
-        let mut basis_snapshots = Vec::with_capacity(input.based_on_entity_ids.len());
         for eid in &input.based_on_entity_ids {
             let basis_snapshot = match self.current_entity_snapshot(*eid) {
                 Ok(Some(snapshot)) => snapshot,
@@ -95,8 +98,9 @@ impl Store {
             if !basis_snapshot_ids.contains(&basis_snapshot.id) {
                 basis_snapshot_ids.push(basis_snapshot.id);
             }
-            basis_snapshots.push((*eid, basis_snapshot));
         }
+        self.validate_basis_snapshots_for_context(input.context_id, &basis_snapshot_ids)?;
+        let basis_snapshots = self.basis_snapshots_for_basis(&basis_snapshot_ids)?;
 
         let tx = self.db.begin();
         let confidence_value = match input.confidence {
@@ -125,10 +129,6 @@ impl Store {
                 "context_id".to_string(),
                 Value::Uuid(input.context_id.as_uuid()),
             ),
-            (
-                "based_on_snapshots".to_string(),
-                Value::Json(serde_json::to_value(&basis_snapshot_ids).unwrap_or_default()),
-            ),
             ("properties".to_string(), Value::Json(properties_json)),
             ("tags".to_string(), Value::Json(tags_json)),
             ("created_at".to_string(), Value::TxId(tx)),
@@ -137,11 +137,17 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, based_on_snapshots, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $based_on_snapshots, $properties, $tags, $created_at)",
+            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
             &decision_params,
         ) {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
+        }
+        if let Err(e) =
+            self.insert_decision_basis_snapshots_in_tx(tx, input.context_id, id, &basis_snapshots)
+        {
+            let _ = self.db.rollback(tx);
+            return Err(e);
         }
 
         for iid in &input.intention_ids {
@@ -157,11 +163,15 @@ impl Store {
                 return Err(e);
             }
         }
-        for (eid, basis_snapshot) in &basis_snapshots {
+        let mut basis_edge_entities = BTreeSet::new();
+        for basis_snapshot in &basis_snapshots {
+            if !basis_edge_entities.insert(basis_snapshot.entity_id) {
+                continue;
+            }
             if let Err(e) = self.insert_edge_in_tx(
                 tx,
                 id.as_uuid(),
-                eid.as_uuid(),
+                basis_snapshot.entity_id.as_uuid(),
                 "BASED_ON",
                 input.context_id,
                 Some(basis_snapshot_edge_properties(basis_snapshot)),
@@ -230,7 +240,7 @@ impl Store {
         let result = self
             .db
             .execute(
-                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, based_on_snapshots, properties, tags, created_at FROM decisions WHERE id = $id",
+                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at FROM decisions WHERE id = $id",
                 &params,
             )
             .map_err(map_engine_err)?;
@@ -266,20 +276,141 @@ impl Store {
     }
 
     fn basis_snapshots_for_decision(&self, id: DecisionId) -> Result<Vec<EntitySnapshotId>> {
-        let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
         let result = self
             .db
             .execute(
-                "SELECT based_on_snapshots FROM decisions WHERE id = $id",
-                &params,
+                "SELECT snapshot_id, basis_order FROM decision_basis_snapshots WHERE decision_id = $decision_id",
+                &HashMap::from([("decision_id".to_string(), Value::Uuid(id.as_uuid()))]),
             )
             .map_err(map_engine_err)?;
-        if let Some(Value::Json(v)) = result.rows.first().and_then(|row| row.first()) {
-            return Ok(serde_json::from_value(v.clone()).unwrap_or_default());
+        ordered_snapshot_ids(&result.columns, &result.rows, "basis_order", "snapshot_id")
+    }
+
+    pub(super) fn basis_snapshots_for_basis(
+        &self,
+        basis_snapshot_ids: &[EntitySnapshotId],
+    ) -> Result<Vec<EntitySnapshot>> {
+        let snapshot = self.db.snapshot();
+        let mut snapshots = Vec::with_capacity(basis_snapshot_ids.len());
+        for snapshot_id in basis_snapshot_ids {
+            let Some(row) = self.snapshot_by_id_at_read(*snapshot_id, snapshot)? else {
+                return Err(CgError::NotFound {
+                    id: Some(snapshot_id.as_uuid().to_string()),
+                    missing: Some("entity_snapshot"),
+                });
+            };
+            snapshots.push(row);
         }
-        Ok(Vec::new())
+        Ok(snapshots)
+    }
+
+    pub(super) fn basis_snapshot_ids_for_decision_at_read(
+        &self,
+        decision_id: DecisionId,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<EntitySnapshotId>> {
+        let result = self
+            .db
+            .execute_at_snapshot(
+                "SELECT snapshot_id, basis_order FROM decision_basis_snapshots WHERE decision_id = $decision_id",
+                &HashMap::from([(
+                    "decision_id".to_string(),
+                    Value::Uuid(decision_id.as_uuid()),
+                )]),
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        ordered_snapshot_ids(&result.columns, &result.rows, "basis_order", "snapshot_id")
+    }
+
+    pub(super) fn insert_decision_basis_snapshots_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        decision_id: DecisionId,
+        basis_snapshots: &[EntitySnapshot],
+    ) -> Result<()> {
+        for (basis_order, snapshot) in basis_snapshots.iter().enumerate() {
+            let params = HashMap::from([
+                (
+                    "id".to_string(),
+                    Value::Uuid(decision_basis_row_id(decision_id, basis_order)),
+                ),
+                ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                (
+                    "decision_id".to_string(),
+                    Value::Uuid(decision_id.as_uuid()),
+                ),
+                (
+                    "entity_id".to_string(),
+                    Value::Uuid(snapshot.entity_id.as_uuid()),
+                ),
+                (
+                    "snapshot_id".to_string(),
+                    Value::Uuid(snapshot.id.as_uuid()),
+                ),
+                ("basis_order".to_string(), Value::Int64(basis_order as i64)),
+                ("created_at".to_string(), Value::TxId(tx)),
+            ]);
+            self.db
+                .execute_in_tx(
+                    tx,
+                    "INSERT INTO decision_basis_snapshots (id, context_id, decision_id, entity_id, snapshot_id, basis_order, created_at) VALUES ($id, $context_id, $decision_id, $entity_id, $snapshot_id, $basis_order, $created_at)",
+                    &params,
+                )
+                .map_err(map_engine_err)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn replace_decision_basis_snapshots_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        decision_id: DecisionId,
+        basis_snapshots: &[EntitySnapshot],
+    ) -> Result<()> {
+        self.db
+            .execute_in_tx(
+                tx,
+                "DELETE FROM decision_basis_snapshots WHERE decision_id = $decision_id",
+                &HashMap::from([(
+                    "decision_id".to_string(),
+                    Value::Uuid(decision_id.as_uuid()),
+                )]),
+            )
+            .map_err(map_engine_err)?;
+        for (basis_order, snapshot) in basis_snapshots.iter().enumerate() {
+            let params = HashMap::from([
+                (
+                    "id".to_string(),
+                    Value::Uuid(decision_basis_row_id(decision_id, basis_order)),
+                ),
+                ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                (
+                    "decision_id".to_string(),
+                    Value::Uuid(decision_id.as_uuid()),
+                ),
+                (
+                    "entity_id".to_string(),
+                    Value::Uuid(snapshot.entity_id.as_uuid()),
+                ),
+                (
+                    "snapshot_id".to_string(),
+                    Value::Uuid(snapshot.id.as_uuid()),
+                ),
+                ("basis_order".to_string(), Value::Int64(basis_order as i64)),
+                ("created_at".to_string(), Value::TxId(tx)),
+            ]);
+            self.db
+                .execute_in_tx(
+                    tx,
+                    "INSERT INTO decision_basis_snapshots (id, context_id, decision_id, entity_id, snapshot_id, basis_order, created_at) VALUES ($id, $context_id, $decision_id, $entity_id, $snapshot_id, $basis_order, $created_at)",
+                    &params,
+                )
+                .map_err(map_engine_err)?;
+        }
+        Ok(())
     }
 
     pub(super) fn decision_context_id(&self, id: DecisionId) -> Result<Option<ContextId>> {
@@ -411,7 +542,7 @@ impl Store {
                 params.insert("context_id".to_string(), Value::Uuid(ctx.as_uuid()));
             }
             let mut sql = String::from(
-                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, based_on_snapshots, properties, tags, created_at FROM decisions",
+                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at FROM decisions",
             );
             if !clauses.is_empty() {
                 sql.push_str(" WHERE ");
@@ -640,7 +771,6 @@ impl Store {
         );
         let properties_json = properties_to_json(&new.properties);
         let mut basis_snapshot_ids = new.based_on_snapshots.clone();
-        let mut basis_snapshots = Vec::with_capacity(new.based_on_entity_ids.len());
         for eid in &new.based_on_entity_ids {
             let basis_snapshot = match self.current_entity_snapshot(*eid) {
                 Ok(Some(snapshot)) => snapshot,
@@ -655,8 +785,9 @@ impl Store {
             if !basis_snapshot_ids.contains(&basis_snapshot.id) {
                 basis_snapshot_ids.push(basis_snapshot.id);
             }
-            basis_snapshots.push((*eid, basis_snapshot));
         }
+        self.validate_basis_snapshots_for_context(new.context_id, &basis_snapshot_ids)?;
+        let basis_snapshots = self.basis_snapshots_for_basis(&basis_snapshot_ids)?;
 
         let tx = self.db.begin();
         // Transition old decision to superseded.
@@ -709,10 +840,6 @@ impl Store {
                 "context_id".to_string(),
                 Value::Uuid(new.context_id.as_uuid()),
             ),
-            (
-                "based_on_snapshots".to_string(),
-                Value::Json(serde_json::to_value(&basis_snapshot_ids).unwrap_or_default()),
-            ),
             ("properties".to_string(), Value::Json(properties_json)),
             ("tags".to_string(), Value::Json(tags_json)),
             ("created_at".to_string(), Value::TxId(tx)),
@@ -721,11 +848,17 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, based_on_snapshots, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $based_on_snapshots, $properties, $tags, $created_at)",
+            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
             &decision_params,
         ) {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
+        }
+        if let Err(e) =
+            self.insert_decision_basis_snapshots_in_tx(tx, new.context_id, new_id, &basis_snapshots)
+        {
+            let _ = self.db.rollback(tx);
+            return Err(e);
         }
         for iid in &new.intention_ids {
             if let Err(e) = self.insert_edge_in_tx(
@@ -740,11 +873,15 @@ impl Store {
                 return Err(e);
             }
         }
-        for (eid, basis_snapshot) in &basis_snapshots {
+        let mut basis_edge_entities = BTreeSet::new();
+        for basis_snapshot in &basis_snapshots {
+            if !basis_edge_entities.insert(basis_snapshot.entity_id) {
+                continue;
+            }
             if let Err(e) = self.insert_edge_in_tx(
                 tx,
                 new_id.as_uuid(),
-                eid.as_uuid(),
+                basis_snapshot.entity_id.as_uuid(),
                 "BASED_ON",
                 new.context_id,
                 Some(basis_snapshot_edge_properties(basis_snapshot)),
@@ -1079,16 +1216,34 @@ impl Store {
     }
 
     pub fn replay(&self, id: DecisionId) -> Result<ReplayResult> {
-        let decision = self.get_decision(id)?.ok_or(CgError::NotFound {
-            id: Some(id.as_uuid().to_string()),
-            missing: Some("decision"),
-        })?;
-        let read_txid = crate::TxId::from_snapshot(self.db.snapshot());
+        let snapshot = self.db.snapshot();
+        let read_txid = crate::TxId::from_snapshot(snapshot);
+        let params = HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]);
+        let decision_rows = self
+            .db
+            .execute_at_snapshot(
+                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at FROM decisions WHERE id = $id",
+                &params,
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        let Some(row) = decision_rows.rows.first() else {
+            return Err(CgError::NotFound {
+                id: Some(id.as_uuid().to_string()),
+                missing: Some("decision"),
+            });
+        };
+        let mut decision = decode_decision(&decision_rows.columns, row)?;
+        decision.based_on_snapshots = self.basis_snapshot_ids_for_decision_at_read(id, snapshot)?;
+        decision.intention_ids =
+            self.intentions_for_decision_at_read(id, decision.context_id, snapshot)?;
+        decision.outcome = self.outcome_for_decision_at_read(id, snapshot)?;
 
-        let basis_snapshots = self.basis_snapshot_entities_for_decision(id, decision.context_id)?;
+        let basis_snapshots = self.basis_snapshots_for_decision_at_read(&decision, snapshot)?;
         let mut input_diffs = Vec::with_capacity(basis_snapshots.len());
         let mut evidence_lineage = Vec::new();
-        for (entity_id, basis_snapshot) in basis_snapshots {
+        for basis_snapshot in basis_snapshots {
+            let entity_id = basis_snapshot.entity_id;
             if basis_snapshot.evidenced_by.is_empty() {
                 evidence_lineage.push(ReplayEvidenceLineage {
                     basis_snapshot_id: basis_snapshot.id,
@@ -1097,16 +1252,17 @@ impl Store {
                     read_txid,
                 });
             } else {
-                evidence_lineage.extend(basis_snapshot.evidenced_by.iter().map(|observation_id| {
-                    ReplayEvidenceLineage {
+                for observation_id in &basis_snapshot.evidenced_by {
+                    evidence_lineage.push(ReplayEvidenceLineage {
                         basis_snapshot_id: basis_snapshot.id,
                         observation_id: Some(*observation_id),
-                        evidence: Vec::new(),
+                        evidence: self
+                            .evidence_for_observation_at_read(*observation_id, snapshot)?,
                         read_txid,
-                    }
-                }));
+                    });
+                }
             }
-            let current_snapshot = self.latest_entity_snapshot(entity_id)?;
+            let current_snapshot = self.current_snapshot_for_entity_at_read(entity_id, snapshot)?;
             let field_changes =
                 replay_field_changes(Some(&basis_snapshot), current_snapshot.as_ref());
             let changed = !field_changes.is_empty();
@@ -1134,26 +1290,14 @@ impl Store {
 
         let mut cited_intention_snapshots = Vec::with_capacity(decision.intention_ids.len());
         for intention_id in &decision.intention_ids {
-            if let Some(intention) = self.get_intention(*intention_id)?
-                && intention.context_id != decision.context_id
-            {
-                return Err(CgError::CrossContextViolation);
-            }
-            let snapshot = self
-                .intention_at(*intention_id, decision.created_at)?
-                .ok_or_else(|| {
-                    CgError::Engine(format!(
-                        "data-integrity: SERVES edge to intention {} has no snapshot covering decision {}.created_at {}",
-                        intention_id,
-                        decision.id,
-                        decision.created_at.0
-                    ))
-                })?;
-            cited_intention_snapshots.push(snapshot);
+            let snapshot_row =
+                self.intention_snapshot_for_decision_at_read(*intention_id, &decision, snapshot)?;
+            cited_intention_snapshots.push(snapshot_row);
         }
         cited_intention_snapshots.sort_by(|a, b| a.intention_id.cmp(&b.intention_id));
 
         let unchanged_input_count = input_diffs.len() as u32 - changed_input_count;
+        let invalidations_at_read = self.invalidations_for_decision_at_read(id, snapshot)?;
         Ok(ReplayResult {
             decision_id: id,
             decision_status: decision.status,
@@ -1164,51 +1308,280 @@ impl Store {
             read_txid,
             input_diffs,
             evidence_lineage,
-            invalidations_at_read: Vec::new(),
+            invalidations_at_read,
             cited_intention_snapshots,
         })
     }
 
-    fn basis_snapshot_entities_for_decision(
+    fn intentions_for_decision_at_read(
         &self,
         id: DecisionId,
         context_id: ContextId,
-    ) -> Result<BTreeMap<EntityId, EntitySnapshot>> {
-        let params: HashMap<String, Value> = [
-            ("source_id".to_string(), Value::Uuid(id.as_uuid())),
-            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
-            ("edge_type".to_string(), Value::Text("BASED_ON".to_string())),
-        ]
-        .into_iter()
-        .collect();
+        snapshot: SnapshotId,
+    ) -> Result<Vec<IntentionId>> {
         let result = self
             .db
-            .execute(
-                "SELECT target_id, properties FROM edges WHERE source_id = $source_id AND context_id = $context_id AND edge_type = $edge_type",
-                &params,
+            .execute_at_snapshot(
+                "SELECT target_id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type AND context_id = $context_id",
+                &HashMap::from([
+                    ("source_id".to_string(), Value::Uuid(id.as_uuid())),
+                    ("edge_type".to_string(), Value::Text("SERVES".to_string())),
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                ]),
+                snapshot,
             )
             .map_err(map_engine_err)?;
-        let mut out = BTreeMap::new();
+        let mut ids = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
-            let entity_id = EntityId::from(get_uuid(row, &result.columns, "target_id")?);
-            let properties = get_json(row, &result.columns, "properties")?;
-            let snapshot = match properties.get("basis_snapshot") {
-                Some(value) => serde_json::from_value(value.clone())
-                    .map_err(|e| CgError::Engine(format!("basis snapshot deserialize: {e}")))?,
-                None => continue,
+            if let Some(Value::Uuid(id)) = row.first() {
+                ids.push(IntentionId::from(*id));
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn outcome_for_decision_at_read(
+        &self,
+        id: DecisionId,
+        snapshot: SnapshotId,
+    ) -> Result<Option<Outcome>> {
+        let result = self
+            .db
+            .execute_at_snapshot(
+                "SELECT id, decision_id, success, notes, recorded_at FROM outcomes WHERE decision_id = $decision_id",
+                &HashMap::from([("decision_id".to_string(), Value::Uuid(id.as_uuid()))]),
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| decode_outcome(&result.columns, row))
+            .transpose()
+    }
+
+    fn basis_snapshots_for_decision_at_read(
+        &self,
+        decision: &Decision,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<EntitySnapshot>> {
+        let mut out = Vec::with_capacity(decision.based_on_snapshots.len());
+        for snapshot_id in &decision.based_on_snapshots {
+            let Some(snapshot_row) = self.snapshot_by_id_at_read(*snapshot_id, snapshot)? else {
+                return Err(CgError::Engine(format!(
+                    "data-integrity: decision {} references missing basis snapshot {}",
+                    decision.id, snapshot_id
+                )));
             };
-            out.insert(entity_id, snapshot);
+            let snapshot_context = self
+                .entity_context_at_read(snapshot_row.entity_id, snapshot)?
+                .ok_or_else(|| {
+                    CgError::Engine(format!(
+                        "data-integrity: basis snapshot {} references missing entity {}",
+                        snapshot_row.id, snapshot_row.entity_id
+                    ))
+                })?;
+            if snapshot_context != decision.context_id {
+                return Err(CgError::CrossContextViolation);
+            }
+            out.push(snapshot_row);
         }
         Ok(out)
     }
 
-    fn latest_entity_snapshot(&self, entity_id: EntityId) -> Result<Option<EntitySnapshot>> {
-        Ok(self.entity_history(entity_id)?.into_iter().last())
+    fn evidence_for_observation_at_read(
+        &self,
+        observation_id: ObservationId,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<EvidenceRef>> {
+        let result = self
+            .db
+            .execute_at_snapshot(
+                "SELECT id, observation_id, context_id, kind, source_ref, mime_type, content_hash, captured_at, captured_at_nanos, byte_range, time_range_ms, frame_index, region, producer, text_projection, derived_from, retention_status, media_retention_until, media_retention_until_nanos, properties, supply_order FROM evidence WHERE observation_id = $observation_id",
+                &HashMap::from([(
+                    "observation_id".to_string(),
+                    Value::Uuid(observation_id.as_uuid()),
+                )]),
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        let supply_order_idx = result
+            .columns
+            .iter()
+            .position(|column| column == "supply_order")
+            .unwrap_or(usize::MAX);
+        let mut rows = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            let mut evidence = decode_evidence(&result.columns, row)?;
+            if let Some(status) = self.evidence_status_at_snapshot(evidence.id, snapshot)? {
+                evidence.retention_status = status;
+            }
+            let supply_order = match row.get(supply_order_idx) {
+                Some(Value::Int64(value)) => *value,
+                _ => i64::MAX,
+            };
+            rows.push((supply_order, evidence));
+        }
+        rows.sort_by_key(|row| row.0);
+        Ok(rows.into_iter().map(|(_, evidence)| evidence).collect())
+    }
+
+    fn intention_snapshot_for_decision_at_read(
+        &self,
+        intention_id: IntentionId,
+        decision: &Decision,
+        snapshot: SnapshotId,
+    ) -> Result<IntentionSnapshot> {
+        let result = self
+            .db
+            .execute_at_snapshot(
+                "SELECT intention_id, description, status, origin, properties, tags, valid_from, valid_to FROM intention_snapshots WHERE intention_id = $intention_id AND valid_from <= $decision_tx",
+                &HashMap::from([
+                    (
+                        "intention_id".to_string(),
+                        Value::Uuid(intention_id.as_uuid()),
+                    ),
+                    ("decision_tx".to_string(), Value::TxId(decision.created_at)),
+                ]),
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        let mut snapshots = Vec::new();
+        for row in &result.rows {
+            let snapshot_row = decode_intention_snapshot_at_read(&result.columns, row)?;
+            if snapshot_row.valid_from <= decision.created_at
+                && snapshot_row
+                    .valid_to
+                    .map(|valid_to| decision.created_at < valid_to)
+                    .unwrap_or(true)
+            {
+                snapshots.push(snapshot_row);
+            }
+        }
+        snapshots
+            .into_iter()
+            .max_by_key(|snapshot| snapshot.valid_from)
+            .ok_or_else(|| {
+                CgError::Engine(format!(
+                    "data-integrity: SERVES edge to intention {} has no snapshot covering decision {}.created_at {}",
+                    intention_id,
+                    decision.id,
+                    decision.created_at.0
+                ))
+            })
+    }
+
+    fn invalidations_for_decision_at_read(
+        &self,
+        decision_id: DecisionId,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<Invalidation>> {
+        let result = self
+            .db
+            .execute_at_snapshot(
+                "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE affected_decision_id = $affected_decision_id",
+                &HashMap::from([(
+                    "affected_decision_id".to_string(),
+                    Value::Uuid(decision_id.as_uuid()),
+                )]),
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        let mut rows = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            rows.push(decode_invalidation_at_read(&result.columns, row)?);
+        }
+        rows.sort_by_key(|row| row.detected_at);
+        Ok(rows)
+    }
+}
+
+fn decode_intention_snapshot_at_read(
+    columns: &[String],
+    row: &[Value],
+) -> Result<IntentionSnapshot> {
+    Ok(IntentionSnapshot {
+        intention_id: IntentionId::from(get_uuid(row, columns, "intention_id")?),
+        description: get_text(row, columns, "description")?,
+        status: intention_status_from_str(&get_text(row, columns, "status")?)?,
+        origin: intention_origin_from_str(&get_text(row, columns, "origin")?)?,
+        properties: properties_from_json(&get_json(row, columns, "properties")?),
+        tags: tags_from_json(&get_json(row, columns, "tags")?),
+        valid_from: get_txid(row, columns, "valid_from")?,
+        valid_to: get_optional_txid(row, columns, "valid_to")?,
+    })
+}
+
+fn decode_invalidation_at_read(columns: &[String], row: &[Value]) -> Result<Invalidation> {
+    Ok(Invalidation {
+        id: InvalidationId::from(get_uuid(row, columns, "id")?),
+        status: invalidation_status_from_str(&get_text(row, columns, "status")?)?,
+        context_id: ContextId::from(get_uuid(row, columns, "context_id")?),
+        affected_decision_id: DecisionId::from(get_uuid(row, columns, "affected_decision_id")?),
+        trigger_observation_id: ObservationId::from(get_uuid(
+            row,
+            columns,
+            "trigger_observation_id",
+        )?),
+        reason: get_optional_text(row, columns, "reason")?,
+        basis_diff: properties_from_json(&get_json(row, columns, "basis_diff")?),
+        severity: invalidation_severity_from_str(&get_text(row, columns, "severity")?)?,
+        detected_at: get_txid(row, columns, "detected_at")?,
+        resolved_at: get_optional_txid(row, columns, "resolved_at")?,
+        resolution_action: get_optional_text(row, columns, "resolution_action")?,
+        resolution_decision_id: optional_uuid(row, columns, "resolution_decision_id")?
+            .map(DecisionId::from),
+    })
+}
+
+fn optional_uuid(row: &[Value], columns: &[String], name: &str) -> Result<Option<uuid::Uuid>> {
+    let Some(idx) = columns.iter().position(|column| column == name) else {
+        return Ok(None);
+    };
+    match row.get(idx) {
+        Some(Value::Uuid(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected uuid|null, got {other:?}"
+        ))),
+    }
+}
+
+fn invalidation_status_from_str(raw: &str) -> Result<InvalidationStatus> {
+    match raw {
+        "pending" => Ok(InvalidationStatus::Pending),
+        "acknowledged" => Ok(InvalidationStatus::Acknowledged),
+        "resolved" => Ok(InvalidationStatus::Resolved),
+        "dismissed" => Ok(InvalidationStatus::Dismissed),
+        other => Err(CgError::Engine(format!(
+            "unknown invalidation status: {other}"
+        ))),
+    }
+}
+
+fn invalidation_severity_from_str(raw: &str) -> Result<InvalidationSeverity> {
+    match raw {
+        "info" => Ok(InvalidationSeverity::Info),
+        "warning" => Ok(InvalidationSeverity::Warning),
+        "critical" => Ok(InvalidationSeverity::Critical),
+        other => Err(CgError::Engine(format!(
+            "unknown invalidation severity: {other}"
+        ))),
     }
 }
 
 fn basis_snapshot_edge_properties(snapshot: &EntitySnapshot) -> JsonValue {
     serde_json::json!({ "basis_snapshot": snapshot })
+}
+
+fn decision_basis_row_id(decision_id: DecisionId, basis_order: usize) -> uuid::Uuid {
+    let mut bytes = *decision_id.as_uuid().as_bytes();
+    let order = (basis_order as u64).to_be_bytes();
+    for (idx, byte) in order.iter().enumerate() {
+        bytes[8 + idx] ^= byte;
+    }
+    uuid::Uuid::from_bytes(bytes)
 }
 
 fn replay_field_changes(
@@ -1258,11 +1631,49 @@ fn decode_decision(columns: &[String], row: &[Value]) -> Result<Decision> {
         properties: properties_from_json(&get_json(row, columns, "properties")?),
         created_at: get_txid(row, columns, "created_at")?,
         intention_ids: Vec::new(),
-        based_on_snapshots: serde_json::from_value(
-            get_json(row, columns, "based_on_snapshots").unwrap_or(JsonValue::Array(Vec::new())),
-        )
-        .unwrap_or_default(),
+        based_on_snapshots: Vec::new(),
         outcome: None,
         precedent_ids: Vec::new(),
     })
+}
+
+fn ordered_snapshot_ids(
+    columns: &[String],
+    rows: &[Vec<Value>],
+    order_column: &str,
+    snapshot_column: &str,
+) -> Result<Vec<EntitySnapshotId>> {
+    let order_idx = columns
+        .iter()
+        .position(|column| column == order_column)
+        .ok_or_else(|| CgError::Engine(format!("missing column {order_column}")))?;
+    let snapshot_idx = columns
+        .iter()
+        .position(|column| column == snapshot_column)
+        .ok_or_else(|| CgError::Engine(format!("missing column {snapshot_column}")))?;
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let order = match row.get(order_idx) {
+            Some(Value::Int64(value)) => *value,
+            other => {
+                return Err(CgError::Engine(format!(
+                    "column {order_column}: expected int, got {other:?}"
+                )));
+            }
+        };
+        let snapshot_id = match row.get(snapshot_idx) {
+            Some(Value::Uuid(value)) => EntitySnapshotId::from(*value),
+            other => {
+                return Err(CgError::Engine(format!(
+                    "column {snapshot_column}: expected uuid, got {other:?}"
+                )));
+            }
+        };
+        values.push((order, snapshot_id));
+    }
+    values.sort_by_key(|(order, snapshot_id)| (*order, snapshot_id.as_uuid()));
+    Ok(values
+        .into_iter()
+        .map(|(_, snapshot_id)| snapshot_id)
+        .collect())
 }

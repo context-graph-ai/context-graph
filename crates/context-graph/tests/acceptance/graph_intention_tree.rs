@@ -332,13 +332,23 @@ fn intention_tree_orders_invalidations_by_severity() {
         )),
         "tx3: D1"
     );
+    let d2 = ok!(
+        store.create_decision(create_decision_input(
+            ctx,
+            "dpop-bound refresh-token policy",
+            vec![i.id],
+            vec![e1.id],
+            vec![],
+        )),
+        "tx3b: D2"
+    );
 
     let obs_info = seed_observation(&store, ctx, e1.id, "d1-info");
-    let obs_critical = seed_observation(&store, ctx, e1.id, "d1-critical");
+    let obs_critical = seed_observation(&store, ctx, e1.id, "d2-critical");
 
     drop(store);
     seed_invalidation(&db_path, ctx, d1.id, obs_info, "pending", "info", 1);
-    seed_invalidation(&db_path, ctx, d1.id, obs_critical, "pending", "critical", 2);
+    seed_invalidation(&db_path, ctx, d2.id, obs_critical, "pending", "critical", 2);
     let store = reopen(&db_path);
     let tree = ok!(store.intention_tree(i.id), "tx4: intention_tree");
     assert_eq!(tree.invalidations.len(), 2);
@@ -349,6 +359,6 @@ fn intention_tree_orders_invalidations_by_severity() {
     assert_eq!(tree.invalidations[1].severity, InvalidationSeverity::Info);
     assert_eq!(tree.invalidations[0].context_id, ctx);
     assert_eq!(tree.invalidations[1].context_id, ctx);
-    assert_eq!(tree.invalidations[0].affected_decision_id, d1.id);
+    assert_eq!(tree.invalidations[0].affected_decision_id, d2.id);
     assert_eq!(tree.invalidations[1].affected_decision_id, d1.id);
 }

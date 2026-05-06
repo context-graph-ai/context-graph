@@ -86,6 +86,12 @@ impl Store {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
+        if let Err(e) =
+            self.set_current_entity_snapshot_in_tx(tx, id, EntitySnapshotId::from(snapshot_id))
+        {
+            let _ = self.db.rollback(tx);
+            return Err(e);
+        }
         if let Err(e) = self.record_audit_in_tx(
             tx,
             AuditOperation::Create,
@@ -203,21 +209,7 @@ impl Store {
                 context: "EntityId",
             });
         }
-        let params: HashMap<String, Value> = [
-            ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
-            ("at".to_string(), Value::TxId(at)),
-        ]
-        .into_iter()
-        .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id AND valid_from <= $at",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        for row in &result.rows {
-            let snap = decode_snapshot(&result.columns, row)?;
+        for snap in self.entity_history(id)? {
             let in_range =
                 snap.valid_from.0 <= at.0 && snap.valid_to.map(|t| t.0 > at.0).unwrap_or(true);
             if in_range {
@@ -233,27 +225,33 @@ impl Store {
                 context: "EntityId",
             });
         }
-        let params: HashMap<String, Value> = [("entity_id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
         let result = self
             .db
             .execute(
-                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
+                "SELECT snapshot_id FROM entity_current_snapshots WHERE entity_id = $entity_id",
+                &HashMap::from([("entity_id".to_string(), Value::Uuid(id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+        let Some(row) = result.rows.first() else {
+            return Ok(None);
+        };
+        let snapshot_id = EntitySnapshotId::from(get_uuid(row, &result.columns, "snapshot_id")?);
+        let params = HashMap::from([("id".to_string(), Value::Uuid(snapshot_id.as_uuid()))]);
+        let snapshot = self
+            .db
+            .execute(
+                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE id = $id",
                 &params,
             )
             .map_err(map_engine_err)?;
-        let mut snaps: Vec<EntitySnapshot> = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            snaps.push(decode_snapshot(&result.columns, row)?);
-        }
-        snaps.sort_by_key(|s| s.valid_from.0);
-        for snap in snaps.into_iter().rev() {
-            if snap.valid_to.is_none() {
-                return Ok(Some(snap));
-            }
-        }
-        Ok(None)
+        let snapshot = snapshot
+            .rows
+            .first()
+            .map(|row| decode_snapshot(&snapshot.columns, row))
+            .transpose()?;
+        snapshot
+            .map(|snapshot| self.hydrate_snapshot_observations(snapshot))
+            .transpose()
     }
 
     pub fn state_at(&self, id: EntityId, txid: TxId) -> Result<Option<EntitySnapshot>> {
@@ -262,18 +260,7 @@ impl Store {
                 context: "EntityId",
             });
         }
-        let params: HashMap<String, Value> = [("entity_id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        for row in &result.rows {
-            let snap = decode_snapshot(&result.columns, row)?;
+        for snap in self.entity_history(id)? {
             let in_range =
                 snap.valid_from.0 <= txid.0 && snap.valid_to.map(|t| t.0 > txid.0).unwrap_or(true);
             if in_range {
@@ -362,6 +349,12 @@ impl Store {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
+        if let Err(e) =
+            self.set_current_entity_snapshot_in_tx(tx, id, EntitySnapshotId::from(snapshot_id))
+        {
+            let _ = self.db.rollback(tx);
+            return Err(e);
+        }
         if let Err(e) = self.record_audit_in_tx(
             tx,
             AuditOperation::Update,
@@ -406,7 +399,8 @@ impl Store {
             .map_err(map_engine_err)?;
         let mut snaps: Vec<EntitySnapshot> = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
-            snaps.push(decode_snapshot(&result.columns, row)?);
+            let snapshot = decode_snapshot(&result.columns, row)?;
+            snaps.push(self.hydrate_snapshot_observations(snapshot)?);
         }
         snaps.sort_by_key(|s| s.valid_from.0);
         Ok(snaps)
@@ -464,6 +458,42 @@ impl Store {
             status: EntityStatus::Archived,
             ..current
         })
+    }
+
+    pub(super) fn set_current_entity_snapshot_in_tx(
+        &self,
+        tx: TxId,
+        entity_id: EntityId,
+        snapshot_id: EntitySnapshotId,
+    ) -> Result<()> {
+        let update_params = HashMap::from([
+            ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+            (
+                "snapshot_id".to_string(),
+                Value::Uuid(snapshot_id.as_uuid()),
+            ),
+            ("updated_at".to_string(), Value::TxId(tx)),
+        ]);
+        let updated = self
+            .db
+            .execute_in_tx(
+                tx,
+                "UPDATE entity_current_snapshots SET snapshot_id = $snapshot_id, updated_at = $updated_at WHERE entity_id = $entity_id",
+                &update_params,
+            )
+            .map_err(map_engine_err)?
+            .rows_affected;
+        if updated == 1 {
+            return Ok(());
+        }
+        self.db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO entity_current_snapshots (entity_id, snapshot_id, updated_at) VALUES ($entity_id, $snapshot_id, $updated_at)",
+                &update_params,
+            )
+            .map_err(map_engine_err)?;
+        Ok(())
     }
 
     pub fn entity_neighborhood(&self, entity_id: EntityId, depth: u8) -> Result<Neighborhood> {
@@ -700,6 +730,7 @@ impl Store {
         let mut snaps = Vec::new();
         for row in &result.rows {
             let snap = decode_snapshot(&result.columns, row)?;
+            let snap = self.hydrate_snapshot_observations(snap)?;
             let created_in_window = snap.valid_from.0 > start && snap.valid_from.0 <= end;
             let archived_in_window = snap
                 .valid_to
@@ -711,6 +742,89 @@ impl Store {
         }
         snaps.sort_by_key(|snap| snap.valid_from.0);
         Ok(snaps)
+    }
+
+    pub(super) fn insert_entity_snapshot_observation_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        entity_id: EntityId,
+        snapshot_id: EntitySnapshotId,
+        observation_id: ObservationId,
+        observation_order: i64,
+    ) -> Result<()> {
+        let params = HashMap::from([
+            ("id".to_string(), Value::Uuid(Uuid::now_v7())),
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+            ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+            (
+                "snapshot_id".to_string(),
+                Value::Uuid(snapshot_id.as_uuid()),
+            ),
+            (
+                "observation_id".to_string(),
+                Value::Uuid(observation_id.as_uuid()),
+            ),
+            (
+                "observation_order".to_string(),
+                Value::Int64(observation_order),
+            ),
+            ("created_at".to_string(), Value::TxId(tx)),
+        ]);
+        self.db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO entity_snapshot_observations (id, context_id, entity_id, snapshot_id, observation_id, observation_order, created_at) VALUES ($id, $context_id, $entity_id, $snapshot_id, $observation_id, $observation_order, $created_at)",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        Ok(())
+    }
+
+    pub(super) fn snapshot_observations_at_read(
+        &self,
+        entity_id: EntityId,
+        snapshot_id: EntitySnapshotId,
+        snapshot: contextdb_core::SnapshotId,
+    ) -> Result<Vec<ObservationId>> {
+        let result = self
+            .db
+            .execute_at_snapshot(
+                "SELECT observation_id, observation_order FROM entity_snapshot_observations WHERE entity_id = $entity_id AND snapshot_id = $snapshot_id",
+                &HashMap::from([
+                    ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+                    ("snapshot_id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
+                ]),
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        ordered_observation_ids(&result.columns, &result.rows)
+    }
+
+    fn hydrate_snapshot_observations(
+        &self,
+        mut snapshot: EntitySnapshot,
+    ) -> Result<EntitySnapshot> {
+        snapshot.evidenced_by = self.snapshot_observations(snapshot.entity_id, snapshot.id)?;
+        Ok(snapshot)
+    }
+
+    fn snapshot_observations(
+        &self,
+        entity_id: EntityId,
+        snapshot_id: EntitySnapshotId,
+    ) -> Result<Vec<ObservationId>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT observation_id, observation_order FROM entity_snapshot_observations WHERE entity_id = $entity_id AND snapshot_id = $snapshot_id",
+                &HashMap::from([
+                    ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+                    ("snapshot_id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        ordered_observation_ids(&result.columns, &result.rows)
     }
 }
 
@@ -816,12 +930,45 @@ fn decode_snapshot(columns: &[String], row: &[Value]) -> Result<EntitySnapshot> 
         entity_type,
         name,
         properties,
-        evidenced_by: match data.get("evidenced_by") {
-            Some(value) => serde_json::from_value(value.clone()).unwrap_or_default(),
-            None => Vec::new(),
-        },
+        evidenced_by: Vec::new(),
         captured_at: valid_from,
         valid_from,
         valid_to,
     })
+}
+
+fn ordered_observation_ids(columns: &[String], rows: &[Vec<Value>]) -> Result<Vec<ObservationId>> {
+    let observation_idx = columns
+        .iter()
+        .position(|column| column == "observation_id")
+        .ok_or_else(|| CgError::Engine("missing column observation_id".to_string()))?;
+    let order_idx = columns
+        .iter()
+        .position(|column| column == "observation_order")
+        .ok_or_else(|| CgError::Engine("missing column observation_order".to_string()))?;
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let order = match row.get(order_idx) {
+            Some(Value::Int64(value)) => *value,
+            other => {
+                return Err(CgError::Engine(format!(
+                    "column observation_order: expected int, got {other:?}"
+                )));
+            }
+        };
+        let observation_id = match row.get(observation_idx) {
+            Some(Value::Uuid(value)) => ObservationId::from(*value),
+            other => {
+                return Err(CgError::Engine(format!(
+                    "column observation_id: expected uuid, got {other:?}"
+                )));
+            }
+        };
+        values.push((order, observation_id));
+    }
+    values.sort_by_key(|(order, observation_id)| (*order, observation_id.as_uuid()));
+    Ok(values
+        .into_iter()
+        .map(|(_, observation_id)| observation_id)
+        .collect())
 }

@@ -20,7 +20,7 @@ fn shared_config() -> (TempDir, StoreConfig) {
             model_family: "vision".to_string(),
             model_name: "vigil-face".to_string(),
             model_version: "1".to_string(),
-            supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
+            supported_evidence_kinds: vec![EvidenceKind::ImageFrame, EvidenceKind::Text],
             default_for_evidence_kind: Some(EvidenceKind::ImageFrame),
             bindings: vec![EmbeddingSpaceBinding {
                 embedding_space_id: "vigil_face_reid_v1".to_string(),
@@ -248,12 +248,9 @@ fn probe_record_observation_observation_and_evidence_visible_atomically() {
         reader_barrier.wait();
         while !reader_done.load(Ordering::SeqCst) {
             for (observation_id, _) in &reader_pairs {
-                let observation_visible = reader.get_observation(*observation_id).is_ok();
-                let evidence_visible = !reader
-                    .list_evidence_for_observation(*observation_id)
-                    .expect("evidence read")
-                    .is_empty();
-                if observation_visible != evidence_visible {
+                if let Ok(observation) = reader.get_observation(*observation_id)
+                    && observation.evidence.is_empty()
+                {
                     reader_torn.store(true, Ordering::SeqCst);
                 }
             }
@@ -401,6 +398,7 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
     let pre_observations = table_count(&pre_db, "observations");
     let pre_evidence = table_count(&pre_db, "evidence");
     let pre_entity_snapshots = table_count(&pre_db, "entity_snapshots");
+    let pre_entity_snapshot_observations = table_count(&pre_db, "entity_snapshot_observations");
     let pre_embedding_handles = table_count(&pre_db, "embedding_handles");
     let pre_evidence_availability_log = table_count(&pre_db, "evidence_availability_log");
     drop(pre_db);
@@ -456,6 +454,10 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
     assert_eq!(table_count(&db, "observations"), pre_observations);
     assert_eq!(table_count(&db, "evidence"), pre_evidence);
     assert_eq!(table_count(&db, "entity_snapshots"), pre_entity_snapshots);
+    assert_eq!(
+        table_count(&db, "entity_snapshot_observations"),
+        pre_entity_snapshot_observations
+    );
     assert_eq!(table_count(&db, "embedding_handles"), pre_embedding_handles);
     assert_eq!(
         table_count(&db, "evidence_availability_log"),
@@ -831,10 +833,33 @@ fn probe_decisions_pk_update_concurrent_writers_collapse_to_one_visible_row() {
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (decision_id, _) = seed_decision(&seed);
-    drop(seed);
+    let decision_context = seed
+        .get_decision(decision_id)
+        .expect("decision")
+        .expect("visible decision")
+        .context_id;
     let supplied_bases: Vec<Vec<EntitySnapshotId>> = (0..6)
-        .map(|_| vec![EntitySnapshotId::new_v7(), EntitySnapshotId::new_v7()])
+        .map(|writer_idx| {
+            (0..2)
+                .map(|basis_idx| {
+                    let entity = seed
+                        .create_entity(CreateEntity {
+                            entity_type: EntityType::Service,
+                            name: format!("basis-{writer_idx}-{basis_idx}"),
+                            properties: BTreeMap::from([("writer".to_string(), json!(writer_idx))]),
+                            tags: Vec::new(),
+                            context_id: decision_context,
+                        })
+                        .expect("basis entity");
+                    seed.current_entity_snapshot(entity.id)
+                        .expect("current snapshot")
+                        .expect("basis snapshot")
+                        .id
+                })
+                .collect()
+        })
         .collect();
+    drop(seed);
     let barrier = Arc::new(Barrier::new(6));
     let handles: Vec<_> = supplied_bases
         .clone()

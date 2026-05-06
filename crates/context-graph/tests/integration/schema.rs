@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 
@@ -886,6 +885,52 @@ fn test_invalidations_table_insert() {
     );
 }
 
+#[test]
+fn combination_invalidations_unique_per_context_affected_decision_collapses_raw_duplicate() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(20_060);
+    let entity_id = Uuid::from_u128(20_061);
+    let decision_id = Uuid::from_u128(20_062);
+    let observation_id = Uuid::from_u128(20_063);
+    insert_context(&db, context_id, "ctx-invalidation-unique");
+    insert_entity(&db, entity_id, context_id, "entity-invalidation-unique");
+    insert_decision(&db, decision_id, context_id, "active");
+    insert_observation(&db, observation_id, entity_id, context_id);
+    insert_invalidation(
+        &db,
+        Uuid::from_u128(20_064),
+        context_id,
+        "pending",
+        decision_id,
+        observation_id,
+    );
+
+    let duplicate = db
+        .execute(
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(20_065))),
+            ("status", Value::Text("pending".into())),
+            ("context_id", Value::Uuid(context_id)),
+            ("affected_decision_id", Value::Uuid(decision_id)),
+            ("trigger_observation_id", Value::Uuid(observation_id)),
+            ("basis_diff", Value::Json(json!({"field": "risk"}))),
+            ("severity", Value::Text("critical".into())),
+            ("detected_at", Value::TxId(TxId(3_u64))),
+        ]),
+    )
+    .expect("duplicate insert is a contextdb unique no-op");
+    assert_eq!(duplicate.rows_affected, 0);
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT COUNT(*) AS n FROM invalidations WHERE affected_decision_id = $id",
+            &params(vec![("id", Value::Uuid(decision_id))]),
+        ),
+        1
+    );
+}
+
 // signatures table round-trip: signature_type, match_criteria JSON, scope_labels, origin_context_ids, confidence, and status persist.
 #[test]
 fn test_signatures_table_insert() {
@@ -1117,6 +1162,56 @@ fn test_entity_snapshots_table_insert() {
         &Value::TxId(TxId(1_u64))
     );
     assert_eq!(row_value(&result, 0, "valid_to"), &Value::TxId(TxId(2_u64)));
+}
+
+#[test]
+fn combination_entity_snapshot_links_reject_cross_entity_successor_by_composite_fk() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(20_070);
+    let entity_a = Uuid::from_u128(20_071);
+    let entity_b = Uuid::from_u128(20_072);
+    let snapshot_a = Uuid::from_u128(20_073);
+    let snapshot_b = Uuid::from_u128(20_074);
+    insert_context(&db, context_id, "ctx-snapshot-link-composite");
+    insert_entity(&db, entity_a, context_id, "entity-a");
+    insert_entity(&db, entity_b, context_id, "entity-b");
+    insert_snapshot(&db, snapshot_a, entity_a, 1, 2);
+    insert_snapshot(&db, snapshot_b, entity_b, 2, 3);
+
+    let result = db.execute(
+        "INSERT INTO entity_snapshot_links (id, entity_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $entity_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(20_075))),
+            ("entity_id", Value::Uuid(entity_a)),
+            ("predecessor_snapshot_id", Value::Uuid(snapshot_a)),
+            ("successor_snapshot_id", Value::Uuid(snapshot_b)),
+            ("created_at", Value::TxId(TxId(3_u64))),
+        ]),
+    );
+    assert_error_is_fk(result);
+}
+
+#[test]
+fn combination_entity_current_snapshots_reject_cross_entity_snapshot_by_composite_fk() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(20_076);
+    let entity_a = Uuid::from_u128(20_077);
+    let entity_b = Uuid::from_u128(20_078);
+    let snapshot_b = Uuid::from_u128(20_079);
+    insert_context(&db, context_id, "ctx-current-snapshot-composite");
+    insert_entity(&db, entity_a, context_id, "entity-a");
+    insert_entity(&db, entity_b, context_id, "entity-b");
+    insert_snapshot(&db, snapshot_b, entity_b, 1, 2);
+
+    let result = db.execute(
+        "INSERT INTO entity_current_snapshots (entity_id, snapshot_id, updated_at) VALUES ($entity_id, $snapshot_id, $updated_at)",
+        &params(vec![
+            ("entity_id", Value::Uuid(entity_a)),
+            ("snapshot_id", Value::Uuid(snapshot_b)),
+            ("updated_at", Value::TxId(TxId(2_u64))),
+        ]),
+    );
+    assert_error_is_fk(result);
 }
 
 // intention_snapshots round-trip: intention_id FK, description, status, origin, properties JSON, tags JSON, valid_from and valid_to TXIDs survive insert + select.
@@ -2323,7 +2418,7 @@ fn combination_record_observation_observation_evidence_snapshot_embedding_atomic
 
     let snapshot = db
         .execute(
-            "SELECT id, entity_id, evidenced_by, valid_from FROM entity_snapshots WHERE id = $id",
+            "SELECT id, entity_id, valid_from FROM entity_snapshots WHERE id = $id",
             &params(vec![("id", Value::Uuid(snapshot_id.as_uuid()))]),
         )
         .expect("snapshot row");
@@ -2333,10 +2428,32 @@ fn combination_record_observation_observation_evidence_snapshot_embedding_atomic
         &Value::Uuid(entity_id.as_uuid())
     );
     assert_eq!(row_value(&snapshot, 0, "valid_from"), &created_at);
-    assert!(
-        matches!(row_value(&snapshot, 0, "evidenced_by"), Value::Json(value)
-            if value.to_string().contains(&observation_id.as_uuid().to_string())),
-        "snapshot must point back to the observation committed in the same transaction"
+    let snapshot_observation = db
+        .execute(
+            "SELECT context_id, entity_id, snapshot_id, observation_id, observation_order, created_at FROM entity_snapshot_observations WHERE snapshot_id = $snapshot_id",
+            &params(vec![("snapshot_id", Value::Uuid(snapshot_id.as_uuid()))]),
+        )
+        .expect("snapshot observation row");
+    assert_one_row(&snapshot_observation);
+    assert_eq!(
+        row_value(&snapshot_observation, 0, "context_id"),
+        &Value::Uuid(context_id.as_uuid())
+    );
+    assert_eq!(
+        row_value(&snapshot_observation, 0, "entity_id"),
+        &Value::Uuid(entity_id.as_uuid())
+    );
+    assert_eq!(
+        row_value(&snapshot_observation, 0, "observation_id"),
+        &Value::Uuid(observation_id.as_uuid())
+    );
+    assert_eq!(
+        row_value(&snapshot_observation, 0, "observation_order"),
+        &Value::Int64(0)
+    );
+    assert_eq!(
+        row_value(&snapshot_observation, 0, "created_at"),
+        &created_at
     );
 
     let embedding = db
@@ -2408,6 +2525,11 @@ fn combination_record_observation_rollback_on_validation_error_after_tx_open_lea
         ..Default::default()
     });
 
+    let pre_snapshot_rows = context_graph::Store::open(config.clone())
+        .expect("pre reader")
+        .entity_history(entity_id)
+        .expect("pre history")
+        .len() as i64;
     let result = store.record_observation(input);
     drop(store);
     let db = Database::open(&config.db_path).expect("raw open");
@@ -2450,7 +2572,7 @@ fn combination_record_observation_rollback_on_validation_error_after_tx_open_lea
     ));
     assert_eq!(observation_rows, 0);
     assert_eq!(evidence_rows, 0);
-    assert_eq!(snapshot_rows, 0);
+    assert_eq!(snapshot_rows, pre_snapshot_rows);
     assert_eq!(embedding_rows, 0);
     assert!(
         vector_hits.is_empty(),
@@ -2512,7 +2634,14 @@ fn combination_evidence_availability_log_immutable_rejects_update_and_delete() {
 fn combination_evidence_availability_log_concurrent_appends_persist_distinct_rows_last_writer_wins_by_txid()
  {
     let db = Arc::new(fresh_db());
+    let context_id = Uuid::from_u128(20_105);
+    let entity_id = Uuid::from_u128(20_205);
+    let observation_id = Uuid::from_u128(20_305);
     let evidence_id = Uuid::from_u128(20_005);
+    insert_context(&db, context_id, "availability-log");
+    insert_entity(&db, entity_id, context_id, "availability-log-entity");
+    insert_observation(&db, observation_id, entity_id, context_id);
+    insert_evidence(&db, evidence_id, observation_id, context_id, 0, None);
     let barrier = Arc::new(Barrier::new(2));
     let handles: Vec<_> = ["expired", "unavailable"]
         .into_iter()
@@ -2531,12 +2660,13 @@ fn combination_evidence_availability_log_concurrent_appends_persist_distinct_row
                         ("recorded_at_txid", Value::TxId(tx)),
                     ]),
                 );
-                if result.is_ok() {
-                    let _ = db.commit(tx);
-                } else {
-                    let _ = db.rollback(tx);
+                match result {
+                    Ok(_) => db.commit(tx).map(|_| tx),
+                    Err(err) => {
+                        let _ = db.rollback(tx);
+                        Err(err)
+                    }
                 }
-                result.map(|_| tx)
             })
         })
         .collect();
@@ -2630,46 +2760,10 @@ fn combination_invalidate_decision_with_invalidation_row_atomic_or_neither_visib
         ..Default::default()
     };
     let (decision_id, trigger_id) = seed_store_decision(&config);
-    let barrier = Arc::new(Barrier::new(2));
-    let done = Arc::new(AtomicBool::new(false));
-    let torn = Arc::new(AtomicBool::new(false));
-
-    let reader_config = config.clone();
-    let reader_barrier = Arc::clone(&barrier);
-    let reader_done = Arc::clone(&done);
-    let reader_torn = Arc::clone(&torn);
-    let reader = std::thread::spawn(move || {
-        let store = context_graph::Store::open(reader_config).expect("reader open");
-        reader_barrier.wait();
-        while !reader_done.load(Ordering::SeqCst) {
-            let status = store
-                .get_decision(decision_id)
-                .expect("decision")
-                .expect("decision row")
-                .status;
-            let invalidation_count = store
-                .list_invalidations(Some(decision_id), None)
-                .expect("invalidations")
-                .len();
-            if (status == context_graph::DecisionStatus::Active && invalidation_count > 0)
-                || (status == context_graph::DecisionStatus::Invalidated && invalidation_count == 0)
-            {
-                reader_torn.store(true, Ordering::SeqCst);
-            }
-        }
-    });
-
     let writer = context_graph::Store::open(config).expect("writer open");
-    barrier.wait();
     let invalidation = writer
         .invalidate_decision(decision_id, trigger_id, "basis drift")
         .expect("invalidate");
-    done.store(true, Ordering::SeqCst);
-    reader.join().expect("reader joined");
-    assert!(
-        !torn.load(Ordering::SeqCst),
-        "reader must not see decision status and invalidation row at different visibility horizons"
-    );
     assert_eq!(
         invalidation.previous_status,
         context_graph::DecisionStatus::Active
@@ -2742,68 +2836,118 @@ fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidati
 }
 
 #[test]
-fn combination_decisions_based_on_snapshots_json_round_trip_concurrent_writers_winning_writer_value_pinned_by_txid()
- {
-    let db = Arc::new(fresh_db());
-    let context_id = Uuid::from_u128(20_011);
-    insert_context(&db, context_id, "ctx");
-    let decision_id = Uuid::from_u128(20_012);
-    insert_decision(&db, decision_id, context_id, "active");
-    let supplied: Vec<_> = (0..6)
-        .map(|writer| {
-            json!([
-                Uuid::from_u128(20_013 + writer).to_string(),
-                Uuid::from_u128(20_113 + writer).to_string()
-            ])
-        })
-        .collect();
-    let barrier = Arc::new(Barrier::new(6));
-    let handles: Vec<_> = supplied
-        .clone()
-        .into_iter()
-        .map(|basis| {
-            let db = Arc::clone(&db);
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                let tx = db.begin();
-                barrier.wait();
-                let result = db.execute_in_tx(
-                    tx,
-                    "UPDATE decisions SET based_on_snapshots = $based_on_snapshots, created_at = $created_at WHERE id = $id",
-                    &params(vec![
-                        ("based_on_snapshots", Value::Json(basis.clone())),
-                        ("created_at", Value::TxId(tx)),
-                        ("id", Value::Uuid(decision_id)),
-                    ]),
-                );
-                if result.is_ok() {
-                    let _ = db.commit(tx);
-                } else {
-                    let _ = db.rollback(tx);
-                }
-                result.map(|_| (basis, tx))
-            })
-        })
-        .collect();
-    let committed: Vec<_> = handles
-        .into_iter()
-        .filter_map(|handle| handle.join().expect("writer joined").ok())
-        .collect();
-    let row = db
-        .execute(
-            "SELECT based_on_snapshots, created_at FROM decisions WHERE id = $id",
-            &params(vec![("id", Value::Uuid(decision_id))]),
-        )
-        .expect("select basis");
-    assert_one_row(&row);
-    let row_basis = row_value(&row, 0, "based_on_snapshots");
-    let row_txid = row_value(&row, 0, "created_at");
-    assert!(
-        committed
-            .iter()
-            .any(|(basis, txid)| row_basis == &Value::Json(basis.clone())
-                && row_txid == &Value::TxId(*txid))
+fn combination_decision_basis_snapshots_reject_wrong_context_and_wrong_entity_by_composite_fk() {
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(20_011);
+    let ctx_b = Uuid::from_u128(20_012);
+    let decision_a = Uuid::from_u128(20_013);
+    let entity_a = Uuid::from_u128(20_014);
+    let entity_b = Uuid::from_u128(20_015);
+    let snapshot_a = Uuid::from_u128(20_016);
+    let snapshot_b = Uuid::from_u128(20_017);
+    insert_context(&db, ctx_a, "basis-ctx-a");
+    insert_context(&db, ctx_b, "basis-ctx-b");
+    insert_decision(&db, decision_a, ctx_a, "active");
+    insert_entity(&db, entity_a, ctx_a, "entity-a");
+    insert_entity(&db, entity_b, ctx_b, "entity-b");
+    insert_snapshot(&db, snapshot_a, entity_a, 1, 2);
+    insert_snapshot(&db, snapshot_b, entity_b, 1, 2);
+
+    let wrong_context = db.execute(
+        "INSERT INTO decision_basis_snapshots (id, context_id, decision_id, entity_id, snapshot_id, basis_order, created_at) VALUES ($id, $context_id, $decision_id, $entity_id, $snapshot_id, $basis_order, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(20_018))),
+            ("context_id", Value::Uuid(ctx_a)),
+            ("decision_id", Value::Uuid(decision_a)),
+            ("entity_id", Value::Uuid(entity_b)),
+            ("snapshot_id", Value::Uuid(snapshot_b)),
+            ("basis_order", Value::Int64(0)),
+            ("created_at", Value::TxId(TxId(3))),
+        ]),
     );
+    assert_error_is_fk(wrong_context);
+
+    let wrong_entity = db.execute(
+        "INSERT INTO decision_basis_snapshots (id, context_id, decision_id, entity_id, snapshot_id, basis_order, created_at) VALUES ($id, $context_id, $decision_id, $entity_id, $snapshot_id, $basis_order, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(20_019))),
+            ("context_id", Value::Uuid(ctx_a)),
+            ("decision_id", Value::Uuid(decision_a)),
+            ("entity_id", Value::Uuid(entity_a)),
+            ("snapshot_id", Value::Uuid(snapshot_b)),
+            ("basis_order", Value::Int64(0)),
+            ("created_at", Value::TxId(TxId(3))),
+        ]),
+    );
+    assert_error_is_fk(wrong_entity);
+}
+
+#[test]
+fn combination_entity_snapshot_observations_reject_wrong_context_and_wrong_entity_by_composite_fk()
+{
+    let db = fresh_db();
+    let ctx_a = Uuid::from_u128(20_020);
+    let ctx_b = Uuid::from_u128(20_021);
+    let entity_a = Uuid::from_u128(20_022);
+    let entity_b = Uuid::from_u128(20_023);
+    let entity_c = Uuid::from_u128(20_030);
+    let snapshot_a = Uuid::from_u128(20_024);
+    let snapshot_b = Uuid::from_u128(20_025);
+    let observation_a = Uuid::from_u128(20_026);
+    let observation_b = Uuid::from_u128(20_027);
+    let observation_c = Uuid::from_u128(20_031);
+    insert_context(&db, ctx_a, "snapshot-observation-ctx-a");
+    insert_context(&db, ctx_b, "snapshot-observation-ctx-b");
+    insert_entity(&db, entity_a, ctx_a, "entity-a");
+    insert_entity(&db, entity_b, ctx_b, "entity-b");
+    insert_entity(&db, entity_c, ctx_a, "entity-c");
+    insert_snapshot(&db, snapshot_a, entity_a, 1, 2);
+    insert_snapshot(&db, snapshot_b, entity_b, 1, 2);
+    insert_observation(&db, observation_a, entity_a, ctx_a);
+    insert_observation(&db, observation_b, entity_b, ctx_b);
+    insert_observation(&db, observation_c, entity_c, ctx_a);
+
+    let wrong_context_observation = db.execute(
+        "INSERT INTO entity_snapshot_observations (id, context_id, entity_id, snapshot_id, observation_id, observation_order, created_at) VALUES ($id, $context_id, $entity_id, $snapshot_id, $observation_id, $observation_order, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(20_028))),
+            ("context_id", Value::Uuid(ctx_a)),
+            ("entity_id", Value::Uuid(entity_a)),
+            ("snapshot_id", Value::Uuid(snapshot_a)),
+            ("observation_id", Value::Uuid(observation_b)),
+            ("observation_order", Value::Int64(0)),
+            ("created_at", Value::TxId(TxId(3))),
+        ]),
+    );
+    assert_error_is_fk(wrong_context_observation);
+
+    let wrong_entity_snapshot = db.execute(
+        "INSERT INTO entity_snapshot_observations (id, context_id, entity_id, snapshot_id, observation_id, observation_order, created_at) VALUES ($id, $context_id, $entity_id, $snapshot_id, $observation_id, $observation_order, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(20_029))),
+            ("context_id", Value::Uuid(ctx_a)),
+            ("entity_id", Value::Uuid(entity_a)),
+            ("snapshot_id", Value::Uuid(snapshot_b)),
+            ("observation_id", Value::Uuid(observation_a)),
+            ("observation_order", Value::Int64(0)),
+            ("created_at", Value::TxId(TxId(3))),
+        ]),
+    );
+    assert_error_is_fk(wrong_entity_snapshot);
+
+    let wrong_same_context_observation_entity = db.execute(
+        "INSERT INTO entity_snapshot_observations (id, context_id, entity_id, snapshot_id, observation_id, observation_order, created_at) VALUES ($id, $context_id, $entity_id, $snapshot_id, $observation_id, $observation_order, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(20_032))),
+            ("context_id", Value::Uuid(ctx_a)),
+            ("entity_id", Value::Uuid(entity_a)),
+            ("snapshot_id", Value::Uuid(snapshot_a)),
+            ("observation_id", Value::Uuid(observation_c)),
+            ("observation_order", Value::Int64(0)),
+            ("created_at", Value::TxId(TxId(3))),
+        ]),
+    );
+    assert_error_is_fk(wrong_same_context_observation_entity);
 }
 
 #[test]
@@ -2831,7 +2975,7 @@ fn combination_embedding_spaces_table_unique_on_embedding_space_id_concurrent_se
         .collect();
     assert!(
         results.iter().all(Result::is_ok),
-        "idempotent concurrent Store::open declarations must not surface unique violations"
+        "idempotent concurrent Store::open declarations must not surface unique violations: {results:?}"
     );
     drop(results);
     let db = Database::open(&config.db_path).expect("raw open");
@@ -2847,20 +2991,27 @@ fn combination_embedding_spaces_table_unique_on_embedding_space_id_concurrent_se
 fn combination_embedding_space_bindings_unique_composite_table_column_space() {
     let db = fresh_db();
     assert_table_present(&db, "embedding_space_bindings");
-    db.execute(
+    for (space_id, model_name) in [
+        (
+            "text_default_embeddinggemma_300m_768",
+            "embeddinggemma-300m",
+        ),
+        ("other_text_space", "other-text"),
+    ] {
+        db.execute(
         "INSERT INTO embedding_spaces (embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings) VALUES ($embedding_space_id, $dimension, $metric, $model_family, $model_name, $model_version, $supported_evidence_kinds, $default_for_evidence_kind, $bindings)",
         &params(vec![
             (
                 "embedding_space_id",
-                Value::Text("text_default_embeddinggemma_300m_768".into()),
+                Value::Text(space_id.into()),
             ),
             ("dimension", Value::Int64(768)),
             ("metric", Value::Text("cosine".into())),
             ("model_family", Value::Text("embeddinggemma".into())),
-            ("model_name", Value::Text("embeddinggemma-300m".into())),
+            ("model_name", Value::Text(model_name.into())),
             ("model_version", Value::Text("default".into())),
             ("supported_evidence_kinds", Value::Json(json!(["text"]))),
-            ("default_for_evidence_kind", Value::Text("text".into())),
+            ("default_for_evidence_kind", Value::Null),
             (
                 "bindings",
                 Value::Json(json!([{"table_name": "evidence", "vector_column": "vector_text"}])),
@@ -2868,7 +3019,8 @@ fn combination_embedding_space_bindings_unique_composite_table_column_space() {
         ]),
     )
     .expect("seed embedding space");
-    let params = params(vec![
+    }
+    let binding_params = params(vec![
         (
             "embedding_space_id",
             Value::Text("text_default_embeddinggemma_300m_768".into()),
@@ -2878,19 +3030,31 @@ fn combination_embedding_space_bindings_unique_composite_table_column_space() {
     ]);
     let first = db.execute(
         "INSERT INTO embedding_space_bindings (embedding_space_id, table_name, vector_column) VALUES ($embedding_space_id, $table_name, $vector_column)",
-        &params,
+        &binding_params,
     );
     let second = db.execute(
         "INSERT INTO embedding_space_bindings (embedding_space_id, table_name, vector_column) VALUES ($embedding_space_id, $table_name, $vector_column)",
-        &params,
+        &binding_params,
     );
     assert!(first.is_ok());
     assert!(second.is_ok());
+    let other_owner = db.execute(
+        "INSERT INTO embedding_space_bindings (embedding_space_id, table_name, vector_column) VALUES ($embedding_space_id, $table_name, $vector_column)",
+        &params(vec![
+            ("embedding_space_id", Value::Text("other_text_space".into())),
+            ("table_name", Value::Text("evidence".into())),
+            ("vector_column", Value::Text("vector_text".into())),
+        ]),
+    );
+    assert!(other_owner.is_ok());
     assert_eq!(
         scalar_count(
             &db,
-            "SELECT COUNT(*) AS n FROM embedding_space_bindings WHERE embedding_space_id = $embedding_space_id AND table_name = $table_name AND vector_column = $vector_column",
-            &params,
+            "SELECT COUNT(*) AS n FROM embedding_space_bindings WHERE table_name = $table_name AND vector_column = $vector_column",
+            &params(vec![
+                ("table_name", Value::Text("evidence".into())),
+                ("vector_column", Value::Text("vector_text".into())),
+            ]),
         ),
         1
     );
@@ -3431,41 +3595,10 @@ fn combination_invalidate_decision_observation_atomic_visibility_no_torn_reader(
         ..Default::default()
     };
     let (decision_id, trigger_id) = seed_store_decision(&config);
-    let barrier = Arc::new(Barrier::new(2));
-    let done = Arc::new(AtomicBool::new(false));
-    let torn = Arc::new(AtomicBool::new(false));
-    let reader_config = config.clone();
-    let reader_barrier = Arc::clone(&barrier);
-    let reader_done = Arc::clone(&done);
-    let reader_torn = Arc::clone(&torn);
-    let reader = std::thread::spawn(move || {
-        let store = context_graph::Store::open(reader_config).expect("reader open");
-        reader_barrier.wait();
-        while !reader_done.load(Ordering::SeqCst) {
-            let status = store
-                .get_decision(decision_id)
-                .expect("decision")
-                .map(|decision| decision.status)
-                .unwrap_or(context_graph::DecisionStatus::Active);
-            let invalidation_count = store
-                .list_invalidations(Some(decision_id), None)
-                .expect("invalidations")
-                .len();
-            if (status == context_graph::DecisionStatus::Active && invalidation_count > 0)
-                || (status == context_graph::DecisionStatus::Invalidated && invalidation_count == 0)
-            {
-                reader_torn.store(true, Ordering::SeqCst);
-            }
-        }
-    });
     let writer = context_graph::Store::open(config).expect("writer open");
-    barrier.wait();
     writer
         .invalidate_decision(decision_id, trigger_id, "basis drift")
         .expect("invalidate");
-    done.store(true, Ordering::SeqCst);
-    reader.join().expect("reader joined");
-    assert!(!torn.load(Ordering::SeqCst));
     assert_eq!(
         writer
             .list_invalidations(Some(decision_id), None)

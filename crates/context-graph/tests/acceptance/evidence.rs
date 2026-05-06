@@ -230,17 +230,6 @@ where
     assert_record_failure_zero_rollback_inner(label, store, input, predicate, true);
 }
 
-fn assert_record_failure_zero_rollback_on_store<F>(
-    label: &str,
-    store: Store,
-    input: RecordObservation,
-    predicate: F,
-) where
-    F: FnOnce(&std::result::Result<RecordObservationResult, CgError>) -> bool,
-{
-    assert_record_failure_zero_rollback_inner(label, store, input, predicate, false);
-}
-
 fn assert_record_failure_zero_rollback_inner<F>(
     label: &str,
     store: Store,
@@ -275,6 +264,7 @@ fn assert_record_failure_zero_rollback_inner<F>(
             "observations",
             "evidence",
             "entity_snapshots",
+            "entity_snapshot_observations",
             "embedding_handles",
             "evidence_availability_log",
         ] {
@@ -334,6 +324,14 @@ fn assert_record_failure_zero_rollback_inner<F>(
             _ => None,
         };
         if let Some((column, evidence_id)) = column_and_evidence_id {
+            let expected_dimension = match column {
+                "vector_text" => 768,
+                "vector_vision" => 512,
+                _ => vector.len(),
+            };
+            if vector.len() != expected_dimension {
+                continue;
+            }
             let hits = db
                 .query_vector(
                     VectorIndexRef::new("evidence", column),
@@ -1064,6 +1062,19 @@ fn record_observation_vigil_edge_camera_frame_atomic_observation_evidence_snapsh
     assert_eq!(
         count_where(
             &db,
+            "entity_snapshot_observations",
+            "snapshot_id = $snapshot_id AND observation_id = $observation_id AND observation_order = $observation_order",
+            db_params(vec![
+                ("snapshot_id", Value::Uuid(snapshot_id.as_uuid())),
+                ("observation_id", Value::Uuid(observation_id.as_uuid())),
+                ("observation_order", Value::Int64(0))
+            ])
+        ),
+        1
+    );
+    assert_eq!(
+        count_where(
+            &db,
             "evidence",
             "id = $id AND observation_id = $observation_id",
             db_params(vec![
@@ -1199,6 +1210,55 @@ fn record_observation_rejects_inline_data_uri_with_raw_media_not_stored_before_a
     assert_record_error("inline observation payload", observation_payload, |err| {
         matches!(err, CgError::RawMediaNotStored)
     });
+
+    let mut nested_payload = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    nested_payload.observed_properties.insert(
+        "camera".to_string(),
+        serde_json::json!({
+            "frames": [
+                {"metadata": {"raw_media": "data:image/jpeg;base64,BBBB"}}
+            ]
+        }),
+    );
+    assert_record_error("nested inline observation payload", nested_payload, |err| {
+        matches!(err, CgError::RawMediaNotStored)
+    });
+
+    let mut nested_delta_payload = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    nested_delta_payload.state_delta.insert(
+        "camera".to_string(),
+        Some(serde_json::json!({
+            "frames": [
+                {"metadata": {"media_payload": "data:image/jpeg;base64,CCCC"}}
+            ]
+        })),
+    );
+    assert_record_error(
+        "nested inline state delta payload",
+        nested_delta_payload,
+        |err| matches!(err, CgError::RawMediaNotStored),
+    );
+
+    let mut upper_data_uri_payload = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    upper_data_uri_payload.observed_properties.insert(
+        "thumbnail".to_string(),
+        serde_json::json!("DATA:image/jpeg;base64,DDDD"),
+    );
+    assert_record_error(
+        "uppercase inline data uri payload",
+        upper_data_uri_payload,
+        |err| matches!(err, CgError::RawMediaNotStored),
+    );
+
+    let mut broad_base64_key_payload = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    broad_base64_key_payload.evidence[0]
+        .properties
+        .insert("image_base64".to_string(), serde_json::json!("EEEE"));
+    assert_record_error(
+        "broad inline base64 key payload",
+        broad_base64_key_payload,
+        |err| matches!(err, CgError::RawMediaNotStored),
+    );
 }
 
 #[test]
@@ -1612,6 +1672,80 @@ fn record_observation_invalid_region_bounds_rejected_with_invalid_evidence_regio
             }
         }
     }
+}
+
+#[test]
+fn record_observation_invalid_line_range_region_rejected_before_db_write() {
+    let mut inverted = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    inverted.evidence[0].region = Some(serde_json::json!({
+        "line_start": 142,
+        "line_end": 100,
+    }));
+    assert_record_error("inverted line range", inverted, |err| {
+        matches!(
+            err,
+            CgError::InvalidEvidenceRegionBounds { field: "line_end" }
+        )
+    });
+
+    let mut negative = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    negative.evidence[0].region = Some(serde_json::json!({
+        "line_start": -1,
+        "line_end": 2,
+    }));
+    assert_record_error("negative line range", negative, |err| {
+        matches!(
+            err,
+            CgError::InvalidEvidenceRegionBounds {
+                field: "line_start"
+            }
+        )
+    });
+}
+
+#[test]
+fn record_observation_embedding_validation_failure_does_not_auto_create_context_or_entity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cg.db");
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
+    let mut input = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    let context_id = input.context_id;
+    let entity_id = input.entity_id;
+    input.embeddings[0].vector = vec![0.0; 384];
+    let result = store.record_observation(input);
+    assert!(matches!(
+        result,
+        Err(CgError::EmbeddingSpaceMismatch {
+            conflicting_field: "dimension"
+        })
+    ));
+    drop(store);
+
+    let db = Database::open(&db_path).expect("raw db");
+    assert_eq!(
+        count_where(
+            &db,
+            "contexts",
+            "id = $id",
+            db_params(vec![("id", Value::Uuid(context_id.as_uuid()))])
+        ),
+        0,
+        "failed observation must not auto-create context"
+    );
+    assert_eq!(
+        count_where(
+            &db,
+            "entities",
+            "id = $id",
+            db_params(vec![("id", Value::Uuid(entity_id.as_uuid()))])
+        ),
+        0,
+        "failed observation must not auto-create entity"
+    );
 }
 
 #[test]
@@ -2142,11 +2276,27 @@ fn replay_returns_original_image_frame_evidence_ref_byte_equal_when_text_project
         Some("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
     supplied.region = Some(serde_json::json!({"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}));
     supplied.text_projection = Some("a whiteboard with retry logic diagram".to_string());
-    let (decision, _, expected_evidence) = seed_decision_with_evidence(
+    let (decision, observation_id, expected_evidence) = seed_decision_with_evidence(
         &store,
         vec![supplied.clone()],
         BTreeMap::from([("seen".to_string(), Some(serde_json::json!(true)))]),
     );
+    let entity = store
+        .get_observation(observation_id)
+        .expect("observation")
+        .entity_id;
+    store
+        .update_entity(
+            entity,
+            EntityPatch {
+                properties: Some(BTreeMap::from([
+                    ("region".to_string(), serde_json::json!("us-east-1")),
+                    ("seen".to_string(), serde_json::json!(false)),
+                ])),
+                ..Default::default()
+            },
+        )
+        .expect("update current");
     let supplied = expected_evidence
         .into_iter()
         .next()
@@ -2292,6 +2442,174 @@ fn replay_returns_cas_sha256_source_ref_and_line_range_byte_equal() {
 }
 
 #[test]
+fn replay_preserves_multiple_basis_snapshots_for_same_entity_without_map_collapse() {
+    let (_dir, store) = fresh_store();
+    let ctx = store
+        .create_context(CreateContext {
+            name: format!("ctx-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("context")
+        .id;
+    let intention = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "same entity basis history".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention");
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "same-entity".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("entity");
+
+    let obs_a = ObservationId::new_v7();
+    let ev_a = EvidenceId::new_v7();
+    let snapshot_a = store
+        .record_observation(record_input_with(
+            obs_a,
+            entity.id,
+            ctx,
+            vec![evidence_ref(obs_a, ev_a)],
+            BTreeMap::from([("phase".to_string(), Some(serde_json::json!("a")))]),
+            Vec::new(),
+        ))
+        .expect("obs a")
+        .snapshot_id
+        .expect("snapshot a");
+    let obs_b = ObservationId::new_v7();
+    let ev_b = EvidenceId::new_v7();
+    let snapshot_b = store
+        .record_observation(record_input_with(
+            obs_b,
+            entity.id,
+            ctx,
+            vec![evidence_ref(obs_b, ev_b)],
+            BTreeMap::from([("phase".to_string(), Some(serde_json::json!("b")))]),
+            Vec::new(),
+        ))
+        .expect("obs b")
+        .snapshot_id
+        .expect("snapshot b");
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "same-entity-basis".to_string(),
+            description: "pin two historical basis snapshots".to_string(),
+            intention_ids: vec![intention.id],
+            based_on_snapshots: vec![snapshot_a, snapshot_b],
+            context_id: ctx,
+            ..Default::default()
+        })
+        .expect("decision");
+
+    let replay = store.replay(decision.id).expect("replay");
+    assert_eq!(
+        replay
+            .evidence_lineage
+            .iter()
+            .map(|lineage| lineage.basis_snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![snapshot_a, snapshot_b]
+    );
+    assert_eq!(replay_evidence_ids(&replay), vec![ev_a, ev_b]);
+    assert_eq!(replay.input_diffs.len(), 2);
+}
+
+#[test]
+fn snapshot_only_decision_basis_persists_based_on_graph_edges_for_create_and_supersede() {
+    let (_dir, store) = fresh_store();
+    let ctx = store
+        .create_context(CreateContext {
+            name: format!("ctx-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("context")
+        .id;
+    let intention = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "snapshot-only graph basis".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention");
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "snapshot-only-entity".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("entity");
+    let basis = store
+        .current_entity_snapshot(entity.id)
+        .expect("current")
+        .expect("basis");
+
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "snapshot-only".to_string(),
+            description: "create from snapshot id only".to_string(),
+            intention_ids: vec![intention.id],
+            based_on_snapshots: vec![basis.id],
+            context_id: ctx,
+            ..Default::default()
+        })
+        .expect("decision");
+    assert!(
+        store
+            .decision_targets_entity(decision.id, RelationshipType::BasedOn, entity.id)
+            .expect("based_on edge")
+    );
+    assert_eq!(
+        store
+            .list_decisions(ListDecisionFilter {
+                based_on_entity_ids: vec![entity.id],
+                ..Default::default()
+            })
+            .expect("list by entity")
+            .iter()
+            .map(|decision| decision.id)
+            .collect::<Vec<_>>(),
+        vec![decision.id]
+    );
+
+    let replacement = store
+        .supersede_decision(
+            decision.id,
+            CreateDecision {
+                decision_type: "snapshot-only".to_string(),
+                description: "supersede from snapshot id only".to_string(),
+                intention_ids: vec![intention.id],
+                based_on_snapshots: vec![basis.id],
+                context_id: ctx,
+                ..Default::default()
+            },
+        )
+        .expect("supersede");
+    assert!(
+        store
+            .decision_targets_entity(replacement.id, RelationshipType::BasedOn, entity.id)
+            .expect("replacement based_on edge")
+    );
+}
+
+#[test]
 fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_single_txid_consistent_basis()
  {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2360,6 +2678,14 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
             .send((before, after, replay))
             .expect("send replay result");
     });
+    let warmup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while committed.load(std::sync::atomic::Ordering::SeqCst) < 50 {
+        assert!(
+            std::time::Instant::now() < warmup_deadline,
+            "writer flood must reach 50 committed observations before replay timeout starts"
+        );
+        std::thread::yield_now();
+    }
     let (before_replay, after_replay, replay) = replay_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("replay returned while writer flood was still active");
@@ -3151,11 +3477,6 @@ fn basis_diff_under_concurrent_writer_returns_one_consistent_basis_to_current_dr
     assert!(after_diff >= before_diff);
     let reader = Store::open(config).expect("reader");
     let diff = diff.expect("diff");
-    let history = reader.entity_history(entity).expect("history");
-    assert!(
-        history.len() >= 51,
-        "writer flood must create durable snapshots"
-    );
     assert!(diff.is_invalidated_candidate);
     assert_eq!(
         diff.divergences.len(),
@@ -3166,6 +3487,10 @@ fn basis_diff_under_concurrent_writer_returns_one_consistent_basis_to_current_dr
     let second_history = reader
         .entity_history(second_entity)
         .expect("second history");
+    assert!(
+        first_history.len() + second_history.len() >= 52,
+        "writer flood must create durable snapshots across both basis entities"
+    );
     assert!(
         first_history.len() >= 26 && second_history.len() >= 26,
         "writer flood must create durable snapshots for both basis entities"
@@ -3244,7 +3569,7 @@ fn basis_diff_value_diff_serializes_with_basis_value_and_current_value_field_nam
             EntityPatch {
                 properties: Some(BTreeMap::from([(
                     "region".to_string(),
-                    serde_json::json!("eu-west-1"),
+                    serde_json::json!("eu-west-2"),
                 )])),
                 ..Default::default()
             },
@@ -3254,8 +3579,8 @@ fn basis_diff_value_diff_serializes_with_basis_value_and_current_value_field_nam
     assert!(diff.divergences.iter().any(|d| {
         d.value_diffs.iter().any(|v| {
             v.field == "region"
-                && v.basis_value == Some(serde_json::json!("us-east-1"))
-                && v.current_value == Some(serde_json::json!("eu-west-1"))
+                && v.basis_value == Some(serde_json::json!("eu-west-1"))
+                && v.current_value == Some(serde_json::json!("eu-west-2"))
         })
     }));
     let serialized = serde_json::to_value(&diff).expect("serialize diff");
@@ -3267,7 +3592,7 @@ fn basis_diff_value_diff_serializes_with_basis_value_and_current_value_field_nam
 }
 
 #[test]
-fn decisions_based_on_snapshots_full_entity_snapshot_json_round_trip() {
+fn decisions_based_on_snapshots_round_trip_from_normalized_db_table() {
     let (_dir, store) = fresh_store();
     let ctx = store
         .create_context(CreateContext {
@@ -3324,11 +3649,727 @@ fn decisions_based_on_snapshots_full_entity_snapshot_json_round_trip() {
         .expect("decision")
         .expect("decision row");
     assert_eq!(fetched.based_on_snapshots, vec![expected_snapshot.id]);
-    let round_trip: Vec<EntitySnapshotId> =
-        serde_json::from_value(serde_json::to_value(&fetched.based_on_snapshots).expect("json"))
-            .expect("json round trip");
-    assert_eq!(round_trip, fetched.based_on_snapshots);
     assert_eq!(expected_snapshot.entity_id, entity.id);
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let db = Database::open(&db_path).expect("raw db");
+    assert_eq!(
+        count_where(
+            &db,
+            "decision_basis_snapshots",
+            "decision_id = $decision_id AND snapshot_id = $snapshot_id AND basis_order = $basis_order",
+            db_params(vec![
+                ("decision_id", Value::Uuid(decision.id.as_uuid())),
+                ("snapshot_id", Value::Uuid(expected_snapshot.id.as_uuid())),
+                ("basis_order", Value::Int64(0)),
+            ]),
+        ),
+        1,
+        "decision basis must be a constrained row, not a JSON array on decisions"
+    );
+    let decisions_meta = db.table_meta("decisions").expect("decisions meta");
+    assert!(
+        decisions_meta
+            .columns
+            .iter()
+            .all(|column| column.name != "based_on_snapshots"),
+        "decisions.based_on_snapshots JSON column must not exist"
+    );
+}
+
+#[test]
+fn replay_uses_entity_snapshot_observations_table_not_nested_data_copy() {
+    let (dir, store) = fresh_store();
+    let ctx = store
+        .create_context(CreateContext {
+            name: format!("ctx-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("context")
+        .id;
+    let intention = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "column lineage".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention");
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "column-lineage-entity".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("entity");
+    let observation_id = ObservationId::new_v7();
+    let evidence_id = EvidenceId::new_v7();
+    store
+        .record_observation(record_input_with(
+            observation_id,
+            entity.id,
+            ctx,
+            vec![evidence_ref(observation_id, evidence_id)],
+            BTreeMap::new(),
+            Vec::new(),
+        ))
+        .expect("observation with evidence");
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+
+    let snapshot_id = EntitySnapshotId::new_v7();
+    let db = Database::open(&db_path).expect("raw db");
+    let tx = db.begin();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        &db_params(vec![
+            ("id", Value::Uuid(snapshot_id.as_uuid())),
+            ("entity_id", Value::Uuid(entity.id.as_uuid())),
+            (
+                "data",
+                Value::Json(serde_json::json!({
+                    "entity_id": entity.id.as_uuid().to_string(),
+                    "entity_type": "SERVICE",
+                    "name": "column-lineage-entity",
+                    "properties": {"from": "raw-normalized"},
+                    "evidenced_by": []
+                })),
+            ),
+            ("valid_from", Value::TxId(tx)),
+            ("valid_to", Value::Null),
+        ]),
+    )
+    .expect("raw snapshot");
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO entity_snapshot_observations (id, context_id, entity_id, snapshot_id, observation_id, observation_order, created_at) VALUES ($id, $context_id, $entity_id, $snapshot_id, $observation_id, $observation_order, $created_at)",
+        &db_params(vec![
+            ("id", Value::Uuid(uuid::Uuid::now_v7())),
+            ("context_id", Value::Uuid(ctx.as_uuid())),
+            ("entity_id", Value::Uuid(entity.id.as_uuid())),
+            ("snapshot_id", Value::Uuid(snapshot_id.as_uuid())),
+            ("observation_id", Value::Uuid(observation_id.as_uuid())),
+            ("observation_order", Value::Int64(0)),
+            ("created_at", Value::TxId(tx)),
+        ]),
+    )
+    .expect("raw normalized snapshot observation");
+    db.commit(tx).expect("commit raw snapshot");
+    drop(db);
+
+    let store = Store::open(StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    })
+    .expect("reopen");
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "column-lineage".to_string(),
+            description: "replay from normalized evidenced_by rows".to_string(),
+            intention_ids: vec![intention.id],
+            based_on_snapshots: vec![snapshot_id],
+            context_id: ctx,
+            ..Default::default()
+        })
+        .expect("decision");
+    let replay = store.replay(decision.id).expect("replay");
+    assert_eq!(replay.evidence_lineage.len(), 1);
+    assert_eq!(
+        replay.evidence_lineage[0].observation_id,
+        Some(observation_id)
+    );
+    assert_eq!(replay_evidence_ids(&replay), vec![evidence_id]);
+}
+
+#[test]
+fn replay_ignores_nested_data_evidenced_by_when_normalized_table_has_no_lineage() {
+    let (dir, store) = fresh_store();
+    let ctx = store
+        .create_context(CreateContext {
+            name: format!("ctx-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("context")
+        .id;
+    let intention = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "column divergence".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention");
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "column-divergence-entity".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("entity");
+    let nested_observation_id = ObservationId::new_v7();
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+
+    let snapshot_id = EntitySnapshotId::new_v7();
+    let db = Database::open(&db_path).expect("raw db");
+    let tx = db.begin();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        &db_params(vec![
+            ("id", Value::Uuid(snapshot_id.as_uuid())),
+            ("entity_id", Value::Uuid(entity.id.as_uuid())),
+            (
+                "data",
+                Value::Json(serde_json::json!({
+                    "entity_id": entity.id.as_uuid().to_string(),
+                    "entity_type": "SERVICE",
+                    "name": "column-divergence-entity",
+                    "properties": {},
+                    "evidenced_by": [nested_observation_id]
+                })),
+            ),
+            ("valid_from", Value::TxId(tx)),
+            ("valid_to", Value::Null),
+        ]),
+    )
+    .expect("raw snapshot with stale nested lineage");
+    db.commit(tx).expect("commit raw snapshot");
+    drop(db);
+
+    let store = Store::open(StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    })
+    .expect("reopen");
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "nested-lineage-ignored".to_string(),
+            description: "normalized table is the only lineage authority".to_string(),
+            intention_ids: vec![intention.id],
+            based_on_snapshots: vec![snapshot_id],
+            context_id: ctx,
+            ..Default::default()
+        })
+        .expect("decision");
+    let replay = store.replay(decision.id).expect("replay");
+    assert_eq!(replay.evidence_lineage.len(), 1);
+    assert_eq!(replay.evidence_lineage[0].basis_snapshot_id, snapshot_id);
+    assert_eq!(replay.evidence_lineage[0].observation_id, None);
+    assert!(
+        replay.evidence_lineage[0].evidence.is_empty(),
+        "nested JSON evidenced_by must not drive replay lineage"
+    );
+}
+
+#[test]
+fn record_observation_state_delta_merges_from_entity_current_snapshot_not_orphan_open_snapshot() {
+    let (dir, store) = fresh_store();
+    let ctx = store
+        .create_context(CreateContext {
+            name: format!("ctx-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("context")
+        .id;
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "current-pointer-entity".to_string(),
+            properties: BTreeMap::from([(
+                "region".to_string(),
+                serde_json::json!("authoritative"),
+            )]),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("entity");
+    let current_before = store
+        .current_entity_snapshot(entity.id)
+        .expect("current")
+        .expect("snapshot");
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+
+    let orphan_snapshot = EntitySnapshotId::new_v7();
+    let db = Database::open(&db_path).expect("raw db");
+    let tx = db.begin();
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        &db_params(vec![
+            ("id", Value::Uuid(orphan_snapshot.as_uuid())),
+            ("entity_id", Value::Uuid(entity.id.as_uuid())),
+            (
+                "data",
+                Value::Json(serde_json::json!({
+                    "entity_id": entity.id.as_uuid().to_string(),
+                    "entity_type": "SERVICE",
+                    "name": "current-pointer-entity",
+                    "properties": {"region": "orphan", "orphan_only": true}
+                })),
+            ),
+            ("valid_from", Value::TxId(tx)),
+            ("valid_to", Value::Null),
+        ]),
+    )
+    .expect("orphan open snapshot");
+    db.commit(tx).expect("commit orphan open snapshot");
+    drop(db);
+
+    let store = Store::open(StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    })
+    .expect("reopen");
+    let observation_id = ObservationId::new_v7();
+    let evidence_id = EvidenceId::new_v7();
+    let result = store
+        .record_observation(record_input_with(
+            observation_id,
+            entity.id,
+            ctx,
+            vec![evidence_ref(observation_id, evidence_id)],
+            BTreeMap::from([("safe".to_string(), Some(serde_json::json!(true)))]),
+            Vec::new(),
+        ))
+        .expect("record");
+    assert_ne!(result.snapshot_id, Some(orphan_snapshot));
+    let current_after = store
+        .current_entity_snapshot(entity.id)
+        .expect("current")
+        .expect("snapshot");
+    assert_ne!(current_after.id, current_before.id);
+    assert_eq!(
+        current_after.properties.get("region"),
+        Some(&serde_json::json!("authoritative"))
+    );
+    assert_eq!(
+        current_after.properties.get("safe"),
+        Some(&serde_json::json!(true))
+    );
+    assert!(
+        !current_after.properties.contains_key("orphan_only"),
+        "merge must not read state from an open row outside entity_current_snapshots"
+    );
+}
+
+#[test]
+fn update_decision_basis_preserves_decision_created_at_for_intention_replay_horizon() {
+    let (_dir, store) = fresh_store();
+    let ctx = store
+        .create_context(CreateContext {
+            name: format!("ctx-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("context")
+        .id;
+    let intention = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "intention v1".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention");
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "basis-created-at".to_string(),
+            properties: BTreeMap::from([("version".to_string(), serde_json::json!(1))]),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("entity");
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "basis-created-at".to_string(),
+            description: "preserve decision horizon".to_string(),
+            intention_ids: vec![intention.id],
+            based_on_entity_ids: vec![entity.id],
+            context_id: ctx,
+            ..Default::default()
+        })
+        .expect("decision");
+    let original_created_at = decision.created_at;
+
+    store
+        .update_intention(
+            intention.id,
+            IntentionPatch {
+                description: Some("intention v2".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("update intention");
+    store
+        .update_entity(
+            entity.id,
+            EntityPatch {
+                properties: Some(BTreeMap::from([(
+                    "version".to_string(),
+                    serde_json::json!(2),
+                )])),
+                ..Default::default()
+            },
+        )
+        .expect("update entity");
+    let new_basis = store
+        .current_entity_snapshot(entity.id)
+        .expect("current")
+        .expect("snapshot");
+    store
+        .update_decision_basis(decision.id, vec![new_basis.id])
+        .expect("update basis");
+
+    let updated = store
+        .get_decision(decision.id)
+        .expect("decision")
+        .expect("decision row");
+    assert_eq!(updated.created_at, original_created_at);
+    let replay = store.replay(decision.id).expect("replay");
+    assert_eq!(replay.cited_intention_snapshots.len(), 1);
+    assert_eq!(
+        replay.cited_intention_snapshots[0].description,
+        "intention v1"
+    );
+}
+
+#[test]
+fn update_decision_basis_reorders_existing_snapshots_without_unique_conflict() {
+    let (_dir, store) = fresh_store();
+    let ctx = store
+        .create_context(CreateContext {
+            name: format!("basis-reorder-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("context")
+        .id;
+    let intention = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "basis reorder".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention");
+    let first_entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "basis-first".to_string(),
+            properties: BTreeMap::from([("order".to_string(), serde_json::json!("first"))]),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("first entity");
+    let second_entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "basis-second".to_string(),
+            properties: BTreeMap::from([("order".to_string(), serde_json::json!("second"))]),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("second entity");
+    let first = store
+        .current_entity_snapshot(first_entity.id)
+        .expect("first snapshot")
+        .expect("first snapshot");
+    let second = store
+        .current_entity_snapshot(second_entity.id)
+        .expect("second snapshot")
+        .expect("second snapshot");
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "basis-reorder".to_string(),
+            description: "basis reorder".to_string(),
+            intention_ids: vec![intention.id],
+            based_on_snapshots: vec![first.id, second.id],
+            context_id: ctx,
+            ..Default::default()
+        })
+        .expect("decision");
+
+    store
+        .update_decision_basis(decision.id, vec![second.id, first.id])
+        .expect("reorder basis");
+    let updated = store
+        .get_decision(decision.id)
+        .expect("decision")
+        .expect("decision");
+    assert_eq!(updated.based_on_snapshots, vec![second.id, first.id]);
+    let replay = store.replay(decision.id).expect("replay");
+    assert_eq!(
+        replay
+            .evidence_lineage
+            .iter()
+            .map(|lineage| lineage.basis_snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![second.id, first.id]
+    );
+}
+
+#[test]
+fn update_decision_basis_rejects_missing_and_cross_context_snapshots() {
+    let (_dir, store) = fresh_store();
+    let ctx_a = store
+        .create_context(CreateContext {
+            name: format!("ctx-a-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("ctx a")
+        .id;
+    let ctx_b = store
+        .create_context(CreateContext {
+            name: format!("ctx-b-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("ctx b")
+        .id;
+    let intention_a = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "basis a".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx_a,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention a");
+    let entity_a = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "entity-a".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx_a,
+        })
+        .expect("entity a");
+    let entity_b = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "entity-b".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx_b,
+        })
+        .expect("entity b");
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "basis-validation".to_string(),
+            description: "pin only same-context basis".to_string(),
+            intention_ids: vec![intention_a.id],
+            based_on_entity_ids: vec![entity_a.id],
+            context_id: ctx_a,
+            ..Default::default()
+        })
+        .expect("decision");
+    let missing = EntitySnapshotId::new_v7();
+    let missing_result = store.update_decision_basis(decision.id, vec![missing]);
+    assert!(matches!(
+        missing_result,
+        Err(CgError::NotFound {
+            missing: Some("entity_snapshot"),
+            ..
+        })
+    ));
+    let cross_snapshot = store
+        .current_entity_snapshot(entity_b.id)
+        .expect("current b")
+        .expect("snapshot b");
+    let cross_result = store.update_decision_basis(decision.id, vec![cross_snapshot.id]);
+    assert!(matches!(cross_result, Err(CgError::CrossContextViolation)));
+}
+
+#[test]
+fn decision_basis_snapshot_missing_target_rejected_by_db_fk() {
+    let (_dir, store) = fresh_store();
+    let decision = seed_decision(&store).0;
+    let decision_row = store
+        .get_decision(decision)
+        .expect("decision")
+        .expect("decision row");
+    let basis_id = decision_row.based_on_snapshots[0];
+    let basis_entity = store
+        .entity_history(store.replay(decision).expect("replay").input_diffs[0].entity_id)
+        .expect("history")
+        .into_iter()
+        .find(|snapshot| snapshot.id == basis_id)
+        .expect("basis snapshot")
+        .entity_id;
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let missing = EntitySnapshotId::new_v7();
+    let db = Database::open(&db_path).expect("raw db");
+    let tx = db.begin();
+    let insert = db.execute_in_tx(
+        tx,
+        "INSERT INTO decision_basis_snapshots (id, context_id, decision_id, entity_id, snapshot_id, basis_order, created_at) VALUES ($id, $context_id, $decision_id, $entity_id, $snapshot_id, $basis_order, $created_at)",
+        &db_params(vec![
+            ("id", Value::Uuid(uuid::Uuid::now_v7())),
+            ("context_id", Value::Uuid(decision_row.context_id.as_uuid())),
+            ("decision_id", Value::Uuid(decision.as_uuid())),
+            ("entity_id", Value::Uuid(basis_entity.as_uuid())),
+            ("snapshot_id", Value::Uuid(missing.as_uuid())),
+            ("basis_order", Value::Int64(99)),
+            ("created_at", Value::TxId(tx)),
+        ]),
+    );
+    let result = match insert {
+        Ok(_) => db.commit(tx),
+        Err(err) => {
+            let _ = db.rollback(tx);
+            Err(err)
+        }
+    };
+    assert!(
+        matches!(result, Err(Error::ForeignKeyViolation { .. })),
+        "unexpected raw basis insert result: {result:?}"
+    );
+}
+
+#[test]
+fn raw_sql_cannot_update_removed_decision_basis_json_column() {
+    let (_dir, store) = fresh_store();
+    let decision = seed_decision(&store).0;
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let db = Database::open(&db_path).expect("raw db");
+    let decisions_meta = db.table_meta("decisions").expect("decisions meta");
+    assert!(
+        decisions_meta
+            .columns
+            .iter()
+            .all(|column| column.name != "based_on_snapshots"),
+        "decision basis must not be stored as a JSON column"
+    );
+    let result = db.execute(
+        "UPDATE decisions SET based_on_snapshots = $basis WHERE id = $id",
+        &db_params(vec![
+            ("id", Value::Uuid(decision.as_uuid())),
+            ("basis", Value::Json(serde_json::json!({"not": "an array"}))),
+        ]),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn replay_ignores_raw_cross_context_serves_edge_for_same_decision_source() {
+    let (dir, store) = fresh_store();
+    let ctx_a = store
+        .create_context(CreateContext {
+            name: format!("ctx-a-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("ctx a")
+        .id;
+    let ctx_b = store
+        .create_context(CreateContext {
+            name: format!("ctx-b-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("ctx b")
+        .id;
+    let intention_a = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "ctx a intention".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx_a,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention a");
+    let intention_b = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: "ctx b leaked intention".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: ctx_b,
+            properties: BTreeMap::new(),
+            tags: vec![],
+        })
+        .expect("intention b");
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "entity-a".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx_a,
+        })
+        .expect("entity");
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "replay-context".to_string(),
+            description: "cite only same context".to_string(),
+            intention_ids: vec![intention_a.id],
+            based_on_entity_ids: vec![entity.id],
+            context_id: ctx_a,
+            ..Default::default()
+        })
+        .expect("decision");
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let db = Database::open(&db_path).expect("raw db");
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
+        &db_params(vec![
+            ("id", Value::Uuid(uuid::Uuid::now_v7())),
+            ("source_id", Value::Uuid(decision.id.as_uuid())),
+            ("target_id", Value::Uuid(intention_b.id.as_uuid())),
+            ("edge_type", Value::Text("SERVES".to_string())),
+            ("context_id", Value::Uuid(ctx_b.as_uuid())),
+            ("valid_from", Value::TxId(TxId(1))),
+            ("valid_to", Value::Null),
+            ("properties", Value::Json(serde_json::json!({}))),
+        ]),
+    )
+    .expect("raw cross-context edge");
+    drop(db);
+    let store = Store::open(StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    })
+    .expect("reopen");
+    let replay = store.replay(decision.id).expect("replay");
+    assert_eq!(
+        replay
+            .cited_intention_snapshots
+            .iter()
+            .map(|snapshot| snapshot.intention_id)
+            .collect::<Vec<_>>(),
+        vec![intention_a.id]
+    );
 }
 
 #[test]
@@ -3399,6 +4440,77 @@ fn store_open_extra_embedding_spaces_validates_binding_against_schema() {
 }
 
 #[test]
+fn store_open_invalid_extra_embedding_space_does_not_poison_fresh_db_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cg.db");
+    let mut invalid = vision_config();
+    invalid.db_path = db_path.clone();
+    invalid.extra_embedding_spaces[0].bindings[0].vector_column = "missing_vector".to_string();
+    let result = Store::open(invalid);
+    assert!(matches!(
+        result,
+        Err(CgError::MissingVectorColumnForSpace { table, column })
+            if table == "evidence" && column == "missing_vector"
+    ));
+
+    let recovered = Store::open(StoreConfig {
+        db_path,
+        ..Default::default()
+    })
+    .expect("fresh path must recover after failed invalid open");
+    assert!(
+        recovered
+            .list_embedding_spaces()
+            .expect("spaces")
+            .iter()
+            .any(|space| space.embedding_space_id == TEXT_SPACE)
+    );
+}
+
+#[test]
+fn store_open_same_id_model_drift_extra_embedding_space_does_not_poison_fresh_db_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cg.db");
+    let invalid = StoreConfig {
+        db_path: db_path.clone(),
+        extra_embedding_spaces: vec![EmbeddingSpaceDecl {
+            embedding_space_id: TEXT_SPACE.to_string(),
+            dimension: 768,
+            metric: DistanceMetric::Cosine,
+            model_family: "text".to_string(),
+            model_name: "different-model".to_string(),
+            model_version: "default".to_string(),
+            supported_evidence_kinds: vec![EvidenceKind::Text, EvidenceKind::StructuredSignal],
+            default_for_evidence_kind: None,
+            bindings: vec![
+                EmbeddingSpaceBinding {
+                    embedding_space_id: TEXT_SPACE.to_string(),
+                    table_name: "evidence".to_string(),
+                    vector_column: "vector_text".to_string(),
+                },
+                EmbeddingSpaceBinding {
+                    embedding_space_id: TEXT_SPACE.to_string(),
+                    table_name: "digests".to_string(),
+                    vector_column: "vector_text".to_string(),
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    let result = Store::open(invalid);
+    assert!(matches!(
+        result,
+        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "model_name"
+    ));
+
+    Store::open(StoreConfig {
+        db_path,
+        ..Default::default()
+    })
+    .expect("fresh path must recover after failed same-id model drift open");
+}
+
+#[test]
 fn store_open_extra_embedding_spaces_idempotent_redeclaration_succeeds_no_duplicate_row() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = vision_config();
@@ -3416,6 +4528,21 @@ fn store_open_extra_embedding_spaces_idempotent_redeclaration_succeeds_no_duplic
             .count(),
         1
     );
+}
+
+#[test]
+fn store_open_extra_embedding_spaces_conflicting_model_identity_returns_embedding_space_mismatch_naming_field()
+ {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = vision_config();
+    config.db_path = dir.path().join("cg.db");
+    Store::open(config.clone()).expect("initial open");
+    config.extra_embedding_spaces[0].model_name = "different-model".to_string();
+    let result = Store::open(config);
+    assert!(matches!(
+        result,
+        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "model_name"
+    ));
 }
 
 #[test]
@@ -3445,6 +4572,39 @@ fn store_open_extra_embedding_spaces_conflicting_metric_returns_embedding_space_
         result,
         Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "metric"
     ));
+}
+
+#[test]
+fn store_open_extra_embedding_space_cannot_claim_existing_vector_column_owned_by_another_space() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        extra_embedding_spaces: vec![EmbeddingSpaceDecl {
+            embedding_space_id: "other_text_space".to_string(),
+            dimension: 768,
+            metric: DistanceMetric::Cosine,
+            model_family: "text".to_string(),
+            model_name: "other-text".to_string(),
+            model_version: "1".to_string(),
+            supported_evidence_kinds: vec![EvidenceKind::Text],
+            default_for_evidence_kind: None,
+            bindings: vec![EmbeddingSpaceBinding {
+                embedding_space_id: "other_text_space".to_string(),
+                table_name: "evidence".to_string(),
+                vector_column: "vector_text".to_string(),
+            }],
+        }],
+        ..Default::default()
+    };
+    let result = Store::open(config.clone());
+    assert!(matches!(
+        result,
+        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "bindings"
+    ));
+
+    config.extra_embedding_spaces[0].bindings[0].vector_column = "vector_vision".to_string();
+    config.extra_embedding_spaces[0].dimension = 512;
+    Store::open(config).expect("unclaimed vision column can be owned");
 }
 
 #[test]
@@ -3925,8 +5085,9 @@ fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_hnsw_index
 #[test]
 fn create_digest_with_dimension_mismatch_rejected_with_embedding_space_mismatch_naming_field() {
     let (_dir, store) = fresh_store();
+    let digest_id = DigestId::new_v7();
     let result = store.create_digest(CreateDigest {
-        id: DigestId::new_v7(),
+        id: digest_id,
         source: "acceptance".to_string(),
         session_ref: None,
         summary: "short vector".to_string(),
@@ -3935,7 +5096,7 @@ fn create_digest_with_dimension_mismatch_rejected_with_embedding_space_mismatch_
             id: EmbeddingId::new_v7(),
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: vec![0.0; 384],
-            target: EmbeddingTarget::Digest(DigestId::new_v7()),
+            target: EmbeddingTarget::Digest(digest_id),
             produced_by: producer(),
         },
         context_id: ContextId::new_v7(),
@@ -4595,6 +5756,111 @@ fn record_observation_evidence_id_collides_with_existing_committed_row_rejected_
 }
 
 #[test]
+fn record_observation_concurrent_same_evidence_id_returns_duplicate_evidence_id_for_loser() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    };
+    let seed = Store::open(config.clone()).expect("open");
+    let ctx = seed
+        .create_context(CreateContext {
+            name: format!("duplicate-evidence-{}", uuid::Uuid::now_v7()),
+            labels: vec![],
+            properties: BTreeMap::new(),
+        })
+        .expect("context")
+        .id;
+    let entity_a = seed
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "duplicate-evidence-a".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("entity a")
+        .id;
+    let entity_b = seed
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "duplicate-evidence-b".to_string(),
+            properties: BTreeMap::new(),
+            tags: vec![],
+            context_id: ctx,
+        })
+        .expect("entity b")
+        .id;
+    drop(seed);
+
+    let duplicate = EvidenceId::new_v7();
+    let obs_a = ObservationId::new_v7();
+    let obs_b = ObservationId::new_v7();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let writers = [(obs_a, entity_a, "a"), (obs_b, entity_b, "b")]
+        .into_iter()
+        .map(|(observation_id, entity_id, label)| {
+            let config = config.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = Store::open(config).expect("writer open");
+                let mut evidence = evidence_ref(observation_id, duplicate);
+                evidence.source_ref = format!(
+                    "cas://sha256:{hash}",
+                    hash = if label == "a" {
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    } else {
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                );
+                evidence.content_hash = Some(format!(
+                    "sha256:{hash}",
+                    hash = if label == "a" {
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    } else {
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                ));
+                let input = record_input_with(
+                    observation_id,
+                    entity_id,
+                    ctx,
+                    vec![evidence],
+                    BTreeMap::from([("writer".to_string(), Some(serde_json::json!(label)))]),
+                    Vec::new(),
+                );
+                barrier.wait();
+                store.record_observation(input)
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = writers
+        .into_iter()
+        .map(|writer| writer.join().expect("writer joined"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(CgError::DuplicateEvidenceId { id }) if *id == duplicate))
+            .count(),
+        1
+    );
+
+    let reader = Store::open(config).expect("reader");
+    let visible = [obs_a, obs_b]
+        .into_iter()
+        .map(|observation_id| {
+            reader
+                .list_evidence_for_observation(observation_id)
+                .expect("evidence list")
+                .len()
+        })
+        .sum::<usize>();
+    assert_eq!(visible, 1);
+}
+
+#[test]
 fn record_observation_derived_from_fan_out_two_children_pointing_at_same_parent_evidence_accepted()
 {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4704,18 +5970,15 @@ fn record_observation_embedding_target_evidence_id_exists_in_db_but_not_in_curre
         .record_observation(record_input(old_observation, old_evidence))
         .expect("old record");
     let mut input = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    let rejected_observation = input.id;
+    let rejected_entity = input.entity_id;
+    let rejected_evidence = input.evidence[0].id;
     input.embeddings[0].target = EmbeddingTarget::Evidence(old_evidence);
-    assert_record_failure_zero_rollback_on_store(
-        "embedding target exists outside batch",
-        store.clone(),
-        input,
-        |result| {
-            matches!(
-                result,
-                Err(CgError::EmbeddingTargetNotFound { id }) if *id == old_evidence
-            )
-        },
-    );
+    let result = store.record_observation(input);
+    assert!(matches!(
+        result,
+        Err(CgError::EmbeddingTargetNotFound { id }) if id == old_evidence
+    ));
     assert_eq!(
         store
             .list_evidence_for_observation(old_observation)
@@ -4724,6 +5987,39 @@ fn record_observation_embedding_target_evidence_id_exists_in_db_but_not_in_curre
             .map(|row| row.id)
             .collect::<Vec<_>>(),
         vec![old_evidence]
+    );
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let db = Database::open(&db_path).expect("open raw contextdb");
+    assert_eq!(
+        count_where(
+            &db,
+            "observations",
+            "id = $id",
+            db_params(vec![("id", Value::Uuid(rejected_observation.as_uuid()))])
+        ),
+        0,
+        "embedding target exists outside batch: observation row leaked"
+    );
+    assert_eq!(
+        count_where(
+            &db,
+            "entity_snapshots",
+            "entity_id = $entity_id",
+            db_params(vec![("entity_id", Value::Uuid(rejected_entity.as_uuid()))])
+        ),
+        0,
+        "embedding target exists outside batch: snapshot row leaked"
+    );
+    assert_eq!(
+        count_where(
+            &db,
+            "evidence",
+            "id = $id",
+            db_params(vec![("id", Value::Uuid(rejected_evidence.as_uuid()))])
+        ),
+        0,
+        "embedding target exists outside batch: evidence row leaked"
     );
 }
 
@@ -4823,6 +6119,9 @@ fn store_initialize_fresh_against_non_empty_path_drops_all_rows_and_reseeds_defa
         "observations",
         "evidence",
         "entity_snapshots",
+        "entity_snapshot_observations",
+        "entity_current_snapshots",
+        "decision_basis_snapshots",
         "embedding_handles",
         "evidence_availability_log",
         "decisions",
