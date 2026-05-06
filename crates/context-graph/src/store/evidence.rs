@@ -367,12 +367,18 @@ impl Store {
 
     pub fn list_invalidations(
         &self,
+        context_id: ContextId,
         decision_id: Option<DecisionId>,
         status: Option<InvalidationStatus>,
     ) -> Result<Vec<Invalidation>> {
-        let mut clauses = Vec::new();
-        let mut params = HashMap::new();
+        let mut clauses = vec!["context_id = $context_id"];
+        let mut params =
+            HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]);
         if let Some(decision_id) = decision_id {
+            match self.decision_context_id(decision_id)? {
+                Some(decision_context) if decision_context == context_id => {}
+                Some(_) | None => return Ok(Vec::new()),
+            }
             clauses.push("affected_decision_id = $affected_decision_id");
             params.insert(
                 "affected_decision_id".to_string(),

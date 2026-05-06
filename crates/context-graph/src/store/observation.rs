@@ -9,7 +9,7 @@ use crate::error::CgError;
 use crate::types::*;
 
 use super::Store;
-use super::convert::{entity_type_str, map_engine_err};
+use super::convert::{entity_type_from_str, entity_type_str, map_engine_err};
 use super::encode::{
     get_json, get_text, get_timestamp, get_txid, get_uuid, properties_from_json, properties_to_json,
 };
@@ -32,25 +32,28 @@ impl Store {
         }
         self.validate_record_observation_input(&input)?;
         let embedding_routes = self.validate_embeddings_for_observation(&input)?;
-        let entity_exists = if let Some(entity) = self.get_entity(input.entity_id)? {
+        let auto_create_entity = if let Some(entity) = self.get_entity(input.entity_id)? {
             if entity.context_id != input.context_id {
                 return Err(CgError::CrossContextObservation);
             }
-            true
-        } else {
             false
+        } else {
+            true
         };
-        if !entity_exists {
-            self.ensure_context_and_entity(input.context_id, input.entity_id)?;
-        }
         let id = input.id;
         let observed_at = input.observed_at;
         let observed_properties_json = properties_to_json(&input.observed_properties);
-        let state_delta_json =
-            serde_json::to_value(&input.state_delta).unwrap_or_else(|_| serde_json::json!({}));
+        let state_delta_json = state_delta_to_json(&input.state_delta);
         let properties_json = properties_to_json(&input.properties);
         for _ in 0..16 {
             let tx = self.db.begin();
+            if auto_create_entity
+                && let Err(e) =
+                    self.ensure_context_and_entity_in_tx(tx, input.context_id, input.entity_id)
+            {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
             let params: HashMap<String, Value> = [
                 ("id".to_string(), Value::Uuid(id.as_uuid())),
                 (
@@ -153,6 +156,13 @@ impl Store {
                 match err {
                     EngineError::UniqueViolation { table, column }
                         if record_observation_snapshot_retry_unique(&table, &column) =>
+                    {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    EngineError::UniqueViolation { table, column }
+                        if auto_create_entity
+                            && record_observation_auto_create_retry_unique(&table, &column) =>
                     {
                         std::thread::yield_now();
                         continue;
@@ -278,8 +288,12 @@ impl Store {
         Ok(out)
     }
 
-    fn ensure_context_and_entity(&self, context_id: ContextId, entity_id: EntityId) -> Result<()> {
-        let tx = self.db.begin();
+    fn ensure_context_and_entity_in_tx(
+        &self,
+        tx: crate::TxId,
+        context_id: ContextId,
+        entity_id: EntityId,
+    ) -> Result<()> {
         let context_params = HashMap::from([
             ("id".to_string(), Value::Uuid(context_id.as_uuid())),
             (
@@ -290,11 +304,15 @@ impl Store {
             ("properties".to_string(), Value::Json(serde_json::json!({}))),
             ("created_at".to_string(), Value::TxId(tx)),
         ]);
-        let _ = self.db.execute_in_tx(
+        match self.db.execute_in_tx(
             tx,
             "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
             &context_params,
-        );
+        ) {
+            Ok(_) => {}
+            Err(EngineError::UniqueViolation { .. }) if self.context_id_exists(context_id)? => {}
+            Err(err) => return Err(map_engine_err(err)),
+        }
         let entity_params = HashMap::from([
             ("id".to_string(), Value::Uuid(entity_id.as_uuid())),
             (
@@ -311,15 +329,28 @@ impl Store {
             ("tags".to_string(), Value::Json(serde_json::json!([]))),
             ("created_at".to_string(), Value::TxId(tx)),
         ]);
-        if let Err(err) = self.db.execute_in_tx(
+        match self.db.execute_in_tx(
             tx,
             "INSERT INTO entities (id, entity_type, name, status, context_id, properties, tags, created_at) VALUES ($id, $entity_type, $name, $status, $context_id, $properties, $tags, $created_at)",
             &entity_params,
         ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(err));
+            Ok(_) => {}
+            Err(EngineError::UniqueViolation { .. })
+                if self.entity_context(entity_id)? == Some(context_id) => {}
+            Err(err) => return Err(map_engine_err(err)),
         }
-        self.db.commit(tx).map_err(map_engine_err)
+        Ok(())
+    }
+
+    fn context_id_exists(&self, context_id: ContextId) -> Result<bool> {
+        let result = self
+            .db
+            .execute(
+                "SELECT id FROM contexts WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(context_id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+        Ok(!result.rows.is_empty())
     }
 
     fn validate_record_observation_input(&self, input: &RecordObservation) -> Result<()> {
@@ -608,13 +639,8 @@ impl Store {
             return Ok(None);
         }
 
-        let entity = self
-            .get_entity(input.entity_id)
-            .map_err(StateDeltaMergeError::Error)?
-            .ok_or(CgError::NotFound {
-                id: Some(input.entity_id.as_uuid().to_string()),
-                missing: Some("entity"),
-            })
+        let (entity_type, entity_name) = self
+            .entity_snapshot_identity_in_tx(tx, input.entity_id)
             .map_err(StateDeltaMergeError::Error)?;
         if let Some(current) = current.as_ref() {
             let close_params = HashMap::from([
@@ -639,8 +665,8 @@ impl Store {
         let snapshot_id = EntitySnapshotId::new_v7();
         let snapshot_data = serde_json::json!({
             "entity_id": input.entity_id.as_uuid().to_string(),
-            "entity_type": entity_type_str(entity.entity_type),
-            "name": entity.name,
+            "entity_type": entity_type,
+            "name": entity_name,
             "properties": properties_to_json(&new_properties),
         });
         let snap_params = HashMap::from([
@@ -790,10 +816,38 @@ impl Store {
             .map(|row| decode_snapshot_for_merge(&result.columns, row))
             .transpose()
     }
+
+    fn entity_snapshot_identity_in_tx(
+        &self,
+        tx: crate::TxId,
+        entity_id: EntityId,
+    ) -> Result<(String, String)> {
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT entity_type, name FROM entities WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(entity_id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+        let Some(row) = result.rows.first() else {
+            return Err(CgError::NotFound {
+                id: Some(entity_id.as_uuid().to_string()),
+                missing: Some("entity"),
+            });
+        };
+        let entity_type = entity_type_from_str(&get_text(row, &result.columns, "entity_type")?)?;
+        let name = get_text(row, &result.columns, "name")?;
+        Ok((entity_type_str(entity_type).to_string(), name))
+    }
 }
 
 fn record_observation_snapshot_retry_unique(table: &str, _column: &str) -> bool {
     matches!(table, "entity_snapshot_links" | "entity_current_snapshots")
+}
+
+fn record_observation_auto_create_retry_unique(table: &str, _column: &str) -> bool {
+    matches!(table, "contexts" | "entities")
 }
 
 #[derive(Debug, Clone)]
@@ -841,8 +895,7 @@ fn decode_observation(columns: &[String], row: &[Value]) -> Result<Observation> 
         observation_type: get_text(row, columns, "observation_type")?,
         evidence: Vec::new(),
         observed_properties: properties_from_json(&get_json(row, columns, "observed_properties")?),
-        state_delta: serde_json::from_value(get_json(row, columns, "state_delta")?)
-            .unwrap_or_default(),
+        state_delta: state_delta_from_json(get_json(row, columns, "state_delta")?)?,
         properties: properties_from_json(&get_json(row, columns, "properties")?),
         source: get_text(row, columns, "source")?,
         entity_id: EntityId::from(get_uuid(row, columns, "entity_id")?),
@@ -862,6 +915,80 @@ fn contains_raw_media_state_delta(delta: &BTreeMap<String, Option<JsonValue>>) -
     delta.iter().any(|(key, value)| {
         is_raw_media_key(key) || value.as_ref().is_some_and(contains_raw_media_value)
     })
+}
+
+fn state_delta_to_json(delta: &BTreeMap<String, Option<JsonValue>>) -> JsonValue {
+    let mut ops = serde_json::Map::new();
+    for (key, value) in delta {
+        let mut op = serde_json::Map::new();
+        match value {
+            Some(value) => {
+                op.insert("op".to_string(), JsonValue::String("set".to_string()));
+                op.insert("value".to_string(), value.clone());
+            }
+            None => {
+                op.insert("op".to_string(), JsonValue::String("delete".to_string()));
+            }
+        }
+        ops.insert(key.clone(), JsonValue::Object(op));
+    }
+    serde_json::json!({
+        "format": "cg_state_delta_v1",
+        "ops": ops,
+    })
+}
+
+fn state_delta_from_json(value: JsonValue) -> Result<BTreeMap<String, Option<JsonValue>>> {
+    let JsonValue::Object(mut object) = value else {
+        return Err(CgError::Engine(
+            "observations.state_delta must be a JSON object".to_string(),
+        ));
+    };
+    if matches!(
+        object.get("format").and_then(JsonValue::as_str),
+        Some("cg_state_delta_v1")
+    ) {
+        let ops = object
+            .remove("ops")
+            .ok_or_else(|| CgError::Engine("state_delta missing ops".to_string()))?;
+        let JsonValue::Object(ops) = ops else {
+            return Err(CgError::Engine(
+                "state_delta ops must be a JSON object".to_string(),
+            ));
+        };
+        let mut out = BTreeMap::new();
+        for (key, op) in ops {
+            let JsonValue::Object(mut op) = op else {
+                return Err(CgError::Engine(
+                    "state_delta op must be a JSON object".to_string(),
+                ));
+            };
+            match op.get("op").and_then(JsonValue::as_str) {
+                Some("set") => {
+                    let value = op.remove("value").ok_or_else(|| {
+                        CgError::Engine("state_delta set op missing value".to_string())
+                    })?;
+                    out.insert(key, Some(value));
+                }
+                Some("delete") => {
+                    out.insert(key, None);
+                }
+                other => {
+                    return Err(CgError::Engine(format!(
+                        "state_delta has unknown op {other:?}"
+                    )));
+                }
+            }
+        }
+        return Ok(out);
+    }
+    Ok(object
+        .into_iter()
+        .map(|(key, value)| {
+            let value = if value.is_null() { None } else { Some(value) };
+            (key, value)
+        })
+        .collect())
 }
 
 fn contains_raw_media_value(value: &JsonValue) -> bool {

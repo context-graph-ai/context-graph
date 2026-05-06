@@ -188,6 +188,17 @@ fn seed_store_decision(
     (decision.id, observation_id)
 }
 
+fn store_decision_context(
+    store: &context_graph::Store,
+    decision_id: context_graph::DecisionId,
+) -> context_graph::ContextId {
+    store
+        .get_decision(decision_id)
+        .expect("decision")
+        .expect("decision row")
+        .context_id
+}
+
 fn uuid(n: u128) -> String {
     Uuid::from_u128(n).to_string()
 }
@@ -2782,7 +2793,11 @@ fn combination_invalidate_decision_with_invalidation_row_atomic_or_neither_visib
     );
     assert_eq!(
         writer
-            .list_invalidations(Some(decision_id), None)
+            .list_invalidations(
+                store_decision_context(&writer, decision_id),
+                Some(decision_id),
+                None,
+            )
             .expect("invalidations")
             .len(),
         1
@@ -2823,9 +2838,13 @@ fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidati
             )
         })
         .count();
-    let invalidation_rows = context_graph::Store::open(config)
-        .expect("reader")
-        .list_invalidations(Some(decision_id), None)
+    let reader = context_graph::Store::open(config).expect("reader");
+    let invalidation_rows = reader
+        .list_invalidations(
+            store_decision_context(&reader, decision_id),
+            Some(decision_id),
+            None,
+        )
         .expect("invalidations");
     assert_eq!(
         ok_count, 1,
@@ -3601,7 +3620,11 @@ fn combination_invalidate_decision_observation_atomic_visibility_no_torn_reader(
         .expect("invalidate");
     assert_eq!(
         writer
-            .list_invalidations(Some(decision_id), None)
+            .list_invalidations(
+                store_decision_context(&writer, decision_id),
+                Some(decision_id),
+                None,
+            )
             .expect("invalidations")
             .len(),
         1,

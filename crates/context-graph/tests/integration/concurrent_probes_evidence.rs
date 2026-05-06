@@ -225,6 +225,14 @@ fn seed_decision(store: &Store) -> (DecisionId, ObservationId) {
     (decision.id, observation_id)
 }
 
+fn decision_context(store: &Store, decision: DecisionId) -> ContextId {
+    store
+        .get_decision(decision)
+        .expect("decision")
+        .expect("decision row")
+        .context_id
+}
+
 #[test]
 fn probe_record_observation_observation_and_evidence_visible_atomically() {
     let (_dir, config) = shared_config();
@@ -319,10 +327,14 @@ fn probe_invalidate_decision_conditional_where_exactly_one_winner_under_4_writer
         .map(|handle| handle.join().expect("writer joined"))
         .collect();
     assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    let reader = Store::open(config).expect("reader");
     assert_eq!(
-        Store::open(config)
-            .expect("reader")
-            .list_invalidations(Some(decision_id), None)
+        reader
+            .list_invalidations(
+                decision_context(&reader, decision_id),
+                Some(decision_id),
+                None
+            )
             .expect("invalidations")
             .len(),
         1

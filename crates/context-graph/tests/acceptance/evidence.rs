@@ -353,6 +353,14 @@ fn seed_decision(store: &Store) -> (DecisionId, ObservationId, EvidenceId) {
     seed_decision_with_source(store, "acceptance")
 }
 
+fn decision_context(store: &Store, decision: DecisionId) -> ContextId {
+    store
+        .get_decision(decision)
+        .expect("decision")
+        .expect("decision row")
+        .context_id
+}
+
 fn seed_decision_with_source(
     store: &Store,
     source: &str,
@@ -1749,6 +1757,57 @@ fn record_observation_embedding_validation_failure_does_not_auto_create_context_
 }
 
 #[test]
+fn record_observation_duplicate_observation_id_rolls_back_auto_created_context_and_entity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cg.db");
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("open");
+    let committed_observation = ObservationId::new_v7();
+    let committed_evidence = EvidenceId::new_v7();
+    store
+        .record_observation(record_input(committed_observation, committed_evidence))
+        .expect("seed observation");
+
+    let leaked_context = ContextId::new_v7();
+    let leaked_entity = EntityId::new_v7();
+    let result = store.record_observation(record_input_with(
+        committed_observation,
+        leaked_entity,
+        leaked_context,
+        vec![evidence_ref(committed_observation, EvidenceId::new_v7())],
+        BTreeMap::from([("region".to_string(), Some(serde_json::json!("eu-west-1")))]),
+        Vec::new(),
+    ));
+    assert!(matches!(result, Err(CgError::UniqueViolation { .. })));
+    drop(store);
+
+    let db = Database::open(&db_path).expect("raw db");
+    assert_eq!(
+        count_where(
+            &db,
+            "contexts",
+            "id = $id",
+            db_params(vec![("id", Value::Uuid(leaked_context.as_uuid()))])
+        ),
+        0,
+        "failed observation must roll back auto-created context"
+    );
+    assert_eq!(
+        count_where(
+            &db,
+            "entities",
+            "id = $id",
+            db_params(vec![("id", Value::Uuid(leaked_entity.as_uuid()))])
+        ),
+        0,
+        "failed observation must roll back auto-created entity"
+    );
+}
+
+#[test]
 fn record_observation_invalid_content_hash_rejected_with_invalid_evidence_hash_valid_hash_accepted()
 {
     for (hash, expected_ok) in [
@@ -1889,6 +1948,14 @@ fn record_observation_structured_signal_terraform_webhook_state_delta_round_trip
     );
     let result = store.record_observation(input).expect("record");
     assert_eq!(result.evidence_ids, vec![evidence_id]);
+    assert_eq!(
+        store
+            .get_observation(observation_id)
+            .expect("observation")
+            .state_delta
+            .get("region"),
+        Some(&Some(serde_json::json!("eu-west-1")))
+    );
     let snapshot_id = result
         .snapshot_id
         .expect("structured state delta must create snapshot");
@@ -3030,7 +3097,7 @@ fn invalidate_decision_concurrent_against_same_active_decision_produces_exactly_
     .expect("reader open");
     assert_eq!(
         reader
-            .list_invalidations(Some(decision), None)
+            .list_invalidations(decision_context(&reader, decision), Some(decision), None)
             .expect("invalidations")
             .len(),
         1
@@ -3098,7 +3165,7 @@ fn invalidate_decision_actor_recoverable_through_one_hop_observation_source_walk
         .invalidate_decision(decision, obs, "basis changed")
         .expect("invalidate");
     let invalidations = store
-        .list_invalidations(Some(decision), None)
+        .list_invalidations(decision_context(&store, decision), Some(decision), None)
         .expect("invalidations");
     let decision_context = store
         .get_decision(decision)
@@ -3228,16 +3295,52 @@ fn invalidate_decision_per_context_isolation_consultant_b_invalidation_does_not_
         .expect("invalidate");
     assert!(
         store
-            .list_invalidations(Some(decision_a), None)
+            .list_invalidations(decision_context(&store, decision_a), Some(decision_a), None,)
             .expect("client-a invalidations")
             .is_empty()
     );
     assert_eq!(
         store
-            .list_invalidations(Some(decision), None)
+            .list_invalidations(decision_context(&store, decision), Some(decision), None)
             .expect("invalidations")
             .len(),
         1
+    );
+}
+
+#[test]
+fn list_invalidations_status_only_is_scoped_to_requested_context() {
+    let (_dir, store) = fresh_store();
+    let (decision_a, obs_a, _evidence_a) = seed_decision_with_source(&store, "client-a");
+    let (decision_b, obs_b, _evidence_b) = seed_decision_with_source(&store, "client-b");
+    let ctx_a = decision_context(&store, decision_a);
+    let ctx_b = decision_context(&store, decision_b);
+    store
+        .invalidate_decision(decision_a, obs_a, "client-a drift")
+        .expect("invalidate a");
+    store
+        .invalidate_decision(decision_b, obs_b, "client-b drift")
+        .expect("invalidate b");
+
+    let client_a_pending = store
+        .list_invalidations(ctx_a, None, Some(InvalidationStatus::Pending))
+        .expect("client-a pending");
+    let client_b_pending = store
+        .list_invalidations(ctx_b, None, Some(InvalidationStatus::Pending))
+        .expect("client-b pending");
+    assert_eq!(
+        client_a_pending
+            .iter()
+            .map(|row| row.affected_decision_id)
+            .collect::<Vec<_>>(),
+        vec![decision_a]
+    );
+    assert_eq!(
+        client_b_pending
+            .iter()
+            .map(|row| row.affected_decision_id)
+            .collect::<Vec<_>>(),
+        vec![decision_b]
     );
 }
 
@@ -3280,10 +3383,10 @@ fn invalidate_decision_concurrent_per_client_does_not_produce_cross_context_inva
     );
 
     let invalidations_a = store
-        .list_invalidations(Some(decision_a), None)
+        .list_invalidations(decision_context(&store, decision_a), Some(decision_a), None)
         .expect("client-a invalidations");
     let invalidations_b = store
-        .list_invalidations(Some(decision_b), None)
+        .list_invalidations(decision_context(&store, decision_b), Some(decision_b), None)
         .expect("client-b invalidations");
     assert_eq!(invalidations_a.len(), 1);
     assert_eq!(invalidations_b.len(), 1);
@@ -5431,7 +5534,11 @@ fn replay_under_concurrent_invalidator_returns_consistent_decision_status_across
         );
         assert_eq!(
             final_reader
-                .list_invalidations(Some(decision), None)
+                .list_invalidations(
+                    decision_context(&final_reader, decision),
+                    Some(decision),
+                    None,
+                )
                 .expect("invalidations")
                 .len(),
             1
@@ -5618,12 +5725,12 @@ fn invalidate_decision_with_consultant_session_source_records_reason_byte_equal_
     assert_eq!(result.new_status, DecisionStatus::Invalidated);
     assert!(
         store
-            .list_invalidations(Some(decision_a), None)
+            .list_invalidations(decision_context(&store, decision_a), Some(decision_a), None,)
             .expect("client-a invalidations")
             .is_empty()
     );
     let invalidations = store
-        .list_invalidations(Some(decision_b), None)
+        .list_invalidations(decision_context(&store, decision_b), Some(decision_b), None)
         .expect("client-b invalidations");
     assert_eq!(invalidations.len(), 1);
     assert_eq!(invalidations[0].context_id, ctx_b);
@@ -5908,7 +6015,8 @@ fn record_observation_derived_from_fan_out_two_children_pointing_at_same_parent_
 #[test]
 fn record_observation_state_delta_some_null_sets_json_null_distinct_from_none_which_deletes_property()
  {
-    let (_dir, store) = fresh_store();
+    let (dir, store) = fresh_store();
+    let db_path = dir.path().join("cg.db");
     let context_id = store
         .create_context(CreateContext {
             name: "null-vs-delete".to_string(),
@@ -5944,6 +6052,12 @@ fn record_observation_state_delta_some_null_sets_json_null_distinct_from_none_wh
         Vec::new(),
     );
     let result = store.record_observation(input).expect("record");
+    let observation = store.get_observation(observation_id).expect("observation");
+    assert_eq!(
+        observation.state_delta.get("region"),
+        Some(&Some(serde_json::Value::Null))
+    );
+    assert_eq!(observation.state_delta.get("tier"), Some(&None));
     let snapshot = store
         .entity_history(entity_id)
         .expect("history")
@@ -5958,6 +6072,39 @@ fn record_observation_state_delta_some_null_sets_json_null_distinct_from_none_wh
         !snapshot.properties.contains_key("tier"),
         "None must delete, distinct from Some(Null)"
     );
+    drop(store);
+
+    let reopened = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    })
+    .expect("reopen");
+    let reopened_observation = reopened
+        .get_observation(observation_id)
+        .expect("reopened observation");
+    assert_eq!(
+        reopened_observation.state_delta.get("region"),
+        Some(&Some(serde_json::Value::Null))
+    );
+    assert_eq!(reopened_observation.state_delta.get("tier"), Some(&None));
+    drop(reopened);
+
+    let db = Database::open(&db_path).expect("raw db");
+    let row = db
+        .execute(
+            "SELECT state_delta FROM observations WHERE id = $id",
+            &db_params(vec![("id", Value::Uuid(observation_id.as_uuid()))]),
+        )
+        .expect("raw state_delta");
+    assert_eq!(row.rows.len(), 1);
+    let Value::Json(raw) = &row.rows[0][0] else {
+        panic!("state_delta must be JSON");
+    };
+    assert_eq!(raw["format"], serde_json::json!("cg_state_delta_v1"));
+    assert_eq!(raw["ops"]["region"]["op"], serde_json::json!("set"));
+    assert!(raw["ops"]["region"]["value"].is_null());
+    assert_eq!(raw["ops"]["tier"]["op"], serde_json::json!("delete"));
+    assert!(raw["ops"]["tier"].get("value").is_none());
 }
 
 #[test]
