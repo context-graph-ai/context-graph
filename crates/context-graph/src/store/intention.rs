@@ -14,8 +14,9 @@ use super::convert::{
     intention_status_str, map_engine_err,
 };
 use super::encode::{
-    decode_outcome, get_json, get_optional_text, get_optional_txid, get_text, get_txid, get_uuid,
-    properties_from_json, properties_to_json, tags_from_json,
+    basis_diff_from_json, decode_outcome, get_bool, get_json, get_optional_text, get_optional_txid,
+    get_text, get_txid, get_uuid, intention_ids_from_json, properties_from_json,
+    properties_to_json, tags_from_json,
 };
 use super::relationship::uuid_or_clause;
 
@@ -37,7 +38,7 @@ impl Store {
                 .collect(),
         );
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             (
@@ -307,7 +308,7 @@ impl Store {
                 .collect();
         let clause = uuid_or_clause("affected_decision_id", "decision", &uuids, &mut params);
         let sql = format!(
-            "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE status = $status AND ({clause})"
+            "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE status = $status AND ({clause})"
         );
         let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
         let mut out = Vec::with_capacity(result.rows.len());
@@ -342,7 +343,7 @@ impl Store {
             }
         }
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let mut ok = true;
         let mut err: Option<CgError> = None;
         for (current, patch) in currents.iter().zip(patches.iter().map(|(_, p)| p)) {
@@ -517,7 +518,7 @@ impl Store {
             });
         }
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("status".to_string(), Value::Text("archived".to_string())),
@@ -705,7 +706,7 @@ impl Store {
                 .map(|t| JsonValue::String(t.clone()))
                 .collect(),
         );
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(input.id.as_uuid())),
             (
@@ -902,13 +903,33 @@ fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation
             "trigger_observation_id",
         )?),
         reason: get_optional_text(row, columns, "reason")?,
-        basis_diff: properties_from_json(&get_json(row, columns, "basis_diff")?),
+        basis_diff: basis_diff_from_json(&get_json(row, columns, "basis_diff")?),
+        cascade_from: optional_uuid(row, columns, "cascade_from")?.map(DecisionId::from),
         severity: invalidation_severity_from_str(&get_text(row, columns, "severity")?)?,
+        threatened_intention_ids: intention_ids_from_json(&get_json(
+            row,
+            columns,
+            "threatened_intention_ids",
+        )?),
+        intention_now_un_served: get_bool(row, columns, "intention_now_un_served")?,
         detected_at: get_txid(row, columns, "detected_at")?,
         resolved_at: get_optional_txid(row, columns, "resolved_at")?,
         resolution_action: get_optional_text(row, columns, "resolution_action")?,
         resolution_decision_id,
     })
+}
+
+fn optional_uuid(row: &[Value], columns: &[String], name: &str) -> Result<Option<Uuid>> {
+    let Some(idx) = columns.iter().position(|column| column == name) else {
+        return Ok(None);
+    };
+    match row.get(idx) {
+        Some(Value::Uuid(u)) => Ok(Some(*u)),
+        Some(Value::Null) | None => Ok(None),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected uuid|null, got {other:?}"
+        ))),
+    }
 }
 
 fn invalidation_status_from_str(s: &str) -> Result<InvalidationStatus> {

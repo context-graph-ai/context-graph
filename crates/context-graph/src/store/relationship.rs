@@ -33,7 +33,7 @@ impl Store {
         if from_entity.context_id != to_entity.context_id {
             return Err(CgError::CrossContextRelationship);
         }
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         if let Err(e) = self.insert_edge_in_tx(
             tx,
             from.as_uuid(),

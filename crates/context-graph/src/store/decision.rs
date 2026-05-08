@@ -13,8 +13,9 @@ use super::convert::{
     relationship_type_str,
 };
 use super::encode::{
-    decode_outcome, get_json, get_optional_float, get_optional_text, get_optional_txid, get_text,
-    get_txid, get_uuid, properties_from_json, properties_to_json, tags_from_json,
+    basis_diff_from_json, decode_outcome, get_bool, get_json, get_optional_float,
+    get_optional_text, get_optional_txid, get_text, get_txid, get_uuid, intention_ids_from_json,
+    properties_from_json, properties_to_json, tags_from_json,
 };
 use super::evidence::decode_evidence;
 
@@ -102,7 +103,7 @@ impl Store {
         self.validate_basis_snapshots_for_context(input.context_id, &basis_snapshot_ids)?;
         let basis_snapshots = self.basis_snapshots_for_basis(&basis_snapshot_ids)?;
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let confidence_value = match input.confidence {
             Some(c) => Value::Float64(c as f64),
             None => Value::Null,
@@ -608,7 +609,7 @@ impl Store {
             set_clauses.push("confidence = $confidence");
             params.insert("confidence".to_string(), Value::Float64(confidence as f64));
         }
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         if !set_clauses.is_empty() {
             let sql = format!(
                 "UPDATE decisions SET {} WHERE id = $id",
@@ -789,7 +790,7 @@ impl Store {
         self.validate_basis_snapshots_for_context(new.context_id, &basis_snapshot_ids)?;
         let basis_snapshots = self.basis_snapshots_for_basis(&basis_snapshot_ids)?;
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         // Transition old decision to superseded.
         let transition_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(old.as_uuid())),
@@ -1047,7 +1048,7 @@ impl Store {
         if from_context != to_context {
             return Err(CgError::CrossContextRelationship);
         }
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         if let Err(e) = self.insert_edge_in_tx(
             tx,
             from.as_uuid(),
@@ -1068,7 +1069,7 @@ impl Store {
             id: Some(id.as_uuid().to_string()),
             missing: Some("decision"),
         })?;
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("status".to_string(), Value::Text("archived".to_string())),
@@ -1480,7 +1481,7 @@ impl Store {
         let result = self
             .db
             .execute_at_snapshot(
-                "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE affected_decision_id = $affected_decision_id",
+                "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE affected_decision_id = $affected_decision_id",
                 &HashMap::from([(
                     "affected_decision_id".to_string(),
                     Value::Uuid(decision_id.as_uuid()),
@@ -1525,8 +1526,15 @@ fn decode_invalidation_at_read(columns: &[String], row: &[Value]) -> Result<Inva
             "trigger_observation_id",
         )?),
         reason: get_optional_text(row, columns, "reason")?,
-        basis_diff: properties_from_json(&get_json(row, columns, "basis_diff")?),
+        basis_diff: basis_diff_from_json(&get_json(row, columns, "basis_diff")?),
+        cascade_from: optional_uuid(row, columns, "cascade_from")?.map(DecisionId::from),
         severity: invalidation_severity_from_str(&get_text(row, columns, "severity")?)?,
+        threatened_intention_ids: intention_ids_from_json(&get_json(
+            row,
+            columns,
+            "threatened_intention_ids",
+        )?),
+        intention_now_un_served: get_bool(row, columns, "intention_now_un_served")?,
         detected_at: get_txid(row, columns, "detected_at")?,
         resolved_at: get_optional_txid(row, columns, "resolved_at")?,
         resolution_action: get_optional_text(row, columns, "resolution_action")?,

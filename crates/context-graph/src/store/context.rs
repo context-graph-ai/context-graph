@@ -42,7 +42,7 @@ impl Store {
             });
         }
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("name".to_string(), Value::Text(input.name.clone())),

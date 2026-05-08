@@ -15,12 +15,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use contextdb_core::{ColumnType, Error as EngineError, Value};
+use contextdb_core::{ColumnType, Error as EngineError, TxId, Value};
 use contextdb_engine::Database;
 
 use crate::Result;
 use crate::error::CgError;
-use crate::schema::{INDEXES, TABLES};
+use crate::schema::{IMPACT_ANALYSIS_TRIGGER_DDL, INDEXES, TABLES};
 use crate::types::*;
 
 use self::convert::map_engine_err;
@@ -89,6 +89,10 @@ impl Store {
 
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    pub(super) fn begin_tx(&self) -> Result<TxId> {
+        self.db.begin().map_err(map_engine_err)
     }
 
     pub fn admin_raw_install_legacy_schema_for_tests(
@@ -192,12 +196,35 @@ fn open_bootstrapped_database(
     let mut guard = registry.lock().expect("store registry lock");
     if !replace_shared_handle && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade) {
         bootstrap_schema(&existing, config, true)?;
+        register_impact_analysis_trigger(&existing)?;
         return Ok(existing);
     }
     let db = Arc::new(Database::open(db_path).map_err(map_engine_err)?);
     bootstrap_schema(&db, config, false)?;
+    register_impact_analysis_trigger(&db)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
     Ok(db)
+}
+
+fn register_impact_analysis_trigger(db: &Database) -> Result<()> {
+    if !db
+        .list_triggers()
+        .iter()
+        .any(|trigger| trigger.name == "impact_analysis_trigger")
+    {
+        db.execute(IMPACT_ANALYSIS_TRIGGER_DDL, &HashMap::new())
+            .map_err(map_engine_err)?;
+    }
+    if !db
+        .registered_trigger_callbacks()
+        .iter()
+        .any(|name| name == "impact_analysis_trigger")
+    {
+        db.register_trigger_callback("impact_analysis_trigger", |_db, _ctx| Ok(()))
+            .map_err(map_engine_err)?;
+        db.complete_initialization().map_err(map_engine_err)?;
+    }
+    Ok(())
 }
 
 fn bootstrap_schema(db: &Database, config: &StoreConfig, reused_shared_handle: bool) -> Result<()> {

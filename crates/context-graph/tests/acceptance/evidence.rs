@@ -413,6 +413,7 @@ fn seed_decision_with_source(
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
+            basis_fields: None,
             based_on_snapshots: observation_result.snapshot_id.into_iter().collect(),
             tags: vec![],
             properties: BTreeMap::new(),
@@ -481,6 +482,7 @@ fn seed_decision_with_evidence(
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
+            basis_fields: None,
             based_on_snapshots: observation_result.snapshot_id.into_iter().collect(),
             tags: vec![],
             properties: BTreeMap::new(),
@@ -2990,6 +2992,7 @@ fn replay_when_entity_snapshot_evidenced_by_is_empty_returns_snapshot_state_with
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
+            basis_fields: None,
             based_on_snapshots: vec![snapshot.id],
             tags: vec![],
             properties: BTreeMap::new(),
@@ -3214,6 +3217,7 @@ fn invalidate_decision_terminal_status_from_superseded_archived_invalidated_retu
                 confidence: current.confidence,
                 intention_ids: current.intention_ids.clone(),
                 based_on_entity_ids: Vec::new(),
+                basis_fields: None,
                 based_on_snapshots: current.based_on_snapshots.clone(),
                 tags: current.tags.clone(),
                 properties: current.properties.clone(),
@@ -3739,6 +3743,7 @@ fn decisions_based_on_snapshots_round_trip_from_normalized_db_table() {
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
+            basis_fields: None,
             based_on_snapshots: vec![],
             tags: vec![],
             properties: BTreeMap::new(),
@@ -3828,7 +3833,7 @@ fn replay_uses_entity_snapshot_observations_table_not_nested_data_copy() {
 
     let snapshot_id = EntitySnapshotId::new_v7();
     let db = Database::open(&db_path).expect("raw db");
-    let tx = db.begin();
+    let tx = db.begin().expect("begin");
     db.execute_in_tx(
         tx,
         "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
@@ -3928,7 +3933,7 @@ fn replay_ignores_nested_data_evidenced_by_when_normalized_table_has_no_lineage(
 
     let snapshot_id = EntitySnapshotId::new_v7();
     let db = Database::open(&db_path).expect("raw db");
-    let tx = db.begin();
+    let tx = db.begin().expect("begin");
     db.execute_in_tx(
         tx,
         "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
@@ -4010,7 +4015,7 @@ fn record_observation_state_delta_merges_from_entity_current_snapshot_not_orphan
 
     let orphan_snapshot = EntitySnapshotId::new_v7();
     let db = Database::open(&db_path).expect("raw db");
-    let tx = db.begin();
+    let tx = db.begin().expect("begin");
     db.execute_in_tx(
         tx,
         "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
@@ -4108,6 +4113,7 @@ fn update_decision_basis_preserves_decision_created_at_for_intention_replay_hori
             description: "preserve decision horizon".to_string(),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
+            basis_fields: None,
             context_id: ctx,
             ..Default::default()
         })
@@ -4288,6 +4294,7 @@ fn update_decision_basis_rejects_missing_and_cross_context_snapshots() {
             description: "pin only same-context basis".to_string(),
             intention_ids: vec![intention_a.id],
             based_on_entity_ids: vec![entity_a.id],
+            basis_fields: None,
             context_id: ctx_a,
             ..Default::default()
         })
@@ -4329,7 +4336,7 @@ fn decision_basis_snapshot_missing_target_rejected_by_db_fk() {
     drop(store);
     let missing = EntitySnapshotId::new_v7();
     let db = Database::open(&db_path).expect("raw db");
-    let tx = db.begin();
+    let tx = db.begin().expect("begin");
     let insert = db.execute_in_tx(
         tx,
         "INSERT INTO decision_basis_snapshots (id, context_id, decision_id, entity_id, snapshot_id, basis_order, created_at) VALUES ($id, $context_id, $decision_id, $entity_id, $snapshot_id, $basis_order, $created_at)",
@@ -4437,6 +4444,7 @@ fn replay_ignores_raw_cross_context_serves_edge_for_same_decision_source() {
             description: "cite only same context".to_string(),
             intention_ids: vec![intention_a.id],
             based_on_entity_ids: vec![entity.id],
+            basis_fields: None,
             context_id: ctx_a,
             ..Default::default()
         })
@@ -5407,6 +5415,7 @@ fn basis_diff_returns_divergence_for_enterprise_constraint_change_with_multi_mod
             confidence: Some(0.9),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
+            basis_fields: None,
             based_on_snapshots: vec![basis_snapshot],
             tags: vec![],
             properties: BTreeMap::new(),
@@ -5592,6 +5601,7 @@ fn basis_diff_for_nested_property_divergence_returns_full_nested_value_diff_byte
             confidence: Some(0.8),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
+            basis_fields: None,
             based_on_snapshots: vec![basis_snapshot.id],
             tags: vec![],
             properties: BTreeMap::new(),

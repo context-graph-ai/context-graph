@@ -43,7 +43,7 @@ impl Store {
             None => Value::Null,
         };
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let context_params = HashMap::from([
             ("id".to_string(), Value::Uuid(input.context_id.as_uuid())),
             (

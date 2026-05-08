@@ -11,8 +11,9 @@ use crate::types::*;
 use super::Store;
 use super::convert::{decision_status_from_str, map_engine_err};
 use super::encode::{
-    column_index, get_json, get_optional_text, get_optional_txid, get_text, get_txid, get_uuid,
-    properties_from_json, properties_to_json,
+    basis_diff_from_json, column_index, get_bool, get_json, get_optional_text, get_optional_txid,
+    get_text, get_txid, get_uuid, intention_ids_from_json, properties_from_json,
+    properties_to_json,
 };
 use super::{
     distance_metric_from_str, evidence_kind_from_str, retention_status_from_str,
@@ -64,7 +65,7 @@ impl Store {
         status: RetentionStatus,
     ) -> Result<()> {
         let _ = self.get_evidence(evidence_id)?;
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let params = HashMap::from([
             ("id".to_string(), Value::Uuid(uuid::Uuid::now_v7())),
             (
@@ -264,7 +265,7 @@ impl Store {
         let diff = self.basis_diff(decision_id)?;
         let basis_diff_json = serde_json::to_value(&diff).unwrap_or_else(|_| serde_json::json!({}));
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let invalidation_id = InvalidationId::from(decision_id.as_uuid());
         let update = self.db.execute_in_tx(
             tx,
@@ -317,7 +318,13 @@ impl Store {
             ),
             ("reason".to_string(), Value::Text(reason.clone())),
             ("basis_diff".to_string(), Value::Json(basis_diff_json)),
+            ("cascade_from".to_string(), Value::Null),
             ("severity".to_string(), Value::Text("warning".to_string())),
+            (
+                "threatened_intention_ids".to_string(),
+                Value::Json(serde_json::json!([])),
+            ),
+            ("intention_now_un_served".to_string(), Value::Bool(false)),
             ("detected_at".to_string(), Value::TxId(tx)),
             ("resolved_at".to_string(), Value::Null),
             ("resolution_action".to_string(), Value::Null),
@@ -325,7 +332,7 @@ impl Store {
         ]);
         let inserted = match self.db.execute_in_tx(
             tx,
-            "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $reason, $basis_diff, $severity, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+            "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $reason, $basis_diff, $cascade_from, $severity, $threatened_intention_ids, $intention_now_un_served, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
             &params,
         ) {
             Ok(result) => result.rows_affected,
@@ -398,7 +405,7 @@ impl Store {
             format!(" WHERE {}", clauses.join(" AND "))
         };
         let sql = format!(
-            "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, severity, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations{where_clause}"
+            "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations{where_clause}"
         );
         let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
         let mut rows = Vec::with_capacity(result.rows.len());
@@ -418,7 +425,7 @@ impl Store {
         self.validate_basis_snapshots_for_context(decision.context_id, &basis)?;
         let basis_snapshots = self.basis_snapshots_for_basis(&basis)?;
         for attempt in 0..8 {
-            let tx = self.db.begin();
+            let tx = self.begin_tx()?;
             if let Err(err) = self.replace_decision_basis_snapshots_in_tx(
                 tx,
                 decision.context_id,
@@ -937,8 +944,15 @@ fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation
             "trigger_observation_id",
         )?),
         reason: get_optional_text(row, columns, "reason")?,
-        basis_diff: properties_from_json(&get_json(row, columns, "basis_diff")?),
+        basis_diff: basis_diff_from_json(&get_json(row, columns, "basis_diff")?),
+        cascade_from: optional_uuid(row, columns, "cascade_from")?.map(DecisionId::from),
         severity: invalidation_severity_from_str(&get_text(row, columns, "severity")?)?,
+        threatened_intention_ids: intention_ids_from_json(&get_json(
+            row,
+            columns,
+            "threatened_intention_ids",
+        )?),
+        intention_now_un_served: get_bool(row, columns, "intention_now_un_served")?,
         detected_at: get_txid(row, columns, "detected_at")?,
         resolved_at: get_optional_txid(row, columns, "resolved_at")?,
         resolution_action: get_optional_text(row, columns, "resolution_action")?,

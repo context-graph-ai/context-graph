@@ -31,7 +31,7 @@ impl Store {
             None => Value::Null,
         };
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         if previous.is_some() {
             let delete_params: HashMap<String, Value> = [(
                 "decision_id".to_string(),

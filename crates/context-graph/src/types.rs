@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -616,6 +616,7 @@ pub struct RecordObservationResult {
     pub evidence_ids: Vec<EvidenceId>,
     pub embedding_ids: Vec<EmbeddingId>,
     pub snapshot_id: Option<EntitySnapshotId>,
+    pub invalidations: Vec<Invalidation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -705,6 +706,7 @@ pub struct CreateDecision {
     pub confidence: Option<f32>,
     pub intention_ids: Vec<IntentionId>,
     pub based_on_entity_ids: Vec<EntityId>,
+    pub basis_fields: Option<HashMap<EntityId, Vec<String>>>,
     pub based_on_snapshots: Vec<EntitySnapshotId>,
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, Value>,
@@ -886,8 +888,11 @@ pub struct Invalidation {
     pub affected_decision_id: DecisionId,
     pub trigger_observation_id: ObservationId,
     pub reason: Option<String>,
-    pub basis_diff: BTreeMap<String, Value>,
+    pub basis_diff: BasisDiffResult,
+    pub cascade_from: Option<DecisionId>,
     pub severity: InvalidationSeverity,
+    pub threatened_intention_ids: Vec<IntentionId>,
+    pub intention_now_un_served: bool,
     pub detected_at: TxId,
     pub resolved_at: Option<TxId>,
     pub resolution_action: Option<String>,

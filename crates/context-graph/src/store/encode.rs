@@ -23,6 +23,19 @@ pub(super) fn properties_from_json(v: &JsonValue) -> BTreeMap<String, JsonValue>
     }
 }
 
+pub(super) fn basis_diff_from_json(v: &JsonValue) -> BasisDiffResult {
+    serde_json::from_value(v.clone()).unwrap_or_else(|_| BasisDiffResult {
+        is_invalidated_candidate: false,
+        divergences: Vec::new(),
+        read_txid: TxId(0),
+        current_snapshot_read_txid: TxId(0),
+    })
+}
+
+pub(super) fn intention_ids_from_json(v: &JsonValue) -> Vec<IntentionId> {
+    serde_json::from_value(v.clone()).unwrap_or_default()
+}
+
 pub(super) fn tags_from_json(v: &JsonValue) -> Vec<String> {
     match v {
         JsonValue::Array(a) => a
@@ -106,6 +119,9 @@ pub(super) fn get_json(row: &[Value], columns: &[String], name: &str) -> Result<
     let idx = column_index(columns, name)?;
     match row.get(idx) {
         Some(Value::Json(v)) => Ok(v.clone()),
+        Some(Value::Text(s)) => serde_json::from_str(s).map_err(|err| {
+            CgError::Engine(format!("column {name}: invalid json text default: {err}"))
+        }),
         Some(Value::Null) => Ok(JsonValue::Null),
         None => Ok(JsonValue::Null),
         other => Err(CgError::Engine(format!(

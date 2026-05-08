@@ -46,7 +46,7 @@ impl Store {
         let state_delta_json = state_delta_to_json(&input.state_delta);
         let properties_json = properties_to_json(&input.properties);
         for _ in 0..16 {
-            let tx = self.db.begin();
+            let tx = self.begin_tx()?;
             if auto_create_entity
                 && let Err(e) =
                     self.ensure_context_and_entity_in_tx(tx, input.context_id, input.entity_id)
@@ -192,6 +192,7 @@ impl Store {
                     .map(|embedding| embedding.id)
                     .collect(),
                 snapshot_id,
+                invalidations: Vec::new(),
             });
         }
 

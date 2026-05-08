@@ -122,6 +122,7 @@ fn create_decision_input(
         confidence: Some(0.9),
         intention_ids,
         based_on_entity_ids,
+        basis_fields: None,
         based_on_snapshots: vec![],
         tags: vec![],
         properties: BTreeMap::new(),

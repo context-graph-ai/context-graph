@@ -180,6 +180,7 @@ fn seed_store_decision(
             description: "schema decision".to_string(),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity_id],
+            basis_fields: None,
             based_on_snapshots: vec![snapshot_id],
             context_id,
             ..Default::default()
@@ -2660,7 +2661,7 @@ fn combination_evidence_availability_log_concurrent_appends_persist_distinct_row
             let db = Arc::clone(&db);
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let tx = db.begin();
+                let tx = db.begin().expect("begin");
                 barrier.wait();
                 let result = db.execute_in_tx(
                     tx,
@@ -3192,7 +3193,7 @@ fn combination_observation_with_evidence_atomic_insert_under_fk_violation_rolls_
     insert_context(&db, context_id, "ctx-evidence-fk-rollback");
     insert_entity(&db, entity_id, context_id, "rollback-entity");
 
-    let tx = db.begin();
+    let tx = db.begin().expect("begin");
     let observation = db.execute_in_tx(
         tx,
         "INSERT INTO observations (id, entity_id, context_id, observation_type, observed_properties, state_delta, properties, source, timestamp, created_at) VALUES ($id, $entity_id, $context_id, $observation_type, $observed_properties, $state_delta, $properties, $source, $timestamp, $created_at)",
@@ -3289,7 +3290,7 @@ fn combination_evidence_self_fk_derived_from_validated_at_commit_against_committ
     let deleter_db = Arc::clone(&db);
     let deleter = std::thread::spawn(move || {
         tx2_started_recv.recv().expect("child tx started");
-        let tx = deleter_db.begin();
+        let tx = deleter_db.begin().expect("begin");
         let deleted = deleter_db.execute_in_tx(
             tx,
             "DELETE FROM evidence_delete_race WHERE id = $id",
@@ -3310,7 +3311,7 @@ fn combination_evidence_self_fk_derived_from_validated_at_commit_against_committ
 
     let child_db = Arc::clone(&db);
     let child_writer = std::thread::spawn(move || {
-        let tx = child_db.begin();
+        let tx = child_db.begin().expect("begin");
         tx2_started_send.send(()).expect("notify tx started");
         delete_committed_recv
             .recv()
@@ -3644,7 +3645,7 @@ fn combination_record_observation_text_evidence_vector_text_hnsw_atomic_with_row
     insert_context(&db, context_id, "ctx-vector-rollback");
     insert_entity(&db, entity_id, context_id, "entity-vector-rollback");
     insert_observation(&db, observation_id, entity_id, context_id);
-    let tx = db.begin();
+    let tx = db.begin().expect("begin");
     let row_id = db
         .insert_row(
             tx,

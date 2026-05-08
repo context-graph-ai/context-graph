@@ -1,4 +1,6 @@
 pub const DIGEST_VECTOR_DIMENSION: usize = 768;
+pub const IMPACT_ANALYSIS_TRIGGER_DDL: &str =
+    "CREATE TRIGGER impact_analysis_trigger ON observations WHEN INSERT";
 
 #[derive(Debug, Clone, Copy)]
 pub struct TableSpec {
@@ -64,7 +66,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "invalidations",
-        ddl: "CREATE TABLE invalidations (id UUID PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', context_id UUID NOT NULL REFERENCES contexts(id), affected_decision_id UUID NOT NULL REFERENCES decisions(id), trigger_observation_id UUID NOT NULL REFERENCES observations(id), reason TEXT, basis_diff JSON NOT NULL, severity TEXT NOT NULL, detected_at TXID NOT NULL, resolved_at TXID, resolution_action TEXT, resolution_decision_id UUID, UNIQUE (context_id, affected_decision_id), FOREIGN KEY (context_id, affected_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, trigger_observation_id) REFERENCES observations(context_id, id), FOREIGN KEY (context_id, resolution_decision_id) REFERENCES decisions(context_id, id)) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed])",
+        ddl: "CREATE TABLE invalidations (id UUID PRIMARY KEY, status TEXT NOT NULL DEFAULT 'pending', context_id UUID NOT NULL REFERENCES contexts(id), affected_decision_id UUID NOT NULL REFERENCES decisions(id), trigger_observation_id UUID NOT NULL REFERENCES observations(id), reason TEXT, basis_diff JSON NOT NULL, cascade_from UUID REFERENCES decisions(id), severity TEXT NOT NULL, threatened_intention_ids JSON NOT NULL DEFAULT '[]', intention_now_un_served BOOLEAN NOT NULL DEFAULT false, detected_at TXID NOT NULL, resolved_at TXID, resolution_action TEXT, resolution_decision_id UUID, UNIQUE (context_id, affected_decision_id), FOREIGN KEY (context_id, affected_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, trigger_observation_id) REFERENCES observations(context_id, id), FOREIGN KEY (context_id, cascade_from) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, resolution_decision_id) REFERENCES decisions(context_id, id)) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed])",
     },
     TableSpec {
         name: "signatures",

@@ -218,6 +218,7 @@ fn seed_decision(store: &Store) -> (DecisionId, ObservationId) {
             context_id: context,
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity],
+            basis_fields: None,
             based_on_snapshots: vec![snapshot_id],
             ..Default::default()
         })
@@ -528,7 +529,7 @@ fn probe_evidence_derived_from_fk_delete_race_rejects_child_insert() {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
             child_tx_started_recv.recv().expect("child tx started");
-            let tx = db.begin();
+            let tx = db.begin().expect("begin");
             let deleted = db.execute_in_tx(
                 tx,
                 "DELETE FROM evidence_delete_race_probe WHERE id = $id",
@@ -550,7 +551,7 @@ fn probe_evidence_derived_from_fk_delete_race_rejects_child_insert() {
     let child_insert = {
         let db = Arc::clone(&db);
         std::thread::spawn(move || {
-            let tx = db.begin();
+            let tx = db.begin().expect("begin");
             child_tx_started_send.send(()).expect("notify child tx");
             delete_committed_recv.recv().expect("delete committed");
             let inserted = db.execute_in_tx(

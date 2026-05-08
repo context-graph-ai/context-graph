@@ -31,7 +31,7 @@ impl Store {
                 .collect(),
         );
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             (
@@ -289,7 +289,7 @@ impl Store {
                 .collect(),
         );
 
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let update_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("name".to_string(), Value::Text(new_name.clone())),
@@ -411,7 +411,7 @@ impl Store {
             id: Some(id.as_uuid().to_string()),
             missing: Some("entity"),
         })?;
-        let tx = self.db.begin();
+        let tx = self.begin_tx()?;
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("status".to_string(), Value::Text("archived".to_string())),
