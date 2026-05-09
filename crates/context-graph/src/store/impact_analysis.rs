@@ -52,6 +52,7 @@ fn run_impact_analysis(db: &Database, ctx: &TriggerContext) -> contextdb_core::R
         return Ok(());
     }
 
+    let mut reads = ImpactReadCache::new(db, ctx.tx, context_id);
     let candidates = active_based_on_decisions(db, ctx.tx, entity_id, context_id)?;
     let mut direct_rows = Vec::new();
     for candidate in candidates {
@@ -74,13 +75,10 @@ fn run_impact_analysis(db: &Database, ctx: &TriggerContext) -> contextdb_core::R
         if !diff.is_invalidated_candidate {
             continue;
         }
-        let threatened = serves_intentions(db, ctx.tx, candidate.decision_id, context_id)?;
-        let unserved =
-            intention_now_unserved(db, ctx.tx, context_id, candidate.decision_id, &threatened)?;
+        let threatened = reads.serves_intentions(candidate.decision_id)?;
+        let unserved = intention_now_unserved(&mut reads, candidate.decision_id, &threatened)?;
         let severity = direct_severity(
-            db,
-            ctx.tx,
-            context_id,
+            &mut reads,
             candidate.decision_id,
             candidate.confidence,
             &threatened,
@@ -100,16 +98,18 @@ fn run_impact_analysis(db: &Database, ctx: &TriggerContext) -> contextdb_core::R
         append_cascade_rows(
             db,
             ctx.tx,
-            context_id,
             direct.affected_decision_id,
+            &mut reads,
             &mut rows,
         )?;
     }
 
-    for row in rows {
-        transition_decision_to_invalidated(db, ctx.tx, context_id, row.affected_decision_id)?;
-        insert_invalidation_row(db, ctx.tx, context_id, observation_id, row)?;
-    }
+    let affected_decision_ids = rows
+        .iter()
+        .map(|row| row.affected_decision_id)
+        .collect::<Vec<_>>();
+    transition_decisions_to_invalidated(db, ctx.tx, context_id, &affected_decision_ids)?;
+    insert_invalidation_rows(db, ctx.tx, context_id, observation_id, rows)?;
     Ok(())
 }
 
@@ -137,6 +137,79 @@ struct ImpactInvalidation {
     intention_now_un_served: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ActiveServer {
+    decision_id: Uuid,
+    confidence: Option<f64>,
+}
+
+struct ImpactReadCache<'a> {
+    db: &'a Database,
+    tx: TxId,
+    context_id: Uuid,
+    serves_by_decision: HashMap<Uuid, Vec<Uuid>>,
+    active_servers_by_intention: HashMap<Uuid, Vec<ActiveServer>>,
+    citing_by_decision: HashMap<Uuid, Vec<Uuid>>,
+}
+
+impl<'a> ImpactReadCache<'a> {
+    fn new(db: &'a Database, tx: TxId, context_id: Uuid) -> Self {
+        Self {
+            db,
+            tx,
+            context_id,
+            serves_by_decision: HashMap::new(),
+            active_servers_by_intention: HashMap::new(),
+            citing_by_decision: HashMap::new(),
+        }
+    }
+
+    fn serves_intentions(&mut self, decision_id: Uuid) -> contextdb_core::Result<Vec<Uuid>> {
+        if let Some(intention_ids) = self.serves_by_decision.get(&decision_id) {
+            return Ok(intention_ids.clone());
+        }
+        let intention_ids =
+            serves_intentions_uncached(self.db, self.tx, decision_id, self.context_id)?;
+        self.serves_by_decision
+            .insert(decision_id, intention_ids.clone());
+        Ok(intention_ids)
+    }
+
+    fn active_servers(&mut self, intention_id: Uuid) -> contextdb_core::Result<Vec<ActiveServer>> {
+        if let Some(servers) = self.active_servers_by_intention.get(&intention_id) {
+            return Ok(servers.clone());
+        }
+        let servers =
+            active_servers_for_intention_uncached(self.db, self.tx, self.context_id, intention_id)?;
+        self.active_servers_by_intention
+            .insert(intention_id, servers.clone());
+        Ok(servers)
+    }
+
+    fn sibling_confidences(
+        &mut self,
+        decision_id: Uuid,
+        intention_id: Uuid,
+    ) -> contextdb_core::Result<Vec<Option<f64>>> {
+        Ok(self
+            .active_servers(intention_id)?
+            .into_iter()
+            .filter(|server| server.decision_id != decision_id)
+            .map(|server| server.confidence)
+            .collect())
+    }
+
+    fn active_citing_decisions(&mut self, decision_id: Uuid) -> contextdb_core::Result<Vec<Uuid>> {
+        if let Some(citers) = self.citing_by_decision.get(&decision_id) {
+            return Ok(citers.clone());
+        }
+        let citers =
+            active_citing_decisions_uncached(self.db, self.tx, self.context_id, decision_id)?;
+        self.citing_by_decision.insert(decision_id, citers.clone());
+        Ok(citers)
+    }
+}
+
 fn graph_ids(
     db: &Database,
     tx: TxId,
@@ -154,6 +227,23 @@ fn graph_ids(
     Ok(out)
 }
 
+fn uuid_or_clause(
+    column: &str,
+    prefix: &str,
+    ids: &[Uuid],
+    params: &mut HashMap<String, Value>,
+) -> String {
+    ids.iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let key = format!("{prefix}_{index}");
+            params.insert(key.clone(), Value::Uuid(*id));
+            format!("{column} = ${key}")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 fn active_based_on_decisions(
     db: &Database,
     tx: TxId,
@@ -166,22 +256,26 @@ fn active_based_on_decisions(
         "SELECT b_id FROM GRAPH_TABLE(edges MATCH (e)<-[:BASED_ON]-(d) WHERE e.id = $entity_id COLUMNS (d.id AS b_id))",
         HashMap::from([("entity_id".to_string(), Value::Uuid(entity_id))]),
     )?;
-    let mut out = Vec::with_capacity(decision_ids.len());
-    for decision_id in decision_ids {
-        let result = db.execute_in_tx(
-            tx,
-            "SELECT edges.source_id, edges.properties, decisions.confidence FROM edges INNER JOIN decisions ON edges.source_id = decisions.id WHERE edges.source_id = $decision_id AND edges.target_id = $entity_id AND edges.context_id = $context_id AND edges.edge_type = $edge_type AND decisions.context_id = $context_id AND decisions.status = $status",
-            &HashMap::from([
-                ("decision_id".to_string(), Value::Uuid(decision_id)),
-                ("entity_id".to_string(), Value::Uuid(entity_id)),
-                ("context_id".to_string(), Value::Uuid(context_id)),
-                ("edge_type".to_string(), Value::Text("BASED_ON".to_string())),
-                ("status".to_string(), Value::Text("active".to_string())),
-            ]),
-        )?;
-        let Some(row) = result.rows.first() else {
-            continue;
-        };
+    if decision_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut params = HashMap::from([
+        ("entity_id".to_string(), Value::Uuid(entity_id)),
+        ("context_id".to_string(), Value::Uuid(context_id)),
+        ("edge_type".to_string(), Value::Text("BASED_ON".to_string())),
+        ("status".to_string(), Value::Text("active".to_string())),
+    ]);
+    let source_clause =
+        uuid_or_clause("edges.source_id", "decision_id", &decision_ids, &mut params);
+    let result = db.execute_in_tx(
+        tx,
+        &format!(
+            "SELECT edges.source_id, edges.properties, decisions.confidence FROM edges INNER JOIN decisions ON edges.source_id = decisions.id WHERE ({source_clause}) AND edges.target_id = $entity_id AND edges.context_id = $context_id AND edges.edge_type = $edge_type AND decisions.context_id = $context_id AND decisions.status = $status"
+        ),
+        &params,
+    )?;
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
         let properties = row_json(row, &result.columns, "properties")?;
         out.push(CandidateDecision {
             decision_id: row_uuid(row, &result.columns, "source_id")?,
@@ -272,7 +366,7 @@ fn diff_basis(
     }
 }
 
-fn serves_intentions(
+fn serves_intentions_uncached(
     db: &Database,
     tx: TxId,
     decision_id: Uuid,
@@ -284,71 +378,79 @@ fn serves_intentions(
         "SELECT b_id FROM GRAPH_TABLE(edges MATCH (d)-[:SERVES]->(i) WHERE d.id = $decision_id COLUMNS (i.id AS b_id))",
         HashMap::from([("decision_id".to_string(), Value::Uuid(decision_id))]),
     )?;
-    let mut out = Vec::with_capacity(intention_ids.len());
-    for intention_id in intention_ids {
-        let result = db.execute_in_tx(
-            tx,
-            "SELECT target_id FROM edges WHERE source_id = $decision_id AND target_id = $intention_id AND context_id = $context_id AND edge_type = $edge_type",
-            &HashMap::from([
-                ("decision_id".to_string(), Value::Uuid(decision_id)),
-                ("intention_id".to_string(), Value::Uuid(intention_id)),
-                ("context_id".to_string(), Value::Uuid(context_id)),
-                ("edge_type".to_string(), Value::Text("SERVES".to_string())),
-            ]),
-        )?;
-        if !result.rows.is_empty() {
-            out.push(intention_id);
-        }
+    if intention_ids.is_empty() {
+        return Ok(Vec::new());
     }
+    let mut params = HashMap::from([
+        ("decision_id".to_string(), Value::Uuid(decision_id)),
+        ("context_id".to_string(), Value::Uuid(context_id)),
+        ("edge_type".to_string(), Value::Text("SERVES".to_string())),
+    ]);
+    let target_clause = uuid_or_clause("target_id", "intention_id", &intention_ids, &mut params);
+    let result = db.execute_in_tx(
+        tx,
+        &format!(
+            "SELECT target_id FROM edges WHERE source_id = $decision_id AND ({target_clause}) AND context_id = $context_id AND edge_type = $edge_type"
+        ),
+        &params,
+    )?;
+    let mut out = result
+        .rows
+        .iter()
+        .map(|row| row_uuid(row, &result.columns, "target_id"))
+        .collect::<contextdb_core::Result<Vec<_>>>()?;
     out.sort();
     Ok(out)
 }
 
-fn active_serving_sibling_confidences(
+fn active_servers_for_intention_uncached(
     db: &Database,
     tx: TxId,
     context_id: Uuid,
-    decision_id: Uuid,
     intention_id: Uuid,
-) -> contextdb_core::Result<Vec<Option<f64>>> {
+) -> contextdb_core::Result<Vec<ActiveServer>> {
     let decision_ids = graph_ids(
         db,
         tx,
         "SELECT b_id FROM GRAPH_TABLE(edges MATCH (i)<-[:SERVES]-(d) WHERE i.id = $intention_id COLUMNS (d.id AS b_id))",
         HashMap::from([("intention_id".to_string(), Value::Uuid(intention_id))]),
     )?;
-    let mut out = Vec::new();
-    for sibling_id in decision_ids {
-        if sibling_id == decision_id {
-            continue;
-        }
-        let result = db.execute_in_tx(
-            tx,
-            "SELECT decisions.confidence FROM edges INNER JOIN decisions ON edges.source_id = decisions.id WHERE edges.source_id = $sibling_id AND edges.target_id = $intention_id AND edges.context_id = $context_id AND edges.edge_type = $edge_type AND decisions.context_id = $context_id AND decisions.status = $status",
-            &HashMap::from([
-                ("sibling_id".to_string(), Value::Uuid(sibling_id)),
-                ("intention_id".to_string(), Value::Uuid(intention_id)),
-                ("context_id".to_string(), Value::Uuid(context_id)),
-                ("edge_type".to_string(), Value::Text("SERVES".to_string())),
-                ("status".to_string(), Value::Text("active".to_string())),
-            ]),
-        )?;
-        if let Some(row) = result.rows.first() {
-            out.push(row_optional_float(row, &result.columns, "confidence")?);
-        }
+    if decision_ids.is_empty() {
+        return Ok(Vec::new());
     }
+    let mut params = HashMap::from([
+        ("intention_id".to_string(), Value::Uuid(intention_id)),
+        ("context_id".to_string(), Value::Uuid(context_id)),
+        ("edge_type".to_string(), Value::Text("SERVES".to_string())),
+        ("status".to_string(), Value::Text("active".to_string())),
+    ]);
+    let source_clause = uuid_or_clause("edges.source_id", "server_id", &decision_ids, &mut params);
+    let result = db.execute_in_tx(
+        tx,
+        &format!(
+            "SELECT decisions.id, decisions.confidence FROM edges INNER JOIN decisions ON edges.source_id = decisions.id WHERE ({source_clause}) AND edges.target_id = $intention_id AND edges.context_id = $context_id AND edges.edge_type = $edge_type AND decisions.context_id = $context_id AND decisions.status = $status"
+        ),
+        &params,
+    )?;
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        out.push(ActiveServer {
+            decision_id: row_uuid(row, &result.columns, "id")?,
+            confidence: row_optional_float(row, &result.columns, "confidence")?,
+        });
+    }
+    out.sort_by_key(|server| server.decision_id);
     Ok(out)
 }
 
 fn intention_now_unserved(
-    db: &Database,
-    tx: TxId,
-    context_id: Uuid,
+    reads: &mut ImpactReadCache<'_>,
     decision_id: Uuid,
     intention_ids: &[Uuid],
 ) -> contextdb_core::Result<bool> {
     for intention_id in intention_ids {
-        if active_serving_sibling_confidences(db, tx, context_id, decision_id, *intention_id)?
+        if reads
+            .sibling_confidences(decision_id, *intention_id)?
             .is_empty()
         {
             return Ok(true);
@@ -358,9 +460,7 @@ fn intention_now_unserved(
 }
 
 fn direct_severity(
-    db: &Database,
-    tx: TxId,
-    context_id: Uuid,
+    reads: &mut ImpactReadCache<'_>,
     decision_id: Uuid,
     confidence: Option<f64>,
     intention_ids: &[Uuid],
@@ -375,8 +475,7 @@ fn direct_severity(
         return Ok(InvalidationSeverity::Warning);
     }
     for intention_id in intention_ids {
-        let siblings =
-            active_serving_sibling_confidences(db, tx, context_id, decision_id, *intention_id)?;
+        let siblings = reads.sibling_confidences(decision_id, *intention_id)?;
         if siblings.is_empty() {
             return Ok(InvalidationSeverity::Critical);
         }
@@ -394,8 +493,8 @@ fn direct_severity(
 fn append_cascade_rows(
     db: &Database,
     tx: TxId,
-    context_id: Uuid,
     direct_decision_id: Uuid,
+    reads: &mut ImpactReadCache<'_>,
     rows: &mut Vec<ImpactInvalidation>,
 ) -> contextdb_core::Result<()> {
     if db.trigger_cascade_depth_cap() <= CASCADE_DEPTH_CAP {
@@ -410,12 +509,12 @@ fn append_cascade_rows(
         if depth >= CASCADE_DEPTH_CAP {
             continue;
         }
-        for citer in active_citing_decisions(db, tx, context_id, current)? {
+        for citer in reads.active_citing_decisions(current)? {
             if !visited.insert(citer) {
                 continue;
             }
-            let threatened = serves_intentions(db, tx, citer, context_id)?;
-            let unserved = intention_now_unserved(db, tx, context_id, citer, &threatened)?;
+            let threatened = reads.serves_intentions(citer)?;
+            let unserved = intention_now_unserved(reads, citer, &threatened)?;
             rows.push(ImpactInvalidation {
                 affected_decision_id: citer,
                 basis_diff: BasisDiffResult {
@@ -435,7 +534,7 @@ fn append_cascade_rows(
     Ok(())
 }
 
-fn active_citing_decisions(
+fn active_citing_decisions_uncached(
     db: &Database,
     tx: TxId,
     context_id: Uuid,
@@ -447,117 +546,145 @@ fn active_citing_decisions(
         "SELECT b_id FROM GRAPH_TABLE(edges MATCH (cited)<-[:CITES]-(d) WHERE cited.id = $decision_id COLUMNS (d.id AS b_id))",
         HashMap::from([("decision_id".to_string(), Value::Uuid(cited_decision_id))]),
     )?;
-    let mut out = Vec::with_capacity(decision_ids.len());
-    for decision_id in decision_ids {
-        let result = db.execute_in_tx(
-            tx,
-            "SELECT edges.source_id FROM edges INNER JOIN decisions ON edges.source_id = decisions.id WHERE edges.source_id = $decision_id AND edges.target_id = $cited_decision_id AND edges.context_id = $context_id AND edges.edge_type = $edge_type AND decisions.context_id = $context_id AND decisions.status = $status",
-            &HashMap::from([
-                ("decision_id".to_string(), Value::Uuid(decision_id)),
-                (
-                    "cited_decision_id".to_string(),
-                    Value::Uuid(cited_decision_id),
-                ),
-                ("context_id".to_string(), Value::Uuid(context_id)),
-                ("edge_type".to_string(), Value::Text("CITES".to_string())),
-                ("status".to_string(), Value::Text("active".to_string())),
-            ]),
-        )?;
-        if !result.rows.is_empty() {
-            out.push(decision_id);
-        }
+    if decision_ids.is_empty() {
+        return Ok(Vec::new());
     }
+    let mut params = HashMap::from([
+        (
+            "cited_decision_id".to_string(),
+            Value::Uuid(cited_decision_id),
+        ),
+        ("context_id".to_string(), Value::Uuid(context_id)),
+        ("edge_type".to_string(), Value::Text("CITES".to_string())),
+        ("status".to_string(), Value::Text("active".to_string())),
+    ]);
+    let source_clause = uuid_or_clause("edges.source_id", "citer_id", &decision_ids, &mut params);
+    let result = db.execute_in_tx(
+        tx,
+        &format!(
+            "SELECT edges.source_id FROM edges INNER JOIN decisions ON edges.source_id = decisions.id WHERE ({source_clause}) AND edges.target_id = $cited_decision_id AND edges.context_id = $context_id AND edges.edge_type = $edge_type AND decisions.context_id = $context_id AND decisions.status = $status"
+        ),
+        &params,
+    )?;
+    let mut out = result
+        .rows
+        .iter()
+        .map(|row| row_uuid(row, &result.columns, "source_id"))
+        .collect::<contextdb_core::Result<Vec<_>>>()?;
     out.sort();
     Ok(out)
 }
 
-fn transition_decision_to_invalidated(
+fn transition_decisions_to_invalidated(
     db: &Database,
     tx: TxId,
     context_id: Uuid,
-    decision_id: Uuid,
+    decision_ids: &[Uuid],
 ) -> contextdb_core::Result<()> {
+    if decision_ids.is_empty() {
+        return Ok(());
+    }
+    let mut params = HashMap::from([
+        ("context_id".to_string(), Value::Uuid(context_id)),
+        (
+            "new_status".to_string(),
+            Value::Text("invalidated".to_string()),
+        ),
+        ("old_status".to_string(), Value::Text("active".to_string())),
+    ]);
+    let id_clause = uuid_or_clause("id", "decision_id", decision_ids, &mut params);
     let result = db.execute_in_tx(
         tx,
-        "UPDATE decisions SET status = $new_status WHERE id = $id AND context_id = $context_id AND status = $old_status",
-        &HashMap::from([
-            ("id".to_string(), Value::Uuid(decision_id)),
-            ("context_id".to_string(), Value::Uuid(context_id)),
-            (
-                "new_status".to_string(),
-                Value::Text("invalidated".to_string()),
-            ),
-            ("old_status".to_string(), Value::Text("active".to_string())),
-        ]),
+        &format!(
+            "UPDATE decisions SET status = $new_status WHERE ({id_clause}) AND context_id = $context_id AND status = $old_status"
+        ),
+        &params,
     )?;
-    if result.rows_affected != 1 {
+    if result.rows_affected != decision_ids.len() as u64 {
         return Err(EngineError::Other(format!(
-            "impact analysis could not invalidate active decision {decision_id}"
+            "impact analysis invalidated {} active decisions, expected {}",
+            result.rows_affected,
+            decision_ids.len()
         )));
     }
     Ok(())
 }
 
-fn insert_invalidation_row(
+fn insert_invalidation_rows(
     db: &Database,
     tx: TxId,
     context_id: Uuid,
     observation_id: Uuid,
-    row: ImpactInvalidation,
+    rows: Vec<ImpactInvalidation>,
 ) -> contextdb_core::Result<()> {
-    let basis_diff = serde_json::to_value(&row.basis_diff)
-        .map_err(|err| EngineError::Other(format!("basis diff serialize: {err}")))?;
-    let threatened_ids = row
-        .threatened_intention_ids
-        .iter()
-        .copied()
-        .map(IntentionId::from)
-        .collect::<Vec<_>>();
-    let threatened = serde_json::to_value(threatened_ids)
-        .map_err(|err| EngineError::Other(format!("threatened intentions serialize: {err}")))?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut params = HashMap::from([
+        ("status".to_string(), Value::Text("pending".to_string())),
+        ("context_id".to_string(), Value::Uuid(context_id)),
+        (
+            "trigger_observation_id".to_string(),
+            Value::Uuid(observation_id),
+        ),
+        ("reason".to_string(), Value::Null),
+        ("detected_at".to_string(), Value::TxId(tx)),
+        ("resolved_at".to_string(), Value::Null),
+        ("resolution_action".to_string(), Value::Null),
+        ("resolution_decision_id".to_string(), Value::Null),
+    ]);
+    let mut values_sql = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let basis_diff = serde_json::to_value(&row.basis_diff)
+            .map_err(|err| EngineError::Other(format!("basis diff serialize: {err}")))?;
+        let threatened_ids = row
+            .threatened_intention_ids
+            .iter()
+            .copied()
+            .map(IntentionId::from)
+            .collect::<Vec<_>>();
+        let threatened = serde_json::to_value(threatened_ids)
+            .map_err(|err| EngineError::Other(format!("threatened intentions serialize: {err}")))?;
+        let id_key = format!("id_{index}");
+        let affected_key = format!("affected_decision_id_{index}");
+        let basis_diff_key = format!("basis_diff_{index}");
+        let cascade_from_key = format!("cascade_from_{index}");
+        let severity_key = format!("severity_{index}");
+        let threatened_key = format!("threatened_intention_ids_{index}");
+        let unserved_key = format!("intention_now_un_served_{index}");
+        params.insert(id_key.clone(), Value::Uuid(Uuid::now_v7()));
+        params.insert(affected_key.clone(), Value::Uuid(row.affected_decision_id));
+        params.insert(basis_diff_key.clone(), Value::Json(basis_diff));
+        params.insert(
+            cascade_from_key.clone(),
+            row.cascade_from.map(Value::Uuid).unwrap_or(Value::Null),
+        );
+        params.insert(
+            severity_key.clone(),
+            Value::Text(invalidation_severity_str(row.severity).to_string()),
+        );
+        params.insert(threatened_key.clone(), Value::Json(threatened));
+        params.insert(
+            unserved_key.clone(),
+            Value::Bool(row.intention_now_un_served),
+        );
+        values_sql.push(format!(
+            "(${id_key}, $status, $context_id, ${affected_key}, $trigger_observation_id, $reason, ${basis_diff_key}, ${cascade_from_key}, ${severity_key}, ${threatened_key}, ${unserved_key}, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)"
+        ));
+    }
     let result = db.execute_in_tx(
         tx,
-        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $reason, $basis_diff, $cascade_from, $severity, $threatened_intention_ids, $intention_now_un_served, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
-        &HashMap::from([
-            ("id".to_string(), Value::Uuid(Uuid::now_v7())),
-            ("status".to_string(), Value::Text("pending".to_string())),
-            ("context_id".to_string(), Value::Uuid(context_id)),
-            (
-                "affected_decision_id".to_string(),
-                Value::Uuid(row.affected_decision_id),
-            ),
-            (
-                "trigger_observation_id".to_string(),
-                Value::Uuid(observation_id),
-            ),
-            ("reason".to_string(), Value::Null),
-            ("basis_diff".to_string(), Value::Json(basis_diff)),
-            (
-                "cascade_from".to_string(),
-                row.cascade_from.map(Value::Uuid).unwrap_or(Value::Null),
-            ),
-            (
-                "severity".to_string(),
-                Value::Text(invalidation_severity_str(row.severity).to_string()),
-            ),
-            (
-                "threatened_intention_ids".to_string(),
-                Value::Json(threatened),
-            ),
-            (
-                "intention_now_un_served".to_string(),
-                Value::Bool(row.intention_now_un_served),
-            ),
-            ("detected_at".to_string(), Value::TxId(tx)),
-            ("resolved_at".to_string(), Value::Null),
-            ("resolution_action".to_string(), Value::Null),
-            ("resolution_decision_id".to_string(), Value::Null),
-        ]),
+        &format!(
+            "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES {}",
+            values_sql.join(", ")
+        ),
+        &params,
     )?;
-    if result.rows_affected != 1 {
+    if result.rows_affected != rows.len() as u64 {
         return Err(EngineError::Other(format!(
-            "impact analysis invalidation insert did not create row for decision {}",
-            row.affected_decision_id
+            "impact analysis inserted {} invalidation rows, expected {}",
+            result.rows_affected,
+            rows.len()
         )));
     }
     Ok(())

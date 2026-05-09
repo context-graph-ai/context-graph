@@ -33,3 +33,8 @@ path = "../../benches/cg_crud.rs"
 name = "cg_graph"
 harness = false
 path = "../../benches/cg_graph.rs"
+
+[[bench]]
+name = "cg_impact_analysis"
+harness = false
+path = "../../benches/cg_impact_analysis.rs"
