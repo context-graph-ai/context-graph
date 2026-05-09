@@ -202,10 +202,13 @@ fn engine_serializes_concurrent_record_observation_with_typed_error_on_refusal()
     let invalidations = store
         .list_invalidations(ctx.id, None, Some(InvalidationStatus::Pending))
         .expect("invalidations");
-    assert_eq!(invalidations.len(), successes);
-    for result in results.into_iter().filter_map(Result::ok) {
-        assert_eq!(result.invalidations.len(), 1);
-    }
+    assert_eq!(invalidations.len(), 1);
+    let returned_count = results
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|result| result.invalidations.len())
+        .sum::<usize>();
+    assert_eq!(returned_count, 1);
 }
 
 // The cascade cap should be the product's ten-hop boundary, not the engine ceiling.

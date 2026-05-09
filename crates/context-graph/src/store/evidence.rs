@@ -416,6 +416,37 @@ impl Store {
         Ok(rows)
     }
 
+    pub(super) fn invalidations_for_observation(
+        &self,
+        context_id: ContextId,
+        observation_id: ObservationId,
+    ) -> Result<Vec<Invalidation>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE context_id = $context_id AND trigger_observation_id = $trigger_observation_id",
+                &HashMap::from([
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    (
+                        "trigger_observation_id".to_string(),
+                        Value::Uuid(observation_id.as_uuid()),
+                    ),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        let mut rows = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            rows.push(decode_invalidation(&result.columns, row)?);
+        }
+        rows.sort_by(|a, b| {
+            a.cascade_from
+                .is_some()
+                .cmp(&b.cascade_from.is_some())
+                .then_with(|| a.affected_decision_id.cmp(&b.affected_decision_id))
+        });
+        Ok(rows)
+    }
+
     pub fn update_decision_basis(
         &self,
         decision_id: DecisionId,

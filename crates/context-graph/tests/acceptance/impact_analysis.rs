@@ -532,6 +532,73 @@ fn impact_analysis_severity_critical_when_sole_active_decision_serving_intention
     assert_path_diff(row, "region", json!("us-east-1"), json!("eu-west-1"));
 }
 
+// Cross-context SERVES edges must not mask a high-confidence decision becoming unserved.
+#[test]
+fn impact_analysis_severity_siblings_are_context_scoped() {
+    let (dir, store) = fresh_store();
+    let ctx_a = context(&store, "severity-a");
+    let ctx_b = context(&store, "severity-b");
+    let ent_a = entity(
+        &store,
+        ctx_a.id,
+        "service-a",
+        props(&[("region", json!("us-east-1"))]),
+    );
+    let intent_a = intention(&store, ctx_a.id, "Keep A region current");
+    let intent_b = intention(&store, ctx_b.id, "Keep B region current");
+    let d_a = decision(
+        &store,
+        ctx_a.id,
+        "A region",
+        Some(0.9),
+        vec![intent_a.id],
+        vec![ent_a.id],
+        None,
+        Vec::new(),
+    );
+    let d_b = decision(
+        &store,
+        ctx_b.id,
+        "B region",
+        Some(0.95),
+        vec![intent_b.id],
+        Vec::new(),
+        None,
+        Vec::new(),
+    );
+    drop(store);
+    let db = open_raw_database(&dir);
+    db.execute(
+        "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $properties)",
+        &HashMap::from([
+            ("id".to_string(), Value::Uuid(uuid::Uuid::now_v7())),
+            ("source_id".to_string(), Value::Uuid(d_b.id.as_uuid())),
+            ("target_id".to_string(), Value::Uuid(intent_a.id.as_uuid())),
+            ("edge_type".to_string(), Value::Text("SERVES".to_string())),
+            ("context_id".to_string(), Value::Uuid(ctx_b.id.as_uuid())),
+            ("valid_from".to_string(), Value::TxId(TxId(1))),
+            ("properties".to_string(), Value::Json(json!({}))),
+        ]),
+    )
+    .expect("cross-context serves edge");
+    drop(db);
+    let store = reopen_store(&dir);
+
+    let result = observe(
+        &store,
+        ctx_a.id,
+        ent_a.id,
+        delta(&[("region", json!("eu-west-1"))]),
+    );
+
+    assert_eq!(result.invalidations.len(), 1);
+    let row = &result.invalidations[0];
+    assert_eq!(row.affected_decision_id, d_a.id);
+    assert_eq!(row.severity, InvalidationSeverity::Critical);
+    assert!(row.intention_now_un_served);
+    assert_eq!(row.threatened_intention_ids, vec![intent_a.id]);
+}
+
 // Retired decisions should not be re-opened by a new observation.
 #[test]
 fn impact_analysis_respects_decision_status() {
@@ -597,7 +664,13 @@ fn impact_analysis_respects_decision_status() {
         None,
         Vec::new(),
     );
-    let prior_observation = observe(&store, ctx.id, ent.id, delta(&[("owner", json!("team-a"))]));
+    let marker = entity(&store, ctx.id, "manual-marker", BTreeMap::new());
+    let prior_observation = observe(
+        &store,
+        ctx.id,
+        marker.id,
+        delta(&[("owner", json!("team-a"))]),
+    );
     store
         .invalidate_decision(d5.id, prior_observation.observation_id, "basis changed")
         .expect("manual invalidation");

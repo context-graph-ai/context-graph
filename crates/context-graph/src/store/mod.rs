@@ -6,6 +6,7 @@ mod digest;
 mod encode;
 mod entity;
 mod evidence;
+mod impact_analysis;
 mod intention;
 mod observation;
 mod outcome;
@@ -20,10 +21,11 @@ use contextdb_engine::Database;
 
 use crate::Result;
 use crate::error::CgError;
-use crate::schema::{IMPACT_ANALYSIS_TRIGGER_DDL, INDEXES, TABLES};
+use crate::schema::{INDEXES, TABLES};
 use crate::types::*;
 
 use self::convert::map_engine_err;
+use self::impact_analysis::register_impact_analysis_trigger;
 
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
@@ -204,27 +206,6 @@ fn open_bootstrapped_database(
     register_impact_analysis_trigger(&db)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
     Ok(db)
-}
-
-fn register_impact_analysis_trigger(db: &Database) -> Result<()> {
-    if !db
-        .list_triggers()
-        .iter()
-        .any(|trigger| trigger.name == "impact_analysis_trigger")
-    {
-        db.execute(IMPACT_ANALYSIS_TRIGGER_DDL, &HashMap::new())
-            .map_err(map_engine_err)?;
-    }
-    if !db
-        .registered_trigger_callbacks()
-        .iter()
-        .any(|name| name == "impact_analysis_trigger")
-    {
-        db.register_trigger_callback("impact_analysis_trigger", |_db, _ctx| Ok(()))
-            .map_err(map_engine_err)?;
-        db.complete_initialization().map_err(map_engine_err)?;
-    }
-    Ok(())
 }
 
 fn bootstrap_schema(db: &Database, config: &StoreConfig, reused_shared_handle: bool) -> Result<()> {

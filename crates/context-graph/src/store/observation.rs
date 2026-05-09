@@ -182,6 +182,7 @@ impl Store {
                 }
             }
 
+            let invalidations = self.invalidations_for_observation(input.context_id, id)?;
             std::thread::yield_now();
             return Ok(RecordObservationResult {
                 observation_id: id,
@@ -192,7 +193,7 @@ impl Store {
                     .map(|embedding| embedding.id)
                     .collect(),
                 snapshot_id,
-                invalidations: Vec::new(),
+                invalidations,
             });
         }
 
@@ -939,7 +940,9 @@ fn state_delta_to_json(delta: &BTreeMap<String, Option<JsonValue>>) -> JsonValue
     })
 }
 
-fn state_delta_from_json(value: JsonValue) -> Result<BTreeMap<String, Option<JsonValue>>> {
+pub(super) fn state_delta_from_json(
+    value: JsonValue,
+) -> Result<BTreeMap<String, Option<JsonValue>>> {
     let JsonValue::Object(mut object) = value else {
         return Err(CgError::Engine(
             "observations.state_delta must be a JSON object".to_string(),

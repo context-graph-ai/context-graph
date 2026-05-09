@@ -169,13 +169,18 @@ impl Store {
             if !basis_edge_entities.insert(basis_snapshot.entity_id) {
                 continue;
             }
+            let basis_fields = input
+                .basis_fields
+                .as_ref()
+                .and_then(|fields| fields.get(&basis_snapshot.entity_id))
+                .map(Vec::as_slice);
             if let Err(e) = self.insert_edge_in_tx(
                 tx,
                 id.as_uuid(),
                 basis_snapshot.entity_id.as_uuid(),
                 "BASED_ON",
                 input.context_id,
-                Some(basis_snapshot_edge_properties(basis_snapshot)),
+                Some(basis_snapshot_edge_properties(basis_snapshot, basis_fields)),
             ) {
                 let _ = self.db.rollback(tx);
                 return Err(e);
@@ -879,13 +884,18 @@ impl Store {
             if !basis_edge_entities.insert(basis_snapshot.entity_id) {
                 continue;
             }
+            let basis_fields = new
+                .basis_fields
+                .as_ref()
+                .and_then(|fields| fields.get(&basis_snapshot.entity_id))
+                .map(Vec::as_slice);
             if let Err(e) = self.insert_edge_in_tx(
                 tx,
                 new_id.as_uuid(),
                 basis_snapshot.entity_id.as_uuid(),
                 "BASED_ON",
                 new.context_id,
-                Some(basis_snapshot_edge_properties(basis_snapshot)),
+                Some(basis_snapshot_edge_properties(basis_snapshot, basis_fields)),
             ) {
                 let _ = self.db.rollback(tx);
                 return Err(e);
@@ -1579,8 +1589,17 @@ fn invalidation_severity_from_str(raw: &str) -> Result<InvalidationSeverity> {
     }
 }
 
-fn basis_snapshot_edge_properties(snapshot: &EntitySnapshot) -> JsonValue {
-    serde_json::json!({ "basis_snapshot": snapshot })
+fn basis_snapshot_edge_properties(
+    snapshot: &EntitySnapshot,
+    basis_fields: Option<&[String]>,
+) -> JsonValue {
+    let mut properties = serde_json::json!({ "basis_snapshot": snapshot });
+    if let Some(fields) = basis_fields
+        && let Some(object) = properties.as_object_mut()
+    {
+        object.insert("basis_fields".to_string(), serde_json::json!(fields));
+    }
+    properties
 }
 
 fn decision_basis_row_id(decision_id: DecisionId, basis_order: usize) -> uuid::Uuid {
