@@ -137,6 +137,12 @@ struct ImpactInvalidation {
     intention_now_un_served: bool,
 }
 
+pub(super) struct DecisionInvalidationContext {
+    pub threatened_intention_ids: Vec<Uuid>,
+    pub intention_now_un_served: bool,
+    pub severity: InvalidationSeverity,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ActiveServer {
     decision_id: Uuid,
@@ -441,6 +447,30 @@ fn active_servers_for_intention_uncached(
     }
     out.sort_by_key(|server| server.decision_id);
     Ok(out)
+}
+
+pub(super) fn decision_invalidation_context(
+    db: &Database,
+    tx: TxId,
+    context_id: Uuid,
+    decision_id: Uuid,
+    confidence: Option<f64>,
+) -> contextdb_core::Result<DecisionInvalidationContext> {
+    let mut reads = ImpactReadCache::new(db, tx, context_id);
+    let threatened_intention_ids = reads.serves_intentions(decision_id)?;
+    let intention_now_un_served =
+        intention_now_unserved(&mut reads, decision_id, &threatened_intention_ids)?;
+    let severity = direct_severity(
+        &mut reads,
+        decision_id,
+        confidence,
+        &threatened_intention_ids,
+    )?;
+    Ok(DecisionInvalidationContext {
+        threatened_intention_ids,
+        intention_now_un_served,
+        severity,
+    })
 }
 
 fn intention_now_unserved(

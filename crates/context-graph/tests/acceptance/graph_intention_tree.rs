@@ -158,9 +158,8 @@ fn seed_observation(
     .observation_id
 }
 
-// The `Store` facade exposes no invalidation-write method. Invalidations are
-// produced by engine-emission on observation basis-diffs; these tests exercise
-// only the read path, so rows are seeded via a direct contextdb INSERT.
+// These tests exercise intention-tree ordering over pre-existing invalidations,
+// so rows are seeded directly with the canonical typed invalidation shape.
 fn seed_invalidation(
     db_path: &Path,
     context_id: ContextId,
@@ -183,7 +182,15 @@ fn seed_invalidation(
             "trigger".to_string(),
             Value::Uuid(trigger_observation.as_uuid()),
         ),
-        ("basis_diff".to_string(), Value::Json(serde_json::json!({}))),
+        (
+            "basis_diff".to_string(),
+            Value::Json(serde_json::json!({
+                "is_invalidated_candidate": true,
+                "divergences": [],
+                "read_txid": detected_at,
+                "current_snapshot_read_txid": detected_at
+            })),
+        ),
         ("severity".to_string(), Value::Text(severity.to_string())),
         ("detected_at".to_string(), Value::TxId(TxId(detected_at))),
     ]

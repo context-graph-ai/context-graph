@@ -23,17 +23,14 @@ pub(super) fn properties_from_json(v: &JsonValue) -> BTreeMap<String, JsonValue>
     }
 }
 
-pub(super) fn basis_diff_from_json(v: &JsonValue) -> BasisDiffResult {
-    serde_json::from_value(v.clone()).unwrap_or_else(|_| BasisDiffResult {
-        is_invalidated_candidate: false,
-        divergences: Vec::new(),
-        read_txid: TxId(0),
-        current_snapshot_read_txid: TxId(0),
-    })
+pub(super) fn basis_diff_from_json(v: &JsonValue) -> Result<BasisDiffResult> {
+    serde_json::from_value(v.clone())
+        .map_err(|err| CgError::Engine(format!("invalid basis_diff JSON: {err}")))
 }
 
-pub(super) fn intention_ids_from_json(v: &JsonValue) -> Vec<IntentionId> {
-    serde_json::from_value(v.clone()).unwrap_or_default()
+pub(super) fn intention_ids_from_json(v: &JsonValue) -> Result<Vec<IntentionId>> {
+    serde_json::from_value(v.clone())
+        .map_err(|err| CgError::Engine(format!("invalid threatened_intention_ids JSON: {err}")))
 }
 
 pub(super) fn tags_from_json(v: &JsonValue) -> Vec<String> {

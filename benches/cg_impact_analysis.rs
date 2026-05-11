@@ -6,8 +6,8 @@ use chrono::Utc;
 use context_graph::{
     Context, ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, Decision,
     Entity, EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef,
-    Intention, IntentionOrigin, IntentionStatus, ObservationId, RecordObservation, RetentionStatus,
-    Store, StoreConfig,
+    Intention, IntentionOrigin, IntentionStatus, ObservationId, RecordObservation,
+    RecordObservationResult, RetentionStatus, Store, StoreConfig,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -116,9 +116,14 @@ fn evidence_ref(observation_id: ObservationId) -> EvidenceRef {
     }
 }
 
-fn observe_region_change(store: &Store, context_id: ContextId, entity_id: EntityId, region: &str) {
+fn observe_region_change(
+    store: &Store,
+    context_id: ContextId,
+    entity_id: EntityId,
+    region: &str,
+) -> RecordObservationResult {
     let observation_id = ObservationId::new_v7();
-    let result = store
+    store
         .record_observation(RecordObservation {
             id: observation_id,
             entity_id,
@@ -132,12 +137,7 @@ fn observe_region_change(store: &Store, context_id: ContextId, entity_id: Entity
             properties: BTreeMap::new(),
             embeddings: Vec::new(),
         })
-        .expect("observation");
-    assert_eq!(
-        result.invalidations.len(),
-        EXPECTED_INVALIDATIONS_PER_OBSERVATION,
-        "impact-analysis bench should exercise direct invalidations plus depth-10 cascade rows"
-    );
+        .expect("observation")
 }
 
 fn seed_unrelated_decisions(store: &Store, ctx: &Context) {
@@ -236,8 +236,13 @@ fn main() {
     for (index, entity_id) in cases.into_iter().enumerate() {
         println!("observing sample {index}");
         let started = Instant::now();
-        observe_region_change(&store, ctx.id, entity_id, &format!("eu-west-{index}"));
+        let result = observe_region_change(&store, ctx.id, entity_id, &format!("eu-west-{index}"));
         let elapsed = started.elapsed();
+        assert_eq!(
+            result.invalidations.len(),
+            EXPECTED_INVALIDATIONS_PER_OBSERVATION,
+            "impact-analysis bench should exercise direct invalidations plus depth-10 cascade rows"
+        );
         println!("observed sample {index}: {elapsed:?}");
         samples.push(elapsed);
     }

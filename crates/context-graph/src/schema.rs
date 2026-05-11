@@ -1,5 +1,5 @@
 pub const DIGEST_VECTOR_DIMENSION: usize = 768;
-pub const IMPACT_ANALYSIS_TRIGGER_DDL: &str =
+pub(crate) const IMPACT_ANALYSIS_TRIGGER_DDL: &str =
     "CREATE TRIGGER impact_analysis_trigger ON observations WHEN INSERT";
 
 #[derive(Debug, Clone, Copy)]

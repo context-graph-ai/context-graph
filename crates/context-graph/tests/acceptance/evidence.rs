@@ -3148,6 +3148,10 @@ fn invalidate_decision_active_to_invalidated_returns_result_with_previous_status
  {
     let (_dir, store) = fresh_store();
     let (decision, obs, _evidence) = seed_decision(&store);
+    let original = store
+        .get_decision(decision)
+        .expect("decision")
+        .expect("decision row");
     let result = store
         .invalidate_decision(decision, obs, "basis changed")
         .expect("invalidate");
@@ -3157,6 +3161,16 @@ fn invalidate_decision_active_to_invalidated_returns_result_with_previous_status
     assert!(result.invalidation_id.is_valid());
     assert_ne!(result.invalidation_id.as_uuid(), uuid::Uuid::nil());
     assert!(result.transitioned_at.0 > 0);
+
+    let rows = store
+        .list_invalidations(original.context_id, Some(decision), None)
+        .expect("invalidations");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.reason.as_deref(), Some("basis changed"));
+    assert_eq!(row.threatened_intention_ids, original.intention_ids);
+    assert!(row.intention_now_un_served);
+    assert_eq!(row.severity, InvalidationSeverity::Critical);
 }
 
 #[test]

@@ -11,10 +11,11 @@ use crate::types::*;
 use super::Store;
 use super::convert::{decision_status_from_str, map_engine_err};
 use super::encode::{
-    basis_diff_from_json, column_index, get_bool, get_json, get_optional_text, get_optional_txid,
-    get_text, get_txid, get_uuid, intention_ids_from_json, properties_from_json,
+    basis_diff_from_json, column_index, get_bool, get_json, get_optional_float, get_optional_text,
+    get_optional_txid, get_text, get_txid, get_uuid, intention_ids_from_json, properties_from_json,
     properties_to_json,
 };
+use super::impact_analysis::decision_invalidation_context;
 use super::{
     distance_metric_from_str, evidence_kind_from_str, retention_status_from_str,
     retention_status_str,
@@ -263,7 +264,8 @@ impl Store {
             return Err(CgError::CrossContextViolation);
         }
         let diff = self.basis_diff(decision_id)?;
-        let basis_diff_json = serde_json::to_value(&diff).unwrap_or_else(|_| serde_json::json!({}));
+        let basis_diff_json = serde_json::to_value(&diff)
+            .map_err(|err| CgError::Engine(format!("basis diff serialize: {err}")))?;
 
         let tx = self.begin_tx()?;
         let invalidation_id = InvalidationId::from(decision_id.as_uuid());
@@ -301,6 +303,31 @@ impl Store {
             });
         }
 
+        let intention_context = match decision_invalidation_context(
+            &self.db,
+            tx,
+            decision.context_id.as_uuid(),
+            decision_id.as_uuid(),
+            decision.confidence,
+        ) {
+            Ok(context) => context,
+            Err(err) => {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(err));
+            }
+        };
+        let threatened_intention_ids = intention_context
+            .threatened_intention_ids
+            .iter()
+            .copied()
+            .map(IntentionId::from)
+            .collect::<Vec<_>>();
+        let threatened_intention_ids =
+            serde_json::to_value(threatened_intention_ids).map_err(|err| {
+                let _ = self.db.rollback(tx);
+                CgError::Engine(format!("threatened intentions serialize: {err}"))
+            })?;
+
         let params = HashMap::from([
             ("id".to_string(), Value::Uuid(invalidation_id.as_uuid())),
             ("status".to_string(), Value::Text("pending".to_string())),
@@ -319,12 +346,18 @@ impl Store {
             ("reason".to_string(), Value::Text(reason.clone())),
             ("basis_diff".to_string(), Value::Json(basis_diff_json)),
             ("cascade_from".to_string(), Value::Null),
-            ("severity".to_string(), Value::Text("warning".to_string())),
+            (
+                "severity".to_string(),
+                Value::Text(invalidation_severity_str(intention_context.severity).to_string()),
+            ),
             (
                 "threatened_intention_ids".to_string(),
-                Value::Json(serde_json::json!([])),
+                Value::Json(threatened_intention_ids),
             ),
-            ("intention_now_un_served".to_string(), Value::Bool(false)),
+            (
+                "intention_now_un_served".to_string(),
+                Value::Bool(intention_context.intention_now_un_served),
+            ),
             ("detected_at".to_string(), Value::TxId(tx)),
             ("resolved_at".to_string(), Value::Null),
             ("resolution_action".to_string(), Value::Null),
@@ -647,7 +680,7 @@ impl Store {
         let result = self
             .db
             .execute(
-                "SELECT status, context_id FROM decisions WHERE id = $id",
+                "SELECT status, context_id, confidence FROM decisions WHERE id = $id",
                 &HashMap::from([("id".to_string(), Value::Uuid(decision_id.as_uuid()))]),
             )
             .map_err(map_engine_err)?;
@@ -660,6 +693,7 @@ impl Store {
         Ok(DecisionStatusAndContext {
             status: decision_status_from_str(&get_text(row, &result.columns, "status")?)?,
             context_id: ContextId::from(get_uuid(row, &result.columns, "context_id")?),
+            confidence: get_optional_float(row, &result.columns, "confidence")?,
         })
     }
 
@@ -721,6 +755,7 @@ impl Store {
 struct DecisionStatusAndContext {
     status: DecisionStatus,
     context_id: ContextId,
+    confidence: Option<f64>,
 }
 
 fn evidence_select_sql(where_clause: &str) -> &'static str {
@@ -975,14 +1010,14 @@ fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation
             "trigger_observation_id",
         )?),
         reason: get_optional_text(row, columns, "reason")?,
-        basis_diff: basis_diff_from_json(&get_json(row, columns, "basis_diff")?),
+        basis_diff: basis_diff_from_json(&get_json(row, columns, "basis_diff")?)?,
         cascade_from: optional_uuid(row, columns, "cascade_from")?.map(DecisionId::from),
         severity: invalidation_severity_from_str(&get_text(row, columns, "severity")?)?,
         threatened_intention_ids: intention_ids_from_json(&get_json(
             row,
             columns,
             "threatened_intention_ids",
-        )?),
+        )?)?,
         intention_now_un_served: get_bool(row, columns, "intention_now_un_served")?,
         detected_at: get_txid(row, columns, "detected_at")?,
         resolved_at: get_optional_txid(row, columns, "resolved_at")?,
@@ -1021,6 +1056,14 @@ fn invalidation_severity_from_str(raw: &str) -> Result<InvalidationSeverity> {
         other => Err(CgError::Engine(format!(
             "unknown invalidation severity: {other}"
         ))),
+    }
+}
+
+fn invalidation_severity_str(severity: InvalidationSeverity) -> &'static str {
+    match severity {
+        InvalidationSeverity::Info => "info",
+        InvalidationSeverity::Warning => "warning",
+        InvalidationSeverity::Critical => "critical",
     }
 }
 
