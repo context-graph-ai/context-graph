@@ -68,6 +68,11 @@ impl Store {
             {
                 continue;
             }
+            if let Some(actor) = &filter.actor
+                && &entry.actor != actor
+            {
+                continue;
+            }
             out.push(entry);
         }
         out.sort_by_key(|e| e.txid.0);
@@ -100,6 +105,7 @@ impl Store {
             AuditTarget::Entity(e) => ("entity", e.as_uuid()),
             AuditTarget::Observation(o) => ("observation", o.as_uuid()),
             AuditTarget::Outcome(d) => ("outcome", d.as_uuid()),
+            AuditTarget::Invalidation(i) => ("invalidation", i.as_uuid()),
         };
         let reason_value = match &reason {
             Some(r) => Value::Text(r.clone()),
@@ -157,6 +163,7 @@ fn decode_audit_entry(columns: &[String], row: &[Value]) -> Result<AuditEntry> {
         "entity" => AuditTarget::Entity(EntityId::from(target_id)),
         "observation" => AuditTarget::Observation(ObservationId::from(target_id)),
         "outcome" => AuditTarget::Outcome(DecisionId::from(target_id)),
+        "invalidation" => AuditTarget::Invalidation(InvalidationId::from(target_id)),
         other => {
             return Err(CgError::Engine(format!(
                 "unknown audit target kind: {other}"
@@ -167,6 +174,7 @@ fn decode_audit_entry(columns: &[String], row: &[Value]) -> Result<AuditEntry> {
         JsonValue::Null => None,
         other => serde_json::from_value::<Outcome>(other.clone()).ok(),
     };
+    let payload = decode_audit_payload(&payload)?;
     Ok(AuditEntry {
         id,
         txid,
@@ -176,5 +184,42 @@ fn decode_audit_entry(columns: &[String], row: &[Value]) -> Result<AuditEntry> {
         target,
         context_id,
         outcome,
+        payload,
     })
+}
+
+pub fn decode_audit_payload(value: &JsonValue) -> Result<Option<AuditPayload>> {
+    let JsonValue::Object(map) = value else {
+        return Ok(None);
+    };
+    let Some(action) = map.get("action").and_then(JsonValue::as_str) else {
+        return Ok(None);
+    };
+    match action {
+        "new_decision_created" => {
+            let decision_id = map
+                .get("resolution_decision_id")
+                .and_then(JsonValue::as_str)
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                .map(DecisionId::from);
+            Ok(Some(AuditPayload::Resolution(ResolutionPayload {
+                action: ResolveAction::NewDecisionCreated,
+                resolution_decision_id: decision_id,
+            })))
+        }
+        "basis_still_valid" => Ok(Some(AuditPayload::Resolution(ResolutionPayload {
+            action: ResolveAction::BasisStillValid,
+            resolution_decision_id: None,
+        }))),
+        "dismissed_as_irrelevant" => {
+            let reason = map
+                .get("reason")
+                .and_then(JsonValue::as_str)
+                .map(ToString::to_string);
+            Ok(Some(AuditPayload::Dismissal(DismissalPayload { reason })))
+        }
+        other => Err(CgError::Engine(format!(
+            "unknown invalidation audit payload action: {other}"
+        ))),
+    }
 }

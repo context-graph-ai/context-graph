@@ -3850,9 +3850,10 @@ fn replay_uses_entity_snapshot_observations_table_not_nested_data_copy() {
     let tx = db.begin().expect("begin");
     db.execute_in_tx(
         tx,
-        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
         &db_params(vec![
             ("id", Value::Uuid(snapshot_id.as_uuid())),
+            ("context_id", Value::Uuid(ctx.as_uuid())),
             ("entity_id", Value::Uuid(entity.id.as_uuid())),
             (
                 "data",
@@ -3950,9 +3951,10 @@ fn replay_ignores_nested_data_evidenced_by_when_normalized_table_has_no_lineage(
     let tx = db.begin().expect("begin");
     db.execute_in_tx(
         tx,
-        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
         &db_params(vec![
             ("id", Value::Uuid(snapshot_id.as_uuid())),
+            ("context_id", Value::Uuid(ctx.as_uuid())),
             ("entity_id", Value::Uuid(entity.id.as_uuid())),
             (
                 "data",
@@ -4032,9 +4034,10 @@ fn record_observation_state_delta_merges_from_entity_current_snapshot_not_orphan
     let tx = db.begin().expect("begin");
     db.execute_in_tx(
         tx,
-        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
         &db_params(vec![
             ("id", Value::Uuid(orphan_snapshot.as_uuid())),
+            ("context_id", Value::Uuid(ctx.as_uuid())),
             ("entity_id", Value::Uuid(entity.id.as_uuid())),
             (
                 "data",

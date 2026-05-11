@@ -56,6 +56,7 @@ impl Store {
         }
         let insert_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
             (
                 "decision_id".to_string(),
                 Value::Uuid(decision_id.as_uuid()),
@@ -68,7 +69,7 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO outcomes (id, decision_id, success, notes, recorded_at) VALUES ($id, $decision_id, $success, $notes, $recorded_at)",
+            "INSERT INTO outcomes (id, context_id, decision_id, success, notes, recorded_at) VALUES ($id, $context_id, $decision_id, $success, $notes, $recorded_at)",
             &insert_params,
         ) {
             let _ = self.db.rollback(tx);

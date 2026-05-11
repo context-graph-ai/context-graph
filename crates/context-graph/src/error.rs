@@ -1,6 +1,9 @@
 use std::fmt;
 
-use crate::{DecisionStatus, IntentionId, IntentionStatus, TxId};
+use crate::{
+    DecisionId, DecisionStatus, IntentionId, IntentionStatus, InvalidationId, InvalidationStatus,
+    TxId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CgError {
@@ -95,6 +98,32 @@ pub enum CgError {
         got: usize,
     },
     EngineStateMachineError(String),
+    InvalidTransition {
+        from: InvalidationStatus,
+        to: InvalidationStatus,
+    },
+    InvalidationNotFound {
+        id: InvalidationId,
+    },
+    ResolutionDecisionDoesNotServeIntention {
+        invalidation_id: InvalidationId,
+        decision_id: DecisionId,
+        expected_intention_ids: Vec<IntentionId>,
+    },
+    BasisStillValidRequiresActiveDecision {
+        invalidation_id: InvalidationId,
+        decision_id: DecisionId,
+        current_status: DecisionStatus,
+    },
+    DecisionNotFound {
+        id: DecisionId,
+    },
+    ResolveActionMissingDecision {
+        invalidation_id: InvalidationId,
+    },
+    ResolveActionUnexpectedDecision {
+        invalidation_id: InvalidationId,
+    },
     ForeignKeyViolation {
         table: &'static str,
         column: &'static str,

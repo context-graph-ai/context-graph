@@ -65,10 +65,14 @@ impl Store {
         evidence_id: EvidenceId,
         status: RetentionStatus,
     ) -> Result<()> {
-        let _ = self.get_evidence(evidence_id)?;
+        let evidence = self.get_evidence(evidence_id)?;
         let tx = self.begin_tx()?;
         let params = HashMap::from([
             ("id".to_string(), Value::Uuid(uuid::Uuid::now_v7())),
+            (
+                "context_id".to_string(),
+                Value::Uuid(evidence.context_id.as_uuid()),
+            ),
             (
                 "evidence_id".to_string(),
                 Value::Uuid(evidence_id.as_uuid()),
@@ -85,7 +89,7 @@ impl Store {
         ]);
         if let Err(err) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO evidence_availability_log (id, evidence_id, status, recorded_at_txid, recorded_at) VALUES ($id, $evidence_id, $status, $recorded_at_txid, $recorded_at)",
+            "INSERT INTO evidence_availability_log (id, context_id, evidence_id, status, recorded_at_txid, recorded_at) VALUES ($id, $context_id, $evidence_id, $status, $recorded_at_txid, $recorded_at)",
             &params,
         ) {
             let _ = self.db.rollback(tx);

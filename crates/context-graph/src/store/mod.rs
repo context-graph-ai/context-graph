@@ -8,11 +8,12 @@ mod entity;
 mod evidence;
 mod impact_analysis;
 mod intention;
+mod invalidation_lifecycle;
 mod observation;
 mod outcome;
 mod relationship;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -26,6 +27,7 @@ use crate::types::*;
 
 use self::convert::map_engine_err;
 use self::impact_analysis::register_impact_analysis_trigger;
+pub use self::invalidation_lifecycle::ScopedStore;
 
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
@@ -35,6 +37,7 @@ static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::n
 pub struct Store {
     db_path: PathBuf,
     db: Arc<Database>,
+    resource_owner: Option<Arc<Database>>,
     https_allowed_hosts: Vec<String>,
     file_uri_allowed: bool,
     trace: Arc<Mutex<String>>,
@@ -45,6 +48,7 @@ impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Store")
             .field("db_path", &self.db_path)
+            .field("has_resource_owner", &self.resource_owner.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -52,6 +56,10 @@ impl std::fmt::Debug for Store {
 impl Store {
     pub fn open(config: StoreConfig) -> Result<Self> {
         Self::open_with_config(config)
+    }
+
+    pub fn open_with_contexts(config: StoreConfig, contexts: BTreeSet<ContextId>) -> Result<Self> {
+        Self::open_with_config_inner(config, false, Some(contexts))
     }
 
     pub fn initialize_fresh(config: StoreConfig) -> Result<Self> {
@@ -65,19 +73,25 @@ impl Store {
     }
 
     fn open_with_config(config: StoreConfig) -> Result<Self> {
-        Self::open_with_config_inner(config, false)
+        Self::open_with_config_inner(config, false, None)
     }
 
     fn open_with_config_replacing(config: StoreConfig) -> Result<Self> {
-        Self::open_with_config_inner(config, true)
+        Self::open_with_config_inner(config, true, None)
     }
 
-    fn open_with_config_inner(config: StoreConfig, replace_shared_handle: bool) -> Result<Self> {
+    fn open_with_config_inner(
+        config: StoreConfig,
+        replace_shared_handle: bool,
+        contexts: Option<BTreeSet<ContextId>>,
+    ) -> Result<Self> {
         let db_path = config.db_path.clone();
-        let db = open_bootstrapped_database(&db_path, &config, replace_shared_handle)?;
+        let (db, resource_owner) =
+            open_bootstrapped_database(&db_path, &config, replace_shared_handle, contexts)?;
         Ok(Self {
             db_path,
             db,
+            resource_owner,
             https_allowed_hosts: config
                 .https_allowed_hosts
                 .into_iter()
@@ -91,6 +105,14 @@ impl Store {
 
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    pub fn with_principal(&self, principal: Principal) -> ScopedStore<'_> {
+        ScopedStore::new(self, principal)
+    }
+
+    pub fn with_system_principal(&self) -> ScopedStore<'_> {
+        self.with_principal(Principal::System)
     }
 
     pub(super) fn begin_tx(&self) -> Result<TxId> {
@@ -193,19 +215,37 @@ fn open_bootstrapped_database(
     db_path: &Path,
     config: &StoreConfig,
     replace_shared_handle: bool,
-) -> Result<Arc<Database>> {
+    contexts: Option<BTreeSet<ContextId>>,
+) -> Result<(Arc<Database>, Option<Arc<Database>>)> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().expect("store registry lock");
     if !replace_shared_handle && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade) {
         bootstrap_schema(&existing, config, true)?;
         register_impact_analysis_trigger(&existing)?;
-        return Ok(existing);
+        if let Some(contexts) = contexts {
+            let engine_contexts = contexts
+                .into_iter()
+                .map(|ctx| contextdb_core::types::ContextId::new(ctx.as_uuid()))
+                .collect();
+            return Ok((
+                Arc::new(existing.scoped_with_contexts(engine_contexts)),
+                Some(existing),
+            ));
+        }
+        return Ok((existing, None));
     }
     let db = Arc::new(Database::open(db_path).map_err(map_engine_err)?);
     bootstrap_schema(&db, config, false)?;
     register_impact_analysis_trigger(&db)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
-    Ok(db)
+    if let Some(contexts) = contexts {
+        let engine_contexts = contexts
+            .into_iter()
+            .map(|ctx| contextdb_core::types::ContextId::new(ctx.as_uuid()))
+            .collect();
+        return Ok((Arc::new(db.scoped_with_contexts(engine_contexts)), Some(db)));
+    }
+    Ok((db, None))
 }
 
 fn bootstrap_schema(db: &Database, config: &StoreConfig, reused_shared_handle: bool) -> Result<()> {

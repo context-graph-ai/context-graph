@@ -1,0 +1,16 @@
+error[E0599]: no method named `acknowledge_invalidation` found for struct `Store` in the current scope
+ --> tests/compile_fail/invalidation_requires_principal.rs:6:19
+  |
+6 |     let _ = store.acknowledge_invalidation(id);
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+help: there is a method `list_invalidations` with a similar name, but with different arguments
+ --> src/store/evidence.rs
+  |
+  | /     pub fn list_invalidations(
+  | |         &self,
+  | |         context_id: ContextId,
+  | |         decision_id: Option<DecisionId>,
+  | |         status: Option<InvalidationStatus>,
+  | |     ) -> Result<Vec<Invalidation>> {
+  | |__________________________________^

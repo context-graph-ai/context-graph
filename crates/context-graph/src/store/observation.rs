@@ -674,6 +674,10 @@ impl Store {
         let snap_params = HashMap::from([
             ("id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
             (
+                "context_id".to_string(),
+                Value::Uuid(input.context_id.as_uuid()),
+            ),
+            (
                 "entity_id".to_string(),
                 Value::Uuid(input.entity_id.as_uuid()),
             ),
@@ -684,7 +688,7 @@ impl Store {
         self.db
             .execute_in_tx(
                 tx,
-                "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+                "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
                 &snap_params,
             )
             .map_err(map_engine_err)
@@ -701,6 +705,10 @@ impl Store {
         if let Some(current) = current {
             let link_params = HashMap::from([
                 ("id".to_string(), Value::Uuid(uuid::Uuid::now_v7())),
+                (
+                    "context_id".to_string(),
+                    Value::Uuid(input.context_id.as_uuid()),
+                ),
                 (
                     "entity_id".to_string(),
                     Value::Uuid(input.entity_id.as_uuid()),
@@ -719,7 +727,7 @@ impl Store {
                 .db
                 .execute_in_tx(
                     tx,
-                    "INSERT INTO entity_snapshot_links (id, entity_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $entity_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
+                    "INSERT INTO entity_snapshot_links (id, context_id, entity_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $context_id, $entity_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
                     &link_params,
                 )
                 .map_err(|err| {
@@ -734,7 +742,7 @@ impl Store {
                 return Err(StateDeltaMergeError::Retry);
             }
         }
-        self.set_current_entity_snapshot_in_tx(tx, input.entity_id, snapshot_id)
+        self.set_current_entity_snapshot_in_tx(tx, input.context_id, input.entity_id, snapshot_id)
             .map_err(StateDeltaMergeError::Error)?;
         Ok(Some(snapshot_id))
     }

@@ -7,4 +7,5 @@ mod graph_intention_tree;
 mod graph_precedent_chain;
 mod graph_traverse;
 mod impact_analysis;
+mod invalidation_lifecycle;
 mod temporal;

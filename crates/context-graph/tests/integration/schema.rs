@@ -371,11 +371,12 @@ fn insert_evidence(
     .unwrap();
 }
 
-fn insert_outcome(db: &Database, id: Uuid, decision_id: Uuid) {
+fn insert_outcome(db: &Database, id: Uuid, context_id: Uuid, decision_id: Uuid) {
     db.execute(
-        "INSERT INTO outcomes (id, decision_id, success, notes, recorded_at) VALUES ($id, $decision_id, $success, $notes, $recorded_at)",
+        "INSERT INTO outcomes (id, context_id, decision_id, success, notes, recorded_at) VALUES ($id, $context_id, $decision_id, $success, $notes, $recorded_at)",
         &params(vec![
             ("id", Value::Uuid(id)),
+            ("context_id", Value::Uuid(context_id)),
             ("decision_id", Value::Uuid(decision_id)),
             ("success", Value::Bool(true)),
             ("notes", Value::Text("works as expected".into())),
@@ -500,11 +501,19 @@ fn insert_edge(
     .unwrap();
 }
 
-fn insert_snapshot(db: &Database, id: Uuid, entity_id: Uuid, valid_from: i64, valid_to: i64) {
+fn insert_snapshot(
+    db: &Database,
+    id: Uuid,
+    context_id: Uuid,
+    entity_id: Uuid,
+    valid_from: i64,
+    valid_to: i64,
+) {
     db.execute(
-        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
         &params(vec![
             ("id", Value::Uuid(id)),
+            ("context_id", Value::Uuid(context_id)),
             ("entity_id", Value::Uuid(entity_id)),
             ("data", Value::Json(json!({"version": valid_from}))),
             ("valid_from", Value::TxId(TxId(valid_from as u64))),
@@ -514,11 +523,12 @@ fn insert_snapshot(db: &Database, id: Uuid, entity_id: Uuid, valid_from: i64, va
     .unwrap();
 }
 
-fn insert_approval(db: &Database, id: Uuid, decision_id: Uuid) {
+fn insert_approval(db: &Database, id: Uuid, context_id: Uuid, decision_id: Uuid) {
     db.execute(
-        "INSERT INTO approvals (id, decision_id, approver_id, level, rationale, created_at) VALUES ($id, $decision_id, $approver_id, $level, $rationale, $created_at)",
+        "INSERT INTO approvals (id, context_id, decision_id, approver_id, level, rationale, created_at) VALUES ($id, $context_id, $decision_id, $approver_id, $level, $rationale, $created_at)",
         &params(vec![
             ("id", Value::Uuid(id)),
+            ("context_id", Value::Uuid(context_id)),
             ("decision_id", Value::Uuid(decision_id)),
             ("approver_id", Value::Text("approver-1".into())),
             ("level", Value::Text("team".into())),
@@ -810,7 +820,7 @@ fn test_outcomes_table_insert() {
     let decision_id = Uuid::from_u128(61);
     insert_decision(&db, decision_id, context_id, "active");
     let id = Uuid::from_u128(6);
-    insert_outcome(&db, id, decision_id);
+    insert_outcome(&db, id, context_id, decision_id);
 
     let result = db
         .execute(
@@ -1159,7 +1169,7 @@ fn test_entity_snapshots_table_insert() {
     let snapshot_id = Uuid::from_u128(301);
     insert_context(&db, context_id, "ctx");
     insert_entity(&db, entity_id, context_id, "entity");
-    insert_snapshot(&db, snapshot_id, entity_id, 1, 2);
+    insert_snapshot(&db, snapshot_id, context_id, entity_id, 1, 2);
 
     let result = db
         .execute(
@@ -1187,13 +1197,14 @@ fn combination_entity_snapshot_links_reject_cross_entity_successor_by_composite_
     insert_context(&db, context_id, "ctx-snapshot-link-composite");
     insert_entity(&db, entity_a, context_id, "entity-a");
     insert_entity(&db, entity_b, context_id, "entity-b");
-    insert_snapshot(&db, snapshot_a, entity_a, 1, 2);
-    insert_snapshot(&db, snapshot_b, entity_b, 2, 3);
+    insert_snapshot(&db, snapshot_a, context_id, entity_a, 1, 2);
+    insert_snapshot(&db, snapshot_b, context_id, entity_b, 2, 3);
 
     let result = db.execute(
-        "INSERT INTO entity_snapshot_links (id, entity_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $entity_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
+        "INSERT INTO entity_snapshot_links (id, context_id, entity_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $context_id, $entity_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(20_075))),
+            ("context_id", Value::Uuid(context_id)),
             ("entity_id", Value::Uuid(entity_a)),
             ("predecessor_snapshot_id", Value::Uuid(snapshot_a)),
             ("successor_snapshot_id", Value::Uuid(snapshot_b)),
@@ -1213,11 +1224,12 @@ fn combination_entity_current_snapshots_reject_cross_entity_snapshot_by_composit
     insert_context(&db, context_id, "ctx-current-snapshot-composite");
     insert_entity(&db, entity_a, context_id, "entity-a");
     insert_entity(&db, entity_b, context_id, "entity-b");
-    insert_snapshot(&db, snapshot_b, entity_b, 1, 2);
+    insert_snapshot(&db, snapshot_b, context_id, entity_b, 1, 2);
 
     let result = db.execute(
-        "INSERT INTO entity_current_snapshots (entity_id, snapshot_id, updated_at) VALUES ($entity_id, $snapshot_id, $updated_at)",
+        "INSERT INTO entity_current_snapshots (context_id, entity_id, snapshot_id, updated_at) VALUES ($context_id, $entity_id, $snapshot_id, $updated_at)",
         &params(vec![
+            ("context_id", Value::Uuid(context_id)),
             ("entity_id", Value::Uuid(entity_a)),
             ("snapshot_id", Value::Uuid(snapshot_b)),
             ("updated_at", Value::TxId(TxId(2_u64))),
@@ -1236,9 +1248,10 @@ fn test_intention_snapshots_table_insert() {
     insert_context(&db, context_id, "ctx");
     insert_intention(&db, intention_id, context_id, "active");
     db.execute(
-        "INSERT INTO intention_snapshots (id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
+        "INSERT INTO intention_snapshots (id, context_id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $context_id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
         &params(vec![
             ("id", Value::Uuid(snapshot_id)),
+            ("context_id", Value::Uuid(context_id)),
             ("intention_id", Value::Uuid(intention_id)),
             ("description", Value::Text("initial framing".into())),
             ("status", Value::Text("active".into())),
@@ -1294,9 +1307,10 @@ fn test_intention_snapshots_table_insert() {
 fn test_fk_intention_snapshot_invalid_intention_id_rejected() {
     let db = fresh_db();
     assert_error_is_fk(db.execute(
-        "INSERT INTO intention_snapshots (id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
+        "INSERT INTO intention_snapshots (id, context_id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $context_id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(320))),
+            ("context_id", Value::Uuid(Uuid::from_u128(319))),
             ("intention_id", Value::Uuid(Uuid::from_u128(321))),
             ("description", Value::Text("stranded".into())),
             ("status", Value::Text("active".into())),
@@ -1318,7 +1332,7 @@ fn test_approvals_table_insert() {
     let decision_id = Uuid::from_u128(401);
     insert_decision(&db, decision_id, context_id, "active");
     let id = Uuid::from_u128(11);
-    insert_approval(&db, id, decision_id);
+    insert_approval(&db, id, context_id, decision_id);
 
     let result = db
         .execute(
@@ -1893,12 +1907,13 @@ fn test_entity_snapshots_adjacent_rows_insert() {
     let snapshot_3 = Uuid::from_u128(903);
     insert_context(&db, context_id, "ctx");
     insert_entity(&db, entity_id, context_id, "entity");
-    insert_snapshot(&db, snapshot_1, entity_id, 1, 2);
-    insert_snapshot(&db, snapshot_2, entity_id, 2, 3);
+    insert_snapshot(&db, snapshot_1, context_id, entity_id, 1, 2);
+    insert_snapshot(&db, snapshot_2, context_id, entity_id, 2, 3);
     let result = db.execute(
-        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
         &params(vec![
             ("id", Value::Uuid(snapshot_3)),
+            ("context_id", Value::Uuid(context_id)),
             ("entity_id", Value::Uuid(entity_id)),
             ("data", Value::Json(json!({"version": 4}))),
             ("valid_from", Value::TxId(TxId(4_u64))),
@@ -1916,11 +1931,12 @@ fn test_entity_snapshots_engine_permits_overlapping_rows() {
     let entity_id = Uuid::from_u128(904);
     insert_context(&db, context_id, "ctx");
     insert_entity(&db, entity_id, context_id, "entity");
-    insert_snapshot(&db, Uuid::from_u128(905), entity_id, 1, 3);
+    insert_snapshot(&db, Uuid::from_u128(905), context_id, entity_id, 1, 3);
     let result = db.execute(
-        "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+        "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(906))),
+            ("context_id", Value::Uuid(context_id)),
             ("entity_id", Value::Uuid(entity_id)),
             ("data", Value::Json(json!({"version": 2}))),
             ("valid_from", Value::TxId(TxId(2_u64))),
@@ -1935,9 +1951,10 @@ fn test_entity_snapshots_engine_permits_overlapping_rows() {
 fn test_fk_outcome_invalid_decision_id_rejected() {
     let db = fresh_db();
     assert_error_is_fk(db.execute(
-        "INSERT INTO outcomes (id, decision_id, success, notes, recorded_at) VALUES ($id, $decision_id, $success, $notes, $recorded_at)",
+        "INSERT INTO outcomes (id, context_id, decision_id, success, notes, recorded_at) VALUES ($id, $context_id, $decision_id, $success, $notes, $recorded_at)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(1000))),
+            ("context_id", Value::Uuid(Uuid::from_u128(999))),
             ("decision_id", Value::Uuid(Uuid::from_u128(1001))),
             ("success", Value::Bool(true)),
             ("notes", Value::Text("n".into())),
@@ -2002,9 +2019,10 @@ fn test_fk_invalidation_invalid_decision_id_rejected() {
 fn test_fk_approval_invalid_decision_id_rejected() {
     let db = fresh_db();
     assert_error_is_fk(db.execute(
-        "INSERT INTO approvals (id, decision_id, approver_id, level, rationale, created_at) VALUES ($id, $decision_id, $approver_id, $level, $rationale, $created_at)",
+        "INSERT INTO approvals (id, context_id, decision_id, approver_id, level, rationale, created_at) VALUES ($id, $context_id, $decision_id, $approver_id, $level, $rationale, $created_at)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(1008))),
+            ("context_id", Value::Uuid(Uuid::from_u128(1007))),
             ("decision_id", Value::Uuid(Uuid::from_u128(1009))),
             ("approver_id", Value::Text("approver".into())),
             ("level", Value::Text("team".into())),
@@ -2665,8 +2683,10 @@ fn combination_evidence_availability_log_concurrent_appends_persist_distinct_row
                 barrier.wait();
                 let result = db.execute_in_tx(
                     tx,
-                    "INSERT INTO evidence_availability_log (evidence_id, status, recorded_at_txid) VALUES ($evidence_id, $status, $recorded_at_txid)",
+                    "INSERT INTO evidence_availability_log (id, context_id, evidence_id, status, recorded_at_txid) VALUES ($id, $context_id, $evidence_id, $status, $recorded_at_txid)",
                     &params(vec![
+                        ("id", Value::Uuid(Uuid::now_v7())),
+                        ("context_id", Value::Uuid(context_id)),
                         ("evidence_id", Value::Uuid(evidence_id)),
                         ("status", Value::Text(status.into())),
                         ("recorded_at_txid", Value::TxId(tx)),
@@ -2870,8 +2890,8 @@ fn combination_decision_basis_snapshots_reject_wrong_context_and_wrong_entity_by
     insert_decision(&db, decision_a, ctx_a, "active");
     insert_entity(&db, entity_a, ctx_a, "entity-a");
     insert_entity(&db, entity_b, ctx_b, "entity-b");
-    insert_snapshot(&db, snapshot_a, entity_a, 1, 2);
-    insert_snapshot(&db, snapshot_b, entity_b, 1, 2);
+    insert_snapshot(&db, snapshot_a, ctx_a, entity_a, 1, 2);
+    insert_snapshot(&db, snapshot_b, ctx_b, entity_b, 1, 2);
 
     let wrong_context = db.execute(
         "INSERT INTO decision_basis_snapshots (id, context_id, decision_id, entity_id, snapshot_id, basis_order, created_at) VALUES ($id, $context_id, $decision_id, $entity_id, $snapshot_id, $basis_order, $created_at)",
@@ -2921,8 +2941,8 @@ fn combination_entity_snapshot_observations_reject_wrong_context_and_wrong_entit
     insert_entity(&db, entity_a, ctx_a, "entity-a");
     insert_entity(&db, entity_b, ctx_b, "entity-b");
     insert_entity(&db, entity_c, ctx_a, "entity-c");
-    insert_snapshot(&db, snapshot_a, entity_a, 1, 2);
-    insert_snapshot(&db, snapshot_b, entity_b, 1, 2);
+    insert_snapshot(&db, snapshot_a, ctx_a, entity_a, 1, 2);
+    insert_snapshot(&db, snapshot_b, ctx_b, entity_b, 1, 2);
     insert_observation(&db, observation_a, entity_a, ctx_a);
     insert_observation(&db, observation_b, entity_b, ctx_b);
     insert_observation(&db, observation_c, entity_c, ctx_a);

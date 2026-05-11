@@ -3,8 +3,9 @@ use std::any::type_name_of_val;
 use context_graph::{
     AuditOperation, CreateDecision, DecisionId, DecisionStatus, EntityId, EntityMatchPolicy,
     EntityStatus, EntityType, IntentionId, IntentionOrigin, IntentionStatus, ObservationId,
-    RelationshipType,
+    RelationshipType, ResolveAction,
 };
+use strum::IntoEnumIterator;
 use uuid::Uuid;
 
 // Guards against silent addition or removal of an IntentionStatus variant without updating the ALL array and state-machine tests.
@@ -130,11 +131,11 @@ fn test_entity_match_policy_variants() {
     );
 }
 
-// Pins AuditOperation to the six recorded mutation kinds so audit filters cannot silently drop an operation class.
+// Pins AuditOperation to the recorded mutation kinds so audit filters cannot silently drop an operation class.
 #[test]
 fn test_audit_operation_variants() {
     let variants = AuditOperation::ALL;
-    assert_eq!(variants.len(), 6);
+    assert_eq!(variants.len(), 9);
     assert_eq!(
         &variants[..],
         &[
@@ -144,6 +145,22 @@ fn test_audit_operation_variants() {
             AuditOperation::Supersede,
             AuditOperation::RecordOutcome,
             AuditOperation::RecordObservation,
+            AuditOperation::AcknowledgeInvalidation,
+            AuditOperation::ResolveInvalidation,
+            AuditOperation::DismissInvalidation,
+        ],
+    );
+}
+
+#[test]
+fn resolve_action_enum_has_exactly_two_public_variants() {
+    let variants = ResolveAction::iter().collect::<Vec<_>>();
+    assert_eq!(variants.len(), 2);
+    assert_eq!(
+        &variants[..],
+        &[
+            ResolveAction::NewDecisionCreated,
+            ResolveAction::BasisStillValid,
         ],
     );
 }

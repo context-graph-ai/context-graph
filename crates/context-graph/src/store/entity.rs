@@ -71,6 +71,10 @@ impl Store {
         });
         let snap_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(snapshot_id)),
+            (
+                "context_id".to_string(),
+                Value::Uuid(input.context_id.as_uuid()),
+            ),
             ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
             ("data".to_string(), Value::Json(snapshot_data)),
             ("valid_from".to_string(), Value::TxId(tx)),
@@ -80,15 +84,18 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+            "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
             &snap_params,
         ) {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
-        if let Err(e) =
-            self.set_current_entity_snapshot_in_tx(tx, id, EntitySnapshotId::from(snapshot_id))
-        {
+        if let Err(e) = self.set_current_entity_snapshot_in_tx(
+            tx,
+            input.context_id,
+            id,
+            EntitySnapshotId::from(snapshot_id),
+        ) {
             let _ = self.db.rollback(tx);
             return Err(e);
         }
@@ -311,6 +318,10 @@ impl Store {
         }
 
         let close_params: HashMap<String, Value> = [
+            (
+                "context_id".to_string(),
+                Value::Uuid(current.context_id.as_uuid()),
+            ),
             ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
             ("valid_to".to_string(), Value::TxId(tx)),
         ]
@@ -318,7 +329,7 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "UPDATE entity_snapshots SET valid_to = $valid_to WHERE entity_id = $entity_id AND valid_to IS NULL",
+            "UPDATE entity_snapshots SET valid_to = $valid_to WHERE context_id = $context_id AND entity_id = $entity_id AND valid_to IS NULL",
             &close_params,
         ) {
             let _ = self.db.rollback(tx);
@@ -334,6 +345,10 @@ impl Store {
         });
         let snap_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(snapshot_id)),
+            (
+                "context_id".to_string(),
+                Value::Uuid(current.context_id.as_uuid()),
+            ),
             ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
             ("data".to_string(), Value::Json(snapshot_data)),
             ("valid_from".to_string(), Value::TxId(tx)),
@@ -343,15 +358,18 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO entity_snapshots (id, entity_id, data, valid_from, valid_to) VALUES ($id, $entity_id, $data, $valid_from, $valid_to)",
+            "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
             &snap_params,
         ) {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
-        if let Err(e) =
-            self.set_current_entity_snapshot_in_tx(tx, id, EntitySnapshotId::from(snapshot_id))
-        {
+        if let Err(e) = self.set_current_entity_snapshot_in_tx(
+            tx,
+            current.context_id,
+            id,
+            EntitySnapshotId::from(snapshot_id),
+        ) {
             let _ = self.db.rollback(tx);
             return Err(e);
         }
@@ -427,6 +445,10 @@ impl Store {
             return Err(map_engine_err(e));
         }
         let close_params: HashMap<String, Value> = [
+            (
+                "context_id".to_string(),
+                Value::Uuid(current.context_id.as_uuid()),
+            ),
             ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
             ("valid_to".to_string(), Value::TxId(tx)),
         ]
@@ -434,7 +456,7 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "UPDATE entity_snapshots SET valid_to = $valid_to WHERE entity_id = $entity_id AND valid_to IS NULL",
+            "UPDATE entity_snapshots SET valid_to = $valid_to WHERE context_id = $context_id AND entity_id = $entity_id AND valid_to IS NULL",
             &close_params,
         ) {
             let _ = self.db.rollback(tx);
@@ -463,10 +485,12 @@ impl Store {
     pub(super) fn set_current_entity_snapshot_in_tx(
         &self,
         tx: TxId,
+        context_id: ContextId,
         entity_id: EntityId,
         snapshot_id: EntitySnapshotId,
     ) -> Result<()> {
         let update_params = HashMap::from([
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
             ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
             (
                 "snapshot_id".to_string(),
@@ -478,7 +502,7 @@ impl Store {
             .db
             .execute_in_tx(
                 tx,
-                "UPDATE entity_current_snapshots SET snapshot_id = $snapshot_id, updated_at = $updated_at WHERE entity_id = $entity_id",
+                "UPDATE entity_current_snapshots SET snapshot_id = $snapshot_id, updated_at = $updated_at WHERE context_id = $context_id AND entity_id = $entity_id",
                 &update_params,
             )
             .map_err(map_engine_err)?
@@ -489,7 +513,7 @@ impl Store {
         self.db
             .execute_in_tx(
                 tx,
-                "INSERT INTO entity_current_snapshots (entity_id, snapshot_id, updated_at) VALUES ($entity_id, $snapshot_id, $updated_at)",
+                "INSERT INTO entity_current_snapshots (context_id, entity_id, snapshot_id, updated_at) VALUES ($context_id, $entity_id, $snapshot_id, $updated_at)",
                 &update_params,
             )
             .map_err(map_engine_err)?;

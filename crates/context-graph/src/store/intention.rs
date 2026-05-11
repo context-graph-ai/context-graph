@@ -80,6 +80,7 @@ impl Store {
         }
         if let Err(e) = self.insert_intention_snapshot_in_tx(
             tx,
+            input.context_id,
             id,
             &input.description,
             input.status,
@@ -472,7 +473,7 @@ impl Store {
         }
 
         // Close prior snapshot, open a new one in the same tx.
-        self.close_open_intention_snapshot_in_tx(tx, current.id, tx)?;
+        self.close_open_intention_snapshot_in_tx(tx, current.context_id, current.id, tx)?;
         let new_properties_json = properties_to_json(&new_properties);
         let new_tags_json = JsonValue::Array(
             new_tags
@@ -482,6 +483,7 @@ impl Store {
         );
         self.insert_intention_snapshot_in_tx(
             tx,
+            current.context_id,
             current.id,
             &new_description,
             new_status,
@@ -533,7 +535,7 @@ impl Store {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
-        if let Err(e) = self.close_open_intention_snapshot_in_tx(tx, id, tx) {
+        if let Err(e) = self.close_open_intention_snapshot_in_tx(tx, current.context_id, id, tx) {
             let _ = self.db.rollback(tx);
             return Err(e);
         }
@@ -777,6 +779,7 @@ impl Store {
     pub(super) fn insert_intention_snapshot_in_tx(
         &self,
         tx: TxId,
+        context_id: ContextId,
         intention_id: IntentionId,
         description: &str,
         status: IntentionStatus,
@@ -787,6 +790,7 @@ impl Store {
     ) -> Result<()> {
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(Uuid::now_v7())),
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
             (
                 "intention_id".to_string(),
                 Value::Uuid(intention_id.as_uuid()),
@@ -816,7 +820,7 @@ impl Store {
         self.db
             .execute_in_tx(
                 tx,
-                "INSERT INTO intention_snapshots (id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
+                "INSERT INTO intention_snapshots (id, context_id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $context_id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
                 &params,
             )
             .map_err(map_engine_err)?;
@@ -826,10 +830,12 @@ impl Store {
     pub(super) fn close_open_intention_snapshot_in_tx(
         &self,
         tx: TxId,
+        context_id: ContextId,
         intention_id: IntentionId,
         valid_to: TxId,
     ) -> Result<()> {
         let params: HashMap<String, Value> = [
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
             (
                 "intention_id".to_string(),
                 Value::Uuid(intention_id.as_uuid()),
@@ -841,7 +847,7 @@ impl Store {
         self.db
             .execute_in_tx(
                 tx,
-                "UPDATE intention_snapshots SET valid_to = $valid_to WHERE intention_id = $intention_id AND valid_to IS NULL",
+                "UPDATE intention_snapshots SET valid_to = $valid_to WHERE context_id = $context_id AND intention_id = $intention_id AND valid_to IS NULL",
                 &params,
             )
             .map_err(map_engine_err)?;

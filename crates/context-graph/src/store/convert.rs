@@ -262,6 +262,9 @@ pub(super) fn audit_operation_str(op: AuditOperation) -> &'static str {
         AuditOperation::Supersede => "supersede",
         AuditOperation::RecordOutcome => "record_outcome",
         AuditOperation::RecordObservation => "record_observation",
+        AuditOperation::AcknowledgeInvalidation => "acknowledge_invalidation",
+        AuditOperation::ResolveInvalidation => "resolve_invalidation",
+        AuditOperation::DismissInvalidation => "dismiss_invalidation",
     }
 }
 
@@ -273,6 +276,9 @@ pub(super) fn audit_operation_from_str(s: &str) -> Result<AuditOperation> {
         "supersede" => Ok(AuditOperation::Supersede),
         "record_outcome" => Ok(AuditOperation::RecordOutcome),
         "record_observation" => Ok(AuditOperation::RecordObservation),
+        "acknowledge_invalidation" => Ok(AuditOperation::AcknowledgeInvalidation),
+        "resolve_invalidation" => Ok(AuditOperation::ResolveInvalidation),
+        "dismiss_invalidation" => Ok(AuditOperation::DismissInvalidation),
         other => Err(CgError::Engine(format!("unknown audit operation: {other}"))),
     }
 }

@@ -251,16 +251,22 @@ pub enum AuditOperation {
     Supersede,
     RecordOutcome,
     RecordObservation,
+    AcknowledgeInvalidation,
+    ResolveInvalidation,
+    DismissInvalidation,
 }
 
 impl AuditOperation {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
         Self::Create,
         Self::Update,
         Self::Archive,
         Self::Supersede,
         Self::RecordOutcome,
         Self::RecordObservation,
+        Self::AcknowledgeInvalidation,
+        Self::ResolveInvalidation,
+        Self::DismissInvalidation,
     ];
 }
 
@@ -272,6 +278,7 @@ pub enum AuditTarget {
     Entity(EntityId),
     Observation(ObservationId),
     Outcome(DecisionId),
+    Invalidation(InvalidationId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -638,6 +645,7 @@ pub struct AuditEntry {
     pub target: AuditTarget,
     pub context_id: ContextId,
     pub outcome: Option<Outcome>,
+    pub payload: Option<AuditPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -880,6 +888,33 @@ pub enum InvalidationSeverity {
     Critical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::EnumIter)]
+pub enum ResolveAction {
+    NewDecisionCreated,
+    BasisStillValid,
+}
+
+impl ResolveAction {
+    pub const ALL: [Self; 2] = [Self::NewDecisionCreated, Self::BasisStillValid];
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionPayload {
+    pub action: ResolveAction,
+    pub resolution_decision_id: Option<DecisionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DismissalPayload {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditPayload {
+    Resolution(ResolutionPayload),
+    Dismissal(DismissalPayload),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invalidation {
     pub id: InvalidationId,
@@ -908,6 +943,7 @@ pub struct AuditFilter {
     pub until_txid: Option<TxId>,
     pub target: Option<AuditTarget>,
     pub context_id: Option<ContextId>,
+    pub actor: Option<Principal>,
     // Reserved for governance approval queries joining audit_log with approvals.
     pub approver: Option<String>,
     // Reserved until approval levels flow through audit_log.
@@ -918,7 +954,7 @@ pub struct AuditFilter {
     pub after: Option<AuditId>,
 }
 
-pub const CG_SCHEMA_VERSION: u32 = 2;
+pub const CG_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreConfig {
