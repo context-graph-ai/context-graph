@@ -110,6 +110,11 @@ pub enum CgError {
         decision_id: DecisionId,
         expected_intention_ids: Vec<IntentionId>,
     },
+    ResolutionDecisionRequiresActiveDecision {
+        invalidation_id: InvalidationId,
+        decision_id: DecisionId,
+        current_status: DecisionStatus,
+    },
     BasisStillValidRequiresActiveDecision {
         invalidation_id: InvalidationId,
         decision_id: DecisionId,

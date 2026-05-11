@@ -61,6 +61,22 @@ fn acknowledge_emits_audit_row_with_full_identity() {
 }
 
 #[test]
+fn human_principal_with_reserved_agent_prefix_round_trips_as_human() {
+    let fixture = seed_pending_fixture();
+    let store = reopen(&fixture.config);
+    let principal = Principal::Human("agent:alice@example.com".to_string());
+
+    store
+        .with_principal(principal.clone())
+        .acknowledge_invalidation(fixture.invalidation.id)
+        .expect("ack");
+
+    let rows = audit_rows_for_invalidation(&store, fixture.invalidation.id);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].actor, principal);
+}
+
+#[test]
 fn resolve_emits_audit_row_with_full_identity() {
     let fixture = seed_acknowledged_fixture();
     let store = reopen(&fixture.config);

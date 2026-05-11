@@ -217,6 +217,52 @@ fn resolve_invalidation_with_decision_not_serving_threatened_intention_refused()
 }
 
 #[test]
+fn resolve_invalidation_with_non_active_new_decision_refused() {
+    for status in [
+        DecisionStatus::Superseded,
+        DecisionStatus::Archived,
+        DecisionStatus::Invalidated,
+    ] {
+        let fixture = seed_acknowledged_fixture();
+        let setup_store = reopen(&fixture.config);
+        let new_decision = create_serving_decision(
+            &setup_store,
+            fixture.context_id,
+            fixture.intention_id,
+            "new",
+        );
+        drop(setup_store);
+        set_decision_status(&fixture.config, new_decision.id, status);
+        let store = reopen(&fixture.config);
+
+        let result = store
+            .with_principal(agent("agent-test"))
+            .resolve_invalidation(
+                fixture.invalidation.id,
+                ResolveAction::NewDecisionCreated,
+                Some(new_decision.id),
+            );
+
+        assert!(
+            matches!(
+                result,
+                Err(CgError::ResolutionDecisionRequiresActiveDecision {
+                    invalidation_id,
+                    decision_id,
+                    current_status,
+                }) if invalidation_id == fixture.invalidation.id
+                    && decision_id == new_decision.id
+                    && current_status == status
+            ),
+            "expected active-replacement refusal for {status:?}, got {result:?}"
+        );
+        let after = find_invalidation(&store, fixture.context_id, fixture.invalidation.id);
+        assert_refusal_preserved(&fixture.invalidation, &after);
+        assert_no_audit_rows_for(&store, fixture.invalidation.id);
+    }
+}
+
+#[test]
 fn resolve_invalidation_with_empty_threatened_intention_ids_refused() {
     let fixture = seed_fixture_with_options(
         "empty-threatened",
@@ -821,21 +867,12 @@ fn cascade_row_dismissed_independently_records_per_row_audit_trail() {
             ..Default::default()
         },
     );
-    set_invalidation_status(
-        &direct.config,
-        cascade.invalidation.id,
-        InvalidationStatus::Acknowledged,
-        None,
-        None,
-    );
-    let before = find_invalidation(
-        &reopen(&direct.config),
-        direct.context_id,
-        cascade.invalidation.id,
-    );
     let store = reopen(&direct.config);
-    let dismissed = store
-        .with_principal(agent("agent-test"))
+    let handle = store.with_principal(agent("agent-test"));
+    let before = handle
+        .acknowledge_invalidation(cascade.invalidation.id)
+        .expect("ack cascade");
+    let dismissed = handle
         .dismiss_invalidation(before.id, Some("cascade not relevant".to_string()))
         .expect("dismiss cascade");
 
@@ -860,18 +897,6 @@ fn cascade_row_resolved_independently_records_per_row_audit_trail() {
             ..Default::default()
         },
     );
-    set_invalidation_status(
-        &direct.config,
-        cascade.invalidation.id,
-        InvalidationStatus::Acknowledged,
-        None,
-        None,
-    );
-    let before = find_invalidation(
-        &reopen(&direct.config),
-        direct.context_id,
-        cascade.invalidation.id,
-    );
     let store = reopen(&direct.config);
     let new_decision = create_serving_decision(
         &store,
@@ -879,9 +904,12 @@ fn cascade_row_resolved_independently_records_per_row_audit_trail() {
         cascade.intention_id,
         "cascade-fix",
     );
+    let handle = store.with_principal(agent("agent-test"));
+    let before = handle
+        .acknowledge_invalidation(cascade.invalidation.id)
+        .expect("ack cascade");
 
-    let resolved = store
-        .with_principal(agent("agent-test"))
+    let resolved = handle
         .resolve_invalidation(
             before.id,
             ResolveAction::NewDecisionCreated,
@@ -972,23 +1000,15 @@ fn consultant_same_principal_multi_context_handle_full_lifecycle_aggregates_on_p
     let other = create_context(&admin, "client-b");
     drop(admin);
     let other_inv = seed_pending_invalidation_in_context(&fixture.config, other.id, "client-b");
-    set_invalidation_status(
-        &fixture.config,
-        fixture.invalidation.id,
-        InvalidationStatus::Acknowledged,
-        None,
-        None,
-    );
-    set_invalidation_status(
-        &fixture.config,
-        other_inv.invalidation.id,
-        InvalidationStatus::Acknowledged,
-        None,
-        None,
-    );
     let scoped = reopen_scoped(&fixture.config, [fixture.context_id, other.id]);
     let principal = Principal::Human("consultant@firm.com".to_string());
     let handle = scoped.with_principal(principal.clone());
+    handle
+        .acknowledge_invalidation(fixture.invalidation.id)
+        .expect("ack tenant a");
+    handle
+        .acknowledge_invalidation(other_inv.invalidation.id)
+        .expect("ack tenant b");
 
     let left = handle
         .resolve_invalidation(

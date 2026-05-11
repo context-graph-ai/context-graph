@@ -398,6 +398,13 @@ impl Store {
                     to: DecisionStatus::Invalidated,
                 });
             }
+            if matches!(err, EngineError::ConditionalUpdateConflict { .. }) {
+                let current = self.decision_status_and_context(decision_id)?.status;
+                return Err(CgError::IllegalTransition {
+                    from: current,
+                    to: DecisionStatus::Invalidated,
+                });
+            }
             return Err(map_engine_err(err));
         }
         Ok(DecisionInvalidationResult {
@@ -1002,7 +1009,7 @@ fn decision_basis_retry_unique(err: &CgError) -> bool {
     )
 }
 
-fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation> {
+pub(super) fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation> {
     Ok(Invalidation {
         id: InvalidationId::from(get_uuid(row, columns, "id")?),
         status: invalidation_status_from_str(&get_text(row, columns, "status")?)?,
@@ -1031,7 +1038,7 @@ fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation
     })
 }
 
-fn invalidation_status_str(status: InvalidationStatus) -> &'static str {
+pub(super) fn invalidation_status_str(status: InvalidationStatus) -> &'static str {
     match status {
         InvalidationStatus::Pending => "pending",
         InvalidationStatus::Acknowledged => "acknowledged",
@@ -1040,7 +1047,7 @@ fn invalidation_status_str(status: InvalidationStatus) -> &'static str {
     }
 }
 
-fn invalidation_status_from_str(raw: &str) -> Result<InvalidationStatus> {
+pub(super) fn invalidation_status_from_str(raw: &str) -> Result<InvalidationStatus> {
     match raw {
         "pending" => Ok(InvalidationStatus::Pending),
         "acknowledged" => Ok(InvalidationStatus::Acknowledged),

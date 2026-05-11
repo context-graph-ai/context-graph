@@ -291,17 +291,23 @@ pub enum Principal {
 impl Principal {
     pub fn encode(&self) -> String {
         match self {
-            Principal::System => "System".to_string(),
-            Principal::Agent(a) => a.clone(),
-            Principal::Human(h) => h.clone(),
+            Principal::System => "system".to_string(),
+            Principal::Agent(a) => format!("agent:{a}"),
+            Principal::Human(h) => format!("human:{h}"),
         }
     }
 
     pub fn decode(raw: &str) -> Self {
-        if raw == "System" {
+        if raw == "system" || raw == "System" {
             return Principal::System;
         }
-        if raw.starts_with("agent:") || raw.starts_with("claude-code-instance-") {
+        if let Some(agent) = raw.strip_prefix("agent:") {
+            return Principal::Agent(agent.to_string());
+        }
+        if let Some(human) = raw.strip_prefix("human:") {
+            return Principal::Human(human.to_string());
+        }
+        if raw.starts_with("claude-code-instance-") {
             return Principal::Agent(raw.to_string());
         }
         Principal::Human(raw.to_string())
