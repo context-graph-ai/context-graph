@@ -509,7 +509,30 @@ impl Store {
             id: Some(id.as_uuid().to_string()),
             missing: Some("intention"),
         })?;
-        let active_serving = self.decisions_actively_serving_intention(id)?;
+        let active_serving_result = self
+            .db
+            .execute(
+                "WITH serving_decisions AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)<-[:SERVES]-(b) WHERE a.id = $intention_id COLUMNS (b.id AS b_id))) SELECT d.id FROM decisions d INNER JOIN serving_decisions sd ON d.id = sd.b_id WHERE d.context_id = $context_id AND d.status = $status",
+                &HashMap::from([(
+                    "intention_id".to_string(),
+                    Value::Uuid(id.as_uuid()),
+                ), (
+                    "context_id".to_string(),
+                    Value::Uuid(current.context_id.as_uuid()),
+                ), (
+                    "status".to_string(),
+                    Value::Text("active".to_string()),
+                )]),
+            )
+            .map_err(map_engine_err)?;
+        let active_serving: Vec<DecisionId> = active_serving_result
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Uuid(source)) => Some(DecisionId::from(*source)),
+                _ => None,
+            })
+            .collect();
         if !active_serving.is_empty() {
             return Err(CgError::ActiveDecisionsReference {
                 intention_id: id,
@@ -592,45 +615,6 @@ impl Store {
             out.insert(*iid, ictx);
         }
         Ok(out)
-    }
-
-    fn decisions_actively_serving_intention(
-        &self,
-        intention_id: IntentionId,
-    ) -> Result<Vec<DecisionId>> {
-        let params: HashMap<String, Value> = [(
-            "intention_id".to_string(),
-            Value::Uuid(intention_id.as_uuid()),
-        )]
-        .into_iter()
-        .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)<-[:SERVES]-(b) WHERE a.id = $intention_id COLUMNS (b.id AS b_id))",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        let mut active = Vec::new();
-        for row in &result.rows {
-            if let Some(Value::Uuid(source)) = row.first() {
-                let decision_id = DecisionId::from(*source);
-                let dparams: HashMap<String, Value> = [("id".to_string(), Value::Uuid(*source))]
-                    .into_iter()
-                    .collect();
-                let dresult = self
-                    .db
-                    .execute("SELECT status FROM decisions WHERE id = $id", &dparams)
-                    .map_err(map_engine_err)?;
-                if let Some(row) = dresult.rows.first()
-                    && let Some(Value::Text(status)) = row.first()
-                    && status == "active"
-                {
-                    active.push(decision_id);
-                }
-            }
-        }
-        Ok(active)
     }
 
     pub fn history(&self, id: IntentionId) -> Result<Vec<IntentionSnapshot>> {

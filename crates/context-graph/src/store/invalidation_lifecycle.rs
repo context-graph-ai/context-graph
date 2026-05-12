@@ -41,6 +41,15 @@ impl<'s> ScopedStore<'s> {
         }
 
         let tx = self.store.begin_tx()?;
+        if let Err(err) = self.guard_transition_precondition_in_tx(
+            tx,
+            &current,
+            InvalidationStatus::Pending,
+            InvalidationStatus::Acknowledged,
+        ) {
+            let _ = self.store.db.rollback(tx);
+            return Err(err);
+        }
         if let Err(err) = self.store.record_audit_in_tx(
             tx,
             AuditOperation::AcknowledgeInvalidation,
@@ -111,6 +120,15 @@ impl<'s> ScopedStore<'s> {
             "resolution_decision_id": decision_id.map(|id| id.as_uuid().to_string()),
         }));
         let tx = self.store.begin_tx()?;
+        if let Err(err) = self.guard_transition_precondition_in_tx(
+            tx,
+            &current,
+            InvalidationStatus::Acknowledged,
+            InvalidationStatus::Resolved,
+        ) {
+            let _ = self.store.db.rollback(tx);
+            return Err(err);
+        }
         if let Err(err) =
             self.guard_resolution_preconditions_in_tx(tx, &current, action, decision_id)
         {
@@ -162,6 +180,15 @@ impl<'s> ScopedStore<'s> {
         }
 
         let tx = self.store.begin_tx()?;
+        if let Err(err) = self.guard_transition_precondition_in_tx(
+            tx,
+            &current,
+            InvalidationStatus::Acknowledged,
+            InvalidationStatus::Dismissed,
+        ) {
+            let _ = self.store.db.rollback(tx);
+            return Err(err);
+        }
         if let Err(err) = self.store.record_audit_in_tx(
             tx,
             AuditOperation::DismissInvalidation,
@@ -273,6 +300,40 @@ impl<'s> ScopedStore<'s> {
                 ))
             }
             Err(err) => Err(map_engine_err(err)),
+        }
+    }
+
+    fn guard_transition_precondition_in_tx(
+        &self,
+        tx: crate::TxId,
+        current: &Invalidation,
+        expected: InvalidationStatus,
+        next: InvalidationStatus,
+    ) -> Result<()> {
+        let guarded = self
+            .store
+            .db
+            .guard_row_conditions_in_tx(
+                tx,
+                "invalidations",
+                "id",
+                &Value::Uuid(current.id.as_uuid()),
+                &[
+                    (
+                        "context_id".to_string(),
+                        Value::Uuid(current.context_id.as_uuid()),
+                    ),
+                    (
+                        "status".to_string(),
+                        Value::Text(invalidation_status_str(expected).to_string()),
+                    ),
+                ],
+            )
+            .map_err(map_engine_err)?;
+        if guarded {
+            Ok(())
+        } else {
+            Err(self.current_transition_error(current.id, next))
         }
     }
 
