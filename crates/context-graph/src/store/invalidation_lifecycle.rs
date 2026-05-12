@@ -14,7 +14,7 @@ use super::evidence::{decode_invalidation, invalidation_status_str};
 const INVALIDATION_SELECT: &str = "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations";
 
 pub struct ScopedStore<'s> {
-    store: &'s Store,
+    pub(super) store: &'s Store,
     principal: Principal,
 }
 

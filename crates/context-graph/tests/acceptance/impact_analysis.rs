@@ -26,17 +26,24 @@ fn reopen_store(dir: &tempfile::TempDir) -> Store {
 
 fn open_raw_database(dir: &tempfile::TempDir) -> Database {
     let db = Database::open(dir.path().join("cg.db")).expect("raw open");
-    if db
-        .list_triggers()
-        .iter()
-        .any(|trigger| trigger.name == "impact_analysis_trigger")
-        && !db
-            .registered_trigger_callbacks()
+    let registered = db.registered_trigger_callbacks();
+    for name in [
+        "impact_analysis_trigger",
+        "conflict_detection_on_decisions",
+        "conflict_detection_on_outcomes",
+        "precedent_match_on_decisions",
+    ] {
+        if db
+            .list_triggers()
             .iter()
-            .any(|name| name == "impact_analysis_trigger")
-    {
-        db.register_trigger_callback("impact_analysis_trigger", |_db, _ctx| Ok(()))
-            .expect("register trigger callback");
+            .any(|trigger| trigger.name == name)
+            && !registered.iter().any(|registered| registered == name)
+        {
+            db.register_trigger_callback(name, |_db, _ctx| Ok(()))
+                .expect("register trigger callback");
+        }
+    }
+    if !db.list_triggers().is_empty() {
         db.complete_initialization().expect("complete init");
     }
     db

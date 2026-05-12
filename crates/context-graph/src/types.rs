@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use contextdb_core::Lsn;
+
 use crate::{AgentId, TxId};
 
 macro_rules! id_type {
@@ -939,6 +941,102 @@ pub struct Invalidation {
     pub resolution_action: Option<String>,
     pub resolution_decision_id: Option<DecisionId>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvalidationDetectedPayload {
+    pub invalidation: Invalidation,
+    pub decision_description: String,
+    pub entity_name: String,
+    pub threatened_intention_descriptions: BTreeMap<IntentionId, String>,
+    pub cascade_from: Option<DecisionId>,
+    pub at_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewDecisionPayload {
+    pub decision: Decision,
+    pub served_intention_ids: Vec<IntentionId>,
+    pub served_intention_descriptions: BTreeMap<IntentionId, String>,
+    pub at_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictDetectedPayload {
+    pub context_id: ContextId,
+    pub older_decision_id: DecisionId,
+    pub newer_decision_id: DecisionId,
+    pub threatened_intention_ids: Vec<IntentionId>,
+    pub intention_in_tension: bool,
+    pub threatened_intention_descriptions: BTreeMap<IntentionId, String>,
+    pub at_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrecedentMatchPayload {
+    pub context_id: ContextId,
+    pub new_decision_id: DecisionId,
+    pub precedent_decision_id: DecisionId,
+    pub served_intention_ids: Vec<IntentionId>,
+    pub served_intention_descriptions: BTreeMap<IntentionId, String>,
+    pub matched_precedent_outcome_success: bool,
+    pub at_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SubscriptionFilter {
+    pub context_ids: Option<Vec<ContextId>>,
+    pub entity_id: Option<EntityId>,
+    pub decision_id: Option<DecisionId>,
+    pub intention_id: Option<IntentionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SubscriptionId {
+    sink_name: String,
+    route_name: String,
+}
+
+impl SubscriptionId {
+    pub fn new(sink_name: impl Into<String>, route_name: impl Into<String>) -> Self {
+        Self {
+            sink_name: sink_name.into(),
+            route_name: route_name.into(),
+        }
+    }
+
+    pub fn sink_name(&self) -> &str {
+        &self.sink_name
+    }
+
+    pub(crate) fn route_name(&self) -> &str {
+        &self.route_name
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SubscriptionMetrics {
+    pub delivered: u64,
+    pub queued: u64,
+    pub retried: u64,
+    pub permanent_failures: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubscriptionError {
+    UnknownSubscription(SubscriptionId),
+    SinkDdlMissing(String),
+    ContextNotAuthorized(ContextId),
+    HandlerFailed(String),
+    Engine(String),
+}
+
+impl std::fmt::Display for SubscriptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for SubscriptionError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AuditFilter {

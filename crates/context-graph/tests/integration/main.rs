@@ -6,3 +6,4 @@ mod impact_analysis_engine_capabilities;
 mod invalidation_audit_log;
 mod invalidation_concurrency;
 mod schema;
+mod subscriptions_engine_capabilities;

@@ -1,4 +1,5 @@
 mod audit;
+mod conflict_detection;
 mod context;
 mod convert;
 mod decision;
@@ -11,7 +12,9 @@ mod intention;
 mod invalidation_lifecycle;
 mod observation;
 mod outcome;
+mod precedent_match;
 mod relationship;
+mod subscriptions;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,12 +25,14 @@ use contextdb_engine::Database;
 
 use crate::Result;
 use crate::error::CgError;
-use crate::schema::{INDEXES, TABLES};
+use crate::schema::{INDEXES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES};
 use crate::types::*;
 
+use self::conflict_detection::register_conflict_detection_triggers;
 use self::convert::map_engine_err;
 use self::impact_analysis::register_impact_analysis_trigger;
 pub use self::invalidation_lifecycle::ScopedStore;
+use self::precedent_match::register_precedent_match_trigger;
 
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
@@ -42,6 +47,7 @@ pub struct Store {
     file_uri_allowed: bool,
     trace: Arc<Mutex<String>>,
     outcome_mutex: Arc<Mutex<()>>,
+    authorized_contexts: Option<BTreeSet<ContextId>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -86,6 +92,7 @@ impl Store {
         contexts: Option<BTreeSet<ContextId>>,
     ) -> Result<Self> {
         let db_path = config.db_path.clone();
+        let authorized_contexts = contexts.clone();
         let (db, resource_owner) =
             open_bootstrapped_database(&db_path, &config, replace_shared_handle, contexts)?;
         Ok(Self {
@@ -100,6 +107,7 @@ impl Store {
             file_uri_allowed: config.file_uri_allowed,
             trace: Arc::new(Mutex::new(String::new())),
             outcome_mutex: Arc::new(Mutex::new(())),
+            authorized_contexts,
         })
     }
 
@@ -221,7 +229,7 @@ fn open_bootstrapped_database(
     let mut guard = registry.lock().expect("store registry lock");
     if !replace_shared_handle && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade) {
         bootstrap_schema(&existing, config, true)?;
-        register_impact_analysis_trigger(&existing)?;
+        register_store_triggers(&existing)?;
         if let Some(contexts) = contexts {
             let engine_contexts = contexts
                 .into_iter()
@@ -236,7 +244,7 @@ fn open_bootstrapped_database(
     }
     let db = Arc::new(Database::open(db_path).map_err(map_engine_err)?);
     bootstrap_schema(&db, config, false)?;
-    register_impact_analysis_trigger(&db)?;
+    register_store_triggers(&db)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
     if let Some(contexts) = contexts {
         let engine_contexts = contexts
@@ -306,6 +314,17 @@ fn initialize_schema(db: &Database) -> Result<()> {
         db.execute(index.ddl, &HashMap::new())
             .map_err(map_engine_err)?;
     }
+    for ddl in SUBSCRIPTION_EVENT_TYPE_DDL {
+        db.execute(ddl, &HashMap::new()).map_err(map_engine_err)?;
+    }
+    Ok(())
+}
+
+fn register_store_triggers(db: &Database) -> Result<()> {
+    register_conflict_detection_triggers(db)?;
+    register_precedent_match_trigger(db)?;
+    register_impact_analysis_trigger(db)?;
+    db.complete_initialization().map_err(map_engine_err)?;
     Ok(())
 }
 

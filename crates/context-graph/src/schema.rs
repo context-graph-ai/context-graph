@@ -1,6 +1,12 @@
 pub const DIGEST_VECTOR_DIMENSION: usize = 768;
 pub(crate) const IMPACT_ANALYSIS_TRIGGER_DDL: &str =
     "CREATE TRIGGER impact_analysis_trigger ON observations WHEN INSERT";
+pub(crate) const CONFLICT_DETECTION_DECISIONS_TRIGGER_DDL: &str =
+    "CREATE TRIGGER conflict_detection_on_decisions ON decisions WHEN INSERT";
+pub(crate) const CONFLICT_DETECTION_OUTCOMES_TRIGGER_DDL: &str =
+    "CREATE TRIGGER conflict_detection_on_outcomes ON outcomes WHEN INSERT";
+pub(crate) const PRECEDENT_MATCH_TRIGGER_DDL: &str =
+    "CREATE TRIGGER precedent_match_on_decisions ON decisions WHEN INSERT";
 
 #[derive(Debug, Clone, Copy)]
 pub struct TableSpec {
@@ -116,6 +122,21 @@ pub const TABLES: &[TableSpec] = &[
         name: "audit_log",
         ddl: "CREATE TABLE audit_log (id UUID PRIMARY KEY, txid TXID NOT NULL, operation TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT, target_kind TEXT NOT NULL, target_id UUID NOT NULL, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), payload JSON)",
     },
+    TableSpec {
+        name: "conflicts",
+        ddl: "CREATE TABLE conflicts (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), older_decision_id UUID NOT NULL REFERENCES decisions(id), newer_decision_id UUID NOT NULL REFERENCES decisions(id), threatened_intention_ids JSON NOT NULL DEFAULT '[]', intention_in_tension BOOLEAN NOT NULL, detected_at TXID NOT NULL, UNIQUE (context_id, older_decision_id, newer_decision_id), FOREIGN KEY (context_id, older_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, newer_decision_id) REFERENCES decisions(context_id, id)) IMMUTABLE",
+    },
+    TableSpec {
+        name: "precedent_matches",
+        ddl: "CREATE TABLE precedent_matches (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), new_decision_id UUID NOT NULL REFERENCES decisions(id), precedent_decision_id UUID NOT NULL REFERENCES decisions(id), served_intention_ids JSON NOT NULL DEFAULT '[]', matched_precedent_outcome_success BOOLEAN NOT NULL, detected_at TXID NOT NULL, UNIQUE (context_id, new_decision_id, precedent_decision_id), FOREIGN KEY (context_id, new_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, precedent_decision_id) REFERENCES decisions(context_id, id)) IMMUTABLE",
+    },
+];
+
+pub const SUBSCRIPTION_EVENT_TYPE_DDL: &[&str] = &[
+    "CREATE EVENT TYPE invalidation_detected WHEN INSERT ON invalidations",
+    "CREATE EVENT TYPE new_decision WHEN INSERT ON decisions",
+    "CREATE EVENT TYPE conflict_detected WHEN INSERT ON conflicts",
+    "CREATE EVENT TYPE precedent_match WHEN INSERT ON precedent_matches",
 ];
 
 pub const INDEXES: &[IndexSpec] = &[
