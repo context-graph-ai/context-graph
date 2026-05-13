@@ -528,6 +528,96 @@ fn subscribe_invalidation_detected_carries_updated_description_text_when_entity_
     );
 }
 
+// Use case: an agent can watch one Intention without receiving unrelated same-context drift.
+#[test]
+fn subscribe_invalidation_detected_with_intention_id_filter_only_fires_for_matching_intention() {
+    let (_dir, _path, store) = fixture();
+    let ctx = context(&store, "invalidation-intention-filter").id;
+    let intent_a = intention(&store, ctx, "keep auth routing current");
+    let intent_b = intention(&store, ctx, "keep billing routing current");
+    let entity_a = entity(
+        &store,
+        ctx,
+        "auth-module",
+        map(&[("path", json!("auth/v1"))]),
+    );
+    let entity_b = entity(
+        &store,
+        ctx,
+        "billing-module",
+        map(&[("path", json!("billing/v1"))]),
+    );
+
+    for (entity_id, intent_id, description) in [
+        (entity_a.id, intent_a.id, "auth module lives at auth/v1"),
+        (
+            entity_b.id,
+            intent_b.id,
+            "billing module lives at billing/v1",
+        ),
+    ] {
+        let mut basis_fields = HashMap::new();
+        basis_fields.insert(entity_id, vec!["path".to_string()]);
+        store
+            .create_decision(CreateDecision {
+                decision_type: "architecture".to_string(),
+                description: description.to_string(),
+                reasoning: reasoning(description),
+                confidence: Some(0.9),
+                intention_ids: vec![intent_id],
+                based_on_entity_ids: vec![entity_id],
+                basis_fields: Some(basis_fields),
+                context_id: ctx,
+                ..Default::default()
+            })
+            .expect("create decision");
+    }
+
+    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&payloads);
+    store
+        .with_system_principal()
+        .subscribe_invalidation_detected(
+            SubscriptionFilter {
+                intention_id: Some(intent_a.id),
+                ..Default::default()
+            },
+            move |payload| {
+                seen.lock().expect("collector").push(payload.clone());
+                Ok(())
+            },
+        )
+        .expect("subscribe invalidation");
+
+    observe(
+        &store,
+        ctx,
+        entity_b.id,
+        delta(&[("path", json!("billing/v2"))]),
+    );
+    assert_no_more(&payloads, 0);
+
+    observe(
+        &store,
+        ctx,
+        entity_a.id,
+        delta(&[("path", json!("auth/v2"))]),
+    );
+    wait_for_len(&payloads, 1);
+    let captured = payloads.lock().expect("collector");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].invalidation.threatened_intention_ids,
+        vec![intent_a.id]
+    );
+    assert_eq!(
+        captured[0]
+            .threatened_intention_descriptions
+            .get(&intent_a.id),
+        Some(&"keep auth routing current".to_string())
+    );
+}
+
 // Use case: an invalidated lower-confidence sibling leaves the Intention served by a stronger Decision.
 #[test]
 fn invalidation_detected_with_higher_confidence_sibling_carries_intention_now_un_served_false_and_severity_warning()
