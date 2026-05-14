@@ -1,5 +1,6 @@
 mod context_isolation;
 mod crud;
+mod discovery;
 mod evidence;
 mod graph_context_isolation;
 mod graph_entity_neighborhood;

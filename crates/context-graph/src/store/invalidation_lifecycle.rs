@@ -232,7 +232,10 @@ impl<'s> ScopedStore<'s> {
                 &sql,
                 &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
             )
-            .map_err(map_engine_err)?;
+            .map_err(|err| match err {
+                EngineError::ContextScopeViolation { .. } => CgError::InvalidationNotFound { id },
+                other => map_engine_err(other),
+            })?;
         let Some(row) = result.rows.first() else {
             return Err(CgError::InvalidationNotFound { id });
         };
@@ -329,7 +332,12 @@ impl<'s> ScopedStore<'s> {
                     ),
                 ],
             )
-            .map_err(map_engine_err)?;
+            .map_err(|err| match err {
+                EngineError::ContextScopeViolation { .. } => {
+                    CgError::InvalidationNotFound { id: current.id }
+                }
+                other => map_engine_err(other),
+            })?;
         if guarded {
             Ok(())
         } else {
@@ -365,7 +373,12 @@ impl<'s> ScopedStore<'s> {
                             ("status".to_string(), Value::Text("active".to_string())),
                         ],
                     )
-                    .map_err(map_engine_err)?;
+                    .map_err(|err| match err {
+                        EngineError::ContextScopeViolation { .. } => {
+                            CgError::DecisionNotFound { id: decision_id }
+                        }
+                        other => map_engine_err(other),
+                    })?;
                 if !guarded {
                     self.validate_resolution_decision(invalidation, decision_id)?;
                 }
@@ -387,7 +400,12 @@ impl<'s> ScopedStore<'s> {
                             ("status".to_string(), Value::Text("active".to_string())),
                         ],
                     )
-                    .map_err(map_engine_err)?;
+                    .map_err(|err| match err {
+                        EngineError::ContextScopeViolation { .. } => CgError::DecisionNotFound {
+                            id: invalidation.affected_decision_id,
+                        },
+                        other => map_engine_err(other),
+                    })?;
                 if !guarded {
                     self.validate_affected_decision_active(invalidation)?;
                 }
@@ -450,7 +468,12 @@ impl<'s> ScopedStore<'s> {
                     ),
                 ]),
             )
-            .map_err(map_engine_err)?
+            .map_err(|err| match err {
+                EngineError::ContextScopeViolation { .. } => {
+                    CgError::InvalidationNotFound { id: current.id }
+                }
+                other => map_engine_err(other),
+            })?
             .rows_affected;
         if rows_affected == 1 {
             return Ok(());
@@ -463,10 +486,14 @@ impl<'s> ScopedStore<'s> {
         invalidation: &Invalidation,
         decision_id: DecisionId,
     ) -> Result<()> {
-        let decision = self
-            .store
-            .get_decision(decision_id)?
-            .ok_or(CgError::DecisionNotFound { id: decision_id })?;
+        let decision = match self.store.get_decision(decision_id) {
+            Ok(Some(decision)) => decision,
+            Ok(None) => return Err(CgError::DecisionNotFound { id: decision_id }),
+            Err(CgError::CrossContextNotSupported) => {
+                return Err(CgError::DecisionNotFound { id: decision_id });
+            }
+            Err(err) => return Err(err),
+        };
         if decision.context_id != invalidation.context_id {
             return Err(CgError::DecisionNotFound { id: decision_id });
         }
@@ -510,7 +537,12 @@ impl<'s> ScopedStore<'s> {
                     ),
                 ]),
             )
-            .map_err(map_engine_err)?;
+            .map_err(|err| match err {
+                EngineError::ContextScopeViolation { .. } => CgError::DecisionNotFound {
+                    id: invalidation.affected_decision_id,
+                },
+                other => map_engine_err(other),
+            })?;
         let Some(row) = result.rows.first() else {
             return Err(CgError::DecisionNotFound {
                 id: invalidation.affected_decision_id,

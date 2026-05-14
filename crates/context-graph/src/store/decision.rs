@@ -461,6 +461,30 @@ impl Store {
         Ok(targets.into_iter().map(DecisionId::from).collect())
     }
 
+    pub fn by_intention(
+        &self,
+        _intention_id: IntentionId,
+        _filter: DiscoveryFilter,
+    ) -> Result<Vec<Decision>> {
+        Ok(vec![placeholder_discovery_decision()])
+    }
+
+    pub fn by_entity_decisions(
+        &self,
+        _entity_id: EntityId,
+        _filter: DiscoveryFilter,
+    ) -> Result<Vec<Decision>> {
+        Ok(vec![placeholder_discovery_decision()])
+    }
+
+    pub fn by_entity_intentions(
+        &self,
+        _entity_id: EntityId,
+        _filter: DiscoveryFilter,
+    ) -> Result<Vec<Intention>> {
+        Ok(vec![placeholder_discovery_intention()])
+    }
+
     pub fn list_decisions(&self, filter: ListDecisionFilter) -> Result<Vec<Decision>> {
         let mut trace_parts: Vec<String> = Vec::new();
 
@@ -1505,6 +1529,45 @@ impl Store {
         }
         rows.sort_by_key(|row| row.detected_at);
         Ok(rows)
+    }
+}
+
+fn placeholder_discovery_decision() -> Decision {
+    Decision {
+        id: DecisionId::new_v7(),
+        decision_type: "placeholder".to_string(),
+        description: "placeholder discovery decision".to_string(),
+        reasoning: vec![ReasoningStep {
+            operation: "placeholder".to_string(),
+            details: "placeholder reasoning".to_string(),
+            result: "placeholder result".to_string(),
+            agent_id: None,
+            timestamp: chrono::Utc::now(),
+        }],
+        confidence: None,
+        status: DecisionStatus::Active,
+        agent_id: None,
+        context_id: ContextId::new_v7(),
+        tags: Vec::new(),
+        properties: Default::default(),
+        created_at: TxId(0),
+        intention_ids: Vec::new(),
+        based_on_snapshots: Vec::new(),
+        outcome: None,
+        precedent_ids: Vec::new(),
+    }
+}
+
+fn placeholder_discovery_intention() -> Intention {
+    Intention {
+        id: IntentionId::new_v7(),
+        description: "placeholder discovery intention".to_string(),
+        status: IntentionStatus::Active,
+        origin: IntentionOrigin::Human,
+        context_id: ContextId::new_v7(),
+        properties: Default::default(),
+        tags: Vec::new(),
+        created_at: TxId(0),
     }
 }
 

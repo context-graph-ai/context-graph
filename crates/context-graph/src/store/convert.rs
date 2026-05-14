@@ -47,6 +47,7 @@ pub(super) fn map_engine_err(err: EngineError) -> CgError {
             expected,
             got: actual,
         },
+        EngineError::ContextScopeViolation { .. } => CgError::CrossContextNotSupported,
         EngineError::BfsDepthExceeded(d) => CgError::Engine(format!("bfs depth exceeded: {d}")),
         other => CgError::Engine(format!("unexpected engine error: {other}")),
     }

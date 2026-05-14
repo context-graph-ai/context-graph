@@ -87,6 +87,7 @@ pub enum CgError {
     CrossContextRelationship,
     CrossContextObservation,
     CrossContextViolation,
+    CrossContextNotSupported,
     ActiveIntentionProtection,
     CyclicCitation,
     InvalidDepth {
@@ -142,7 +143,13 @@ pub enum CgError {
 
 impl fmt::Display for CgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            CgError::CrossContextNotSupported => write!(
+                f,
+                "this discovery view is scoped to one context at a time; use the cross-client retrospective view for a combined answer"
+            ),
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 

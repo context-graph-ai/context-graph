@@ -848,6 +848,12 @@ pub struct ListDecisionFilter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DiscoveryFilter {
+    pub include_decision_statuses: Option<Vec<DecisionStatus>>,
+    pub include_intention_statuses: Option<Vec<IntentionStatus>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TraverseFilter {
     pub depth: u8,
     pub rel: Option<RelationshipType>,
