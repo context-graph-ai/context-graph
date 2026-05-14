@@ -839,7 +839,7 @@ impl Store {
     }
 }
 
-fn decode_intention(columns: &[String], row: &[Value]) -> Result<Intention> {
+pub(super) fn decode_intention(columns: &[String], row: &[Value]) -> Result<Intention> {
     Ok(Intention {
         id: IntentionId::from(get_uuid(row, columns, "id")?),
         description: get_text(row, columns, "description")?,

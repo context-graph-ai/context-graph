@@ -1,0 +1,17 @@
+error[E0432]: unresolved import `context_graph::ListDecisionFilter`
+ --> tests/compile_fail/list_decisions_is_not_public.rs:1:21
+  |
+1 | use context_graph::{ListDecisionFilter, Store, StoreConfig};
+  |                     ^^^^^^^^^^^^^^^^^^ no `ListDecisionFilter` in the root
+
+error[E0599]: no method named `list_decisions` found for struct `Store` in the current scope
+  --> tests/compile_fail/list_decisions_is_not_public.rs:13:19
+   |
+13 |     let _ = store.list_decisions(ListDecisionFilter::default());
+   |                   ^^^^^^^^^^^^^^
+   |
+help: there is a method `get_decision` with a similar name
+   |
+13 -     let _ = store.list_decisions(ListDecisionFilter::default());
+13 +     let _ = store.get_decision(ListDecisionFilter::default());
+   |

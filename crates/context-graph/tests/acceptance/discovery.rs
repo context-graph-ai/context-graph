@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use context_graph::*;
-use contextdb_core::{TxId, Value};
+use contextdb_core::{Result as EngineResult, TxId, Value};
 use contextdb_engine::Database;
 use serde_json::{Value as JsonValue, json};
 use tempfile::TempDir;
@@ -39,6 +39,24 @@ fn reopen(db_path: &Path) -> Store {
         ..Default::default()
     })
     .expect("open")
+}
+
+fn current_tx(db_path: &Path) -> TxId {
+    let db = raw_db(db_path);
+    TxId::from_snapshot(db.snapshot())
+}
+
+fn raw_db(db_path: &Path) -> Database {
+    let db = Database::open(db_path).expect("raw db");
+    let registered = db.registered_trigger_callbacks();
+    for trigger in db.list_triggers() {
+        if !registered.iter().any(|name| name == &trigger.name) {
+            db.register_trigger_callback(&trigger.name, |_db, _ctx| -> EngineResult<()> { Ok(()) })
+                .expect("register noop trigger");
+        }
+    }
+    db.complete_initialization().expect("raw db triggers ready");
+    db
 }
 
 fn scoped(db_path: &Path, context_id: ContextId) -> Store {
@@ -227,7 +245,7 @@ fn insert_raw_edges(
     relationship: &str,
     edges: &[(uuid::Uuid, uuid::Uuid)],
 ) {
-    let db = Database::open(db_path).expect("raw db");
+    let db = raw_db(db_path);
     for (source_id, target_id) in edges {
         db.execute(
             "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
@@ -261,7 +279,7 @@ fn insert_raw_decision(
     description: &str,
     created_at: TxId,
 ) {
-    let db = Database::open(db_path).expect("raw db");
+    let db = raw_db(db_path);
     db.execute(
         "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
         &HashMap::from([
@@ -2395,9 +2413,10 @@ fn discovery_ordering_created_at_desc_id_asc_deterministic() {
         0x0000_0000_0000_0000_0000_0000_0000_0013,
     ));
     drop(store);
-    insert_raw_decision(&db_path, ctx.id, high, "tie high", TxId(4242));
-    insert_raw_decision(&db_path, ctx.id, low, "tie low", TxId(4242));
-    insert_raw_decision(&db_path, ctx.id, mid, "tie mid", TxId(4242));
+    let tie_tx = current_tx(&db_path);
+    insert_raw_decision(&db_path, ctx.id, high, "tie high", tie_tx);
+    insert_raw_decision(&db_path, ctx.id, low, "tie low", tie_tx);
+    insert_raw_decision(&db_path, ctx.id, mid, "tie mid", tie_tx);
     insert_raw_edges(
         &db_path,
         ctx.id,
@@ -2414,7 +2433,7 @@ fn discovery_ordering_created_at_desc_id_asc_deterministic() {
         "by intention same tx"
     );
     assert_decision_order(&tied, &[low, mid, high]);
-    assert!(tied.iter().all(|row| row.created_at == TxId(4242)));
+    assert!(tied.iter().all(|row| row.created_at == tie_tx));
 
     let e_tie = entity(&store, ctx.id, "same tx entity tie");
     let decision_low = DecisionId::from(uuid::Uuid::from_u128(
@@ -2436,36 +2455,49 @@ fn discovery_ordering_created_at_desc_id_asc_deterministic() {
         0x0000_0000_0000_0000_0000_0000_0000_0033,
     ));
     drop(store);
+    let entity_tie_tx = current_tx(&db_path);
     insert_raw_intention(
         &db_path,
         ctx.id,
         intention_high,
         "entity tie high",
-        TxId(4444),
+        entity_tie_tx,
     );
     insert_raw_intention(
         &db_path,
         ctx.id,
         intention_low,
         "entity tie low",
-        TxId(4444),
+        entity_tie_tx,
     );
     insert_raw_intention(
         &db_path,
         ctx.id,
         intention_mid,
         "entity tie mid",
-        TxId(4444),
+        entity_tie_tx,
     );
     insert_raw_decision(
         &db_path,
         ctx.id,
         decision_high,
         "entity tie high",
-        TxId(4343),
+        entity_tie_tx,
     );
-    insert_raw_decision(&db_path, ctx.id, decision_low, "entity tie low", TxId(4343));
-    insert_raw_decision(&db_path, ctx.id, decision_mid, "entity tie mid", TxId(4343));
+    insert_raw_decision(
+        &db_path,
+        ctx.id,
+        decision_low,
+        "entity tie low",
+        entity_tie_tx,
+    );
+    insert_raw_decision(
+        &db_path,
+        ctx.id,
+        decision_mid,
+        "entity tie mid",
+        entity_tie_tx,
+    );
     insert_raw_edges(
         &db_path,
         ctx.id,
@@ -2503,7 +2535,7 @@ fn discovery_ordering_created_at_desc_id_asc_deterministic() {
     assert!(
         entity_decisions_first
             .iter()
-            .all(|row| row.created_at == TxId(4343))
+            .all(|row| row.created_at == entity_tie_tx)
     );
 
     let entity_intentions_first = ok!(
@@ -2522,7 +2554,7 @@ fn discovery_ordering_created_at_desc_id_asc_deterministic() {
     assert!(
         entity_intentions_first
             .iter()
-            .all(|row| row.created_at == TxId(4444))
+            .all(|row| row.created_at == entity_tie_tx)
     );
     drop(store);
 

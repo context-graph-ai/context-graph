@@ -2175,7 +2175,7 @@ fn test_not_null_intention_description_rejected() {
     );
 }
 
-// decisions.decision_type is NOT NULL; list_decisions and audit queries key off this column, so a null value must be rejected at insert.
+// decisions.decision_type is NOT NULL; Discovery and audit queries key off this column, so a null value must be rejected at insert.
 #[test]
 fn test_not_null_decision_decision_type_rejected() {
     let db = fresh_db();

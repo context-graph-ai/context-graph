@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `context_graph::types::ListDecisionFilter`
+ --> tests/compile_fail/list_decision_filter_module_is_not_public.rs:1:5
+  |
+1 | use context_graph::types::ListDecisionFilter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `ListDecisionFilter` in `types`

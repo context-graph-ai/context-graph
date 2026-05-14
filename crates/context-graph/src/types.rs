@@ -836,18 +836,6 @@ pub struct RecordObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ListDecisionFilter {
-    pub intention_id: Option<IntentionId>,
-    pub tags: Vec<String>,
-    pub based_on_entity_ids: Vec<EntityId>,
-    pub entity_match_policy: EntityMatchPolicy,
-    pub status: Option<DecisionStatus>,
-    pub context_id: Option<ContextId>,
-    pub limit: Option<u32>,
-    pub after: Option<DecisionId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DiscoveryFilter {
     pub include_decision_statuses: Option<Vec<DecisionStatus>>,
     pub include_intention_statuses: Option<Vec<IntentionStatus>>,

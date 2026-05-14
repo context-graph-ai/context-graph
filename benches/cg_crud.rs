@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use common::entity_fixture::seed_entity_fixture;
 use context_graph::{
-    ContextId, CreateContext, CreateDecision, CreateIntention, EntityId, EntityType, IntentionId,
-    IntentionOrigin, IntentionStatus, ListDecisionFilter, ListEntityFilter, ReasoningStep, Store,
-    StoreConfig,
+    ContextId, CreateContext, CreateDecision, CreateIntention, DiscoveryFilter, EntityId,
+    EntityType, IntentionId, IntentionOrigin, IntentionStatus, ListEntityFilter, ReasoningStep,
+    Store, StoreConfig,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
@@ -138,24 +138,25 @@ fn bench_decision_list_by_intention_10k(c: &mut Criterion) {
     drop(store);
     let store = reopen(&db_path);
 
-    let filter = || ListDecisionFilter {
-        intention_id: Some(i1.id),
-        ..ListDecisionFilter::default()
-    };
-    let warm = store.list_decisions(filter()).expect("list decisions");
+    let filter = || DiscoveryFilter::default();
+    let warm = store
+        .by_intention(i1.id, filter())
+        .expect("decisions by intention");
     assert_eq!(warm, vec![d2.clone(), d1.clone()]);
     assert!(!warm.iter().any(|d| d.id == d3.id));
-    assert_eq!(
-        store.last_query_trace().expect("query trace"),
-        "edge_type=SERVES"
-    );
 
     c.bench_function("decision_list_by_intention_10k", |b| {
-        b.iter(|| store.list_decisions(filter()).expect("list decisions"));
+        b.iter(|| {
+            store
+                .by_intention(i1.id, filter())
+                .expect("decisions by intention")
+        });
     });
 
     let started = Instant::now();
-    let _ = store.list_decisions(filter()).expect("list decisions");
+    let _ = store
+        .by_intention(i1.id, filter())
+        .expect("decisions by intention");
     let elapsed = started.elapsed();
     assert!(
         elapsed <= DECISION_BUDGET,

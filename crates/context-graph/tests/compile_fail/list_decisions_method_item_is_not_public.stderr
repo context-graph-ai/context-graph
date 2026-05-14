@@ -1,0 +1,11 @@
+error[E0599]: no function or associated item named `list_decisions` found for struct `Store` in the current scope
+ --> tests/compile_fail/list_decisions_method_item_is_not_public.rs:4:31
+  |
+4 |     let _method_item = Store::list_decisions;
+  |                               ^^^^^^^^^^^^^^ function or associated item not found in `Store`
+  |
+help: there is a method `get_decision` with a similar name
+ --> src/store/decision.rs
+  |
+  |     pub fn get_decision(&self, id: DecisionId) -> Result<Option<Decision>> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

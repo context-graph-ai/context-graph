@@ -120,7 +120,7 @@ fn test_entity_status_variants() {
     );
 }
 
-// Confirms EntityMatchPolicy exposes exactly Any and All so list_decisions' based_on semantics stay exhaustive.
+// Confirms EntityMatchPolicy exposes exactly Any and All so entity-anchored based_on semantics stay exhaustive.
 #[test]
 fn test_entity_match_policy_variants() {
     let variants = EntityMatchPolicy::ALL;
@@ -171,7 +171,7 @@ fn test_intention_default_status_is_active() {
     assert_eq!(IntentionStatus::default(), IntentionStatus::Active);
 }
 
-// A freshly-created Decision defaults to Active; a different default would skew list_decisions' status filter.
+// A freshly-created Decision defaults to Active; a different default would skew Discovery's live-row filter.
 #[test]
 fn test_decision_default_status_is_active() {
     assert_eq!(DecisionStatus::default(), DecisionStatus::Active);

@@ -2647,11 +2647,8 @@ fn snapshot_only_decision_basis_persists_based_on_graph_edges_for_create_and_sup
     );
     assert_eq!(
         store
-            .list_decisions(ListDecisionFilter {
-                based_on_entity_ids: vec![entity.id],
-                ..Default::default()
-            })
-            .expect("list by entity")
+            .by_entity_decisions(entity.id, DiscoveryFilter::default())
+            .expect("decisions by entity")
             .iter()
             .map(|decision| decision.id)
             .collect::<Vec<_>>(),

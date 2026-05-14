@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -8,12 +8,13 @@ use context_graph::schema::DIGEST_VECTOR_DIMENSION;
 use context_graph::{
     AuditFilter, AuditTarget, CgError, ContextId, CreateContext, CreateDecision, CreateDigest,
     CreateEntity, CreateIntention, DecisionId, DecisionPatch, DecisionStatus, DigestId,
-    EmbeddingId, EmbeddingTarget, EntityId, EntityMatchPolicy, EntityPatch, EntityStatus,
-    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, Intention, IntentionId,
-    IntentionOrigin, IntentionPatch, IntentionStatus, ListDecisionFilter, ListEntityFilter,
-    ObservationId, PrecomputedEmbedding, ReasoningStep, RecordObservation, RelationshipType,
-    RetentionStatus, StorageKey, Store, StoreConfig, TraverseFilter,
+    DiscoveryFilter, EmbeddingId, EmbeddingTarget, EntityId, EntityPatch, EntityStatus, EntityType,
+    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, Intention, IntentionId,
+    IntentionOrigin, IntentionPatch, IntentionStatus, ListEntityFilter, ObservationId,
+    PrecomputedEmbedding, ReasoningStep, RecordObservation, RelationshipType, RetentionStatus,
+    StorageKey, Store, StoreConfig, TraverseFilter,
 };
+use contextdb_engine::Database;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -47,6 +48,13 @@ fn reopen(db_path: &Path) -> Store {
         ..Default::default()
     })
     .expect("open")
+}
+
+fn raw_decision_count(db_path: &Path) -> usize {
+    let db = Database::open(db_path).expect("raw db");
+    db.scan("decisions", db.snapshot())
+        .expect("scan decisions")
+        .len()
 }
 
 fn map(entries: &[(&str, Value)]) -> BTreeMap<String, Value> {
@@ -465,14 +473,8 @@ fn decision_create_requires_intention() {
         missing
     );
     drop(store);
+    assert_eq!(raw_decision_count(&db_path), 0);
     let store = reopen(&db_path);
-    assert!(
-        ok!(
-            store.list_decisions(ListDecisionFilter::default()),
-            "list after first reject"
-        )
-        .is_empty()
-    );
     let non_existent_id = IntentionId::new_v7();
     let bad_id = store.create_decision(CreateDecision {
         decision_type: "architecture".to_string(),
@@ -495,14 +497,7 @@ fn decision_create_requires_intention() {
         bad_id
     );
     drop(store);
-    let store = reopen(&db_path);
-    assert!(
-        ok!(
-            store.list_decisions(ListDecisionFilter::default()),
-            "list after second reject"
-        )
-        .is_empty()
-    );
+    assert_eq!(raw_decision_count(&db_path), 0);
 }
 
 // Use case: a platform engineer records "use axum" with three reasoning steps and two BASED_ON entities; six months later the graph must return reasoning, SERVES, and BASED_ON snapshots as they were at decision time (Invariant 2).
@@ -768,19 +763,14 @@ fn decision_list_by_intention() {
     drop(store);
     let store = reopen(&db_path);
     let results = ok!(
-        store.list_decisions(ListDecisionFilter {
-            intention_id: Some(i1.id),
-            ..ListDecisionFilter::default()
-        }),
-        "list decisions"
+        store.by_intention(i1.id, DiscoveryFilter::default()),
+        "decisions by intention"
     );
-    let trace = ok!(store.last_query_trace(), "query trace");
     assert_eq!(results, vec![d2.clone(), d1.clone()]);
     assert!(!results.iter().any(|decision| decision.id == d3.id));
-    assert_eq!(trace, "edge_type=SERVES");
 }
 
-// Use case: a network-posture review asks for Decisions tagged exactly "networking" and must not silently fold in "networking-legacy" via substring matching; tag exactness is a storage-index invariant.
+// Use case: a network-posture review depends on exact tags surviving persistence; a Decision tagged "networking-legacy" must not be rewritten into "networking" after reopen.
 #[test]
 fn decision_list_by_tags() {
     let (_tempdir, db_path, store) = fixture();
@@ -792,6 +782,7 @@ fn decision_list_by_tags() {
         store.create_intention(create_intention_input(ctx.id, "manage network posture")),
         "intention"
     );
+    let mut networking_ids = Vec::new();
     for i in 0..100 {
         let bucket = match i % 10 {
             0 => "networking",
@@ -805,7 +796,7 @@ fn decision_list_by_tags() {
             8 => "identity",
             _ => "delivery",
         };
-        ok!(
+        let created = ok!(
             store.create_decision(CreateDecision {
                 decision_type: "policy".to_string(),
                 description: format!("net-policy-{i}"),
@@ -823,6 +814,9 @@ fn decision_list_by_tags() {
             }),
             "seed decision"
         );
+        if bucket == "networking" {
+            networking_ids.push(created.id);
+        }
     }
     let trap = ok!(
         store.create_decision(CreateDecision {
@@ -844,33 +838,17 @@ fn decision_list_by_tags() {
     );
     drop(store);
     let store = reopen(&db_path);
-    let results = ok!(
-        store.list_decisions(ListDecisionFilter {
-            tags: vec!["networking".to_string()],
-            ..ListDecisionFilter::default()
-        }),
-        "list by tags"
-    );
-    assert_eq!(results.len(), 10);
-    assert!(
-        results
-            .iter()
-            .all(|decision| decision.tags.iter().any(|tag| tag == "networking"))
-    );
-    assert!(
-        results
-            .iter()
-            .all(|decision| decision.tags.iter().all(|tag| tag != "networking-legacy"))
-    );
-    assert!(!results.iter().any(|decision| decision.id == trap.id));
-    assert!(
-        results
-            .windows(2)
-            .all(|pair| pair[0].created_at >= pair[1].created_at)
-    );
+    for id in networking_ids {
+        let decision = ok!(store.get_decision(id), "get networking decision").expect("decision");
+        assert!(decision.tags.iter().any(|tag| tag == "networking"));
+        assert!(decision.tags.iter().all(|tag| tag != "networking-legacy"));
+    }
+    let trap = ok!(store.get_decision(trap.id), "get trap decision").expect("trap");
+    assert!(trap.tags.iter().all(|tag| tag != "networking"));
+    assert!(trap.tags.iter().any(|tag| tag == "networking-legacy"));
 }
 
-// Use case: an engineer planning a refactor asks for Decisions BASED_ON either the payments-api or the payments-db; each matching Decision must appear exactly once so blast-radius counts are not inflated.
+// Use case: an engineer planning a refactor composes two Entity-anchored Discovery reads for payments-api or payments-db; each matching Decision must appear exactly once so blast-radius counts are not inflated.
 #[test]
 fn decision_list_by_entities_any_semantics() {
     let (_tempdir, db_path, store) = fixture();
@@ -944,20 +922,24 @@ fn decision_list_by_entities_any_semantics() {
     );
     drop(store);
     let store = reopen(&db_path);
-    let results = ok!(
-        store.list_decisions(ListDecisionFilter {
-            based_on_entity_ids: vec![e1.id, e2.id],
-            entity_match_policy: EntityMatchPolicy::Any,
-            ..ListDecisionFilter::default()
-        }),
-        "list any"
+    let e1_results = ok!(
+        store.by_entity_decisions(e1.id, DiscoveryFilter::default()),
+        "by entity e1"
     );
-    assert_eq!(results, vec![d_both.clone(), d_b.clone(), d_a.clone()]);
-    assert_eq!(results.len(), 3);
-    assert!(!results.iter().any(|decision| decision.id == d_c.id));
+    let e2_results = ok!(
+        store.by_entity_decisions(e2.id, DiscoveryFilter::default()),
+        "by entity e2"
+    );
+    let results = e1_results
+        .iter()
+        .chain(e2_results.iter())
+        .map(|decision| decision.id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(results, BTreeSet::from([d_both.id, d_b.id, d_a.id]));
+    assert!(!results.contains(&d_c.id));
 }
 
-// Use case: a cross-service regression investigation asks for Decisions that depend on BOTH auth and rate-limiter; the engine must intersect BASED_ON reverse indexes, not union them.
+// Use case: a cross-service regression investigation asks for Decisions that depend on both payments-api and payments-db; intersecting two Entity-anchored Discovery reads must leave only Decisions touching both anchors.
 #[test]
 fn decision_list_by_entities_all_semantics() {
     let (_tempdir, db_path, store) = fixture();
@@ -1031,18 +1013,28 @@ fn decision_list_by_entities_all_semantics() {
     );
     drop(store);
     let store = reopen(&db_path);
-    let results = ok!(
-        store.list_decisions(ListDecisionFilter {
-            based_on_entity_ids: vec![e1.id, e2.id],
-            entity_match_policy: EntityMatchPolicy::All,
-            ..ListDecisionFilter::default()
-        }),
-        "list all"
-    );
-    assert_eq!(results, vec![d_both.clone()]);
-    assert!(!results.iter().any(|decision| decision.id == d_a.id));
-    assert!(!results.iter().any(|decision| decision.id == d_b.id));
-    assert!(!results.iter().any(|decision| decision.id == d_c.id));
+    let e1_results = ok!(
+        store.by_entity_decisions(e1.id, DiscoveryFilter::default()),
+        "by entity e1"
+    )
+    .into_iter()
+    .map(|decision| decision.id)
+    .collect::<BTreeSet<_>>();
+    let e2_results = ok!(
+        store.by_entity_decisions(e2.id, DiscoveryFilter::default()),
+        "by entity e2"
+    )
+    .into_iter()
+    .map(|decision| decision.id)
+    .collect::<BTreeSet<_>>();
+    let intersection = e1_results
+        .intersection(&e2_results)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(intersection, BTreeSet::from([d_both.id]));
+    assert!(!intersection.contains(&d_a.id));
+    assert!(!intersection.contains(&d_b.id));
+    assert!(!intersection.contains(&d_c.id));
 }
 
 // Use case: an agent tries to quietly rewrite a Decision's description for a nicer report; the engine refuses at the schema layer so the audit trail cannot be polished after the fact.
@@ -1331,14 +1323,8 @@ fn decision_archive_not_found() {
     drop(store);
     let store = reopen(&db_path);
     assert!(matches!(store.get_decision(unknown_id), Ok(None)));
-    let archived = ok!(
-        store.list_decisions(ListDecisionFilter {
-            status: Some(DecisionStatus::Archived),
-            ..ListDecisionFilter::default()
-        }),
-        "list archived"
-    );
-    assert!(archived.is_empty());
+    drop(store);
+    assert_eq!(raw_decision_count(&db_path), 0);
 }
 
 // Use case: a compliance auditor a year later asks "what Decisions were active at that review?"; archived Decisions must remain queryable with the row physically present under admin raw scan (Invariant 3 — no hard deletes).
