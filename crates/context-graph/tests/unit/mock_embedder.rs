@@ -10,14 +10,26 @@ use context_graph::{
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
+use sha2::{Digest, Sha256};
 
 fn expected_mock_vector(kind: &str, value: &str, dimension: usize) -> Vec<f32> {
-    let seed = format!("{kind}:{value}")
-        .bytes()
-        .fold(0_u32, |acc, byte| acc + u32::from(byte));
-    let mut vector = (0..dimension)
-        .map(|idx| ((seed + idx as u32) % 23) as f32 / 23.0)
-        .collect::<Vec<_>>();
+    let mut vector = Vec::with_capacity(dimension);
+    let mut block = 0_u64;
+    while vector.len() < dimension {
+        let mut hasher = Sha256::new();
+        hasher.update(kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update(block.to_le_bytes());
+        for chunk in hasher.finalize().chunks_exact(4) {
+            if vector.len() == dimension {
+                break;
+            }
+            let bytes = <[u8; 4]>::try_from(chunk).expect("sha256 chunk");
+            vector.push(u32::from_le_bytes(bytes) as f32 / u32::MAX as f32);
+        }
+        block += 1;
+    }
     let norm = vector_l2_norm(&vector);
     for value in &mut vector {
         *value /= norm;
@@ -88,6 +100,22 @@ fn mock_embedder_distinct_inputs_distinct_vectors() {
             && (vector_l2_norm(&first.vector) - 1.0).abs() <= 1.0e-6
             && (vector_l2_norm(&second.vector) - 1.0).abs() <= 1.0e-6,
         "distinct mock inputs must remain meaningfully separated after L2 normalization, not collapse to zeros or a near-duplicate vector; distance={distance}, first={first:?}, second={second:?}"
+    );
+}
+
+#[test]
+fn mock_embedder_order_sensitive_inputs_do_not_collide() {
+    let embedder = MockEmbedder::new("mock_space", 4);
+    let ab = embedder
+        .embed(EmbeddingInput::Text("ab".to_string()))
+        .expect("ab");
+    let ba = embedder
+        .embed(EmbeddingInput::Text("ba".to_string()))
+        .expect("ba");
+
+    assert_ne!(
+        ab.vector, ba.vector,
+        "mock vectors must be order-sensitive stable hashes, not byte-sum projections"
     );
 }
 

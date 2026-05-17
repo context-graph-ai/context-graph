@@ -3,15 +3,27 @@ use context_graph::{
     CG_EDGE_SYSTEM_TAG, CgError, DistanceMetric, Embedder, EmbeddingInput, EmbeddingOutput,
     EmbeddingSpace, EvidenceKind, EvidenceProducer,
 };
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn expected_mock_vector(kind: &str, value: &str, dimension: usize) -> Vec<f32> {
-    let seed = format!("{kind}:{value}")
-        .bytes()
-        .fold(0_u32, |acc, byte| acc + u32::from(byte));
-    let mut vector = (0..dimension)
-        .map(|idx| ((seed + idx as u32) % 23) as f32 / 23.0)
-        .collect::<Vec<_>>();
+    let mut vector = Vec::with_capacity(dimension);
+    let mut block = 0_u64;
+    while vector.len() < dimension {
+        let mut hasher = Sha256::new();
+        hasher.update(kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+        hasher.update(block.to_le_bytes());
+        for chunk in hasher.finalize().chunks_exact(4) {
+            if vector.len() == dimension {
+                break;
+            }
+            let bytes = <[u8; 4]>::try_from(chunk).expect("sha256 chunk");
+            vector.push(u32::from_le_bytes(bytes) as f32 / u32::MAX as f32);
+        }
+        block += 1;
+    }
     let norm = vector_l2_norm(&vector);
     for value in &mut vector {
         *value /= norm;
