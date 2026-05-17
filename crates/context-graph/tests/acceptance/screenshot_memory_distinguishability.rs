@@ -55,7 +55,7 @@ fn context_and_entity(store: &Store) -> (ContextId, EntityId) {
 
 fn producer(model_name: &str, model_version: &str) -> EvidenceProducer {
     EvidenceProducer {
-        system: "cg-edge".to_string(),
+        system: "edge-memory".to_string(),
         model_name: model_name.to_string(),
         model_version: model_version.to_string(),
         pipeline_version: "screenshot-review".to_string(),

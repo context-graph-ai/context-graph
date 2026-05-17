@@ -864,12 +864,44 @@ fn embedder_first_use_emits_observable_progress_signal_naming_model_version_path
 #[test]
 fn store_open_against_mismatched_cg_schema_version_returns_legacy_schema_detected() {
     let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("schema.db");
     let config = StoreConfig {
-        db_path: dir.path().join("schema.db"),
+        db_path: db_path.clone(),
         expected_schema_version: CG_SCHEMA_VERSION + 1,
         ..Default::default()
     };
     let result = Store::open(config);
+    let db = Database::open(&db_path).expect("raw schema db");
+    let schema_version_rows = db
+        .execute(
+            "SELECT COUNT(*) AS n FROM cg_schema_version WHERE version = $version",
+            &std::collections::HashMap::from([(
+                "version".to_string(),
+                Value::Int64(CG_SCHEMA_VERSION as i64),
+            )]),
+        )
+        .expect("schema version row count");
+    let schema_version_count = match schema_version_rows.rows.first().and_then(|row| row.first()) {
+        Some(Value::Int64(value)) => *value,
+        _ => 0,
+    };
+    db.execute(
+        "UPDATE cg_schema_version SET version = $found_version WHERE id = $id",
+        &std::collections::HashMap::from([
+            ("id".to_string(), Value::Int64(1)),
+            (
+                "found_version".to_string(),
+                Value::Int64((CG_SCHEMA_VERSION - 2) as i64),
+            ),
+        ]),
+    )
+    .expect("rewrite schema version row");
+    drop(db);
+    let row_backed_result = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        expected_schema_version: CG_SCHEMA_VERSION + 1,
+        ..Default::default()
+    });
 
     assert!(matches!(
         result,
@@ -878,7 +910,21 @@ fn store_open_against_mismatched_cg_schema_version_returns_legacy_schema_detecte
             expected_version
         }) if found_version == CG_SCHEMA_VERSION && expected_version == CG_SCHEMA_VERSION + 1
     ));
-    assert!(format!("{:?}", result.err()).contains("cg_schema_version"));
+    assert_eq!(
+        schema_version_count, 1,
+        "schema-version mismatch must be grounded in the persisted cg_schema_version row"
+    );
+    assert!(
+        matches!(
+            row_backed_result,
+            Err(CgError::LegacySchemaDetected {
+                found_version,
+                expected_version
+            }) if found_version == CG_SCHEMA_VERSION - 2
+                && expected_version == CG_SCHEMA_VERSION + 1
+        ),
+        "schema-version mismatch must report the persisted row value, not a hardcoded current-version constant, got {row_backed_result:?}"
+    );
 }
 
 #[test]

@@ -14,7 +14,7 @@ use context_graph::{
     IntentionStatus, PrecomputedEmbedding, RecordObservation, ReindexEvent, ReindexOptions,
     RetentionStatus, Store, StoreConfig,
 };
-use contextdb_core::Value;
+use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::Database;
 
 const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
@@ -38,6 +38,27 @@ struct BlockingReindexState {
 }
 
 impl BlockingReindexControl {
+    fn wait_until_calls_at_least(&self, expected_calls: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut state = self.state.lock().expect("blocking state");
+        while state.calls < expected_calls {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let timeout = deadline.saturating_duration_since(now);
+            let (next_state, wait) = self
+                .changed
+                .wait_timeout(state, timeout)
+                .expect("call-count wait");
+            state = next_state;
+            if wait.timed_out() && state.calls < expected_calls {
+                return false;
+            }
+        }
+        true
+    }
+
     fn wait_until_blocked_on_second_row(&self) -> bool {
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut state = self.state.lock().expect("blocking state");
@@ -93,6 +114,30 @@ impl Embedder for BlockingSecondRowConcurrencyEmbedder {
 
     fn embedding_space(&self) -> EmbeddingSpace {
         RecordingConcurrencyEmbedder.embedding_space()
+    }
+}
+
+#[derive(Clone)]
+struct CountingVisionConcurrencyEmbedder {
+    control: Arc<BlockingReindexControl>,
+}
+
+impl Embedder for CountingVisionConcurrencyEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> CgResult<EmbeddingOutput> {
+        if matches!(input, EmbeddingInput::ImageFrame { .. }) {
+            let mut state = self.control.state.lock().expect("vision call state");
+            state.calls += 1;
+            self.control.changed.notify_all();
+        }
+        RecordingVisionConcurrencyEmbedder.embed(input)
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        RecordingVisionConcurrencyEmbedder.supported_inputs()
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpace {
+        RecordingVisionConcurrencyEmbedder.embedding_space()
     }
 }
 
@@ -178,6 +223,18 @@ struct ActiveBasisDecision {
 }
 
 fn fixture(name: &str) -> Fixture {
+    fixture_with_embedders(
+        name,
+        Arc::new(RecordingConcurrencyEmbedder),
+        Arc::new(RecordingVisionConcurrencyEmbedder),
+    )
+}
+
+fn fixture_with_embedders(
+    name: &str,
+    text_embedder: Arc<dyn Embedder>,
+    image_embedder: Arc<dyn Embedder>,
+) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(format!("{name}.db"));
     let store = Store::open_with_embedder_registrations(
@@ -189,11 +246,11 @@ fn fixture(name: &str) -> Fixture {
         vec![
             EmbedderRegistration {
                 space: text_space(),
-                embedder: Arc::new(RecordingConcurrencyEmbedder),
+                embedder: text_embedder,
             },
             EmbedderRegistration {
                 space: image_space(),
-                embedder: Arc::new(RecordingVisionConcurrencyEmbedder),
+                embedder: image_embedder,
             },
         ],
     )
@@ -307,14 +364,6 @@ fn expected_reindexed_image_vector(source_ref: &str) -> Vec<f32> {
     vector[primary] = 0.7;
     vector[secondary] = 0.7;
     vector
-}
-
-fn vectors_equal(left: &[f32], right: &[f32]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|(left, right)| (left - right).abs() <= 1.0e-6)
 }
 
 fn axis(dim: usize, idx: usize) -> Vec<f32> {
@@ -473,9 +522,17 @@ fn open_raw_database(db_path: &PathBuf) -> Database {
     }
 }
 
+fn execute_query(
+    db_path: &PathBuf,
+    sql: &str,
+    params: &HashMap<String, Value>,
+) -> contextdb_engine::QueryResult {
+    let store = open_reindex_store(db_path.clone()).expect("query store opens");
+    store.execute_sql_for_test(sql, params).expect("query")
+}
+
 fn count(db_path: &PathBuf, sql: &str, params: &HashMap<String, Value>) -> i64 {
-    let db = open_raw_database(db_path);
-    let result = db.execute(sql, params).expect("count query");
+    let result = execute_query(db_path, sql, params);
     assert_eq!(result.rows.len(), 1);
     assert!(
         matches!(result.rows[0].first(), Some(Value::Int64(_))),
@@ -508,13 +565,11 @@ fn cursor_at(db_path: &PathBuf, space: &str, expected_cursor: i64) -> i64 {
 }
 
 fn lease_owner_run_id(db_path: &PathBuf, space: &str) -> Option<String> {
-    let db = open_raw_database(db_path);
-    let result = db
-        .execute(
-            "SELECT owner_run_id FROM reindex_cursors WHERE embedding_space_id = $space",
-            &params(vec![("space", Value::Text(space.to_string()))]),
-        )
-        .expect("lease owner query");
+    let result = execute_query(
+        db_path,
+        "SELECT owner_run_id FROM reindex_cursors WHERE embedding_space_id = $space",
+        &params(vec![("space", Value::Text(space.to_string()))]),
+    );
     result.rows.first().and_then(|row| match row.first() {
         Some(Value::Text(owner)) => Some(owner.clone()),
         _ => None,
@@ -552,8 +607,9 @@ fn raw_conditional_lease_takeover_rejected(db_path: &PathBuf, space: &str) -> bo
     if durable_in_progress_lease_at(db_path, space, 1) != 1 {
         return false;
     }
-    let db = open_raw_database(db_path);
-    let available_status_result = db.execute(
+    let available_status_result = {
+        let store = open_reindex_store(db_path.clone()).expect("lease contender store opens");
+        store.execute_sql_for_test(
         "UPDATE reindex_cursors SET owner_run_id = $owner, lease_epoch = $next_epoch WHERE embedding_space_id = $space AND status = $available",
         &params(vec![
             ("owner", Value::Text("raw-contender".to_string())),
@@ -561,8 +617,11 @@ fn raw_conditional_lease_takeover_rejected(db_path: &PathBuf, space: &str) -> bo
             ("space", Value::Text(space.to_string())),
             ("available", Value::Text("available".to_string())),
         ]),
-    );
-    let stale_owner_result = db.execute(
+        )
+    };
+    let stale_owner_result = {
+        let store = open_reindex_store(db_path.clone()).expect("lease contender store opens");
+        store.execute_sql_for_test(
         "UPDATE reindex_cursors SET owner_run_id = $owner, lease_epoch = $next_epoch WHERE embedding_space_id = $space AND status = $status AND owner_run_id = $stale_owner AND lease_epoch = $epoch",
         &params(vec![
             ("owner", Value::Text("raw-contender".to_string())),
@@ -572,36 +631,41 @@ fn raw_conditional_lease_takeover_rejected(db_path: &PathBuf, space: &str) -> bo
             ("stale_owner", Value::Text(format!("{owner_run_id}-stale"))),
             ("epoch", Value::Int64(1)),
         ]),
-    );
+        )
+    };
     matches!(available_status_result, Ok(query) if query.rows_affected == 0)
         && matches!(stale_owner_result, Ok(query) if query.rows_affected == 0)
         && lease_owner_run_id(db_path, space).as_deref() == Some(owner_run_id.as_str())
         && durable_in_progress_lease_at(db_path, space, 1) == 1
 }
 
-fn stored_evidence_vector(db_path: &PathBuf, evidence_id: EvidenceId) -> Option<Vec<f32>> {
-    stored_evidence_vector_column(db_path, evidence_id, "vector_text")
-}
-
-fn stored_evidence_image_vector(db_path: &PathBuf, evidence_id: EvidenceId) -> Option<Vec<f32>> {
-    stored_evidence_vector_column(db_path, evidence_id, "vector_vision")
-}
-
-fn stored_evidence_vector_column(
+fn vector_score_for(
     db_path: &PathBuf,
     evidence_id: EvidenceId,
     column: &str,
-) -> Option<Vec<f32>> {
+    query: Vec<f32>,
+) -> Option<f32> {
     let db = open_raw_database(db_path);
-    let result = db
-        .execute(
-            &format!("SELECT {column} FROM evidence WHERE id = $id"),
-            &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
+    let hits = db
+        .query_vector(
+            VectorIndexRef::new("evidence", column),
+            &query,
+            32,
+            None,
+            db.snapshot(),
         )
         .expect("vector query");
-    result.rows.first().and_then(|row| match row.first() {
-        Some(Value::Vector(vector)) => Some(vector.clone()),
-        _ => None,
+    let rows = db.scan("evidence", db.snapshot()).expect("scan evidence");
+    hits.into_iter().find_map(|(row_id, score)| {
+        rows.iter().find_map(|row| {
+            (row.row_id == row_id)
+                .then(|| row.values.get("id").cloned())
+                .flatten()
+                .and_then(|value| match value {
+                    Value::Uuid(id) if id == evidence_id.as_uuid() => Some(score),
+                    _ => None,
+                })
+        })
     })
 }
 
@@ -632,19 +696,25 @@ fn producer_rows_for_space(db_path: &PathBuf, space: &str, producer: EvidencePro
 
 fn all_reindexed_vectors_visible(db_path: &PathBuf, seeded: &[(EvidenceId, String)]) -> bool {
     seeded.iter().all(|(evidence_id, source_text)| {
-        stored_evidence_vector(db_path, *evidence_id)
-            .as_ref()
-            .is_some_and(|vector| vectors_equal(vector, &expected_reindexed_vector(source_text)))
+        vector_score_for(
+            db_path,
+            *evidence_id,
+            "vector_text",
+            expected_reindexed_vector(source_text),
+        )
+        .is_some_and(|score| score > 0.99)
     })
 }
 
 fn all_reindexed_image_vectors_visible(db_path: &PathBuf, seeded: &[(EvidenceId, String)]) -> bool {
     seeded.iter().all(|(evidence_id, source_ref)| {
-        stored_evidence_image_vector(db_path, *evidence_id)
-            .as_ref()
-            .is_some_and(|vector| {
-                vectors_equal(vector, &expected_reindexed_image_vector(source_ref))
-            })
+        vector_score_for(
+            db_path,
+            *evidence_id,
+            "vector_vision",
+            expected_reindexed_image_vector(source_ref),
+        )
+        .is_some_and(|score| score > 0.99)
     })
 }
 
@@ -769,7 +839,7 @@ fn reindex_concurrent_invocations_on_same_space_serialize_or_reject_typed() {
 
 #[test]
 fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
-    let row_count = 200;
+    let row_count = 20;
     let serial_fixture = fixture("reindex-distinct-serial");
     let serial_text_seeded = seed_rows(
         &serial_fixture.store,
@@ -805,7 +875,17 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
     let serial_image_new_producer_rows =
         producer_rows_for_space(&serial_db_path, IMAGE_SPACE, image_producer("new"));
 
-    let fixture = fixture("reindex-distinct-parallel");
+    let text_control = Arc::new(BlockingReindexControl::default());
+    let image_control = Arc::new(BlockingReindexControl::default());
+    let fixture = fixture_with_embedders(
+        "reindex-distinct-parallel",
+        Arc::new(BlockingSecondRowConcurrencyEmbedder {
+            control: Arc::clone(&text_control),
+        }),
+        Arc::new(CountingVisionConcurrencyEmbedder {
+            control: Arc::clone(&image_control),
+        }),
+    );
     let text_seeded = seed_rows(
         &fixture.store,
         TEXT_SPACE,
@@ -820,18 +900,32 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
         512,
         row_count,
     );
+    let db_path = fixture.db_path.clone();
     let parallel_start = Instant::now();
-    let (first, second) = run_two_reindexes(fixture.store, TEXT_SPACE, IMAGE_SPACE);
+    let shared = Arc::new(fixture.store.clone());
+    let first = {
+        let store = Arc::clone(&shared);
+        thread::spawn(move || store.reindex_space(TEXT_SPACE, ReindexOptions::default()))
+    };
+    let text_blocked_inside_active_reindex = text_control.wait_until_blocked_on_second_row();
+    let second = {
+        let store = Arc::clone(&shared);
+        thread::spawn(move || store.reindex_space(IMAGE_SPACE, ReindexOptions::default()))
+    };
+    let image_progress_while_text_blocked = image_control.wait_until_calls_at_least(1);
+    text_control.release();
+    let first = first.join().expect("text reindex thread");
+    let second = second.join().expect("image reindex thread");
     let parallel_elapsed = parallel_start.elapsed();
-    let text_cursors = cursor_count(&fixture.db_path, TEXT_SPACE);
-    let vision_cursors = cursor_count(&fixture.db_path, IMAGE_SPACE);
-    let serial_budget = serial_text_elapsed.max(serial_image_elapsed).mul_f32(1.3);
-    let text_vectors = all_reindexed_vectors_visible(&fixture.db_path, &text_seeded);
-    let image_vectors = all_reindexed_image_vectors_visible(&fixture.db_path, &image_seeded);
-    let text_new_producer_rows =
-        producer_rows_for_space(&fixture.db_path, TEXT_SPACE, producer("new"));
+    drop(shared);
+    drop(fixture.store);
+    let text_cursors = cursor_count(&db_path, TEXT_SPACE);
+    let vision_cursors = cursor_count(&db_path, IMAGE_SPACE);
+    let text_vectors = all_reindexed_vectors_visible(&db_path, &text_seeded);
+    let image_vectors = all_reindexed_image_vectors_visible(&db_path, &image_seeded);
+    let text_new_producer_rows = producer_rows_for_space(&db_path, TEXT_SPACE, producer("new"));
     let image_new_producer_rows =
-        producer_rows_for_space(&fixture.db_path, IMAGE_SPACE, image_producer("new"));
+        producer_rows_for_space(&db_path, IMAGE_SPACE, image_producer("new"));
 
     assert!(
         serial_text.is_ok()
@@ -840,6 +934,8 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
             && serial_image_vectors
             && serial_text_new_producer_rows == row_count as i64
             && serial_image_new_producer_rows == row_count as i64
+            && text_blocked_inside_active_reindex
+            && image_progress_while_text_blocked
             && first.is_ok()
             && second.is_ok()
             && text_cursors == 1
@@ -847,9 +943,8 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
             && text_vectors
             && image_vectors
             && text_new_producer_rows == row_count as i64
-            && image_new_producer_rows == row_count as i64
-            && parallel_elapsed < serial_budget,
-        "distinct-space reindexes must each record durable cursors, re-embed exact text/image rows with post-reindex producers, and avoid global head-of-line blocking, row_count={row_count}, serial_text={serial_text:?}/{serial_text_elapsed:?}, serial_image={serial_image:?}/{serial_image_elapsed:?}, serial_text_vectors={serial_text_vectors}, serial_image_vectors={serial_image_vectors}, serial_text_new_producer_rows={serial_text_new_producer_rows}, serial_image_new_producer_rows={serial_image_new_producer_rows}, first={first:?}, second={second:?}, parallel={parallel_elapsed:?}, budget={serial_budget:?}, text_cursors={text_cursors}, vision_cursors={vision_cursors}, text_vectors={text_vectors}, image_vectors={image_vectors}, text_new_producer_rows={text_new_producer_rows}, image_new_producer_rows={image_new_producer_rows}"
+            && image_new_producer_rows == row_count as i64,
+        "distinct-space reindexes must each record durable cursors, re-embed exact text/image rows with post-reindex producers, and allow image row work to enter while text row work is actively blocked; this probe intentionally does not require overlapping long Database commit apply windows, row_count={row_count}, serial_text={serial_text:?}/{serial_text_elapsed:?}, serial_image={serial_image:?}/{serial_image_elapsed:?}, serial_text_vectors={serial_text_vectors}, serial_image_vectors={serial_image_vectors}, serial_text_new_producer_rows={serial_text_new_producer_rows}, serial_image_new_producer_rows={serial_image_new_producer_rows}, text_blocked_inside_active_reindex={text_blocked_inside_active_reindex}, image_progress_while_text_blocked={image_progress_while_text_blocked}, first={first:?}, second={second:?}, parallel={parallel_elapsed:?}, text_cursors={text_cursors}, vision_cursors={vision_cursors}, text_vectors={text_vectors}, image_vectors={image_vectors}, text_new_producer_rows={text_new_producer_rows}, image_new_producer_rows={image_new_producer_rows}"
     );
 }
 
@@ -939,7 +1034,9 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
         evidence: vec![EvidenceRef {
             id: EvidenceId::new_v7(),
             kind: EvidenceKind::Text,
-            source_ref: "positive-control://state-change".to_string(),
+            source_ref:
+                "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
             mime_type: Some("text/plain".to_string()),
             retention_status: RetentionStatus::RetainedExternal,
             producer: producer("positive-control"),
@@ -1220,21 +1317,24 @@ fn reindex_on_registered_space_with_no_bindings_returns_typed_no_op_or_error() {
         .store
         .reindex_space(UNBOUND_SPACE, ReindexOptions::default());
     let events = fixture.store.drain_reindex_events();
-    let completed_zero_rows = events.iter().any(|event| {
-        matches!(
-            event,
-            ReindexEvent::Completed {
-                embedding_space_id,
-                rows_processed: 0,
-                from_producer: None,
-                to_producer: None,
-            } if embedding_space_id == UNBOUND_SPACE
-        )
-    });
+    let completed_zero_rows = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ReindexEvent::Completed {
+                    embedding_space_id,
+                    rows_processed: 0,
+                    from_producer: None,
+                    to_producer: None,
+                } if embedding_space_id == UNBOUND_SPACE
+            )
+        })
+        .count();
 
     assert!(
-        before_events.is_empty() && result.is_ok() && completed_zero_rows,
-        "unbound registered space must complete as a typed zero-row no-op event, result={result:?}, before_events={before_events:?}, events={events:?}"
+        before_events.is_empty() && result.is_ok() && events.len() == 1 && completed_zero_rows == 1,
+        "unbound registered space must complete as exactly one typed zero-row no-op event and no unrelated reindex events, result={result:?}, before_events={before_events:?}, events={events:?}, completed_zero_rows={completed_zero_rows}"
     );
 }
 

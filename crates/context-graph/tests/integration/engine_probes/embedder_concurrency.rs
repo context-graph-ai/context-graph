@@ -7,7 +7,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use context_graph::test_support::embedding::{VectorSearchFilters, vector_search};
 use context_graph::{
     ContextId, CreateContext, CreateEntity, DistanceMetric, EmbeddingId, EmbeddingSpaceBinding,
     EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind,
@@ -258,11 +257,7 @@ fn record_evidence_concurrently_with_reader(
     let reader = thread::spawn(move || {
         reader_barrier.wait();
         for _ in 0..256 {
-            let count = reader_writes
-                .iter()
-                .filter(|write| reader_store.get_evidence(write.evidence_id).is_ok())
-                .count();
-            let vector_count = matching_vector_hit_count(&reader_store, &reader_writes);
+            let (count, vector_count) = visibility_counts(&reader_store, &reader_writes);
             reader_counts.lock().expect("counts").push(count);
             reader_vector_counts
                 .lock()
@@ -296,11 +291,7 @@ fn record_evidence_concurrently_with_reader(
     let duration = started.elapsed();
     done.store(true, Ordering::SeqCst);
     reader.join().expect("reader thread");
-    let final_count = final_writes
-        .iter()
-        .filter(|write| fixture.store.get_evidence(write.evidence_id).is_ok())
-        .count();
-    let final_vector_count = matching_vector_hit_count(&fixture.store, &final_writes);
+    let (final_count, final_vector_count) = visibility_counts(&fixture.store, &final_writes);
     let mut counts = observed_counts.lock().expect("counts").clone();
     counts.push(final_count);
     let mut vector_counts = observed_vector_counts
@@ -380,27 +371,18 @@ fn record_text_embedding(
     )
 }
 
-fn matching_vector_hit_count(store: &Store, writes: &[EvidenceWrite]) -> usize {
-    writes
+fn visibility_counts(store: &Store, writes: &[EvidenceWrite]) -> (usize, usize) {
+    let evidence_ids = writes
         .iter()
-        .filter(|write| {
-            vector_search(
-                store,
-                &write.vector,
-                write.embedding_space_id,
-                VectorSearchFilters {
-                    top_k: Some(1),
-                    ..Default::default()
-                },
-            )
-            .is_ok_and(|hits| {
-                matches!(
-                    hits.first().map(|hit| &hit.target),
-                    Some(EmbeddingTarget::Evidence(id)) if *id == write.evidence_id
-                )
-            })
-        })
-        .count()
+        .map(|write| write.evidence_id.as_uuid())
+        .collect::<Vec<_>>();
+    let queries = writes
+        .iter()
+        .map(|write| write.vector.clone())
+        .collect::<Vec<_>>();
+    store
+        .evidence_vector_visibility_counts_for_test(&evidence_ids, text_index(), &queries)
+        .expect("visibility counts")
 }
 
 fn first_hit_id(db: &Database, index: VectorIndexRef, query: Vec<f32>) -> Option<uuid::Uuid> {
@@ -789,7 +771,7 @@ fn engine_probe_composite_fk_same_context_rejects_cross_context_embedding_handle
         thread::spawn(move || {
             barrier.wait();
             db.execute(
-                "INSERT INTO evidence_embedding_handles (id, context_id, target_id, embedding_space_id, produced_by, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $created_at)",
+                "INSERT INTO evidence_embedding_handles (id, context_id, target_id, embedding_space_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $producer_system, $created_at)",
                 &params(vec![
                     ("id", Value::Uuid(handle_id.as_uuid())),
                     ("context_id", Value::Uuid(context_id.as_uuid())),
@@ -799,6 +781,7 @@ fn engine_probe_composite_fk_same_context_rejects_cross_context_embedding_handle
                         "producer",
                         Value::Json(serde_json::to_value(producer("cross-context")).expect("json")),
                     ),
+                    ("producer_system", Value::Text("cg-edge".to_string())),
                     ("created_at", Value::TxId(txid)),
                 ]),
             )
@@ -924,9 +907,7 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
         results.iter().filter(|result| result.is_ok()).count() == 1
             && results.iter().any(|result| matches!(
                 result,
-                Err(context_graph::CgError::EngineFault {
-                    source: context_graph::error::EngineError::UniqueViolation { .. }
-                })
+                Err(context_graph::CgError::UniqueViolation { .. })
             ))
             && variant_handles == 1
             && first_evidence_rows + second_evidence_rows == 1

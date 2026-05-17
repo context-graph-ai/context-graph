@@ -412,7 +412,7 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
     let pre_evidence = table_count(&pre_db, "evidence");
     let pre_entity_snapshots = table_count(&pre_db, "entity_snapshots");
     let pre_entity_snapshot_observations = table_count(&pre_db, "entity_snapshot_observations");
-    let pre_embedding_handles = table_count(&pre_db, "embedding_handles");
+    let pre_embedding_handles = table_count(&pre_db, "evidence_embedding_handles");
     let pre_evidence_availability_log = table_count(&pre_db, "evidence_availability_log");
     drop(pre_db);
 
@@ -471,7 +471,10 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
         table_count(&db, "entity_snapshot_observations"),
         pre_entity_snapshot_observations
     );
-    assert_eq!(table_count(&db, "embedding_handles"), pre_embedding_handles);
+    assert_eq!(
+        table_count(&db, "evidence_embedding_handles"),
+        pre_embedding_handles
+    );
     assert_eq!(
         table_count(&db, "evidence_availability_log"),
         pre_evidence_availability_log
@@ -486,7 +489,12 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
             0
         );
         assert_eq!(
-            count_where_uuid(&db, "embedding_handles", "id", embedding_id.as_uuid()),
+            count_where_uuid(
+                &db,
+                "evidence_embedding_handles",
+                "id",
+                embedding_id.as_uuid()
+            ),
             0
         );
         let hits = db

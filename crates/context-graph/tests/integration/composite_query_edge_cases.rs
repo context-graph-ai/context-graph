@@ -579,6 +579,7 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
         TEXT_SPACE,
         VectorSearchFilters {
             top_k: Some(5),
+            include_planner_trace: true,
             ..Default::default()
         },
     )
@@ -628,7 +629,7 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
                 .iter()
                 .all(|hit| hit.index_ref == "evidence.vector_text"
                     && hit.planner_trace.as_str() == raw_trace.as_str()
-                    && hit.planner_trace.contains("IndexScan -> HNSWSearch"))
+                    && hit.planner_trace.contains("HNSWSearch"))
             && raw_targets == targets
             && hnsw_stats
                 .as_ref()

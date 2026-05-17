@@ -8,7 +8,7 @@ use context_graph::{
     EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, PrecomputedEmbedding,
     RecordObservation, RetentionStatus, Store, StoreConfig,
 };
-use contextdb_core::{Error as EngineError, Value};
+use contextdb_core::{Error as EngineError, Value, VectorIndexRef};
 use contextdb_engine::{Database, QueryResult};
 
 const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
@@ -237,7 +237,7 @@ fn cross_context_handle_insert_rejected(
     embedding_space_id: &str,
 ) -> bool {
     let sql = format!(
-        "INSERT INTO {table} (id, context_id, target_id, embedding_space_id, produced_by, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $created_at)"
+        "INSERT INTO {table} (id, context_id, target_id, embedding_space_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $producer_system, $created_at)"
     );
     let insert = db.execute(
         &sql,
@@ -250,6 +250,7 @@ fn cross_context_handle_insert_rejected(
                 "producer",
                 Value::Json(serde_json::to_value(producer()).expect("producer json")),
             ),
+            ("producer_system", Value::Text(producer().system)),
             ("created_at", Value::TxId(context_graph::TxId(1))),
         ]),
     );
@@ -393,10 +394,135 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
     let evidence_id = EvidenceId::new_v7();
     let mut input = embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id));
     input.produced_by.system = CG_EDGE_SYSTEM_TAG.to_string();
+    let query_vector = input.vector.clone();
     let result = record(&fixture, input);
+    let db = raw_db(&fixture.db_path, fixture.store);
+    let observation_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM observations WHERE context_id = $context_id AND entity_id = $entity_id AND observation_type = $observation_type AND source = $source",
+        &params(vec![
+            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+            ("entity_id", Value::Uuid(fixture.entity_id.as_uuid())),
+            (
+                "observation_type",
+                Value::Text("precomputed_embedding_edge".to_string()),
+            ),
+            ("source", Value::Text("edge".to_string())),
+        ]),
+    );
+    let snapshot_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
+        &params(vec![
+            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+            ("entity_id", Value::Uuid(fixture.entity_id.as_uuid())),
+        ]),
+    );
+    let snapshot_observation_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
+        &params(vec![
+            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+            ("entity_id", Value::Uuid(fixture.entity_id.as_uuid())),
+        ]),
+    );
+    let evidence_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM evidence WHERE id = $id",
+        &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
+    );
+    let evidence_handle_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE context_id = $context_id OR target_id = $target_id OR produced_by = $producer",
+        &params(vec![
+            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+            ("target_id", Value::Uuid(evidence_id.as_uuid())),
+            (
+                "producer",
+                Value::Json(serde_json::json!({
+                    "system": CG_EDGE_SYSTEM_TAG,
+                    "model_name": "encoder",
+                    "model_version": "1",
+                    "pipeline_version": "1"
+                })),
+            ),
+        ]),
+    );
+    let entity_reference_handle_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE context_id = $context_id OR produced_by = $producer",
+        &params(vec![
+            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+            (
+                "producer",
+                Value::Json(serde_json::json!({
+                    "system": CG_EDGE_SYSTEM_TAG,
+                    "model_name": "encoder",
+                    "model_version": "1",
+                    "pipeline_version": "1"
+                })),
+            ),
+        ]),
+    );
+    let digest_handle_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE context_id = $context_id OR produced_by = $producer",
+        &params(vec![
+            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+            (
+                "producer",
+                Value::Json(serde_json::json!({
+                    "system": CG_EDGE_SYSTEM_TAG,
+                    "model_name": "encoder",
+                    "model_version": "1",
+                    "pipeline_version": "1"
+                })),
+            ),
+        ]),
+    );
+    let legacy_handle_rows = if db.table_meta("embedding_handles").is_some() {
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM embedding_handles WHERE context_id = $context_id OR target_id = $target_id OR produced_by = $producer",
+            &params(vec![
+                ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+                ("target_id", Value::Uuid(evidence_id.as_uuid())),
+                (
+                    "producer",
+                    Value::Json(serde_json::json!({
+                        "system": CG_EDGE_SYSTEM_TAG,
+                        "model_name": "encoder",
+                        "model_version": "1",
+                        "pipeline_version": "1"
+                    })),
+                ),
+            ]),
+        )
+    } else {
+        0
+    };
+    let raw_vector_hits = db
+        .query_vector(
+            VectorIndexRef::new("evidence", "vector_text"),
+            &query_vector,
+            8,
+            None,
+            db.snapshot(),
+        )
+        .expect("reserved-tag vector query")
+        .len();
     assert!(
-        matches!(result, Err(CgError::ReservedProducerTag { ref tag }) if tag == CG_EDGE_SYSTEM_TAG),
-        "expected reserved producer tag rejection, got {result:?}"
+        matches!(result, Err(CgError::ReservedProducerTag { ref tag }) if tag == CG_EDGE_SYSTEM_TAG)
+            && observation_rows == 0
+            && snapshot_rows == 0
+            && snapshot_observation_rows == 0
+            && evidence_rows == 0
+            && evidence_handle_rows == 0
+            && entity_reference_handle_rows == 0
+            && digest_handle_rows == 0
+            && legacy_handle_rows == 0
+            && raw_vector_hits == 0,
+        "expected reserved producer tag rejection before any observation/snapshot/evidence/handle/vector write, got result={result:?}, observation_rows={observation_rows}, snapshot_rows={snapshot_rows}, snapshot_observation_rows={snapshot_observation_rows}, evidence_rows={evidence_rows}, evidence_handle_rows={evidence_handle_rows}, entity_reference_handle_rows={entity_reference_handle_rows}, digest_handle_rows={digest_handle_rows}, legacy_handle_rows={legacy_handle_rows}, raw_vector_hits={raw_vector_hits}"
     );
 }
 
@@ -644,7 +770,7 @@ fn embedding_target_routing_evidence_variant_writes_to_evidence_vector_column_di
 #[test]
 fn producer_metadata_model_name_persists_full_string_up_to_documented_max() {
     let fixture = fixture("producer-long-name");
-    let long_name = "encoder-".repeat(32);
+    let long_name = "encoder-".repeat(31);
     let embedding_id = EmbeddingId::new_v7();
     let evidence_id = EvidenceId::new_v7();
     let mut input = embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id));

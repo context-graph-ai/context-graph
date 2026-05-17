@@ -29,6 +29,7 @@ mod precomputed_embedding_ingest;
 mod producer_diagnostic;
 mod registry_edge_cases;
 mod reindex;
+#[cfg(context_graph_internal_test_support)]
 mod reindex_concurrency;
 mod schema;
 #[cfg(context_graph_internal_test_support)]

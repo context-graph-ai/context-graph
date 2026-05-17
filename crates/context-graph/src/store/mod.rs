@@ -92,6 +92,16 @@ impl Store {
         Self::open_with_config_inner_with_plugin(config, false, None, Some(plugin))
     }
 
+    #[cfg(context_graph_internal_test_support)]
+    pub fn open_with_database_plugin_and_embedder_registrations(
+        config: StoreConfig,
+        plugin: Arc<dyn DatabasePlugin>,
+        registrations: Vec<EmbedderRegistration>,
+    ) -> Result<Self> {
+        let _ = registrations;
+        Self::open_with_database_plugin(config, plugin)
+    }
+
     pub fn initialize_fresh(config: StoreConfig) -> Result<Self> {
         if let Some(db) = existing_shared_database(&config.db_path) {
             db.close().map_err(map_engine_err)?;
@@ -225,6 +235,53 @@ impl Store {
     pub fn last_query_trace(&self) -> Result<String> {
         let guard = self.trace.lock().expect("trace lock");
         Ok(guard.clone())
+    }
+
+    #[cfg(context_graph_internal_test_support)]
+    pub fn execute_sql_for_test(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<contextdb_engine::QueryResult> {
+        self.db.execute(sql, params).map_err(map_engine_err)
+    }
+
+    #[cfg(context_graph_internal_test_support)]
+    pub fn evidence_vector_visibility_counts_for_test(
+        &self,
+        evidence_ids: &[uuid::Uuid],
+        index_ref: contextdb_core::VectorIndexRef,
+        queries: &[Vec<f32>],
+    ) -> Result<(usize, usize)> {
+        let snapshot = self.db.snapshot();
+        let wanted = evidence_ids.iter().copied().collect::<HashSet<_>>();
+        let rows = self.db.scan("evidence", snapshot).map_err(map_engine_err)?;
+        let evidence_rows = rows
+            .iter()
+            .filter_map(|row| match row.values.get("id") {
+                Some(Value::Uuid(id)) if wanted.contains(id) => Some((row.row_id, *id)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let mut vector_ids = HashSet::new();
+        for query in queries {
+            let hits = self
+                .db
+                .query_vector(
+                    index_ref.clone(),
+                    query,
+                    queries.len().max(1),
+                    None,
+                    snapshot,
+                )
+                .map_err(map_engine_err)?;
+            for (row_id, _) in hits {
+                if let Some(id) = evidence_rows.get(&row_id) {
+                    vector_ids.insert(*id);
+                }
+            }
+        }
+        Ok((evidence_rows.len(), vector_ids.len()))
     }
 
     pub(super) fn require_context(&self, ctx: ContextId) -> Result<()> {

@@ -1,14 +1,16 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
+    sync::Arc,
 };
 
 use chrono::Utc;
+use context_graph::embedder::{Embedder, EmbeddingInput, EmbeddingOutput};
 use context_graph::{
-    ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, Decision, EmbeddingId,
-    EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef,
-    IntentionOrigin, IntentionStatus, PrecomputedEmbedding, ReasoningStep, RecordObservation,
-    ReindexOptions, Store, StoreConfig,
+    ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, Decision,
+    DistanceMetric, EmbedderRegistration, EmbeddingSpace, EmbeddingSpaceBinding, EntityId,
+    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin,
+    IntentionStatus, ReasoningStep, RecordObservation, ReindexOptions, Store, StoreConfig,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -16,14 +18,69 @@ use contextdb_engine::Database;
 const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
 
 fn store() -> Store {
-    Store::open(StoreConfig {
-        db_path: std::env::temp_dir().join(format!(
-            "decision-reasoning-metadata-{}.db",
-            uuid::Uuid::now_v7()
-        )),
-        ..Default::default()
-    })
+    Store::open_with_embedder_registrations(
+        StoreConfig {
+            db_path: std::env::temp_dir().join(format!(
+                "decision-reasoning-metadata-{}.db",
+                uuid::Uuid::now_v7()
+            )),
+            ..Default::default()
+        },
+        vec![EmbedderRegistration {
+            space: text_space(),
+            embedder: Arc::new(DecisionLineageEmbedder),
+        }],
+    )
     .expect("open")
+}
+
+#[derive(Clone)]
+struct DecisionLineageEmbedder;
+
+impl Embedder for DecisionLineageEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
+        let version = match input {
+            EmbeddingInput::Text(text) if text.contains("version-2") => "2",
+            EmbeddingInput::Text(_) => "1",
+            _ => {
+                return Err(context_graph::CgError::UnsupportedEvidenceKind {
+                    kind: EvidenceKind::ImageFrame,
+                });
+            }
+        };
+        Ok(EmbeddingOutput {
+            embedding_space_id: TEXT_SPACE.to_string(),
+            dimension: 768,
+            producer: producer(version),
+            vector: vector(),
+        })
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        vec![EvidenceKind::Text]
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpace {
+        text_space()
+    }
+}
+
+fn text_space() -> EmbeddingSpace {
+    EmbeddingSpace {
+        embedding_space_id: TEXT_SPACE.to_string(),
+        dimension: 768,
+        metric: DistanceMetric::Cosine,
+        model_family: "text".to_string(),
+        model_name: "decision-encoder".to_string(),
+        model_version: "test".to_string(),
+        supported_evidence_kinds: vec![EvidenceKind::Text],
+        default_for_evidence_kind: Some(EvidenceKind::Text),
+        bindings: vec![EmbeddingSpaceBinding {
+            embedding_space_id: TEXT_SPACE.to_string(),
+            table_name: "evidence".to_string(),
+            vector_column: "vector_text".to_string(),
+        }],
+    }
 }
 
 fn producer(version: &str) -> EvidenceProducer {
@@ -78,6 +135,7 @@ fn create_decision_with_seeded_embedding(store: &Store, version: &str) -> Decisi
             source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
             mime_type: Some("text/plain".to_string()),
             producer: producer(version),
+            text_projection: Some(format!("version-{version}")),
             ..Default::default()
         }],
         observed_properties: BTreeMap::new(),
@@ -86,13 +144,7 @@ fn create_decision_with_seeded_embedding(store: &Store, version: &str) -> Decisi
             Some(serde_json::json!(format!("version-{version}"))),
         )]),
         properties: BTreeMap::new(),
-        embeddings: vec![PrecomputedEmbedding {
-            id: EmbeddingId::new_v7(),
-            embedding_space_id: TEXT_SPACE.to_string(),
-            vector: vector(),
-            target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer(version),
-        }],
+        embeddings: Vec::new(),
     });
     assert!(
         observation.is_ok(),
@@ -156,6 +208,7 @@ fn record_same_entity_decoy_embedding(store: &Store, fixture: &DecisionProducerF
             source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
             mime_type: Some("text/plain".to_string()),
             producer: producer("2"),
+            text_projection: Some("version-2-decoy".to_string()),
             ..Default::default()
         }],
         observed_properties: BTreeMap::new(),
@@ -164,13 +217,7 @@ fn record_same_entity_decoy_embedding(store: &Store, fixture: &DecisionProducerF
             Some(serde_json::json!("version-2-decoy")),
         )]),
         properties: BTreeMap::new(),
-        embeddings: vec![PrecomputedEmbedding {
-            id: EmbeddingId::new_v7(),
-            embedding_space_id: TEXT_SPACE.to_string(),
-            vector: vector(),
-            target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer("2"),
-        }],
+        embeddings: Vec::new(),
     });
     assert!(
         observation.is_ok(),
@@ -242,12 +289,12 @@ fn embedding_metadata_stored_on_decision_reasoning_chain_at_write_time_not_deriv
     let rows = store.decision_lineage_producer_systems(&[decision_id]);
 
     assert!(
-        decoy_rows == 1
+        decoy_rows == 2
             && rows.as_ref().is_ok_and(|rows| rows.len() == 1
                 && rows[0].model_version == "1"
                 && !rows[0].write_txid.is_empty()
                 && rows[0].embedding_space_id == TEXT_SPACE),
-        "decision reasoning must keep the write-time producer snapshot across decoy writes and reindex, decoy_rows={decoy_rows}, rows={rows:?}"
+        "decision reasoning must keep the write-time producer snapshot across the decoy's original and post-reindex producer rows, decoy_rows={decoy_rows}, rows={rows:?}"
     );
 }
 
@@ -269,7 +316,7 @@ fn decision_reasoning_chain_producer_remains_queryable_after_subsequent_reindex(
     let rows = store.decision_lineage_producer_systems(&[decision_id]);
 
     assert!(
-        decoy_rows == 1
+        decoy_rows == 2
             && rows
                 .as_ref()
                 .is_ok_and(|rows| rows.iter().any(|row| row.decision_id == decision_id
@@ -277,6 +324,6 @@ fn decision_reasoning_chain_producer_remains_queryable_after_subsequent_reindex(
                     && row.audit_grade == "first-party"
                     && row.model_version == "1"
                     && row.embedding_space_id == TEXT_SPACE)),
-        "producer metadata must remain queryable from stored decision lineage after decoy writes and reindex, decoy_rows={decoy_rows}, rows={rows:?}"
+        "producer metadata must remain queryable from stored decision lineage after the decoy's original and post-reindex producer rows, decoy_rows={decoy_rows}, rows={rows:?}"
     );
 }

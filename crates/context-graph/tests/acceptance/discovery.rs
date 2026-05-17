@@ -1005,12 +1005,13 @@ fn assert_method_source_lacks(method: &str, source: &str, forbidden: &[&str]) {
 fn assert_no_unapproved_store_helper_calls(method: &str, source: &str, allowed_helpers: &[&str]) {
     let allowed = allowed_helpers.iter().copied().collect::<BTreeSet<&str>>();
     let code = code_mask_for_function_scan(source);
+    let calls = call_names_in_function(&code);
     for name in store_function_names() {
         if allowed.contains(name.as_str()) {
             continue;
         }
         assert!(
-            !code.contains(&format!("{name}(")),
+            !calls.iter().any(|call| call == &name),
             "{method} must not delegate Discovery behavior to unscanned helper {name}"
         );
     }

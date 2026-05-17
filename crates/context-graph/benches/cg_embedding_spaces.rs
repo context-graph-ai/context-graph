@@ -123,6 +123,20 @@ pub fn vector_search_per_query_latency_within_budget(c: &mut Criterion) {
         seed_vector(&store, context.id, entity.id, axis);
     }
     let _ = db_path;
+    let warm_hits = vector_search(
+        &store,
+        &query_vector(7),
+        TEXT_SPACE,
+        VectorSearchFilters {
+            top_k: Some(8),
+            ..Default::default()
+        },
+    )
+    .expect("bench warm vector query");
+    assert!(
+        !warm_hits.is_empty(),
+        "bench warm vector query must hit the populated vector index"
+    );
 
     c.bench_function("vector_search_per_query_latency_within_budget", |b| {
         b.iter(|| {

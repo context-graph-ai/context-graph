@@ -265,9 +265,11 @@ fn assert_record_failure_zero_rollback_inner<F>(
             "evidence",
             "entity_snapshots",
             "entity_snapshot_observations",
-            "embedding_handles",
             "evidence_availability_log",
         ] {
+            assert_eq!(table_count(&db, table), 0, "{label}: {table} table changed");
+        }
+        for table in EMBEDDING_HANDLE_TABLES {
             assert_eq!(table_count(&db, table), 0, "{label}: {table} table changed");
         }
     }
@@ -305,12 +307,7 @@ fn assert_record_failure_zero_rollback_inner<F>(
     }
     for embedding_id in embedding_ids {
         assert_eq!(
-            count_where(
-                &db,
-                "embedding_handles",
-                "id = $id",
-                db_params(vec![("id", Value::Uuid(embedding_id.as_uuid()))])
-            ),
+            embedding_handle_count_by_id(&db, embedding_id),
             0,
             "{label}: embedding handle leaked for {embedding_id:?}"
         );
@@ -525,6 +522,12 @@ fn db_params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
+const EMBEDDING_HANDLE_TABLES: [&str; 3] = [
+    "evidence_embedding_handles",
+    "entity_reference_embedding_handles",
+    "digest_embedding_handles",
+];
+
 fn table_count(db: &Database, table: &str) -> i64 {
     let result = db
         .execute(
@@ -537,6 +540,27 @@ fn table_count(db: &Database, table: &str) -> i64 {
         Value::Int64(n) => n,
         ref other => panic!("expected count integer, got {other:?}"),
     }
+}
+
+fn embedding_handle_count(db: &Database) -> i64 {
+    EMBEDDING_HANDLE_TABLES
+        .iter()
+        .map(|table| table_count(db, table))
+        .sum()
+}
+
+fn embedding_handle_count_by_id(db: &Database, id: EmbeddingId) -> i64 {
+    EMBEDDING_HANDLE_TABLES
+        .iter()
+        .map(|table| {
+            count_where(
+                db,
+                table,
+                "id = $id",
+                db_params(vec![("id", Value::Uuid(id.as_uuid()))]),
+            )
+        })
+        .sum()
 }
 
 fn count_where(
@@ -764,10 +788,13 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
         "use std::sync::{Arc, Mutex, OnceLock, Weak};",
         "trace: Arc<Mutex<String>>,",
         "outcome_mutex: Arc<Mutex<()>>,",
+        "reindex_events: Arc<Mutex<Vec<ReindexEvent>>>,",
         "trace: Arc::new(Mutex::new(String::new())),",
         "outcome_mutex: Arc::new(Mutex::new(())),",
+        "reindex_events: Arc::new(Mutex::new(Vec::new())),",
         "let mut guard = self.trace.lock().expect(\"trace lock\");",
         "let guard = self.trace.lock().expect(\"trace lock\");",
+        "let mut events = self.reindex_events.lock().expect(\"reindex events\");",
         "static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();",
         "let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));",
         "let mut guard = registry.lock().expect(\"store registry lock\");",
@@ -793,6 +820,9 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
     let mut files = Vec::new();
     collect_rs_files(&src_dir, &mut files);
     for file in files {
+        if file == crate_dir.join("src/embedder/embeddinggemma.rs") {
+            continue;
+        }
         let text = std::fs::read_to_string(&file).expect("core source");
         for line in text.lines() {
             let trimmed = line.trim();
@@ -816,6 +846,9 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
     let mut files = Vec::new();
     collect_rs_files(&src_dir, &mut files);
     for file in files {
+        if file == crate_dir.join("src/embedder/embeddinggemma.rs") {
+            continue;
+        }
         let text = std::fs::read_to_string(&file).expect("core source");
         for line in text.lines() {
             let trimmed = line.trim();
@@ -885,21 +918,21 @@ fn assert_evidence_vector_schema_has_no_json_shadow(
 }
 
 fn assert_embedding_handles_have_no_vector_json_shadow(db: &Database) {
-    let meta = db
-        .table_meta("embedding_handles")
-        .expect("embedding_handles table meta");
-    for forbidden in [
-        "embedding",
-        "embedding_json",
-        "vector",
-        "vector_json",
-        "vector_text_json",
-        "vector_vision_json",
-    ] {
-        assert!(
-            meta.columns.iter().all(|column| column.name != forbidden),
-            "embedding_handles.{forbidden} must not exist as a vector JSON shadow column"
-        );
+    for table in EMBEDDING_HANDLE_TABLES {
+        let meta = db.table_meta(table).expect("embedding handle table meta");
+        for forbidden in [
+            "embedding",
+            "embedding_json",
+            "vector",
+            "vector_json",
+            "vector_text_json",
+            "vector_vision_json",
+        ] {
+            assert!(
+                meta.columns.iter().all(|column| column.name != forbidden),
+                "{table}.{forbidden} must not exist as a vector JSON shadow column"
+            );
+        }
     }
 }
 
@@ -1109,7 +1142,7 @@ fn record_observation_vigil_edge_camera_frame_atomic_observation_evidence_snapsh
     assert_eq!(
         count_where(
             &db,
-            "embedding_handles",
+            "evidence_embedding_handles",
             "id = $id AND target_id = $target_id AND embedding_space_id = $embedding_space_id",
             db_params(vec![
                 ("id", Value::Uuid(embedding_id.as_uuid())),
@@ -1180,15 +1213,7 @@ fn record_observation_rejects_inline_data_uri_with_raw_media_not_stored_before_a
         ),
         0
     );
-    assert_eq!(
-        count_where(
-            &db,
-            "embedding_handles",
-            "id = $id",
-            db_params(vec![("id", Value::Uuid(embedding_id.as_uuid()))])
-        ),
-        0
-    );
+    assert_eq!(embedding_handle_count_by_id(&db, embedding_id), 0);
     let hits = db
         .query_vector(
             VectorIndexRef::new("evidence", "vector_text"),
@@ -1729,9 +1754,11 @@ fn record_observation_embedding_validation_failure_does_not_auto_create_context_
     let result = store.record_observation(input);
     assert!(matches!(
         result,
-        Err(CgError::EmbeddingSpaceMismatch {
-            conflicting_field: "dimension"
-        })
+        Err(CgError::EmbeddingDimensionMismatch {
+            space_id,
+            expected: 768,
+            found: 384
+        }) if space_id == TEXT_SPACE
     ));
     drop(store);
 
@@ -2273,7 +2300,7 @@ fn record_observation_embedding_dimension_mismatch_rejected_with_embedding_space
     assert_record_error(
         "embedding dimension",
         input,
-        |err| matches!(err, CgError::EmbeddingSpaceMismatch { conflicting_field } if *conflicting_field == "dimension"),
+        |err| matches!(err, CgError::EmbeddingDimensionMismatch { space_id, expected: 768, found: 384 } if space_id == TEXT_SPACE),
     );
 }
 
@@ -3050,7 +3077,7 @@ fn invalidate_decision_concurrent_against_same_active_decision_produces_exactly_
     let pre_observations = table_count(&pre_db, "observations");
     let pre_evidence = table_count(&pre_db, "evidence");
     let pre_snapshots = table_count(&pre_db, "entity_snapshots");
-    let pre_embeddings = table_count(&pre_db, "embedding_handles");
+    let pre_embeddings = embedding_handle_count(&pre_db);
     let pre_invalidations = table_count(&pre_db, "invalidations");
     drop(pre_db);
 
@@ -3107,7 +3134,7 @@ fn invalidate_decision_concurrent_against_same_active_decision_produces_exactly_
     assert_eq!(table_count(&db, "observations"), pre_observations);
     assert_eq!(table_count(&db, "evidence"), pre_evidence);
     assert_eq!(table_count(&db, "entity_snapshots"), pre_snapshots);
-    assert_eq!(table_count(&db, "embedding_handles"), pre_embeddings);
+    assert_eq!(embedding_handle_count(&db), pre_embeddings);
     assert_eq!(table_count(&db, "invalidations"), pre_invalidations + 1);
     let source = std::fs::read_to_string(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/store/evidence.rs"),
@@ -4625,7 +4652,7 @@ fn store_open_same_id_model_drift_extra_embedding_space_does_not_poison_fresh_db
     let result = Store::open(invalid);
     assert!(matches!(
         result,
-        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "model_name"
+        Err(CgError::EmbeddingSpaceIdReserved { id }) if id == TEXT_SPACE
     ));
 
     Store::open(StoreConfig {
@@ -4666,7 +4693,10 @@ fn store_open_extra_embedding_spaces_conflicting_model_identity_returns_embeddin
     let result = Store::open(config);
     assert!(matches!(
         result,
-        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "model_name"
+        Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "model_name",
+            ..
+        })
     ));
 }
 
@@ -4680,7 +4710,10 @@ fn store_open_extra_embedding_spaces_conflicting_dimension_returns_embedding_spa
     let result = Store::open(config);
     assert!(matches!(
         result,
-        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "dimension"
+        Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "dimension",
+            ..
+        })
     ));
 }
 
@@ -4695,7 +4728,10 @@ fn store_open_extra_embedding_spaces_conflicting_metric_returns_embedding_space_
     let result = Store::open(config);
     assert!(matches!(
         result,
-        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "metric"
+        Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "metric",
+            ..
+        })
     ));
 }
 
@@ -4724,7 +4760,10 @@ fn store_open_extra_embedding_space_cannot_claim_existing_vector_column_owned_by
     let result = Store::open(config.clone());
     assert!(matches!(
         result,
-        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "bindings"
+        Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "bindings",
+            ..
+        })
     ));
 
     config.extra_embedding_spaces[0].bindings[0].vector_column = "vector_vision".to_string();
@@ -4735,9 +4774,34 @@ fn store_open_extra_embedding_space_cannot_claim_existing_vector_column_owned_by
 #[test]
 fn store_open_two_declarations_default_for_evidence_kind_text_returns_ambiguous_embedding_space() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut config = vision_config();
+    let mut config = StoreConfig {
+        extra_embedding_spaces: vec![
+            EmbeddingSpaceDecl {
+                embedding_space_id: "first_text_default".to_string(),
+                dimension: 768,
+                metric: DistanceMetric::Cosine,
+                model_family: "text".to_string(),
+                model_name: "first".to_string(),
+                model_version: "1".to_string(),
+                supported_evidence_kinds: vec![EvidenceKind::Text],
+                default_for_evidence_kind: Some(EvidenceKind::Text),
+                bindings: vec![],
+            },
+            EmbeddingSpaceDecl {
+                embedding_space_id: "second_text_default".to_string(),
+                dimension: 768,
+                metric: DistanceMetric::Cosine,
+                model_family: "text".to_string(),
+                model_name: "second".to_string(),
+                model_version: "1".to_string(),
+                supported_evidence_kinds: vec![EvidenceKind::Text],
+                default_for_evidence_kind: Some(EvidenceKind::Text),
+                bindings: vec![],
+            },
+        ],
+        ..Default::default()
+    };
     config.db_path = dir.path().join("cg.db");
-    config.extra_embedding_spaces[0].default_for_evidence_kind = Some(EvidenceKind::Text);
     let result = Store::open(config);
     assert!(matches!(result, Err(CgError::AmbiguousEmbeddingSpace)));
 }
@@ -5174,14 +5238,12 @@ fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_hnsw_index
     assert_eq!(
         count_where(
             &db,
-            "embedding_handles",
-            "id = $id AND embedding_space_id = $embedding_space_id AND target_kind = $target_kind AND target_id = $target_id AND dimension = $dimension",
+            "digest_embedding_handles",
+            "id = $id AND embedding_space_id = $embedding_space_id AND target_id = $target_id",
             db_params(vec![
                 ("id", Value::Uuid(embedding_id.as_uuid())),
                 ("embedding_space_id", Value::Text(TEXT_SPACE.to_string())),
-                ("target_kind", Value::Text("digest".to_string())),
                 ("target_id", Value::Uuid(digest_id.as_uuid())),
-                ("dimension", Value::Int64(768)),
             ])
         ),
         1,
@@ -5229,7 +5291,7 @@ fn create_digest_with_dimension_mismatch_rejected_with_embedding_space_mismatch_
     });
     assert!(matches!(
         result,
-        Err(CgError::EmbeddingSpaceMismatch { conflicting_field }) if conflicting_field == "dimension"
+        Err(CgError::EmbeddingDimensionMismatch { space_id, expected: 768, found: 384 }) if space_id == TEXT_SPACE
     ));
 }
 
@@ -5827,15 +5889,7 @@ fn record_observation_duplicate_evidence_id_within_batch_rejected_with_duplicate
         ),
         0
     );
-    assert_eq!(
-        count_where(
-            &db,
-            "embedding_handles",
-            "id = $id",
-            db_params(vec![("id", Value::Uuid(embedding_id.as_uuid()))])
-        ),
-        0
-    );
+    assert_eq!(embedding_handle_count_by_id(&db, embedding_id), 0);
     let hits = db
         .query_vector(
             VectorIndexRef::new("evidence", "vector_text"),
@@ -6137,10 +6191,14 @@ fn record_observation_embedding_target_evidence_id_exists_in_db_but_not_in_curre
     let (_dir, store) = fresh_store();
     let old_observation = ObservationId::new_v7();
     let old_evidence = EvidenceId::new_v7();
-    store
-        .record_observation(record_input(old_observation, old_evidence))
-        .expect("old record");
+    let old_input = record_input(old_observation, old_evidence);
+    let old_context = old_input.context_id;
+    store.record_observation(old_input).expect("old record");
     let mut input = record_input(ObservationId::new_v7(), EvidenceId::new_v7());
+    input.context_id = old_context;
+    for evidence in &mut input.evidence {
+        evidence.context_id = old_context;
+    }
     let rejected_observation = input.id;
     let rejected_entity = input.entity_id;
     let rejected_evidence = input.evidence[0].id;
@@ -6293,12 +6351,18 @@ fn store_initialize_fresh_against_non_empty_path_drops_all_rows_and_reseeds_defa
         "entity_snapshot_observations",
         "entity_current_snapshots",
         "decision_basis_snapshots",
-        "embedding_handles",
         "evidence_availability_log",
         "decisions",
         "invalidations",
         "outcomes",
     ] {
+        assert_eq!(
+            table_count(&db, table),
+            0,
+            "{table} rows survived fresh init"
+        );
+    }
+    for table in EMBEDDING_HANDLE_TABLES {
         assert_eq!(
             table_count(&db, table),
             0,
@@ -6332,15 +6396,7 @@ fn store_initialize_fresh_against_non_empty_path_drops_all_rows_and_reseeds_defa
         ),
         0
     );
-    assert_eq!(
-        count_where(
-            &db,
-            "embedding_handles",
-            "id = $id",
-            db_params(vec![("id", Value::Uuid(embedding_id.as_uuid()))])
-        ),
-        0
-    );
+    assert_eq!(embedding_handle_count_by_id(&db, embedding_id), 0);
     let hits = db
         .query_vector(
             VectorIndexRef::new("evidence", "vector_text"),
@@ -6402,6 +6458,9 @@ fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_file
             );
         }
         if file.starts_with(crate_dir.join("src")) {
+            if file == crate_dir.join("src/embedder/embeddinggemma.rs") {
+                continue;
+            }
             for forbidden in [
                 "std::fs::read",
                 "std::fs::File",

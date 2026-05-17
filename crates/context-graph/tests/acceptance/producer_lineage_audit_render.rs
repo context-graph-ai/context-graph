@@ -1,10 +1,11 @@
 use chrono::Utc;
+use context_graph::embedder::mock::MockEmbedder;
 use context_graph::{
     ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId,
-    DistanceMetric, EmbeddingId, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget,
-    EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin,
-    IntentionStatus, PrecomputedEmbedding, RecordObservation, RecordObservationResult, Store,
-    StoreConfig,
+    DistanceMetric, Embedder, EmbedderRegistration, EmbeddingId, EmbeddingSpaceBinding,
+    EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind,
+    EvidenceProducer, EvidenceRef, IntentionOrigin, IntentionStatus, PrecomputedEmbedding,
+    RecordObservation, RecordObservationResult, Store, StoreConfig,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -12,9 +13,10 @@ use contextdb_engine::Database;
 use contextdb_engine::plugin::{DatabasePlugin, QueryOutcome};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(context_graph_internal_test_support)]
 use std::sync::{
-    Arc, Mutex,
+    Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 #[cfg(context_graph_internal_test_support)]
@@ -74,40 +76,53 @@ fn producer_with_system(system: &str) -> EvidenceProducer {
     }
 }
 
+fn cg_edge_registration(space_id: &str) -> EmbedderRegistration {
+    let embedder = Arc::new(MockEmbedder::new(space_id, 768));
+    let mut space = embedder.embedding_space();
+    space.default_for_evidence_kind = Some(EvidenceKind::Text);
+    EmbedderRegistration { space, embedder }
+}
+
 fn store(name: &str) -> (tempfile::TempDir, std::path::PathBuf, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(format!("{name}.db"));
-    let store = Store::open(StoreConfig {
-        db_path: db_path.clone(),
-        ..Default::default()
-    })
+    let store = Store::open_with_embedder_registrations(
+        StoreConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
+        },
+        vec![cg_edge_registration(TEXT_SPACE)],
+    )
     .expect("open");
     (dir, db_path, store)
 }
 
 fn procurement_store() -> context_graph::Result<Store> {
-    Store::open(StoreConfig {
-        db_path: std::env::temp_dir().join(format!(
-            "producer-lineage-procurement-{}.db",
-            uuid::Uuid::now_v7()
-        )),
-        extra_embedding_spaces: vec![EmbeddingSpaceDecl {
-            embedding_space_id: PROCUREMENT_SPACE.to_string(),
-            dimension: 768,
-            metric: DistanceMetric::Cosine,
-            model_family: "text".to_string(),
-            model_name: "embeddinggemma-300m".to_string(),
-            model_version: "procurement".to_string(),
-            supported_evidence_kinds: vec![EvidenceKind::Text],
-            default_for_evidence_kind: Some(EvidenceKind::Text),
-            bindings: vec![EmbeddingSpaceBinding {
+    Store::open_with_embedder_registrations(
+        StoreConfig {
+            db_path: std::env::temp_dir().join(format!(
+                "producer-lineage-procurement-{}.db",
+                uuid::Uuid::now_v7()
+            )),
+            extra_embedding_spaces: vec![EmbeddingSpaceDecl {
                 embedding_space_id: PROCUREMENT_SPACE.to_string(),
-                table_name: "evidence".to_string(),
-                vector_column: "vector_text".to_string(),
+                dimension: 768,
+                metric: DistanceMetric::Cosine,
+                model_family: "text".to_string(),
+                model_name: "embeddinggemma-300m".to_string(),
+                model_version: "procurement".to_string(),
+                supported_evidence_kinds: vec![EvidenceKind::Text],
+                default_for_evidence_kind: Some(EvidenceKind::Text),
+                bindings: vec![EmbeddingSpaceBinding {
+                    embedding_space_id: PROCUREMENT_SPACE.to_string(),
+                    table_name: "evidence".to_string(),
+                    vector_column: "vector_text".to_string(),
+                }],
             }],
-        }],
-        ..Default::default()
-    })
+            ..Default::default()
+        },
+        vec![cg_edge_registration(PROCUREMENT_SPACE)],
+    )
 }
 
 fn vector() -> Vec<f32> {
@@ -269,13 +284,17 @@ fn record_text_basis_observation(
         observed_properties: BTreeMap::new(),
         state_delta,
         properties: BTreeMap::new(),
-        embeddings: vec![PrecomputedEmbedding {
-            id: EmbeddingId::new_v7(),
-            embedding_space_id: embedding_space_id.to_string(),
-            vector: vector(),
-            target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer_with_system(producer_system),
-        }],
+        embeddings: if producer_system == context_graph::CG_EDGE_SYSTEM_TAG {
+            Vec::new()
+        } else {
+            vec![PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: embedding_space_id.to_string(),
+                vector: vector(),
+                target: EmbeddingTarget::Evidence(evidence_id),
+                produced_by: producer_with_system(producer_system),
+            }]
+        },
     })
 }
 
@@ -422,12 +441,13 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("producer-lineage-one-query.db");
     let query_counter = Arc::new(QueryCountingPlugin::default());
-    let store = Store::open_with_database_plugin(
+    let store = Store::open_with_database_plugin_and_embedder_registrations(
         StoreConfig {
             db_path: db_path.clone(),
             ..Default::default()
         },
         query_counter.clone(),
+        vec![cg_edge_registration(TEXT_SPACE)],
     )
     .expect("open");
     let mut decision_ids = Vec::new();

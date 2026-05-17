@@ -93,7 +93,7 @@ fn mock_embedder_distinct_inputs_distinct_vectors() {
 
 #[test]
 fn mock_embedder_configurable_producer_string() {
-    let embedder = MockEmbedder::new("mock_space", 4);
+    let embedder = MockEmbedder::new("mock_space", 768);
     let mut registered_space = embedder.embedding_space();
     registered_space.default_for_evidence_kind = Some(EvidenceKind::Text);
     let dir = tempfile::tempdir().expect("store dir");

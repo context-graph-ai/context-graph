@@ -78,8 +78,9 @@ fn expected_tensor_shape_for(
     projection_intermediate_size: usize,
 ) -> Vec<usize> {
     match name {
-        TOKEN_EMBEDDING_TENSOR | Q_PROJ_TENSOR | K_PROJ_TENSOR | V_PROJ_TENSOR | O_PROJ_TENSOR => {
-            vec![4, hidden_size]
+        TOKEN_EMBEDDING_TENSOR => vec![4, hidden_size],
+        Q_PROJ_TENSOR | K_PROJ_TENSOR | V_PROJ_TENSOR | O_PROJ_TENSOR => {
+            vec![hidden_size, hidden_size]
         }
         GATE_PROJ_TENSOR | UP_PROJ_TENSOR => vec![hidden_size, intermediate_size],
         DOWN_PROJ_TENSOR => vec![intermediate_size, hidden_size],
@@ -947,7 +948,7 @@ fn embeddinggemma_warm_cache_success_requires_real_tokenizer_safetensors_and_can
         variable_observer_trait,
     );
     let variable_output =
-        variable_embedder.embed(EmbeddingInput::Text(format!("{variable_token} blue truck")));
+        variable_embedder.embed(EmbeddingInput::Text(format!("{variable_token} red sedan")));
     let variable_events = variable_observer.events();
 
     assert!(

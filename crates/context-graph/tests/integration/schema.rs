@@ -2488,7 +2488,7 @@ fn combination_record_observation_observation_evidence_snapshot_embedding_atomic
 
     let embedding = db
         .execute(
-            "SELECT id, embedding_space_id, target_kind, target_id, dimension, created_at FROM embedding_handles WHERE id = $id",
+            "SELECT id, embedding_space_id, target_id, created_at FROM evidence_embedding_handles WHERE id = $id",
             &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
         )
         .expect("embedding handle row");
@@ -2498,14 +2498,9 @@ fn combination_record_observation_observation_evidence_snapshot_embedding_atomic
         &Value::Text(TEXT_SPACE.to_string())
     );
     assert_eq!(
-        row_value(&embedding, 0, "target_kind"),
-        &Value::Text("evidence".to_string())
-    );
-    assert_eq!(
         row_value(&embedding, 0, "target_id"),
         &Value::Uuid(evidence_id.as_uuid())
     );
-    assert_eq!(row_value(&embedding, 0, "dimension"), &Value::Int64(768));
     assert_eq!(row_value(&embedding, 0, "created_at"), &created_at);
 
     let vector_hits = db
@@ -2583,7 +2578,7 @@ fn combination_record_observation_rollback_on_validation_error_after_tx_open_lea
     );
     let embedding_rows = scalar_count(
         &db,
-        "SELECT COUNT(*) AS n FROM embedding_handles WHERE id = $id",
+        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
         &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
     );
     let vector_hits = db

@@ -9,9 +9,22 @@ fn expected_mock_vector(kind: &str, value: &str, dimension: usize) -> Vec<f32> {
     let seed = format!("{kind}:{value}")
         .bytes()
         .fold(0_u32, |acc, byte| acc + u32::from(byte));
-    (0..dimension)
+    let mut vector = (0..dimension)
         .map(|idx| ((seed + idx as u32) % 23) as f32 / 23.0)
-        .collect()
+        .collect::<Vec<_>>();
+    let norm = vector_l2_norm(&vector);
+    for value in &mut vector {
+        *value /= norm;
+    }
+    vector
+}
+
+fn vector_l2_norm(vector: &[f32]) -> f32 {
+    vector
+        .iter()
+        .map(|component| component.powi(2))
+        .sum::<f32>()
+        .sqrt()
 }
 
 #[derive(Debug)]

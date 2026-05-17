@@ -7,6 +7,7 @@ pub struct VectorSearchFilters {
     pub candidate_embedding_space_ids: Vec<String>,
     pub candidate_dimensions: Vec<(String, usize)>,
     pub top_k: Option<usize>,
+    pub include_planner_trace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

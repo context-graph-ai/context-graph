@@ -21,10 +21,10 @@ use context_graph::store::signatures::{
     signature_match_full_chain_producers,
 };
 use context_graph::{
-    CG_EDGE_SYSTEM_TAG, CreateContext, CreateEntity, EmbedderConfig, EmbedderRegistration,
-    EmbeddingId, EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer,
-    EvidenceRef, ModelSource, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store,
-    StoreConfig,
+    CG_EDGE_SYSTEM_TAG, CreateContext, CreateDecision, CreateEntity, CreateIntention,
+    EmbedderConfig, EmbedderRegistration, EmbeddingId, EmbeddingTarget, EntityId, EntityType,
+    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin, IntentionStatus,
+    ModelSource, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store, StoreConfig,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -426,6 +426,99 @@ fn record(fixture: &Fixture, version: &str, axis: usize) -> (EvidenceId, Embeddi
     record_with_system(fixture, "edge-memory", version, axis)
 }
 
+fn create_rendered_decision_for_snapshot(
+    store: &Store,
+    context_id: context_graph::ContextId,
+    snapshot_id: context_graph::EntitySnapshotId,
+    name: &str,
+) -> Option<String> {
+    let intention = store
+        .create_intention(CreateIntention {
+            id: None,
+            description: format!("{name} producer display intention"),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id,
+            properties: BTreeMap::new(),
+            tags: Vec::new(),
+        })
+        .ok()?;
+    let decision = store
+        .create_decision(CreateDecision {
+            decision_type: "producer_display".to_string(),
+            description: format!("{name} producer display decision"),
+            confidence: Some(0.9),
+            intention_ids: vec![intention.id],
+            based_on_entity_ids: Vec::new(),
+            based_on_snapshots: vec![snapshot_id],
+            context_id,
+            ..Default::default()
+        })
+        .ok()?;
+    store
+        .render_decision_producer_audit_paragraph(decision.id)
+        .ok()
+}
+
+fn record_precomputed_basis_with_system(
+    fixture: &Fixture,
+    system: &str,
+    version: &str,
+    axis: usize,
+    name: &str,
+) -> (EvidenceId, EmbeddingId, Option<String>) {
+    let evidence_id = EvidenceId::new_v7();
+    let embedding_id = EmbeddingId::new_v7();
+    let mut state_delta = BTreeMap::new();
+    state_delta.insert(
+        format!("producer_display_{}", evidence_id.as_uuid().simple()),
+        Some(serde_json::json!(system)),
+    );
+    let result = fixture.store.record_observation(RecordObservation {
+        id: context_graph::ObservationId::new_v7(),
+        entity_id: fixture.entity_id,
+        context_id: fixture.context_id,
+        observation_type: "producer-diagnostic-display".to_string(),
+        source: "edge".to_string(),
+        observed_at: Utc::now(),
+        evidence: vec![EvidenceRef {
+            id: evidence_id,
+            kind: EvidenceKind::Text,
+            source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
+            retention_status: RetentionStatus::RetainedExternal,
+            producer: producer("capture", "raw"),
+            ..Default::default()
+        }],
+        observed_properties: BTreeMap::new(),
+        state_delta,
+        properties: BTreeMap::new(),
+        embeddings: vec![PrecomputedEmbedding {
+            id: embedding_id,
+            embedding_space_id: TEXT_SPACE.to_string(),
+            vector: vector(axis),
+            target: EmbeddingTarget::Evidence(evidence_id),
+            produced_by: producer(system, version),
+        }],
+    });
+    assert!(
+        result.is_ok(),
+        "producer diagnostic display setup failed: {result:?}"
+    );
+    let rendered = result
+        .as_ref()
+        .ok()
+        .and_then(|output| output.snapshot_id)
+        .and_then(|snapshot_id| {
+            create_rendered_decision_for_snapshot(
+                &fixture.store,
+                fixture.context_id,
+                snapshot_id,
+                name,
+            )
+        });
+    (evidence_id, embedding_id, rendered)
+}
+
 #[cfg(context_graph_internal_test_support)]
 fn contribution(role: &str, recorded: &RecordedEmbedding) -> SignatureProducerContribution {
     SignatureProducerContribution {
@@ -659,6 +752,11 @@ fn record_auto_text(
     context_graph::Result<context_graph::RecordObservationResult>,
 ) {
     let evidence_id = EvidenceId::new_v7();
+    let mut state_delta = BTreeMap::new();
+    state_delta.insert(
+        format!("producer_display_{}", evidence_id.as_uuid().simple()),
+        Some(serde_json::json!(source)),
+    );
     let result = store.record_observation(RecordObservation {
         id: context_graph::ObservationId::new_v7(),
         entity_id,
@@ -676,7 +774,7 @@ fn record_auto_text(
             ..Default::default()
         }],
         observed_properties: BTreeMap::new(),
-        state_delta: BTreeMap::new(),
+        state_delta,
         properties: BTreeMap::new(),
         embeddings: Vec::new(),
     });
@@ -687,7 +785,7 @@ fn auto_path_row(
     name: &str,
     config: StoreConfig,
     registrations: Vec<EmbedderRegistration>,
-) -> (Option<HandleProducerRow>, String) {
+) -> (Option<HandleProducerRow>, Option<String>, String) {
     let store = if registrations.is_empty() {
         Store::open(config)
     } else {
@@ -695,7 +793,7 @@ fn auto_path_row(
     };
     let store = match store {
         Ok(store) => store,
-        Err(error) => return (None, format!("open={error:?}")),
+        Err(error) => return (None, None, format!("open={error:?}")),
     };
     let context = match store.create_context(CreateContext {
         name: format!("{name}-{}", uuid::Uuid::now_v7()),
@@ -703,7 +801,7 @@ fn auto_path_row(
         properties: BTreeMap::new(),
     }) {
         Ok(context) => context,
-        Err(error) => return (None, format!("context={error:?}")),
+        Err(error) => return (None, None, format!("context={error:?}")),
     };
     let entity = match store.create_entity(CreateEntity {
         entity_type: EntityType::Service,
@@ -713,7 +811,7 @@ fn auto_path_row(
         context_id: context.id,
     }) {
         Ok(entity) => entity,
-        Err(error) => return (None, format!("entity={error:?}")),
+        Err(error) => return (None, None, format!("entity={error:?}")),
     };
     let db_path = store.db_path().to_path_buf();
     let (evidence_id, result) = record_auto_text(&store, context.id, entity.id, name);
@@ -721,11 +819,20 @@ fn auto_path_row(
         .as_ref()
         .map(|output| output.embedding_ids.clone())
         .unwrap_or_default();
+    let rendered = result
+        .as_ref()
+        .ok()
+        .filter(|output| !output.embedding_ids.is_empty())
+        .and_then(|output| output.snapshot_id)
+        .and_then(|snapshot_id| {
+            create_rendered_decision_for_snapshot(&store, context.id, snapshot_id, name)
+        });
     drop(store);
     let db = Database::open(&db_path).expect("raw auto producer db");
     let row = handle_producer_row_by_target(&db, evidence_id);
     (
         row,
+        rendered,
         format!("record={result:?}, output_embedding_ids={output_ids:?}"),
     )
 }
@@ -774,10 +881,10 @@ fn producer_metadata_query_explain_uses_indexed_projection_on_system_field() {
     let db = raw_db(&fixture.db_path, fixture.store);
     let result = db
         .execute(
-            "SELECT id FROM evidence_embedding_handles WHERE produced_by = $producer",
+            "SELECT id FROM evidence_embedding_handles WHERE producer_system = $producer_system",
             &params(vec![(
-                "producer",
-                Value::Json(serde_json::to_value(producer("edge-memory", "v1")).expect("json")),
+                "producer_system",
+                Value::Text("edge-memory".to_string()),
             )]),
         )
         .expect("producer projection query");
@@ -798,9 +905,7 @@ fn producer_metadata_query_explain_uses_indexed_projection_on_system_field() {
     let expected_index = "idx_evidence_embedding_handles_producer_system";
     let indexed_by_producer_system = trace.physical_plan == "IndexScan"
         && trace.index_used.as_deref() == Some(expected_index)
-        && pushed
-            .iter()
-            .any(|predicate| *predicate == "producer.system" || *predicate == "produced_by.system");
+        && pushed.contains(&"producer_system");
     let exact_row_count = count(
         &db,
         "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
@@ -826,7 +931,7 @@ fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and
         )),
         ..Default::default()
     };
-    let (one_tensor_row, one_tensor_debug) = auto_path_row(
+    let (one_tensor_row, one_tensor_rendered, one_tensor_debug) = auto_path_row(
         "producer-display-one-tensor-rejected",
         one_tensor_config,
         Vec::new(),
@@ -842,7 +947,7 @@ fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and
         )),
         ..Default::default()
     };
-    let (first_party_row, first_party_debug) =
+    let (first_party_row, first_party_rendered, first_party_debug) =
         auto_path_row("producer-display-bundled", bundled_config, Vec::new());
 
     let consumer_dir = tempfile::tempdir().expect("consumer dir");
@@ -854,7 +959,7 @@ fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and
         extra_embedding_spaces: vec![registered_space.clone()],
         ..Default::default()
     };
-    let (consumer_trait_row, consumer_debug) = auto_path_row(
+    let (consumer_trait_row, consumer_trait_rendered, consumer_debug) = auto_path_row(
         "producer-display-consumer-trait",
         consumer_config,
         vec![EmbedderRegistration {
@@ -864,49 +969,42 @@ fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and
     );
 
     let fixture = fixture("producer-display-precomputed");
-    let (_, precomputed_embedding) = record_with_system(&fixture, "customer", "2026-05-17", 2);
+    let (_, precomputed_embedding, precomputed_rendered) =
+        record_precomputed_basis_with_system(&fixture, "customer", "2026-05-17", 2, "precomputed");
     let db = raw_db(&fixture.db_path, fixture.store);
     let precomputed_row = handle_producer_row(&db, precomputed_embedding);
-    let first_party = first_party_row
+    let first_party_expected = first_party_row
         .as_ref()
-        .map(|row| row.producer.to_string())
+        .map(|row| producer_display(&row.space, &row.producer, row.txid))
         .unwrap_or_default();
-    let consumer_trait = consumer_trait_row
+    let consumer_trait_expected = consumer_trait_row
         .as_ref()
-        .map(|row| row.producer.to_string())
+        .map(|row| producer_display(&row.space, &row.producer, row.txid))
         .unwrap_or_default();
-    let precomputed = precomputed_row
+    let precomputed_expected = precomputed_row
         .as_ref()
-        .map(|row| row.producer.to_string())
+        .map(|row| producer_display(&row.space, &row.producer, row.txid))
         .unwrap_or_default();
-    let expected_first = first_party_row
-        .as_ref()
-        .map(|row| producer_display(&row.space, &row.producer, row.txid));
-    let expected_consumer = consumer_trait_row
-        .as_ref()
-        .map(|row| producer_display(&row.space, &row.producer, row.txid));
-    let expected_precomputed = precomputed_row
-        .as_ref()
-        .map(|row| producer_display(&row.space, &row.producer, row.txid));
 
     assert!(
         one_tensor_row.is_none()
+            && one_tensor_rendered.is_none()
             && one_tensor_debug.contains("EmbedderModelCorrupt")
-            && expected_first
+            && first_party_rendered
                 .as_ref()
-                .is_some_and(|expected| first_party == *expected)
-            && expected_consumer
+                .is_some_and(|actual| actual == &first_party_expected)
+            && consumer_trait_rendered
                 .as_ref()
-                .is_some_and(|expected| consumer_trait == *expected)
-            && expected_precomputed
+                .is_some_and(|actual| actual == &consumer_trait_expected)
+            && precomputed_rendered
                 .as_ref()
-                .is_some_and(|expected| precomputed == *expected)
-            && !first_party.contains('\n')
-            && !consumer_trait.contains('\n')
-            && !precomputed.contains('\n')
-            && first_party.matches(" - ").count() == 1
-            && consumer_trait.matches(" - ").count() == 1
-            && precomputed.matches(" - ").count() == 1
+                .is_some_and(|actual| actual == &precomputed_expected)
+            && !first_party_expected.contains('\n')
+            && !consumer_trait_expected.contains('\n')
+            && !precomputed_expected.contains('\n')
+            && first_party_expected.matches(" - ").count() == 1
+            && consumer_trait_expected.matches(" - ").count() == 1
+            && precomputed_expected.matches(" - ").count() == 1
             && first_party_row.as_ref().is_some_and(
                 |row| row.space == TEXT_SPACE && row.producer.system == CG_EDGE_SYSTEM_TAG
             )
@@ -916,7 +1014,7 @@ fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and
             && precomputed_row
                 .as_ref()
                 .is_some_and(|row| row.space == TEXT_SPACE && row.producer.system == "customer"),
-        "producer display must reject one-tensor fake EmbeddingGemma caches and exactly render persisted space, audit grade, pipeline, produced date, and lowercase txid across actual bundled, consumer-trait, and precomputed ingest paths, one_tensor_row={one_tensor_row:?}, one_tensor_debug={one_tensor_debug}, expected_first={expected_first:?}, first_party={first_party:?}, first_party_debug={first_party_debug}, expected_consumer={expected_consumer:?}, consumer_trait={consumer_trait:?}, consumer_debug={consumer_debug}, expected_precomputed={expected_precomputed:?}, precomputed={precomputed:?}"
+        "producer display must reject one-tensor fake EmbeddingGemma caches and production-render persisted space, audit grade, pipeline, produced version, and lowercase txid across actual bundled, consumer-trait, and precomputed ingest paths, one_tensor_row={one_tensor_row:?}, one_tensor_rendered={one_tensor_rendered:?}, one_tensor_debug={one_tensor_debug}, expected_first={first_party_expected:?}, first_party_rendered={first_party_rendered:?}, first_party_debug={first_party_debug}, expected_consumer={consumer_trait_expected:?}, consumer_trait_rendered={consumer_trait_rendered:?}, consumer_debug={consumer_debug}, expected_precomputed={precomputed_expected:?}, precomputed_rendered={precomputed_rendered:?}"
     );
 }
 
@@ -1055,6 +1153,7 @@ fn signature_match_full_chain_query_returns_centroid_producer_and_all_contributi
         && public_sql[0].contains("signatures")
         && public_sql[0].contains("signature_producer_lineage")
         && !public_sql[0].contains("WHERE id = $first OR id = $second");
+    drop(fixture.store);
     let db = Database::open(&db_path).expect("raw database open");
     let raw_result = raw_signature_lineage_rows(&db, signature_id);
     let raw_rows_match = raw_result.as_ref().is_ok_and(|rows| {

@@ -256,6 +256,47 @@ fn fixture(name: &str) -> Fixture {
     }
 }
 
+fn fixture_with_registered_embedder(name: &str, embedder: MockEmbedder) -> Fixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join(format!("{name}.db"));
+    let mut space = embedder.embedding_space();
+    space.default_for_evidence_kind = Some(EvidenceKind::Text);
+    let store = Store::open_with_embedder_registrations(
+        StoreConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
+        },
+        vec![EmbedderRegistration {
+            space,
+            embedder: Arc::new(embedder),
+        }],
+    )
+    .expect("open");
+    let context = store
+        .create_context(CreateContext {
+            name: format!("{name}-{}", uuid::Uuid::now_v7()),
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        })
+        .expect("context");
+    let entity = store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "metadata-target".to_string(),
+            properties: BTreeMap::new(),
+            tags: Vec::new(),
+            context_id: context.id,
+        })
+        .expect("entity");
+    Fixture {
+        _dir: dir,
+        db_path,
+        store,
+        context_id: context.id,
+        entity_id: entity.id,
+    }
+}
+
 fn vector(axis: usize) -> Vec<f32> {
     let mut vector = vec![0.0; 768];
     vector[axis] = 1.0;
@@ -474,8 +515,19 @@ fn embedding_metadata_includes_space_id() {
 
 #[test]
 fn embedder_metadata_distinguishes_internal_vs_external() {
-    let fixture = fixture("metadata-discriminant");
-    let internal = record(&fixture, CG_EDGE_SYSTEM_TAG, "1", 0);
+    let embedder = MockEmbedder::new(TEXT_SPACE, 768);
+    let expected_internal = embedder.producer.clone();
+    let fixture = fixture_with_registered_embedder("metadata-discriminant", embedder);
+    let (_internal_evidence_id, internal_result) = record_auto_text(
+        &fixture.store,
+        fixture.context_id,
+        fixture.entity_id,
+        "metadata-discriminant-internal",
+    );
+    let internal = internal_result
+        .as_ref()
+        .expect("internal auto embedding")
+        .embedding_ids[0];
     let external = record(&fixture, "customer", "1", 1);
     let db = raw_db(&fixture.db_path, fixture.store);
     let internal_rows = count(
@@ -485,7 +537,7 @@ fn embedder_metadata_distinguishes_internal_vs_external() {
             ("id", Value::Uuid(internal.as_uuid())),
             (
                 "producer",
-                Value::Json(serde_json::to_value(producer(CG_EDGE_SYSTEM_TAG, "1")).expect("json")),
+                Value::Json(serde_json::to_value(expected_internal).expect("json")),
             ),
         ]),
     );
@@ -512,10 +564,8 @@ fn producer_metadata_first_party_vs_third_party_distinguishable() {
     let internal = producer(CG_EDGE_SYSTEM_TAG, "1").to_string();
     let external = producer("customer", "1").to_string();
     assert!(
-        internal.contains("first-party, cg-attested")
-            && external.contains("consumer-claimed")
-            && internal.contains(TEXT_SPACE)
-            && external.contains(TEXT_SPACE)
+        internal == "audit-encoder 1 (pipeline pipeline-7) - first-party, cg-attested"
+            && external == "audit-encoder 1 (pipeline pipeline-7) - consumer-claimed"
             && internal != external,
         "producer Display must expose audit grade, internal={internal:?}, external={external:?}"
     );
@@ -525,11 +575,8 @@ fn producer_metadata_first_party_vs_third_party_distinguishable() {
 fn producer_metadata_serializes_to_human_readable_string() {
     let rendered = producer("customer", "2").to_string();
     assert!(
-        rendered.contains("audit-encoder 2")
-            && rendered.contains(TEXT_SPACE)
-            && rendered.contains("0x")
-            && !rendered.contains('\n'),
-        "producer Display must include model, space, txid, and no newline, rendered={rendered:?}"
+        rendered == "audit-encoder 2 (pipeline pipeline-7) - consumer-claimed",
+        "producer Display must be exactly the producer-owned shape with no fabricated space/txid/date, rendered={rendered:?}"
     );
 }
 

@@ -172,6 +172,7 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
         VectorSearchFilters {
             context_ids: Some(vec![allowed_context.id]),
             top_k: Some(5),
+            include_planner_trace: true,
             ..Default::default()
         },
     )

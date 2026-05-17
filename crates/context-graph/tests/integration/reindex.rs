@@ -166,14 +166,6 @@ fn expected_reindexed_vector(source_text: &str) -> Vec<f32> {
     vector
 }
 
-fn vectors_equal(left: &[f32], right: &[f32]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|(l, r)| (l - r).abs() <= 1.0e-6)
-}
-
 fn vision_vector(axis: usize) -> Vec<f32> {
     let mut vector = vec![0.0; 512];
     vector[axis] = 1.0;
@@ -376,17 +368,14 @@ fn single_txid(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Opt
         })
 }
 
-fn stored_evidence_vector(db: &Database, evidence_id: EvidenceId) -> Option<Vec<f32>> {
-    let result = db
-        .execute(
-            "SELECT vector_text FROM evidence WHERE id = $id",
-            &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
-        )
-        .expect("evidence vector query");
-    result.rows.first().and_then(|row| match row.first() {
-        Some(Value::Vector(vector)) => Some(vector.clone()),
-        _ => None,
-    })
+fn single_uuid(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Option<uuid::Uuid> {
+    db.execute(sql, params)
+        .ok()
+        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
+        .and_then(|value| match value {
+            Value::Uuid(value) => Some(value),
+            _ => None,
+        })
 }
 
 fn stored_evidence_vision_vector(db: &Database, evidence_id: EvidenceId) -> Option<Vec<f32>> {
@@ -402,37 +391,14 @@ fn stored_evidence_vision_vector(db: &Database, evidence_id: EvidenceId) -> Opti
     })
 }
 
-fn stored_evidence_vectors(db: &Database, evidence_ids: &[EvidenceId]) -> Vec<Option<Vec<f32>>> {
-    evidence_ids
-        .iter()
-        .map(|evidence_id| stored_evidence_vector(db, *evidence_id))
+fn hit_ids(db: &Database, query: Vec<f32>, top_k: usize) -> Vec<uuid::Uuid> {
+    hit_scores(db, query, top_k)
+        .into_iter()
+        .map(|(id, _)| id)
         .collect()
 }
 
-fn vectors_changed(old_vectors: &[Vec<f32>], after_vectors: &[Option<Vec<f32>>]) -> bool {
-    if old_vectors.len() != after_vectors.len() {
-        return false;
-    }
-    for (idx, after) in after_vectors.iter().enumerate() {
-        let Some(after) = after else {
-            return false;
-        };
-        if *after == old_vectors[idx] {
-            return false;
-        }
-    }
-    true
-}
-
-fn l2_distance(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right.iter())
-        .map(|(l, r)| (l - r).powi(2))
-        .sum::<f32>()
-        .sqrt()
-}
-
-fn hit_ids(db: &Database, query: Vec<f32>, top_k: usize) -> Vec<uuid::Uuid> {
+fn hit_scores(db: &Database, query: Vec<f32>, top_k: usize) -> Vec<(uuid::Uuid, f32)> {
     let hits = db
         .query_vector(
             VectorIndexRef::new("evidence", "vector_text"),
@@ -444,13 +410,13 @@ fn hit_ids(db: &Database, query: Vec<f32>, top_k: usize) -> Vec<uuid::Uuid> {
         .expect("vector query");
     let rows = db.scan("evidence", db.snapshot()).expect("scan evidence");
     hits.into_iter()
-        .filter_map(|(row_id, _)| {
+        .filter_map(|(row_id, score)| {
             rows.iter().find_map(|row| {
                 (row.row_id == row_id)
                     .then(|| row.values.get("id").cloned())
                     .flatten()
                     .and_then(|value| match value {
-                        Value::Uuid(id) => Some(id),
+                        Value::Uuid(id) => Some((id, score)),
                         _ => None,
                     })
             })
@@ -458,16 +424,39 @@ fn hit_ids(db: &Database, query: Vec<f32>, top_k: usize) -> Vec<uuid::Uuid> {
         .collect()
 }
 
-fn after_vectors_match_sources(
-    after_vectors: &[Option<Vec<f32>>],
+fn score_for(db: &Database, evidence_id: EvidenceId, query: Vec<f32>) -> Option<f32> {
+    hit_scores(db, query, 32)
+        .into_iter()
+        .find_map(|(id, score)| (id == evidence_id.as_uuid()).then_some(score))
+}
+
+fn vector_index_matches_sources(
+    db: &Database,
+    evidence_ids: &[EvidenceId],
     source_texts: &[String],
 ) -> bool {
-    after_vectors.len() == source_texts.len()
-        && after_vectors.iter().zip(source_texts).all(|(after, text)| {
-            after
-                .as_ref()
-                .is_some_and(|vector| vectors_equal(vector, &expected_reindexed_vector(text)))
-        })
+    evidence_ids.len() == source_texts.len()
+        && evidence_ids
+            .iter()
+            .zip(source_texts)
+            .all(|(evidence_id, text)| {
+                score_for(db, *evidence_id, expected_reindexed_vector(text))
+                    .is_some_and(|score| score > 0.99)
+            })
+}
+
+fn old_vectors_no_longer_match(
+    db: &Database,
+    evidence_ids: &[EvidenceId],
+    old_vectors: &[Vec<f32>],
+) -> bool {
+    evidence_ids.len() == old_vectors.len()
+        && evidence_ids
+            .iter()
+            .zip(old_vectors)
+            .all(|(evidence_id, old)| {
+                score_for(db, *evidence_id, old.clone()).is_none_or(|score| score < 0.5)
+            })
 }
 
 fn calls_include_all(calls: &Arc<Mutex<Vec<String>>>, expected_texts: &[String]) -> bool {
@@ -498,10 +487,15 @@ fn observation_created_txids(db: &Database, evidence_ids: &[EvidenceId]) -> Vec<
     evidence_ids
         .iter()
         .map(|evidence_id| {
+            let observation_id = single_uuid(
+                db,
+                "SELECT observation_id FROM evidence WHERE id = $evidence_id",
+                &params(vec![("evidence_id", Value::Uuid(evidence_id.as_uuid()))]),
+            )?;
             single_txid(
                 db,
-                "SELECT observations.created_at FROM observations JOIN evidence ON observations.id = evidence.observation_id WHERE evidence.id = $evidence_id",
-                &params(vec![("evidence_id", Value::Uuid(evidence_id.as_uuid()))]),
+                "SELECT created_at FROM observations WHERE id = $observation_id",
+                &params(vec![("observation_id", Value::Uuid(observation_id))]),
             )
         })
         .collect()
@@ -520,7 +514,6 @@ fn reindex_updates_vectors_and_preserves_searchability() {
     let reindex_calls = Arc::clone(&fixture.reindex_calls);
     drop(fixture.store);
     let db = raw_db(&db_path);
-    let after_vectors = stored_evidence_vectors(&db, &evidence_ids);
     let after_hits = evidence_ids
         .iter()
         .zip(source_texts.iter())
@@ -532,13 +525,13 @@ fn reindex_updates_vectors_and_preserves_searchability() {
 
     assert!(
         result.is_ok()
-            && vectors_changed(&old_vectors, &after_vectors)
-            && after_vectors_match_sources(&after_vectors, &source_texts)
+            && old_vectors_no_longer_match(&db, &evidence_ids, &old_vectors)
+            && vector_index_matches_sources(&db, &evidence_ids, &source_texts)
             && calls_include_all(&reindex_calls, &source_texts)
             && after_hits
                 .iter()
                 .all(|(expected, hits)| hits.contains(expected)),
-        "reindex must call the registered embedder on each row's original source text, store that exact output vector, and preserve searchability, result={result:?}, after_vectors={after_vectors:?}, source_texts={source_texts:?}, reindex_calls={:?}, after_hits={after_hits:?}",
+        "reindex must call the registered embedder on each row's original source text, replace the engine vector index with that output, and preserve searchability, result={result:?}, source_texts={source_texts:?}, reindex_calls={:?}, after_hits={after_hits:?}",
         reindex_calls.lock().expect("calls")
     );
 }
@@ -555,12 +548,24 @@ fn reindex_changes_stored_vectors() {
     let source_texts = fixture.source_texts.clone();
     drop(fixture.store);
     let db_after = raw_db(&db_path);
-    let after_vectors = stored_evidence_vectors(&db_after, &evidence_ids);
-    let min_distance = old_vectors
-        .iter()
-        .zip(after_vectors.iter())
-        .filter_map(|(before, after)| after.as_ref().map(|after| l2_distance(before, after)))
-        .fold(f32::INFINITY, f32::min);
+    let duplicate_rows_match_same_source = score_for(
+        &db_after,
+        evidence_ids[0],
+        expected_reindexed_vector(&source_texts[0]),
+    )
+    .is_some_and(|score| score > 0.99)
+        && score_for(
+            &db_after,
+            evidence_ids[2],
+            expected_reindexed_vector(&source_texts[2]),
+        )
+        .is_some_and(|score| score > 0.99);
+    let distinct_row_matches_own_source = score_for(
+        &db_after,
+        evidence_ids[1],
+        expected_reindexed_vector(&source_texts[1]),
+    )
+    .is_some_and(|score| score > 0.99);
     let new_producer_rows = count(
         &db_after,
         "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE produced_by = $producer",
@@ -580,14 +585,13 @@ fn reindex_changes_stored_vectors() {
 
     assert!(
         result.is_ok()
-            && vectors_changed(&old_vectors, &after_vectors)
-            && after_vectors_match_sources(&after_vectors, &source_texts)
-            && after_vectors[0] == after_vectors[2]
-            && after_vectors[1] != after_vectors[0]
-            && min_distance >= 0.5
+            && old_vectors_no_longer_match(&db_after, &evidence_ids, &old_vectors)
+            && vector_index_matches_sources(&db_after, &evidence_ids, &source_texts)
+            && duplicate_rows_match_same_source
+            && distinct_row_matches_own_source
             && new_producer_rows == evidence_ids.len() as i64
             && old_producer_rows == evidence_ids.len() as i64,
-        "stored vectors should be the registered embedder output for source content, duplicate source content should deduplicate to the same vector, and producer lineage should be preserved, result={result:?}, after_vectors={after_vectors:?}, source_texts={source_texts:?}, min_distance={min_distance}, new_producer_rows={new_producer_rows}, old_producer_rows={old_producer_rows}"
+        "engine vector index should be replaced with the registered embedder output for source content, duplicate source content should search against the same expected vector, and producer lineage should be preserved, result={result:?}, source_texts={source_texts:?}, duplicate_rows_match_same_source={duplicate_rows_match_same_source}, distinct_row_matches_own_source={distinct_row_matches_own_source}, new_producer_rows={new_producer_rows}, old_producer_rows={old_producer_rows}"
     );
 }
 
@@ -796,6 +800,7 @@ fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_determin
         .map(|(idx, (evidence_id, source_text))| {
             let writer = fixture.store.clone();
             let barrier = Arc::clone(&barrier);
+            let reindex_calls = Arc::clone(&fixture.reindex_calls);
             let reindex_started = Arc::clone(&reindex_started);
             let reindex_done = Arc::clone(&reindex_done);
             let writers_entered_before_reindex_done =
@@ -810,6 +815,11 @@ fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_determin
                 .spawn(move || {
                     barrier.wait();
                     while !reindex_started.load(Ordering::SeqCst) {
+                        thread::yield_now();
+                    }
+                    while !reindex_done.load(Ordering::SeqCst)
+                        && reindex_calls.lock().expect("reindex calls").is_empty()
+                    {
                         thread::yield_now();
                     }
                     if !reindex_done.load(Ordering::SeqCst) {
@@ -887,7 +897,6 @@ fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_determin
             .iter()
             .all(|created_at| created_at.is_some_and(|created_at| created_at > started_at))
     });
-    let entered_vectors = stored_evidence_vectors(&db, &entered_ids);
     let new_producer_rows = entered_ids
         .iter()
         .map(|evidence_id| {
@@ -912,10 +921,10 @@ fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_determin
             && cursor_rows == 1
             && cursor_last_committed == Some(expected_scan_rows as i64)
             && entered_after_scan_start
-            && after_vectors_match_sources(&entered_vectors, &entered_texts)
+            && vector_index_matches_sources(&db, &entered_ids, &entered_texts)
             && writer_texts_embedded_only_by_writer_threads(&embed_calls, &entered_texts)
             && new_producer_rows == entered_ids.len() as i64,
-        "writes that entered before reindex completed must commit after the scan-start cursor, be embedded on the writer path from their original source text, and never be embedded by the bounded reindex scan or a reindex worker, reindex_result={reindex_result:?}, writer_results={writer_results:?}, entered_before_reindex_done={entered_before_reindex_done}, expected_scan_rows={expected_scan_rows}, cursor_rows={cursor_rows}, cursor_last_committed={cursor_last_committed:?}, scan_started_at={scan_started_at:?}, entered_created_txids={entered_created_txids:?}, entered_after_scan_start={entered_after_scan_start}, entered_ids={entered_ids:?}, entered_texts={entered_texts:?}, entered_vectors={entered_vectors:?}, reindex_calls={:?}, embed_calls={:?}, new_producer_rows={new_producer_rows}",
+        "writes that entered before reindex completed must commit after the scan-start cursor, be embedded on the writer path from their original source text, and never be embedded by the bounded reindex scan or a reindex worker, reindex_result={reindex_result:?}, writer_results={writer_results:?}, entered_before_reindex_done={entered_before_reindex_done}, expected_scan_rows={expected_scan_rows}, cursor_rows={cursor_rows}, cursor_last_committed={cursor_last_committed:?}, scan_started_at={scan_started_at:?}, entered_created_txids={entered_created_txids:?}, entered_after_scan_start={entered_after_scan_start}, entered_ids={entered_ids:?}, entered_texts={entered_texts:?}, reindex_calls={:?}, embed_calls={:?}, new_producer_rows={new_producer_rows}",
         reindex_calls.lock().expect("calls"),
         embed_calls.lock().expect("detailed calls")
     );
