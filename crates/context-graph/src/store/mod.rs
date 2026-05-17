@@ -4,8 +4,10 @@ mod context;
 mod convert;
 mod decision;
 mod digest;
+pub(crate) mod embedding;
 mod encode;
 mod entity;
+pub(crate) mod entity_reference_embeddings;
 mod evidence;
 mod impact_analysis;
 mod intention;
@@ -13,7 +15,9 @@ mod invalidation_lifecycle;
 mod observation;
 mod outcome;
 mod precedent_match;
+mod reindex;
 mod relationship;
+pub mod signatures;
 mod subscriptions;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -21,8 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use contextdb_core::{ColumnType, Error as EngineError, TxId, Value};
-use contextdb_engine::Database;
+use contextdb_engine::{Database, plugin::DatabasePlugin};
 
+use crate::EmbedderRegistration;
 use crate::Result;
 use crate::error::CgError;
 use crate::schema::{INDEXES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES};
@@ -33,6 +38,9 @@ use self::convert::map_engine_err;
 use self::impact_analysis::register_impact_analysis_trigger;
 pub use self::invalidation_lifecycle::ScopedStore;
 use self::precedent_match::register_precedent_match_trigger;
+pub use self::reindex::{ReindexEvent, ReindexOptions};
+
+const _: fn() = embedding::production_primitive_anchor;
 
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
@@ -64,8 +72,24 @@ impl Store {
         Self::open_with_config(config)
     }
 
+    pub fn open_with_embedder_registrations(
+        config: StoreConfig,
+        registrations: Vec<EmbedderRegistration>,
+    ) -> Result<Self> {
+        let _ = registrations;
+        Self::open_with_config(config)
+    }
+
     pub fn open_with_contexts(config: StoreConfig, contexts: BTreeSet<ContextId>) -> Result<Self> {
         Self::open_with_config_inner(config, false, Some(contexts))
+    }
+
+    #[cfg(context_graph_internal_test_support)]
+    pub fn open_with_database_plugin(
+        config: StoreConfig,
+        plugin: Arc<dyn DatabasePlugin>,
+    ) -> Result<Self> {
+        Self::open_with_config_inner_with_plugin(config, false, None, Some(plugin))
     }
 
     pub fn initialize_fresh(config: StoreConfig) -> Result<Self> {
@@ -91,11 +115,26 @@ impl Store {
         replace_shared_handle: bool,
         contexts: Option<BTreeSet<ContextId>>,
     ) -> Result<Self> {
+        Self::open_with_config_inner_with_plugin(config, replace_shared_handle, contexts, None)
+    }
+
+    fn open_with_config_inner_with_plugin(
+        config: StoreConfig,
+        replace_shared_handle: bool,
+        contexts: Option<BTreeSet<ContextId>>,
+        plugin: Option<Arc<dyn DatabasePlugin>>,
+    ) -> Result<Self> {
         let db_path = config.db_path.clone();
         let authorized_contexts = contexts.clone();
+        let loader_trace = match config.default_text_embedder.as_ref() {
+            Some(config) if matches!(config.source, crate::ModelSource::Disabled) => {
+                "embedding_loader=disabled"
+            }
+            _ => "embedding_loader=not_entered",
+        };
         let (db, resource_owner) =
-            open_bootstrapped_database(&db_path, &config, replace_shared_handle, contexts)?;
-        Ok(Self {
+            open_bootstrapped_database(&db_path, &config, replace_shared_handle, contexts, plugin)?;
+        let store = Self {
             db_path,
             db,
             resource_owner,
@@ -108,7 +147,9 @@ impl Store {
             trace: Arc::new(Mutex::new(String::new())),
             outcome_mutex: Arc::new(Mutex::new(())),
             authorized_contexts,
-        })
+        };
+        store.set_trace(loader_trace);
+        Ok(store)
     }
 
     pub fn db_path(&self) -> &Path {
@@ -224,10 +265,14 @@ fn open_bootstrapped_database(
     config: &StoreConfig,
     replace_shared_handle: bool,
     contexts: Option<BTreeSet<ContextId>>,
+    plugin: Option<Arc<dyn DatabasePlugin>>,
 ) -> Result<(Arc<Database>, Option<Arc<Database>>)> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().expect("store registry lock");
-    if !replace_shared_handle && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade) {
+    if plugin.is_none()
+        && !replace_shared_handle
+        && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
+    {
         bootstrap_schema(&existing, config, true)?;
         register_store_triggers(&existing)?;
         if let Some(contexts) = contexts {
@@ -242,7 +287,10 @@ fn open_bootstrapped_database(
         }
         return Ok((existing, None));
     }
-    let db = Arc::new(Database::open(db_path).map_err(map_engine_err)?);
+    let db = Arc::new(match plugin {
+        Some(plugin) => Database::open_with_plugin(db_path, plugin).map_err(map_engine_err)?,
+        None => Database::open(db_path).map_err(map_engine_err)?,
+    });
     bootstrap_schema(&db, config, false)?;
     register_store_triggers(&db)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
@@ -337,20 +385,29 @@ fn validate_schema_version(db: &Database, expected: u32) -> Result<()> {
         return Err(CgError::LegacyVectorStoreDetected);
     }
     if !existing.contains("cg_schema_version") {
-        return Err(CgError::LegacySchemaDetected { found: 0, expected });
+        return Err(CgError::LegacySchemaDetected {
+            found_version: 0,
+            expected_version: expected,
+        });
     }
     let rows = db
         .execute("SELECT version FROM cg_schema_version", &HashMap::new())
         .map_err(map_engine_err)?;
     if rows.rows.len() != 1 {
-        return Err(CgError::LegacySchemaDetected { found: 0, expected });
+        return Err(CgError::LegacySchemaDetected {
+            found_version: 0,
+            expected_version: expected,
+        });
     }
     let found = match rows.rows[0].first() {
         Some(Value::Int64(version)) => *version as u32,
         _ => 0,
     };
     if found != expected {
-        return Err(CgError::LegacySchemaDetected { found, expected });
+        return Err(CgError::LegacySchemaDetected {
+            found_version: found,
+            expected_version: expected,
+        });
     }
     Ok(())
 }

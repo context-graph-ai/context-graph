@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use contextdb_core::Lsn;
 
+use crate::embedder::EmbedderConfig;
 use crate::{AgentId, TxId};
 
 macro_rules! id_type {
@@ -441,6 +442,7 @@ pub type EmbeddingSpaceDecl = EmbeddingSpace;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EmbeddingTarget {
     Evidence(EvidenceId),
+    EntityReference(EntityId, Option<String>),
     Digest(DigestId),
 }
 
@@ -1052,7 +1054,7 @@ pub struct AuditFilter {
     pub after: Option<AuditId>,
 }
 
-pub const CG_SCHEMA_VERSION: u32 = 3;
+pub const CG_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreConfig {
@@ -1060,6 +1062,7 @@ pub struct StoreConfig {
     pub https_allowed_hosts: Vec<String>,
     pub file_uri_allowed: bool,
     pub extra_embedding_spaces: Vec<EmbeddingSpaceDecl>,
+    pub default_text_embedder: Option<EmbedderConfig>,
     pub expected_schema_version: u32,
 }
 
@@ -1070,6 +1073,7 @@ impl Default for StoreConfig {
             https_allowed_hosts: Vec::new(),
             file_uri_allowed: false,
             extra_embedding_spaces: Vec::new(),
+            default_text_embedder: None,
             expected_schema_version: CG_SCHEMA_VERSION,
         }
     }

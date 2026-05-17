@@ -1,0 +1,11 @@
+error[E0603]: function `list_member_vectors` is private
+ --> tests/ui/cluster_aggregate_member_vectors_private.rs:1:39
+  |
+1 | use context_graph::store::signatures::list_member_vectors;
+  |                                       ^^^^^^^^^^^^^^^^^^^ private function
+  |
+note: the function `list_member_vectors` is defined here
+ --> src/store/signatures.rs
+  |
+  | pub(crate) fn list_member_vectors(_signature_id: &str) -> Vec<Vec<f32>> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

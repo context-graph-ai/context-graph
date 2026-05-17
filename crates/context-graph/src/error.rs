@@ -1,15 +1,28 @@
 use std::fmt;
 
 use crate::{
-    DecisionId, DecisionStatus, IntentionId, IntentionStatus, InvalidationId, InvalidationStatus,
-    TxId,
+    ContextId, DecisionId, DecisionStatus, EvidenceId, IntentionId, IntentionStatus,
+    InvalidationId, InvalidationStatus, TxId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CgError {
-    NotImplemented {
-        symbol: &'static str,
+pub enum EngineError {
+    UniqueViolation {
+        table: String,
+        column: String,
     },
+    ImmutableTable {
+        table: String,
+    },
+    ForeignKeyViolation {
+        table: String,
+        column: String,
+        ref_table: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CgError {
     InvalidIdentity {
         context: &'static str,
     },
@@ -42,6 +55,105 @@ pub enum CgError {
     EmbeddingSpaceMismatch {
         conflicting_field: &'static str,
     },
+    EmbeddingSpaceIdMismatch {
+        embedder_declared: String,
+        registry_declared: String,
+    },
+    EmbeddingSpaceConfigMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    CrossSpaceQueryRefused {
+        query_space: String,
+        candidate_space: String,
+        query_dim: Option<usize>,
+        candidate_dim: Option<usize>,
+    },
+    CrossSpaceCosineRefused {
+        live_space: String,
+        reference_space: String,
+    },
+    EmbeddingDimensionMismatch {
+        space_id: String,
+        expected: u32,
+        found: u32,
+    },
+    EmbeddingSpaceIdReserved {
+        id: String,
+    },
+    UnknownEmbeddingSpace {
+        id: String,
+    },
+    InvalidEmbeddingSpaceId {
+        reason: &'static str,
+    },
+    InconsistentEmbeddingSpaceDeclaration {
+        space_id: String,
+    },
+    CrossContextEmbeddingTargetRejected {
+        handle_context: ContextId,
+        target_context: ContextId,
+    },
+    EvidenceNotFound {
+        evidence_id: EvidenceId,
+    },
+    ReindexAlreadyInProgress {
+        embedding_space_id: String,
+    },
+    ReindexPaused {
+        embedding_space_id: String,
+        last_committed_cursor: usize,
+    },
+    ReservedProducerTag {
+        tag: String,
+    },
+    EmbedderDeclaresNoSupportedInputs {
+        embedding_space_id: String,
+    },
+    EmptyVector,
+    InvalidVectorFloat {
+        field: &'static str,
+        index: usize,
+        actual: &'static str,
+    },
+    EmptyEmbeddingVector,
+    InvalidEmbeddingVectorFloat,
+    EntityArchived {
+        entity_id: crate::EntityId,
+    },
+    EntityNotFound {
+        entity_id: crate::EntityId,
+    },
+    ProducerFieldExceedsMaxLength {
+        field: &'static str,
+        max: usize,
+        actual: usize,
+    },
+    SignatureSpaceNotDeclaredLocally {
+        signature_id: String,
+        declared_space: String,
+        locally_declared_spaces: Vec<String>,
+    },
+    CompositeQueryRequiresExplicitFusionPolicy,
+    CompositeQueryClausesShareSpace {
+        space_id: String,
+    },
+    TextEmbedderDisabled,
+    EmbedderModelNotAvailable {
+        source: String,
+        path: String,
+    },
+    EmbedderModelCorrupt {
+        path: String,
+    },
+    EmbedderModelRevisionMismatch {
+        expected: String,
+        actual: String,
+    },
+    OfflineModeNoCache {
+        path: String,
+    },
     UnsupportedEvidenceKind {
         kind: crate::EvidenceKind,
     },
@@ -60,8 +172,8 @@ pub enum CgError {
     },
     LegacyVectorStoreDetected,
     LegacySchemaDetected {
-        found: u32,
-        expected: u32,
+        found_version: u32,
+        expected_version: u32,
     },
     MissingVectorColumnForSpace {
         table: String,
@@ -137,6 +249,9 @@ pub enum CgError {
     },
     Rollback {
         txid: TxId,
+    },
+    EngineFault {
+        source: EngineError,
     },
     Engine(String),
 }

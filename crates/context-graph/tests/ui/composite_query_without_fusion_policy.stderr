@@ -1,0 +1,22 @@
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+  --> tests/ui/composite_query_without_fusion_policy.rs:18:13
+   |
+18 |     let _ = composite_vector_search_with_policy(
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+21 |         VectorSearchFilters::default(),
+   |         ------------------------------ argument #3 of type `FusionPolicy` is missing
+   |
+note: function defined here
+  --> src/store/embedding.rs
+   |
+   | pub fn composite_vector_search_with_policy(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+   |
+18 |     let _ = composite_vector_search_with_policy(
+19 |         &store,
+20 |         clauses,
+21 ~         /* FusionPolicy */,
+22 ~         VectorSearchFilters::default(),
+   |

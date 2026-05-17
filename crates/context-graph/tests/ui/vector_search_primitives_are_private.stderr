@@ -1,0 +1,8 @@
+error[E0432]: unresolved imports `context_graph::evidence_search`, `context_graph::semantic_search`, `context_graph::vector_search`
+ --> tests/ui/vector_search_primitives_are_private.rs:1:21
+  |
+1 | use context_graph::{evidence_search, semantic_search, vector_search};
+  |                     ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^ no `vector_search` in the root
+  |                     |                |
+  |                     |                no `semantic_search` in the root
+  |                     no `evidence_search` in the root

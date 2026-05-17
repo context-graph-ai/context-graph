@@ -1126,6 +1126,7 @@ pub(super) fn value_for_optional_evidence_id(value: Option<EvidenceId>) -> Value
 pub(super) fn embedding_target_kind(target: &EmbeddingTarget) -> &'static str {
     match target {
         EmbeddingTarget::Evidence(_) => "evidence",
+        EmbeddingTarget::EntityReference(_, _) => "entity_reference",
         EmbeddingTarget::Digest(_) => "digest",
     }
 }
@@ -1133,6 +1134,7 @@ pub(super) fn embedding_target_kind(target: &EmbeddingTarget) -> &'static str {
 pub(super) fn embedding_target_uuid(target: &EmbeddingTarget) -> uuid::Uuid {
     match target {
         EmbeddingTarget::Evidence(id) => id.as_uuid(),
+        EmbeddingTarget::EntityReference(id, _) => id.as_uuid(),
         EmbeddingTarget::Digest(id) => id.as_uuid(),
     }
 }
@@ -1143,6 +1145,7 @@ pub(super) fn vector_binding_for_target(
 ) -> Result<EmbeddingSpaceBinding> {
     let table = match target_kind {
         "evidence" => "evidence",
+        "entity_reference" => "entity_reference_embeddings",
         "digest" => "digests",
         _ => "",
     };

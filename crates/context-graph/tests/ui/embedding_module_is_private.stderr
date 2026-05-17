@@ -1,0 +1,11 @@
+error[E0603]: module `embedding` is private
+ --> tests/ui/embedding_module_is_private.rs:1:27
+  |
+1 | use context_graph::store::embedding;
+  |                           ^^^^^^^^^ private module
+  |
+note: the module `embedding` is defined here
+ --> src/store/mod.rs
+  |
+  | pub(crate) mod embedding;
+  | ^^^^^^^^^^^^^^^^^^^^^^^^

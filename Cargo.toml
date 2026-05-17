@@ -15,5 +15,13 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 strum = { version = "0.28.0", features = ["derive"] }
 chrono = { version = "0.4.44", features = ["serde"] }
+candle-core = "0.10.2"
+criterion = { version = "0.8", features = ["html_reports"] }
 contextdb-core = { path = "../contextdb/crates/contextdb-core" }
 contextdb-engine = { path = "../contextdb/crates/contextdb-engine" }
+contextdb-vector = { path = "../contextdb/crates/contextdb-vector" }
+safetensors = "0.7.0"
+sha2 = "0.10.9"
+tempfile = "3.23.0"
+tokenizers = "0.23.1"
+trybuild = "1.0.112"

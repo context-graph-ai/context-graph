@@ -124,6 +124,7 @@ impl Store {
             for route in &embedding_routes {
                 let row_id = match route.target {
                     EmbeddingTarget::Evidence(id) => evidence_row_ids.get(&id).copied(),
+                    EmbeddingTarget::EntityReference(_, _) => None,
                     EmbeddingTarget::Digest(_) => None,
                 };
                 let Some(row_id) = row_id else {
@@ -131,6 +132,7 @@ impl Store {
                     return Err(CgError::EmbeddingTargetNotFound {
                         id: match route.target {
                             EmbeddingTarget::Evidence(id) => id,
+                            EmbeddingTarget::EntityReference(_, _) => EvidenceId::default(),
                             EmbeddingTarget::Digest(_) => EvidenceId::default(),
                         },
                     });
@@ -439,6 +441,11 @@ impl Store {
         for embedding in &input.embeddings {
             let target_id = match embedding.target {
                 EmbeddingTarget::Evidence(id) => id,
+                EmbeddingTarget::EntityReference(_, _) => {
+                    return Err(CgError::EmbeddingTargetNotFound {
+                        id: EvidenceId::default(),
+                    });
+                }
                 EmbeddingTarget::Digest(_) => {
                     return Err(CgError::EmbeddingTargetNotFound {
                         id: EvidenceId::default(),

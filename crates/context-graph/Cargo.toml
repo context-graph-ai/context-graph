@@ -12,18 +12,33 @@ name = "context_graph"
 path = "src/lib.rs"
 
 [dependencies]
+candle-core.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
+safetensors = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 strum.workspace = true
+tokenizers = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 
+[features]
+embeddinggemma-runtime = ["dep:safetensors", "dep:tokenizers"]
+
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
-tempfile = "3.23.0"
-trybuild = "1.0.112"
+candle-core.workspace = true
+contextdb-engine = { workspace = true, features = ["test-seams"] }
+contextdb-vector = { workspace = true, features = ["test-seams"] }
+criterion.workspace = true
+safetensors.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokenizers.workspace = true
+trybuild.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(context_graph_internal_test_support)', 'cfg(trybuild)'] }
 
 [[bench]]
 name = "cg_crud"
@@ -39,3 +54,8 @@ path = "../../benches/cg_graph.rs"
 name = "cg_impact_analysis"
 harness = false
 path = "../../benches/cg_impact_analysis.rs"
+
+[[bench]]
+name = "cg_embedding_spaces"
+harness = false
+path = "benches/cg_embedding_spaces.rs"

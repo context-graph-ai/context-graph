@@ -1,9 +1,37 @@
 #[path = "../common/invalidation_fixtures.rs"]
 mod invalidation_fixtures;
 
+mod cluster_aggregate_substrate;
+#[cfg(context_graph_internal_test_support)]
+mod composite_query_edge_cases;
 mod concurrent_probes_evidence;
+#[cfg(context_graph_internal_test_support)]
+mod cross_context_label_filter;
+#[cfg(context_graph_internal_test_support)]
+mod cross_space_refusal;
+mod decision_reasoning_chain_metadata;
+mod embedder_metadata;
+mod entity_reference_edge_cases;
+mod entity_reference_embeddings;
+#[cfg(context_graph_internal_test_support)]
+mod engine_probes {
+    pub mod embedder_concurrency;
+}
+#[cfg(context_graph_internal_test_support)]
+mod explain_introspection;
 mod impact_analysis_engine_capabilities;
+#[cfg(context_graph_internal_test_support)]
+mod intra_space_modality_agnostic;
 mod invalidation_audit_log;
 mod invalidation_concurrency;
+mod precomputed_embedding_edge_cases;
+mod precomputed_embedding_ingest;
+mod producer_diagnostic;
+mod registry_edge_cases;
+mod reindex;
+mod reindex_concurrency;
 mod schema;
+#[cfg(context_graph_internal_test_support)]
+mod store_open_runtime_config;
 mod subscriptions_engine_capabilities;
+mod visibility_boundary;

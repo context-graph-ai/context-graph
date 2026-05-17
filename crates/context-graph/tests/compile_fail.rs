@@ -2,7 +2,18 @@
 #[test]
 fn compile_fail_ui_tests() {
     let trybuild = trybuild::TestCases::new();
-    trybuild.compile_fail("tests/ui/*.rs");
+    trybuild.compile_fail("tests/ui/no_create_digest_embedding_field.rs");
+    trybuild.compile_fail("tests/ui/no_digest_embedding_field.rs");
+    trybuild.compile_fail("tests/ui/no_observation_data_field.rs");
+    trybuild.compile_fail("tests/ui/no_record_observation_data_field.rs");
+    trybuild.compile_fail("tests/ui/no_update_digest.rs");
+    trybuild.compile_fail("tests/ui/no_update_observation.rs");
+    trybuild.compile_fail("tests/ui/cluster_aggregate_member_vectors_private.rs");
+    trybuild.compile_fail("tests/ui/test_support_embedding_not_public.rs");
+    trybuild.compile_fail("tests/ui/composite_query_without_fusion_policy.rs");
+    trybuild.compile_fail("tests/ui/composite_query_single_clause_without_fusion_policy.rs");
+    trybuild.compile_fail("tests/ui/embedding_module_is_private.rs");
+    trybuild.compile_fail("tests/ui/vector_search_primitives_are_private.rs");
 }
 
 #[test]
