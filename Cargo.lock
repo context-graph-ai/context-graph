@@ -400,6 +400,7 @@ dependencies = [
  "chrono",
  "contextdb-core",
  "contextdb-engine",
+ "contextdb-tx",
  "contextdb-vector",
  "criterion",
  "safetensors",

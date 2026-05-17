@@ -29,6 +29,7 @@ embeddinggemma-runtime = ["dep:safetensors", "dep:tokenizers"]
 [dev-dependencies]
 candle-core.workspace = true
 contextdb-engine = { workspace = true, features = ["test-seams"] }
+contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }
 criterion.workspace = true
 safetensors.workspace = true
