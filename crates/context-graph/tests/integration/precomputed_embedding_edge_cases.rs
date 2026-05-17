@@ -31,22 +31,26 @@ fn producer() -> EvidenceProducer {
     }
 }
 
+fn face_space_decl() -> EmbeddingSpaceDecl {
+    EmbeddingSpaceDecl {
+        embedding_space_id: FACE_SPACE.to_string(),
+        dimension: 512,
+        metric: DistanceMetric::Cosine,
+        model_family: "vision".to_string(),
+        model_name: "face-reference".to_string(),
+        model_version: "v1".to_string(),
+        supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
+        default_for_evidence_kind: None,
+        bindings: Vec::new(),
+    }
+}
+
 fn fixture(name: &str) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(format!("{name}.db"));
     let store = Store::open(StoreConfig {
         db_path: db_path.clone(),
-        extra_embedding_spaces: vec![EmbeddingSpaceDecl {
-            embedding_space_id: FACE_SPACE.to_string(),
-            dimension: 512,
-            metric: DistanceMetric::Cosine,
-            model_family: "vision".to_string(),
-            model_name: "face-reference".to_string(),
-            model_version: "v1".to_string(),
-            supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
-            default_for_evidence_kind: None,
-            bindings: Vec::new(),
-        }],
+        extra_embedding_spaces: vec![face_space_decl()],
         ..Default::default()
     })
     .expect("open");
@@ -395,108 +399,147 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
     let mut input = embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id));
     input.produced_by.system = CG_EDGE_SYSTEM_TAG.to_string();
     let query_vector = input.vector.clone();
+    let Fixture {
+        _dir,
+        db_path,
+        store,
+        context_id,
+        entity_id,
+    } = fixture;
+    let snapshot_params = params(vec![
+        ("context_id", Value::Uuid(context_id.as_uuid())),
+        ("entity_id", Value::Uuid(entity_id.as_uuid())),
+    ]);
+    let baseline_history = store
+        .entity_history(entity_id)
+        .expect("baseline entity history");
+    let baseline_snapshot = baseline_history
+        .first()
+        .expect("baseline entity snapshot")
+        .clone();
+    drop(store);
+    let baseline_db = Database::open(&db_path).expect("baseline raw database open");
+    let context_params = params(vec![("context_id", Value::Uuid(context_id.as_uuid()))]);
+    let pre_observation_rows = count(
+        &baseline_db,
+        "SELECT COUNT(*) AS n FROM observations WHERE context_id = $context_id",
+        &context_params,
+    );
+    let pre_snapshot_rows = count(
+        &baseline_db,
+        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
+        &snapshot_params,
+    );
+    let pre_snapshot_observation_rows = count(
+        &baseline_db,
+        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
+        &snapshot_params,
+    );
+    let pre_evidence_rows = count(
+        &baseline_db,
+        "SELECT COUNT(*) AS n FROM evidence WHERE context_id = $context_id",
+        &context_params,
+    );
+    let pre_evidence_handle_rows = count(
+        &baseline_db,
+        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE context_id = $context_id",
+        &context_params,
+    );
+    let pre_entity_reference_handle_rows = count(
+        &baseline_db,
+        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE context_id = $context_id",
+        &context_params,
+    );
+    let pre_digest_handle_rows = count(
+        &baseline_db,
+        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE context_id = $context_id",
+        &context_params,
+    );
+    let pre_legacy_handle_rows = if baseline_db.table_meta("embedding_handles").is_some() {
+        count(
+            &baseline_db,
+            "SELECT COUNT(*) AS n FROM embedding_handles WHERE context_id = $context_id",
+            &context_params,
+        )
+    } else {
+        0
+    };
+    let pre_raw_vector_hits = baseline_db
+        .query_vector(
+            VectorIndexRef::new("evidence", "vector_text"),
+            &query_vector,
+            8,
+            None,
+            baseline_db.snapshot(),
+        )
+        .expect("baseline reserved-tag vector query")
+        .len();
+    drop(baseline_db);
+    let store = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        extra_embedding_spaces: vec![face_space_decl()],
+        ..Default::default()
+    })
+    .expect("reopen store for reserved producer attempt");
+    let fixture = Fixture {
+        _dir,
+        db_path,
+        store,
+        context_id,
+        entity_id,
+    };
     let result = record(&fixture, input);
     let db = raw_db(&fixture.db_path, fixture.store);
     let observation_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM observations WHERE context_id = $context_id AND entity_id = $entity_id AND observation_type = $observation_type AND source = $source",
-        &params(vec![
-            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-            ("entity_id", Value::Uuid(fixture.entity_id.as_uuid())),
-            (
-                "observation_type",
-                Value::Text("precomputed_embedding_edge".to_string()),
-            ),
-            ("source", Value::Text("edge".to_string())),
-        ]),
+        "SELECT COUNT(*) AS n FROM observations WHERE context_id = $context_id",
+        &context_params,
     );
     let snapshot_rows = count(
         &db,
         "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
-        &params(vec![
-            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-            ("entity_id", Value::Uuid(fixture.entity_id.as_uuid())),
-        ]),
+        &snapshot_params,
     );
     let snapshot_observation_rows = count(
         &db,
         "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
+        &snapshot_params,
+    );
+    let baseline_snapshot_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE id = $snapshot_id AND context_id = $context_id AND entity_id = $entity_id AND valid_from = $valid_from AND valid_to IS NULL",
         &params(vec![
-            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-            ("entity_id", Value::Uuid(fixture.entity_id.as_uuid())),
+            ("snapshot_id", Value::Uuid(baseline_snapshot.id.as_uuid())),
+            ("context_id", Value::Uuid(context_id.as_uuid())),
+            ("entity_id", Value::Uuid(entity_id.as_uuid())),
+            ("valid_from", Value::TxId(baseline_snapshot.valid_from)),
         ]),
     );
     let evidence_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence WHERE id = $id",
-        &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
+        "SELECT COUNT(*) AS n FROM evidence WHERE context_id = $context_id",
+        &context_params,
     );
     let evidence_handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE context_id = $context_id OR target_id = $target_id OR produced_by = $producer",
-        &params(vec![
-            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-            ("target_id", Value::Uuid(evidence_id.as_uuid())),
-            (
-                "producer",
-                Value::Json(serde_json::json!({
-                    "system": CG_EDGE_SYSTEM_TAG,
-                    "model_name": "encoder",
-                    "model_version": "1",
-                    "pipeline_version": "1"
-                })),
-            ),
-        ]),
+        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE context_id = $context_id",
+        &context_params,
     );
     let entity_reference_handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE context_id = $context_id OR produced_by = $producer",
-        &params(vec![
-            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-            (
-                "producer",
-                Value::Json(serde_json::json!({
-                    "system": CG_EDGE_SYSTEM_TAG,
-                    "model_name": "encoder",
-                    "model_version": "1",
-                    "pipeline_version": "1"
-                })),
-            ),
-        ]),
+        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE context_id = $context_id",
+        &context_params,
     );
     let digest_handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE context_id = $context_id OR produced_by = $producer",
-        &params(vec![
-            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-            (
-                "producer",
-                Value::Json(serde_json::json!({
-                    "system": CG_EDGE_SYSTEM_TAG,
-                    "model_name": "encoder",
-                    "model_version": "1",
-                    "pipeline_version": "1"
-                })),
-            ),
-        ]),
+        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE context_id = $context_id",
+        &context_params,
     );
     let legacy_handle_rows = if db.table_meta("embedding_handles").is_some() {
         count(
             &db,
-            "SELECT COUNT(*) AS n FROM embedding_handles WHERE context_id = $context_id OR target_id = $target_id OR produced_by = $producer",
-            &params(vec![
-                ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-                ("target_id", Value::Uuid(evidence_id.as_uuid())),
-                (
-                    "producer",
-                    Value::Json(serde_json::json!({
-                        "system": CG_EDGE_SYSTEM_TAG,
-                        "model_name": "encoder",
-                        "model_version": "1",
-                        "pipeline_version": "1"
-                    })),
-                ),
-            ]),
+            "SELECT COUNT(*) AS n FROM embedding_handles WHERE context_id = $context_id",
+            &context_params,
         )
     } else {
         0
@@ -513,16 +556,17 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
         .len();
     assert!(
         matches!(result, Err(CgError::ReservedProducerTag { ref tag }) if tag == CG_EDGE_SYSTEM_TAG)
-            && observation_rows == 0
-            && snapshot_rows == 0
-            && snapshot_observation_rows == 0
-            && evidence_rows == 0
-            && evidence_handle_rows == 0
-            && entity_reference_handle_rows == 0
-            && digest_handle_rows == 0
-            && legacy_handle_rows == 0
-            && raw_vector_hits == 0,
-        "expected reserved producer tag rejection before any observation/snapshot/evidence/handle/vector write, got result={result:?}, observation_rows={observation_rows}, snapshot_rows={snapshot_rows}, snapshot_observation_rows={snapshot_observation_rows}, evidence_rows={evidence_rows}, evidence_handle_rows={evidence_handle_rows}, entity_reference_handle_rows={entity_reference_handle_rows}, digest_handle_rows={digest_handle_rows}, legacy_handle_rows={legacy_handle_rows}, raw_vector_hits={raw_vector_hits}"
+            && observation_rows == pre_observation_rows
+            && snapshot_rows == pre_snapshot_rows
+            && baseline_snapshot_rows == 1
+            && snapshot_observation_rows == pre_snapshot_observation_rows
+            && evidence_rows == pre_evidence_rows
+            && evidence_handle_rows == pre_evidence_handle_rows
+            && entity_reference_handle_rows == pre_entity_reference_handle_rows
+            && digest_handle_rows == pre_digest_handle_rows
+            && legacy_handle_rows == pre_legacy_handle_rows
+            && raw_vector_hits == pre_raw_vector_hits,
+        "expected reserved producer tag rejection before any observation or new snapshot/evidence/handle/vector write, got result={result:?}, pre_observation_rows={pre_observation_rows}, observation_rows={observation_rows}, pre_snapshot_rows={pre_snapshot_rows}, snapshot_rows={snapshot_rows}, baseline_snapshot={baseline_snapshot:?}, baseline_snapshot_rows={baseline_snapshot_rows}, pre_snapshot_observation_rows={pre_snapshot_observation_rows}, snapshot_observation_rows={snapshot_observation_rows}, pre_evidence_rows={pre_evidence_rows}, evidence_rows={evidence_rows}, pre_evidence_handle_rows={pre_evidence_handle_rows}, evidence_handle_rows={evidence_handle_rows}, pre_entity_reference_handle_rows={pre_entity_reference_handle_rows}, entity_reference_handle_rows={entity_reference_handle_rows}, pre_digest_handle_rows={pre_digest_handle_rows}, digest_handle_rows={digest_handle_rows}, pre_legacy_handle_rows={pre_legacy_handle_rows}, legacy_handle_rows={legacy_handle_rows}, pre_raw_vector_hits={pre_raw_vector_hits}, raw_vector_hits={raw_vector_hits}"
     );
 }
 
