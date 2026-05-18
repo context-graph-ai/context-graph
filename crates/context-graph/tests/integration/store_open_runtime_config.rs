@@ -47,20 +47,39 @@ const FINAL_NORM_TENSOR: &str = "model.norm.weight";
 const TEXT_PROJECTION_UP_TENSOR: &str = "model.text_projection.up_proj.weight";
 const TEXT_PROJECTION_DOWN_TENSOR: &str = "model.text_projection.down_proj.weight";
 
-#[derive(Default)]
 struct RecordingLoadObserver {
-    events: Mutex<Vec<EmbeddingGemmaLoadEvent>>,
+    events: Mutex<Vec<(EmbeddingGemmaLoadEvent, Instant)>>,
+}
+
+impl Default for RecordingLoadObserver {
+    fn default() -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl RecordingLoadObserver {
     fn events(&self) -> Vec<EmbeddingGemmaLoadEvent> {
+        self.events
+            .lock()
+            .expect("loader events")
+            .iter()
+            .map(|(event, _)| event.clone())
+            .collect()
+    }
+
+    fn timed_events(&self) -> Vec<(EmbeddingGemmaLoadEvent, Instant)> {
         self.events.lock().expect("loader events").clone()
     }
 }
 
 impl EmbeddingGemmaLoadObserver for RecordingLoadObserver {
     fn observe(&self, event: EmbeddingGemmaLoadEvent) {
-        self.events.lock().expect("loader events").push(event);
+        self.events
+            .lock()
+            .expect("loader events")
+            .push((event, Instant::now()));
     }
 
     fn observe_candle_tensor(&self, stage: EmbeddingGemmaForwardStage, tensor: &Tensor) {
@@ -252,6 +271,13 @@ fn seeded_values(seed: u128, len: usize, scale: f32) -> Vec<f32> {
             let byte = ((seed.rotate_left((idx % 64) as u32) >> shift) & 0xff) as f32;
             ((byte + 1.0) / 257.0) * scale
         })
+        .collect()
+}
+
+fn seeded_signed_values(seed: u128, len: usize, scale: f32) -> Vec<f32> {
+    seeded_values(seed, len, 2.0 * scale)
+        .into_iter()
+        .map(|value| value - scale)
         .collect()
 }
 
@@ -479,19 +505,24 @@ fn stage_local_embeddinggemma_cache(cache_dir: &Path) -> (PathBuf, String, Vec<f
     std::fs::create_dir_all(&model_dir).expect("model dir");
 
     let unique_token = format!("edge_sentinel_{}", uuid::Uuid::now_v7().simple());
-    let seed = uuid::Uuid::now_v7().as_u128();
+    let seed = 0x6a09_e667_f3bc_c908_bb67_ae85_84ca_a73b_u128;
     let weights = MiniEmbeddingGemmaWeights {
-        token_embedding: seeded_values(seed, 16, 1.0),
-        q_proj: seeded_values(seed.rotate_left(1), 4 * 4, 0.2),
-        k_proj: seeded_values(seed.rotate_left(2), 4 * 4, 0.2),
-        v_proj: seeded_values(seed.rotate_left(3), 4 * 4, 0.2),
-        o_proj: seeded_values(seed.rotate_left(4), 4 * 4, 0.2),
-        gate_proj: seeded_values(seed.rotate_left(5), 4 * 8, 0.15),
-        up_proj: seeded_values(seed.rotate_left(6), 4 * 8, 0.15),
-        down_proj: seeded_values(seed.rotate_left(7), 8 * 4, 0.15),
-        final_norm: seeded_values(seed.rotate_left(8), 4, 0.5),
-        text_projection_up: seeded_values(seed.rotate_left(9), 4 * 8, 0.2),
-        text_projection_down: seeded_values(seed.reverse_bits(), 8 * 768, 0.2),
+        token_embedding: vec![
+            -2.75, 0.25, -0.85, 1.35, //
+            0.65, 2.45, -1.55, 0.70, //
+            -0.90, 1.50, 2.80, -0.55, //
+            1.95, -2.20, 0.45, 2.65,
+        ],
+        q_proj: seeded_signed_values(seed.rotate_left(1), 4 * 4, 0.45),
+        k_proj: seeded_signed_values(seed.rotate_left(2), 4 * 4, 0.40),
+        v_proj: seeded_signed_values(seed.rotate_left(3), 4 * 4, 0.50),
+        o_proj: seeded_signed_values(seed.rotate_left(4), 4 * 4, 0.35),
+        gate_proj: seeded_signed_values(seed.rotate_left(5), 4 * 8, 0.30),
+        up_proj: seeded_signed_values(seed.rotate_left(6), 4 * 8, 0.40),
+        down_proj: seeded_signed_values(seed.rotate_left(7), 8 * 4, 0.35),
+        final_norm: vec![1.20, -0.75, 0.55, -1.45],
+        text_projection_up: seeded_signed_values(seed.rotate_left(9), 4 * 8, 0.45),
+        text_projection_down: seeded_signed_values(seed.reverse_bits(), 8 * 768, 0.30),
     };
     let token_embedding_bytes = tensor_bytes(&weights.token_embedding);
     let q_proj_bytes = tensor_bytes(&weights.q_proj);
@@ -581,6 +612,109 @@ fn stage_local_embeddinggemma_cache(cache_dir: &Path) -> (PathBuf, String, Vec<f
         &[3, 1, 2],
     ));
     (model_dir, unique_token, golden)
+}
+
+fn expected_embedding_for_text(model_dir: &Path, text: &str) -> (Vec<u32>, Vec<f32>) {
+    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer");
+    let token_ids = tokenizer
+        .encode(text, false)
+        .expect("fixture tokenization")
+        .get_ids()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let token_indexes = token_ids.iter().map(|id| *id as usize).collect::<Vec<_>>();
+    let weights = mini_weights_from_safetensors(&model_dir.join("model.safetensors"));
+    let vector = normalized_768(&candle_mini_gemma_golden_projection(
+        &weights,
+        &token_indexes,
+    ));
+    (token_ids, vector)
+}
+
+fn production_embedder_outbound_fetch_markers() -> Vec<String> {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = crate_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let manifest = std::fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest");
+    let lock = std::fs::read_to_string(workspace_root.join("Cargo.lock")).expect("lock");
+    let dependency_text = format!("{manifest}\n{lock}");
+    let mut markers = Vec::new();
+
+    for dep in [
+        ["req", "west"].concat(),
+        ["u", "req"].concat(),
+        "hyper".to_string(),
+        "hyper-util".to_string(),
+        "h2".to_string(),
+        "socket2".to_string(),
+        "http".to_string(),
+        "http-body".to_string(),
+        ["hyper-", "client"].concat(),
+        ["s", "urf"].concat(),
+        ["is", "ahc"].concat(),
+        ["hf", "-hub"].concat(),
+        ["hf_", "hub"].concat(),
+        "curl".to_string(),
+        "curl-sys".to_string(),
+    ] {
+        if dependency_text.contains(&format!("name = \"{dep}\"")) || manifest.contains(&dep) {
+            markers.push(format!("outbound dependency {dep}"));
+        }
+    }
+
+    let mut source_files = Vec::new();
+    collect_rs_files(&crate_dir.join("src"), &mut source_files);
+    for file in source_files {
+        let text = std::fs::read_to_string(&file).expect("production source");
+        for token in [
+            ["Tcp", "Stream::connect"].concat(),
+            ["std::net::Tcp", "Stream"].concat(),
+            ["tokio::net::Tcp", "Stream"].concat(),
+            ["std::process::Com", "mand"].concat(),
+            ["Command", "::new"].concat(),
+            ["Model", "Download"].concat(),
+            ["download", "_model"].concat(),
+            ["http::", "Client"].concat(),
+            "std::net".to_string(),
+            "hyper::Client".to_string(),
+            "hyper_util".to_string(),
+            "HttpConnector".to_string(),
+            "h2::client".to_string(),
+            "http_body_util".to_string(),
+            "socket2".to_string(),
+            "reqwest".to_string(),
+            "ureq".to_string(),
+            "isahc".to_string(),
+            "surf".to_string(),
+            "hf_hub".to_string(),
+            "hf-hub".to_string(),
+            "TcpStream".to_string(),
+            "UdpSocket".to_string(),
+            "::connect".to_string(),
+            "curl".to_string(),
+            "wget".to_string(),
+        ] {
+            if text.contains(&token) {
+                markers.push(format!("{} contains {token}", file.display()));
+            }
+        }
+    }
+
+    markers
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read source dir") {
+        let path = entry.expect("source entry").path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
 }
 
 fn stage_invalid_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
@@ -841,15 +975,132 @@ fn embedder_partially_downloaded_cache_returns_typed_model_corrupt_no_silent_red
 #[test]
 fn embedder_first_use_emits_observable_progress_signal_naming_model_version_path_revision() {
     let cache_dir = tempfile::tempdir().expect("cache");
-    let embedder = EmbeddingGemmaTextEmbedder::new(config(
-        ModelSource::HuggingFace {
-            repo: "google/embeddinggemma-300m".to_string(),
-        },
-        false,
-        Some(cache_dir.path().to_path_buf()),
-    ));
-    let progress = embedder.emit_cold_start_progress();
+    let (model_dir, _unique_token, warm_cache_vector) =
+        stage_local_embeddinggemma_cache(cache_dir.path());
+    let expected_model_fingerprint = sha256_fingerprint(
+        &std::fs::read(model_dir.join("model.safetensors")).expect("model bytes"),
+    );
+    let input_text = "<unk>".to_string();
+    let (expected_token_ids, expected_vector) =
+        expected_embedding_for_text(&model_dir, &input_text);
+    assert!(
+        !vectors_close(&expected_vector, &warm_cache_vector),
+        "progress-path expected vector must be derived from the actual input tokens, not the warm-cache fixture token path"
+    );
+    let observer = Arc::new(RecordingLoadObserver::default());
+    let observer_trait: Arc<dyn EmbeddingGemmaLoadObserver> = observer.clone();
+    let embedder = EmbeddingGemmaTextEmbedder::new_with_load_observer(
+        config(
+            ModelSource::LocalPath(model_dir.clone()),
+            true,
+            Some(cache_dir.path().to_path_buf()),
+        ),
+        observer_trait,
+    );
+    let call_started = Instant::now();
+    let output = embedder.embed(EmbeddingInput::Text(input_text));
+    let events = observer.events();
+    let timed_events = observer.timed_events();
+    let outbound_fetch_markers = production_embedder_outbound_fetch_markers();
+    let first_event_within_budget = timed_events.first().is_some_and(|(_, at)| {
+        at.checked_duration_since(call_started)
+            .is_some_and(|elapsed| elapsed <= Duration::from_millis(200))
+    });
+    let loaded_index = events.iter().position(|event| {
+        matches!(
+            event,
+            EmbeddingGemmaLoadEvent::ModelLoaded {
+                model_id,
+                cache_path,
+                pinned_revision,
+                artifact_sha256,
+            } if model_id == "embeddinggemma-300m"
+                && cache_path == &model_dir.display().to_string()
+                && pinned_revision.as_deref() == Some("rev-a")
+                && artifact_sha256 == &expected_model_fingerprint
+        )
+    });
+    let pre_loaded_events = loaded_index
+        .map(|index| &events[..index])
+        .unwrap_or(&events[..0]);
+    let loader_chain_has_artifacts_before_loaded = pre_loaded_events.iter().any(|event| {
+        matches!(
+            event,
+            EmbeddingGemmaLoadEvent::ArtifactOpened { path_suffix }
+                if path_suffix.ends_with("model.safetensors")
+        )
+    }) && pre_loaded_events.iter().any(|event| {
+        matches!(
+            event,
+            EmbeddingGemmaLoadEvent::TokenizerLoaded { path_suffix, .. }
+                if path_suffix.ends_with("tokenizer.json")
+        )
+    }) && pre_loaded_events.iter().any(|event| {
+        matches!(
+            event,
+            EmbeddingGemmaLoadEvent::ArtifactFingerprinted { path_suffix, sha256 }
+                if path_suffix.ends_with("model.safetensors")
+                    && sha256 == &expected_model_fingerprint
+        )
+    }) && pre_loaded_events
+        .iter()
+        .any(|event| matches!(event, EmbeddingGemmaLoadEvent::TensorLoaded { .. }));
+    let last_event_is_loaded = matches!(
+        events.last(),
+        Some(EmbeddingGemmaLoadEvent::ModelLoaded {
+            model_id,
+            cache_path,
+            pinned_revision,
+            artifact_sha256,
+        }) if model_id == "embeddinggemma-300m"
+            && cache_path == &model_dir.display().to_string()
+            && pinned_revision.as_deref() == Some("rev-a")
+            && artifact_sha256 == &expected_model_fingerprint
+    );
 
+    assert!(
+        matches!(
+            &output,
+            Ok(value)
+                if value.embedding_space_id == "text_default_embeddinggemma_300m_768"
+                    && value.dimension == 768
+                    && value.producer.system == context_graph::CG_EDGE_SYSTEM_TAG
+                    && vectors_close(&value.vector, &expected_vector)
+        ) && matches!(
+            events.first(),
+            Some(EmbeddingGemmaLoadEvent::ModelLookupStarted {
+                model_id,
+                cache_path,
+                pinned_revision,
+                source,
+                network_policy,
+            }) if model_id == "embeddinggemma-300m"
+                && cache_path == &model_dir.display().to_string()
+                && pinned_revision.as_deref() == Some("rev-a")
+                && source.contains("LocalPath")
+                && network_policy == "offline"
+        ) && first_event_within_budget
+            && loader_chain_has_artifacts_before_loaded
+            && last_event_is_loaded
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    EmbeddingGemmaLoadEvent::TokenIds { ids } if ids == &expected_token_ids
+                )
+            })
+            && observed_artifact_fingerprint(
+                &events,
+                "model.safetensors",
+                &expected_model_fingerprint,
+            )
+            && events.len() <= 200
+            && EmbeddingGemmaTextEmbedder::network_attempt_count() == 0
+            && outbound_fetch_markers.is_empty(),
+        "first use must emit bounded ordered local-cache lookup/load events naming model, cache path, revision, exact input token ids, and artifact fingerprint without any download path or outbound fetch surface, output={output:?}, expected_token_ids={expected_token_ids:?}, first_event_within_budget={first_event_within_budget}, loader_chain_has_artifacts_before_loaded={loader_chain_has_artifacts_before_loaded}, last_event_is_loaded={last_event_is_loaded}, timed_events={timed_events:?}, events={events:?}, network_attempts={}, outbound_fetch_markers={outbound_fetch_markers:?}",
+        EmbeddingGemmaTextEmbedder::network_attempt_count()
+    );
+
+    let progress = embedder.emit_cold_start_progress();
     assert!(progress.contains("embeddinggemma-300m"));
     assert!(progress.contains("rev-a"));
     assert!(progress.contains(cache_dir.path().to_string_lossy().as_ref()));

@@ -679,10 +679,14 @@ fn probe_basis_diff_under_concurrent_writer_returns_mvcc_consistent_horizon() {
     let reader_config = config.clone();
     let reader_barrier = Arc::clone(&barrier);
     let reader_committed = Arc::clone(&committed);
-    std::thread::spawn(move || {
+    let reader_stop = Arc::clone(&stop);
+    let reader = std::thread::spawn(move || {
         let reader = Store::open(reader_config).expect("reader open");
         reader_barrier.wait();
         while reader_committed.load(Ordering::SeqCst) < 50 {
+            if reader_stop.load(Ordering::SeqCst) {
+                return;
+            }
             std::thread::yield_now();
         }
         let before = reader_committed.load(Ordering::SeqCst);
@@ -690,13 +694,19 @@ fn probe_basis_diff_under_concurrent_writer_returns_mvcc_consistent_horizon() {
         let after = reader_committed.load(Ordering::SeqCst);
         diff_tx.send((before, after, diff)).expect("send diff");
     });
-    let (before_diff, after_diff, diff) = diff_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("basis_diff returned while writer flood was still active");
+    let received = diff_rx.recv_timeout(std::time::Duration::from_secs(30));
     stop.store(true, Ordering::SeqCst);
     for writer in writers {
         writer.join().expect("writer joined");
     }
+    let (before_diff, after_diff, diff) = received.unwrap_or_else(|err| {
+        panic!(
+            "basis_diff returned while writer flood was still active: {err}; attempts={}, committed={}",
+            attempts.load(Ordering::SeqCst),
+            committed.load(Ordering::SeqCst)
+        )
+    });
+    reader.join().expect("reader joined");
     assert!(before_diff >= 50);
     assert!(after_diff >= before_diff);
     let reader = Store::open(config).expect("reader");

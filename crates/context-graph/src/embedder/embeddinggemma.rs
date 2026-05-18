@@ -33,6 +33,13 @@ pub enum EmbeddingGemmaForwardStage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmbeddingGemmaLoadEvent {
+    ModelLookupStarted {
+        model_id: String,
+        cache_path: String,
+        pinned_revision: Option<String>,
+        source: String,
+        network_policy: String,
+    },
     ArtifactOpened {
         path_suffix: String,
     },
@@ -65,6 +72,12 @@ pub enum EmbeddingGemmaLoadEvent {
     ArtifactFingerprinted {
         path_suffix: String,
         sha256: String,
+    },
+    ModelLoaded {
+        model_id: String,
+        cache_path: String,
+        pinned_revision: Option<String>,
+        artifact_sha256: String,
     },
 }
 
