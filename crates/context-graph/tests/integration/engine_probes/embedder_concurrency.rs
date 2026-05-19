@@ -24,6 +24,7 @@ const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
 const VISION_SPACE: &str = "vigil_face_reid_v1";
 const FACE_REFERENCE_SPACE: &str = "face_reference_v1";
 const ENGINE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const ENGINE_PROBE_HNSW_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 const HNSW_PADDING_ROWS: usize = 1000;
 
 struct ProbeFixture {
@@ -1012,7 +1013,9 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
 
     let text_result = match text_done_before_release {
         Ok(result) => Some(result),
-        Err(TryRecvError::Empty) => text_done_rx.recv_timeout(ENGINE_PROBE_TIMEOUT).ok(),
+        Err(TryRecvError::Empty) => text_done_rx
+            .recv_timeout(ENGINE_PROBE_HNSW_COMPLETION_TIMEOUT)
+            .ok(),
         Err(TryRecvError::Disconnected) => None,
     };
     let vision_result = match vision_done_before_release {

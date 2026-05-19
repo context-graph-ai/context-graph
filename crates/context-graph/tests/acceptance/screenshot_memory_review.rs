@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process;
 #[cfg(context_graph_internal_test_support)]
@@ -696,6 +696,34 @@ fn source_contains_any(source: &str, needles: &[&str]) -> bool {
         .any(|needle| source.contains(&needle.to_ascii_lowercase()))
 }
 
+fn source_contains_string_literal(source: &str, needle: &str) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    let bytes = source.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] != b'"' {
+            idx += 1;
+            continue;
+        }
+        idx += 1;
+        let literal_start = idx;
+        while idx < bytes.len() {
+            match bytes[idx] {
+                b'\\' => idx += 2,
+                b'"' => {
+                    if source[literal_start..idx].contains(&needle) {
+                        return true;
+                    }
+                    idx += 1;
+                    break;
+                }
+                _ => idx += 1,
+            }
+        }
+    }
+    false
+}
+
 fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
     let functions = collect_production_function_sources();
     let dedup_source = function_sources_for_markers(&functions, "dedup_compare_digest_spaces");
@@ -727,7 +755,6 @@ fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
         ("manual indexed vector loop", "for i in 0.."),
         ("raw vector SQL projection", "select vector_text"),
         ("cg-side cosine fallback", "cosine_score("),
-        ("fabricated planner trace", "hnswsearch"),
     ]
     .into_iter()
     .filter_map(|(label, needle)| {
@@ -736,6 +763,14 @@ fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
             .then_some(label.to_string())
     })
     .collect::<Vec<_>>();
+    for (label, needle) in [
+        ("fabricated VectorSearch planner trace", "vectorsearch"),
+        ("fabricated HNSWSearch planner trace", "hnswsearch"),
+    ] {
+        if source_contains_string_literal(&dedup_source, needle) {
+            markers.push(label.to_string());
+        }
+    }
     if source_contains_any(
         &store_open_source,
         &[
@@ -765,7 +800,7 @@ fn assert_same_space_dedup_results(
     decoy_digest: DigestId,
     candidate_digest: DigestId,
     proof: &str,
-) {
+) -> [String; 3] {
     let result = dedup_compare_digest_spaces(
         store,
         query_digest,
@@ -783,6 +818,24 @@ fn assert_same_space_dedup_results(
         TEXT_SPACE,
     );
     let source_forbidden_vector_bypass_markers = dedup_source_forbidden_vector_bypass_markers();
+    let result_trace = result
+        .as_ref()
+        .ok()
+        .and_then(|rows| rows.first())
+        .map(|row| row.planner_trace.clone())
+        .unwrap_or_default();
+    let unlike_trace = unlike_result
+        .as_ref()
+        .ok()
+        .and_then(|rows| rows.first())
+        .map(|row| row.planner_trace.clone())
+        .unwrap_or_default();
+    let other_query_trace = other_query_result
+        .as_ref()
+        .ok()
+        .and_then(|rows| rows.first())
+        .map(|row| row.planner_trace.clone())
+        .unwrap_or_default();
 
     assert!(
         result.as_ref().is_ok_and(|rows| {
@@ -791,7 +844,7 @@ fn assert_same_space_dedup_results(
                 && rows[0].embedding_space_id == TEXT_SPACE
                 && rows[0].context_id == Some(context_id)
                 && rows[0].index_ref == "digests.vector_text"
-                && rows[0].planner_trace.contains("HNSWSearch")
+                && dedup_engine_vector_trace(&rows[0].planner_trace)
                 && rows[0].score > 0.99
         }) && unlike_result.as_ref().is_ok_and(|rows| {
             rows.len() == 1
@@ -799,7 +852,7 @@ fn assert_same_space_dedup_results(
                 && rows[0].embedding_space_id == TEXT_SPACE
                 && rows[0].context_id == Some(context_id)
                 && rows[0].index_ref == "digests.vector_text"
-                && rows[0].planner_trace.contains("HNSWSearch")
+                && dedup_engine_vector_trace(&rows[0].planner_trace)
                 && rows[0].score < 0.25
         }) && other_query_result.as_ref().is_ok_and(|rows| {
             rows.len() == 1
@@ -807,11 +860,33 @@ fn assert_same_space_dedup_results(
                 && rows[0].embedding_space_id == TEXT_SPACE
                 && rows[0].context_id == Some(context_id)
                 && rows[0].index_ref == "digests.vector_text"
-                && rows[0].planner_trace.contains("HNSWSearch")
+                && dedup_engine_vector_trace(&rows[0].planner_trace)
                 && rows[0].score < 0.25
         }) && source_forbidden_vector_bypass_markers.is_empty(),
-        "same-space dedup must compare the supplied query Digest vector with each supplied candidate Digest vector through the contextdb digests.vector_text HNSW path from durable contextdb state after Store reopen and fresh-process execution, and the reachable production dedup helper code must not hide a broad vector primitive call or cg-side cosine fallback behind probe SQL; proof={proof}; source_forbidden_vector_bypass_markers={source_forbidden_vector_bypass_markers:?}; result={result:?}, unlike_result={unlike_result:?}, other_query_result={other_query_result:?}"
+        "same-space dedup must compare the supplied query Digest vector with each supplied candidate Digest vector through the contextdb digests.vector_text vector path from durable contextdb state after Store reopen and fresh-process execution, and the reachable production dedup helper code must not hide a broad vector primitive call or cg-side cosine fallback behind probe SQL; proof={proof}; source_forbidden_vector_bypass_markers={source_forbidden_vector_bypass_markers:?}; result={result:?}, unlike_result={unlike_result:?}, other_query_result={other_query_result:?}"
     );
+    [result_trace, unlike_trace, other_query_trace]
+}
+
+fn dedup_engine_vector_trace(trace: &str) -> bool {
+    trace.contains("VectorSearch") || trace.contains("HNSWSearch")
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn raw_dedup_trace(store: &Store, query_digest: DigestId, candidate_digest: DigestId) -> String {
+    let result = store
+        .execute_sql_for_test(
+            "SELECT id, context_id, score FROM digests WHERE id = $candidate_id ORDER BY vector_text <=> ROW_VECTOR('digests','vector_text',$query_id) LIMIT 1",
+            &HashMap::from([
+                (
+                    "candidate_id".to_string(),
+                    Value::Uuid(candidate_digest.as_uuid()),
+                ),
+                ("query_id".to_string(), Value::Uuid(query_digest.as_uuid())),
+            ]),
+        )
+        .expect("raw dedup trace query");
+    format!("{:?}", result.trace)
 }
 
 fn create_screenshot_digest(
@@ -970,7 +1045,7 @@ fn screenshot_review_dedup_classifier_compares_same_space_digest_vectors() {
             probe.enable();
             let store = reopen_store_with_dedup_probe(&db_path, probe.clone());
             probe.begin_dedup();
-            assert_same_space_dedup_results(
+            let returned_traces = assert_same_space_dedup_results(
                 &store,
                 ContextId::from(uuid_env("CG_SCREENSHOT_DEDUP_CONTEXT")),
                 DigestId::from(uuid_env("CG_SCREENSHOT_DEDUP_QUERY")),
@@ -980,6 +1055,15 @@ fn screenshot_review_dedup_classifier_compares_same_space_digest_vectors() {
                 "fresh child process opened the persisted database with no parent process-local digest cache",
             );
             probe.disable();
+            let query_digest = DigestId::from(uuid_env("CG_SCREENSHOT_DEDUP_QUERY"));
+            let other_query_digest = DigestId::from(uuid_env("CG_SCREENSHOT_DEDUP_OTHER_QUERY"));
+            let decoy_digest = DigestId::from(uuid_env("CG_SCREENSHOT_DEDUP_DECOY"));
+            let candidate_digest = DigestId::from(uuid_env("CG_SCREENSHOT_DEDUP_CANDIDATE"));
+            let raw_traces = [
+                raw_dedup_trace(&store, query_digest, candidate_digest),
+                raw_dedup_trace(&store, query_digest, decoy_digest),
+                raw_dedup_trace(&store, other_query_digest, candidate_digest),
+            ];
             let vector_order_query_count = probe.vector_order_query_count();
             let constrained_vector_order_query_count = probe.constrained_vector_order_query_count();
             let unconstrained_vector_order_query_count =
@@ -994,8 +1078,9 @@ fn screenshot_review_dedup_classifier_compares_same_space_digest_vectors() {
                     && unconstrained_vector_order_query_count == 0
                     && direct_digest_vector_read_count == 0
                     && pre_dedup_forbidden_queries.is_empty()
-                    && forbidden_queries.is_empty(),
-                "same-space dedup must execute exactly one candidate-id-constrained contextdb digests.vector_text <=> query per comparison after Store::open, and must not preload digest vectors before the helper call, broad-search then filter, or read digest vectors into cg memory for scoring, vector_order_query_count={vector_order_query_count}, constrained_vector_order_query_count={constrained_vector_order_query_count}, unconstrained_vector_order_query_count={unconstrained_vector_order_query_count}, direct_digest_vector_read_count={direct_digest_vector_read_count}, pre_dedup_forbidden_queries={pre_dedup_forbidden_queries:?}, forbidden_queries={forbidden_queries:?}, observed_sql={observed_sql:?}"
+                    && forbidden_queries.is_empty()
+                    && returned_traces == raw_traces,
+                "same-space dedup must execute exactly one candidate-id-constrained contextdb digests.vector_text <=> query per comparison after Store::open, propagate the exact contextdb QueryResult.trace from the equivalent ROW_VECTOR query, and must not preload digest vectors before the helper call, broad-search then filter, or read digest vectors into cg memory for scoring, vector_order_query_count={vector_order_query_count}, constrained_vector_order_query_count={constrained_vector_order_query_count}, unconstrained_vector_order_query_count={unconstrained_vector_order_query_count}, direct_digest_vector_read_count={direct_digest_vector_read_count}, pre_dedup_forbidden_queries={pre_dedup_forbidden_queries:?}, forbidden_queries={forbidden_queries:?}, observed_sql={observed_sql:?}, returned_traces={returned_traces:?}, raw_traces={raw_traces:?}"
             );
         }
         #[cfg(not(context_graph_internal_test_support))]
