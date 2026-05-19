@@ -166,13 +166,12 @@ fn producer_display(space: &str, producer: &EvidenceProducer, txid: context_grap
         "consumer-claimed"
     };
     format!(
-        "{} {} ({}) - {}, pipeline {}, produced {} at txid 0x{:x}",
+        "{} {} ({}) - {}, pipeline {}, write txid 0x{:x}",
         producer.model_name,
         producer.model_version,
         space,
         audit_grade,
         producer.pipeline_version,
-        producer.model_version,
         txid.0
     )
 }
@@ -428,9 +427,13 @@ fn executive_pdf_paragraph_includes_human_readable_producer_string() {
     let expected = raw_decision_producer_display(&db_path, decision.id, TEXT_SPACE);
 
     assert!(
-        expected.as_ref().is_some_and(|expected| rendered
+        expected
             .as_ref()
-            .is_ok_and(|paragraph| paragraph == expected && !paragraph.contains("vendor-decoy"))),
+            .is_some_and(|expected| rendered
+                .as_ref()
+                .is_ok_and(|paragraph| paragraph == expected
+                    && !paragraph.contains("vendor-decoy")
+                    && !paragraph.contains("produced "))),
         "executive paragraph must exactly render the persisted producer lineage from the decision's basis snapshot, not a later same-entity decoy observation, expected={expected:?}, rendered={rendered:?}"
     );
 }

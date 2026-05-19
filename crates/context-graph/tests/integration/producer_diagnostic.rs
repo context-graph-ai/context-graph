@@ -952,13 +952,12 @@ fn producer_display(space: &str, producer: &EvidenceProducer, txid: context_grap
         "consumer-claimed"
     };
     format!(
-        "{} {} ({}) - {}, pipeline {}, produced {} at txid 0x{:x}",
+        "{} {} ({}) - {}, pipeline {}, write txid 0x{:x}",
         producer.model_name,
         producer.model_version,
         space,
         audit_grade,
         producer.pipeline_version,
-        producer.model_version,
         txid.0
     )
 }
@@ -1366,6 +1365,9 @@ fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and
             && !first_party_expected.contains('\n')
             && !consumer_trait_expected.contains('\n')
             && !precomputed_expected.contains('\n')
+            && !first_party_expected.contains("produced ")
+            && !consumer_trait_expected.contains("produced ")
+            && !precomputed_expected.contains("produced ")
             && first_party_expected.matches(" - ").count() == 1
             && consumer_trait_expected.matches(" - ").count() == 1
             && precomputed_expected.matches(" - ").count() == 1
@@ -1378,7 +1380,7 @@ fn producer_metadata_display_format_uniform_across_cg_bundled_consumer_trait_and
             && precomputed_row
                 .as_ref()
                 .is_some_and(|row| row.space == TEXT_SPACE && row.producer.system == "customer"),
-        "producer display must reject one-tensor, stale-11-tensor, projection-only, and same-cardinality wrong-identity fake EmbeddingGemma caches with typed EmbedderModelCorrupt and production-render persisted space, audit grade, pipeline, produced version, and lowercase txid across actual bundled, consumer-trait, and precomputed ingest paths, one_tensor_row={one_tensor_row:?}, one_tensor_rendered={one_tensor_rendered:?}, one_tensor_error={one_tensor_error:?}, one_tensor_debug={one_tensor_debug}, stale_11_row={stale_11_row:?}, stale_11_rendered={stale_11_rendered:?}, stale_11_error={stale_11_error:?}, stale_11_debug={stale_11_debug}, projection_only_row={projection_only_row:?}, projection_only_rendered={projection_only_rendered:?}, projection_only_error={projection_only_error:?}, projection_only_debug={projection_only_debug}, wrong_identity_row={wrong_identity_row:?}, wrong_identity_rendered={wrong_identity_rendered:?}, wrong_identity_error={wrong_identity_error:?}, wrong_identity_debug={wrong_identity_debug}, expected_first={first_party_expected:?}, first_party_rendered={first_party_rendered:?}, first_party_debug={first_party_debug}, expected_consumer={consumer_trait_expected:?}, consumer_trait_rendered={consumer_trait_rendered:?}, consumer_debug={consumer_debug}, expected_precomputed={precomputed_expected:?}, precomputed_rendered={precomputed_rendered:?}"
+        "producer display must reject one-tensor, stale-11-tensor, projection-only, and same-cardinality wrong-identity fake EmbeddingGemma caches with typed EmbedderModelCorrupt and production-render persisted space, audit grade, pipeline, model version, and lowercase write txid across actual bundled, consumer-trait, and precomputed ingest paths without fabricating produced-at chronology from model_version, one_tensor_row={one_tensor_row:?}, one_tensor_rendered={one_tensor_rendered:?}, one_tensor_error={one_tensor_error:?}, one_tensor_debug={one_tensor_debug}, stale_11_row={stale_11_row:?}, stale_11_rendered={stale_11_rendered:?}, stale_11_error={stale_11_error:?}, stale_11_debug={stale_11_debug}, projection_only_row={projection_only_row:?}, projection_only_rendered={projection_only_rendered:?}, projection_only_error={projection_only_error:?}, projection_only_debug={projection_only_debug}, wrong_identity_row={wrong_identity_row:?}, wrong_identity_rendered={wrong_identity_rendered:?}, wrong_identity_error={wrong_identity_error:?}, wrong_identity_debug={wrong_identity_debug}, expected_first={first_party_expected:?}, first_party_rendered={first_party_rendered:?}, first_party_debug={first_party_debug}, expected_consumer={consumer_trait_expected:?}, consumer_trait_rendered={consumer_trait_rendered:?}, consumer_debug={consumer_debug}, expected_precomputed={precomputed_expected:?}, precomputed_rendered={precomputed_rendered:?}"
     );
 }
 
