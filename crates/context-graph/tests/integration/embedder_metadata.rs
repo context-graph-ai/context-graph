@@ -6,7 +6,7 @@ use chrono::Utc;
 use context_graph::embedder::Embedder;
 use context_graph::embedder::mock::MockEmbedder;
 use context_graph::{
-    CG_EDGE_SYSTEM_TAG, CreateContext, CreateEntity, EmbedderConfig, EmbedderRegistration,
+    CG_EDGE_SYSTEM_TAG, CgError, CreateContext, CreateEntity, EmbedderConfig, EmbedderRegistration,
     EmbeddingId, EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer,
     EvidenceRef, ModelSource, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store,
     StoreConfig,
@@ -25,6 +25,12 @@ const Q_PROJ_TENSOR: &str = "model.layers.0.self_attn.q_proj.weight";
 const K_PROJ_TENSOR: &str = "model.layers.0.self_attn.k_proj.weight";
 const V_PROJ_TENSOR: &str = "model.layers.0.self_attn.v_proj.weight";
 const O_PROJ_TENSOR: &str = "model.layers.0.self_attn.o_proj.weight";
+const Q_NORM_TENSOR: &str = "model.layers.0.self_attn.q_norm.weight";
+const K_NORM_TENSOR: &str = "model.layers.0.self_attn.k_norm.weight";
+const INPUT_LAYERNORM_TENSOR: &str = "model.layers.0.input_layernorm.weight";
+const PRE_FEEDFORWARD_LAYERNORM_TENSOR: &str = "model.layers.0.pre_feedforward_layernorm.weight";
+const POST_FEEDFORWARD_LAYERNORM_TENSOR: &str = "model.layers.0.post_feedforward_layernorm.weight";
+const POST_ATTENTION_LAYERNORM_TENSOR: &str = "model.layers.0.post_attention_layernorm.weight";
 const GATE_PROJ_TENSOR: &str = "model.layers.0.mlp.gate_proj.weight";
 const UP_PROJ_TENSOR: &str = "model.layers.0.mlp.up_proj.weight";
 const DOWN_PROJ_TENSOR: &str = "model.layers.0.mlp.down_proj.weight";
@@ -32,7 +38,29 @@ const FINAL_NORM_TENSOR: &str = "model.norm.weight";
 const TEXT_PROJECTION_UP_TENSOR: &str = "model.text_projection.up_proj.weight";
 const TEXT_PROJECTION_DOWN_TENSOR: &str = "model.text_projection.down_proj.weight";
 
-fn required_graph_tensors() -> [&'static str; 11] {
+fn required_graph_tensors() -> [&'static str; 17] {
+    [
+        TOKEN_EMBEDDING_TENSOR,
+        Q_PROJ_TENSOR,
+        K_PROJ_TENSOR,
+        V_PROJ_TENSOR,
+        O_PROJ_TENSOR,
+        Q_NORM_TENSOR,
+        K_NORM_TENSOR,
+        INPUT_LAYERNORM_TENSOR,
+        PRE_FEEDFORWARD_LAYERNORM_TENSOR,
+        POST_FEEDFORWARD_LAYERNORM_TENSOR,
+        POST_ATTENTION_LAYERNORM_TENSOR,
+        GATE_PROJ_TENSOR,
+        UP_PROJ_TENSOR,
+        DOWN_PROJ_TENSOR,
+        FINAL_NORM_TENSOR,
+        TEXT_PROJECTION_UP_TENSOR,
+        TEXT_PROJECTION_DOWN_TENSOR,
+    ]
+}
+
+fn stale_11_graph_tensors() -> [&'static str; 11] {
     [
         TOKEN_EMBEDDING_TENSOR,
         Q_PROJ_TENSOR,
@@ -46,6 +74,36 @@ fn required_graph_tensors() -> [&'static str; 11] {
         TEXT_PROJECTION_UP_TENSOR,
         TEXT_PROJECTION_DOWN_TENSOR,
     ]
+}
+
+fn wrong_identity_17_graph_tensors() -> [&'static str; 17] {
+    [
+        TOKEN_EMBEDDING_TENSOR,
+        Q_PROJ_TENSOR,
+        K_PROJ_TENSOR,
+        V_PROJ_TENSOR,
+        O_PROJ_TENSOR,
+        "model.layers.0.self_attn.q_norm.bias",
+        K_NORM_TENSOR,
+        INPUT_LAYERNORM_TENSOR,
+        PRE_FEEDFORWARD_LAYERNORM_TENSOR,
+        POST_FEEDFORWARD_LAYERNORM_TENSOR,
+        POST_ATTENTION_LAYERNORM_TENSOR,
+        GATE_PROJ_TENSOR,
+        UP_PROJ_TENSOR,
+        DOWN_PROJ_TENSOR,
+        FINAL_NORM_TENSOR,
+        TEXT_PROJECTION_UP_TENSOR,
+        TEXT_PROJECTION_DOWN_TENSOR,
+    ]
+}
+
+fn corrupt_model_error(error: &Option<CgError>) -> bool {
+    matches!(
+        error,
+        Some(CgError::EmbedderModelCorrupt { path })
+            if path.contains("embeddinggemma-300m") && !path.trim().is_empty()
+    )
 }
 
 fn tensor_bytes(values: &[f32]) -> Vec<u8> {
@@ -136,7 +194,7 @@ fn stage_one_tensor_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
     model_dir
 }
 
-fn stage_local_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
+fn stage_stale_11_tensor_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
     let model_dir = cache_dir.join("embeddinggemma-300m");
     std::fs::create_dir_all(&model_dir).expect("model dir");
     let seed = uuid::Uuid::now_v7().as_u128();
@@ -191,6 +249,230 @@ fn stage_local_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
             (K_PROJ_TENSOR, k_tensor),
             (V_PROJ_TENSOR, v_tensor),
             (O_PROJ_TENSOR, o_tensor),
+            (GATE_PROJ_TENSOR, gate_tensor),
+            (UP_PROJ_TENSOR, up_tensor),
+            (DOWN_PROJ_TENSOR, down_tensor),
+            (FINAL_NORM_TENSOR, final_norm_tensor),
+            (TEXT_PROJECTION_UP_TENSOR, text_projection_up_tensor),
+            (TEXT_PROJECTION_DOWN_TENSOR, text_projection_down_tensor),
+        ],
+        None,
+    )
+    .expect("safetensors");
+    std::fs::write(model_dir.join("model.safetensors"), model_bytes).expect("model");
+    write_tokenizer_and_revision(&model_dir, b"metadata-rev");
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::json!({
+            "model_type": "embeddinggemma",
+            "architectures": ["EmbeddingGemmaTextModel"],
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "intermediate_size": 8,
+            "projection_dim": 768,
+            "projection_intermediate_size": 8,
+            "matryoshka_dimensions": [768, 512, 256, 128],
+            "required_tensors": stale_11_graph_tensors(),
+        })
+        .to_string(),
+    )
+    .expect("config");
+    model_dir
+}
+
+fn stage_projection_only_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
+    let model_dir = cache_dir.join("embeddinggemma-300m");
+    std::fs::create_dir_all(&model_dir).expect("model dir");
+    let seed = uuid::Uuid::now_v7().as_u128();
+    let token_embedding = seeded_values(seed, 16, 1.0);
+    let text_projection_up = seeded_values(seed.rotate_left(1), 4 * 8, 0.2);
+    let text_projection_down = seeded_values(seed.reverse_bits(), 8 * 768, 0.2);
+
+    let token_embedding_bytes = tensor_bytes(&token_embedding);
+    let text_projection_up_bytes = tensor_bytes(&text_projection_up);
+    let text_projection_down_bytes = tensor_bytes(&text_projection_down);
+
+    let token_tensor =
+        TensorView::new(Dtype::F32, vec![4, 4], &token_embedding_bytes).expect("token tensor");
+    let text_projection_up_tensor =
+        TensorView::new(Dtype::F32, vec![4, 8], &text_projection_up_bytes)
+            .expect("projection up tensor");
+    let text_projection_down_tensor =
+        TensorView::new(Dtype::F32, vec![8, 768], &text_projection_down_bytes)
+            .expect("projection down tensor");
+
+    let model_bytes = safetensors::tensor::serialize(
+        [
+            (TOKEN_EMBEDDING_TENSOR, token_tensor),
+            (TEXT_PROJECTION_UP_TENSOR, text_projection_up_tensor),
+            (TEXT_PROJECTION_DOWN_TENSOR, text_projection_down_tensor),
+        ],
+        None,
+    )
+    .expect("safetensors");
+    std::fs::write(model_dir.join("model.safetensors"), model_bytes).expect("model");
+    write_tokenizer_and_revision(&model_dir, b"metadata-rev");
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::json!({
+            "model_type": "embeddinggemma",
+            "architectures": ["EmbeddingGemmaTextModel"],
+            "hidden_size": 4,
+            "projection_dim": 768,
+            "projection_intermediate_size": 8,
+            "matryoshka_dimensions": [768, 512, 256, 128],
+            "required_tensors": [
+                TOKEN_EMBEDDING_TENSOR,
+                TEXT_PROJECTION_UP_TENSOR,
+                TEXT_PROJECTION_DOWN_TENSOR
+            ],
+        })
+        .to_string(),
+    )
+    .expect("config");
+    model_dir
+}
+
+fn stage_wrong_identity_17_tensor_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
+    let model_dir = cache_dir.join("embeddinggemma-300m");
+    std::fs::create_dir_all(&model_dir).expect("model dir");
+    let seed = uuid::Uuid::now_v7().as_u128();
+    let tensor_names = wrong_identity_17_graph_tensors();
+    let tensor_values = tensor_names
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| tensor_bytes(&seeded_values(seed.rotate_left((idx as u32) + 1), 4, 0.1)))
+        .collect::<Vec<_>>();
+    let tensor_views = tensor_names
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            (
+                *name,
+                TensorView::new(Dtype::F32, vec![4], &tensor_values[idx])
+                    .expect("wrong identity tensor"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let model_bytes = safetensors::tensor::serialize(tensor_views, None).expect("safetensors");
+    std::fs::write(model_dir.join("model.safetensors"), model_bytes).expect("model");
+    write_tokenizer_and_revision(&model_dir, b"metadata-rev");
+    std::fs::write(
+        model_dir.join("config.json"),
+        serde_json::json!({
+            "model_type": "embeddinggemma",
+            "architectures": ["EmbeddingGemmaTextModel"],
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "intermediate_size": 8,
+            "projection_dim": 768,
+            "projection_intermediate_size": 8,
+            "matryoshka_dimensions": [768, 512, 256, 128],
+            "required_tensors": required_graph_tensors(),
+        })
+        .to_string(),
+    )
+    .expect("config");
+    model_dir
+}
+
+fn stage_local_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
+    let model_dir = cache_dir.join("embeddinggemma-300m");
+    std::fs::create_dir_all(&model_dir).expect("model dir");
+    let seed = uuid::Uuid::now_v7().as_u128();
+    let token_embedding = seeded_values(seed, 16, 1.0);
+    let q_proj = seeded_values(seed.rotate_left(1), 4 * 4, 0.2);
+    let k_proj = seeded_values(seed.rotate_left(2), 4 * 4, 0.2);
+    let v_proj = seeded_values(seed.rotate_left(3), 4 * 4, 0.2);
+    let o_proj = seeded_values(seed.rotate_left(4), 4 * 4, 0.2);
+    let q_norm = seeded_values(seed.rotate_left(5), 4, 0.05);
+    let k_norm = seeded_values(seed.rotate_left(6), 4, 0.05);
+    let input_layernorm = seeded_values(seed.rotate_left(7), 4, 0.05);
+    let pre_feedforward_layernorm = seeded_values(seed.rotate_left(8), 4, 0.05);
+    let post_feedforward_layernorm = seeded_values(seed.rotate_left(9), 4, 0.05);
+    let post_attention_layernorm = seeded_values(seed.rotate_left(10), 4, 0.05);
+    let gate_proj = seeded_values(seed.rotate_left(11), 4 * 8, 0.15);
+    let up_proj = seeded_values(seed.rotate_left(12), 4 * 8, 0.15);
+    let down_proj = seeded_values(seed.rotate_left(13), 8 * 4, 0.15);
+    let final_norm = seeded_values(seed.rotate_left(14), 4, 0.5);
+    let text_projection_up = seeded_values(seed.rotate_left(15), 4 * 8, 0.2);
+    let text_projection_down = seeded_values(seed.reverse_bits(), 8 * 768, 0.2);
+
+    let token_embedding_bytes = tensor_bytes(&token_embedding);
+    let q_proj_bytes = tensor_bytes(&q_proj);
+    let k_proj_bytes = tensor_bytes(&k_proj);
+    let v_proj_bytes = tensor_bytes(&v_proj);
+    let o_proj_bytes = tensor_bytes(&o_proj);
+    let q_norm_bytes = tensor_bytes(&q_norm);
+    let k_norm_bytes = tensor_bytes(&k_norm);
+    let input_layernorm_bytes = tensor_bytes(&input_layernorm);
+    let pre_feedforward_layernorm_bytes = tensor_bytes(&pre_feedforward_layernorm);
+    let post_feedforward_layernorm_bytes = tensor_bytes(&post_feedforward_layernorm);
+    let post_attention_layernorm_bytes = tensor_bytes(&post_attention_layernorm);
+    let gate_proj_bytes = tensor_bytes(&gate_proj);
+    let up_proj_bytes = tensor_bytes(&up_proj);
+    let down_proj_bytes = tensor_bytes(&down_proj);
+    let final_norm_bytes = tensor_bytes(&final_norm);
+    let text_projection_up_bytes = tensor_bytes(&text_projection_up);
+    let text_projection_down_bytes = tensor_bytes(&text_projection_down);
+
+    let token_tensor =
+        TensorView::new(Dtype::F32, vec![4, 4], &token_embedding_bytes).expect("token tensor");
+    let q_tensor = TensorView::new(Dtype::F32, vec![4, 4], &q_proj_bytes).expect("q tensor");
+    let k_tensor = TensorView::new(Dtype::F32, vec![4, 4], &k_proj_bytes).expect("k tensor");
+    let v_tensor = TensorView::new(Dtype::F32, vec![4, 4], &v_proj_bytes).expect("v tensor");
+    let o_tensor = TensorView::new(Dtype::F32, vec![4, 4], &o_proj_bytes).expect("o tensor");
+    let q_norm_tensor = TensorView::new(Dtype::F32, vec![4], &q_norm_bytes).expect("q norm tensor");
+    let k_norm_tensor = TensorView::new(Dtype::F32, vec![4], &k_norm_bytes).expect("k norm tensor");
+    let input_layernorm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &input_layernorm_bytes).expect("input norm tensor");
+    let pre_feedforward_layernorm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &pre_feedforward_layernorm_bytes)
+            .expect("pre feedforward norm tensor");
+    let post_feedforward_layernorm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &post_feedforward_layernorm_bytes)
+            .expect("post feedforward norm tensor");
+    let post_attention_layernorm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &post_attention_layernorm_bytes)
+            .expect("post attention norm tensor");
+    let gate_tensor =
+        TensorView::new(Dtype::F32, vec![4, 8], &gate_proj_bytes).expect("gate tensor");
+    let up_tensor = TensorView::new(Dtype::F32, vec![4, 8], &up_proj_bytes).expect("up tensor");
+    let down_tensor =
+        TensorView::new(Dtype::F32, vec![8, 4], &down_proj_bytes).expect("down tensor");
+    let final_norm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &final_norm_bytes).expect("norm tensor");
+    let text_projection_up_tensor =
+        TensorView::new(Dtype::F32, vec![4, 8], &text_projection_up_bytes)
+            .expect("projection up tensor");
+    let text_projection_down_tensor =
+        TensorView::new(Dtype::F32, vec![8, 768], &text_projection_down_bytes)
+            .expect("projection down tensor");
+
+    let model_bytes = safetensors::tensor::serialize(
+        [
+            (TOKEN_EMBEDDING_TENSOR, token_tensor),
+            (Q_PROJ_TENSOR, q_tensor),
+            (K_PROJ_TENSOR, k_tensor),
+            (V_PROJ_TENSOR, v_tensor),
+            (O_PROJ_TENSOR, o_tensor),
+            (Q_NORM_TENSOR, q_norm_tensor),
+            (K_NORM_TENSOR, k_norm_tensor),
+            (INPUT_LAYERNORM_TENSOR, input_layernorm_tensor),
+            (
+                PRE_FEEDFORWARD_LAYERNORM_TENSOR,
+                pre_feedforward_layernorm_tensor,
+            ),
+            (
+                POST_FEEDFORWARD_LAYERNORM_TENSOR,
+                post_feedforward_layernorm_tensor,
+            ),
+            (
+                POST_ATTENTION_LAYERNORM_TENSOR,
+                post_attention_layernorm_tensor,
+            ),
             (GATE_PROJ_TENSOR, gate_tensor),
             (UP_PROJ_TENSOR, up_tensor),
             (DOWN_PROJ_TENSOR, down_tensor),
@@ -412,7 +694,7 @@ fn auto_path_projection(
     name: &str,
     config: StoreConfig,
     registrations: Vec<EmbedderRegistration>,
-) -> (Option<ProducerProjection>, String) {
+) -> (Option<ProducerProjection>, Option<CgError>, String) {
     let store = if registrations.is_empty() {
         Store::open(config)
     } else {
@@ -420,7 +702,10 @@ fn auto_path_projection(
     };
     let store = match store {
         Ok(store) => store,
-        Err(error) => return (None, format!("open={error:?}")),
+        Err(error) => {
+            let debug = format!("open={error:?}");
+            return (None, Some(error), debug);
+        }
     };
     let context = match store.create_context(CreateContext {
         name: format!("{name}-{}", uuid::Uuid::now_v7()),
@@ -428,7 +713,10 @@ fn auto_path_projection(
         properties: BTreeMap::new(),
     }) {
         Ok(context) => context,
-        Err(error) => return (None, format!("context={error:?}")),
+        Err(error) => {
+            let debug = format!("context={error:?}");
+            return (None, Some(error), debug);
+        }
     };
     let entity = match store.create_entity(CreateEntity {
         entity_type: EntityType::Service,
@@ -438,7 +726,10 @@ fn auto_path_projection(
         context_id: context.id,
     }) {
         Ok(entity) => entity,
-        Err(error) => return (None, format!("entity={error:?}")),
+        Err(error) => {
+            let debug = format!("entity={error:?}");
+            return (None, Some(error), debug);
+        }
     };
     let db_path = store.db_path().to_path_buf();
     let (evidence_id, result) = record_auto_text(&store, context.id, entity.id, name);
@@ -446,11 +737,13 @@ fn auto_path_projection(
         .as_ref()
         .map(|output| output.embedding_ids.clone())
         .unwrap_or_default();
+    let error = result.as_ref().err().cloned();
     drop(store);
     let db = Database::open(&db_path).expect("raw auto-path db");
     let projection = producer_projection_by_target(&db, evidence_id);
     (
         projection,
+        error,
         format!("record={result:?}, output_embedding_ids={output_ids:?}"),
     )
 }
@@ -592,11 +885,63 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
         )),
         ..Default::default()
     };
-    let (one_tensor_projection, one_tensor_debug) = auto_path_projection(
+    let (one_tensor_projection, one_tensor_error, one_tensor_debug) = auto_path_projection(
         "metadata-one-tensor-rejected",
         one_tensor_config,
         Vec::new(),
     );
+
+    let stale_11_dir = tempfile::tempdir().expect("stale 11 tensor dir");
+    let stale_11_model = stage_stale_11_tensor_embeddinggemma_cache(stale_11_dir.path());
+    let stale_11_config = StoreConfig {
+        db_path: stale_11_dir.path().join("stale-11-tensor.db"),
+        default_text_embedder: Some(bundled_config(
+            stale_11_model,
+            stale_11_dir.path().to_path_buf(),
+        )),
+        ..Default::default()
+    };
+    let (stale_11_projection, stale_11_error, stale_11_debug) = auto_path_projection(
+        "metadata-stale-11-tensor-rejected",
+        stale_11_config,
+        Vec::new(),
+    );
+
+    let projection_only_dir = tempfile::tempdir().expect("projection only dir");
+    let projection_only_model =
+        stage_projection_only_embeddinggemma_cache(projection_only_dir.path());
+    let projection_only_config = StoreConfig {
+        db_path: projection_only_dir.path().join("projection-only.db"),
+        default_text_embedder: Some(bundled_config(
+            projection_only_model,
+            projection_only_dir.path().to_path_buf(),
+        )),
+        ..Default::default()
+    };
+    let (projection_only_projection, projection_only_error, projection_only_debug) =
+        auto_path_projection(
+            "metadata-projection-only-rejected",
+            projection_only_config,
+            Vec::new(),
+        );
+
+    let wrong_identity_dir = tempfile::tempdir().expect("wrong identity dir");
+    let wrong_identity_model =
+        stage_wrong_identity_17_tensor_embeddinggemma_cache(wrong_identity_dir.path());
+    let wrong_identity_config = StoreConfig {
+        db_path: wrong_identity_dir.path().join("wrong-identity-17.db"),
+        default_text_embedder: Some(bundled_config(
+            wrong_identity_model,
+            wrong_identity_dir.path().to_path_buf(),
+        )),
+        ..Default::default()
+    };
+    let (wrong_identity_projection, wrong_identity_error, wrong_identity_debug) =
+        auto_path_projection(
+            "metadata-wrong-identity-17-rejected",
+            wrong_identity_config,
+            Vec::new(),
+        );
 
     let bundled_dir = tempfile::tempdir().expect("bundled dir");
     let bundled_model = stage_local_embeddinggemma_cache(bundled_dir.path());
@@ -608,7 +953,7 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
         )),
         ..Default::default()
     };
-    let (bundled, bundled_debug) =
+    let (bundled, _bundled_error, bundled_debug) =
         auto_path_projection("metadata-bundled", bundled_config, Vec::new());
 
     let consumer_dir = tempfile::tempdir().expect("consumer dir");
@@ -620,7 +965,7 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
         extra_embedding_spaces: vec![registered_space.clone()],
         ..Default::default()
     };
-    let (consumer_trait, consumer_debug) = auto_path_projection(
+    let (consumer_trait, _consumer_error, consumer_debug) = auto_path_projection(
         "metadata-consumer-trait",
         consumer_config,
         vec![EmbedderRegistration {
@@ -681,7 +1026,13 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
 
     assert!(
         one_tensor_projection.is_none()
-            && one_tensor_debug.contains("EmbedderModelCorrupt")
+            && corrupt_model_error(&one_tensor_error)
+            && stale_11_projection.is_none()
+            && corrupt_model_error(&stale_11_error)
+            && projection_only_projection.is_none()
+            && corrupt_model_error(&projection_only_error)
+            && wrong_identity_projection.is_none()
+            && corrupt_model_error(&wrong_identity_error)
             && bundled
                 .as_ref()
                 .is_some_and(|projection| projection.space == TEXT_SPACE)
@@ -706,6 +1057,6 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
                 .producer_json
                 .as_object()
                 .is_some_and(|object| object.contains_key("producer_kind"))),
-        "all producer paths must reject one-tensor fake EmbeddingGemma caches and land real producer rows with one uniform JSON schema, one_tensor_projection={one_tensor_projection:?}, one_tensor_debug={one_tensor_debug}, bundled={bundled:?}, bundled_schema={bundled_schema:?}, bundled_debug={bundled_debug}, consumer_trait={consumer_trait:?}, consumer_schema={consumer_schema:?}, consumer_debug={consumer_debug}, precomputed={precomputed:?}, precomputed_schema={precomputed_schema:?}, precomputed_result={precomputed_result:?}"
+        "all producer paths must reject one-tensor, stale-11-tensor, projection-only, and same-cardinality wrong-identity fake EmbeddingGemma caches with typed EmbedderModelCorrupt and land real producer rows with one uniform JSON schema, one_tensor_projection={one_tensor_projection:?}, one_tensor_error={one_tensor_error:?}, one_tensor_debug={one_tensor_debug}, stale_11_projection={stale_11_projection:?}, stale_11_error={stale_11_error:?}, stale_11_debug={stale_11_debug}, projection_only_projection={projection_only_projection:?}, projection_only_error={projection_only_error:?}, projection_only_debug={projection_only_debug}, wrong_identity_projection={wrong_identity_projection:?}, wrong_identity_error={wrong_identity_error:?}, wrong_identity_debug={wrong_identity_debug}, bundled={bundled:?}, bundled_schema={bundled_schema:?}, bundled_debug={bundled_debug}, consumer_trait={consumer_trait:?}, consumer_schema={consumer_schema:?}, consumer_debug={consumer_debug}, precomputed={precomputed:?}, precomputed_schema={precomputed_schema:?}, precomputed_result={precomputed_result:?}"
     );
 }
