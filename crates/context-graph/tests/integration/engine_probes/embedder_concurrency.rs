@@ -1303,15 +1303,34 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
     let embedding_id = EmbeddingId::new_v7();
     let first_evidence = EvidenceId::new_v7();
     let second_evidence = EvidenceId::new_v7();
+    let second_entity = fixture
+        .store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Person,
+            name: "probe entity duplicate-handle peer".to_string(),
+            properties: BTreeMap::new(),
+            tags: Vec::new(),
+            context_id: fixture.context_id,
+        })
+        .expect("second entity");
     let barrier = Arc::new(Barrier::new(3));
-    let writes = [(first_evidence, 0), (second_evidence, 1)];
+    let first_entity_id = fixture.entity_id;
+    let second_entity_id = second_entity.id;
+    let writes = [
+        (first_evidence, first_entity_id, 0),
+        (second_evidence, second_entity_id, 1),
+    ];
     let context_params = params(vec![(
         "context_id",
         Value::Uuid(fixture.context_id.as_uuid()),
     )]);
-    let entity_params = params(vec![
+    let first_entity_params = params(vec![
         ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-        ("entity_id", Value::Uuid(fixture.entity_id.as_uuid())),
+        ("entity_id", Value::Uuid(first_entity_id.as_uuid())),
+    ]);
+    let second_entity_params = params(vec![
+        ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+        ("entity_id", Value::Uuid(second_entity_id.as_uuid())),
     ]);
     let pre_observation_rows = store_count(
         &fixture.store,
@@ -1320,29 +1339,48 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
     );
     let pre_snapshot_rows = store_count(
         &fixture.store,
+        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id",
+        &context_params,
+    );
+    let pre_first_snapshot_rows = store_count(
+        &fixture.store,
         "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
-        &entity_params,
+        &first_entity_params,
+    );
+    let pre_second_snapshot_rows = store_count(
+        &fixture.store,
+        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
+        &second_entity_params,
     );
     let pre_snapshot_observation_rows = store_count(
         &fixture.store,
+        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id",
+        &context_params,
+    );
+    let pre_first_snapshot_observation_rows = store_count(
+        &fixture.store,
         "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
-        &entity_params,
+        &first_entity_params,
+    );
+    let pre_second_snapshot_observation_rows = store_count(
+        &fixture.store,
+        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
+        &second_entity_params,
     );
     let fixture_context_id = fixture.context_id;
     staging_probe.arm(DuplicateHandleTarget {
         embedding_id,
         writes: writes
             .iter()
-            .map(|(evidence_id, axis)| (*evidence_id, text_vector(*axis)))
+            .map(|(evidence_id, _, axis)| (*evidence_id, text_vector(*axis)))
             .collect(),
     });
     let handles = writes
         .into_iter()
-        .map(|(evidence_id, axis)| {
+        .map(|(evidence_id, entity_id, axis)| {
             let writer = fixture.store.clone();
             let barrier = Arc::clone(&barrier);
             let context_id = fixture.context_id;
-            let entity_id = fixture.entity_id;
             thread::spawn(move || {
                 barrier.wait();
                 record_text_embedding_with_state_delta(
@@ -1398,18 +1436,68 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
     );
     let snapshot_rows = count(
         &db,
+        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id",
+        &context_params,
+    );
+    let first_snapshot_rows = count(
+        &db,
         "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
-        &entity_params,
+        &first_entity_params,
+    );
+    let second_snapshot_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
+        &second_entity_params,
     );
     let snapshot_observation_rows = count(
         &db,
+        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id",
+        &context_params,
+    );
+    let first_snapshot_observation_rows = count(
+        &db,
         "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
-        &entity_params,
+        &first_entity_params,
+    );
+    let second_snapshot_observation_rows = count(
+        &db,
+        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
+        &second_entity_params,
     );
     let successful_evidence_id = results
         .iter()
         .find_map(|result| result.as_ref().ok())
         .and_then(|result| result.evidence_ids.first().copied());
+    let winner_durable_identity = match successful_evidence_id {
+        Some(id) if id == first_evidence => {
+            first_evidence_rows == 1
+                && first_handle_rows == 1
+                && second_evidence_rows == 0
+                && second_handle_rows == 0
+        }
+        Some(id) if id == second_evidence => {
+            second_evidence_rows == 1
+                && second_handle_rows == 1
+                && first_evidence_rows == 0
+                && first_handle_rows == 0
+        }
+        _ => false,
+    };
+    let winner_entity_progress = match successful_evidence_id {
+        Some(id) if id == first_evidence => {
+            first_snapshot_rows == pre_first_snapshot_rows + 1
+                && first_snapshot_observation_rows == pre_first_snapshot_observation_rows + 1
+                && second_snapshot_rows == pre_second_snapshot_rows
+                && second_snapshot_observation_rows == pre_second_snapshot_observation_rows
+        }
+        Some(id) if id == second_evidence => {
+            second_snapshot_rows == pre_second_snapshot_rows + 1
+                && second_snapshot_observation_rows == pre_second_snapshot_observation_rows + 1
+                && first_snapshot_rows == pre_first_snapshot_rows
+                && first_snapshot_observation_rows == pre_first_snapshot_observation_rows
+        }
+        _ => false,
+    };
     let store_evidence_insert_query_count = staging_probe.evidence_insert_query_count();
     let store_handle_insert_query_count = staging_probe.handle_insert_query_count();
     let store_concurrent_writer_reached_handle_sql =
@@ -1490,10 +1578,12 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
             && observation_rows == pre_observation_rows + 1
             && snapshot_rows == pre_snapshot_rows + 1
             && snapshot_observation_rows == pre_snapshot_observation_rows + 1
+            && winner_entity_progress
             && successful_evidence_id.is_some()
             && raw_duplicate_id_rejected
             && variant_handles_after_raw_duplicate == 1
             && loser_evidence_id.is_some()
+            && winner_durable_identity
             && successful_staged_full_write
             && failed_staged_full_write
             && successful_reachable
@@ -1504,7 +1594,7 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
             && store_handle_insert_query_count == 2
             && store_concurrent_writer_reached_handle_sql
             && duration.as_millis() >= 1,
-        "duplicate embedding handle under contention must surface the exact engine unique violation, stage the successful observation/evidence/snapshot/handle/vector write in one tx, expose the losing failed WriteSet with the exact observation/evidence/snapshot/handle/vector write and structured UniqueViolation before pre_commit, and roll back the losing write without committed-row or raw-vector leaks while the second Store writer reaches the contended handle SQL before the first commit returns; raw Database duplicate id insert must also fail through the durable contextdb constraint; results={results:?}, variant_handles={variant_handles}, raw_duplicate_handle_insert={raw_duplicate_handle_insert:?}, raw_duplicate_id_rejected={raw_duplicate_id_rejected}, variant_handles_after_raw_duplicate={variant_handles_after_raw_duplicate}, first_evidence_rows={first_evidence_rows}, second_evidence_rows={second_evidence_rows}, first_handle_rows={first_handle_rows}, second_handle_rows={second_handle_rows}, observation_rows={observation_rows}, pre_observation_rows={pre_observation_rows}, snapshot_rows={snapshot_rows}, pre_snapshot_rows={pre_snapshot_rows}, snapshot_observation_rows={snapshot_observation_rows}, pre_snapshot_observation_rows={pre_snapshot_observation_rows}, first_hit={first_hit:?}, second_hit={second_hit:?}, successful_evidence_id={successful_evidence_id:?}, loser_evidence_id={loser_evidence_id:?}, successful_staged_full_write={successful_staged_full_write}, failed_staged_full_write={failed_staged_full_write}, loser_precommit_observed={loser_precommit_observed}, observed_staged_writes={observed_staged_writes:?}, successful_reachable={successful_reachable}, loser_mapped_to_committed_evidence={loser_mapped_to_committed_evidence}, loser_orphan_vector_leaked={loser_orphan_vector_leaked}, store_evidence_insert_query_count={store_evidence_insert_query_count}, store_handle_insert_query_count={store_handle_insert_query_count}, store_concurrent_writer_reached_handle_sql={store_concurrent_writer_reached_handle_sql}, duration={duration:?}"
+        "duplicate embedding handle under contention must surface the exact engine unique violation, stage the successful observation/evidence/snapshot/handle/vector write in one tx, expose the losing failed WriteSet with the exact observation/evidence/snapshot/handle/vector write and structured UniqueViolation before pre_commit, commit durable evidence/handle/snapshot lineage only for the winning entity, and roll back the losing write without committed-row or raw-vector leaks while the second Store writer reaches the contended handle SQL before the first commit returns; raw Database duplicate id insert must also fail through the durable contextdb constraint; results={results:?}, variant_handles={variant_handles}, raw_duplicate_handle_insert={raw_duplicate_handle_insert:?}, raw_duplicate_id_rejected={raw_duplicate_id_rejected}, variant_handles_after_raw_duplicate={variant_handles_after_raw_duplicate}, first_evidence_rows={first_evidence_rows}, second_evidence_rows={second_evidence_rows}, first_handle_rows={first_handle_rows}, second_handle_rows={second_handle_rows}, winner_durable_identity={winner_durable_identity}, observation_rows={observation_rows}, pre_observation_rows={pre_observation_rows}, snapshot_rows={snapshot_rows}, pre_snapshot_rows={pre_snapshot_rows}, first_snapshot_rows={first_snapshot_rows}, pre_first_snapshot_rows={pre_first_snapshot_rows}, second_snapshot_rows={second_snapshot_rows}, pre_second_snapshot_rows={pre_second_snapshot_rows}, snapshot_observation_rows={snapshot_observation_rows}, pre_snapshot_observation_rows={pre_snapshot_observation_rows}, first_snapshot_observation_rows={first_snapshot_observation_rows}, pre_first_snapshot_observation_rows={pre_first_snapshot_observation_rows}, second_snapshot_observation_rows={second_snapshot_observation_rows}, pre_second_snapshot_observation_rows={pre_second_snapshot_observation_rows}, winner_entity_progress={winner_entity_progress}, first_hit={first_hit:?}, second_hit={second_hit:?}, successful_evidence_id={successful_evidence_id:?}, loser_evidence_id={loser_evidence_id:?}, successful_staged_full_write={successful_staged_full_write}, failed_staged_full_write={failed_staged_full_write}, loser_precommit_observed={loser_precommit_observed}, observed_staged_writes={observed_staged_writes:?}, successful_reachable={successful_reachable}, loser_mapped_to_committed_evidence={loser_mapped_to_committed_evidence}, loser_orphan_vector_leaked={loser_orphan_vector_leaked}, store_evidence_insert_query_count={store_evidence_insert_query_count}, store_handle_insert_query_count={store_handle_insert_query_count}, store_concurrent_writer_reached_handle_sql={store_concurrent_writer_reached_handle_sql}, duration={duration:?}"
     );
 }
 
