@@ -1,9 +1,26 @@
 use std::collections::BTreeMap;
+#[cfg(context_graph_internal_test_support)]
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+#[cfg(context_graph_internal_test_support)]
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use context_graph::{
     CgError, CreateContext, CreateEntity, DistanceMetric, EmbeddingId, EmbeddingSpaceDecl,
     EntityId, EntityType, EvidenceKind, EvidenceProducer, Store, StoreConfig,
 };
+#[cfg(context_graph_internal_test_support)]
+use contextdb_core::{Error as EngineError, RowId, Value, VectorIndexRef};
+#[cfg(context_graph_internal_test_support)]
+use contextdb_engine::{
+    Database,
+    plugin::{CommitSource, DatabasePlugin},
+};
+#[cfg(context_graph_internal_test_support)]
+use contextdb_tx::WriteSet;
 
 const FACE_REFERENCE_SPACE: &str = "face_reference_v1";
 
@@ -13,14 +30,14 @@ fn store() -> Store {
 
 struct Fixture {
     _dir: tempfile::TempDir,
+    #[cfg(context_graph_internal_test_support)]
+    db_path: PathBuf,
     store: Store,
 }
 
-fn fixture(name: &str) -> Fixture {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join(format!("{name}.db"));
-    let store = Store::open(StoreConfig {
-        db_path: db_path.clone(),
+fn store_config(db_path: PathBuf) -> StoreConfig {
+    StoreConfig {
+        db_path,
         extra_embedding_spaces: vec![EmbeddingSpaceDecl {
             embedding_space_id: FACE_REFERENCE_SPACE.to_string(),
             dimension: 512,
@@ -33,9 +50,223 @@ fn fixture(name: &str) -> Fixture {
             bindings: Vec::new(),
         }],
         ..Default::default()
+    }
+}
+
+fn fixture(name: &str) -> Fixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join(format!("{name}.db"));
+    let store = Store::open(store_config(db_path.clone())).expect("open");
+    Fixture {
+        _dir: dir,
+        #[cfg(context_graph_internal_test_support)]
+        db_path,
+        store,
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn fixture_with_database_plugin(name: &str, plugin: Arc<dyn DatabasePlugin>) -> Fixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join(format!("{name}.db"));
+    let store = Store::open_with_database_plugin(store_config(db_path.clone()), plugin)
+        .expect("open with plugin");
+    Fixture {
+        _dir: dir,
+        #[cfg(context_graph_internal_test_support)]
+        db_path,
+        store,
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+#[derive(Default)]
+struct EntityReferenceFkProbe {
+    target: Mutex<Option<EntityReferenceFkTarget>>,
+    saw_failed_engine_fk_write: AtomicBool,
+}
+
+#[cfg(context_graph_internal_test_support)]
+#[derive(Clone)]
+struct EntityReferenceFkTarget {
+    entity_id: uuid::Uuid,
+    context_id: uuid::Uuid,
+    vector: Vec<f32>,
+}
+
+#[cfg(context_graph_internal_test_support)]
+impl EntityReferenceFkProbe {
+    fn arm(&self, entity_id: uuid::Uuid, context_id: uuid::Uuid, vector: Vec<f32>) {
+        *self.target.lock().expect("target") = Some(EntityReferenceFkTarget {
+            entity_id,
+            context_id,
+            vector,
+        });
+        self.saw_failed_engine_fk_write
+            .store(false, Ordering::SeqCst);
+    }
+
+    fn saw_engine_fk_path(&self) -> bool {
+        self.saw_failed_engine_fk_write.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+impl DatabasePlugin for EntityReferenceFkProbe {
+    fn commit_failed(&self, ws: &WriteSet, source: CommitSource, error: &EngineError) {
+        let Some(target) = self.target.lock().expect("target").clone() else {
+            return;
+        };
+        let reference_row = write_set_row_for_entity_reference(ws, &target);
+        let handle_row = write_set_handle_for_entity_reference(ws, &target);
+        let reference_vector_tx = reference_row.and_then(|row_id| {
+            write_set_vector_tx(
+                ws,
+                row_id,
+                "entity_reference_embeddings_512",
+                "vector",
+                &target.vector,
+            )
+        });
+        let txs = [
+            reference_row.and_then(|row_id| write_set_row_tx(ws, row_id)),
+            handle_row.and_then(|row_id| write_set_row_tx(ws, row_id)),
+            reference_vector_tx,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+        if reference_row.is_some()
+            && handle_row.is_some()
+            && reference_vector_tx.is_some()
+            && txs.len() == 1
+            && source == CommitSource::User
+            && entity_reference_fk_error(error)
+        {
+            self.saw_failed_engine_fk_write
+                .store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn entity_reference_fk_error(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::ForeignKeyViolation {
+            child_table,
+            child_columns,
+            parent_table,
+            ..
+        } if parent_table == "entities"
+            && (child_table == "entity_reference_embeddings_512"
+                || child_table == "entity_reference_embedding_handles")
+            && child_columns.iter().any(|column| column == "context_id")
+            && child_columns.iter().any(|column| column == "entity_id" || column == "target_id")
+    )
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn write_set_row_for_entity_reference(
+    ws: &WriteSet,
+    target: &EntityReferenceFkTarget,
+) -> Option<RowId> {
+    ws.relational_inserts
+        .iter()
+        .filter(|(table_name, _)| table_name == "entity_reference_embeddings_512")
+        .find_map(|(_, row)| {
+            (row.values.get("entity_id") == Some(&Value::Uuid(target.entity_id))
+                && row.values.get("context_id") == Some(&Value::Uuid(target.context_id))
+                && row.values.get("embedding_space_id")
+                    == Some(&Value::Text(FACE_REFERENCE_SPACE.to_string())))
+            .then_some(row.row_id)
+        })
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn write_set_handle_for_entity_reference(
+    ws: &WriteSet,
+    target: &EntityReferenceFkTarget,
+) -> Option<RowId> {
+    ws.relational_inserts
+        .iter()
+        .filter(|(table_name, _)| table_name == "entity_reference_embedding_handles")
+        .find_map(|(_, row)| {
+            (row.values.get("target_id") == Some(&Value::Uuid(target.entity_id))
+                && row.values.get("context_id") == Some(&Value::Uuid(target.context_id))
+                && row.values.get("embedding_space_id")
+                    == Some(&Value::Text(FACE_REFERENCE_SPACE.to_string())))
+            .then_some(row.row_id)
+        })
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn write_set_row_tx(ws: &WriteSet, row_id: RowId) -> Option<u64> {
+    ws.relational_inserts
+        .iter()
+        .find_map(|(_, row)| (row.row_id == row_id).then_some(row.created_tx.0))
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn write_set_vector_tx(
+    ws: &WriteSet,
+    row_id: RowId,
+    table: &str,
+    column: &str,
+    vector: &[f32],
+) -> Option<u64> {
+    ws.vector_inserts.iter().find_map(|entry| {
+        (entry.row_id == row_id
+            && entry.index.table == table
+            && entry.index.column == column
+            && entry.vector == vector)
+            .then_some(entry.created_tx.0)
     })
-    .expect("open");
-    Fixture { _dir: dir, store }
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn count_from_store(
+    store: &Store,
+    sql: &str,
+    params: &std::collections::HashMap<String, Value>,
+) -> i64 {
+    let result = store
+        .execute_sql_for_test(sql, params)
+        .expect("count query");
+    assert_eq!(result.rows.len(), 1);
+    assert!(
+        matches!(result.rows[0].first(), Some(Value::Int64(_))),
+        "expected count integer, got {:?}",
+        result.rows[0].first()
+    );
+    match result.rows[0][0] {
+        Value::Int64(value) => value,
+        _ => 0,
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn params(pairs: Vec<(&str, Value)>) -> std::collections::HashMap<String, Value> {
+    pairs
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn leaked_entity_reference_vector_count(db_path: &PathBuf, vector: &[f32]) -> usize {
+    let db = Database::open(db_path).expect("raw database open");
+    db.query_vector(
+        VectorIndexRef::new("entity_reference_embeddings_512", "vector"),
+        vector,
+        10,
+        None,
+        db.snapshot(),
+    )
+    .expect("raw entity reference vector query")
+    .into_iter()
+    .filter(|(_, score)| *score > 0.99)
+    .count()
 }
 
 fn seed_entity(store: &Store, name: &str) -> context_graph::Entity {
@@ -121,22 +352,89 @@ fn entity_reference_enrollment_dimension_validated_against_space_at_write_time()
 
 #[test]
 fn entity_reference_enrollment_for_unknown_entity_id_rejected_with_typed_fk_error() {
-    let result = store().enroll_entity_reference(
-        EntityId::new_v7(),
+    #[cfg(context_graph_internal_test_support)]
+    {
+        assert_unknown_entity_reference_enrollment_reaches_engine_fk();
+    }
+    #[cfg(not(context_graph_internal_test_support))]
+    {
+        let unknown_entity_id = EntityId::new_v7();
+        let result = store().enroll_entity_reference(
+            unknown_entity_id,
+            FACE_REFERENCE_SPACE,
+            None,
+            vec![1.0; 512],
+            producer(),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(CgError::EntityNotFound { entity_id }) if entity_id == unknown_entity_id
+            ),
+            "expected typed missing-entity rejection, got {result:?}"
+        );
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn assert_unknown_entity_reference_enrollment_reaches_engine_fk() {
+    let probe = Arc::new(EntityReferenceFkProbe::default());
+    let fixture = fixture_with_database_plugin("entity-reference-unknown-fk", probe.clone());
+    let Fixture {
+        _dir,
+        db_path,
+        store,
+    } = fixture;
+    let context = store
+        .create_context(CreateContext {
+            name: format!("unknown-fk-{}", uuid::Uuid::now_v7()),
+            labels: Vec::new(),
+            properties: BTreeMap::new(),
+        })
+        .expect("context");
+    let unknown_entity_id = EntityId::new_v7();
+    let vector = vec![1.0; 512];
+    probe.arm(
+        unknown_entity_id.as_uuid(),
+        context.id.as_uuid(),
+        vector.clone(),
+    );
+    let result = store.enroll_entity_reference(
+        unknown_entity_id,
         FACE_REFERENCE_SPACE,
         None,
-        vec![1.0; 512],
+        vector.clone(),
         producer(),
     );
+    let reference_rows = count_from_store(
+        &store,
+        "SELECT COUNT(*) AS n FROM entity_reference_embeddings_512 WHERE entity_id = $entity_id AND context_id = $context_id",
+        &params(vec![
+            ("entity_id", Value::Uuid(unknown_entity_id.as_uuid())),
+            ("context_id", Value::Uuid(context.id.as_uuid())),
+        ]),
+    );
+    let handle_rows = count_from_store(
+        &store,
+        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE target_id = $entity_id AND context_id = $context_id",
+        &params(vec![
+            ("entity_id", Value::Uuid(unknown_entity_id.as_uuid())),
+            ("context_id", Value::Uuid(context.id.as_uuid())),
+        ]),
+    );
+    let engine_fk_path_seen = probe.saw_engine_fk_path();
+    drop(store);
+    let leaked_vectors = leaked_entity_reference_vector_count(&db_path, &vector);
     assert!(
         matches!(
             result,
-            Err(CgError::NotFound {
-                missing: Some("entity"),
-                ..
-            })
+            Err(CgError::EntityNotFound { entity_id }) if entity_id == unknown_entity_id
         ),
-        "expected typed missing-entity rejection, got {result:?}"
+        "expected typed missing-entity rejection from engine FK path with no durable row or vector leak, result={result:?}, engine_fk_path_seen={engine_fk_path_seen}, reference_rows={reference_rows}, handle_rows={handle_rows}, leaked_vectors={leaked_vectors}"
+    );
+    assert!(
+        engine_fk_path_seen && reference_rows == 0 && handle_rows == 0 && leaked_vectors == 0,
+        "unknown entity enrollment must reach a failed contextdb WriteSet with entity-reference row, handle, and row-bound vector in one tx, then roll all of it back; result={result:?}, engine_fk_path_seen={engine_fk_path_seen}, reference_rows={reference_rows}, handle_rows={handle_rows}, leaked_vectors={leaked_vectors}"
     );
 }
 
