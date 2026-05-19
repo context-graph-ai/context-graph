@@ -1184,8 +1184,9 @@ fn collect_production_static_and_macro_names() -> (BTreeSet<String>, BTreeSet<St
                 .map(|end| name_end + end)
                 .unwrap_or(name_end);
             let item_source = source[keyword_start..item_end].to_ascii_lowercase();
-            if source_item_can_hide_vector_bypass(&item_source, &function_pointer_type_names)
-                || source_item_initializer_names_function(&item_source, &function_names)
+            if &source[name_start..name_end] != "_"
+                && (source_item_can_hide_vector_bypass(&item_source, &function_pointer_type_names)
+                    || source_item_initializer_names_function(&item_source, &function_names))
             {
                 static_names.insert(source[name_start..name_end].to_string());
             }
@@ -1217,8 +1218,9 @@ fn collect_production_static_and_macro_names() -> (BTreeSet<String>, BTreeSet<St
                 .map(|end| name_end + end)
                 .unwrap_or(name_end);
             let item_source = source[keyword_start..item_end].to_ascii_lowercase();
-            if source_item_can_hide_vector_bypass(&item_source, &function_pointer_type_names)
-                || source_item_initializer_names_function(&item_source, &function_names)
+            if &source[name_start..name_end] != "_"
+                && (source_item_can_hide_vector_bypass(&item_source, &function_pointer_type_names)
+                    || source_item_initializer_names_function(&item_source, &function_names))
             {
                 static_names.insert(source[name_start..name_end].to_string());
             }
@@ -1325,7 +1327,260 @@ fn source_item_initializer_names_function(source: &str, function_names: &BTreeSe
     };
     function_names
         .iter()
-        .any(|function_name| contains_identifier(initializer, function_name))
+        .any(|function_name| source_references_production_function(initializer, function_name))
+}
+
+fn source_references_production_function(source: &str, identifier: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(offset) = source[search_from..].find(identifier) {
+        let start = search_from + offset;
+        let end = start + identifier.len();
+        let prev_is_ident = start > 0
+            && (source.as_bytes()[start - 1].is_ascii_alphanumeric()
+                || source.as_bytes()[start - 1] == b'_');
+        let next_is_ident = end < source.len()
+            && (source.as_bytes()[end].is_ascii_alphanumeric() || source.as_bytes()[end] == b'_');
+        if prev_is_ident || next_is_ident {
+            search_from = end;
+            continue;
+        }
+        let after_source = source[end..].trim_start();
+        let after = after_source.chars().next();
+        let after_can_reference_function =
+            matches!(after, None | Some('(' | ';' | ',' | ')' | '}' | ']'))
+                || after_source.starts_with("::<")
+                || source_tail_starts_with_as_alias(after_source);
+        if source_prefix_can_reference_production_function(source, start)
+            && after_can_reference_function
+        {
+            return true;
+        }
+        search_from = end;
+    }
+    false
+}
+
+fn source_tail_starts_with_as_alias(source: &str) -> bool {
+    let Some(tail) = source.strip_prefix("as") else {
+        return false;
+    };
+    tail.chars()
+        .next()
+        .is_some_and(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+}
+
+fn source_prefix_can_reference_production_function(source: &str, identifier_start: usize) -> bool {
+    let prefix = source[..identifier_start].trim_end();
+    if prefix.ends_with('.') {
+        return !source_dot_method_is_registered_embedder_dispatch(
+            prefix,
+            source[identifier_start..].trim(),
+        );
+    }
+    if prefix.ends_with("::") {
+        return path_qualifier_can_name_function_namespace(prefix.trim_end_matches(':'));
+    }
+    true
+}
+
+fn source_dot_method_is_registered_embedder_dispatch(prefix: &str, method_and_tail: &str) -> bool {
+    let Some(method_name) = method_and_tail
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .next()
+    else {
+        return false;
+    };
+    if method_name != "embed" {
+        return false;
+    }
+    let receiver_prefix = prefix.trim_end_matches('.').trim_end();
+    let receiver_segment = receiver_prefix
+        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .next()
+        .unwrap_or("");
+    receiver_segment == "embedder"
+        && source_prefix_binds_receiver_from_registered_embedders(receiver_prefix, receiver_segment)
+}
+
+fn source_prefix_binds_receiver_from_registered_embedders(
+    source_prefix: &str,
+    receiver: &str,
+) -> bool {
+    let compact = compact_source_for_markers(source_prefix);
+    let binding = format!("let{receiver}=");
+    let Some(binding_start) = compact.rfind(&binding) else {
+        return false;
+    };
+    let binding_tail = &compact[binding_start + binding.len()..];
+    let initializer = binding_tail.split(';').next().unwrap_or(binding_tail);
+    initializer_is_direct_registered_embedder_lookup(initializer)
+}
+
+fn initializer_is_direct_registered_embedder_lookup(initializer: &str) -> bool {
+    let Some(()) = initializer
+        .starts_with("store.embedders.get(")
+        .then_some(())
+    else {
+        return false;
+    };
+    let Some(get_end) = matching_paren_end(initializer, "store.embedders.get".len()) else {
+        return false;
+    };
+    let tail = &initializer[get_end..];
+    let ok_call_open = if tail.starts_with(".ok_or(") {
+        get_end + ".ok_or".len()
+    } else if tail.starts_with(".ok_or_else(") {
+        get_end + ".ok_or_else".len()
+    } else {
+        return false;
+    };
+    let Some(ok_call_end) = matching_paren_end(initializer, ok_call_open) else {
+        return false;
+    };
+    &initializer[ok_call_end..] == "?"
+}
+
+fn matching_paren_end(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, ch) in source[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn path_qualifier_can_name_function_namespace(path_before_final_separator: &str) -> bool {
+    let path = path_before_final_separator.trim();
+    if path.contains('<') && path.contains('>') {
+        return true;
+    }
+    let path_start = path
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let segment = path[path_start..].rsplit("::").next().unwrap_or("").trim();
+    matches!(segment, "crate" | "self" | "super")
+        || segment
+            .chars()
+            .next()
+            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+            && !segment
+                .chars()
+                .any(|ch| matches!(ch, '<' | '>' | '(' | ')' | '[' | ']'))
+}
+
+fn assert_source_references_production_function_preserves_hidden_helper_guard() {
+    assert!(source_references_production_function(
+        "let hits = hidden_raw_return(store);",
+        "hidden_raw_return"
+    ));
+    assert!(source_references_production_function(
+        "let hits = raw_return::hidden_raw_return(store);",
+        "hidden_raw_return"
+    ));
+    assert!(source_references_production_function(
+        "static RETURNER: EvidenceSearchFn = raw_return::hidden_raw_return",
+        "hidden_raw_return"
+    ));
+    assert!(source_references_production_function(
+        "let hits = crate::store::raw_return::hidden_raw_return::<EvidenceSearchFn>(store);",
+        "hidden_raw_return"
+    ));
+    assert!(source_references_production_function(
+        "let hits = RawReturn::embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "use raw_return::hidden_raw_return as returner; returner(store);",
+        "hidden_raw_return"
+    ));
+    assert!(source_references_production_function(
+        "let returner = raw_return::hidden_raw_return as EvidenceSearchFn;",
+        "hidden_raw_return"
+    ));
+    assert!(source_references_production_function(
+        "let returner = [raw_return::hidden_raw_return][0];",
+        "hidden_raw_return"
+    ));
+    assert!(source_references_production_function(
+        "let hits = RawReturner.run(store);",
+        "run"
+    ));
+    assert!(source_references_production_function(
+        "let hits = RawReturner.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "let hits = raw_return_embedder.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "const RETURNER: RawReturner = RawReturner { f: hidden_raw_return };",
+        "hidden_raw_return"
+    ));
+    assert!(source_references_production_function(
+        "let hits = <RawReturner as ReturnPath>::run(store);",
+        "run"
+    ));
+    assert!(source_references_production_function(
+        "let hits = RawReturner::<EvidenceSearchFn>::run(store);",
+        "run"
+    ));
+    assert!(source_references_production_function(
+        "let embedder = RawReturner; let hits = embedder.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "let embedder: RawReturner = RawReturner; let hits = embedder.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "let embedder = raw_returner(store); let hits = embedder.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "let embedder = Arc::new(RawReturner); let hits = embedder.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "let embedder = RawReturner;
+         let _ = store.embedders.get(&space_id);
+         let hits = embedder.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "let embedder = (store.embedders.get(&space_id), RawReturner).1;
+         let hits = embedder.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "let embedder = { let _ = store.embedders.get(&space_id); RawReturner };
+         let hits = embedder.embed(store);",
+        "embed"
+    ));
+    assert!(source_references_production_function(
+        "let embedder = store.embedders.get(&space_id).map(|_| RawReturner).unwrap();
+         let hits = embedder.embed(store);",
+        "embed"
+    ));
+    assert!(!source_references_production_function(
+        "let embedder = store.embedders.get(&space_id).ok_or(CgError::TextEmbedderDisabled)?;
+         let vector = embedder.embed(input);",
+        "embed"
+    ));
+    assert!(!source_references_production_function(
+        "let embedder = store.embedders.get(&space_id).ok_or_else(|| embedder_missing_error(evidence.kind))?;
+         let vector = embedder.embed(input);",
+        "embed"
+    ));
 }
 
 fn reachable_function_source(
@@ -1344,7 +1599,7 @@ fn reachable_function_source(
         };
         reachable.insert(name.clone(), source.clone());
         for candidate in functions.keys() {
-            if candidate != &name && contains_identifier(source, candidate) {
+            if candidate != &name && source_references_production_function(source, candidate) {
                 pending.push(candidate.clone());
             }
         }
@@ -1474,6 +1729,7 @@ fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
 
 fn vector_primitive_source_forbidden_bypass_markers(root: &str) -> Vec<String> {
     assert_source_without_comments_preserves_string_literal_tail();
+    assert_source_references_production_function_preserves_hidden_helper_guard();
     let functions = collect_production_function_sources();
     let source = function_sources_for_markers(&functions, root);
     let raw_functions = collect_raw_production_function_sources();
