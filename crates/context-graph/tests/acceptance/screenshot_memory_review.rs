@@ -10,14 +10,15 @@ use std::time::Duration;
 
 use chrono::Utc;
 use context_graph::test_support::embedding::{
-    VectorSearchFilters, dedup_compare_digest_spaces, vector_search,
+    VectorSearchFilters, dedup_compare_digest_spaces, evidence_search, semantic_search,
+    vector_search,
 };
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDecision, CreateDigest, CreateEntity, CreateIntention,
-    DigestId, DistanceMetric, EmbeddingId, EmbeddingSpace, EmbeddingSpaceBinding, EmbeddingTarget,
-    EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin,
-    IntentionStatus, ObservationId, PrecomputedEmbedding, RecordObservation, ReindexEvent, Store,
-    StoreConfig,
+    DigestId, DistanceMetric, Embedder, EmbedderRegistration, EmbeddingId, EmbeddingInput,
+    EmbeddingOutput, EmbeddingSpace, EmbeddingSpaceBinding, EmbeddingTarget, EntityId, EntityType,
+    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin, IntentionStatus,
+    ObservationId, PrecomputedEmbedding, RecordObservation, ReindexEvent, Store, StoreConfig,
 };
 use contextdb_core::{TxId, Value};
 use contextdb_engine::Database;
@@ -47,6 +48,32 @@ fn image_evidence(evidence_id: EvidenceId) -> EvidenceRef {
         text_projection: Some("red sedan near loading dock".to_string()),
         producer: producer("vision-v1"),
         ..Default::default()
+    }
+}
+
+fn text_evidence(evidence_id: EvidenceId, text: &str) -> EvidenceRef {
+    EvidenceRef {
+        id: evidence_id,
+        kind: EvidenceKind::Text,
+        source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
+        mime_type: Some("text/plain".to_string()),
+        text_projection: Some(text.to_string()),
+        producer: EvidenceProducer {
+            system: "cg-edge".to_string(),
+            model_name: "embeddinggemma-300m".to_string(),
+            model_version: "semantic-test".to_string(),
+            pipeline_version: "2026-05-19".to_string(),
+        },
+        ..Default::default()
+    }
+}
+
+fn semantic_fixture_producer() -> EvidenceProducer {
+    EvidenceProducer {
+        system: "test-precomputed-text".to_string(),
+        model_name: "embeddinggemma-300m".to_string(),
+        model_version: "semantic-test".to_string(),
+        pipeline_version: "2026-05-19".to_string(),
     }
 }
 
@@ -97,9 +124,332 @@ fn store(name: &str) -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
+struct AxisTextEmbedder {
+    calls: Arc<AtomicUsize>,
+    inputs: Arc<Mutex<Vec<String>>>,
+    outputs: Arc<Mutex<Vec<Vec<f32>>>>,
+    query_token: String,
+    query_axis: usize,
+}
+
+impl AxisTextEmbedder {
+    fn new(query_token: String, query_axis: usize) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            inputs: Arc::new(Mutex::new(Vec::new())),
+            outputs: Arc::new(Mutex::new(Vec::new())),
+            query_token,
+            query_axis,
+        }
+    }
+}
+
+impl Embedder for AxisTextEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
+        match input {
+            EmbeddingInput::Text(text) => {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inputs
+                    .lock()
+                    .expect("embedder inputs")
+                    .push(text.clone());
+                let axis = if text.contains(&self.query_token) {
+                    self.query_axis
+                } else {
+                    2
+                };
+                let vector = vector(768, axis);
+                self.outputs
+                    .lock()
+                    .expect("embedder outputs")
+                    .push(vector.clone());
+                Ok(EmbeddingOutput {
+                    embedding_space_id: TEXT_SPACE.to_string(),
+                    dimension: 768,
+                    producer: EvidenceProducer {
+                        system: "cg-edge".to_string(),
+                        model_name: "embeddinggemma-300m".to_string(),
+                        model_version: "semantic-test".to_string(),
+                        pipeline_version: "2026-05-19".to_string(),
+                    },
+                    vector,
+                })
+            }
+            EmbeddingInput::ImageFrame { .. } => Err(CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::ImageFrame,
+            }),
+            EmbeddingInput::AudioSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::AudioSegment,
+            }),
+            EmbeddingInput::VideoSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::VideoSegment,
+            }),
+            EmbeddingInput::StructuredSignal(_) => Err(CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::StructuredSignal,
+            }),
+        }
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        vec![EvidenceKind::Text]
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpace {
+        EmbeddingSpace {
+            embedding_space_id: TEXT_SPACE.to_string(),
+            dimension: 768,
+            metric: DistanceMetric::Cosine,
+            model_family: "text".to_string(),
+            model_name: "embeddinggemma-300m".to_string(),
+            model_version: "semantic-test".to_string(),
+            supported_evidence_kinds: vec![EvidenceKind::Text],
+            default_for_evidence_kind: Some(EvidenceKind::Text),
+            bindings: vec![
+                EmbeddingSpaceBinding {
+                    embedding_space_id: TEXT_SPACE.to_string(),
+                    table_name: "evidence".to_string(),
+                    vector_column: "vector_text".to_string(),
+                },
+                EmbeddingSpaceBinding {
+                    embedding_space_id: TEXT_SPACE.to_string(),
+                    table_name: "digests".to_string(),
+                    vector_column: "vector_text".to_string(),
+                },
+            ],
+        }
+    }
+}
+
+fn open_store_with_axis_text_embedder_and_probe(
+    db_path: PathBuf,
+    probe: Arc<VectorPrimitiveQueryProbe>,
+    query_token: String,
+    query_axis: usize,
+) -> (
+    Store,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<Vec<f32>>>>,
+) {
+    let embedder = AxisTextEmbedder::new(query_token, query_axis);
+    let calls = Arc::clone(&embedder.calls);
+    let inputs = Arc::clone(&embedder.inputs);
+    let outputs = Arc::clone(&embedder.outputs);
+    let space = embedder.embedding_space();
+    let store = Store::open_with_database_plugin_and_embedder_registrations(
+        store_config(db_path),
+        probe,
+        vec![EmbedderRegistration {
+            space,
+            embedder: Arc::new(embedder),
+        }],
+    )
+    .expect("store opens with axis text embedder");
+    (store, calls, inputs, outputs)
+}
+
 #[cfg(not(context_graph_internal_test_support))]
 fn reopen_store(db_path: &Path) -> Store {
     Store::open(store_config(db_path.to_path_buf())).expect("reopened store")
+}
+
+#[cfg(context_graph_internal_test_support)]
+#[derive(Default)]
+struct VectorPrimitiveQueryProbe {
+    enabled: AtomicBool,
+    evidence_row_vector_queries: AtomicUsize,
+    semantic_vector_queries: AtomicUsize,
+    unexpected_vector_queries: Mutex<Vec<String>>,
+    sql: Mutex<Vec<String>>,
+}
+
+#[cfg(context_graph_internal_test_support)]
+impl VectorPrimitiveQueryProbe {
+    fn begin(&self) {
+        self.sql.lock().expect("primitive sql").clear();
+        self.unexpected_vector_queries
+            .lock()
+            .expect("unexpected primitive sql")
+            .clear();
+        self.evidence_row_vector_queries.store(0, Ordering::SeqCst);
+        self.semantic_vector_queries.store(0, Ordering::SeqCst);
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    fn disable(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+    }
+
+    fn evidence_row_vector_query_count(&self) -> usize {
+        self.evidence_row_vector_queries.load(Ordering::SeqCst)
+    }
+
+    fn semantic_vector_query_count(&self) -> usize {
+        self.semantic_vector_queries.load(Ordering::SeqCst)
+    }
+
+    fn unexpected_vector_queries(&self) -> Vec<String> {
+        self.unexpected_vector_queries
+            .lock()
+            .expect("unexpected primitive sql")
+            .clone()
+    }
+
+    fn sql(&self) -> Vec<String> {
+        self.sql.lock().expect("primitive sql").clone()
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+impl DatabasePlugin for VectorPrimitiveQueryProbe {
+    fn on_query(&self, sql: &str) -> contextdb_core::Result<()> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let normalized = sql
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.sql
+            .lock()
+            .expect("primitive sql")
+            .push(normalized.clone());
+        let touches_evidence_table = normalized.contains("from evidence")
+            || normalized.contains("join evidence")
+            || normalized.contains("update evidence")
+            || normalized.contains("insert into evidence")
+            || normalized.contains("delete from evidence")
+            || normalized.contains(" evidence ")
+            || normalized.contains("evidence.")
+            || normalized.contains("e.")
+            || normalized.contains("vector_text")
+            || normalized.contains("vector_vision");
+        let expected_evidence_row_vector_query = normalized.contains("from evidence")
+            && normalized.contains("order by")
+            && normalized
+                .contains("vector_vision <=> row_vector('evidence','vector_vision',$query_id)")
+            && query_has_exact_limit(&normalized, 2)
+            && ordered_query_has_context_id_filter(&normalized)
+            && !query_has_forbidden_context_region(&normalized);
+        let expected_semantic_vector_query = normalized.contains("from evidence")
+            && normalized.contains("order by")
+            && normalized.contains("vector_text <=> $query")
+            && query_has_exact_limit(&normalized, 1)
+            && ordered_query_has_context_id_filter(&normalized)
+            && !query_has_forbidden_context_region(&normalized);
+        if expected_evidence_row_vector_query {
+            self.evidence_row_vector_queries
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if expected_semantic_vector_query {
+            self.semantic_vector_queries.fetch_add(1, Ordering::SeqCst);
+        }
+        let targeted_evidence_metadata_lookup = touches_evidence_table
+            && normalized.contains("where")
+            && (normalized.contains(" id =")
+                || normalized.contains(" id in")
+                || normalized.contains(".id =")
+                || normalized.contains(".id in"))
+            && !normalized.contains("select *")
+            && !normalized.contains("<=>")
+            && !normalized.contains("vector_text")
+            && !normalized.contains("vector_vision");
+        if touches_evidence_table
+            && !expected_evidence_row_vector_query
+            && !expected_semantic_vector_query
+            && !targeted_evidence_metadata_lookup
+        {
+            self.unexpected_vector_queries
+                .lock()
+                .expect("unexpected primitive sql")
+                .push(normalized);
+        }
+        Ok(())
+    }
+
+    fn post_query(&self, _sql: &str, _duration: Duration, _outcome: &QueryOutcome) {}
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn reopen_store_with_vector_probe(db_path: &Path, probe: Arc<VectorPrimitiveQueryProbe>) -> Store {
+    Store::open_with_database_plugin(store_config(db_path.to_path_buf()), probe)
+        .expect("reopened store with vector primitive probe")
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn sql_has_context_id_filter(sql_region: &str) -> bool {
+    [
+        " context_id = $context_id",
+        " context_id=$context_id",
+        " evidence.context_id = $context_id",
+        " evidence.context_id=$context_id",
+        " e.context_id = $context_id",
+        " e.context_id=$context_id",
+        " context_id in ($context_id)",
+        " context_id in ($context_ids)",
+        " context_id in $context_ids",
+        " evidence.context_id in ($context_id)",
+        " evidence.context_id in ($context_ids)",
+        " e.context_id in ($context_id)",
+        " e.context_id in ($context_ids)",
+    ]
+    .iter()
+    .any(|needle| sql_region.contains(needle))
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn ordered_query_has_context_id_filter(normalized_sql: &str) -> bool {
+    query_candidate_region(normalized_sql).is_some_and(sql_has_context_id_filter)
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn query_has_exact_limit(normalized_sql: &str, expected_limit: usize) -> bool {
+    let expected = expected_limit.to_string();
+    let tokens = normalized_sql.split_whitespace().collect::<Vec<_>>();
+    tokens.windows(2).any(|pair| {
+        pair[0] == "limit" && pair[1] == expected && pair[1].chars().all(|ch| ch.is_ascii_digit())
+    })
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn query_has_forbidden_context_region(normalized_sql: &str) -> bool {
+    let Some(candidate_region) = query_candidate_region(normalized_sql) else {
+        return true;
+    };
+    [
+        " or ",
+        " 1=1",
+        " true",
+        " context_id = context_id",
+        " context_id=context_id",
+        " evidence.context_id = evidence.context_id",
+        " e.context_id = e.context_id",
+        " is not null",
+        " select ",
+    ]
+    .iter()
+    .any(|needle| candidate_region.contains(needle))
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn reopen_store_with_axis_text_embedder_and_probe(
+    db_path: &Path,
+    probe: Arc<VectorPrimitiveQueryProbe>,
+    query_token: String,
+    query_axis: usize,
+) -> (
+    Store,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<Vec<f32>>>>,
+) {
+    open_store_with_axis_text_embedder_and_probe(
+        db_path.to_path_buf(),
+        probe,
+        query_token,
+        query_axis,
+    )
 }
 
 #[cfg(context_graph_internal_test_support)]
@@ -352,6 +702,14 @@ fn vector(dim: usize, axis: usize) -> Vec<f32> {
     values
 }
 
+fn vector_with_components(dim: usize, components: &[(usize, f32)]) -> Vec<f32> {
+    let mut values = vec![0.0; dim];
+    for &(axis, value) in components {
+        values[axis] = value;
+    }
+    values
+}
+
 fn observation_with_evidence(
     context_id: ContextId,
     entity_id: EntityId,
@@ -444,37 +802,129 @@ fn raw_top_digest_ids(db_path: &Path, query: &[f32], top_k: usize) -> Vec<Digest
 
 fn source_without_comments(source: &str) -> String {
     let mut output = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-    while let Some(ch) = chars.next() {
-        if in_line_comment {
-            if ch == '\n' {
-                in_line_comment = false;
-                output.push('\n');
+    let bytes = source.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'/' if bytes.get(idx + 1) == Some(&b'/') => {
+                idx += 2;
+                while idx < bytes.len() && bytes[idx] != b'\n' {
+                    idx += 1;
+                }
             }
-            continue;
-        }
-        if in_block_comment {
-            if ch == '*' && chars.peek() == Some(&'/') {
-                chars.next();
-                in_block_comment = false;
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                idx += 2;
+                let mut depth = 1usize;
+                while idx < bytes.len() && depth > 0 {
+                    if bytes[idx] == b'\n' {
+                        output.push('\n');
+                        idx += 1;
+                    } else if bytes[idx] == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+                        depth += 1;
+                        idx += 2;
+                    } else if bytes[idx] == b'*' && bytes.get(idx + 1) == Some(&b'/') {
+                        depth -= 1;
+                        idx += 2;
+                    } else {
+                        idx += 1;
+                    }
+                }
             }
-            continue;
+            b'"' => {
+                output.push('"');
+                idx += 1;
+                let mut escaped = false;
+                while idx < bytes.len() {
+                    let ch = bytes[idx] as char;
+                    output.push(ch);
+                    idx += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        break;
+                    }
+                }
+            }
+            b'\'' => {
+                output.push('\'');
+                idx += 1;
+                let mut escaped = false;
+                while idx < bytes.len() {
+                    let ch = bytes[idx] as char;
+                    output.push(ch);
+                    idx += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '\'' {
+                        break;
+                    }
+                }
+            }
+            b'r' | b'b' if raw_string_start(bytes, idx).is_some() => {
+                let (prefix_len, hash_count) = raw_string_start(bytes, idx).expect("raw string");
+                for byte in &bytes[idx..idx + prefix_len] {
+                    output.push(*byte as char);
+                }
+                idx += prefix_len;
+                while idx < bytes.len() {
+                    output.push(bytes[idx] as char);
+                    if bytes[idx] == b'"'
+                        && (0..hash_count).all(|offset| bytes.get(idx + 1 + offset) == Some(&b'#'))
+                    {
+                        for _ in 0..hash_count {
+                            idx += 1;
+                            output.push(bytes[idx] as char);
+                        }
+                        idx += 1;
+                        break;
+                    }
+                    idx += 1;
+                }
+            }
+            _ => {
+                output.push(bytes[idx] as char);
+                idx += 1;
+            }
         }
-        if ch == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            in_line_comment = true;
-            continue;
-        }
-        if ch == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            in_block_comment = true;
-            continue;
-        }
-        output.push(ch);
     }
     output
+}
+
+fn raw_string_start(bytes: &[u8], idx: usize) -> Option<(usize, usize)> {
+    let mut cursor = match (bytes.get(idx), bytes.get(idx + 1)) {
+        (Some(b'r'), _) => idx + 1,
+        (Some(b'b'), Some(b'r')) => idx + 2,
+        _ => return None,
+    };
+    let mut hash_count = 0usize;
+    while bytes.get(cursor) == Some(&b'#') {
+        hash_count += 1;
+        cursor += 1;
+    }
+    (bytes.get(cursor) == Some(&b'"')).then_some((cursor - idx + 1, hash_count))
+}
+
+fn assert_source_without_comments_preserves_string_literal_tail() {
+    for alias in ["EvidenceSearchFn", "SemanticSearchFn"] {
+        let source = format!(
+            "static RETURNER: {alias} = hidden_raw_return;\n\
+             fn primitive() {{ let _ = \"cg://\"; RETURNER(store); }}\n\
+             // RETURNER in a real comment is stripped\n"
+        );
+        let stripped = source_without_comments(&source).to_ascii_lowercase();
+        assert!(
+            stripped.contains("\"cg://\"; returner(store);"),
+            "comment stripping must keep primitive dispatch after URL-like string literals: {stripped}"
+        );
+        assert!(
+            contains_identifier(&stripped, "returner"),
+            "comment stripping must leave static/const dispatch aliases visible: {stripped}"
+        );
+    }
 }
 
 fn compact_source(source: &str) -> String {
@@ -640,10 +1090,31 @@ fn collect_production_function_sources() -> BTreeMap<String, String> {
     collect_rs_files(&src_dir, &mut paths);
     paths.sort();
 
+    collect_function_sources_from_paths(paths, true)
+}
+
+fn collect_raw_production_function_sources() -> BTreeMap<String, String> {
+    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = Vec::new();
+    collect_rs_files(&src_dir, &mut paths);
+    paths.sort();
+
+    collect_function_sources_from_paths(paths, false)
+}
+
+fn collect_function_sources_from_paths(
+    paths: Vec<PathBuf>,
+    strip_internal_test_support: bool,
+) -> BTreeMap<String, String> {
     let mut functions = BTreeMap::<String, String>::new();
     for path in paths {
         let source = std::fs::read_to_string(&path).expect("production source");
-        let source = strip_internal_test_support_items(&source_without_comments(&source));
+        let source = source_without_comments(&source);
+        let source = if strip_internal_test_support {
+            strip_internal_test_support_items(&source)
+        } else {
+            source
+        };
         for (name, function_source) in collect_function_sources(&source) {
             functions
                 .entry(name)
@@ -655,6 +1126,206 @@ fn collect_production_function_sources() -> BTreeMap<String, String> {
         }
     }
     functions
+}
+
+fn collect_production_static_and_macro_names() -> (BTreeSet<String>, BTreeSet<String>) {
+    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = Vec::new();
+    collect_rs_files(&src_dir, &mut paths);
+    paths.sort();
+
+    let function_names = collect_production_function_sources()
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let function_pointer_type_names = collect_production_function_pointer_type_names(&paths);
+    let mut static_names = BTreeSet::new();
+    let mut macro_names = BTreeSet::new();
+    for path in paths {
+        let source = std::fs::read_to_string(&path).expect("production source");
+        let source = strip_internal_test_support_items(&source_without_comments(&source));
+        let mut idx = 0usize;
+        while let Some(offset) = source[idx..].find("static ") {
+            let keyword_start = idx + offset;
+            let prev_is_item_boundary = keyword_start == 0
+                || (!source.as_bytes()[keyword_start - 1].is_ascii_alphanumeric()
+                    && source.as_bytes()[keyword_start - 1] != b'_'
+                    && source.as_bytes()[keyword_start - 1] != b'\'');
+            if !prev_is_item_boundary {
+                idx = keyword_start + "static ".len();
+                continue;
+            }
+            let start = keyword_start + "static ".len();
+            let Some(name_start_offset) =
+                source[start..].find(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+            else {
+                break;
+            };
+            let mut name_start = start + name_start_offset;
+            let name_end = source[name_start..]
+                .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .map(|end| name_start + end)
+                .unwrap_or(source.len());
+            if &source[name_start..name_end] == "mut" {
+                let after_mut = name_end;
+                let Some(next_name_start_offset) =
+                    source[after_mut..].find(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+                else {
+                    break;
+                };
+                name_start = after_mut + next_name_start_offset;
+            }
+            let name_end = source[name_start..]
+                .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .map(|end| name_start + end)
+                .unwrap_or(source.len());
+            let item_end = source[name_end..]
+                .find(';')
+                .map(|end| name_end + end)
+                .unwrap_or(name_end);
+            let item_source = source[keyword_start..item_end].to_ascii_lowercase();
+            if source_item_can_hide_vector_bypass(&item_source, &function_pointer_type_names)
+                || source_item_initializer_names_function(&item_source, &function_names)
+            {
+                static_names.insert(source[name_start..name_end].to_string());
+            }
+            idx = name_end;
+        }
+        idx = 0;
+        while let Some(offset) = source[idx..].find("const ") {
+            let keyword_start = idx + offset;
+            let prev_is_item_boundary = keyword_start == 0
+                || (!source.as_bytes()[keyword_start - 1].is_ascii_alphanumeric()
+                    && source.as_bytes()[keyword_start - 1] != b'_');
+            if !prev_is_item_boundary {
+                idx = keyword_start + "const ".len();
+                continue;
+            }
+            let start = keyword_start + "const ".len();
+            let Some(name_start_offset) =
+                source[start..].find(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+            else {
+                break;
+            };
+            let name_start = start + name_start_offset;
+            let name_end = source[name_start..]
+                .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .map(|end| name_start + end)
+                .unwrap_or(source.len());
+            let item_end = source[name_end..]
+                .find(';')
+                .map(|end| name_end + end)
+                .unwrap_or(name_end);
+            let item_source = source[keyword_start..item_end].to_ascii_lowercase();
+            if source_item_can_hide_vector_bypass(&item_source, &function_pointer_type_names)
+                || source_item_initializer_names_function(&item_source, &function_names)
+            {
+                static_names.insert(source[name_start..name_end].to_string());
+            }
+            idx = name_end;
+        }
+        idx = 0;
+        while let Some(offset) = source[idx..].find("macro_rules!") {
+            let start = idx + offset + "macro_rules!".len();
+            let Some(name_start_offset) =
+                source[start..].find(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+            else {
+                break;
+            };
+            let name_start = start + name_start_offset;
+            let name_end = source[name_start..]
+                .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .map(|end| name_start + end)
+                .unwrap_or(source.len());
+            macro_names.insert(source[name_start..name_end].to_string());
+            idx = name_end;
+        }
+    }
+    (static_names, macro_names)
+}
+
+fn collect_production_function_pointer_type_names(paths: &[PathBuf]) -> BTreeSet<String> {
+    let mut type_names = BTreeSet::new();
+    for path in paths {
+        let source = std::fs::read_to_string(path).expect("production source");
+        let source = strip_internal_test_support_items(&source_without_comments(&source));
+        let mut idx = 0usize;
+        while let Some(offset) = source[idx..].find("type ") {
+            let keyword_start = idx + offset;
+            let prev_is_item_boundary = keyword_start == 0
+                || (!source.as_bytes()[keyword_start - 1].is_ascii_alphanumeric()
+                    && source.as_bytes()[keyword_start - 1] != b'_');
+            if !prev_is_item_boundary {
+                idx = keyword_start + "type ".len();
+                continue;
+            }
+            let start = keyword_start + "type ".len();
+            let Some(name_start_offset) =
+                source[start..].find(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+            else {
+                break;
+            };
+            let name_start = start + name_start_offset;
+            let name_end = source[name_start..]
+                .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .map(|end| name_start + end)
+                .unwrap_or(source.len());
+            let item_end = source[name_end..]
+                .find(';')
+                .map(|end| name_end + end)
+                .unwrap_or(name_end);
+            let item_source = source[keyword_start..item_end].to_ascii_lowercase();
+            let compact = compact_source_for_markers(&item_source);
+            if compact.contains("=fn(")
+                || compact.contains("=unsafefn(")
+                || compact.contains("=extern\"c\"fn(")
+            {
+                type_names.insert(source[name_start..name_end].to_ascii_lowercase());
+            }
+            idx = name_end;
+        }
+    }
+    type_names
+}
+
+fn source_item_can_hide_vector_bypass(
+    source: &str,
+    function_pointer_type_names: &BTreeSet<String>,
+) -> bool {
+    let compact = compact_source_for_markers(source);
+    let declares_function_pointer = compact.contains(":fn(")
+        || compact.contains("fn(")
+        || compact.contains(":extern\"c\"fn(")
+        || function_pointer_type_names.iter().any(|type_name| {
+            compact.contains(&format!(":{type_name}="))
+                || compact.contains(&format!(":{type_name};"))
+                || compact.contains(&format!(":{type_name},"))
+                || compact.contains(&format!(":{type_name}>"))
+        });
+    source_contains_any(
+        source,
+        &[
+            "Database::open",
+            "::open",
+            "open_with_",
+            "open_memory",
+            "query_vector",
+            "SemanticQuery",
+            "semantic_search",
+            "__debug_vector",
+            "live_vector_entry",
+            "cosine_score",
+        ],
+    ) || declares_function_pointer
+}
+
+fn source_item_initializer_names_function(source: &str, function_names: &BTreeSet<String>) -> bool {
+    let Some((_, initializer)) = source.split_once('=') else {
+        return false;
+    };
+    function_names
+        .iter()
+        .any(|function_name| contains_identifier(initializer, function_name))
 }
 
 fn reachable_function_source(
@@ -694,6 +1365,20 @@ fn source_contains_any(source: &str, needles: &[&str]) -> bool {
     needles
         .iter()
         .any(|needle| source.contains(&needle.to_ascii_lowercase()))
+}
+
+fn compact_source_for_markers(source: &str) -> String {
+    source
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect()
+}
+
+fn compact_source_contains_any(source: &str, needles: &[&str]) -> bool {
+    let compact_source = compact_source_for_markers(source);
+    needles
+        .iter()
+        .any(|needle| compact_source.contains(&needle.to_ascii_lowercase()))
 }
 
 fn source_contains_string_literal(source: &str, needle: &str) -> bool {
@@ -783,6 +1468,159 @@ fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
     ) && source_contains_any(&store_open_source, &["vector_text", "Value::Vector"])
     {
         markers.push("Store::open digest vector preload source".to_string());
+    }
+    markers
+}
+
+fn vector_primitive_source_forbidden_bypass_markers(root: &str) -> Vec<String> {
+    assert_source_without_comments_preserves_string_literal_tail();
+    let functions = collect_production_function_sources();
+    let source = function_sources_for_markers(&functions, root);
+    let raw_functions = collect_raw_production_function_sources();
+    let raw_source = function_sources_for_markers(&raw_functions, root);
+    let (static_names, macro_names) = collect_production_static_and_macro_names();
+    let mut store_open_sources = BTreeMap::new();
+    for root in [
+        "open_with_database_plugin_and_embedder_registrations",
+        "open_with_database_plugin",
+        "open_with_embedder_registrations",
+        "open_with_config_inner_with_plugin",
+        "open_with_config_inner",
+        "open_bootstrapped_database",
+    ] {
+        store_open_sources.extend(reachable_function_source(&functions, root));
+    }
+    let mut markers = [
+        ("raw Database open", "Database::open("),
+        ("raw database open alias", "::open("),
+        ("Store open", "Store::open("),
+        ("bootstrapped database open", "open_bootstrapped_database("),
+        ("direct engine scan", ".scan("),
+        ("direct engine scan UFCS", "::scan"),
+        ("engine query_vector call", ".query_vector("),
+        ("engine query_vector UFCS", "::query_vector"),
+        ("engine semantic_search call", ".semantic_search("),
+        ("engine semantic_search UFCS", "::semantic_search"),
+        ("SemanticQuery construction", "SemanticQuery"),
+        ("engine vector debug API", "__debug_vector"),
+        (
+            "engine last-query vector debug API",
+            "__debug_last_query_vector",
+        ),
+        ("live vector entry access", "live_vector_entry"),
+        ("cg-side cosine fallback", "cosine_score("),
+        ("manual vector zip", ".zip("),
+        ("manual vector fold", ".fold("),
+        ("manual vector sum", ".sum("),
+        ("manual vector dot", ".dot("),
+        ("manual vector enumerate", ".enumerate("),
+        ("manual indexed vector loop", "for idx in 0.."),
+        ("manual indexed vector loop", "for i in 0.."),
+    ]
+    .into_iter()
+    .filter_map(|(label, needle)| {
+        source
+            .contains(&needle.to_ascii_lowercase())
+            .then(|| label.to_string())
+    })
+    .collect::<Vec<_>>();
+    for (label, needle) in [
+        ("raw Database open", "Database::open("),
+        ("raw database open alias", "::open("),
+        ("raw Database open function pointer", "Database::open;"),
+        ("raw database open alias function pointer", "::open;"),
+        ("raw Database open cast", "Database::openas"),
+        ("raw database open alias cast", "::openas"),
+        ("raw database open turbofish", "::open::<"),
+        (
+            "raw Database open_with_plugin",
+            "Database::open_with_plugin(",
+        ),
+        (
+            "raw Database open_with_plugin function pointer",
+            "Database::open_with_plugin;",
+        ),
+        (
+            "raw Database open_with_plugin cast",
+            "Database::open_with_pluginas",
+        ),
+        ("raw database open_with alias", "::open_with_"),
+        ("raw database open_memory", "::open_memory"),
+    ] {
+        if compact_source_contains_any(&source, &[needle])
+            && !markers.iter().any(|marker| marker == label)
+        {
+            markers.push(label.to_string());
+        }
+    }
+    if store_open_sources.values().any(|source| {
+        let source = source.to_ascii_lowercase();
+        let sql_vector_projection = (source_contains_string_literal(&source, "from evidence")
+            || source_contains_string_literal(&source, "join evidence"))
+            && source_contains_any(
+                &source,
+                &[
+                    "vector_text",
+                    "vector_vision",
+                    "Value::Vector",
+                    "get_vector(",
+                ],
+            );
+        let scan_vector_projection =
+            source_contains_any(&source, &[".scan(\"evidence\"", "::scan(\"evidence\""])
+                && source_contains_any(
+                    &source,
+                    &[
+                        "Value::Vector",
+                        "get_vector(",
+                        ".query_vector(",
+                        "::query_vector",
+                    ],
+                );
+        let direct_vector_api = source_contains_string_literal(&source, "evidence")
+            && source_contains_any(&source, &["vector_text", "vector_vision"])
+            && (source_contains_any(
+                &source,
+                &[
+                    ".semantic_search(",
+                    "::semantic_search",
+                    "SemanticQuery",
+                    ".query_vector(",
+                    "::query_vector",
+                    "__debug_vector",
+                    "__debug_last_query_vector",
+                ],
+            ) || compact_source_contains_any(
+                &source,
+                &[
+                    ".semantic_search(",
+                    "::semantic_search",
+                    "SemanticQuery",
+                    ".query_vector(",
+                    "::query_vector",
+                    "__debug_vector",
+                    "__debug_last_query_vector",
+                ],
+            ));
+        sql_vector_projection || scan_vector_projection || direct_vector_api
+    }) {
+        markers.push("Store::open evidence vector preload source".to_string());
+    }
+    if raw_source.contains("context_graph_internal_test_support") {
+        markers.push("test-support-only primitive implementation branch".to_string());
+    }
+    for static_name in static_names {
+        let static_name = static_name.to_ascii_lowercase();
+        if contains_identifier(&source, &static_name) {
+            markers.push(format!("static/const dispatch indirection: {static_name}"));
+        }
+    }
+    for macro_name in macro_names {
+        let macro_name = macro_name.to_ascii_lowercase();
+        let macro_call = format!("{macro_name}!");
+        if source.contains(&macro_call) {
+            markers.push(format!("macro dispatch indirection: {macro_name}"));
+        }
     }
     markers
 }
@@ -887,6 +1725,98 @@ fn raw_dedup_trace(store: &Store, query_digest: DigestId, candidate_digest: Dige
         )
         .expect("raw dedup trace query");
     format!("{:?}", result.trace)
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn raw_evidence_row_vector_hits(
+    store: &Store,
+    query_evidence_id: EvidenceId,
+    context_id: ContextId,
+    limit: usize,
+) -> (Vec<EmbeddingTarget>, Vec<f32>, String) {
+    let result = store
+        .execute_sql_for_test(
+            &format!(
+                "SELECT id, context_id, score FROM evidence WHERE context_id = $context_id ORDER BY vector_vision <=> ROW_VECTOR('evidence','vector_vision',$query_id) LIMIT {limit}"
+            ),
+            &HashMap::from([
+                (
+                    "context_id".to_string(),
+                    Value::Uuid(context_id.as_uuid()),
+                ),
+                (
+                    "query_id".to_string(),
+                    Value::Uuid(query_evidence_id.as_uuid()),
+                ),
+            ]),
+        )
+        .expect("raw evidence ROW_VECTOR query");
+    let targets = result
+        .rows
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::Uuid(id)) => EmbeddingTarget::Evidence(EvidenceId::from(*id)),
+            other => panic!("raw evidence query expected id uuid, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    let scores = result
+        .rows
+        .iter()
+        .map(|row| score_from_value(row.get(2)))
+        .collect::<Vec<_>>();
+    (targets, scores, format!("{:?}", result.trace))
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn raw_semantic_vector_hits(
+    store: &Store,
+    query_vector: Vec<f32>,
+    context_id: ContextId,
+    limit: usize,
+) -> (Vec<EmbeddingTarget>, Vec<f32>, String) {
+    let result = store
+        .execute_sql_for_test(
+            &format!("SELECT id, context_id, score FROM evidence WHERE context_id = $context_id ORDER BY vector_text <=> $query LIMIT {limit}"),
+            &HashMap::from([
+                (
+                    "context_id".to_string(),
+                    Value::Uuid(context_id.as_uuid()),
+                ),
+                ("query".to_string(), Value::Vector(query_vector)),
+            ]),
+        )
+        .expect("raw semantic vector query");
+    let targets = result
+        .rows
+        .iter()
+        .map(|row| match row.first() {
+            Some(Value::Uuid(id)) => EmbeddingTarget::Evidence(EvidenceId::from(*id)),
+            other => panic!("raw semantic query expected id uuid, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    let scores = result
+        .rows
+        .iter()
+        .map(|row| score_from_value(row.get(2)))
+        .collect::<Vec<_>>();
+    (targets, scores, format!("{:?}", result.trace))
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn score_from_value(value: Option<&Value>) -> f32 {
+    match value {
+        Some(Value::Float64(score)) => *score as f32,
+        other => panic!("expected vector score, got {other:?}"),
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn scores_match(actual: &[f32], expected: &[f32]) -> bool {
+    actual.len() == expected.len()
+        && actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| (actual - expected).abs() <= 0.000_01)
 }
 
 fn create_screenshot_digest(
@@ -1032,6 +1962,370 @@ fn screenshot_review_ingest_and_internal_search() {
                 .first()
                 .is_some_and(|row| row.target == EmbeddingTarget::Digest(digest_id))),
         "expected one record_observation call to persist evidence and digest handles plus exact vector hits, while the matched Digest has durable source/session/summary content; digest_seed={digest_seed:?}, digest_row={digest_row:?}, result={result:?}, evidence_handle_rows={evidence_handle_rows}, digest_handle_rows={digest_handle_rows}, evidence_hits={evidence_hits:?}, digest_hits={digest_hits:?}"
+    );
+}
+
+#[test]
+fn screenshot_review_evidence_search_uses_persisted_evidence_vector_as_query() {
+    if std::env::var_os("CG_SCREENSHOT_EVIDENCE_SEARCH_CHILD").is_some() {
+        let db_path =
+            PathBuf::from(std::env::var("CG_SCREENSHOT_EVIDENCE_SEARCH_DB").expect("db env"));
+        let context_id = ContextId::from(uuid_env("CG_SCREENSHOT_EVIDENCE_SEARCH_CONTEXT"));
+        let query_evidence_id = EvidenceId::from(uuid_env("CG_SCREENSHOT_EVIDENCE_SEARCH_QUERY"));
+        let aligned_evidence_id =
+            EvidenceId::from(uuid_env("CG_SCREENSHOT_EVIDENCE_SEARCH_ALIGNED"));
+        let decoy_evidence_id = EvidenceId::from(uuid_env("CG_SCREENSHOT_EVIDENCE_SEARCH_DECOY"));
+        let wrong_context_evidence_id =
+            EvidenceId::from(uuid_env("CG_SCREENSHOT_EVIDENCE_SEARCH_WRONG_CONTEXT"));
+        let probe = Arc::new(VectorPrimitiveQueryProbe::default());
+        probe.begin();
+        let store = reopen_store_with_vector_probe(&db_path, probe.clone());
+        let query_evidence = image_evidence(query_evidence_id);
+        let hits = evidence_search(
+            &store,
+            &query_evidence,
+            Some(IMAGE_SPACE),
+            VectorSearchFilters {
+                top_k: Some(2),
+                context_ids: Some(vec![context_id]),
+                include_planner_trace: true,
+                ..Default::default()
+            },
+        )
+        .expect("evidence_search over persisted evidence vector");
+        probe.disable();
+        let (raw_targets, raw_scores, raw_trace) =
+            raw_evidence_row_vector_hits(&store, query_evidence_id, context_id, 2);
+        let targets = hits
+            .iter()
+            .map(|hit| hit.target.clone())
+            .collect::<Vec<_>>();
+        let scores = hits.iter().map(|hit| hit.score).collect::<Vec<_>>();
+        let returned_traces = hits
+            .iter()
+            .map(|hit| hit.planner_trace.clone())
+            .collect::<Vec<_>>();
+        let evidence_row_vector_query_count = probe.evidence_row_vector_query_count();
+        let unexpected_vector_queries = probe.unexpected_vector_queries();
+        let observed_sql = probe.sql();
+        let source_forbidden_vector_bypass_markers =
+            vector_primitive_source_forbidden_bypass_markers("evidence_search");
+
+        assert!(
+            targets
+                == vec![
+                    EmbeddingTarget::Evidence(query_evidence_id),
+                    EmbeddingTarget::Evidence(aligned_evidence_id),
+                ]
+                && raw_targets == targets
+                && !targets.contains(&EmbeddingTarget::Evidence(decoy_evidence_id))
+                && !targets.contains(&EmbeddingTarget::Evidence(wrong_context_evidence_id))
+                && raw_scores.len() == 2
+                && raw_scores[0] > 0.99
+                && raw_scores[1] > 0.75
+                && raw_scores[1] < 0.99
+                && scores_match(&scores, &raw_scores)
+                && evidence_row_vector_query_count == 1
+                && unexpected_vector_queries.is_empty()
+                && source_forbidden_vector_bypass_markers.is_empty()
+                && dedup_engine_vector_trace(&raw_trace)
+                && hits.iter().all(|hit| hit.embedding_space_id == IMAGE_SPACE
+                    && hit.index_ref == "evidence.vector_vision"
+                    && hit.context_id == Some(context_id)
+                    && hit.planner_trace == raw_trace),
+            "evidence_search must reopen durable contextdb state in a fresh process under an already-enabled query probe, bind the query Evidence id to ROW_VECTOR, restrict the vector query to the requested context, and return the same ordered ids/scores/trace as the raw contextdb query. The aligned row is deliberately similar but not identical, and a wrong-context row is closer than the aligned row, so binding the aligned id, ignoring context scope, or replaying a Store-local cache changes order/scores; hits={hits:?}, targets={targets:?}, scores={scores:?}, raw_targets={raw_targets:?}, raw_scores={raw_scores:?}, raw_trace={raw_trace:?}, returned_traces={returned_traces:?}, evidence_row_vector_query_count={evidence_row_vector_query_count}, unexpected_vector_queries={unexpected_vector_queries:?}, source_forbidden_vector_bypass_markers={source_forbidden_vector_bypass_markers:?}, observed_sql={observed_sql:?}, query_evidence_id={query_evidence_id:?}, aligned_evidence_id={aligned_evidence_id:?}, decoy_evidence_id={decoy_evidence_id:?}, wrong_context_evidence_id={wrong_context_evidence_id:?}"
+        );
+        return;
+    }
+
+    let query_evidence_id = EvidenceId::new_v7();
+    let aligned_evidence_id = EvidenceId::new_v7();
+    let decoy_evidence_id = EvidenceId::new_v7();
+    let wrong_context_evidence_id = EvidenceId::new_v7();
+    let query_axis = ((uuid::Uuid::now_v7().as_u128() as usize) % 384) + 64;
+    let decoy_axis = (query_axis + 127) % 512;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir
+        .path()
+        .join("screenshot-evidence-search-persisted-vector.db");
+    let store = Store::open(store_config(db_path.clone())).expect("store opens");
+    let (context_id, entity_id) = context_and_entity(&store);
+    let (wrong_context_id, wrong_context_entity_id) = context_and_entity(&store);
+    for (evidence_id, vector) in [
+        (decoy_evidence_id, vector(512, decoy_axis)),
+        (
+            aligned_evidence_id,
+            vector_with_components(512, &[(query_axis, 0.8), (query_axis + 1, 0.6)]),
+        ),
+        (query_evidence_id, vector(512, query_axis)),
+    ] {
+        let observation = observation_with_evidence(
+            context_id,
+            entity_id,
+            image_evidence(evidence_id),
+            vec![PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: IMAGE_SPACE.to_string(),
+                vector,
+                target: EmbeddingTarget::Evidence(evidence_id),
+                produced_by: producer("vision-v1"),
+            }],
+        );
+        store
+            .record_observation(observation)
+            .expect("seed image evidence vector");
+    }
+    store
+        .record_observation(observation_with_evidence(
+            wrong_context_id,
+            wrong_context_entity_id,
+            image_evidence(wrong_context_evidence_id),
+            vec![PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: IMAGE_SPACE.to_string(),
+                vector: vector(512, query_axis),
+                target: EmbeddingTarget::Evidence(wrong_context_evidence_id),
+                produced_by: producer("vision-v1"),
+            }],
+        ))
+        .expect("seed closer wrong-context image evidence vector");
+    let (raw_targets, raw_scores, _raw_trace) =
+        raw_evidence_row_vector_hits(&store, query_evidence_id, context_id, 2);
+    drop(store);
+
+    let child = process::Command::new(std::env::current_exe().expect("current test exe"))
+        .arg("--exact")
+        .arg(
+            "screenshot_memory_review::screenshot_review_evidence_search_uses_persisted_evidence_vector_as_query",
+        )
+        .arg("--nocapture")
+        .env("CG_SCREENSHOT_EVIDENCE_SEARCH_CHILD", "1")
+        .env("CG_SCREENSHOT_EVIDENCE_SEARCH_DB", db_path.display().to_string())
+        .env(
+            "CG_SCREENSHOT_EVIDENCE_SEARCH_CONTEXT",
+            context_id.as_uuid().to_string(),
+        )
+        .env(
+            "CG_SCREENSHOT_EVIDENCE_SEARCH_QUERY",
+            query_evidence_id.as_uuid().to_string(),
+        )
+        .env(
+            "CG_SCREENSHOT_EVIDENCE_SEARCH_ALIGNED",
+            aligned_evidence_id.as_uuid().to_string(),
+        )
+        .env(
+            "CG_SCREENSHOT_EVIDENCE_SEARCH_DECOY",
+            decoy_evidence_id.as_uuid().to_string(),
+        )
+        .env(
+            "CG_SCREENSHOT_EVIDENCE_SEARCH_WRONG_CONTEXT",
+            wrong_context_evidence_id.as_uuid().to_string(),
+        )
+        .output()
+        .expect("spawn fresh evidence_search verifier process");
+
+    assert!(
+        raw_targets
+            == vec![
+                EmbeddingTarget::Evidence(query_evidence_id),
+                EmbeddingTarget::Evidence(aligned_evidence_id),
+            ]
+            && raw_scores.len() == 2
+            && raw_scores[0] > 0.99
+            && raw_scores[1] > 0.75
+            && raw_scores[1] < 0.99
+            && child.status.success(),
+        "evidence_search must verify the persisted query vector from a fresh process, not from the Store instance that seeded the rows; raw_targets={raw_targets:?}, raw_scores={raw_scores:?}, child_status={:?}, child_stdout={}, child_stderr={}",
+        child.status.code(),
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
+#[test]
+fn screenshot_review_semantic_search_uses_registered_default_text_embedder_and_engine_vectors() {
+    if std::env::var_os("CG_SCREENSHOT_SEMANTIC_SEARCH_CHILD").is_some() {
+        let db_path =
+            PathBuf::from(std::env::var("CG_SCREENSHOT_SEMANTIC_SEARCH_DB").expect("db env"));
+        let context_id = ContextId::from(uuid_env("CG_SCREENSHOT_SEMANTIC_SEARCH_CONTEXT"));
+        let matching_evidence_id =
+            EvidenceId::from(uuid_env("CG_SCREENSHOT_SEMANTIC_SEARCH_MATCHING"));
+        let decoy_evidence_id = EvidenceId::from(uuid_env("CG_SCREENSHOT_SEMANTIC_SEARCH_DECOY"));
+        let wrong_context_evidence_id =
+            EvidenceId::from(uuid_env("CG_SCREENSHOT_SEMANTIC_SEARCH_WRONG_CONTEXT"));
+        let query_token =
+            std::env::var("CG_SCREENSHOT_SEMANTIC_SEARCH_TOKEN").expect("semantic query token env");
+        let query_axis = std::env::var("CG_SCREENSHOT_SEMANTIC_SEARCH_AXIS")
+            .expect("semantic query axis env")
+            .parse::<usize>()
+            .expect("semantic query axis");
+        let query_text = format!("find the {query_token} architecture note");
+        let probe = Arc::new(VectorPrimitiveQueryProbe::default());
+        probe.begin();
+        let (store, embedder_calls, embedder_inputs, embedder_outputs) =
+            reopen_store_with_axis_text_embedder_and_probe(
+                &db_path,
+                probe.clone(),
+                query_token,
+                query_axis,
+            );
+        let hits = semantic_search(
+            &store,
+            &query_text,
+            VectorSearchFilters {
+                top_k: Some(1),
+                context_ids: Some(vec![context_id]),
+                include_planner_trace: true,
+                ..Default::default()
+            },
+        )
+        .expect("semantic_search over default text embedder");
+        probe.disable();
+        let embedder_outputs = embedder_outputs.lock().expect("embedder outputs").clone();
+        let embedder_output = embedder_outputs.first().cloned().unwrap_or_default();
+        let (raw_targets, raw_scores, raw_trace) = if embedder_output.len() == 768 {
+            raw_semantic_vector_hits(&store, embedder_output.clone(), context_id, 1)
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                "embedder output missing before raw semantic vector query".to_string(),
+            )
+        };
+        let targets = hits
+            .iter()
+            .map(|hit| hit.target.clone())
+            .collect::<Vec<_>>();
+        let scores = hits.iter().map(|hit| hit.score).collect::<Vec<_>>();
+        let embedder_inputs = embedder_inputs.lock().expect("embedder inputs").clone();
+        let semantic_vector_query_count = probe.semantic_vector_query_count();
+        let unexpected_vector_queries = probe.unexpected_vector_queries();
+        let observed_sql = probe.sql();
+        let source_forbidden_vector_bypass_markers =
+            vector_primitive_source_forbidden_bypass_markers("semantic_search");
+
+        assert!(
+            hits.len() == 1
+                && hits[0].target == EmbeddingTarget::Evidence(matching_evidence_id)
+                && !targets.contains(&EmbeddingTarget::Evidence(decoy_evidence_id))
+                && !targets.contains(&EmbeddingTarget::Evidence(wrong_context_evidence_id))
+                && targets == raw_targets
+                && raw_scores.len() == 1
+                && raw_scores[0] > 0.75
+                && raw_scores[0] < 0.99
+                && scores_match(&scores, &raw_scores)
+                && embedder_calls.load(Ordering::SeqCst) == 1
+                && embedder_inputs == vec![query_text.clone()]
+                && embedder_outputs == vec![vector(768, query_axis)]
+                && semantic_vector_query_count == 1
+                && unexpected_vector_queries.is_empty()
+                && source_forbidden_vector_bypass_markers.is_empty()
+                && dedup_engine_vector_trace(&raw_trace)
+                && hits[0].embedding_space_id == TEXT_SPACE
+                && hits[0].index_ref == "evidence.vector_text"
+                && hits[0].context_id == Some(context_id)
+                && hits[0].planner_trace == raw_trace,
+            "semantic_search must reopen durable contextdb state in a fresh process under an already-enabled query probe, embed the query exactly once with the registered default text Embedder, bind that runtime output vector into a context-restricted engine query, and return the same ordered ids/scores/trace as raw contextdb. The matching row vector is deliberately similar but not identical to the Embedder output, and a wrong-context row exactly matches the Embedder output, so ignoring the output, binding the row vector, or ignoring context scope changes the score/target; hits={hits:?}, targets={targets:?}, scores={scores:?}, raw_targets={raw_targets:?}, raw_scores={raw_scores:?}, raw_trace={raw_trace:?}, embedder_calls={}, embedder_inputs={embedder_inputs:?}, embedder_outputs={embedder_outputs:?}, query_axis={query_axis}, semantic_vector_query_count={semantic_vector_query_count}, unexpected_vector_queries={unexpected_vector_queries:?}, source_forbidden_vector_bypass_markers={source_forbidden_vector_bypass_markers:?}, observed_sql={observed_sql:?}, matching_evidence_id={matching_evidence_id:?}, decoy_evidence_id={decoy_evidence_id:?}, wrong_context_evidence_id={wrong_context_evidence_id:?}",
+            embedder_calls.load(Ordering::SeqCst)
+        );
+        return;
+    }
+
+    let matching_evidence_id = EvidenceId::new_v7();
+    let decoy_evidence_id = EvidenceId::new_v7();
+    let wrong_context_evidence_id = EvidenceId::new_v7();
+    let query_token = format!("rate-limiter-{}", uuid::Uuid::now_v7());
+    let query_axis = ((uuid::Uuid::now_v7().as_u128() as usize) % 600) + 100;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("screenshot-semantic-search-embedder.db");
+    let store = Store::open(store_config(db_path.clone())).expect("store opens");
+    let (context_id, entity_id) = context_and_entity(&store);
+    let (wrong_context_id, wrong_context_entity_id) = context_and_entity(&store);
+    for (evidence_id, text, vector) in [
+        (
+            decoy_evidence_id,
+            "vegetation anomaly at loading dock",
+            vector(768, 1),
+        ),
+        (
+            matching_evidence_id,
+            "architecture note for screenshot session",
+            vector_with_components(768, &[(query_axis, 0.8), (query_axis + 1, 0.6)]),
+        ),
+    ] {
+        let observation = observation_with_evidence(
+            context_id,
+            entity_id,
+            text_evidence(evidence_id, text),
+            vec![PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: TEXT_SPACE.to_string(),
+                vector,
+                target: EmbeddingTarget::Evidence(evidence_id),
+                produced_by: semantic_fixture_producer(),
+            }],
+        );
+        store
+            .record_observation(observation)
+            .expect("seed text evidence vector");
+    }
+    store
+        .record_observation(observation_with_evidence(
+            wrong_context_id,
+            wrong_context_entity_id,
+            text_evidence(wrong_context_evidence_id, "wrong context exact query match"),
+            vec![PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: TEXT_SPACE.to_string(),
+                vector: vector(768, query_axis),
+                target: EmbeddingTarget::Evidence(wrong_context_evidence_id),
+                produced_by: semantic_fixture_producer(),
+            }],
+        ))
+        .expect("seed closer wrong-context text evidence vector");
+    let (raw_targets, raw_scores, _raw_trace) =
+        raw_semantic_vector_hits(&store, vector(768, query_axis), context_id, 1);
+    drop(store);
+
+    let child = process::Command::new(std::env::current_exe().expect("current test exe"))
+        .arg("--exact")
+        .arg(
+            "screenshot_memory_review::screenshot_review_semantic_search_uses_registered_default_text_embedder_and_engine_vectors",
+        )
+        .arg("--nocapture")
+        .env("CG_SCREENSHOT_SEMANTIC_SEARCH_CHILD", "1")
+        .env("CG_SCREENSHOT_SEMANTIC_SEARCH_DB", db_path.display().to_string())
+        .env(
+            "CG_SCREENSHOT_SEMANTIC_SEARCH_CONTEXT",
+            context_id.as_uuid().to_string(),
+        )
+        .env(
+            "CG_SCREENSHOT_SEMANTIC_SEARCH_MATCHING",
+            matching_evidence_id.as_uuid().to_string(),
+        )
+        .env(
+            "CG_SCREENSHOT_SEMANTIC_SEARCH_DECOY",
+            decoy_evidence_id.as_uuid().to_string(),
+        )
+        .env(
+            "CG_SCREENSHOT_SEMANTIC_SEARCH_WRONG_CONTEXT",
+            wrong_context_evidence_id.as_uuid().to_string(),
+        )
+        .env("CG_SCREENSHOT_SEMANTIC_SEARCH_TOKEN", &query_token)
+        .env("CG_SCREENSHOT_SEMANTIC_SEARCH_AXIS", query_axis.to_string())
+        .output()
+        .expect("spawn fresh semantic_search verifier process");
+
+    assert!(
+        raw_targets == vec![EmbeddingTarget::Evidence(matching_evidence_id)]
+            && raw_scores.len() == 1
+            && raw_scores[0] > 0.75
+            && raw_scores[0] < 0.99
+            && child.status.success(),
+        "semantic_search must verify the registered Embedder output vector from a fresh process, not from the Store instance that seeded rows or from the matching row's stored vector; raw_targets={raw_targets:?}, raw_scores={raw_scores:?}, child_status={:?}, child_stdout={}, child_stderr={}",
+        child.status.code(),
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
     );
 }
 
