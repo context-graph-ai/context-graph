@@ -2,7 +2,7 @@
 fn main() {}
 
 #[cfg(context_graph_internal_test_support)]
-use candle_core::{Device, Tensor};
+use candle_core::{D, DType, Device, Tensor};
 #[cfg(context_graph_internal_test_support)]
 use chrono::Utc;
 #[cfg(context_graph_internal_test_support)]
@@ -50,6 +50,18 @@ const K_PROJ_TENSOR: &str = "model.layers.0.self_attn.k_proj.weight";
 const V_PROJ_TENSOR: &str = "model.layers.0.self_attn.v_proj.weight";
 #[cfg(context_graph_internal_test_support)]
 const O_PROJ_TENSOR: &str = "model.layers.0.self_attn.o_proj.weight";
+#[cfg(context_graph_internal_test_support)]
+const Q_NORM_TENSOR: &str = "model.layers.0.self_attn.q_norm.weight";
+#[cfg(context_graph_internal_test_support)]
+const K_NORM_TENSOR: &str = "model.layers.0.self_attn.k_norm.weight";
+#[cfg(context_graph_internal_test_support)]
+const INPUT_LAYERNORM_TENSOR: &str = "model.layers.0.input_layernorm.weight";
+#[cfg(context_graph_internal_test_support)]
+const PRE_FEEDFORWARD_LAYERNORM_TENSOR: &str = "model.layers.0.pre_feedforward_layernorm.weight";
+#[cfg(context_graph_internal_test_support)]
+const POST_FEEDFORWARD_LAYERNORM_TENSOR: &str = "model.layers.0.post_feedforward_layernorm.weight";
+#[cfg(context_graph_internal_test_support)]
+const POST_ATTENTION_LAYERNORM_TENSOR: &str = "model.layers.0.post_attention_layernorm.weight";
 #[cfg(context_graph_internal_test_support)]
 const GATE_PROJ_TENSOR: &str = "model.layers.0.mlp.gate_proj.weight";
 #[cfg(context_graph_internal_test_support)]
@@ -233,6 +245,12 @@ struct MiniEmbeddingGemmaWeights {
     k_proj: Vec<f32>,
     v_proj: Vec<f32>,
     o_proj: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    input_layernorm: Vec<f32>,
+    pre_feedforward_layernorm: Vec<f32>,
+    post_feedforward_layernorm: Vec<f32>,
+    post_attention_layernorm: Vec<f32>,
     gate_proj: Vec<f32>,
     up_proj: Vec<f32>,
     down_proj: Vec<f32>,
@@ -251,13 +269,19 @@ fn vectors_close(left: &[f32], right: &[f32]) -> bool {
 }
 
 #[cfg(context_graph_internal_test_support)]
-fn required_graph_tensors() -> [&'static str; 11] {
-    [
+fn required_graph_tensors() -> Vec<&'static str> {
+    vec![
         TOKEN_EMBEDDING_TENSOR,
         Q_PROJ_TENSOR,
         K_PROJ_TENSOR,
         V_PROJ_TENSOR,
         O_PROJ_TENSOR,
+        Q_NORM_TENSOR,
+        K_NORM_TENSOR,
+        INPUT_LAYERNORM_TENSOR,
+        PRE_FEEDFORWARD_LAYERNORM_TENSOR,
+        POST_FEEDFORWARD_LAYERNORM_TENSOR,
+        POST_ATTENTION_LAYERNORM_TENSOR,
         GATE_PROJ_TENSOR,
         UP_PROJ_TENSOR,
         DOWN_PROJ_TENSOR,
@@ -294,6 +318,18 @@ fn mini_weights_from_safetensors(model_path: &std::path::Path) -> MiniEmbeddingG
         k_proj: safetensor_f32_values(&tensors, K_PROJ_TENSOR),
         v_proj: safetensor_f32_values(&tensors, V_PROJ_TENSOR),
         o_proj: safetensor_f32_values(&tensors, O_PROJ_TENSOR),
+        q_norm: safetensor_f32_values(&tensors, Q_NORM_TENSOR),
+        k_norm: safetensor_f32_values(&tensors, K_NORM_TENSOR),
+        input_layernorm: safetensor_f32_values(&tensors, INPUT_LAYERNORM_TENSOR),
+        pre_feedforward_layernorm: safetensor_f32_values(
+            &tensors,
+            PRE_FEEDFORWARD_LAYERNORM_TENSOR,
+        ),
+        post_feedforward_layernorm: safetensor_f32_values(
+            &tensors,
+            POST_FEEDFORWARD_LAYERNORM_TENSOR,
+        ),
+        post_attention_layernorm: safetensor_f32_values(&tensors, POST_ATTENTION_LAYERNORM_TENSOR),
         gate_proj: safetensor_f32_values(&tensors, GATE_PROJ_TENSOR),
         up_proj: safetensor_f32_values(&tensors, UP_PROJ_TENSOR),
         down_proj: safetensor_f32_values(&tensors, DOWN_PROJ_TENSOR),
@@ -304,41 +340,133 @@ fn mini_weights_from_safetensors(model_path: &std::path::Path) -> MiniEmbeddingG
 }
 
 #[cfg(context_graph_internal_test_support)]
-fn candle_mini_gemma_token_output(weights: &MiniEmbeddingGemmaWeights, token_id: usize) -> Tensor {
-    let token_start = token_id * 4;
-    let token = tensor_row(
-        &weights.token_embedding[token_start..token_start + 4],
-        (1, 4),
-    );
-    let q = token
+fn mini_rms_norm(xs: &Tensor, weight: &[f32]) -> Tensor {
+    let weight = Tensor::from_slice(weight, weight.len(), &Device::Cpu).expect("rms weight");
+    let hidden_size = xs.dim(D::Minus1).expect("hidden dim");
+    let xs_f32 = xs.to_dtype(DType::F32).expect("rms dtype");
+    let norm = (xs_f32
+        .sqr()
+        .expect("rms sqr")
+        .sum_keepdim(D::Minus1)
+        .expect("rms sum")
+        / hidden_size as f64)
+        .expect("rms mean");
+    xs_f32
+        .broadcast_div(&(norm + 1.0e-6).expect("rms eps").sqrt().expect("rms sqrt"))
+        .expect("rms divide")
+        .broadcast_mul(&(weight + 1.0).expect("rms weight plus one"))
+        .expect("rms multiply")
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn mini_token_sequence(weights: &MiniEmbeddingGemmaWeights, token_ids: &[usize]) -> Tensor {
+    let mut values = Vec::with_capacity(token_ids.len() * 4);
+    for token_id in token_ids {
+        let token_start = token_id * 4;
+        values.extend_from_slice(&weights.token_embedding[token_start..token_start + 4]);
+    }
+    Tensor::from_slice(&values, (1, token_ids.len(), 4), &Device::Cpu).expect("token sequence")
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn mini_apply_rotary(q: &Tensor, k: &Tensor, seq_len: usize) -> (Tensor, Tensor) {
+    let inv_freq = Tensor::from_vec(vec![1.0_f32, 0.01], (1, 2), &Device::Cpu).expect("inv freq");
+    let positions = Tensor::arange(0u32, seq_len as u32, &Device::Cpu)
+        .expect("positions")
+        .to_dtype(DType::F32)
+        .expect("position dtype")
+        .reshape((seq_len, 1))
+        .expect("position reshape");
+    let freqs = positions.matmul(&inv_freq).expect("rotary freqs");
+    let sin = freqs.sin().expect("rotary sin");
+    let cos = freqs.cos().expect("rotary cos");
+    (
+        candle_nn::rotary_emb::rope(&q.contiguous().expect("q contiguous"), &cos, &sin)
+            .expect("q rope"),
+        candle_nn::rotary_emb::rope(&k.contiguous().expect("k contiguous"), &cos, &sin)
+            .expect("k rope"),
+    )
+}
+
+#[cfg(context_graph_internal_test_support)]
+fn candle_mini_gemma_forward_parts(
+    weights: &MiniEmbeddingGemmaWeights,
+    token_ids: &[usize],
+) -> Tensor {
+    let seq_len = token_ids.len();
+    let token_embedding = mini_token_sequence(weights, token_ids);
+    let normalized = mini_rms_norm(&token_embedding, &weights.input_layernorm);
+    let normalized_2d = normalized
+        .reshape((seq_len, 4))
+        .expect("normalized reshape");
+    let q = normalized_2d
         .matmul(&tensor_row(&weights.q_proj, (4, 4)))
-        .expect("candle q projection");
-    let k = token
+        .expect("candle q projection")
+        .reshape((1, seq_len, 1, 4))
+        .expect("q reshape")
+        .transpose(1, 2)
+        .expect("q transpose");
+    let k = normalized_2d
         .matmul(&tensor_row(&weights.k_proj, (4, 4)))
-        .expect("candle k projection");
-    let v = token
+        .expect("candle k projection")
+        .reshape((1, seq_len, 1, 4))
+        .expect("k reshape")
+        .transpose(1, 2)
+        .expect("k transpose");
+    let v = normalized_2d
         .matmul(&tensor_row(&weights.v_proj, (4, 4)))
-        .expect("candle v projection");
-    let attention = (((&q + &k).expect("candle q+k") + &v).expect("candle q+k+v") / 3.0)
-        .expect("candle attention average");
-    let attention_out = attention
+        .expect("candle v projection")
+        .reshape((1, seq_len, 1, 4))
+        .expect("v reshape")
+        .transpose(1, 2)
+        .expect("v transpose");
+    let q = mini_rms_norm(&q, &weights.q_norm);
+    let k = mini_rms_norm(&k, &weights.k_norm);
+    let (q, k) = mini_apply_rotary(&q, &k, seq_len);
+    let attention_scores = (q
+        .matmul(&k.transpose(2, 3).expect("k transpose score"))
+        .expect("attention scores")
+        * 0.5)
+        .expect("attention scale");
+    let attention_weights =
+        candle_nn::ops::softmax_last_dim(&attention_scores).expect("attention softmax");
+    let attention_out = attention_weights
+        .matmul(&v)
+        .expect("attention values")
+        .transpose(1, 2)
+        .expect("attention transpose")
+        .reshape((seq_len, 4))
+        .expect("attention reshape")
         .matmul(&tensor_row(&weights.o_proj, (4, 4)))
-        .expect("candle o projection");
-    let gate = attention_out
+        .expect("candle o projection")
+        .reshape((1, seq_len, 4))
+        .expect("attention output reshape");
+    let attention_out = mini_rms_norm(&attention_out, &weights.post_attention_layernorm);
+    let post_attention = (&attention_out + &token_embedding).expect("attention residual");
+    let mlp_input = mini_rms_norm(&post_attention, &weights.pre_feedforward_layernorm);
+    let mlp_input_2d = mlp_input.reshape((seq_len, 4)).expect("mlp reshape");
+    let gate = mlp_input_2d
         .matmul(&tensor_row(&weights.gate_proj, (4, 8)))
         .expect("candle gate projection")
-        .tanh()
+        .silu()
         .expect("candle gate activation");
-    let up = attention_out
+    let up = mlp_input_2d
         .matmul(&tensor_row(&weights.up_proj, (4, 8)))
         .expect("candle up projection");
     let gated = (&gate * &up).expect("candle gated mlp");
     let mlp = gated
         .matmul(&tensor_row(&weights.down_proj, (8, 4)))
-        .expect("candle down projection");
-    let final_norm =
-        Tensor::from_slice(&weights.final_norm, (1, 4), &Device::Cpu).expect("candle norm");
-    ((&attention_out + &mlp).expect("candle residual") * &final_norm).expect("candle final norm")
+        .expect("candle down projection")
+        .reshape((1, seq_len, 4))
+        .expect("mlp output reshape");
+    let mlp = mini_rms_norm(&mlp, &weights.post_feedforward_layernorm);
+    let layer_out = (&post_attention + &mlp).expect("mlp residual");
+    let final_sequence = mini_rms_norm(&layer_out, &weights.final_norm);
+    final_sequence
+        .mean_keepdim(1)
+        .expect("mean pool")
+        .reshape((1, 4))
+        .expect("pooled reshape")
 }
 
 #[cfg(context_graph_internal_test_support)]
@@ -346,16 +474,11 @@ fn candle_mini_gemma_golden_projection(
     weights: &MiniEmbeddingGemmaWeights,
     token_ids: &[usize],
 ) -> Vec<f32> {
-    let pooled = token_ids
-        .iter()
-        .map(|token_id| candle_mini_gemma_token_output(weights, *token_id))
-        .reduce(|left, right| (&left + &right).expect("candle pool add"))
-        .expect("at least one token");
-    let pooled = (pooled / token_ids.len() as f64).expect("candle mean pool");
+    let pooled = candle_mini_gemma_forward_parts(weights, token_ids);
     let projection_hidden = pooled
         .matmul(&tensor_row(&weights.text_projection_up, (4, 8)))
         .expect("candle projection up")
-        .tanh()
+        .silu()
         .expect("candle projection activation");
     projection_hidden
         .matmul(&tensor_row(&weights.text_projection_down, (8, 768)))
@@ -393,6 +516,12 @@ fn stage_valid_mini_embeddinggemma_cache(
         k_proj: seeded_values(seed.rotate_left(2), 4 * 4, 0.2),
         v_proj: seeded_values(seed.rotate_left(3), 4 * 4, 0.2),
         o_proj: seeded_values(seed.rotate_left(4), 4 * 4, 0.2),
+        q_norm: seeded_values(seed.rotate_left(10), 4, 0.05),
+        k_norm: seeded_values(seed.rotate_left(11), 4, 0.05),
+        input_layernorm: seeded_values(seed.rotate_left(12), 4, 0.05),
+        pre_feedforward_layernorm: seeded_values(seed.rotate_left(13), 4, 0.05),
+        post_feedforward_layernorm: seeded_values(seed.rotate_left(14), 4, 0.05),
+        post_attention_layernorm: seeded_values(seed.rotate_left(15), 4, 0.05),
         gate_proj: seeded_values(seed.rotate_left(5), 4 * 8, 0.15),
         up_proj: seeded_values(seed.rotate_left(6), 4 * 8, 0.15),
         down_proj: seeded_values(seed.rotate_left(7), 8 * 4, 0.15),
@@ -405,6 +534,12 @@ fn stage_valid_mini_embeddinggemma_cache(
     let k_proj_bytes = tensor_bytes(&weights.k_proj);
     let v_proj_bytes = tensor_bytes(&weights.v_proj);
     let o_proj_bytes = tensor_bytes(&weights.o_proj);
+    let q_norm_bytes = tensor_bytes(&weights.q_norm);
+    let k_norm_bytes = tensor_bytes(&weights.k_norm);
+    let input_layernorm_bytes = tensor_bytes(&weights.input_layernorm);
+    let pre_feedforward_layernorm_bytes = tensor_bytes(&weights.pre_feedforward_layernorm);
+    let post_feedforward_layernorm_bytes = tensor_bytes(&weights.post_feedforward_layernorm);
+    let post_attention_layernorm_bytes = tensor_bytes(&weights.post_attention_layernorm);
     let gate_proj_bytes = tensor_bytes(&weights.gate_proj);
     let up_proj_bytes = tensor_bytes(&weights.up_proj);
     let down_proj_bytes = tensor_bytes(&weights.down_proj);
@@ -417,6 +552,19 @@ fn stage_valid_mini_embeddinggemma_cache(
     let k_tensor = TensorView::new(Dtype::F32, vec![4, 4], &k_proj_bytes).expect("k view");
     let v_tensor = TensorView::new(Dtype::F32, vec![4, 4], &v_proj_bytes).expect("v view");
     let o_tensor = TensorView::new(Dtype::F32, vec![4, 4], &o_proj_bytes).expect("o view");
+    let q_norm_tensor = TensorView::new(Dtype::F32, vec![4], &q_norm_bytes).expect("q norm view");
+    let k_norm_tensor = TensorView::new(Dtype::F32, vec![4], &k_norm_bytes).expect("k norm view");
+    let input_layernorm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &input_layernorm_bytes).expect("input norm view");
+    let pre_feedforward_layernorm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &pre_feedforward_layernorm_bytes)
+            .expect("pre feedforward norm view");
+    let post_feedforward_layernorm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &post_feedforward_layernorm_bytes)
+            .expect("post feedforward norm view");
+    let post_attention_layernorm_tensor =
+        TensorView::new(Dtype::F32, vec![4], &post_attention_layernorm_bytes)
+            .expect("post attention norm view");
     let gate_tensor = TensorView::new(Dtype::F32, vec![4, 8], &gate_proj_bytes).expect("gate view");
     let up_tensor = TensorView::new(Dtype::F32, vec![4, 8], &up_proj_bytes).expect("up view");
     let down_tensor = TensorView::new(Dtype::F32, vec![8, 4], &down_proj_bytes).expect("down view");
@@ -435,6 +583,21 @@ fn stage_valid_mini_embeddinggemma_cache(
             (K_PROJ_TENSOR, k_tensor),
             (V_PROJ_TENSOR, v_tensor),
             (O_PROJ_TENSOR, o_tensor),
+            (Q_NORM_TENSOR, q_norm_tensor),
+            (K_NORM_TENSOR, k_norm_tensor),
+            (INPUT_LAYERNORM_TENSOR, input_layernorm_tensor),
+            (
+                PRE_FEEDFORWARD_LAYERNORM_TENSOR,
+                pre_feedforward_layernorm_tensor,
+            ),
+            (
+                POST_FEEDFORWARD_LAYERNORM_TENSOR,
+                post_feedforward_layernorm_tensor,
+            ),
+            (
+                POST_ATTENTION_LAYERNORM_TENSOR,
+                post_attention_layernorm_tensor,
+            ),
             (GATE_PROJ_TENSOR, gate_tensor),
             (UP_PROJ_TENSOR, up_tensor),
             (DOWN_PROJ_TENSOR, down_tensor),
@@ -472,9 +635,15 @@ fn stage_valid_mini_embeddinggemma_cache(
             "model_type": "embeddinggemma",
             "architectures": ["EmbeddingGemmaTextModel"],
             "hidden_size": 4,
+            "head_dim": 4,
             "num_hidden_layers": 1,
             "num_attention_heads": 1,
+            "num_key_value_heads": 1,
             "intermediate_size": 8,
+            "hidden_activation": "silu",
+            "rms_norm_eps": 1.0e-6,
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": 10000.0,
             "projection_dim": 768,
             "projection_intermediate_size": 8,
             "matryoshka_dimensions": [768, 512, 256, 128],

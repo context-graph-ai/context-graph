@@ -247,6 +247,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-nn"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9317a09d6530b758990ed7f625ac69ff43653bc9ee28b0464644ad1169ada87"
+dependencies = [
+ "candle-core",
+ "half",
+ "libc",
+ "num-traits",
+ "rayon",
+ "safetensors",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -397,6 +413,7 @@ name = "context-graph"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "candle-nn",
  "chrono",
  "contextdb-core",
  "contextdb-engine",
@@ -461,6 +478,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "contextdb-hnsw"
+version = "1.0.0"
+dependencies = [
+ "anndists",
+ "anyhow",
+ "bincode 1.3.3",
+ "cfg-if",
+ "cpu-time",
+ "env_logger",
+ "hashbrown 0.15.5",
+ "indexmap",
+ "lazy_static",
+ "log",
+ "mmap-rs",
+ "num-traits",
+ "num_cpus",
+ "parking_lot",
+ "rand",
+ "rayon",
+ "serde",
+]
+
+[[package]]
 name = "contextdb-parser"
 version = "1.0.0"
 dependencies = [
@@ -501,8 +541,8 @@ version = "1.0.0"
 dependencies = [
  "anndists",
  "contextdb-core",
+ "contextdb-hnsw",
  "contextdb-tx",
- "hnsw_rs",
  "parking_lot",
  "roaring",
 ]
@@ -1073,31 +1113,6 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
-
-[[package]]
-name = "hnsw_rs"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07"
-dependencies = [
- "anndists",
- "anyhow",
- "bincode 1.3.3",
- "cfg-if",
- "cpu-time",
- "env_logger",
- "hashbrown 0.15.5",
- "indexmap",
- "lazy_static",
- "log",
- "mmap-rs",
- "num-traits",
- "num_cpus",
- "parking_lot",
- "rand",
- "rayon",
- "serde",
-]
 
 [[package]]
 name = "iana-time-zone"
