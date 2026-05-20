@@ -105,7 +105,11 @@ fn new_text_space() -> EmbeddingSpace {
         model_version: "v1".to_string(),
         supported_evidence_kinds: vec![EvidenceKind::Text],
         default_for_evidence_kind: None,
-        bindings: Vec::new(),
+        bindings: vec![EmbeddingSpaceBinding {
+            embedding_space_id: NEW_TEXT_SPACE.to_string(),
+            table_name: "digests".to_string(),
+            vector_column: "vector_text".to_string(),
+        }],
     }
 }
 

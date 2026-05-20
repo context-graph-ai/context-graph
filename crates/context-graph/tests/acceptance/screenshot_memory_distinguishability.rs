@@ -1,9 +1,9 @@
 use chrono::Utc;
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDigest, CreateEntity, DigestId, DistanceMetric,
-    EmbeddingId, EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType, EvidenceId,
-    EvidenceKind, EvidenceProducer, EvidenceRef, PrecomputedEmbedding, RecordObservation,
-    ReindexEvent, Store, StoreConfig,
+    EmbeddingId, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType,
+    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, PrecomputedEmbedding,
+    RecordObservation, ReindexEvent, Store, StoreConfig,
     test_support::embedding::{VectorSearchFilters, dedup_compare_digest_spaces, vector_search},
 };
 use std::collections::BTreeMap;
@@ -26,7 +26,11 @@ fn store() -> Store {
             model_version: "v1".to_string(),
             supported_evidence_kinds: vec![EvidenceKind::Text],
             default_for_evidence_kind: None,
-            bindings: Vec::new(),
+            bindings: vec![EmbeddingSpaceBinding {
+                embedding_space_id: NEW_TEXT_SPACE.to_string(),
+                table_name: "digests".to_string(),
+                vector_column: "vector_text".to_string(),
+            }],
         }],
         ..Default::default()
     })
@@ -224,11 +228,35 @@ fn screenshot_review_dedup_classifier_refuses_cross_space_compare_under_realisti
         tuesday_digest,
         OLD_TEXT_SPACE,
     );
+    let friday_hits = vector_search(
+        &store,
+        &vector(768, 0),
+        NEW_TEXT_SPACE,
+        VectorSearchFilters {
+            top_k: Some(2),
+            ..Default::default()
+        },
+    );
+    let tuesday_hits = vector_search(
+        &store,
+        &vector(768, 0),
+        OLD_TEXT_SPACE,
+        VectorSearchFilters {
+            top_k: Some(2),
+            ..Default::default()
+        },
+    );
     let events = store.drain_reindex_events();
 
     assert!(
         tuesday.is_ok()
             && friday.is_ok()
+            && friday_hits.as_ref().is_ok_and(|rows| rows.len() == 1
+                && rows[0].target == context_graph::EmbeddingTarget::Digest(friday_digest)
+                && rows[0].index_ref == "digests.vector_text")
+            && tuesday_hits.as_ref().is_ok_and(|rows| rows.len() == 1
+                && rows[0].target == context_graph::EmbeddingTarget::Digest(tuesday_digest)
+                && rows[0].index_ref == "digests.vector_text")
             && matches!(
                 &result,
                 Err(CgError::CrossSpaceQueryRefused {
@@ -244,6 +272,6 @@ fn screenshot_review_dedup_classifier_refuses_cross_space_compare_under_realisti
                     to_space
                 } if from_space == OLD_TEXT_SPACE && to_space == NEW_TEXT_SPACE
             )),
-        "realistic text-default version bump must refuse exact spaces and emit exact reindex trigger, tuesday={tuesday:?}, friday={friday:?}, result={result:?}, events={events:?}"
+        "realistic text-default version bump must persist each Digest under its own space-filtered digests.vector_text binding, refuse exact spaces, and emit exact reindex trigger, tuesday={tuesday:?}, friday={friday:?}, friday_hits={friday_hits:?}, tuesday_hits={tuesday_hits:?}, result={result:?}, events={events:?}"
     );
 }
