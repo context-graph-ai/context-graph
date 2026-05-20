@@ -17,6 +17,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
+candle-transformers = "0.10.2"
 criterion = { version = "0.8", features = ["html_reports"] }
 contextdb-core = { path = "../contextdb/crates/contextdb-core" }
 contextdb-engine = { path = "../contextdb/crates/contextdb-engine" }

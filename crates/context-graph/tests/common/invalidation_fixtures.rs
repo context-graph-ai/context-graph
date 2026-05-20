@@ -35,6 +35,7 @@ pub fn fresh_store() -> (tempfile::TempDir, StoreConfig, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(EmbedderConfig::disabled()),
         ..Default::default()
     };
     let store = Store::open(config.clone()).expect("open store");
@@ -333,7 +334,7 @@ pub fn record_seed_observation(
                 id: EvidenceId::new_v7(),
                 observation_id,
                 context_id: ContextId::default(),
-                kind: EvidenceKind::Text,
+                kind: EvidenceKind::StructuredSignal,
                 source_ref:
                     "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_string(),

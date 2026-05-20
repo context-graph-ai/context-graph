@@ -11,6 +11,7 @@ fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::open(StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: None,
         ..Default::default()
     })
     .expect("open");
@@ -1462,6 +1463,7 @@ fn record_observation_derived_from_links_within_same_context_chain_preserved() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: None,
         ..Default::default()
     };
     let db_path = config.db_path.clone();
@@ -2420,6 +2422,7 @@ fn replay_lineage_walk_visits_entity_snapshot_evidenced_by_observation_evidence_
     let store = Store::open(StoreConfig {
         db_path: dir.path().join("cg.db"),
         https_allowed_hosts: vec!["github.com".to_string(), "slack.com".to_string()],
+        default_text_embedder: None,
         ..Default::default()
     })
     .expect("open");

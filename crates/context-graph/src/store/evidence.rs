@@ -4,9 +4,9 @@ use chrono::{DateTime, Utc};
 use contextdb_core::{Error as EngineError, SnapshotId, Value};
 use serde_json::Value as JsonValue;
 
-use crate::Result;
 use crate::error::CgError;
 use crate::types::*;
+use crate::{CG_EDGE_SYSTEM_TAG, Result};
 
 use super::Store;
 use super::convert::{decision_status_from_str, map_engine_err};
@@ -142,13 +142,20 @@ impl Store {
         let result = self
             .db
             .execute(
-                "SELECT embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind FROM embedding_spaces",
+                "SELECT embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings FROM embedding_spaces",
                 &HashMap::new(),
             )
             .map_err(map_engine_err)?;
         let mut spaces = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             let embedding_space_id = get_text(row, &result.columns, "embedding_space_id")?;
+            let mut bindings = self.bindings_for_space(&embedding_space_id)?;
+            if bindings.is_empty() {
+                bindings = bindings_from_json(
+                    &embedding_space_id,
+                    &get_json(row, &result.columns, "bindings")?,
+                );
+            }
             spaces.push(EmbeddingSpace {
                 embedding_space_id: embedding_space_id.clone(),
                 dimension: get_int(row, &result.columns, "dimension")? as usize,
@@ -171,7 +178,7 @@ impl Store {
                 )?
                 .map(|raw| evidence_kind_from_str(&raw))
                 .transpose()?,
-                bindings: self.bindings_for_space(&embedding_space_id)?,
+                bindings,
             });
         }
         spaces.sort_by(|a, b| a.embedding_space_id.cmp(&b.embedding_space_id));
@@ -491,6 +498,21 @@ impl Store {
         Ok(rows)
     }
 
+    pub(crate) fn invalidation_by_id(&self, id: InvalidationId) -> Result<Option<Invalidation>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| decode_invalidation(&result.columns, row))
+            .transpose()
+    }
+
     pub fn update_decision_basis(
         &self,
         decision_id: DecisionId,
@@ -733,9 +755,7 @@ impl Store {
         self.list_embedding_spaces()?
             .into_iter()
             .find(|space| space.embedding_space_id == id)
-            .ok_or(CgError::EmbeddingSpaceMismatch {
-                conflicting_field: "embedding_space_id",
-            })
+            .ok_or_else(|| CgError::UnknownEmbeddingSpace { id: id.to_string() })
     }
 
     pub(super) fn evidence_status_at_snapshot(
@@ -761,6 +781,22 @@ impl Store {
         rows.sort_by_key(|row| row.0);
         Ok(rows.last().map(|row| row.1))
     }
+}
+
+fn bindings_from_json(embedding_space_id: &str, value: &JsonValue) -> Vec<EmbeddingSpaceBinding> {
+    let Some(bindings) = value.as_array() else {
+        return Vec::new();
+    };
+    bindings
+        .iter()
+        .filter_map(|binding| {
+            Some(EmbeddingSpaceBinding {
+                embedding_space_id: embedding_space_id.to_string(),
+                table_name: binding.get("table_name")?.as_str()?.to_string(),
+                vector_column: binding.get("vector_column")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
 }
 
 struct DecisionStatusAndContext {
@@ -795,7 +831,8 @@ pub(super) fn decode_evidence(columns: &[String], row: &[Value]) -> Result<Evide
         time_range_ms: optional_pair(row, columns, "time_range_ms")?,
         frame_index: optional_u64(row, columns, "frame_index")?,
         region: optional_json(row, columns, "region")?,
-        producer: serde_json::from_value(get_json(row, columns, "producer")?).unwrap_or_default(),
+        producer: serde_json::from_value(get_json(row, columns, "producer")?)
+            .map_err(|err| CgError::Engine(format!("invalid evidence producer json: {err}")))?,
         text_projection: get_optional_text(row, columns, "text_projection")?,
         derived_from: optional_uuid(row, columns, "derived_from")?.map(EvidenceId::from),
         retention_status: retention_status_from_str(&get_text(row, columns, "retention_status")?)?,
@@ -1123,14 +1160,6 @@ pub(super) fn value_for_optional_evidence_id(value: Option<EvidenceId>) -> Value
         .unwrap_or(Value::Null)
 }
 
-pub(super) fn embedding_target_kind(target: &EmbeddingTarget) -> &'static str {
-    match target {
-        EmbeddingTarget::Evidence(_) => "evidence",
-        EmbeddingTarget::EntityReference(_, _) => "entity_reference",
-        EmbeddingTarget::Digest(_) => "digest",
-    }
-}
-
 pub(super) fn embedding_target_uuid(target: &EmbeddingTarget) -> uuid::Uuid {
     match target {
         EmbeddingTarget::Evidence(id) => id.as_uuid(),
@@ -1143,25 +1172,83 @@ pub(super) fn vector_binding_for_target(
     space: &EmbeddingSpace,
     target_kind: &str,
 ) -> Result<EmbeddingSpaceBinding> {
-    let table = match target_kind {
-        "evidence" => "evidence",
-        "entity_reference" => "entity_reference_embeddings",
-        "digest" => "digests",
-        _ => "",
+    let (table, column) = match target_kind {
+        "evidence" => ("evidence", "vector_text"),
+        "entity_reference" => ("entity_reference_embeddings", "vector"),
+        "digest" => ("digests", "vector_text"),
+        _ => ("", ""),
     };
     space
         .bindings
         .iter()
         .find(|binding| binding.table_name == table)
         .cloned()
-        .ok_or(CgError::EmbeddingSpaceMismatch {
-            conflicting_field: "bindings",
+        .ok_or(CgError::MissingVectorColumnForSpace {
+            table: table.to_string(),
+            column: column.to_string(),
         })
 }
 
 pub(super) fn validate_space_kind(space: &EmbeddingSpace, kind: EvidenceKind) -> Result<()> {
     if !space.supported_evidence_kinds.contains(&kind) {
         return Err(CgError::UnsupportedEvidenceKind { kind });
+    }
+    Ok(())
+}
+
+pub(super) fn validate_precomputed_embedding(
+    embedding: &PrecomputedEmbedding,
+    allow_reserved_producer: bool,
+) -> Result<()> {
+    if embedding.vector.is_empty() {
+        return Err(CgError::EmptyVector);
+    }
+    for (index, value) in embedding.vector.iter().enumerate() {
+        let actual = if value.is_nan() {
+            Some("NaN")
+        } else if value.is_infinite() {
+            Some(if value.is_sign_negative() {
+                "-inf"
+            } else {
+                "inf"
+            })
+        } else if value.is_subnormal() {
+            Some("subnormal")
+        } else {
+            None
+        };
+        if let Some(actual) = actual {
+            return Err(CgError::InvalidVectorFloat {
+                field: "vector",
+                index,
+                actual,
+            });
+        }
+    }
+    if embedding.produced_by.system == CG_EDGE_SYSTEM_TAG && !allow_reserved_producer {
+        return Err(CgError::ReservedProducerTag {
+            tag: CG_EDGE_SYSTEM_TAG.to_string(),
+        });
+    }
+    for (field, value) in [
+        ("system", embedding.produced_by.system.as_str()),
+        ("model_name", embedding.produced_by.model_name.as_str()),
+        (
+            "model_version",
+            embedding.produced_by.model_version.as_str(),
+        ),
+        (
+            "pipeline_version",
+            embedding.produced_by.pipeline_version.as_str(),
+        ),
+    ] {
+        if value.len() > 255 {
+            return Err(CgError::ProducerFieldExceedsMaxLength {
+                field,
+                max: 255,
+                actual: value.len(),
+            });
+        }
     }
     Ok(())
 }

@@ -13,6 +13,7 @@ fn shared_config() -> (TempDir, StoreConfig) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(EmbedderConfig::disabled()),
         extra_embedding_spaces: vec![EmbeddingSpaceDecl {
             embedding_space_id: "vigil_face_reid_v1".to_string(),
             dimension: 512,
@@ -114,7 +115,11 @@ fn text_observation(
         id: evidence_id,
         observation_id,
         context_id: context,
-        kind: EvidenceKind::Text,
+        kind: if vector.is_some() {
+            EvidenceKind::Text
+        } else {
+            EvidenceKind::StructuredSignal
+        },
         source_ref: "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .to_string(),
         mime_type: None,

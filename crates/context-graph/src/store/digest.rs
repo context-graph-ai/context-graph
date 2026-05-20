@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use contextdb_core::{Value, VectorIndexRef};
+use contextdb_core::{Error as EngineError, Value, VectorIndexRef};
 
 use crate::Result;
 use crate::error::CgError;
@@ -13,7 +13,7 @@ use super::encode::{
     properties_to_json,
 };
 use super::evidence::{
-    embedding_target_kind, embedding_target_uuid, producer_value, validate_space_kind,
+    embedding_target_uuid, producer_value, validate_precomputed_embedding, validate_space_kind,
     vector_binding_for_target,
 };
 use super::evidence_kind_str;
@@ -23,15 +23,24 @@ impl Store {
         if input.kind != EvidenceKind::Text {
             return Err(CgError::UnsupportedEvidenceKind { kind: input.kind });
         }
+        validate_precomputed_embedding(&input.embedding, false)?;
         if input.embedding.target != EmbeddingTarget::Digest(input.id) {
-            return Err(CgError::EmbeddingSpaceMismatch {
-                conflicting_field: "target",
+            return Err(CgError::EmbeddingSpaceConfigMismatch {
+                field: "target",
+                expected: format!("Digest({})", input.id),
+                actual: format!("{:?}", input.embedding.target),
             });
         }
-        let space = self.embedding_space_for_id(&input.embedding.embedding_space_id)?;
+        let space = self
+            .embedding_space_for_id(&input.embedding.embedding_space_id)
+            .map_err(|_| CgError::UnknownEmbeddingSpace {
+                id: input.embedding.embedding_space_id.clone(),
+            })?;
         if input.embedding.vector.len() != space.dimension {
-            return Err(CgError::EmbeddingSpaceMismatch {
-                conflicting_field: "dimension",
+            return Err(CgError::EmbeddingDimensionMismatch {
+                space_id: input.embedding.embedding_space_id.clone(),
+                expected: space.dimension as u32,
+                found: input.embedding.vector.len() as u32,
             });
         }
         validate_space_kind(&space, input.kind)?;
@@ -54,11 +63,21 @@ impl Store {
             ("properties".to_string(), Value::Json(serde_json::json!({}))),
             ("created_at".to_string(), Value::TxId(tx)),
         ]);
-        let _ = self.db.execute_in_tx(
+        match self.db.execute_in_tx(
             tx,
             "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
             &context_params,
-        );
+        ) {
+            Ok(_) => {}
+            Err(EngineError::UniqueViolation { table, column })
+                if table == "contexts"
+                    && column == "id"
+                    && digest_context_id_exists(self, input.context_id)? => {}
+            Err(err) => {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(err));
+            }
+        }
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("source".to_string(), Value::Text(input.source.clone())),
@@ -103,26 +122,22 @@ impl Store {
                 Value::Text(input.embedding.embedding_space_id.clone()),
             ),
             (
-                "target_kind".to_string(),
-                Value::Text(embedding_target_kind(&input.embedding.target).to_string()),
-            ),
-            (
                 "target_id".to_string(),
                 Value::Uuid(embedding_target_uuid(&input.embedding.target)),
-            ),
-            (
-                "dimension".to_string(),
-                Value::Int64(space.dimension as i64),
             ),
             (
                 "produced_by".to_string(),
                 producer_value(&input.embedding.produced_by),
             ),
+            (
+                "producer_system".to_string(),
+                Value::Text(input.embedding.produced_by.system.clone()),
+            ),
             ("created_at".to_string(), Value::TxId(tx)),
         ]);
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO embedding_handles (id, context_id, embedding_space_id, target_kind, target_id, dimension, produced_by, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_kind, $target_id, $dimension, $produced_by, $created_at)",
+            "INSERT INTO digest_embedding_handles (id, context_id, embedding_space_id, target_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_id, $produced_by, $producer_system, $created_at)",
             &handle_params,
         ) {
             let _ = self.db.rollback(tx);
@@ -201,4 +216,15 @@ fn decode_digest(columns: &[String], row: &[Value]) -> Result<Digest> {
         properties: properties_from_json(&get_json(row, columns, "properties")?),
         created_at: get_txid(row, columns, "created_at")?,
     })
+}
+
+fn digest_context_id_exists(store: &Store, context_id: ContextId) -> Result<bool> {
+    let result = store
+        .db
+        .execute(
+            "SELECT id FROM contexts WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(context_id.as_uuid()))]),
+        )
+        .map_err(map_engine_err)?;
+    Ok(!result.rows.is_empty())
 }

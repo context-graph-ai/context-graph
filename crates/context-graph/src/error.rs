@@ -52,9 +52,6 @@ pub enum CgError {
     InvalidEvidenceHash {
         hash: String,
     },
-    EmbeddingSpaceMismatch {
-        conflicting_field: &'static str,
-    },
     EmbeddingSpaceIdMismatch {
         embedder_declared: String,
         registry_declared: String,

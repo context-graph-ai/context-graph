@@ -680,6 +680,7 @@ fn record_auto_text(
             mime_type: Some("text/plain".to_string()),
             retention_status: RetentionStatus::RetainedExternal,
             producer: producer("capture", "raw"),
+            text_projection: Some(format!("metadata semantic text {source}")),
             ..Default::default()
         }],
         observed_properties: BTreeMap::new(),

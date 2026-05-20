@@ -2,17 +2,26 @@ use contextdb_core::Error as EngineError;
 
 use crate::Result;
 use crate::error::CgError;
+use crate::error::EngineError as CgEngineError;
 use crate::types::*;
 
 pub(super) fn map_engine_err(err: EngineError) -> CgError {
     match err {
-        EngineError::ImmutableTable(t) => match t.as_str() {
-            "observations" => CgError::ImmutableEntity {
-                kind: "observation",
-            },
-            "digests" => CgError::ImmutableEntity { kind: "digest" },
-            other => CgError::Engine(format!("unexpected immutable table: {other}")),
-        },
+        EngineError::ImmutableTable(t) => {
+            if is_embedding_handle_table(&t) {
+                CgError::EngineFault {
+                    source: CgEngineError::ImmutableTable { table: t },
+                }
+            } else {
+                match t.as_str() {
+                    "observations" => CgError::ImmutableEntity {
+                        kind: "observation",
+                    },
+                    "digests" => CgError::ImmutableEntity { kind: "digest" },
+                    other => CgError::Engine(format!("unexpected immutable table: {other}")),
+                }
+            }
+        }
         EngineError::NotFound(msg) => CgError::NotFound {
             id: Some(msg),
             missing: None,
@@ -27,20 +36,40 @@ pub(super) fn map_engine_err(err: EngineError) -> CgError {
             "propagation aborted: {table}.{column} {from} -> {to}"
         )),
         EngineError::CycleDetected { .. } => CgError::CyclicCitation,
-        EngineError::UniqueViolation { table, .. } => CgError::UniqueViolation {
-            entity: static_table_name(&table),
-            id: None,
-        },
+        EngineError::UniqueViolation { table, column } => {
+            if is_embedding_handle_table(&table) {
+                CgError::EngineFault {
+                    source: CgEngineError::UniqueViolation { table, column },
+                }
+            } else {
+                CgError::UniqueViolation {
+                    entity: static_table_name(&table),
+                    id: None,
+                }
+            }
+        }
         EngineError::ForeignKeyViolation {
             child_table,
             child_columns,
             parent_table,
             parent_columns: _,
-        } => CgError::ForeignKeyViolation {
-            table: static_table_name(&child_table),
-            column: static_column_name(foreign_key_display_column(&child_columns)),
-            ref_table: static_table_name(&parent_table),
-        },
+        } => {
+            if is_embedding_handle_table(&child_table) {
+                CgError::EngineFault {
+                    source: CgEngineError::ForeignKeyViolation {
+                        table: child_table,
+                        column: child_columns.join(","),
+                        ref_table: parent_table,
+                    },
+                }
+            } else {
+                CgError::ForeignKeyViolation {
+                    table: static_table_name(&child_table),
+                    column: static_column_name(foreign_key_display_column(&child_columns)),
+                    ref_table: static_table_name(&parent_table),
+                }
+            }
+        }
         EngineError::VectorIndexDimensionMismatch {
             expected, actual, ..
         } => CgError::VectorDimensionMismatch {
@@ -64,6 +93,9 @@ fn static_table_name(name: &str) -> &'static str {
         "embedding_spaces" => "embedding_space",
         "embedding_space_bindings" => "embedding_space_binding",
         "embedding_handles" => "embedding_handle",
+        "evidence_embedding_handles" => "evidence_embedding_handle",
+        "entity_reference_embedding_handles" => "entity_reference_embedding_handle",
+        "digest_embedding_handles" => "digest_embedding_handle",
         "evidence_availability_log" => "evidence_availability_log",
         "entity_snapshot_observations" => "entity_snapshot_observation",
         "decision_basis_snapshots" => "decision_basis_snapshot",
@@ -79,6 +111,15 @@ fn static_table_name(name: &str) -> &'static str {
         "audit_log" => "audit_log",
         _ => "unknown",
     }
+}
+
+fn is_embedding_handle_table(table: &str) -> bool {
+    matches!(
+        table,
+        "evidence_embedding_handles"
+            | "entity_reference_embedding_handles"
+            | "digest_embedding_handles"
+    )
 }
 
 fn static_column_name(name: &str) -> &'static str {

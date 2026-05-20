@@ -178,6 +178,7 @@ fn mock_embedder_configurable_producer_string() {
                     model_version: "0".to_string(),
                     pipeline_version: "unit".to_string(),
                 },
+                text_projection: Some("mock embedder semantic text".to_string()),
                 ..Default::default()
             }],
             observed_properties: BTreeMap::new(),

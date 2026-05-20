@@ -5,21 +5,27 @@ use contextdb_core::{Error as EngineError, RowId, Value, VectorIndexRef};
 use serde_json::Value as JsonValue;
 
 use crate::Result;
-use crate::error::CgError;
+use crate::embedder::EmbeddingInput;
+use crate::error::{CgError, EngineError as CgEngineError};
+use crate::messaging::OverrideFailureReason;
 use crate::types::*;
 
 use super::Store;
 use super::convert::{entity_type_from_str, entity_type_str, map_engine_err};
 use super::encode::{
-    get_json, get_text, get_timestamp, get_txid, get_uuid, properties_from_json, properties_to_json,
+    get_json, get_optional_float, get_text, get_timestamp, get_txid, get_uuid,
+    properties_from_json, properties_to_json,
 };
 use super::evidence::{
-    embedding_target_kind, embedding_target_uuid, producer_value, properties_value,
+    embedding_target_uuid, producer_value, properties_value, validate_precomputed_embedding,
     validate_space_kind, value_for_optional_evidence_id, value_for_optional_json,
     value_for_optional_pair, value_for_optional_text, value_for_optional_timestamp,
     value_for_optional_timestamp_nanos, value_for_optional_u64, vector_binding_for_target,
 };
+use super::impact_analysis::decision_invalidation_context;
 use super::{evidence_kind_str, retention_status_str};
+
+const ENTITY_REFERENCE_MATCH_THRESHOLD: f32 = 0.8;
 
 impl Store {
     pub fn record_observation(
@@ -31,7 +37,16 @@ impl Store {
             evidence.context_id = input.context_id;
         }
         self.validate_record_observation_input(&input)?;
-        let embedding_routes = self.validate_embeddings_for_observation(&input)?;
+        let caller_supplied_embeddings = !input.embeddings.is_empty();
+        self.generate_default_embeddings(&mut input)?;
+        let embedding_routes =
+            self.validate_embeddings_for_observation(&input, !caller_supplied_embeddings)?;
+        let evidence_vectors = evidence_vectors_for_insert(&embedding_routes)?;
+        let evidence_ids = input
+            .evidence
+            .iter()
+            .map(|evidence| evidence.id)
+            .collect::<HashSet<_>>();
         let auto_create_entity = if let Some(entity) = self.get_entity(input.entity_id)? {
             if entity.context_id != input.context_id {
                 return Err(CgError::CrossContextObservation);
@@ -97,15 +112,28 @@ impl Store {
                 let _ = self.db.rollback(tx);
                 return Err(map_engine_err(e));
             }
-            let mut evidence_row_ids: HashMap<EvidenceId, RowId> = HashMap::new();
             for (supply_order, evidence) in input.evidence.iter().enumerate() {
-                match self.insert_evidence_in_tx(tx, evidence, supply_order as i64) {
-                    Ok(row_id) => {
-                        evidence_row_ids.insert(evidence.id, row_id);
-                    }
-                    Err(err) => {
+                if let Err(err) = self.insert_evidence_in_tx(
+                    tx,
+                    evidence,
+                    supply_order as i64,
+                    evidence_vectors.get(&evidence.id),
+                ) {
+                    let _ = self.db.rollback(tx);
+                    return Err(err);
+                }
+            }
+            for route in &embedding_routes {
+                if let EmbeddingTarget::Evidence(id) = route.target {
+                    if let Err(err) = self.insert_embedding_handle_in_tx(tx, route) {
                         let _ = self.db.rollback(tx);
-                        return Err(err);
+                        return Err(self.map_embedding_route_engine_err(err, route));
+                    }
+                    if !evidence_ids.contains(&id)
+                        && self.evidence_exists_in_context(id, input.context_id)?
+                    {
+                        let _ = self.db.rollback(tx);
+                        return Err(CgError::EmbeddingTargetNotFound { id });
                     }
                 }
             }
@@ -122,25 +150,65 @@ impl Store {
                 }
             };
             for route in &embedding_routes {
-                let row_id = match route.target {
-                    EmbeddingTarget::Evidence(id) => evidence_row_ids.get(&id).copied(),
-                    EmbeddingTarget::EntityReference(_, _) => None,
-                    EmbeddingTarget::Digest(_) => None,
-                };
-                let Some(row_id) = row_id else {
-                    let _ = self.db.rollback(tx);
-                    return Err(CgError::EmbeddingTargetNotFound {
-                        id: match route.target {
-                            EmbeddingTarget::Evidence(id) => id,
-                            EmbeddingTarget::EntityReference(_, _) => EvidenceId::default(),
-                            EmbeddingTarget::Digest(_) => EvidenceId::default(),
-                        },
-                    });
-                };
-                if let Err(err) = self.insert_embedding_handle_and_vector_in_tx(tx, route, row_id) {
-                    let _ = self.db.rollback(tx);
-                    return Err(err);
+                match route.target {
+                    EmbeddingTarget::Evidence(_) => {}
+                    EmbeddingTarget::EntityReference(_, _) => {
+                        let row_id =
+                            match self.insert_entity_reference_embedding_row_in_tx(tx, route) {
+                                Ok(row_id) => row_id,
+                                Err(err) => {
+                                    let _ = self.db.rollback(tx);
+                                    return Err(self.map_embedding_route_engine_err(err, route));
+                                }
+                            };
+                        if let Err(err) = self.insert_embedding_handle_in_tx(tx, route) {
+                            let _ = self.db.rollback(tx);
+                            return Err(self.map_embedding_route_engine_err(err, route));
+                        }
+                        if let Err(err) = self.insert_embedding_vector_in_tx(tx, route, row_id) {
+                            let _ = self.db.rollback(tx);
+                            return Err(err);
+                        }
+                    }
+                    EmbeddingTarget::Digest(id) => {
+                        if let Err(err) = self.insert_embedding_handle_in_tx(tx, route) {
+                            let _ = self.db.rollback(tx);
+                            return Err(self.map_embedding_route_engine_err(err, route));
+                        }
+                        let row_id = match self.digest_row_id(id, input.context_id) {
+                            Ok(Some(row_id)) => row_id,
+                            Ok(None) => match self.digest_context(id) {
+                                Ok(Some(target_context)) if target_context == input.context_id => {
+                                    let _ = self.db.rollback(tx);
+                                    return Err(CgError::EmbeddingTargetNotFound {
+                                        id: EvidenceId::default(),
+                                    });
+                                }
+                                Ok(_) => continue,
+                                Err(err) => {
+                                    let _ = self.db.rollback(tx);
+                                    return Err(err);
+                                }
+                            },
+                            Err(err) => {
+                                let _ = self.db.rollback(tx);
+                                return Err(err);
+                            }
+                        };
+                        if let Err(err) = self.insert_embedding_vector_in_tx(tx, route, row_id) {
+                            let _ = self.db.rollback(tx);
+                            return Err(err);
+                        }
+                    }
                 }
+            }
+            if let Err(err) = self.insert_entity_reference_no_match_invalidations_in_tx(
+                tx,
+                &input,
+                &embedding_routes,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(err);
             }
             if let Err(e) = self.record_audit_in_tx(
                 tx,
@@ -175,10 +243,18 @@ impl Store {
                         return Err(self.duplicate_evidence_commit_error(&input)?);
                     }
                     EngineError::UniqueViolation { table, column } => {
+                        if is_embedding_handle_table(&table) {
+                            return Err(CgError::EngineFault {
+                                source: CgEngineError::UniqueViolation { table, column },
+                            });
+                        }
                         return Err(map_engine_err(EngineError::UniqueViolation {
                             table,
                             column,
                         }));
+                    }
+                    err @ EngineError::ForeignKeyViolation { .. } => {
+                        return Err(self.map_embedding_commit_fk_err(err, &embedding_routes));
                     }
                     err => return Err(map_engine_err(err)),
                 }
@@ -431,6 +507,7 @@ impl Store {
     fn validate_embeddings_for_observation(
         &self,
         input: &RecordObservation,
+        allow_reserved_producer: bool,
     ) -> Result<Vec<EmbeddingRoute>> {
         let evidence_by_id = input
             .evidence
@@ -439,43 +516,164 @@ impl Store {
             .collect::<HashMap<_, _>>();
         let mut routes = Vec::with_capacity(input.embeddings.len());
         for embedding in &input.embeddings {
-            let target_id = match embedding.target {
-                EmbeddingTarget::Evidence(id) => id,
-                EmbeddingTarget::EntityReference(_, _) => {
-                    return Err(CgError::EmbeddingTargetNotFound {
-                        id: EvidenceId::default(),
-                    });
-                }
-                EmbeddingTarget::Digest(_) => {
-                    return Err(CgError::EmbeddingTargetNotFound {
-                        id: EvidenceId::default(),
-                    });
-                }
-            };
-            let Some(evidence) = evidence_by_id.get(&target_id) else {
-                return Err(CgError::EmbeddingTargetNotFound { id: target_id });
-            };
-            let space = self.embedding_space_for_id(&embedding.embedding_space_id)?;
-            if embedding.vector.len() != space.dimension {
-                return Err(CgError::EmbeddingSpaceMismatch {
-                    conflicting_field: "dimension",
-                });
-            }
-            validate_space_kind(&space, evidence.kind)?;
-            let binding = vector_binding_for_target(&space, "evidence")?;
-            routes.push(EmbeddingRoute {
-                id: embedding.id,
-                context_id: input.context_id,
-                embedding_space_id: embedding.embedding_space_id.clone(),
-                vector: embedding.vector.clone(),
-                target: embedding.target.clone(),
-                produced_by: embedding.produced_by.clone(),
-                dimension: space.dimension,
-                table_name: binding.table_name,
-                vector_column: binding.vector_column,
-            });
+            validate_precomputed_embedding(embedding, allow_reserved_producer)?;
+            routes.push(self.validate_embedding_route(input, embedding, &evidence_by_id)?);
         }
         Ok(routes)
+    }
+
+    fn validate_embedding_route(
+        &self,
+        input: &RecordObservation,
+        embedding: &PrecomputedEmbedding,
+        evidence_by_id: &HashMap<EvidenceId, &EvidenceRef>,
+    ) -> Result<EmbeddingRoute> {
+        match embedding.target {
+            EmbeddingTarget::Evidence(target_id) => {
+                let space = self
+                    .embedding_space_for_id(&embedding.embedding_space_id)
+                    .map_err(|_| CgError::UnknownEmbeddingSpace {
+                        id: embedding.embedding_space_id.clone(),
+                    })?;
+                if embedding.vector.len() != space.dimension {
+                    return Err(CgError::EmbeddingDimensionMismatch {
+                        space_id: embedding.embedding_space_id.clone(),
+                        expected: space.dimension as u32,
+                        found: embedding.vector.len() as u32,
+                    });
+                }
+                if let Some(evidence) = evidence_by_id.get(&target_id)
+                    && !(space.supported_evidence_kinds.contains(&evidence.kind)
+                        || (evidence.text_projection.is_some()
+                            && space.supported_evidence_kinds.contains(&EvidenceKind::Text)))
+                {
+                    validate_space_kind(&space, evidence.kind)?;
+                }
+                let binding = vector_binding_for_target(&space, "evidence")?;
+                Ok(EmbeddingRoute {
+                    id: embedding.id,
+                    context_id: input.context_id,
+                    embedding_space_id: embedding.embedding_space_id.clone(),
+                    vector: embedding.vector.clone(),
+                    target: embedding.target.clone(),
+                    produced_by: embedding.produced_by.clone(),
+                    table_name: binding.table_name,
+                    vector_column: binding.vector_column,
+                })
+            }
+            EmbeddingTarget::EntityReference(_, _) => {
+                let space = self
+                    .embedding_space_for_id(&embedding.embedding_space_id)
+                    .map_err(|_| CgError::UnknownEmbeddingSpace {
+                        id: embedding.embedding_space_id.clone(),
+                    })?;
+                if embedding.vector.len() != space.dimension {
+                    return Err(CgError::EmbeddingDimensionMismatch {
+                        space_id: embedding.embedding_space_id.clone(),
+                        expected: space.dimension as u32,
+                        found: embedding.vector.len() as u32,
+                    });
+                }
+                Ok(EmbeddingRoute {
+                    id: embedding.id,
+                    context_id: input.context_id,
+                    embedding_space_id: embedding.embedding_space_id.clone(),
+                    vector: embedding.vector.clone(),
+                    target: embedding.target.clone(),
+                    produced_by: embedding.produced_by.clone(),
+                    table_name: format!("entity_reference_embeddings_{}", space.dimension),
+                    vector_column: "vector".to_string(),
+                })
+            }
+            EmbeddingTarget::Digest(_) => {
+                let space = self
+                    .embedding_space_for_id(&embedding.embedding_space_id)
+                    .map_err(|_| CgError::UnknownEmbeddingSpace {
+                        id: embedding.embedding_space_id.clone(),
+                    })?;
+                if embedding.vector.len() != space.dimension {
+                    return Err(CgError::EmbeddingDimensionMismatch {
+                        space_id: embedding.embedding_space_id.clone(),
+                        expected: space.dimension as u32,
+                        found: embedding.vector.len() as u32,
+                    });
+                }
+                validate_space_kind(&space, EvidenceKind::Text)?;
+                let binding = vector_binding_for_target(&space, "digest")?;
+                Ok(EmbeddingRoute {
+                    id: embedding.id,
+                    context_id: input.context_id,
+                    embedding_space_id: embedding.embedding_space_id.clone(),
+                    vector: embedding.vector.clone(),
+                    target: embedding.target.clone(),
+                    produced_by: embedding.produced_by.clone(),
+                    table_name: binding.table_name,
+                    vector_column: binding.vector_column,
+                })
+            }
+        }
+    }
+
+    fn generate_default_embeddings(&self, input: &mut RecordObservation) -> Result<()> {
+        if !input.embeddings.is_empty() {
+            return Ok(());
+        }
+        for evidence in &input.evidence {
+            let text_projection = match evidence.kind {
+                EvidenceKind::Text => match evidence.text_projection.clone() {
+                    Some(text) => Some(text),
+                    None => continue,
+                },
+                _ => None,
+            };
+            let Some(space_id) = self.default_embedding_spaces.get(&evidence.kind) else {
+                continue;
+            };
+            let Some(embedder) = self.embedders.get(space_id) else {
+                if evidence.kind == EvidenceKind::Text && self.default_text_embedder_disabled {
+                    return Err(CgError::TextEmbedderDisabled);
+                }
+                continue;
+            };
+            let embed_input = match evidence.kind {
+                EvidenceKind::Text => {
+                    let Some(text) = text_projection else {
+                        continue;
+                    };
+                    EmbeddingInput::Text(text)
+                }
+                EvidenceKind::ImageFrame => EmbeddingInput::ImageFrame {
+                    uri: evidence.source_ref.clone(),
+                },
+                EvidenceKind::AudioSegment => EmbeddingInput::AudioSegment {
+                    uri: evidence.source_ref.clone(),
+                },
+                EvidenceKind::VideoSegment => EmbeddingInput::VideoSegment {
+                    uri: evidence.source_ref.clone(),
+                },
+                EvidenceKind::StructuredSignal => {
+                    EmbeddingInput::StructuredSignal(serde_json::json!({
+                        "source_ref": evidence.source_ref,
+                        "properties": evidence.properties,
+                    }))
+                }
+            };
+            let output = embedder.embed(embed_input)?;
+            if output.embedding_space_id != *space_id {
+                return Err(CgError::EmbeddingSpaceIdMismatch {
+                    embedder_declared: output.embedding_space_id,
+                    registry_declared: space_id.clone(),
+                });
+            }
+            input.embeddings.push(PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: output.embedding_space_id,
+                vector: output.vector,
+                target: EmbeddingTarget::Evidence(evidence.id),
+                produced_by: output.producer,
+            });
+        }
+        Ok(())
     }
 
     fn evidence_id_exists(&self, id: EvidenceId) -> Result<bool> {
@@ -487,6 +685,21 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         Ok(!result.rows.is_empty())
+    }
+
+    fn evidence_context(&self, id: EvidenceId) -> Result<Option<ContextId>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT context_id FROM evidence WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| get_uuid(row, &result.columns, "context_id").map(ContextId::from))
+            .transpose()
     }
 
     fn duplicate_evidence_commit_error(&self, input: &RecordObservation) -> Result<CgError> {
@@ -518,12 +731,109 @@ impl Store {
         Ok(!result.rows.is_empty())
     }
 
+    fn digest_row_id(&self, id: DigestId, context_id: ContextId) -> Result<Option<RowId>> {
+        let rows = self
+            .db
+            .scan("digests", self.db.snapshot())
+            .map_err(map_engine_err)?;
+        Ok(rows
+            .into_iter()
+            .find(|row| {
+                row.values.get("id") == Some(&Value::Uuid(id.as_uuid()))
+                    && row.values.get("context_id") == Some(&Value::Uuid(context_id.as_uuid()))
+            })
+            .map(|row| row.row_id))
+    }
+
+    fn digest_context(&self, id: DigestId) -> Result<Option<ContextId>> {
+        let rows = self
+            .db
+            .scan("digests", self.db.snapshot())
+            .map_err(map_engine_err)?;
+        rows.into_iter()
+            .find(|row| row.values.get("id") == Some(&Value::Uuid(id.as_uuid())))
+            .map(|row| match row.values.get("context_id") {
+                Some(Value::Uuid(context_id)) => Ok(ContextId::from(*context_id)),
+                _ => Err(CgError::Engine("digest row missing context_id".to_string())),
+            })
+            .transpose()
+    }
+
+    fn map_embedding_route_engine_err(&self, err: EngineError, route: &EmbeddingRoute) -> CgError {
+        if matches!(err, EngineError::ForeignKeyViolation { .. }) {
+            return self
+                .embedding_route_fk_error_candidate(route)
+                .unwrap_or_else(|| map_engine_err(err));
+        }
+        map_engine_err(err)
+    }
+
+    fn map_embedding_commit_fk_err(&self, err: EngineError, routes: &[EmbeddingRoute]) -> CgError {
+        routes
+            .iter()
+            .find_map(|route| self.embedding_route_fk_error_candidate(route))
+            .unwrap_or_else(|| map_engine_err(err))
+    }
+
+    fn embedding_route_fk_error_candidate(&self, route: &EmbeddingRoute) -> Option<CgError> {
+        match route.target {
+            EmbeddingTarget::Evidence(id) => match self.evidence_context(id) {
+                Ok(Some(target_context)) if target_context != route.context_id => {
+                    Some(CgError::CrossContextEmbeddingTargetRejected {
+                        handle_context: route.context_id,
+                        target_context,
+                    })
+                }
+                Ok(None) => Some(CgError::EmbeddingTargetNotFound { id }),
+                Ok(Some(_)) => None,
+                Err(err) => Some(err),
+            },
+            EmbeddingTarget::EntityReference(entity_id, _) => {
+                match self.entity_context(entity_id) {
+                    Ok(Some(target_context)) if target_context != route.context_id => {
+                        Some(CgError::CrossContextEmbeddingTargetRejected {
+                            handle_context: route.context_id,
+                            target_context,
+                        })
+                    }
+                    Ok(None) => Some(CgError::EntityNotFound { entity_id }),
+                    Ok(Some(_)) => None,
+                    Err(err) => Some(err),
+                }
+            }
+            EmbeddingTarget::Digest(id) => match self.digest_context(id) {
+                Ok(Some(target_context)) if target_context != route.context_id => {
+                    Some(CgError::CrossContextEmbeddingTargetRejected {
+                        handle_context: route.context_id,
+                        target_context,
+                    })
+                }
+                Ok(None) => Some(CgError::EmbeddingTargetNotFound {
+                    id: EvidenceId::default(),
+                }),
+                Ok(Some(_)) => None,
+                Err(err) => Some(err),
+            },
+        }
+    }
+
     fn insert_evidence_in_tx(
         &self,
         tx: crate::TxId,
         evidence: &EvidenceRef,
         supply_order: i64,
-    ) -> Result<RowId> {
+        vectors: Option<&HashMap<String, Vec<f32>>>,
+    ) -> Result<()> {
+        let vector_text = vectors
+            .and_then(|columns| columns.get("vector_text"))
+            .cloned()
+            .map(Value::Vector)
+            .unwrap_or(Value::Null);
+        let vector_vision = vectors
+            .and_then(|columns| columns.get("vector_vision"))
+            .cloned()
+            .map(Value::Vector)
+            .unwrap_or(Value::Null);
         let params = HashMap::from([
             ("id".to_string(), Value::Uuid(evidence.id.as_uuid())),
             (
@@ -600,20 +910,29 @@ impl Store {
                 properties_value(&evidence.properties),
             ),
             ("supply_order".to_string(), Value::Int64(supply_order)),
+            ("vector_text".to_string(), vector_text),
+            ("vector_vision".to_string(), vector_vision),
         ]);
-        self.db.insert_row(tx, "evidence", params).map_err(|err| {
-            if matches!(
-                err,
-                EngineError::UniqueViolation {
-                    ref table,
-                    ref column
-                } if table == "evidence" && column == "id"
-            ) {
-                CgError::DuplicateEvidenceId { id: evidence.id }
-            } else {
-                map_engine_err(err)
-            }
-        })
+        self.db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, mime_type, content_hash, captured_at, captured_at_nanos, byte_range, time_range_ms, frame_index, region, producer, text_projection, derived_from, retention_status, media_retention_until, media_retention_until_nanos, properties, supply_order, vector_text, vector_vision) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $mime_type, $content_hash, $captured_at, $captured_at_nanos, $byte_range, $time_range_ms, $frame_index, $region, $producer, $text_projection, $derived_from, $retention_status, $media_retention_until, $media_retention_until_nanos, $properties, $supply_order, $vector_text, $vector_vision)",
+                &params,
+            )
+            .map(|_| ())
+            .map_err(|err| {
+                if matches!(
+                    err,
+                    EngineError::UniqueViolation {
+                        ref table,
+                        ref column
+                    } if table == "evidence" && column == "id"
+                ) {
+                    CgError::DuplicateEvidenceId { id: evidence.id }
+                } else {
+                    map_engine_err(err)
+                }
+            })
     }
 
     fn merge_state_delta_in_tx(
@@ -754,12 +1073,11 @@ impl Store {
         Ok(Some(snapshot_id))
     }
 
-    fn insert_embedding_handle_and_vector_in_tx(
+    fn insert_embedding_handle_in_tx(
         &self,
         tx: crate::TxId,
         route: &EmbeddingRoute,
-        row_id: RowId,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), EngineError> {
         let params = HashMap::from([
             ("id".to_string(), Value::Uuid(route.id.as_uuid())),
             (
@@ -771,30 +1089,39 @@ impl Store {
                 Value::Text(route.embedding_space_id.clone()),
             ),
             (
-                "target_kind".to_string(),
-                Value::Text(embedding_target_kind(&route.target).to_string()),
-            ),
-            (
                 "target_id".to_string(),
                 Value::Uuid(embedding_target_uuid(&route.target)),
-            ),
-            (
-                "dimension".to_string(),
-                Value::Int64(route.dimension as i64),
             ),
             (
                 "produced_by".to_string(),
                 producer_value(&route.produced_by),
             ),
+            (
+                "producer_system".to_string(),
+                Value::Text(route.produced_by.system.clone()),
+            ),
             ("created_at".to_string(), Value::TxId(tx)),
         ]);
+        let handle_table = match route.target {
+            EmbeddingTarget::Evidence(_) => "evidence_embedding_handles",
+            EmbeddingTarget::EntityReference(_, _) => "entity_reference_embedding_handles",
+            EmbeddingTarget::Digest(_) => "digest_embedding_handles",
+        };
         self.db
             .execute_in_tx(
                 tx,
-                "INSERT INTO embedding_handles (id, context_id, embedding_space_id, target_kind, target_id, dimension, produced_by, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_kind, $target_id, $dimension, $produced_by, $created_at)",
+                &format!("INSERT INTO {handle_table} (id, context_id, embedding_space_id, target_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_id, $produced_by, $producer_system, $created_at)"),
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
+        Ok(())
+    }
+
+    fn insert_embedding_vector_in_tx(
+        &self,
+        tx: crate::TxId,
+        route: &EmbeddingRoute,
+        row_id: RowId,
+    ) -> Result<()> {
         self.db
             .insert_vector(
                 tx,
@@ -803,6 +1130,364 @@ impl Store {
                 route.vector.clone(),
             )
             .map_err(map_engine_err)
+    }
+
+    fn insert_entity_reference_embedding_row_in_tx(
+        &self,
+        tx: crate::TxId,
+        route: &EmbeddingRoute,
+    ) -> std::result::Result<RowId, EngineError> {
+        let EmbeddingTarget::EntityReference(entity_id, ref label) = route.target else {
+            unreachable!("entity reference route required");
+        };
+        let params = HashMap::from([
+            ("id".to_string(), Value::Uuid(route.id.as_uuid())),
+            (
+                "context_id".to_string(),
+                Value::Uuid(route.context_id.as_uuid()),
+            ),
+            ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+            (
+                "label".to_string(),
+                label.clone().map(Value::Text).unwrap_or(Value::Null),
+            ),
+            ("vector".to_string(), Value::Vector(route.vector.clone())),
+            (
+                "embedding_space_id".to_string(),
+                Value::Text(route.embedding_space_id.clone()),
+            ),
+            (
+                "produced_by".to_string(),
+                producer_value(&route.produced_by),
+            ),
+            ("created_at".to_string(), Value::TxId(tx)),
+        ]);
+        self.db.insert_row(tx, &route.table_name, params)
+    }
+
+    fn insert_entity_reference_no_match_invalidations_in_tx(
+        &self,
+        tx: crate::TxId,
+        input: &RecordObservation,
+        routes: &[EmbeddingRoute],
+    ) -> Result<()> {
+        let evidence_by_id = input
+            .evidence
+            .iter()
+            .map(|evidence| (evidence.id, evidence))
+            .collect::<HashMap<_, _>>();
+        let candidates =
+            self.active_entity_basis_decisions_in_tx(tx, input.context_id, input.entity_id)?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let mut invalidated = HashSet::new();
+        for route in routes {
+            let EmbeddingTarget::Evidence(evidence_id) = route.target else {
+                continue;
+            };
+            let Some(evidence) = evidence_by_id.get(&evidence_id) else {
+                continue;
+            };
+            if evidence.kind != EvidenceKind::ImageFrame {
+                continue;
+            }
+
+            for candidate in &candidates {
+                if invalidated.contains(&candidate.decision_id) {
+                    continue;
+                }
+                let best_reference_score = self.best_entity_reference_score_in_tx(
+                    tx,
+                    candidate.entity_id,
+                    input.context_id,
+                    &route.embedding_space_id,
+                    &route.vector,
+                )?;
+                let Some(best_reference_score) = best_reference_score else {
+                    continue;
+                };
+                if best_reference_score >= ENTITY_REFERENCE_MATCH_THRESHOLD {
+                    continue;
+                }
+
+                let (_, entity_name) =
+                    self.entity_snapshot_identity_in_tx(tx, candidate.entity_id)?;
+                let snapshot_id = self.decision_basis_snapshot_for_entity_in_tx(
+                    tx,
+                    input.context_id,
+                    candidate.decision_id,
+                    candidate.entity_id,
+                )?;
+                self.insert_entity_no_match_invalidation_in_tx(
+                    tx,
+                    EntityNoMatchInvalidation {
+                        context_id: input.context_id,
+                        observation_id: input.id,
+                        decision_id: candidate.decision_id,
+                        entity_id: candidate.entity_id,
+                        entity_name: &entity_name,
+                        basis_snapshot_id: snapshot_id,
+                        confidence: candidate.confidence,
+                        embedding_space_id: &route.embedding_space_id,
+                    },
+                )?;
+                invalidated.insert(candidate.decision_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn active_entity_basis_decisions_in_tx(
+        &self,
+        tx: crate::TxId,
+        context_id: ContextId,
+        live_entity_id: EntityId,
+    ) -> Result<Vec<EntityBasisDecisionCandidate>> {
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT edges.source_id, edges.target_id, decisions.confidence FROM edges INNER JOIN decisions ON edges.source_id = decisions.id WHERE edges.context_id = $context_id AND edges.edge_type = $edge_type AND decisions.context_id = $context_id AND decisions.status = $status",
+                &HashMap::from([
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    ("edge_type".to_string(), Value::Text("BASED_ON".to_string())),
+                    ("status".to_string(), Value::Text("active".to_string())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        let mut candidates = Vec::new();
+        for row in &result.rows {
+            let entity_id = EntityId::from(get_uuid(row, &result.columns, "target_id")?);
+            if entity_id == live_entity_id {
+                continue;
+            }
+            candidates.push(EntityBasisDecisionCandidate {
+                decision_id: DecisionId::from(get_uuid(row, &result.columns, "source_id")?),
+                entity_id,
+                confidence: get_optional_float(row, &result.columns, "confidence")?,
+            });
+        }
+        candidates.sort_by_key(|candidate| (candidate.decision_id, candidate.entity_id));
+        candidates.dedup_by_key(|candidate| (candidate.decision_id, candidate.entity_id));
+        Ok(candidates)
+    }
+
+    fn best_entity_reference_score_in_tx(
+        &self,
+        tx: crate::TxId,
+        entity_id: EntityId,
+        context_id: ContextId,
+        embedding_space_id: &str,
+        query_vector: &[f32],
+    ) -> Result<Option<f32>> {
+        let space = self
+            .embedding_space_for_id(embedding_space_id)
+            .map_err(|_| CgError::UnknownEmbeddingSpace {
+                id: embedding_space_id.to_string(),
+            })?;
+        if query_vector.len() != space.dimension {
+            return Err(CgError::EmbeddingDimensionMismatch {
+                space_id: embedding_space_id.to_string(),
+                expected: space.dimension as u32,
+                found: query_vector.len() as u32,
+            });
+        }
+        let table = format!("entity_reference_embeddings_{}", space.dimension);
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                &format!(
+                    "SELECT id, score FROM {table} WHERE context_id = $context_id AND entity_id = $entity_id AND embedding_space_id = $embedding_space_id ORDER BY vector <=> $query LIMIT 1"
+                ),
+                &HashMap::from([
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+                    (
+                        "embedding_space_id".to_string(),
+                        Value::Text(embedding_space_id.to_string()),
+                    ),
+                    ("query".to_string(), Value::Vector(query_vector.to_vec())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        let Some(row) = result.rows.first() else {
+            return Ok(None);
+        };
+        let score = get_optional_float(row, &result.columns, "score")?.ok_or_else(|| {
+            CgError::Engine("entity reference vector search missing score".to_string())
+        })?;
+        Ok(Some(score as f32))
+    }
+
+    fn decision_basis_snapshot_for_entity_in_tx(
+        &self,
+        tx: crate::TxId,
+        context_id: ContextId,
+        decision_id: DecisionId,
+        entity_id: EntityId,
+    ) -> Result<EntitySnapshotId> {
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT snapshot_id FROM decision_basis_snapshots WHERE context_id = $context_id AND decision_id = $decision_id AND entity_id = $entity_id",
+                &HashMap::from([
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    ("decision_id".to_string(), Value::Uuid(decision_id.as_uuid())),
+                    ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        let Some(row) = result.rows.first() else {
+            return Err(CgError::NotFound {
+                id: Some(decision_id.as_uuid().to_string()),
+                missing: Some("decision_basis_snapshot"),
+            });
+        };
+        Ok(EntitySnapshotId::from(get_uuid(
+            row,
+            &result.columns,
+            "snapshot_id",
+        )?))
+    }
+
+    fn insert_entity_no_match_invalidation_in_tx(
+        &self,
+        tx: crate::TxId,
+        invalidation: EntityNoMatchInvalidation<'_>,
+    ) -> Result<()> {
+        let intention_context = decision_invalidation_context(
+            &self.db,
+            tx,
+            invalidation.context_id.as_uuid(),
+            invalidation.decision_id.as_uuid(),
+            invalidation.confidence,
+        )
+        .map_err(map_engine_err)?;
+        let override_failure = serde_json::to_value(OverrideFailureReason::EntityAwareNoMatch {
+            reference_space: invalidation.embedding_space_id.to_string(),
+            live_space: invalidation.embedding_space_id.to_string(),
+        })
+        .map_err(|err| CgError::Engine(format!("override failure serialize: {err}")))?;
+        let basis_diff = BasisDiffResult {
+            is_invalidated_candidate: true,
+            divergences: vec![EntityDivergence {
+                basis_snapshot_id: invalidation.basis_snapshot_id,
+                entity_id: invalidation.entity_id,
+                value_diffs: vec![
+                    ValueDiff {
+                        field: "entity_name".to_string(),
+                        basis_value: None,
+                        current_value: Some(JsonValue::String(
+                            invalidation.entity_name.to_string(),
+                        )),
+                    },
+                    ValueDiff {
+                        field: "entity_id".to_string(),
+                        basis_value: None,
+                        current_value: Some(serde_json::json!(invalidation.entity_id.as_uuid())),
+                    },
+                    ValueDiff {
+                        field: "override_failure_reason".to_string(),
+                        basis_value: None,
+                        current_value: Some(override_failure),
+                    },
+                ],
+                read_txid: tx,
+            }],
+            read_txid: tx,
+            current_snapshot_read_txid: tx,
+        };
+        let basis_diff_json = serde_json::to_value(&basis_diff)
+            .map_err(|err| CgError::Engine(format!("basis diff serialize: {err}")))?;
+        let threatened_ids = intention_context
+            .threatened_intention_ids
+            .iter()
+            .copied()
+            .map(IntentionId::from)
+            .collect::<Vec<_>>();
+        let threatened_json = serde_json::to_value(threatened_ids)
+            .map_err(|err| CgError::Engine(format!("threatened intentions serialize: {err}")))?;
+
+        let updated = self
+            .db
+            .execute_in_tx(
+                tx,
+                    "UPDATE decisions SET status = $new_status WHERE id = $id AND context_id = $context_id AND status = $old_status",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(invalidation.decision_id.as_uuid())),
+                    (
+                        "context_id".to_string(),
+                        Value::Uuid(invalidation.context_id.as_uuid()),
+                    ),
+                    (
+                        "new_status".to_string(),
+                        Value::Text("invalidated".to_string()),
+                    ),
+                    ("old_status".to_string(), Value::Text("active".to_string())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        if updated.rows_affected == 0 {
+            return Ok(());
+        }
+        if updated.rows_affected != 1 {
+            return Err(CgError::Engine(format!(
+                "entity no-match invalidated {} decisions, expected 1",
+                updated.rows_affected
+            )));
+        }
+
+        let invalidation_id = InvalidationId::new_v7();
+        self.db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $reason, $basis_diff, $cascade_from, $severity, $threatened_intention_ids, $intention_now_un_served, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(invalidation_id.as_uuid())),
+                    ("status".to_string(), Value::Text("pending".to_string())),
+                    (
+                        "context_id".to_string(),
+                        Value::Uuid(invalidation.context_id.as_uuid()),
+                    ),
+                    (
+                        "affected_decision_id".to_string(),
+                        Value::Uuid(invalidation.decision_id.as_uuid()),
+                    ),
+                    (
+                        "trigger_observation_id".to_string(),
+                        Value::Uuid(invalidation.observation_id.as_uuid()),
+                    ),
+                    (
+                        "reason".to_string(),
+                        Value::Text("entity-reference-no-match".to_string()),
+                    ),
+                    ("basis_diff".to_string(), Value::Json(basis_diff_json)),
+                    ("cascade_from".to_string(), Value::Null),
+                    (
+                        "severity".to_string(),
+                        Value::Text(invalidation_severity_text(intention_context.severity).to_string()),
+                    ),
+                    (
+                        "threatened_intention_ids".to_string(),
+                        Value::Json(threatened_json),
+                    ),
+                    (
+                        "intention_now_un_served".to_string(),
+                        Value::Bool(intention_context.intention_now_un_served),
+                    ),
+                    ("detected_at".to_string(), Value::TxId(tx)),
+                    ("resolved_at".to_string(), Value::Null),
+                    ("resolution_action".to_string(), Value::Null),
+                    ("resolution_decision_id".to_string(), Value::Null),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        Ok(())
     }
 
     fn open_entity_snapshot_for_merge(
@@ -867,6 +1552,44 @@ fn record_observation_auto_create_retry_unique(table: &str, _column: &str) -> bo
     matches!(table, "contexts" | "entities")
 }
 
+fn is_embedding_handle_table(table: &str) -> bool {
+    matches!(
+        table,
+        "evidence_embedding_handles"
+            | "entity_reference_embedding_handles"
+            | "digest_embedding_handles"
+    )
+}
+
+fn evidence_vectors_for_insert(
+    routes: &[EmbeddingRoute],
+) -> Result<HashMap<EvidenceId, HashMap<String, Vec<f32>>>> {
+    let mut by_evidence: HashMap<EvidenceId, HashMap<String, Vec<f32>>> = HashMap::new();
+    for route in routes {
+        let EmbeddingTarget::Evidence(evidence_id) = route.target else {
+            continue;
+        };
+        if route.table_name != "evidence" {
+            return Err(CgError::Engine(format!(
+                "evidence embedding route points at unexpected table {}",
+                route.table_name
+            )));
+        }
+        let columns = by_evidence.entry(evidence_id).or_default();
+        if columns
+            .insert(route.vector_column.clone(), route.vector.clone())
+            .is_some()
+        {
+            return Err(CgError::Engine(format!(
+                "multiple embeddings target evidence {} column {}",
+                evidence_id.as_uuid(),
+                route.vector_column
+            )));
+        }
+    }
+    Ok(by_evidence)
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct EmbeddingRoute {
     pub id: EmbeddingId,
@@ -875,9 +1598,27 @@ pub(super) struct EmbeddingRoute {
     pub vector: Vec<f32>,
     pub target: EmbeddingTarget,
     pub produced_by: EvidenceProducer,
-    pub dimension: usize,
     pub table_name: String,
     pub vector_column: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EntityBasisDecisionCandidate {
+    decision_id: DecisionId,
+    entity_id: EntityId,
+    confidence: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EntityNoMatchInvalidation<'a> {
+    context_id: ContextId,
+    observation_id: ObservationId,
+    decision_id: DecisionId,
+    entity_id: EntityId,
+    entity_name: &'a str,
+    basis_snapshot_id: EntitySnapshotId,
+    confidence: Option<f64>,
+    embedding_space_id: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -902,6 +1643,14 @@ fn decode_snapshot_for_merge(columns: &[String], row: &[Value]) -> Result<Entity
         _ => BTreeMap::new(),
     };
     Ok(EntitySnapshotForMerge { id, properties })
+}
+
+fn invalidation_severity_text(severity: InvalidationSeverity) -> &'static str {
+    match severity {
+        InvalidationSeverity::Info => "info",
+        InvalidationSeverity::Warning => "warning",
+        InvalidationSeverity::Critical => "critical",
+    }
 }
 
 fn decode_observation(columns: &[String], row: &[Value]) -> Result<Observation> {

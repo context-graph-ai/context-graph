@@ -52,39 +52,35 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "embedding_spaces",
-        ddl: "CREATE TABLE embedding_spaces (embedding_space_id TEXT PRIMARY KEY, dimension INTEGER NOT NULL, metric TEXT NOT NULL, model_family TEXT, model_name TEXT, model_version TEXT, supported_evidence_kinds JSON, default_for_evidence_kind TEXT, bindings JSON)",
+        ddl: "CREATE TABLE embedding_spaces (embedding_space_id TEXT PRIMARY KEY, dimension INTEGER NOT NULL, metric TEXT NOT NULL, model_family TEXT, model_name TEXT, model_version TEXT, supported_evidence_kinds JSON, default_for_evidence_kind TEXT, bindings JSON, created_at TXID NOT NULL)",
     },
     TableSpec {
         name: "embedding_space_bindings",
-        ddl: "CREATE TABLE embedding_space_bindings (embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), table_name TEXT NOT NULL, vector_column TEXT NOT NULL, UNIQUE (embedding_space_id, table_name, vector_column), UNIQUE (table_name, vector_column))",
-    },
-    TableSpec {
-        name: "embedding_handles",
-        ddl: "CREATE TABLE embedding_handles (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), target_kind TEXT NOT NULL, target_id UUID NOT NULL, dimension INTEGER NOT NULL, produced_by JSON, created_at TXID NOT NULL)",
+        ddl: "CREATE TABLE embedding_space_bindings (embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), table_name TEXT NOT NULL, vector_column TEXT NOT NULL, UNIQUE (embedding_space_id, table_name, vector_column))",
     },
     TableSpec {
         name: "evidence_embedding_handles",
-        ddl: "CREATE TABLE evidence_embedding_handles (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), target_id UUID NOT NULL REFERENCES evidence(id), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (context_id, id), FOREIGN KEY (context_id, target_id) REFERENCES evidence(context_id, id)) IMMUTABLE",
+        ddl: "CREATE TABLE evidence_embedding_handles (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), target_id UUID NOT NULL REFERENCES evidence(id), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, producer_system TEXT NOT NULL, created_at TXID NOT NULL, FOREIGN KEY (context_id, target_id) REFERENCES evidence(context_id, id)) IMMUTABLE",
     },
     TableSpec {
         name: "entity_reference_embedding_handles",
-        ddl: "CREATE TABLE entity_reference_embedding_handles (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), target_id UUID NOT NULL REFERENCES entities(id), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (context_id, id), FOREIGN KEY (context_id, target_id) REFERENCES entities(context_id, id)) IMMUTABLE",
+        ddl: "CREATE TABLE entity_reference_embedding_handles (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), target_id UUID NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, producer_system TEXT NOT NULL, created_at TXID NOT NULL, FOREIGN KEY (context_id, target_id) REFERENCES entities(context_id, id)) IMMUTABLE",
     },
     TableSpec {
         name: "entity_reference_embeddings_128",
-        ddl: "CREATE TABLE entity_reference_embeddings_128 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL REFERENCES entities(id), label TEXT, vector VECTOR(128), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))",
+        ddl: "CREATE TABLE entity_reference_embeddings_128 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL, label TEXT, vector VECTOR(128), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))",
     },
     TableSpec {
         name: "entity_reference_embeddings_256",
-        ddl: "CREATE TABLE entity_reference_embeddings_256 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL REFERENCES entities(id), label TEXT, vector VECTOR(256), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))",
+        ddl: "CREATE TABLE entity_reference_embeddings_256 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL, label TEXT, vector VECTOR(256), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))",
     },
     TableSpec {
         name: "entity_reference_embeddings_512",
-        ddl: "CREATE TABLE entity_reference_embeddings_512 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL REFERENCES entities(id), label TEXT, vector VECTOR(512), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))",
+        ddl: "CREATE TABLE entity_reference_embeddings_512 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL, label TEXT, vector VECTOR(512), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))",
     },
     TableSpec {
         name: "entity_reference_embeddings_768",
-        ddl: "CREATE TABLE entity_reference_embeddings_768 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL REFERENCES entities(id), label TEXT, vector VECTOR(768), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))",
+        ddl: "CREATE TABLE entity_reference_embeddings_768 (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL, label TEXT, vector VECTOR(768), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))",
     },
     TableSpec {
         name: "reindex_cursors",
@@ -107,12 +103,20 @@ pub const TABLES: &[TableSpec] = &[
         ddl: "CREATE TABLE signatures (id UUID PRIMARY KEY, signature_type TEXT NOT NULL, description TEXT NOT NULL, match_criteria JSON NOT NULL, scope_labels JSON NOT NULL, confidence REAL NOT NULL, origin_context_ids JSON, status TEXT NOT NULL DEFAULT 'active', created_at TXID NOT NULL, last_matched_at TXID)",
     },
     TableSpec {
+        name: "signature_aggregates",
+        ddl: "CREATE TABLE signature_aggregates (signature_id TEXT PRIMARY KEY, signature_row_id UUID REFERENCES signatures(id), embedding_space_id TEXT NOT NULL, producer JSON NOT NULL, centroid JSON NOT NULL, member_count INTEGER NOT NULL, scope_labels JSON NOT NULL, created_at TXID NOT NULL)",
+    },
+    TableSpec {
+        name: "signature_producer_lineage",
+        ddl: "CREATE TABLE signature_producer_lineage (id UUID PRIMARY KEY, signature_id TEXT NOT NULL, signature_row_id UUID REFERENCES signatures(id), contribution_role TEXT NOT NULL, observation_id UUID NOT NULL, evidence_id UUID NOT NULL, embedding_id UUID NOT NULL, embedding_space_id TEXT NOT NULL, producer JSON NOT NULL, created_at TXID NOT NULL)",
+    },
+    TableSpec {
         name: "digests",
         ddl: "CREATE TABLE digests (id UUID PRIMARY KEY, source TEXT NOT NULL, session_ref TEXT, summary TEXT NOT NULL, kind TEXT NOT NULL, vector_text VECTOR(768), dimension INTEGER NOT NULL, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), properties JSON, created_at TXID NOT NULL, UNIQUE (context_id, id)) IMMUTABLE",
     },
     TableSpec {
         name: "digest_embedding_handles",
-        ddl: "CREATE TABLE digest_embedding_handles (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), target_id UUID NOT NULL REFERENCES digests(id), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (context_id, id), FOREIGN KEY (context_id, target_id) REFERENCES digests(context_id, id)) IMMUTABLE",
+        ddl: "CREATE TABLE digest_embedding_handles (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), target_id UUID NOT NULL REFERENCES digests(id), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, producer_system TEXT NOT NULL, created_at TXID NOT NULL, FOREIGN KEY (context_id, target_id) REFERENCES digests(context_id, id)) IMMUTABLE",
     },
     TableSpec {
         name: "blueprints",
@@ -169,6 +173,10 @@ pub const SUBSCRIPTION_EVENT_TYPE_DDL: &[&str] = &[
     "CREATE EVENT TYPE new_decision WHEN INSERT ON decisions",
     "CREATE EVENT TYPE conflict_detected WHEN INSERT ON conflicts",
     "CREATE EVENT TYPE precedent_match WHEN INSERT ON precedent_matches",
+    "CREATE EVENT TYPE ReindexCompleted WHEN UPDATE ON reindex_cursors",
+    "CREATE EVENT TYPE ReindexPaused WHEN UPDATE ON reindex_cursors",
+    "CREATE EVENT TYPE ReindexResumed WHEN UPDATE ON reindex_cursors",
+    "CREATE EVENT TYPE ReindexTriggerSuggested WHEN UPDATE ON reindex_cursors",
 ];
 
 pub const INDEXES: &[IndexSpec] = &[
@@ -181,5 +189,20 @@ pub const INDEXES: &[IndexSpec] = &[
         table: "edges",
         name: "idx_edges_target_context_type",
         ddl: "CREATE INDEX idx_edges_target_context_type ON edges (target_id, context_id, edge_type)",
+    },
+    IndexSpec {
+        table: "evidence_embedding_handles",
+        name: "idx_evidence_embedding_handles_producer_system",
+        ddl: "CREATE INDEX idx_evidence_embedding_handles_producer_system ON evidence_embedding_handles (producer_system)",
+    },
+    IndexSpec {
+        table: "entity_reference_embedding_handles",
+        name: "idx_entity_reference_embedding_handles_producer_system",
+        ddl: "CREATE INDEX idx_entity_reference_embedding_handles_producer_system ON entity_reference_embedding_handles (producer_system)",
+    },
+    IndexSpec {
+        table: "digest_embedding_handles",
+        name: "idx_digest_embedding_handles_producer_system",
+        ddl: "CREATE INDEX idx_digest_embedding_handles_producer_system ON digest_embedding_handles (producer_system)",
     },
 ];

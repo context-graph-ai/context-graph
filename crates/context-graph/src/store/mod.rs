@@ -27,11 +27,13 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use contextdb_core::{ColumnType, Error as EngineError, TxId, Value};
 use contextdb_engine::{Database, plugin::DatabasePlugin};
 
-use crate::EmbedderRegistration;
 use crate::Result;
+use crate::embedder::embeddinggemma::EmbeddingGemmaTextEmbedder;
+use crate::embedding_space::default_text_embedding_space;
 use crate::error::CgError;
 use crate::schema::{INDEXES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES};
 use crate::types::*;
+use crate::{Embedder, EmbedderRegistration};
 
 use self::conflict_detection::register_conflict_detection_triggers;
 use self::convert::map_engine_err;
@@ -56,6 +58,10 @@ pub struct Store {
     trace: Arc<Mutex<String>>,
     outcome_mutex: Arc<Mutex<()>>,
     authorized_contexts: Option<BTreeSet<ContextId>>,
+    embedders: Arc<HashMap<String, Arc<dyn Embedder>>>,
+    default_embedding_spaces: Arc<HashMap<EvidenceKind, String>>,
+    default_text_embedder_disabled: bool,
+    reindex_events: Arc<Mutex<Vec<ReindexEvent>>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -76,8 +82,7 @@ impl Store {
         config: StoreConfig,
         registrations: Vec<EmbedderRegistration>,
     ) -> Result<Self> {
-        let _ = registrations;
-        Self::open_with_config(config)
+        Self::open_with_config_inner_with_plugin(config, false, None, None, registrations)
     }
 
     pub fn open_with_contexts(config: StoreConfig, contexts: BTreeSet<ContextId>) -> Result<Self> {
@@ -89,7 +94,7 @@ impl Store {
         config: StoreConfig,
         plugin: Arc<dyn DatabasePlugin>,
     ) -> Result<Self> {
-        Self::open_with_config_inner_with_plugin(config, false, None, Some(plugin))
+        Self::open_with_config_inner_with_plugin(config, false, None, Some(plugin), Vec::new())
     }
 
     #[cfg(context_graph_internal_test_support)]
@@ -98,8 +103,7 @@ impl Store {
         plugin: Arc<dyn DatabasePlugin>,
         registrations: Vec<EmbedderRegistration>,
     ) -> Result<Self> {
-        let _ = registrations;
-        Self::open_with_database_plugin(config, plugin)
+        Self::open_with_config_inner_with_plugin(config, false, None, Some(plugin), registrations)
     }
 
     pub fn initialize_fresh(config: StoreConfig) -> Result<Self> {
@@ -125,7 +129,13 @@ impl Store {
         replace_shared_handle: bool,
         contexts: Option<BTreeSet<ContextId>>,
     ) -> Result<Self> {
-        Self::open_with_config_inner_with_plugin(config, replace_shared_handle, contexts, None)
+        Self::open_with_config_inner_with_plugin(
+            config,
+            replace_shared_handle,
+            contexts,
+            None,
+            Vec::new(),
+        )
     }
 
     fn open_with_config_inner_with_plugin(
@@ -133,15 +143,43 @@ impl Store {
         replace_shared_handle: bool,
         contexts: Option<BTreeSet<ContextId>>,
         plugin: Option<Arc<dyn DatabasePlugin>>,
+        registrations: Vec<EmbedderRegistration>,
     ) -> Result<Self> {
+        let mut registrations = registrations;
+        let explicit_registration_count = registrations.len();
+        if let Some(config) = config.default_text_embedder.clone()
+            && !matches!(config.source, crate::ModelSource::Disabled)
+            && !registrations.iter().any(|registration| {
+                registration.space.embedding_space_id
+                    == default_text_embedding_space().embedding_space_id
+            })
+        {
+            let embedder = Arc::new(EmbeddingGemmaTextEmbedder::new(config));
+            registrations.push(EmbedderRegistration {
+                space: embedder.embedding_space(),
+                embedder,
+            });
+        }
+        validate_embedder_registrations(&registrations)?;
         let db_path = config.db_path.clone();
         let authorized_contexts = contexts.clone();
         let loader_trace = match config.default_text_embedder.as_ref() {
             Some(config) if matches!(config.source, crate::ModelSource::Disabled) => {
-                "embedding_loader=disabled"
+                "embedding_loader=disabled".to_string()
             }
-            _ => "embedding_loader=not_entered",
+            Some(_) if explicit_registration_count > 0 => {
+                "embedding_loader=not_entered".to_string()
+            }
+            Some(_) => selected_default_trace(&config.extra_embedding_spaces),
+            None if explicit_registration_count > 0 => "embedding_loader=not_entered".to_string(),
+            None => selected_default_trace(&config.extra_embedding_spaces),
         };
+        let default_embedding_spaces = default_embedding_space_map(&config.extra_embedding_spaces);
+        let embedders = embedder_map(&registrations);
+        let default_text_embedder_disabled = config
+            .default_text_embedder
+            .as_ref()
+            .is_some_and(|config| matches!(config.source, crate::ModelSource::Disabled));
         let (db, resource_owner) =
             open_bootstrapped_database(&db_path, &config, replace_shared_handle, contexts, plugin)?;
         let store = Self {
@@ -157,6 +195,10 @@ impl Store {
             trace: Arc::new(Mutex::new(String::new())),
             outcome_mutex: Arc::new(Mutex::new(())),
             authorized_contexts,
+            embedders: Arc::new(embedders),
+            default_embedding_spaces: Arc::new(default_embedding_spaces),
+            default_text_embedder_disabled,
+            reindex_events: Arc::new(Mutex::new(Vec::new())),
         };
         store.set_trace(loader_trace);
         Ok(store)
@@ -227,7 +269,11 @@ impl Store {
         Ok(())
     }
 
-    pub(super) fn set_trace(&self, s: impl Into<String>) {
+    pub(crate) fn internal_db(&self) -> &Database {
+        &self.db
+    }
+
+    pub(crate) fn set_trace(&self, s: impl Into<String>) {
         let mut guard = self.trace.lock().expect("trace lock");
         *guard = s.into();
     }
@@ -361,6 +407,60 @@ fn open_bootstrapped_database(
     Ok((db, None))
 }
 
+fn validate_embedder_registrations(registrations: &[EmbedderRegistration]) -> Result<()> {
+    for registration in registrations {
+        let declared = registration.embedder.embedding_space();
+        if declared.embedding_space_id != registration.space.embedding_space_id {
+            return Err(CgError::EmbeddingSpaceIdMismatch {
+                embedder_declared: declared.embedding_space_id,
+                registry_declared: registration.space.embedding_space_id.clone(),
+            });
+        }
+        if registration.embedder.supported_inputs().is_empty() {
+            return Err(CgError::EmbedderDeclaresNoSupportedInputs {
+                embedding_space_id: registration.space.embedding_space_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn embedder_map(registrations: &[EmbedderRegistration]) -> HashMap<String, Arc<dyn Embedder>> {
+    let mut out = HashMap::new();
+    for registration in registrations {
+        out.insert(
+            registration.space.embedding_space_id.clone(),
+            Arc::clone(&registration.embedder),
+        );
+    }
+    out
+}
+
+fn selected_default_trace(extra: &[EmbeddingSpaceDecl]) -> String {
+    extra
+        .iter()
+        .find_map(|space| {
+            (space.default_for_evidence_kind == Some(EvidenceKind::Text))
+                .then(|| space.embedding_space_id.clone())
+        })
+        .or_else(|| extra.first().map(|space| space.embedding_space_id.clone()))
+        .unwrap_or_else(|| default_text_embedding_space().embedding_space_id)
+}
+
+fn default_embedding_space_map(extra: &[EmbeddingSpaceDecl]) -> HashMap<EvidenceKind, String> {
+    let mut out = HashMap::new();
+    out.insert(
+        EvidenceKind::Text,
+        default_text_embedding_space().embedding_space_id,
+    );
+    for space in extra {
+        if let Some(kind) = space.default_for_evidence_kind {
+            out.insert(kind, space.embedding_space_id.clone());
+        }
+    }
+    out
+}
+
 fn bootstrap_schema(db: &Database, config: &StoreConfig, reused_shared_handle: bool) -> Result<()> {
     validate_embedding_space_declarations(&config.extra_embedding_spaces)?;
     let mut bootstrapped_reused_handle = false;
@@ -373,6 +473,7 @@ fn bootstrap_schema(db: &Database, config: &StoreConfig, reused_shared_handle: b
             if reused_shared_handle && schema_version_table_is_empty(db) =>
         {
             initialize_schema(db)?;
+            ensure_entity_reference_embedding_tables(db, &config.extra_embedding_spaces)?;
             seed_embedding_spaces(db, &config.extra_embedding_spaces)?;
             validate_schema_version_after_bootstrap(db, config.expected_schema_version)?;
             bootstrapped_reused_handle = true;
@@ -383,6 +484,7 @@ fn bootstrap_schema(db: &Database, config: &StoreConfig, reused_shared_handle: b
         && (!reused_shared_handle || schema_was_empty || !config.extra_embedding_spaces.is_empty())
     {
         initialize_schema(db)?;
+        ensure_entity_reference_embedding_tables(db, &config.extra_embedding_spaces)?;
         seed_embedding_spaces(db, &config.extra_embedding_spaces)?;
         validate_schema_version_after_bootstrap(db, config.expected_schema_version)?;
     }
@@ -421,6 +523,29 @@ fn initialize_schema(db: &Database) -> Result<()> {
     }
     for ddl in SUBSCRIPTION_EVENT_TYPE_DDL {
         db.execute(ddl, &HashMap::new()).map_err(map_engine_err)?;
+    }
+    Ok(())
+}
+
+fn ensure_entity_reference_embedding_tables(
+    db: &Database,
+    spaces: &[EmbeddingSpaceDecl],
+) -> Result<()> {
+    for dimension in spaces.iter().map(|space| space.dimension) {
+        if matches!(dimension, 128 | 256 | 512 | 768) {
+            continue;
+        }
+        if dimension == 0 || dimension > 4096 {
+            continue;
+        }
+        let table = format!("entity_reference_embeddings_{dimension}");
+        if db.table_meta(&table).is_some() {
+            continue;
+        }
+        let ddl = format!(
+            "CREATE TABLE {table} (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL, label TEXT, vector VECTOR({dimension}), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))"
+        );
+        db.execute(&ddl, &HashMap::new()).map_err(map_engine_err)?;
     }
     Ok(())
 }
@@ -503,9 +628,6 @@ fn seed_embedding_spaces(db: &Database, extra: &[EmbeddingSpaceDecl]) -> Result<
     validate_embedding_space_declarations(extra)?;
     let default = default_text_embedding_space();
     let mut defaults = HashSet::new();
-    if let Some(kind) = default.default_for_evidence_kind {
-        defaults.insert(kind);
-    }
     for space in extra {
         if let Some(kind) = space.default_for_evidence_kind
             && !defaults.insert(kind)
@@ -519,32 +641,6 @@ fn seed_embedding_spaces(db: &Database, extra: &[EmbeddingSpaceDecl]) -> Result<
     }
     ensure_schema_version_row(db)?;
     Ok(())
-}
-
-fn default_text_embedding_space() -> EmbeddingSpace {
-    let id = "text_default_embeddinggemma_300m_768";
-    EmbeddingSpace {
-        embedding_space_id: id.to_string(),
-        dimension: 768,
-        metric: DistanceMetric::Cosine,
-        model_family: "text".to_string(),
-        model_name: "embeddinggemma-300m".to_string(),
-        model_version: "default".to_string(),
-        supported_evidence_kinds: vec![EvidenceKind::Text, EvidenceKind::StructuredSignal],
-        default_for_evidence_kind: Some(EvidenceKind::Text),
-        bindings: vec![
-            EmbeddingSpaceBinding {
-                embedding_space_id: id.to_string(),
-                table_name: "evidence".to_string(),
-                vector_column: "vector_text".to_string(),
-            },
-            EmbeddingSpaceBinding {
-                embedding_space_id: id.to_string(),
-                table_name: "digests".to_string(),
-                vector_column: "vector_text".to_string(),
-            },
-        ],
-    }
 }
 
 fn seed_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()> {
@@ -614,9 +710,10 @@ fn seed_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()>
                         .collect::<Vec<_>>()
                 )),
             ),
+            ("created_at".to_string(), Value::TxId(crate::TxId(1))),
         ]);
         match db.execute(
-            "INSERT INTO embedding_spaces (embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings) VALUES ($embedding_space_id, $dimension, $metric, $model_family, $model_name, $model_version, $supported_evidence_kinds, $default_for_evidence_kind, $bindings)",
+            "INSERT INTO embedding_spaces (embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings, created_at) VALUES ($embedding_space_id, $dimension, $metric, $model_family, $model_name, $model_version, $supported_evidence_kinds, $default_for_evidence_kind, $bindings, $created_at)",
             &params,
         ) {
             Ok(_) => {}
@@ -665,7 +762,7 @@ fn validate_existing_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) 
     )]);
     let rows = db
         .execute(
-            "SELECT dimension, metric, model_family, model_name, model_version FROM embedding_spaces WHERE embedding_space_id = $id",
+            "SELECT dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings FROM embedding_spaces WHERE embedding_space_id = $id",
             &params,
         )
         .map_err(map_engine_err)?;
@@ -673,14 +770,18 @@ fn validate_existing_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) 
         return Ok(());
     };
     if !matches!(row.first(), Some(Value::Int64(n)) if *n as usize == space.dimension) {
-        return Err(CgError::EmbeddingSpaceMismatch {
-            conflicting_field: "dimension",
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "dimension",
+            expected: row.first().map(value_to_config_string).unwrap_or_default(),
+            actual: space.dimension.to_string(),
         });
     }
     if !matches!(row.get(1), Some(Value::Text(metric)) if metric == distance_metric_str(space.metric))
     {
-        return Err(CgError::EmbeddingSpaceMismatch {
-            conflicting_field: "metric",
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "metric",
+            expected: row.get(1).map(value_to_config_string).unwrap_or_default(),
+            actual: distance_metric_str(space.metric).to_string(),
         });
     }
     for (idx, expected, field) in [
@@ -692,51 +793,112 @@ fn validate_existing_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) 
             Some(Value::Text(value)) => value.as_str(),
             Some(Value::Null) | None => "",
             _ => {
-                return Err(CgError::EmbeddingSpaceMismatch {
-                    conflicting_field: field,
+                return Err(CgError::EmbeddingSpaceConfigMismatch {
+                    field,
+                    expected: String::new(),
+                    actual: expected.to_string(),
                 });
             }
         };
         if actual != expected {
-            return Err(CgError::EmbeddingSpaceMismatch {
-                conflicting_field: field,
+            return Err(CgError::EmbeddingSpaceConfigMismatch {
+                field,
+                expected: actual.to_string(),
+                actual: expected.to_string(),
             });
         }
+    }
+    let actual_supported = embedding_kinds_from_value(row.get(5));
+    let supplied_supported = canonical_supported_kinds(&space.supported_evidence_kinds);
+    if actual_supported.as_deref() != Some(supplied_supported.as_slice()) {
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "supported_evidence_kinds",
+            expected: actual_supported
+                .map(|kinds| kinds.join(","))
+                .unwrap_or_else(|| row.get(5).map(value_to_config_string).unwrap_or_default()),
+            actual: supplied_supported.join(","),
+        });
+    }
+    let actual_default = embedding_kind_from_value(row.get(6));
+    let supplied_default = canonical_default_kind(space.default_for_evidence_kind);
+    if actual_default.as_deref() != Some(supplied_default.as_str()) {
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "default_for_evidence_kind",
+            expected: actual_default
+                .unwrap_or_else(|| row.get(6).map(value_to_config_string).unwrap_or_default()),
+            actual: supplied_default,
+        });
+    }
+    let actual_bindings = embedding_bindings_from_value(row.get(7));
+    let supplied_bindings = canonical_bindings(&space.bindings);
+    if actual_bindings.as_deref() != Some(supplied_bindings.as_slice()) {
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "bindings",
+            expected: actual_bindings
+                .map(|bindings| bindings.join(","))
+                .unwrap_or_else(|| row.get(7).map(value_to_config_string).unwrap_or_default()),
+            actual: supplied_bindings.join(","),
+        });
     }
     Ok(())
 }
 
 fn validate_embedding_space_declarations(extra: &[EmbeddingSpaceDecl]) -> Result<()> {
+    let mut extra_defaults = HashMap::<EvidenceKind, String>::new();
+    for space in extra {
+        validate_embedding_space_id(&space.embedding_space_id)?;
+        if space.embedding_space_id == default_text_embedding_space().embedding_space_id {
+            return Err(CgError::EmbeddingSpaceIdReserved {
+                id: space.embedding_space_id.clone(),
+            });
+        }
+        if space.supported_evidence_kinds.is_empty() {
+            return Err(CgError::EmbedderDeclaresNoSupportedInputs {
+                embedding_space_id: space.embedding_space_id.clone(),
+            });
+        }
+        if let Some(kind) = space.default_for_evidence_kind {
+            if !space.supported_evidence_kinds.contains(&kind) {
+                return Err(CgError::InconsistentEmbeddingSpaceDeclaration {
+                    space_id: space.embedding_space_id.clone(),
+                });
+            }
+            match extra_defaults.get(&kind) {
+                Some(owner) if owner != &space.embedding_space_id => {
+                    return Err(CgError::AmbiguousEmbeddingSpace);
+                }
+                _ => {
+                    extra_defaults.insert(kind, space.embedding_space_id.clone());
+                }
+            }
+        }
+    }
     let mut spaces = Vec::with_capacity(extra.len() + 1);
     spaces.push(default_text_embedding_space());
     spaces.extend(extra.iter().cloned());
 
     let mut declared = HashMap::<String, EmbeddingSpaceDecl>::new();
-    let mut defaults = HashMap::<EvidenceKind, String>::new();
     let mut owners = HashMap::<(String, String), String>::new();
+    let builtin_text_id = default_text_embedding_space().embedding_space_id;
     for space in &spaces {
         if let Some(previous) = declared.get(&space.embedding_space_id) {
             validate_embedding_space_decl_matches(previous, space)?;
         } else {
             declared.insert(space.embedding_space_id.clone(), space.clone());
         }
-        if let Some(kind) = space.default_for_evidence_kind {
-            match defaults.get(&kind) {
-                Some(owner) if owner != &space.embedding_space_id => {
-                    return Err(CgError::AmbiguousEmbeddingSpace);
-                }
-                Some(_) => {}
-                None => {
-                    defaults.insert(kind, space.embedding_space_id.clone());
-                }
-            }
-        }
         for binding in &space.bindings {
             match static_vector_column_dimension(&binding.table_name, &binding.vector_column) {
                 Some(dimension) if dimension == space.dimension => {}
                 Some(_) => {
-                    return Err(CgError::EmbeddingSpaceMismatch {
-                        conflicting_field: "dimension",
+                    return Err(CgError::EmbeddingSpaceConfigMismatch {
+                        field: "dimension",
+                        expected: static_vector_column_dimension(
+                            &binding.table_name,
+                            &binding.vector_column,
+                        )
+                        .unwrap_or_default()
+                        .to_string(),
+                        actual: space.dimension.to_string(),
                     });
                 }
                 None => {
@@ -747,10 +909,22 @@ fn validate_embedding_space_declarations(extra: &[EmbeddingSpaceDecl]) -> Result
                 }
             }
             let key = (binding.table_name.clone(), binding.vector_column.clone());
+            if shared_digest_vector_binding_allowed(binding) {
+                continue;
+            }
+            if space.embedding_space_id == builtin_text_id
+                && space
+                    .default_for_evidence_kind
+                    .is_some_and(|kind| extra_defaults.contains_key(&kind))
+            {
+                continue;
+            }
             match owners.get(&key) {
                 Some(owner) if owner != &space.embedding_space_id => {
-                    return Err(CgError::EmbeddingSpaceMismatch {
-                        conflicting_field: "bindings",
+                    return Err(CgError::EmbeddingSpaceConfigMismatch {
+                        field: "bindings",
+                        expected: owner.clone(),
+                        actual: space.embedding_space_id.clone(),
                     });
                 }
                 Some(_) => {}
@@ -768,13 +942,17 @@ fn validate_embedding_space_decl_matches(
     supplied: &EmbeddingSpaceDecl,
 ) -> Result<()> {
     if existing.dimension != supplied.dimension {
-        return Err(CgError::EmbeddingSpaceMismatch {
-            conflicting_field: "dimension",
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "dimension",
+            expected: existing.dimension.to_string(),
+            actual: supplied.dimension.to_string(),
         });
     }
     if existing.metric != supplied.metric {
-        return Err(CgError::EmbeddingSpaceMismatch {
-            conflicting_field: "metric",
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "metric",
+            expected: distance_metric_str(existing.metric).to_string(),
+            actual: distance_metric_str(supplied.metric).to_string(),
         });
     }
     for (field, matches) in [
@@ -789,12 +967,131 @@ fn validate_embedding_space_decl_matches(
         ),
     ] {
         if !matches {
-            return Err(CgError::EmbeddingSpaceMismatch {
-                conflicting_field: field,
+            return Err(CgError::EmbeddingSpaceConfigMismatch {
+                field,
+                expected: match field {
+                    "model_family" => existing.model_family.clone(),
+                    "model_name" => existing.model_name.clone(),
+                    "model_version" => existing.model_version.clone(),
+                    _ => String::new(),
+                },
+                actual: match field {
+                    "model_family" => supplied.model_family.clone(),
+                    "model_name" => supplied.model_name.clone(),
+                    "model_version" => supplied.model_version.clone(),
+                    _ => String::new(),
+                },
             });
         }
     }
+    if canonical_supported_kinds(&existing.supported_evidence_kinds)
+        != canonical_supported_kinds(&supplied.supported_evidence_kinds)
+    {
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "supported_evidence_kinds",
+            expected: canonical_supported_kinds(&existing.supported_evidence_kinds).join(","),
+            actual: canonical_supported_kinds(&supplied.supported_evidence_kinds).join(","),
+        });
+    }
+    if existing.default_for_evidence_kind != supplied.default_for_evidence_kind {
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "default_for_evidence_kind",
+            expected: canonical_default_kind(existing.default_for_evidence_kind),
+            actual: canonical_default_kind(supplied.default_for_evidence_kind),
+        });
+    }
+    if canonical_bindings(&existing.bindings) != canonical_bindings(&supplied.bindings) {
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "bindings",
+            expected: canonical_bindings(&existing.bindings).join(","),
+            actual: canonical_bindings(&supplied.bindings).join(","),
+        });
+    }
     Ok(())
+}
+
+fn validate_embedding_space_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(CgError::InvalidEmbeddingSpaceId { reason: "empty_id" });
+    }
+    if id.len() > 128 {
+        return Err(CgError::InvalidEmbeddingSpaceId { reason: "too_long" });
+    }
+    if id.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err(CgError::InvalidEmbeddingSpaceId {
+            reason: "whitespace_or_control_chars",
+        });
+    }
+    Ok(())
+}
+
+fn value_to_config_string(value: &Value) -> String {
+    match value {
+        Value::Text(value) => value.clone(),
+        Value::Int64(value) => value.to_string(),
+        Value::Null => String::new(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn canonical_supported_kinds(kinds: &[EvidenceKind]) -> Vec<String> {
+    let mut values = kinds
+        .iter()
+        .map(|kind| evidence_kind_str(*kind).to_string())
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn canonical_default_kind(kind: Option<EvidenceKind>) -> String {
+    kind.map(evidence_kind_str).unwrap_or_default().to_string()
+}
+
+fn canonical_bindings(bindings: &[EmbeddingSpaceBinding]) -> Vec<String> {
+    let mut values = bindings
+        .iter()
+        .map(|binding| format!("{}:{}", binding.table_name, binding.vector_column))
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn embedding_kinds_from_value(value: Option<&Value>) -> Option<Vec<String>> {
+    let mut values = value
+        .and_then(|value| match value {
+            Value::Json(json) => Some(json.as_array()?),
+            _ => None,
+        })?
+        .iter()
+        .map(|value| value.as_str().map(ToString::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    values.sort();
+    Some(values)
+}
+
+fn embedding_kind_from_value(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Text(value)) => Some(value.clone()),
+        Some(Value::Null) => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn embedding_bindings_from_value(value: Option<&Value>) -> Option<Vec<String>> {
+    let mut values = value
+        .and_then(|value| match value {
+            Value::Json(json) => Some(json.as_array()?),
+            _ => None,
+        })?
+        .iter()
+        .map(|value| {
+            let table_name = value.get("table_name")?.as_str()?;
+            let vector_column = value.get("vector_column")?.as_str()?;
+            Some(format!("{table_name}:{vector_column}"))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    values.sort();
+    Some(values)
 }
 
 fn static_vector_column_dimension(table_name: &str, vector_column: &str) -> Option<usize> {
@@ -830,11 +1127,31 @@ fn validate_binding_owner(
     if let Some(row) = rows.rows.first()
         && !matches!(row.first(), Some(Value::Text(owner)) if owner == &space.embedding_space_id)
     {
-        return Err(CgError::EmbeddingSpaceMismatch {
-            conflicting_field: "bindings",
+        if shared_digest_vector_binding_allowed(binding) {
+            return Ok(());
+        }
+        if matches!(
+            row.first(),
+            Some(Value::Text(owner))
+                if owner == &default_text_embedding_space().embedding_space_id
+                    && space.default_for_evidence_kind == Some(EvidenceKind::Text)
+        ) {
+            return Ok(());
+        }
+        return Err(CgError::EmbeddingSpaceConfigMismatch {
+            field: "bindings",
+            expected: match row.first() {
+                Some(Value::Text(owner)) => owner.clone(),
+                _ => String::new(),
+            },
+            actual: space.embedding_space_id.clone(),
         });
     }
     Ok(())
+}
+
+fn shared_digest_vector_binding_allowed(binding: &EmbeddingSpaceBinding) -> bool {
+    binding.table_name == "digests" && binding.vector_column == "vector_text"
 }
 
 fn validate_embedding_space_bindings(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()> {
@@ -857,9 +1174,11 @@ fn validate_embedding_space_bindings(db: &Database, space: &EmbeddingSpaceDecl) 
         };
         match column.column_type {
             ColumnType::Vector(dimension) if dimension == space.dimension => {}
-            ColumnType::Vector(_) => {
-                return Err(CgError::EmbeddingSpaceMismatch {
-                    conflicting_field: "dimension",
+            ColumnType::Vector(actual_dimension) => {
+                return Err(CgError::EmbeddingSpaceConfigMismatch {
+                    field: "dimension",
+                    expected: space.dimension.to_string(),
+                    actual: actual_dimension.to_string(),
                 });
             }
             _ => {

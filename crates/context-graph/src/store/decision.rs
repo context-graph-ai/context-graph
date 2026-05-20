@@ -4,6 +4,9 @@ use contextdb_core::{Error as EngineError, SnapshotId, Value};
 use serde_json::Value as JsonValue;
 
 use crate::error::CgError;
+use crate::producer::{
+    DecisionReasoningProducerSnapshot, attach_decision_reasoning_producer_snapshots,
+};
 use crate::types::*;
 use crate::{Result, TxId};
 
@@ -75,8 +78,6 @@ impl Store {
         }
 
         let id = DecisionId::new_v7();
-        let reasoning_json = serde_json::to_value(&input.reasoning)
-            .map_err(|e| CgError::Engine(format!("reasoning serialize: {e}")))?;
         let tags_json = JsonValue::Array(
             input
                 .tags
@@ -105,6 +106,17 @@ impl Store {
         let basis_snapshots = self.basis_snapshots_for_basis(&basis_snapshot_ids)?;
 
         let tx = self.begin_tx()?;
+        let reasoning_json = match self.reasoning_json_with_producer_snapshot_in_tx(
+            tx,
+            &input.reasoning,
+            &basis_snapshots,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = self.db.rollback(tx);
+                return Err(err);
+            }
+        };
         let confidence_value = match input.confidence {
             Some(c) => Value::Float64(c as f64),
             None => Value::Null,
@@ -311,6 +323,73 @@ impl Store {
             };
             snapshots.push(row);
         }
+        Ok(snapshots)
+    }
+
+    fn reasoning_json_with_producer_snapshot_in_tx(
+        &self,
+        tx: TxId,
+        reasoning: &[ReasoningStep],
+        basis_snapshots: &[EntitySnapshot],
+    ) -> Result<JsonValue> {
+        let reasoning_json = serde_json::to_value(reasoning)
+            .map_err(|e| CgError::Engine(format!("reasoning serialize: {e}")))?;
+        let snapshots = self.decision_reasoning_producer_snapshots_in_tx(tx, basis_snapshots)?;
+        attach_decision_reasoning_producer_snapshots(reasoning_json, &snapshots)
+    }
+
+    fn decision_reasoning_producer_snapshots_in_tx(
+        &self,
+        tx: TxId,
+        basis_snapshots: &[EntitySnapshot],
+    ) -> Result<Vec<DecisionReasoningProducerSnapshot>> {
+        if basis_snapshots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..basis_snapshots.len())
+            .map(|idx| format!("$snapshot_id_{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT evidence_embedding_handles.target_id, evidence_embedding_handles.embedding_space_id, evidence_embedding_handles.produced_by, evidence_embedding_handles.created_at \
+             FROM entity_snapshot_observations \
+             INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id \
+             INNER JOIN evidence_embedding_handles ON evidence_embedding_handles.context_id = evidence.context_id AND evidence_embedding_handles.target_id = evidence.id \
+             WHERE entity_snapshot_observations.snapshot_id IN ({placeholders})"
+        );
+        let mut params = HashMap::new();
+        for (idx, snapshot) in basis_snapshots.iter().enumerate() {
+            params.insert(
+                format!("snapshot_id_{idx}"),
+                Value::Uuid(snapshot.id.as_uuid()),
+            );
+        }
+        let result = self
+            .db
+            .execute_in_tx(tx, &sql, &params)
+            .map_err(map_engine_err)?;
+        let mut latest_by_evidence_space =
+            HashMap::<(uuid::Uuid, String), DecisionReasoningProducerSnapshot>::new();
+        for row in &result.rows {
+            let snapshot = decode_decision_reasoning_producer_snapshot(row)?;
+            let key = (snapshot.evidence_id, snapshot.embedding_space_id.clone());
+            latest_by_evidence_space
+                .entry(key)
+                .and_modify(|existing| {
+                    if snapshot.created_at > existing.created_at {
+                        *existing = snapshot.clone();
+                    }
+                })
+                .or_insert(snapshot);
+        }
+        let mut snapshots = latest_by_evidence_space.into_values().collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| {
+            (
+                snapshot.evidence_id,
+                snapshot.embedding_space_id.clone(),
+                snapshot.created_at,
+            )
+        });
         Ok(snapshots)
     }
 
@@ -863,8 +942,6 @@ impl Store {
         }
 
         let new_id = DecisionId::new_v7();
-        let reasoning_json = serde_json::to_value(&new.reasoning)
-            .map_err(|e| CgError::Engine(format!("reasoning serialize: {e}")))?;
         let tags_json = JsonValue::Array(
             new.tags
                 .iter()
@@ -892,6 +969,17 @@ impl Store {
         let basis_snapshots = self.basis_snapshots_for_basis(&basis_snapshot_ids)?;
 
         let tx = self.begin_tx()?;
+        let reasoning_json = match self.reasoning_json_with_producer_snapshot_in_tx(
+            tx,
+            &new.reasoning,
+            &basis_snapshots,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = self.db.rollback(tx);
+                return Err(err);
+            }
+        };
         // Transition old decision to superseded.
         let transition_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(old.as_uuid())),
@@ -1766,6 +1854,50 @@ fn sql_string_list(values: &[&'static str]) -> String {
         .map(|value| format!("'{value}'"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn decode_decision_reasoning_producer_snapshot(
+    row: &[Value],
+) -> Result<DecisionReasoningProducerSnapshot> {
+    let evidence_id = match row.first() {
+        Some(Value::Uuid(value)) => *value,
+        value => {
+            return Err(CgError::Engine(format!(
+                "expected evidence id in decision producer snapshot row, got {value:?}"
+            )));
+        }
+    };
+    let embedding_space_id = match row.get(1) {
+        Some(Value::Text(value)) => value.clone(),
+        value => {
+            return Err(CgError::Engine(format!(
+                "expected embedding space in decision producer snapshot row, got {value:?}"
+            )));
+        }
+    };
+    let produced_by = match row.get(2) {
+        Some(Value::Json(value)) => serde_json::from_value::<EvidenceProducer>(value.clone())
+            .map_err(|err| CgError::Engine(format!("invalid producer snapshot json: {err}")))?,
+        value => {
+            return Err(CgError::Engine(format!(
+                "expected producer json in decision producer snapshot row, got {value:?}"
+            )));
+        }
+    };
+    let created_at = match row.get(3) {
+        Some(Value::TxId(value)) => *value,
+        value => {
+            return Err(CgError::Engine(format!(
+                "expected txid in decision producer snapshot row, got {value:?}"
+            )));
+        }
+    };
+    Ok(DecisionReasoningProducerSnapshot {
+        evidence_id,
+        embedding_space_id,
+        produced_by,
+        created_at,
+    })
 }
 
 fn decode_decision(columns: &[String], row: &[Value]) -> Result<Decision> {

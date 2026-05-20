@@ -44,7 +44,7 @@ fn cg_observation(
             id: evidence_id,
             observation_id,
             context_id,
-            kind: context_graph::EvidenceKind::Text,
+            kind: context_graph::EvidenceKind::StructuredSignal,
             source_ref:
                 "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
@@ -71,6 +71,7 @@ fn cg_observation_with_text_embedding(
     vector: Vec<f32>,
 ) -> context_graph::RecordObservation {
     let mut observation = cg_observation(observation_id, evidence_id, entity_id, context_id, 0);
+    observation.evidence[0].kind = context_graph::EvidenceKind::Text;
     observation.state_delta = BTreeMap::from([("risk".to_string(), Some(json!("elevated")))]);
     observation.embeddings = vec![context_graph::PrecomputedEmbedding {
         id: embedding_id,
@@ -2521,6 +2522,7 @@ fn combination_record_observation_rollback_on_validation_error_after_tx_open_lea
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(context_graph::EmbedderConfig::disabled()),
         ..Default::default()
     };
     let store = context_graph::Store::open(config.clone()).expect("open");
@@ -2784,6 +2786,7 @@ fn combination_invalidate_decision_with_invalidation_row_atomic_or_neither_visib
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(context_graph::EmbedderConfig::disabled()),
         ..Default::default()
     };
     let (decision_id, trigger_id) = seed_store_decision(&config);
@@ -2825,6 +2828,7 @@ fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidati
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(context_graph::EmbedderConfig::disabled()),
         ..Default::default()
     };
     let (decision_id, trigger_id) = seed_store_decision(&config);
@@ -3604,6 +3608,7 @@ fn combination_record_observation_concurrent_against_same_entity_snapshot_timeli
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(context_graph::EmbedderConfig::disabled()),
         ..Default::default()
     };
     let store = context_graph::Store::open(config.clone()).expect("open");
@@ -3654,6 +3659,7 @@ fn combination_invalidate_decision_observation_atomic_visibility_no_torn_reader(
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(context_graph::EmbedderConfig::disabled()),
         ..Default::default()
     };
     let (decision_id, trigger_id) = seed_store_decision(&config);

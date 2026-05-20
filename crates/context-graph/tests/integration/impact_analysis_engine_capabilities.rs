@@ -12,6 +12,7 @@ fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::open(StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(EmbedderConfig::disabled()),
         ..Default::default()
     })
     .expect("open");
@@ -21,6 +22,7 @@ fn fresh_store() -> (tempfile::TempDir, Store) {
 fn reopen_store(dir: &tempfile::TempDir) -> Store {
     Store::open(StoreConfig {
         db_path: dir.path().join("cg.db"),
+        default_text_embedder: Some(EmbedderConfig::disabled()),
         ..Default::default()
     })
     .expect("reopen")
@@ -70,7 +72,7 @@ fn evidence_ref(observation_id: ObservationId) -> EvidenceRef {
         id: EvidenceId::new_v7(),
         observation_id,
         context_id: ContextId::default(),
-        kind: EvidenceKind::Text,
+        kind: EvidenceKind::StructuredSignal,
         source_ref: "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .to_string(),
         content_hash: Some(

@@ -278,6 +278,7 @@ fn record_text_basis_observation(
             source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
             mime_type: Some("text/plain".to_string()),
             producer: producer_with_system(producer_system),
+            text_projection: Some(format!("producer lineage basis {producer_system}")),
             ..Default::default()
         }],
         observed_properties: BTreeMap::new(),

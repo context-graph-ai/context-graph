@@ -439,7 +439,7 @@ impl Default for EmbeddingSpace {
 
 pub type EmbeddingSpaceDecl = EmbeddingSpace;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EmbeddingTarget {
     Evidence(EvidenceId),
     EntityReference(EntityId, Option<String>),
@@ -1054,7 +1054,7 @@ pub struct AuditFilter {
     pub after: Option<AuditId>,
 }
 
-pub const CG_SCHEMA_VERSION: u32 = 4;
+pub const CG_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreConfig {
@@ -1073,7 +1073,7 @@ impl Default for StoreConfig {
             https_allowed_hosts: Vec::new(),
             file_uri_allowed: false,
             extra_embedding_spaces: Vec::new(),
-            default_text_embedder: None,
+            default_text_embedder: Some(EmbedderConfig::default_embeddinggemma_offline()),
             expected_schema_version: CG_SCHEMA_VERSION,
         }
     }

@@ -309,6 +309,10 @@ impl CallbackStoreParts {
         let trace = Arc::clone(&store.trace);
         let outcome_mutex = Arc::clone(&store.outcome_mutex);
         let authorized_contexts = store.authorized_contexts.clone();
+        let embedders = Arc::clone(&store.embedders);
+        let default_embedding_spaces = Arc::clone(&store.default_embedding_spaces);
+        let default_text_embedder_disabled = store.default_text_embedder_disabled;
+        let reindex_events = Arc::clone(&store.reindex_events);
         let build = Arc::new(move |db| Store {
             db_path: db_path.clone(),
             db,
@@ -318,6 +322,10 @@ impl CallbackStoreParts {
             trace: Arc::clone(&trace),
             outcome_mutex: Arc::clone(&outcome_mutex),
             authorized_contexts: authorized_contexts.clone(),
+            embedders: Arc::clone(&embedders),
+            default_embedding_spaces: Arc::clone(&default_embedding_spaces),
+            default_text_embedder_disabled,
+            reindex_events: Arc::clone(&reindex_events),
         });
         Self {
             db: Arc::downgrade(&store.db),

@@ -25,8 +25,7 @@ pub mod test_support {
         pub use crate::store::embedding::{
             CompositeVectorClause, FusionPolicy, VectorSearchFilters, VectorSearchResult,
             compare_embedding_targets_across_spaces, composite_vector_search_with_policy,
-            dedup_compare_digest_spaces, evidence_search, semantic_search,
-            stage_versioned_text_digest_for_dedup, vector_search,
+            dedup_compare_digest_spaces, evidence_search, semantic_search, vector_search,
         };
         pub use crate::store::entity_reference_embeddings::entity_reference_cosine_match;
     }

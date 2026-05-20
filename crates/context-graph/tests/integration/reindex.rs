@@ -748,6 +748,7 @@ fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_determin
                 source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
                 retention_status: RetentionStatus::RetainedExternal,
                 producer: producer("capture"),
+                text_projection: Some(format!("padding text {idx}")),
                 ..Default::default()
             }],
             observed_properties: BTreeMap::new(),

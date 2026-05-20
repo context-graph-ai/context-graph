@@ -66,6 +66,18 @@ pub struct EmbedderConfig {
 }
 
 impl EmbedderConfig {
+    pub fn default_embeddinggemma_offline() -> Self {
+        Self {
+            source: ModelSource::HuggingFace {
+                repo: "google/embeddinggemma-300m".to_string(),
+            },
+            offline: true,
+            cache_dir: None,
+            pinned_revision: None,
+            network_policy: "offline-cache-only".to_string(),
+        }
+    }
+
     pub fn disabled() -> Self {
         Self {
             source: ModelSource::Disabled,
