@@ -121,6 +121,7 @@ pub enum CgError {
     InvalidEmbeddingVectorFloat,
     EntityArchived {
         entity_id: crate::EntityId,
+        archived_at: TxId,
     },
     EntityNotFound {
         entity_id: crate::EntityId,

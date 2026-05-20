@@ -10,15 +10,14 @@ use std::sync::{
 
 use context_graph::{
     CgError, CreateContext, CreateEntity, DistanceMetric, EmbeddingId, EmbeddingSpaceDecl,
-    EntityId, EntityType, EvidenceKind, EvidenceProducer, Store, StoreConfig,
+    EntityId, EntityType, EvidenceKind, EvidenceProducer, Store, StoreConfig, TxId,
 };
 #[cfg(context_graph_internal_test_support)]
-use contextdb_core::{Error as EngineError, RowId, Value, VectorIndexRef};
+use contextdb_core::{Error as EngineError, RowId};
+use contextdb_core::{Value, VectorIndexRef};
+use contextdb_engine::Database;
 #[cfg(context_graph_internal_test_support)]
-use contextdb_engine::{
-    Database,
-    plugin::{CommitSource, DatabasePlugin},
-};
+use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
 #[cfg(context_graph_internal_test_support)]
 use contextdb_tx::WriteSet;
 
@@ -30,7 +29,6 @@ fn store() -> Store {
 
 struct Fixture {
     _dir: tempfile::TempDir,
-    #[cfg(context_graph_internal_test_support)]
     db_path: PathBuf,
     store: Store,
 }
@@ -59,7 +57,6 @@ fn fixture(name: &str) -> Fixture {
     let store = Store::open(store_config(db_path.clone())).expect("open");
     Fixture {
         _dir: dir,
-        #[cfg(context_graph_internal_test_support)]
         db_path,
         store,
     }
@@ -73,7 +70,6 @@ fn fixture_with_database_plugin(name: &str, plugin: Arc<dyn DatabasePlugin>) -> 
         .expect("open with plugin");
     Fixture {
         _dir: dir,
-        #[cfg(context_graph_internal_test_support)]
         db_path,
         store,
     }
@@ -253,7 +249,6 @@ fn params(pairs: Vec<(&str, Value)>) -> std::collections::HashMap<String, Value>
         .collect()
 }
 
-#[cfg(context_graph_internal_test_support)]
 fn leaked_entity_reference_vector_count(db_path: &PathBuf, vector: &[f32]) -> usize {
     let db = Database::open(db_path).expect("raw database open");
     db.query_vector(
@@ -267,6 +262,46 @@ fn leaked_entity_reference_vector_count(db_path: &PathBuf, vector: &[f32]) -> us
     .into_iter()
     .filter(|(_, score)| *score > 0.99)
     .count()
+}
+
+fn raw_entity_reference_rows(db_path: &PathBuf, entity_id: EntityId) -> Vec<(EmbeddingId, TxId)> {
+    let db = Database::open(db_path).expect("raw database open");
+    let mut rows = db
+        .scan("entity_reference_embeddings_512", db.snapshot())
+        .expect("raw entity reference scan")
+        .into_iter()
+        .filter_map(|row| {
+            if row.values.get("entity_id") != Some(&Value::Uuid(entity_id.as_uuid())) {
+                return None;
+            }
+            let id = match row.values.get("id") {
+                Some(Value::Uuid(id)) => EmbeddingId::from(*id),
+                _ => return None,
+            };
+            let created_at = match row.values.get("created_at") {
+                Some(Value::TxId(txid)) => *txid,
+                _ => return None,
+            };
+            Some((id, created_at))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    rows
+}
+
+fn raw_entity_reference_handle_count(db_path: &PathBuf, entity_id: EntityId) -> usize {
+    let db = Database::open(db_path).expect("raw database open");
+    db.scan("entity_reference_embedding_handles", db.snapshot())
+        .expect("raw entity reference handle scan")
+        .into_iter()
+        .filter(|row| row.values.get("target_id") == Some(&Value::Uuid(entity_id.as_uuid())))
+        .count()
+}
+
+fn axis_vector(dimension: usize, axis: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; dimension];
+    vector[axis] = 1.0;
+    vector
 }
 
 fn seed_entity(store: &Store, name: &str) -> context_graph::Entity {
@@ -441,19 +476,31 @@ fn assert_unknown_entity_reference_enrollment_reaches_engine_fk() {
 #[test]
 fn entity_reference_embedding_parent_entity_archive_does_not_orphan_child_rows() {
     let fixture = fixture("entity-reference-archive");
+    let db_path = fixture.db_path.clone();
     let entity = seed_entity(&fixture.store, "Kumar");
+    let first_vector = axis_vector(512, 0);
+    let second_vector = axis_vector(512, 1);
+    let third_vector = axis_vector(512, 2);
+    let rejected_vector = axis_vector(512, 3);
     let first_id = fixture.store.enroll_entity_reference(
         entity.id,
         FACE_REFERENCE_SPACE,
         Some("front".to_string()),
-        vec![1.0; 512],
+        first_vector,
         producer(),
     );
     let second_id = fixture.store.enroll_entity_reference(
         entity.id,
         FACE_REFERENCE_SPACE,
         Some("side".to_string()),
-        vec![0.5; 512],
+        second_vector,
+        producer(),
+    );
+    let third_id = fixture.store.enroll_entity_reference(
+        entity.id,
+        FACE_REFERENCE_SPACE,
+        Some("overhead".to_string()),
+        third_vector,
         producer(),
     );
     let before_rows = fixture
@@ -469,6 +516,16 @@ fn entity_reference_embedding_parent_entity_archive_does_not_orphan_child_rows()
         })
         .unwrap_or_default();
     let archived = fixture.store.archive_entity(entity.id);
+    let expected_archived_at = fixture
+        .store
+        .entity_history(entity.id)
+        .ok()
+        .and_then(|history| {
+            history
+                .into_iter()
+                .filter_map(|snapshot| snapshot.valid_to)
+                .max_by_key(|txid| txid.0)
+        });
     let rows = fixture
         .store
         .list_entity_reference_embeddings_for_entity(entity.id);
@@ -485,9 +542,43 @@ fn entity_reference_embedding_parent_entity_archive_does_not_orphan_child_rows()
         entity.id,
         FACE_REFERENCE_SPACE,
         Some("post-archive".to_string()),
-        vec![0.25; 512],
+        rejected_vector.clone(),
         producer(),
     );
+    let rows_after_rejected_write = fixture
+        .store
+        .list_entity_reference_embeddings_for_entity(entity.id);
+    let after_rejected_write_created_at = rows_after_rejected_write
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .map(|row| (row.id, row.created_at))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    drop(fixture.store);
+    let raw_rows_after_rejected_write = raw_entity_reference_rows(&db_path, entity.id);
+    let raw_handle_count_after_rejected_write =
+        raw_entity_reference_handle_count(&db_path, entity.id);
+    let rejected_vector_hits_after_rejected_write =
+        leaked_entity_reference_vector_count(&db_path, &rejected_vector);
+    let reopened_store = Store::open(store_config(db_path.clone())).expect("reopen after archive");
+    let rows_after_reopen = reopened_store.list_entity_reference_embeddings_for_entity(entity.id);
+    let after_reopen_created_at = rows_after_reopen
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .map(|row| (row.id, row.created_at))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    drop(reopened_store);
+    let raw_rows_after_reopen = raw_entity_reference_rows(&db_path, entity.id);
+    let raw_handle_count_after_reopen = raw_entity_reference_handle_count(&db_path, entity.id);
+    let rejected_vector_hits_after_reopen =
+        leaked_entity_reference_vector_count(&db_path, &rejected_vector);
 
     assert!(
         first_id
@@ -496,23 +587,51 @@ fn entity_reference_embedding_parent_entity_archive_does_not_orphan_child_rows()
             && second_id
                 .as_ref()
                 .is_ok_and(|value| value.is_valid() && *value != EmbeddingId::default())
-            && before_rows.as_ref().is_ok_and(|items| items.len() == 2)
+            && third_id
+                .as_ref()
+                .is_ok_and(|value| value.is_valid() && *value != EmbeddingId::default())
+            && before_rows.as_ref().is_ok_and(|items| items.len() == 3)
             && archived.is_ok()
-            && rows.as_ref().is_ok_and(|items| items.len() == 2
+            && rows.as_ref().is_ok_and(|items| items.len() == 3
                 && items
                     .iter()
                     .any(|row| Some(&row.id) == first_id.as_ref().ok())
                 && items
                     .iter()
-                    .any(|row| Some(&row.id) == second_id.as_ref().ok()))
-            && before_created_at.len() == 2
+                    .any(|row| Some(&row.id) == second_id.as_ref().ok())
+                && items
+                    .iter()
+                    .any(|row| Some(&row.id) == third_id.as_ref().ok()))
+            && rows_after_rejected_write
+                .as_ref()
+                .is_ok_and(|items| items.len() == 3
+                    && items
+                        .iter()
+                        .any(|row| Some(&row.id) == first_id.as_ref().ok())
+                    && items
+                        .iter()
+                        .any(|row| Some(&row.id) == second_id.as_ref().ok())
+                    && items
+                        .iter()
+                        .any(|row| Some(&row.id) == third_id.as_ref().ok()))
+            && before_created_at.len() == 3
             && before_created_at == after_created_at
+            && before_created_at == after_rejected_write_created_at
+            && before_created_at == after_reopen_created_at
+            && raw_rows_after_rejected_write == before_created_at
+            && raw_rows_after_reopen == before_created_at
+            && raw_handle_count_after_rejected_write == 3
+            && raw_handle_count_after_reopen == 3
+            && rejected_vector_hits_after_rejected_write == 0
+            && rejected_vector_hits_after_reopen == 0
             && matches!(
                 new_enrollment,
                 Err(CgError::EntityArchived {
-                    entity_id: archived_entity
+                    entity_id: archived_entity,
+                    archived_at
                 }) if archived_entity == entity.id
+                    && Some(archived_at) == expected_archived_at
             ),
-        "expected archive to preserve existing child reference rows and txids while rejecting new enrollment, first_id={first_id:?}, second_id={second_id:?}, before_rows={before_rows:?}, archived={archived:?}, rows={rows:?}, before_created_at={before_created_at:?}, after_created_at={after_created_at:?}, new_enrollment={new_enrollment:?}"
+        "expected archive to preserve exact persisted child rows/handles/vectors while rejecting new enrollment with the archive TxId and no fourth row, first_id={first_id:?}, second_id={second_id:?}, third_id={third_id:?}, before_rows={before_rows:?}, archived={archived:?}, expected_archived_at={expected_archived_at:?}, rows={rows:?}, rows_after_rejected_write={rows_after_rejected_write:?}, rows_after_reopen={rows_after_reopen:?}, before_created_at={before_created_at:?}, after_created_at={after_created_at:?}, after_rejected_write_created_at={after_rejected_write_created_at:?}, after_reopen_created_at={after_reopen_created_at:?}, raw_rows_after_rejected_write={raw_rows_after_rejected_write:?}, raw_rows_after_reopen={raw_rows_after_reopen:?}, raw_handle_count_after_rejected_write={raw_handle_count_after_rejected_write}, raw_handle_count_after_reopen={raw_handle_count_after_reopen}, rejected_vector_hits_after_rejected_write={rejected_vector_hits_after_rejected_write}, rejected_vector_hits_after_reopen={rejected_vector_hits_after_reopen}, new_enrollment={new_enrollment:?}"
     );
 }
