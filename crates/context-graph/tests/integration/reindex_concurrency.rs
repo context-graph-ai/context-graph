@@ -130,7 +130,7 @@ struct PhaseRecordingConcurrencyEmbedder {
     calls: Arc<Mutex<Vec<PhaseReindexCall>>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct PhaseReindexCall {
     text: String,
     vector: Vec<f32>,
@@ -426,6 +426,15 @@ fn reindex_cursor_evidence_ids_env(seeded: &[(EvidenceId, String)]) -> String {
         .join(",")
 }
 
+const REINDEX_CURSOR_RESUME_CALLS_MARKER: &str = "CG_REINDEX_CURSOR_RESUME_CALLS=";
+
+fn resume_call_records_from_child_stdout(stdout: &str) -> Option<Vec<PhaseReindexCall>> {
+    stdout.lines().find_map(|line| {
+        line.strip_prefix(REINDEX_CURSOR_RESUME_CALLS_MARKER)
+            .and_then(|payload| serde_json::from_str(payload).ok())
+    })
+}
+
 fn new_reindex_vector_salt(discriminator: u64) -> u64 {
     let raw = uuid::Uuid::now_v7().as_u128();
     ((raw >> 64) as u64) ^ (raw as u64) ^ discriminator
@@ -687,6 +696,35 @@ fn cursor_at(db_path: &PathBuf, space: &str, expected_cursor: i64) -> i64 {
     )
 }
 
+fn store_count(store: &Store, query: &str, params: &HashMap<String, Value>) -> i64 {
+    let result = store
+        .execute_sql_for_test(query, params)
+        .expect("store count query");
+    match result.rows.first().and_then(|row| row.first()) {
+        Some(Value::Int64(value)) => *value,
+        _ => 0,
+    }
+}
+
+fn store_cursor_count(store: &Store, space: &str) -> i64 {
+    store_count(
+        store,
+        "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space",
+        &params(vec![("space", Value::Text(space.to_string()))]),
+    )
+}
+
+fn store_cursor_at(store: &Store, space: &str, expected_cursor: i64) -> i64 {
+    store_count(
+        store,
+        "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space AND last_committed_cursor = $cursor",
+        &params(vec![
+            ("space", Value::Text(space.to_string())),
+            ("cursor", Value::Int64(expected_cursor)),
+        ]),
+    )
+}
+
 fn lease_owner_run_id(db_path: &PathBuf, space: &str) -> Option<String> {
     let result = execute_query(
         db_path,
@@ -794,16 +832,18 @@ fn vector_score_for(
 
 fn stored_text_vector(db_path: &PathBuf, evidence_id: EvidenceId) -> Option<Vec<f32>> {
     let db = open_raw_database(db_path);
-    let result = db
-        .execute(
-            "SELECT vector_text FROM evidence WHERE id = $id",
-            &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
-        )
-        .expect("stored text vector query");
-    result.rows.first().and_then(|row| match row.first() {
-        Some(Value::Vector(vector)) => Some(vector.clone()),
-        _ => None,
-    })
+    let snapshot = db.snapshot();
+    let row_id = db
+        .scan("evidence", snapshot)
+        .expect("scan evidence")
+        .into_iter()
+        .find_map(|row| match row.values.get("id") {
+            Some(Value::Uuid(id)) if *id == evidence_id.as_uuid() => Some(row.row_id),
+            _ => None,
+        })?;
+    db.live_vector_entry(row_id, snapshot)
+        .filter(|entry| entry.index == VectorIndexRef::new("evidence", "vector_text"))
+        .map(|entry| entry.vector)
 }
 
 fn evidence_text_projection(db_path: &PathBuf, evidence_id: EvidenceId) -> Option<String> {
@@ -1041,6 +1081,41 @@ fn phase_output_vectors_indexed_for_seeded_range(
                         .is_some_and(|score| score > 0.99)
                 })
         })
+}
+
+fn phase_output_vectors_indexed_for_seeded_range_in_store(
+    store: &Store,
+    seeded: &[(EvidenceId, String)],
+    start_idx: usize,
+    calls: &[PhaseReindexCall],
+) -> bool {
+    if calls.is_empty() {
+        return false;
+    }
+    let Some(ids) = calls
+        .iter()
+        .enumerate()
+        .map(|(offset, _)| {
+            seeded
+                .get(start_idx + offset)
+                .map(|(evidence_id, _)| evidence_id.as_uuid())
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let queries = calls
+        .iter()
+        .map(|call| call.vector.clone())
+        .collect::<Vec<_>>();
+    matches!(
+        store.evidence_vector_visibility_counts_for_test(
+            &ids,
+            VectorIndexRef::new("evidence", "vector_text"),
+            &queries,
+        ),
+        Ok((row_count, vector_count)) if row_count == calls.len() && vector_count == calls.len()
+    )
 }
 
 fn all_reindexed_image_vectors_visible(db_path: &PathBuf, seeded: &[(EvidenceId, String)]) -> bool {
@@ -1510,6 +1585,11 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
                 && resume_vectors_from_output_visible,
             "fresh child process must resume from durable cursor 2 only, persist and index exact runtime-salted Embedder output vectors rather than text-derived vectors, and avoid parent process state or handle-derived progress, resume_result={resume_result:?}, resume_events={resume_events:?}, resume_call_texts={resume_call_texts:?}, resume_vectors_not_text_formula={resume_vectors_not_text_formula}, resume_vectors_from_output_visible={resume_vectors_from_output_visible}, resume_vectors_from_output_indexed={resume_vectors_from_output_indexed}, cursor_rows={cursor_rows}, cursor_count_final={cursor_count_final}, pause_producer_rows_after={pause_producer_rows_after}, resume_producer_rows={resume_producer_rows}, final_target_lineage={final_target_lineage}"
         );
+        println!(
+            "{}{}",
+            REINDEX_CURSOR_RESUME_CALLS_MARKER,
+            serde_json::to_string(&resume_call_records).expect("serialize resume call records")
+        );
         return;
     }
 
@@ -1548,30 +1628,17 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
     let pause_call_shape = pause_call_texts == vec![seeded[0].1.clone(), seeded[1].1.clone()];
     let pause_vectors_not_text_formula =
         phase_call_vectors_are_not_text_formula(&pause_call_records);
-    let pause_vectors_from_output_visible = pause_call_records.len() == 2
-        && phase_output_vectors_visible_for_seeded_range(
-            &fixture.db_path,
+    let pause_vectors_indexed_before_drop = pause_call_records.len() == 2
+        && phase_output_vectors_indexed_for_seeded_range_in_store(
+            &fixture.store,
             &seeded,
             0,
             &pause_call_records,
         );
-    let pause_vectors_from_output_indexed = pause_call_records.len() == 2
-        && phase_output_vectors_indexed_for_seeded_range(
-            &fixture.db_path,
-            &seeded,
-            0,
-            &pause_call_records,
-        );
-    drop(fixture.store);
-    let pause_vectors_only_first_two =
-        reindex_cursor_pause_vectors_visible(&fixture.db_path, &seeded, pause_salt);
-    let pause_producer_rows = producer_rows(&fixture.db_path, producer("pause-new"));
-    let resume_producer_rows_before = producer_rows(&fixture.db_path, producer("resume-new"));
-    let paused_cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 2);
-    let paused_cursor_count = cursor_count(&fixture.db_path, TEXT_SPACE);
-    let premature_completed_cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 5);
-    let pre_resume_target_lineage =
-        target_handle_lineage_matches(&fixture.db_path, &seeded, &seed_versions, 2, None);
+    let paused_cursor_rows_before_drop = store_cursor_at(&fixture.store, TEXT_SPACE, 2);
+    let paused_cursor_count_before_drop = store_cursor_count(&fixture.store, TEXT_SPACE);
+    let premature_completed_cursor_rows_before_drop =
+        store_cursor_at(&fixture.store, TEXT_SPACE, 5);
     let paused_events_shape = paused_events
         == vec![ReindexEvent::Paused {
             embedding_space_id: TEXT_SPACE.to_string(),
@@ -1586,6 +1653,30 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
             } if embedding_space_id == TEXT_SPACE
         )
     });
+    drop(fixture.store);
+    let pause_vectors_from_output_visible = pause_call_records.len() == 2
+        && phase_output_vectors_visible_for_seeded_range(
+            &fixture.db_path,
+            &seeded,
+            0,
+            &pause_call_records,
+        );
+    let pause_vectors_from_output_indexed = pause_call_records.len() == 2
+        && phase_output_vectors_indexed_for_seeded_range(
+            &fixture.db_path,
+            &seeded,
+            0,
+            &pause_call_records,
+        );
+    let pause_vectors_only_first_two =
+        reindex_cursor_pause_vectors_visible(&fixture.db_path, &seeded, pause_salt);
+    let pause_producer_rows = producer_rows(&fixture.db_path, producer("pause-new"));
+    let resume_producer_rows_before = producer_rows(&fixture.db_path, producer("resume-new"));
+    let paused_cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 2);
+    let paused_cursor_count = cursor_count(&fixture.db_path, TEXT_SPACE);
+    let premature_completed_cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 5);
+    let pre_resume_target_lineage =
+        target_handle_lineage_matches(&fixture.db_path, &seeded, &seed_versions, 2, None);
     let child = process::Command::new(std::env::current_exe().expect("current test exe"))
         .arg("--exact")
         .arg("reindex_concurrency::reindex_resumable_after_process_restart_persists_cursor_to_disk")
@@ -1601,6 +1692,28 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
         )
         .output()
         .expect("spawn fresh reindex resume verifier process");
+    let child_stdout = String::from_utf8_lossy(&child.stdout);
+    let child_resume_call_records = resume_call_records_from_child_stdout(&child_stdout);
+    let resume_vectors_from_output_visible_after_child =
+        child_resume_call_records.as_ref().is_some_and(|records| {
+            records.len() == seeded[2..].len()
+                && phase_output_vectors_visible_for_seeded_range(
+                    &fixture.db_path,
+                    &seeded,
+                    2,
+                    records,
+                )
+        });
+    let resume_vectors_from_output_indexed_after_child =
+        child_resume_call_records.as_ref().is_some_and(|records| {
+            records.len() == seeded[2..].len()
+                && phase_output_vectors_indexed_for_seeded_range(
+                    &fixture.db_path,
+                    &seeded,
+                    2,
+                    records,
+                )
+        });
     let cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 5);
     let cursor_count_final = cursor_count(&fixture.db_path, TEXT_SPACE);
     let pause_producer_rows_after = producer_rows(&fixture.db_path, producer("pause-new"));
@@ -1627,12 +1740,16 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
         ) && paused_at_two
             && pause_call_shape
             && pause_vectors_not_text_formula
+            && pause_vectors_indexed_before_drop
             && pause_vectors_from_output_visible
             && pause_vectors_from_output_indexed
             && pause_vectors_only_first_two
             && extra_history_inserted
             && pause_producer_rows == 3
             && resume_producer_rows_before == 0
+            && paused_cursor_rows_before_drop == 1
+            && paused_cursor_count_before_drop == 1
+            && premature_completed_cursor_rows_before_drop == 0
             && paused_cursor_rows == 1
             && paused_cursor_count == 1
             && premature_completed_cursor_rows == 0
@@ -1647,10 +1764,12 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
             && old_b_producer_rows == 1
             && old_c_producer_rows == 1
             && final_target_lineage
+            && resume_vectors_from_output_visible_after_child
+            && resume_vectors_from_output_indexed_after_child
             && pause_vectors_still_visible,
-        "interrupted reindex must persist cursor 2 before a fresh child-process resume, process exactly rows 0..1 before pause, emit only the typed pause event before child resume, persist and index the exact runtime-salted Embedder output vectors from persisted DB text rather than synthesized ordinal text, resume from row 2 without rewriting rows 0..1 or deriving progress from pause-new handle counts, re-embed every remaining row across mixed old producers including a post-cursor row with extra historical handle lineage, and preserve per-target old/resume producer lineage without filtering resumed candidates to the first producer, result={result:?}, paused_events={paused_events:?}, paused_events_shape={paused_events_shape}, pause_call_texts={pause_call_texts:?}, pause_vectors_not_text_formula={pause_vectors_not_text_formula}, pause_vectors_from_output_visible={pause_vectors_from_output_visible}, pause_vectors_from_output_indexed={pause_vectors_from_output_indexed}, pause_vectors_only_first_two={pause_vectors_only_first_two}, pause_vectors_still_visible={pause_vectors_still_visible}, extra_history_inserted={extra_history_inserted}, pause_producer_rows={pause_producer_rows}, resume_producer_rows_before={resume_producer_rows_before}, paused_cursor_rows={paused_cursor_rows}, paused_cursor_count={paused_cursor_count}, premature_completed_cursor_rows={premature_completed_cursor_rows}, pre_resume_target_lineage={pre_resume_target_lineage}, child_status={:?}, child_stdout={}, child_stderr={}, cursor_rows={cursor_rows}, cursor_count_final={cursor_count_final}, pause_producer_rows_after={pause_producer_rows_after}, resume_producer_rows={resume_producer_rows}, old_a_producer_rows={old_a_producer_rows}, old_b_producer_rows={old_b_producer_rows}, old_c_producer_rows={old_c_producer_rows}, final_target_lineage={final_target_lineage}",
+        "interrupted reindex must persist cursor 2 before a fresh child-process resume, process exactly rows 0..1 before pause, emit only the typed pause event before child resume, persist and index the exact runtime-salted Embedder output vectors from persisted DB text rather than synthesized ordinal text, resume from row 2 without rewriting rows 0..1 or deriving progress from pause-new handle counts, re-embed every remaining row across mixed old producers including a post-cursor row with extra historical handle lineage, and preserve per-target old/resume producer lineage without filtering resumed candidates to the first producer, result={result:?}, paused_events={paused_events:?}, paused_events_shape={paused_events_shape}, pause_call_texts={pause_call_texts:?}, pause_vectors_not_text_formula={pause_vectors_not_text_formula}, pause_vectors_indexed_before_drop={pause_vectors_indexed_before_drop}, pause_vectors_from_output_visible={pause_vectors_from_output_visible}, pause_vectors_from_output_indexed={pause_vectors_from_output_indexed}, pause_vectors_only_first_two={pause_vectors_only_first_two}, pause_vectors_still_visible={pause_vectors_still_visible}, extra_history_inserted={extra_history_inserted}, pause_producer_rows={pause_producer_rows}, resume_producer_rows_before={resume_producer_rows_before}, paused_cursor_rows_before_drop={paused_cursor_rows_before_drop}, paused_cursor_count_before_drop={paused_cursor_count_before_drop}, premature_completed_cursor_rows_before_drop={premature_completed_cursor_rows_before_drop}, paused_cursor_rows={paused_cursor_rows}, paused_cursor_count={paused_cursor_count}, premature_completed_cursor_rows={premature_completed_cursor_rows}, pre_resume_target_lineage={pre_resume_target_lineage}, child_status={:?}, child_stdout={}, child_stderr={}, cursor_rows={cursor_rows}, cursor_count_final={cursor_count_final}, pause_producer_rows_after={pause_producer_rows_after}, resume_producer_rows={resume_producer_rows}, resume_vectors_from_output_visible_after_child={resume_vectors_from_output_visible_after_child}, resume_vectors_from_output_indexed_after_child={resume_vectors_from_output_indexed_after_child}, old_a_producer_rows={old_a_producer_rows}, old_b_producer_rows={old_b_producer_rows}, old_c_producer_rows={old_c_producer_rows}, final_target_lineage={final_target_lineage}",
         child.status.code(),
-        String::from_utf8_lossy(&child.stdout),
+        child_stdout,
         String::from_utf8_lossy(&child.stderr)
     );
 }
