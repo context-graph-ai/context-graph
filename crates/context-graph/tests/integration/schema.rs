@@ -3073,25 +3073,52 @@ fn combination_embedding_space_bindings_unique_composite_table_column_space() {
     );
     assert!(first.is_ok());
     assert!(second.is_ok());
-    let other_owner = db.execute(
-        "INSERT INTO embedding_space_bindings (embedding_space_id, table_name, vector_column) VALUES ($embedding_space_id, $table_name, $vector_column)",
-        &params(vec![
-            ("embedding_space_id", Value::Text("other_text_space".into())),
-            ("table_name", Value::Text("evidence".into())),
-            ("vector_column", Value::Text("vector_text".into())),
-        ]),
-    );
-    assert!(other_owner.is_ok());
     assert_eq!(
         scalar_count(
             &db,
-            "SELECT COUNT(*) AS n FROM embedding_space_bindings WHERE table_name = $table_name AND vector_column = $vector_column",
+            "SELECT COUNT(*) AS n FROM embedding_space_bindings WHERE embedding_space_id = $embedding_space_id AND table_name = $table_name AND vector_column = $vector_column",
             &params(vec![
+                (
+                    "embedding_space_id",
+                    Value::Text("text_default_embeddinggemma_300m_768".into()),
+                ),
                 ("table_name", Value::Text("evidence".into())),
                 ("vector_column", Value::Text("vector_text".into())),
             ]),
         ),
         1
+    );
+    let default_digest = db.execute(
+        "INSERT INTO embedding_space_bindings (embedding_space_id, table_name, vector_column) VALUES ($embedding_space_id, $table_name, $vector_column)",
+        &params(vec![
+            (
+                "embedding_space_id",
+                Value::Text("text_default_embeddinggemma_300m_768".into()),
+            ),
+            ("table_name", Value::Text("digests".into())),
+            ("vector_column", Value::Text("vector_text".into())),
+        ]),
+    );
+    let other_digest_owner = db.execute(
+        "INSERT INTO embedding_space_bindings (embedding_space_id, table_name, vector_column) VALUES ($embedding_space_id, $table_name, $vector_column)",
+        &params(vec![
+            ("embedding_space_id", Value::Text("other_text_space".into())),
+            ("table_name", Value::Text("digests".into())),
+            ("vector_column", Value::Text("vector_text".into())),
+        ]),
+    );
+    assert!(default_digest.is_ok());
+    assert!(other_digest_owner.is_ok());
+    assert_eq!(
+        scalar_count(
+            &db,
+            "SELECT COUNT(*) AS n FROM embedding_space_bindings WHERE table_name = $table_name AND vector_column = $vector_column",
+            &params(vec![
+                ("table_name", Value::Text("digests".into())),
+                ("vector_column", Value::Text("vector_text".into())),
+            ]),
+        ),
+        2
     );
 }
 
