@@ -1,4 +1,3 @@
-pub mod embeddinggemma;
 pub mod load_observer;
 pub mod mock;
 pub mod nomic;
@@ -68,15 +67,15 @@ pub struct EmbedderConfig {
 }
 
 impl EmbedderConfig {
-    pub fn default_embeddinggemma_offline() -> Self {
+    pub fn default_nomic() -> Self {
         Self {
             source: ModelSource::HuggingFace {
-                repo: "google/embeddinggemma-300m".to_string(),
+                repo: "nomic-ai/nomic-embed-text-v1.5".to_string(),
             },
-            offline: true,
+            offline: false,
             cache_dir: None,
             pinned_revision: None,
-            network_policy: "offline-cache-only".to_string(),
+            network_policy: "allow-download".to_string(),
         }
     }
 

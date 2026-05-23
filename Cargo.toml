@@ -10,6 +10,7 @@ repository = "https://github.com/context-graph-ai/context-graph"
 description = "Agentic memory graph — Intention-centric ontology, contextdb-backed"
 
 [workspace.dependencies]
+candle-embeddinggemma = { path = "crates/candle-embeddinggemma" }
 uuid = { version = "1.23.0", features = ["v4", "v7", "serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -29,3 +30,4 @@ tempfile = "3.23.0"
 tokenizers = "0.23.1"
 trybuild = "1.0.112"
 serde_yml = "0.0.12"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }

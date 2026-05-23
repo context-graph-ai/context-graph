@@ -26,6 +26,3 @@ chrono = { workspace = true, features = ["serde"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 tempfile.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(context_graph_internal_test_support)'] }

@@ -3,6 +3,17 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmbedderLoadEvent {
+    LoadStarted {
+        model_id: String,
+        byte_size: Option<u64>,
+        destination: PathBuf,
+    },
+    LoadCompleted {
+        model_id: String,
+        byte_size: Option<u64>,
+        destination: PathBuf,
+        elapsed: Duration,
+    },
     FetchStarted {
         model_id: String,
         byte_size: Option<u64>,

@@ -177,7 +177,7 @@ fn create_digest_input(context_id: ContextId, summary: &str) -> CreateDigest {
         kind: EvidenceKind::Text,
         embedding: PrecomputedEmbedding {
             id: EmbeddingId::new_v7(),
-            embedding_space_id: "text_default_embeddinggemma_300m_768".to_string(),
+            embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
             vector: digest_embedding_fixture(summary),
             target: EmbeddingTarget::Digest(id),
             produced_by: EvidenceProducer::default(),

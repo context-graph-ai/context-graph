@@ -102,7 +102,7 @@ fn embedding_space_created_at(
 #[test]
 fn embedding_space_collision_with_builtin_id_refused_at_store_open() {
     let result = open_with(vec![text_space(
-        "text_default_embeddinggemma_300m_768",
+        "text_default_nomic_v1_5_768",
         "consumer",
         None,
     )]);
@@ -204,10 +204,9 @@ fn embedding_space_consumer_can_override_default_with_distinct_id_and_explicit_d
     drop(result);
     let reopened_without_override = open_path(&db_path, Vec::new());
     assert!(
-        reopened_without_override
-            .as_ref()
-            .is_ok_and(|store| store.last_query_trace().as_deref()
-                == Ok("text_default_embeddinggemma_300m_768")),
+        reopened_without_override.as_ref().is_ok_and(
+            |store| store.last_query_trace().as_deref() == Ok("text_default_nomic_v1_5_768")
+        ),
         "consumer default override must be bounded to the boot and fall back to the built-in on reopen without the override, initial={initial_debug}, reopened_without_override={reopened_without_override:?}"
     );
     let override_boot = open_path(

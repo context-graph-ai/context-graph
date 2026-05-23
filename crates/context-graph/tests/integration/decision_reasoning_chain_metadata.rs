@@ -15,7 +15,7 @@ use context_graph::{
 use contextdb_core::Value;
 use contextdb_engine::Database;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 
 fn store() -> Store {
     Store::open_with_embedder_registrations(

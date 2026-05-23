@@ -10,7 +10,7 @@ use context_graph::{
 use contextdb_core::{Error as EngineError, Value};
 use contextdb_engine::Database;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 
 fn producer() -> EvidenceProducer {
     EvidenceProducer {

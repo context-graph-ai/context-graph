@@ -20,7 +20,7 @@ use contextdb_tx::WriteSet;
 use contextdb_vector::test_seam::PauseWindow;
 use serde_json::json;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const VISION_SPACE: &str = "vigil_face_reid_v1";
 const FACE_REFERENCE_SPACE: &str = "face_reference_v1";
 const ENGINE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);

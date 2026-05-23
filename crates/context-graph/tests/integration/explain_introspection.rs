@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use candle_embeddinggemma::EmbeddingGemmaTextEmbedder;
 use chrono::Utc;
-use context_graph::embedder::embeddinggemma::EmbeddingGemmaTextEmbedder;
 use context_graph::embedder::{Embedder, EmbeddingInput};
 use context_graph::test_support::embedding::{VectorSearchFilters, vector_search};
 use context_graph::{
@@ -12,7 +12,7 @@ use context_graph::{
 use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::Database;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 
 fn vector(axis: usize) -> Vec<f32> {
     let mut value = vec![0.0; 768];

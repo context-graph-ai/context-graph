@@ -19,7 +19,7 @@ use contextdb_engine::{
     plugin::{DatabasePlugin, QueryOutcome},
 };
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const IMAGE_SPACE: &str = "image_clip_v1_4";
 
 #[derive(Default)]

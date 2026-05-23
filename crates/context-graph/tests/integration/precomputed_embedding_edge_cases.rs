@@ -11,7 +11,7 @@ use context_graph::{
 use contextdb_core::{Error as EngineError, Value, VectorIndexRef};
 use contextdb_engine::{Database, QueryResult};
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const FACE_SPACE: &str = "face_reference_v1";
 
 struct Fixture {

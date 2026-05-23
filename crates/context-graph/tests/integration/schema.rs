@@ -8,7 +8,7 @@ use contextdb_engine::{Database, QueryResult};
 use serde_json::json;
 use uuid::Uuid;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 
 fn initialize_schema(db: &Database) {
     let existing: HashSet<_> = db.table_names().into_iter().collect();
@@ -3031,10 +3031,7 @@ fn combination_embedding_space_bindings_unique_composite_table_column_space() {
     let db = fresh_db();
     assert_table_present(&db, "embedding_space_bindings");
     for (space_id, model_name) in [
-        (
-            "text_default_embeddinggemma_300m_768",
-            "embeddinggemma-300m",
-        ),
+        ("text_default_nomic_v1_5_768", "embeddinggemma-300m"),
         ("other_text_space", "other-text"),
     ] {
         db.execute(
@@ -3062,7 +3059,7 @@ fn combination_embedding_space_bindings_unique_composite_table_column_space() {
     let binding_params = params(vec![
         (
             "embedding_space_id",
-            Value::Text("text_default_embeddinggemma_300m_768".into()),
+            Value::Text("text_default_nomic_v1_5_768".into()),
         ),
         ("table_name", Value::Text("evidence".into())),
         ("vector_column", Value::Text("vector_text".into())),
@@ -3084,7 +3081,7 @@ fn combination_embedding_space_bindings_unique_composite_table_column_space() {
             &params(vec![
                 (
                     "embedding_space_id",
-                    Value::Text("text_default_embeddinggemma_300m_768".into()),
+                    Value::Text("text_default_nomic_v1_5_768".into()),
                 ),
                 ("table_name", Value::Text("evidence".into())),
                 ("vector_column", Value::Text("vector_text".into())),
@@ -3097,7 +3094,7 @@ fn combination_embedding_space_bindings_unique_composite_table_column_space() {
         &params(vec![
             (
                 "embedding_space_id",
-                Value::Text("text_default_embeddinggemma_300m_768".into()),
+                Value::Text("text_default_nomic_v1_5_768".into()),
             ),
             ("table_name", Value::Text("digests".into())),
             ("vector_column", Value::Text("vector_text".into())),

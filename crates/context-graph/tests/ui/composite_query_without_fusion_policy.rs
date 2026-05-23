@@ -8,7 +8,7 @@ fn main() {
     let clauses = vec![
             CompositeVectorClause {
                 query_vector: vec![1.0],
-                embedding_space_id: "text_default_embeddinggemma_300m_768".to_string(),
+                embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
             },
             CompositeVectorClause {
                 query_vector: vec![0.0],

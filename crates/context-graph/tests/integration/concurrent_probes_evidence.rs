@@ -141,7 +141,7 @@ fn text_observation(
     let embeddings = vector
         .map(|vector| PrecomputedEmbedding {
             id: EmbeddingId::new_v7(),
-            embedding_space_id: "text_default_embeddinggemma_300m_768".to_string(),
+            embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
             vector,
             target: EmbeddingTarget::Evidence(evidence_id),
             produced_by: producer("probe"),

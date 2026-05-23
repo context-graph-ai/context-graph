@@ -16,7 +16,7 @@ use context_graph::{
 use contextdb_core::{TxId, Value, VectorIndexRef};
 use contextdb_engine::Database;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const IMAGE_SPACE: &str = "vigil_face_reid_v1";
 
 struct Fixture {

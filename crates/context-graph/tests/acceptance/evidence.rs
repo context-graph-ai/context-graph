@@ -5,7 +5,7 @@ use context_graph::*;
 use contextdb_core::{ColumnType, Error, RowId, Value, VectorIndexRef};
 use contextdb_engine::Database;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -821,7 +821,9 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
     let mut files = Vec::new();
     collect_rs_files(&src_dir, &mut files);
     for file in files {
-        if file == crate_dir.join("src/embedder/embeddinggemma.rs") {
+        if file == crate_dir.join("src/embedder/embeddinggemma.rs")
+            || file == crate_dir.join("src/embedder/nomic.rs")
+        {
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("core source");
@@ -847,7 +849,9 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
     let mut files = Vec::new();
     collect_rs_files(&src_dir, &mut files);
     for file in files {
-        if file == crate_dir.join("src/embedder/embeddinggemma.rs") {
+        if file == crate_dir.join("src/embedder/embeddinggemma.rs")
+            || file == crate_dir.join("src/embedder/nomic.rs")
+        {
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("core source");
@@ -6430,7 +6434,6 @@ fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_file
     for dep in [
         ["req", "west"].concat(),
         ["hyper-", "client"].concat(),
-        ["u", "req"].concat(),
         ["s", "urf"].concat(),
         ["is", "ahc"].concat(),
         ["atto", "httpc"].concat(),
@@ -6461,7 +6464,9 @@ fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_file
             );
         }
         if file.starts_with(crate_dir.join("src")) {
-            if file == crate_dir.join("src/embedder/embeddinggemma.rs") {
+            if file == crate_dir.join("src/embedder/embeddinggemma.rs")
+                || file == crate_dir.join("src/embedder/nomic.rs")
+            {
                 continue;
             }
             for forbidden in [

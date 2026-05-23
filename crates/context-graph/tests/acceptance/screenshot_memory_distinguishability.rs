@@ -8,7 +8,7 @@ use context_graph::{
 };
 use std::collections::BTreeMap;
 
-const OLD_TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const OLD_TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const NEW_TEXT_SPACE: &str = "text_default_embeddinggemma_500m_768";
 
 fn store() -> Store {

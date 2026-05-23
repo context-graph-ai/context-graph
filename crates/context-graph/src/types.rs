@@ -1073,7 +1073,7 @@ impl Default for StoreConfig {
             https_allowed_hosts: Vec::new(),
             file_uri_allowed: false,
             extra_embedding_spaces: Vec::new(),
-            default_text_embedder: Some(EmbedderConfig::default_embeddinggemma_offline()),
+            default_text_embedder: Some(EmbedderConfig::default_nomic()),
             expected_schema_version: CG_SCHEMA_VERSION,
         }
     }

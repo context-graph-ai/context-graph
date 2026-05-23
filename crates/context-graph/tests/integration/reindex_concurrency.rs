@@ -18,7 +18,7 @@ use context_graph::{
 use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::Database;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const IMAGE_SPACE: &str = "image_clip_v1_4";
 const UNBOUND_SPACE: &str = "unbound_custom_space_v1";
 

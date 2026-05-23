@@ -1,18 +1,29 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use candle_embeddinggemma::EmbeddingGemmaTextEmbedder;
-use context_graph::embedder::nomic::{NOMIC_MODEL_ID, NomicTextEmbedder};
+use candle_embeddinggemma::{EmbeddingGemmaTextEmbedder, default_embeddinggemma_offline_config};
+use chrono::Utc;
+use context_graph::embedder::nomic::NomicTextEmbedder;
 use context_graph::embedding_space::{BuiltinSpaceRegistry, default_text_embedding_space};
 use context_graph::{
-    CG_EDGE_SYSTEM_TAG, CreateContext, CreateEntity, DistanceMetric, Embedder, EmbedderConfig,
-    EmbedderRegistration, EmbeddingInput, EmbeddingSpaceDecl, EntityType, EvidenceKind,
-    EvidenceProducer, ModelSource, Store, StoreConfig,
+    CG_EDGE_SYSTEM_TAG, CgError, ContextId, CreateContext, CreateEntity, DistanceMetric, Embedder,
+    EmbedderConfig, EmbedderLoadEvent, EmbedderLoadObserver, EmbedderRegistration, EmbeddingId,
+    EmbeddingInput, EmbeddingOutput, EmbeddingSpace, EmbeddingSpaceDecl, EmbeddingTarget, EntityId,
+    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, ModelSource,
+    ObservationId, PrecomputedEmbedding, RecordObservation, ReindexEvent, ReindexOptions,
+    RetentionStatus, Store, StoreConfig,
 };
+use contextdb_core::{RowId, Value, VectorIndexRef};
+use contextdb_engine::Database;
+use safetensors::tensor::{Dtype, TensorView};
+use tokenizers::Tokenizer;
+use tokenizers::models::wordlevel::WordLevel;
+use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
 
 const NOMIC_TEXT_DEFAULT_ID: &str = "text_default_nomic_v1_5_768";
+const NOMIC_MODEL_ID: &str = "nomic-embed-text-v1.5";
 const EMBEDDINGGEMMA_TEXT_DEFAULT_ID: &str = "text_default_embeddinggemma_300m_768";
 const FACE_REID_SPACE: &str = "vigil_face_reid_v1";
 
@@ -58,6 +69,115 @@ fn read_workspace_file(path: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
+fn read_store_public_api_sources() -> String {
+    let store_dir = crate_root().join("src/store");
+    let mut paths = fs::read_dir(&store_dir)
+        .expect("store source dir")
+        .map(|entry| entry.expect("store source entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.extend([
+        crate_root().join("src/producer.rs"),
+        crate_root().join("src/messaging.rs"),
+    ]);
+    paths
+        .into_iter()
+        .map(|path| {
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn public_struct_fields(source: &str, struct_name: &str) -> Vec<String> {
+    let marker = format!("pub struct {struct_name} {{");
+    let block = source
+        .split(&marker)
+        .nth(1)
+        .and_then(|after_marker| after_marker.split("\n}").next())
+        .unwrap_or_else(|| panic!("missing public struct {struct_name}"));
+    let mut fields = block
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("pub ")
+                .and_then(|field| field.split(':').next())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect::<Vec<_>>();
+    fields.sort();
+    fields
+}
+
+fn brace_delta_outside_string_literals(line: &str) -> isize {
+    let mut delta = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in line.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => delta += 1,
+            '}' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+fn public_inherent_methods(source: &str, type_name: &str) -> Vec<String> {
+    let marker = format!("impl {type_name} {{");
+    let mut remaining = source;
+    let mut methods = Vec::new();
+    while let Some(offset) = remaining.find(&marker) {
+        let block = &remaining[offset + marker.len()..];
+        let mut depth = 1_isize;
+        let mut pending_attrs = Vec::new();
+        for line in block.lines() {
+            if depth == 1 {
+                let trimmed = line.trim();
+                if trimmed.starts_with("#[") {
+                    pending_attrs.push(trimmed.to_string());
+                } else if let Some(signature) = trimmed.strip_prefix("pub fn ") {
+                    if !pending_attrs
+                        .iter()
+                        .any(|attr| attr.contains("context_graph_internal_test_support"))
+                    {
+                        let name = signature
+                            .split(|ch: char| ch == '(' || ch == '<' || ch.is_whitespace())
+                            .next()
+                            .expect("public method name");
+                        methods.push(name.to_string());
+                    }
+                    pending_attrs.clear();
+                } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                    pending_attrs.clear();
+                }
+            }
+            depth += brace_delta_outside_string_literals(line);
+            if depth <= 0 {
+                break;
+            }
+        }
+        remaining = block;
+    }
+    methods.sort();
+    methods
+}
+
 fn l2_norm(vector: &[f32]) -> f32 {
     vector
         .iter()
@@ -72,7 +192,117 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
 }
 
 fn embeddinggemma_embedder() -> EmbeddingGemmaTextEmbedder {
-    EmbeddingGemmaTextEmbedder::new(EmbedderConfig::disabled())
+    let config = default_embeddinggemma_offline_config();
+    assert!(config.offline);
+    assert_eq!("offline-cache-only", config.network_policy);
+    assert!(matches!(
+        &config.source,
+        ModelSource::HuggingFace { repo } if repo == "google/embeddinggemma-300m"
+    ));
+    EmbeddingGemmaTextEmbedder::new(config)
+}
+
+#[derive(Clone, Debug)]
+struct DeterministicSiblingTextEmbedder {
+    space: EmbeddingSpace,
+    vector: Vec<f32>,
+}
+
+impl DeterministicSiblingTextEmbedder {
+    fn new(space: EmbeddingSpace, vector: Vec<f32>) -> Self {
+        Self { space, vector }
+    }
+}
+
+impl Embedder for DeterministicSiblingTextEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
+        match input {
+            EmbeddingInput::Text(_) => Ok(EmbeddingOutput {
+                embedding_space_id: self.space.embedding_space_id.clone(),
+                dimension: self.space.dimension,
+                producer: EvidenceProducer {
+                    system: "acceptance".to_string(),
+                    model_name: "embeddinggemma-reindex-fixture".to_string(),
+                    model_version: "1".to_string(),
+                    pipeline_version: "reindex".to_string(),
+                },
+                vector: self.vector.clone(),
+            }),
+            EmbeddingInput::ImageFrame { .. } => Err(CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::ImageFrame,
+            }),
+            EmbeddingInput::AudioSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::AudioSegment,
+            }),
+            EmbeddingInput::VideoSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::VideoSegment,
+            }),
+            EmbeddingInput::StructuredSignal(_) => Err(CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::StructuredSignal,
+            }),
+        }
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        vec![EvidenceKind::Text]
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpace {
+        self.space.clone()
+    }
+}
+
+#[derive(Default)]
+struct RecordingNomicLoadObserver {
+    events: Mutex<Vec<EmbedderLoadEvent>>,
+}
+
+impl RecordingNomicLoadObserver {
+    fn events(&self) -> Vec<EmbedderLoadEvent> {
+        self.events.lock().expect("nomic load events").clone()
+    }
+}
+
+impl EmbedderLoadObserver for RecordingNomicLoadObserver {
+    fn observe(&self, event: EmbedderLoadEvent) {
+        self.events.lock().expect("nomic load events").push(event);
+    }
+}
+
+fn nomic_acceptance_cache_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("CG_NOMIC_TEST_CACHE") {
+        return PathBuf::from(path);
+    }
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("cg")
+            .join("embedders");
+    }
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cg")
+        .join("embedders")
+}
+
+fn nomic_live_config() -> EmbedderConfig {
+    let cache_dir = nomic_acceptance_cache_root();
+    fs::create_dir_all(&cache_dir).expect("nomic acceptance cache directory");
+    EmbedderConfig {
+        cache_dir: Some(cache_dir),
+        ..EmbedderConfig::default_nomic()
+    }
+}
+
+fn nomic_live_embedder() -> NomicTextEmbedder {
+    NomicTextEmbedder::new(nomic_live_config())
 }
 
 fn face_space() -> EmbeddingSpaceDecl {
@@ -96,6 +326,128 @@ fn face_producer() -> EvidenceProducer {
         model_version: "1".to_string(),
         pipeline_version: "local-face".to_string(),
     }
+}
+
+fn text_producer() -> EvidenceProducer {
+    EvidenceProducer {
+        system: "acceptance".to_string(),
+        model_name: "text-fixture".to_string(),
+        model_version: "1".to_string(),
+        pipeline_version: "local-text".to_string(),
+    }
+}
+
+fn text_evidence(
+    observation_id: ObservationId,
+    evidence_id: EvidenceId,
+    context_id: ContextId,
+    text: &str,
+) -> EvidenceRef {
+    EvidenceRef {
+        id: evidence_id,
+        observation_id,
+        context_id,
+        kind: EvidenceKind::Text,
+        source_ref: "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
+        content_hash: Some(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        captured_at: Some(Utc::now()),
+        producer: text_producer(),
+        text_projection: Some(text.to_string()),
+        retention_status: RetentionStatus::RetainedExternal,
+        ..Default::default()
+    }
+}
+
+fn text_observation(
+    id: ObservationId,
+    entity_id: EntityId,
+    context_id: ContextId,
+    evidence: EvidenceRef,
+    embeddings: Vec<PrecomputedEmbedding>,
+) -> RecordObservation {
+    RecordObservation {
+        id,
+        entity_id,
+        context_id,
+        observation_type: "nomic-acceptance".to_string(),
+        source: "nomic-acceptance".to_string(),
+        observed_at: Utc::now(),
+        evidence: vec![evidence],
+        observed_properties: BTreeMap::from([(
+            "component".to_string(),
+            serde_json::json!("embedding"),
+        )]),
+        state_delta: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        embeddings,
+    }
+}
+
+fn assert_first_vector_hit_id(
+    db: &Database,
+    table: &str,
+    hits: &[(RowId, f32)],
+    expected: uuid::Uuid,
+) {
+    assert!(
+        !hits.is_empty(),
+        "expected at least one vector hit for {table}.id {expected}"
+    );
+    let row_id = hits[0].0;
+    let rows = db
+        .scan(table, db.snapshot())
+        .expect("scan vector hit table");
+    let row = rows
+        .into_iter()
+        .find(|row| row.row_id == row_id)
+        .expect("vector hit row must still be visible");
+    assert_eq!(row.values.get("id"), Some(&Value::Uuid(expected)));
+}
+
+fn tensor_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn write_minimal_tokenizer(path: &Path) {
+    let vocab = [
+        ("<unk>".to_string(), 0),
+        ("wrong".to_string(), 1),
+        ("cache".to_string(), 2),
+    ]
+    .into_iter()
+    .collect();
+    let model = WordLevel::builder()
+        .vocab(vocab)
+        .unk_token("<unk>".to_string())
+        .build()
+        .expect("wordlevel");
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+    tokenizer.save(path, false).expect("tokenizer");
+}
+
+fn stage_wrong_identity_nomic_cache(model_dir: &Path) -> PathBuf {
+    fs::create_dir_all(model_dir).expect("wrong nomic model dir");
+    let values = vec![0.0; 256 * 1024];
+    let bytes = tensor_bytes(&values);
+    let tensor = TensorView::new(Dtype::F32, vec![256, 1024], &bytes).expect("wrong tensor view");
+    let model_bytes = safetensors::tensor::serialize([("not_nomic_bert.weight", tensor)], None)
+        .expect("wrong safetensors");
+    fs::write(model_dir.join("model.safetensors"), model_bytes).expect("wrong model");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{"model_type":"nomic_bert","n_embd":768,"n_head":12,"n_layer":12}"#,
+    )
+    .expect("wrong config");
+    write_minimal_tokenizer(&model_dir.join("tokenizer.json"));
+    fs::write(model_dir.join("REVISION"), "old-revision").expect("wrong revision");
+    model_dir.to_path_buf()
 }
 
 fn collect_test_sources(dir: &Path, out: &mut String) {
@@ -153,7 +505,7 @@ fn text_default_space_id_resolves_to_text_default_nomic_v1_5_768_after_default_s
 #[test]
 fn nomic_embed_text_adapter_implements_embedder_trait_with_declared_dimension_768_and_l2_normalized_output()
  {
-    let embedder = NomicTextEmbedder::new(EmbedderConfig::disabled());
+    let embedder = nomic_live_embedder();
     let space = embedder.embedding_space();
     let output = embedder
         .embed(EmbeddingInput::Text("the quick brown fox".to_string()))
@@ -182,7 +534,7 @@ fn nomic_embed_text_adapter_implements_embedder_trait_with_declared_dimension_76
 #[test]
 fn nomic_embed_text_matryoshka_heads_truncate_to_512_256_128_with_renormalized_unit_norm() {
     for dimension in [512, 256, 128] {
-        let embedder = NomicTextEmbedder::new_for_dimension(EmbedderConfig::disabled(), dimension);
+        let embedder = NomicTextEmbedder::new_for_dimension(nomic_live_config(), dimension);
         let output = embedder
             .embed(EmbeddingInput::Text("payment idempotency keys".to_string()))
             .expect("matryoshka embed");
@@ -235,6 +587,45 @@ fn candle_embeddinggemma_consumer_registers_via_storeconfig_extra_embedding_spac
             .iter()
             .any(|space| space.embedding_space_id == EMBEDDINGGEMMA_TEXT_DEFAULT_ID)
     );
+    let context_id = ContextId::new_v7();
+    let observation_id = ObservationId::new_v7();
+    let evidence_id = EvidenceId::new_v7();
+    let evidence = text_evidence(
+        observation_id,
+        evidence_id,
+        context_id,
+        "embeddinggemma sibling recall path",
+    );
+    let mut sibling_vector = vec![0.0; 768];
+    sibling_vector[0] = 1.0;
+    store
+        .record_observation(text_observation(
+            observation_id,
+            EntityId::new_v7(),
+            context_id,
+            evidence,
+            vec![PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: EMBEDDINGGEMMA_TEXT_DEFAULT_ID.to_string(),
+                vector: sibling_vector.clone(),
+                target: EmbeddingTarget::Evidence(evidence_id),
+                produced_by: text_producer(),
+            }],
+        ))
+        .expect("record through sibling space");
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let db = Database::open(&db_path).expect("raw contextdb");
+    let hits = db
+        .query_vector(
+            VectorIndexRef::new("evidence", "vector_text"),
+            &sibling_vector,
+            1,
+            None,
+            db.snapshot(),
+        )
+        .expect("query sibling vector");
+    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
 }
 
 #[test]
@@ -266,10 +657,11 @@ fn cg_main_crate_has_no_embeddinggemma_runtime_code_grep_audit_against_cargo_exp
     );
     assert!(!cargo_toml.contains("candle-embeddinggemma = {"));
     let nomic_tensors = [
-        "model.embeddings.word_embeddings.weight",
-        "model.encoder.layer.0.attention.self.query.weight",
-        "model.text_projection.up_proj.weight",
-        "model.text_projection.down_proj.weight",
+        "embeddings.word_embeddings.weight",
+        "encoder.layers.0.attn.Wqkv.weight",
+        "encoder.layers.0.attn.out_proj.weight",
+        "encoder.layers.0.mlp.fc11.weight",
+        "encoder.layers.11.attn.Wqkv.weight",
     ];
     let fingerprint_count = nomic_tensors
         .iter()
@@ -287,7 +679,7 @@ fn embedder_trait_surface_remains_byte_identical_across_default_embedder_pivot()
         let _ = embedder.embed(input);
     }
 
-    let embedder = NomicTextEmbedder::new(EmbedderConfig::disabled());
+    let embedder = nomic_live_embedder();
     let inputs = [
         EmbeddingInput::Text("text".to_string()),
         EmbeddingInput::ImageFrame {
@@ -305,10 +697,6 @@ fn embedder_trait_surface_remains_byte_identical_across_default_embedder_pivot()
     for input in inputs {
         assert_embed_signature(&embedder, input);
     }
-    let fixture = include_str!("../fixtures/previous_public_api.txt");
-    assert!(fixture.contains("pub trait Embedder"));
-    assert!(fixture.contains("pub struct EmbedderConfig"));
-    assert!(fixture.contains("pub struct EmbedderRegistration"));
 }
 
 #[test]
@@ -352,10 +740,11 @@ fn nomic_bert_forward_pass_graph_shape_cache_contract_fixtures_match_main_crate(
     let nomic_source = read_crate_file("src/embedder/nomic.rs");
     let expected_shape_terms = [
         "NomicBertModel",
-        "model.encoder.layer.0.attention.self.query.weight",
-        "model.encoder.layer.0.attention.self.key.weight",
-        "model.encoder.layer.0.attention.self.value.weight",
-        "model.text_projection.up_proj.weight",
+        "embeddings.word_embeddings.weight",
+        "encoder.layers.0.attn.Wqkv.weight",
+        "encoder.layers.0.attn.out_proj.weight",
+        "encoder.layers.0.mlp.fc11.weight",
+        "encoder.layers.11.attn.Wqkv.weight",
     ];
     let matched = expected_shape_terms
         .iter()
@@ -363,7 +752,7 @@ fn nomic_bert_forward_pass_graph_shape_cache_contract_fixtures_match_main_crate(
         .count();
 
     assert!(
-        matched >= 4,
+        matched == expected_shape_terms.len(),
         "main crate must carry Nomic-specific forward-pass shape fixtures"
     );
 }
@@ -382,15 +771,99 @@ fn embeddinggemma_graph_shape_cache_contract_fixtures_relocated_to_sibling_crate
 #[test]
 fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_default_embeddinggemma_300m_768_via_existing_reindex_no_new_api_surface()
  {
-    let reindex_source = read_crate_file("src/store/reindex.rs");
     let store_source = read_crate_file("src/store/mod.rs");
     let sibling = embeddinggemma_embedder();
+    let sibling_space = sibling.embedding_space();
+    let mut old_vector = vec![0.0; 768];
+    old_vector[1] = 1.0;
+    let mut reindexed_vector = vec![0.0; 768];
+    reindexed_vector[2] = 1.0;
+    let (_dir, mut config) = temp_store_config("embeddinggemma-reindex");
+    config.extra_embedding_spaces.push(sibling_space.clone());
+    let embedder = Arc::new(DeterministicSiblingTextEmbedder::new(
+        sibling_space.clone(),
+        reindexed_vector.clone(),
+    ));
+    let store = Store::open_with_embedder_registrations(
+        config,
+        vec![EmbedderRegistration {
+            space: sibling_space.clone(),
+            embedder,
+        }],
+    )
+    .expect("open Nomic default with registered EmbeddingGemma sibling space");
+    let spaces = store.list_embedding_spaces().expect("embedding spaces");
+    let context_id = ContextId::new_v7();
+    let observation_id = ObservationId::new_v7();
+    let evidence_id = EvidenceId::new_v7();
+    let evidence = text_evidence(
+        observation_id,
+        evidence_id,
+        context_id,
+        "embeddinggemma reindex keeps prior text searchable",
+    );
 
     assert_eq!(
         EMBEDDINGGEMMA_TEXT_DEFAULT_ID,
-        sibling.embedding_space().embedding_space_id
+        sibling_space.embedding_space_id
     );
-    assert!(reindex_source.contains("pub fn reindex_space"));
+    assert!(
+        spaces
+            .iter()
+            .any(|space| space.embedding_space_id == NOMIC_TEXT_DEFAULT_ID)
+    );
+    assert!(
+        spaces
+            .iter()
+            .any(|space| space.embedding_space_id == EMBEDDINGGEMMA_TEXT_DEFAULT_ID)
+    );
+    store
+        .record_observation(text_observation(
+            observation_id,
+            EntityId::new_v7(),
+            context_id,
+            evidence,
+            vec![PrecomputedEmbedding {
+                id: EmbeddingId::new_v7(),
+                embedding_space_id: EMBEDDINGGEMMA_TEXT_DEFAULT_ID.to_string(),
+                vector: old_vector,
+                target: EmbeddingTarget::Evidence(evidence_id),
+                produced_by: text_producer(),
+            }],
+        ))
+        .expect("seed target-space handle before reindex");
+    store
+        .reindex_space(EMBEDDINGGEMMA_TEXT_DEFAULT_ID, ReindexOptions::default())
+        .expect("reindex registered EmbeddingGemma sibling space");
+    let events = store.drain_reindex_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ReindexEvent::Completed {
+                embedding_space_id,
+                rows_processed: 1,
+                ..
+            } if embedding_space_id == EMBEDDINGGEMMA_TEXT_DEFAULT_ID
+        )),
+        "expected reindex completion for the sibling space, events={events:?}"
+    );
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let db = Database::open(&db_path).expect("raw contextdb");
+    let hits = db
+        .query_vector(
+            VectorIndexRef::new("evidence", "vector_text"),
+            &reindexed_vector,
+            1,
+            None,
+            db.snapshot(),
+        )
+        .expect("query reindexed EmbeddingGemma sibling vector");
+    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
+    assert!(
+        hits.first().is_some_and(|(_, score)| *score > 0.99),
+        "the sibling-space vector index must return the reindexed text evidence with a self-match score, hits={hits:?}"
+    );
     assert!(store_source.contains("pub fn open_with_embedder_registrations"));
     assert!(!store_source.contains("switch_embedder"));
 }
@@ -400,11 +873,46 @@ fn semantic_search_through_default_text_space_after_pivot_returns_results_under_
  {
     let embedding_source = read_crate_file("src/store/embedding.rs");
     let default_space = default_text_embedding_space();
+    let (_dir, mut config) = temp_store_config("nomic-semantic-recall");
+    config.default_text_embedder = Some(nomic_live_config());
+    let store = Store::open(config).expect("open with live Nomic default");
+    let context_id = ContextId::new_v7();
+    let observation_id = ObservationId::new_v7();
+    let evidence_id = EvidenceId::new_v7();
+    let text = "auth library choice uses argon2id password hashing";
+    let evidence = text_evidence(observation_id, evidence_id, context_id, text);
+    store
+        .record_observation(text_observation(
+            observation_id,
+            EntityId::new_v7(),
+            context_id,
+            evidence,
+            Vec::new(),
+        ))
+        .expect("record Nomic text observation");
+    let query = NomicTextEmbedder::new(nomic_live_config())
+        .embed(EmbeddingInput::Text(text.to_string()))
+        .expect("query embedding");
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let db = Database::open(&db_path).expect("raw contextdb");
+    let hits = db
+        .query_vector(
+            VectorIndexRef::new("evidence", "vector_text"),
+            &query.vector,
+            1,
+            None,
+            db.snapshot(),
+        )
+        .expect("query Nomic evidence vector");
 
     assert_eq!(NOMIC_TEXT_DEFAULT_ID, default_space.embedding_space_id);
+    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
     assert!(
-        embedding_source.contains(NOMIC_TEXT_DEFAULT_ID),
-        "semantic search must route through the Nomic bundled default id"
+        embedding_source.contains("pub fn semantic_search")
+            && embedding_source.contains("vector_search_with_count_mode")
+            && embedding_source.contains("EmbeddingInput::Text"),
+        "semantic_search must embed the query text and route through the vector search primitive"
     );
 }
 
@@ -413,25 +921,50 @@ fn evidence_search_against_evidence_vector_text_column_under_text_default_nomic_
  {
     let embedding_source = read_crate_file("src/store/embedding.rs");
     let default_space = default_text_embedding_space();
+    let (_dir, mut config) = temp_store_config("nomic-evidence-recall");
+    config.default_text_embedder = Some(nomic_live_config());
+    let store = Store::open(config).expect("open with live Nomic default");
+    let context_id = ContextId::new_v7();
+    let observation_id = ObservationId::new_v7();
+    let evidence_id = EvidenceId::new_v7();
+    let text = "queue retry policy records idempotency key decisions";
+    let evidence = text_evidence(observation_id, evidence_id, context_id, text);
+    store
+        .record_observation(text_observation(
+            observation_id,
+            EntityId::new_v7(),
+            context_id,
+            evidence,
+            Vec::new(),
+        ))
+        .expect("record Nomic text observation");
+    let query = NomicTextEmbedder::new(nomic_live_config())
+        .embed(EmbeddingInput::Text(text.to_string()))
+        .expect("query embedding");
+    let db_path = store.db_path().to_path_buf();
+    drop(store);
+    let db = Database::open(&db_path).expect("raw contextdb");
+    let hits = db
+        .query_vector(
+            VectorIndexRef::new("evidence", "vector_text"),
+            &query.vector,
+            1,
+            None,
+            db.snapshot(),
+        )
+        .expect("query Nomic evidence vector");
 
     assert_eq!(NOMIC_TEXT_DEFAULT_ID, default_space.embedding_space_id);
     assert!(default_space.bindings.iter().any(|binding| {
         binding.table_name == "evidence" && binding.vector_column == "vector_text"
     }));
+    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
     assert!(
-        embedding_source.contains(NOMIC_TEXT_DEFAULT_ID),
-        "evidence search must bind the evidence vector_text column to the Nomic default id"
+        embedding_source.contains("pub fn evidence_search")
+            && embedding_source.contains("row_vector_search_from_evidence")
+            && embedding_source.contains("vector_search_with_count_mode"),
+        "evidence_search must use persisted row vectors or the vector search primitive under the Nomic default"
     );
-}
-
-#[test]
-fn vector_search_with_embedding_space_id_text_default_nomic_v1_5_768_refuses_query_vectors_of_mismatched_dimension()
- {
-    let source = read_crate_file("src/store/embedding.rs");
-
-    assert!(source.contains("query_vector.len() != space.dimension"));
-    assert!(source.contains("EmbeddingDimensionMismatch"));
-    assert!(source.contains("CrossSpaceQueryRefused"));
 }
 
 #[test]
@@ -455,9 +988,52 @@ fn nomic_weights_first_load_writes_to_localappdata_cg_namespace_on_windows() {
 
 #[test]
 fn nomic_weights_first_load_emits_log_info_and_default_stderr_line_at_fetch_start_and_completion() {
+    let cache_root = nomic_acceptance_cache_root().join("observer-fresh-fetch");
+    let model_dir = cache_root.join(NOMIC_MODEL_ID);
+    let _ = fs::remove_dir_all(&model_dir);
+    fs::create_dir_all(&cache_root).expect("observer cache root");
+    let observer = Arc::new(RecordingNomicLoadObserver::default());
+    let observer_trait: Arc<dyn EmbedderLoadObserver> = observer.clone();
+    let embedder = NomicTextEmbedder::new_with_load_observer(
+        EmbedderConfig {
+            cache_dir: Some(cache_root.clone()),
+            ..EmbedderConfig::default_nomic()
+        },
+        observer_trait,
+    );
+
+    let output = embedder
+        .embed(EmbeddingInput::Text("observable first load".to_string()))
+        .expect("observed nomic fetch");
+    let observed = observer.events();
+    let structured = embedder.structured_loader_events();
     let nomic_source = read_crate_file("src/embedder/nomic.rs");
     let observer_source = read_crate_file("src/embedder/load_observer.rs");
 
+    assert_eq!(NOMIC_TEXT_DEFAULT_ID, output.embedding_space_id);
+    assert_eq!(768, output.vector.len());
+    assert!(matches!(
+        observed.first(),
+        Some(EmbedderLoadEvent::FetchStarted {
+            model_id,
+            byte_size: Some(547_112_608),
+            destination,
+        }) if model_id == NOMIC_MODEL_ID && destination == &model_dir
+    ));
+    assert!(observed.iter().any(|event| {
+        matches!(
+            event,
+            EmbedderLoadEvent::FetchCompleted {
+                model_id,
+                byte_size: Some(547_112_608),
+                destination,
+                elapsed,
+            } if model_id == NOMIC_MODEL_ID
+                && destination == &model_dir
+                && elapsed.as_nanos() > 0
+        )
+    }));
+    assert_eq!(observed, structured);
     assert!(observer_source.contains("FetchStarted"));
     assert!(observer_source.contains("FetchCompleted"));
     assert!(
@@ -469,15 +1045,99 @@ fn nomic_weights_first_load_emits_log_info_and_default_stderr_line_at_fetch_star
 }
 
 #[test]
+fn nomic_cache_and_first_load_fetch_failures_return_typed_model_errors() {
+    let cache = tempfile::tempdir().expect("nomic corrupt cache");
+    let model_dir = stage_wrong_identity_nomic_cache(&cache.path().join("prestaged-nomic-v1-5"));
+    let embedder = NomicTextEmbedder::new(EmbedderConfig {
+        source: ModelSource::LocalPath(model_dir.clone()),
+        offline: true,
+        cache_dir: Some(cache.path().to_path_buf()),
+        pinned_revision: None,
+        network_policy: "offline-cache-only".to_string(),
+    });
+
+    let output = embedder.embed(EmbeddingInput::Text("wrong cache".to_string()));
+
+    assert!(
+        matches!(
+            output,
+            Err(CgError::EmbedderModelCorrupt { ref path })
+                if path == &model_dir.join("model.safetensors").display().to_string()
+        ),
+        "wrong-model SafeTensors caches must fail with a typed corrupt-artifact error, output={output:?}"
+    );
+
+    let revision_mismatch = NomicTextEmbedder::new(EmbedderConfig {
+        source: ModelSource::LocalPath(model_dir.clone()),
+        offline: true,
+        cache_dir: Some(cache.path().to_path_buf()),
+        pinned_revision: Some("expected-revision".to_string()),
+        network_policy: "offline-cache-only".to_string(),
+    });
+    let output = revision_mismatch.embed(EmbeddingInput::Text("wrong revision".to_string()));
+
+    assert!(
+        matches!(
+            output,
+            Err(CgError::EmbedderModelRevisionMismatch { ref expected, ref actual })
+                if expected == "expected-revision" && actual == "old-revision"
+        ),
+        "pinned revisions must reject mismatched local Nomic caches before accepting tensors by shape, output={output:?}"
+    );
+
+    let missing_cache = tempfile::tempdir().expect("nomic missing fetch cache");
+    let missing_repo = "context-graph-ai/definitely-missing-nomic-test-artifact";
+    let missing_revision = "never-existing-revision";
+    let missing = NomicTextEmbedder::new(EmbedderConfig {
+        source: ModelSource::HuggingFace {
+            repo: missing_repo.to_string(),
+        },
+        offline: false,
+        cache_dir: Some(missing_cache.path().to_path_buf()),
+        pinned_revision: Some(missing_revision.to_string()),
+        network_policy: "allow-download".to_string(),
+    });
+    let output = missing.embed(EmbeddingInput::Text("missing remote".to_string()));
+    let nomic_source = read_crate_file("src/embedder/nomic.rs");
+
+    assert!(
+        matches!(
+            output,
+            Err(CgError::EmbedderModelNotAvailable { ref source, ref path })
+                if source == &format!("HuggingFace({missing_repo})")
+                    && path == &missing_cache
+                        .path()
+                        .join(NOMIC_MODEL_ID)
+                        .join("model.safetensors")
+                        .display()
+                        .to_string()
+        ),
+        "first-load fetch failures must fail with typed model-unavailable errors, output={output:?}"
+    );
+    assert!(
+        nomic_source.contains("resolve/{revision}"),
+        "Nomic fetch URLs must honor EmbedderConfig::pinned_revision rather than hard-coding main"
+    );
+    assert!(
+        nomic_source.contains("check_revision_marker(&revision_path")
+            && nomic_source.contains("NomicModelCacheKey")
+            && nomic_source.contains("pinned_revision: self.config.pinned_revision.clone()")
+            && nomic_source.contains("guard.get(&cache_key)"),
+        "warm in-process Nomic loads must key and validate the cache by pinned_revision before returning a cached model"
+    );
+}
+
+#[test]
 fn embedderconfig_cache_path_override_field_routes_weight_storage_to_supplied_path_for_air_gapped_consumers()
  {
-    let cache = tempfile::tempdir().expect("cache tempdir");
+    let cache = nomic_acceptance_cache_root().join("override-cache");
+    fs::create_dir_all(&cache).expect("override cache root");
     let embedder = NomicTextEmbedder::new(EmbedderConfig {
         source: ModelSource::HuggingFace {
             repo: "nomic-ai/nomic-embed-text-v1.5".to_string(),
         },
         offline: false,
-        cache_dir: Some(cache.path().to_path_buf()),
+        cache_dir: Some(cache.clone()),
         pinned_revision: None,
         network_policy: "allow-download".to_string(),
     });
@@ -485,7 +1145,7 @@ fn embedderconfig_cache_path_override_field_routes_weight_storage_to_supplied_pa
     let _ = embedder
         .embed(EmbeddingInput::Text("cache override check".to_string()))
         .expect("nomic embed");
-    let expected_dir = cache.path().join("nomic-embed-text-v1.5");
+    let expected_dir = cache.join("nomic-embed-text-v1.5");
     assert!(
         expected_dir.exists(),
         "Nomic weights must be stored under the supplied cache_dir override"
@@ -511,6 +1171,7 @@ fn cg_readme_choosing_an_embedder_section_discloses_nomic_artifact_huggingface_u
     assert!(readme.contains("three minutes"));
     assert!(readme.contains("25Mbps"));
     assert!(readme.contains("Store::open_with_embedder_registrations"));
+    assert!(readme.contains("default_embeddinggemma_offline_config"));
 }
 
 #[test]
@@ -649,20 +1310,192 @@ fn cg_readme_ci_section_documents_three_runner_matrix_and_actions_cache_snippet_
     );
 }
 
+const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
+    "add_relationship",
+    "admin_overwrite_digest",
+    "admin_overwrite_observation",
+    "admin_raw_edge_count",
+    "admin_raw_edge_scan",
+    "admin_raw_has_outcome_edge_count",
+    "admin_raw_insert_cites",
+    "admin_raw_insert_intention",
+    "admin_raw_install_legacy_schema_for_tests",
+    "admin_raw_observations_for_entity_in_context",
+    "admin_raw_outcomes_for_decision",
+    "admin_raw_scan",
+    "admin_raw_scan_intention_rows",
+    "admin_raw_update_decision_immutable_fields",
+    "archive_decision",
+    "archive_entity",
+    "archive_intention",
+    "audit_query",
+    "basis_diff",
+    "by_entity_decisions",
+    "by_entity_intentions",
+    "by_intention",
+    "create_context",
+    "create_decision",
+    "create_digest",
+    "create_entity",
+    "create_intention",
+    "current_entity_snapshot",
+    "db_path",
+    "decision_lineage_producer_systems",
+    "decision_targets_entity",
+    "decision_targets_intention",
+    "dereference_evidence",
+    "diff",
+    "drain_reindex_events",
+    "edge_exists",
+    "enroll_entity_reference",
+    "entity_history",
+    "entity_neighborhood",
+    "evidence_availability_log",
+    "get_context",
+    "get_decision",
+    "get_digest",
+    "get_entity",
+    "get_evidence",
+    "get_intention",
+    "get_observation",
+    "history",
+    "incoming_supersedes",
+    "initialize_fresh",
+    "intention_at",
+    "intention_tree",
+    "invalidate_decision",
+    "last_query_trace",
+    "list_contexts",
+    "list_embedding_spaces",
+    "list_entities",
+    "list_entity_reference_embeddings_for_entity",
+    "list_evidence_for_observation",
+    "list_invalidations",
+    "list_observations",
+    "open",
+    "open_with_contexts",
+    "open_with_embedder_registrations",
+    "precedent_chain",
+    "record_observation",
+    "record_outcome",
+    "reindex_space",
+    "render_decision_producer_audit_paragraph",
+    "render_school_gate_message_body",
+    "replay",
+    "snapshot_at",
+    "state_at",
+    "supersede_decision",
+    "supersede_history",
+    "traverse",
+    "update_decision",
+    "update_decision_basis",
+    "update_entity",
+    "update_evidence_retention_status",
+    "update_intention",
+    "update_intentions_batch",
+    "with_principal",
+    "with_system_principal",
+];
+
 #[test]
 fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures_and_allowed_moves()
 {
-    let fixture = include_str!("../fixtures/previous_public_api.txt");
+    let lib_source = read_crate_file("src/lib.rs");
     let embedder_source = read_crate_file("src/embedder.rs");
-    let types_source = read_crate_file("src/types.rs");
-    let store_source = read_crate_file("src/store/mod.rs");
     let observer_source = read_crate_file("src/embedder/load_observer.rs");
+    let nomic_source = read_crate_file("src/embedder/nomic.rs");
+    let types_source = read_crate_file("src/types.rs");
+    let store_source = read_store_public_api_sources();
+    let public_sources = format!(
+        "{lib_source}\n{embedder_source}\n{observer_source}\n{nomic_source}\n{types_source}\n{store_source}"
+    );
 
-    assert!(fixture.contains("pub trait Embedder"));
-    assert!(embedder_source.contains("pub trait Embedder"));
-    assert!(embedder_source.contains("fn embed(&self, input: EmbeddingInput)"));
-    assert!(types_source.contains("pub default_text_embedder: Option<EmbedderConfig>"));
-    assert!(types_source.contains("pub extra_embedding_spaces: Vec<EmbeddingSpaceDecl>"));
-    assert!(observer_source.contains("pub trait EmbedderLoadObserver"));
-    assert!(!store_source.contains("pub fn switch_embedder"));
+    for (source, required) in [
+        (&embedder_source, "pub struct EmbedderConfig"),
+        (&embedder_source, "pub struct EmbedderRegistration"),
+        (&embedder_source, "pub enum EmbeddingInput"),
+        (&embedder_source, "pub struct EmbeddingOutput"),
+        (&observer_source, "pub enum EmbedderLoadEvent"),
+        (&observer_source, "pub trait EmbedderLoadObserver"),
+        (&nomic_source, "pub struct NomicTextEmbedder"),
+        (&types_source, "pub struct StoreConfig"),
+        (&store_source, "pub struct Store"),
+    ] {
+        assert!(
+            source.contains(required),
+            "public API source missing required item {required}"
+        );
+    }
+    assert!(lib_source.contains("EmbedderLoadEvent"));
+    assert!(lib_source.contains("EmbedderLoadObserver"));
+    assert!(lib_source.contains("NomicTextEmbedder") || nomic_source.contains("NomicTextEmbedder"));
+    for removed_or_forbidden in [
+        "EmbeddingGemma",
+        "EmbeddingGemmaLoadObserver",
+        "EmbeddingGemmaLoadEvent",
+        "EmbeddingGemmaTextEmbedder",
+        "LazyHandle",
+        "default_embeddinggemma_offline",
+        "tensor_fingerprints",
+        "switch_embedder",
+    ] {
+        assert!(
+            !public_sources.contains(removed_or_forbidden),
+            "public API source exposes forbidden item {removed_or_forbidden}"
+        );
+    }
+
+    assert!(embedder_source.contains("pub trait Embedder: Send + Sync"));
+    assert!(
+        embedder_source
+            .contains("fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput>;")
+    );
+    assert!(embedder_source.contains("fn supported_inputs(&self) -> Vec<EvidenceKind>;"));
+    assert!(embedder_source.contains("fn embedding_space(&self) -> EmbeddingSpace;"));
+
+    assert_eq!(
+        vec![
+            "cache_dir",
+            "network_policy",
+            "offline",
+            "pinned_revision",
+            "source"
+        ],
+        public_struct_fields(&embedder_source, "EmbedderConfig")
+    );
+    assert_eq!(
+        vec!["default_nomic", "disabled"],
+        public_inherent_methods(&embedder_source, "EmbedderConfig")
+    );
+
+    assert_eq!(
+        vec![
+            "db_path",
+            "default_text_embedder",
+            "expected_schema_version",
+            "extra_embedding_spaces",
+            "file_uri_allowed",
+            "https_allowed_hosts",
+        ],
+        public_struct_fields(&types_source, "StoreConfig")
+    );
+
+    assert_eq!(
+        vec![
+            "new",
+            "new_for_dimension",
+            "new_with_load_observer",
+            "structured_loader_events"
+        ],
+        public_inherent_methods(&nomic_source, "NomicTextEmbedder")
+    );
+    assert_eq!(
+        Vec::<String>::new(),
+        public_struct_fields(&nomic_source, "NomicTextEmbedder")
+    );
+    assert!(!nomic_source.contains("pub const NOMIC_"));
+
+    let store_methods = public_inherent_methods(&store_source, "Store");
+    let store_methods = store_methods.iter().map(String::as_str).collect::<Vec<_>>();
+    assert_eq!(EXPECTED_STORE_PUBLIC_METHODS, store_methods.as_slice());
 }

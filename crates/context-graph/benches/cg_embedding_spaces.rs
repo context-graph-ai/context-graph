@@ -1,23 +1,20 @@
-#[cfg(not(context_graph_internal_test_support))]
-fn main() {}
-
 #[cfg(context_graph_internal_test_support)]
 use candle_core::{D, DType, Device, Tensor};
 #[cfg(context_graph_internal_test_support)]
+use candle_embeddinggemma::EmbeddingGemmaTextEmbedder;
+#[cfg(context_graph_internal_test_support)]
 use chrono::Utc;
+use context_graph::EmbedderConfig;
 #[cfg(context_graph_internal_test_support)]
-use context_graph::embedder::embeddinggemma::EmbeddingGemmaTextEmbedder;
-#[cfg(context_graph_internal_test_support)]
+use context_graph::embedder::ModelSource;
 use context_graph::embedder::nomic::NomicTextEmbedder;
-#[cfg(context_graph_internal_test_support)]
-use context_graph::embedder::{Embedder, EmbeddingInput, ModelSource};
+use context_graph::embedder::{Embedder, EmbeddingInput};
 #[cfg(context_graph_internal_test_support)]
 use context_graph::{
-    ContextId, CreateContext, CreateEntity, EmbedderConfig, EntityId, EntityType, EvidenceId,
-    EvidenceKind, EvidenceRef, RecordObservation, RetentionStatus, Store, StoreConfig,
+    ContextId, CreateContext, CreateEntity, EntityId, EntityType, EvidenceId, EvidenceKind,
+    EvidenceRef, RecordObservation, RetentionStatus, Store, StoreConfig,
     test_support::embedding::{VectorSearchFilters, vector_search},
 };
-#[cfg(context_graph_internal_test_support)]
 use criterion::{Criterion, criterion_group, criterion_main};
 #[cfg(context_graph_internal_test_support)]
 use safetensors::SafeTensors;
@@ -25,9 +22,8 @@ use safetensors::SafeTensors;
 use safetensors::tensor::{Dtype, TensorView};
 #[cfg(context_graph_internal_test_support)]
 use std::collections::BTreeMap;
-#[cfg(context_graph_internal_test_support)]
 use std::hint::black_box;
-#[cfg(context_graph_internal_test_support)]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 #[cfg(context_graph_internal_test_support)]
 use tokenizers::Tokenizer;
@@ -37,11 +33,12 @@ use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
 
 #[cfg(context_graph_internal_test_support)]
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 #[cfg(context_graph_internal_test_support)]
 const COLD_START_BUDGET: Duration = Duration::from_secs(5);
 #[cfg(context_graph_internal_test_support)]
 const VECTOR_QUERY_BUDGET: Duration = Duration::from_millis(50);
+const NOMIC_HOT_PATH_BUDGET: Duration = Duration::from_millis(200);
 #[cfg(context_graph_internal_test_support)]
 const TOKEN_EMBEDDING_TENSOR: &str = "model.embed_tokens.weight";
 #[cfg(context_graph_internal_test_support)]
@@ -175,18 +172,33 @@ pub fn vector_search_per_query_latency_within_budget(c: &mut Criterion) {
     });
 }
 
-#[cfg(context_graph_internal_test_support)]
-pub fn bench_nomic_per_call_embed_latency_stays_under_1_2ms_cold_start_ceiling(c: &mut Criterion) {
-    let embedder = NomicTextEmbedder::new(EmbedderConfig::disabled());
+pub fn bench_nomic_per_call_embed_latency_stays_under_200ms_hot_path_budget(c: &mut Criterion) {
+    let mut config = EmbedderConfig::default_nomic();
+    if let Some(cache_dir) = std::env::var_os("CG_NOMIC_BENCH_CACHE").map(PathBuf::from) {
+        std::fs::create_dir_all(&cache_dir).expect("nomic bench cache directory");
+        config.cache_dir = Some(cache_dir);
+    }
+    let embedder = NomicTextEmbedder::new(config);
+    let warm_output = embedder
+        .embed(EmbeddingInput::Text("a small text input".to_string()))
+        .expect("nomic bench warm embed");
+    black_box(warm_output.vector.len());
+
     c.bench_function(
-        "bench_nomic_per_call_embed_latency_stays_under_1_2ms_cold_start_ceiling",
+        "bench_nomic_per_call_embed_latency_stays_under_200ms_hot_path_budget",
         |b| {
             b.iter(|| {
+                let started = Instant::now();
                 let output = embedder
                     .embed(EmbeddingInput::Text(black_box(
                         "a small text input".to_string(),
                     )))
                     .expect("nomic bench embed");
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed <= NOMIC_HOT_PATH_BUDGET,
+                    "Nomic per-call embed exceeded hot-path budget {NOMIC_HOT_PATH_BUDGET:?}: {elapsed:?}"
+                );
                 black_box(output.vector.len())
             })
         },
@@ -691,7 +703,11 @@ criterion_group!(
     benches,
     embedder_cold_start_first_invocation_within_budget,
     vector_search_per_query_latency_within_budget,
-    bench_nomic_per_call_embed_latency_stays_under_1_2ms_cold_start_ceiling
+    bench_nomic_per_call_embed_latency_stays_under_200ms_hot_path_budget
 );
-#[cfg(context_graph_internal_test_support)]
+#[cfg(not(context_graph_internal_test_support))]
+criterion_group!(
+    benches,
+    bench_nomic_per_call_embed_latency_stays_under_200ms_hot_path_budget
+);
 criterion_main!(benches);

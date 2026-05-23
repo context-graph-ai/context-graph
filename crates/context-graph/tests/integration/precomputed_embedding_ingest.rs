@@ -22,7 +22,7 @@ use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
 #[cfg(context_graph_internal_test_support)]
 use contextdb_tx::WriteSet;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 
 struct Fixture {
     _dir: tempfile::TempDir,

@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use candle_core::{D, DType, Device, Tensor, shape::ShapeWithOneHole};
 use candle_nn::{Activation, Module};
@@ -11,8 +12,8 @@ use tokenizers::Tokenizer;
 
 use context_graph::embedder::{Embedder, EmbeddingInput, EmbeddingOutput};
 use context_graph::{
-    CgError, DistanceMetric, EmbedderConfig, EmbeddingSpace, EmbeddingSpaceBinding, EvidenceKind,
-    EvidenceProducer, Result,
+    CgError, DistanceMetric, EmbedderConfig, EmbedderLoadEvent, EmbedderLoadObserver,
+    EmbeddingSpace, EmbeddingSpaceBinding, EvidenceKind, EvidenceProducer, Result,
 };
 
 static NETWORK_ATTEMPT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -104,17 +105,11 @@ pub enum EmbeddingGemmaLoadEvent {
     },
 }
 
-pub trait EmbeddingGemmaLoadObserver: Send + Sync {
-    fn observe(&self, event: EmbeddingGemmaLoadEvent);
-
-    fn observe_candle_tensor(&self, _stage: EmbeddingGemmaForwardStage, _tensor: &Tensor) {}
-}
-
 #[derive(Clone)]
 pub struct EmbeddingGemmaTextEmbedder {
     pub config: EmbedderConfig,
     pub dimension: usize,
-    load_observer: Option<Arc<dyn EmbeddingGemmaLoadObserver>>,
+    load_observer: Option<Arc<dyn EmbedderLoadObserver>>,
     loaded_model: Arc<OnceLock<LoadedEmbeddingGemmaModel>>,
     model_loaded_event_emitted: Arc<AtomicBool>,
     load_lock: Arc<Mutex<()>>,
@@ -151,7 +146,7 @@ impl EmbeddingGemmaTextEmbedder {
 
     pub fn new_with_load_observer(
         config: EmbedderConfig,
-        load_observer: Arc<dyn EmbeddingGemmaLoadObserver>,
+        load_observer: Arc<dyn EmbedderLoadObserver>,
     ) -> Self {
         Self {
             config,
@@ -242,11 +237,17 @@ impl EmbeddingGemmaTextEmbedder {
         if matches!(self.config.source, context_graph::ModelSource::Disabled) {
             return Err(CgError::TextEmbedderDisabled);
         }
+        let started = Instant::now();
         LOADER_ENTRY_COUNT.with(|count| count.set(count.get() + 1));
         let model_dir = resolve_model_dir(&self.config)?;
         let model_id = EMBEDDINGGEMMA_MODEL_NAME.to_string();
         let cache_path = model_dir.display().to_string();
         let pinned_revision = self.config.pinned_revision.clone();
+        self.observe_load(EmbedderLoadEvent::LoadStarted {
+            model_id: model_id.clone(),
+            byte_size: None,
+            destination: model_dir.clone(),
+        });
         self.observe(EmbeddingGemmaLoadEvent::ModelLookupStarted {
             model_id: model_id.clone(),
             cache_path: cache_path.clone(),
@@ -342,6 +343,12 @@ impl EmbeddingGemmaTextEmbedder {
                 device: "Cpu".to_string(),
             });
         }
+        self.observe_load(EmbedderLoadEvent::LoadCompleted {
+            model_id: model_id.clone(),
+            byte_size: None,
+            destination: model_dir,
+            elapsed: started.elapsed(),
+        });
         Ok(LoadedEmbeddingGemmaModel {
             weights,
             tokenizer,
@@ -355,8 +362,11 @@ impl EmbeddingGemmaTextEmbedder {
 
     fn observe(&self, event: EmbeddingGemmaLoadEvent) {
         if let Ok(mut events) = self.loader_events.lock() {
-            events.push(event.clone());
+            events.push(event);
         }
+    }
+
+    fn observe_load(&self, event: EmbedderLoadEvent) {
         if let Some(observer) = &self.load_observer {
             observer.observe(event);
         }
@@ -369,8 +379,14 @@ impl EmbeddingGemmaTextEmbedder {
             dtype: format!("{:?}", tensor.dtype()),
             device: format!("{:?}", tensor.device()),
         });
-        if let Some(observer) = &self.load_observer {
-            observer.observe_candle_tensor(stage, tensor);
+        if let Ok(value_sha256) = tensor_digest(tensor) {
+            self.observe(EmbeddingGemmaLoadEvent::CandleTensorDigest {
+                stage,
+                shape: tensor.dims().to_vec(),
+                dtype: format!("{:?}", tensor.dtype()),
+                device: format!("{:?}", tensor.device()),
+                value_sha256,
+            });
         }
     }
 
@@ -587,6 +603,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn tensor_digest(tensor: &Tensor) -> Result<String> {
+    let values = tensor
+        .flatten_all()
+        .map_err(|err| CgError::Engine(format!("embeddinggemma tensor digest flatten: {err}")))?
+        .to_vec1::<f32>()
+        .map_err(|err| CgError::Engine(format!("embeddinggemma tensor digest values: {err}")))?;
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.to_le_bytes());
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 struct LoadedEmbeddingGemmaModel {

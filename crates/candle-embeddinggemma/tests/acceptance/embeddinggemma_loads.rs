@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use candle_core::{D, DType, Device, Tensor};
 use candle_embeddinggemma::{
-    EmbeddingGemmaForwardStage, EmbeddingGemmaLoadEvent, EmbeddingGemmaLoadObserver,
-    EmbeddingGemmaTextEmbedder,
+    EmbeddingGemmaForwardStage, EmbeddingGemmaLoadEvent, EmbeddingGemmaTextEmbedder,
 };
 use context_graph::embedder::{Embedder, EmbeddingInput};
-use context_graph::{CgError, EmbedderConfig, ModelSource};
+use context_graph::{
+    CgError, EmbedderConfig, EmbedderLoadEvent, EmbedderLoadObserver, ModelSource,
+};
 use safetensors::SafeTensors;
 use safetensors::tensor::{Dtype, TensorView};
 use sha2::{Digest, Sha256};
@@ -171,28 +172,12 @@ struct MiniEmbeddingGemmaWeights {
 
 #[derive(Default)]
 struct RecordingLoadObserver {
-    events: Mutex<Vec<EmbeddingGemmaLoadEvent>>,
+    events: Mutex<Vec<EmbedderLoadEvent>>,
 }
 
-impl RecordingLoadObserver {
-    fn events(&self) -> Vec<EmbeddingGemmaLoadEvent> {
-        self.events.lock().expect("loader events").clone()
-    }
-}
-
-impl EmbeddingGemmaLoadObserver for RecordingLoadObserver {
-    fn observe(&self, event: EmbeddingGemmaLoadEvent) {
+impl EmbedderLoadObserver for RecordingLoadObserver {
+    fn observe(&self, event: EmbedderLoadEvent) {
         self.events.lock().expect("loader events").push(event);
-    }
-
-    fn observe_candle_tensor(&self, stage: EmbeddingGemmaForwardStage, tensor: &Tensor) {
-        self.observe(EmbeddingGemmaLoadEvent::CandleTensorDigest {
-            stage,
-            shape: tensor.dims().to_vec(),
-            dtype: format!("{:?}", tensor.dtype()),
-            device: format!("{:?}", tensor.device()),
-            value_sha256: tensor_digest(tensor),
-        });
     }
 }
 
@@ -970,7 +955,7 @@ fn embeddinggemma_requires_valid_candle_tokenizer_safetensors_artifacts_before_f
     let model_bytes = std::fs::read(model_dir.join("model.safetensors")).expect("model bytes");
     let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"));
     let observer = Arc::new(RecordingLoadObserver::default());
-    let observer_trait: Arc<dyn EmbeddingGemmaLoadObserver> = observer.clone();
+    let observer_trait: Arc<dyn EmbedderLoadObserver> = observer.clone();
     let embedder = EmbeddingGemmaTextEmbedder::new_with_load_observer(
         local_model_config(cache.path()),
         observer_trait,
@@ -1026,7 +1011,7 @@ fn embeddinggemma_warm_cache_success_requires_real_tokenizer_safetensors_and_can
         .encode(unique_token.as_str(), false)
         .expect("encode sentinel");
     let observer = Arc::new(RecordingLoadObserver::default());
-    let observer_trait: Arc<dyn EmbeddingGemmaLoadObserver> = observer.clone();
+    let observer_trait: Arc<dyn EmbedderLoadObserver> = observer.clone();
     let embedder = EmbeddingGemmaTextEmbedder::new_with_load_observer(
         local_model_config(cache.path()),
         observer_trait,
@@ -1049,7 +1034,7 @@ fn embeddinggemma_warm_cache_success_requires_real_tokenizer_safetensors_and_can
             .any(|component| component.abs() > 1.0e-6)
     );
     let output = embedder.embed(EmbeddingInput::Text(format!("{unique_token} red sedan")));
-    let structured_events = observer.events();
+    let structured_events = embedder.structured_loader_events();
 
     assert!(
         matches!(
@@ -1100,14 +1085,14 @@ fn embeddinggemma_warm_cache_success_requires_real_tokenizer_safetensors_and_can
         &[3, 1, 2],
     );
     let variable_observer = Arc::new(RecordingLoadObserver::default());
-    let variable_observer_trait: Arc<dyn EmbeddingGemmaLoadObserver> = variable_observer.clone();
+    let variable_observer_trait: Arc<dyn EmbedderLoadObserver> = variable_observer.clone();
     let variable_embedder = EmbeddingGemmaTextEmbedder::new_with_load_observer(
         local_model_config(variable_cache.path()),
         variable_observer_trait,
     );
     let variable_output =
         variable_embedder.embed(EmbeddingInput::Text(format!("{variable_token} red sedan")));
-    let variable_events = variable_observer.events();
+    let variable_events = variable_embedder.structured_loader_events();
 
     assert!(
         matches!(

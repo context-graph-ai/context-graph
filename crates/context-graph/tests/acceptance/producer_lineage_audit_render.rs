@@ -22,7 +22,7 @@ use std::sync::{
 #[cfg(context_graph_internal_test_support)]
 use std::time::Duration;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const PROCUREMENT_SPACE: &str = "procurement_evidence_v1";
 
 #[cfg(context_graph_internal_test_support)]

@@ -1672,8 +1672,21 @@ fn row_values_by_column(columns: &[String], row: &[Value]) -> HashMap<String, Va
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use chrono::Utc;
+
     use super::*;
-    use crate::StoreConfig;
+    use crate::{
+        ContextId, DistanceMetric, Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingId,
+        EmbeddingOutput, EmbeddingSpace, EmbeddingSpaceBinding, EntityId, EvidenceId,
+        EvidenceProducer, ObservationId, PrecomputedEmbedding, RecordObservation, ReindexEvent,
+        ReindexOptions, RetentionStatus, StoreConfig,
+    };
+
+    const NOMIC_TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
+    const SIBLING_TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
 
     #[test]
     fn production_vector_search_anchor_is_not_test_support_only() {
@@ -1686,7 +1699,7 @@ mod tests {
         let hits = vector_search(
             &store,
             &[1.0; 768],
-            "text_default_embeddinggemma_300m_768",
+            "text_default_nomic_v1_5_768",
             VectorSearchFilters {
                 top_k: Some(1),
                 ..Default::default()
@@ -1698,5 +1711,404 @@ mod tests {
             hits.is_empty(),
             "production private vector_search must execute in the normal crate build, not only through context_graph_internal_test_support; empty corpus should return no hits, hits={hits:?}"
         );
+    }
+
+    #[test]
+    fn semantic_and_evidence_search_execute_real_nomic_default_recall_path() {
+        let dir = tempfile::tempdir().expect("store dir");
+        let store = Store::open(StoreConfig {
+            db_path: dir.path().join("cg.db"),
+            ..Default::default()
+        })
+        .expect("open");
+        let context_id = ContextId::new_v7();
+        let observation_id = ObservationId::new_v7();
+        let evidence_id = EvidenceId::new_v7();
+        let evidence = text_evidence(
+            observation_id,
+            evidence_id,
+            context_id,
+            "auth module chooses argon2id password hashing",
+        );
+        store
+            .record_observation(text_observation(
+                observation_id,
+                EntityId::new_v7(),
+                context_id,
+                evidence.clone(),
+                Vec::new(),
+            ))
+            .expect("record observation");
+
+        let filters = VectorSearchFilters {
+            context_ids: Some(vec![context_id]),
+            top_k: Some(1),
+            ..Default::default()
+        };
+        let semantic_hits = semantic_search(&store, "auth password hashing", filters.clone())
+            .expect("semantic search");
+        assert!(
+            matches!(
+                semantic_hits.first().map(|hit| &hit.target),
+                Some(EmbeddingTarget::Evidence(id)) if *id == evidence_id
+            ),
+            "semantic_search must return the recorded Nomic text evidence, hits={semantic_hits:?}"
+        );
+        assert!(
+            semantic_hits
+                .iter()
+                .all(|hit| hit.embedding_space_id == NOMIC_TEXT_SPACE),
+            "semantic_search must route through the Nomic bundled default, hits={semantic_hits:?}"
+        );
+
+        let evidence_hits = evidence_search(&store, &evidence, Some(NOMIC_TEXT_SPACE), filters)
+            .expect("evidence search");
+        assert!(
+            matches!(
+                evidence_hits.first().map(|hit| &hit.target),
+                Some(EmbeddingTarget::Evidence(id)) if *id == evidence_id
+            ),
+            "evidence_search must find the persisted Nomic evidence vector, hits={evidence_hits:?}"
+        );
+        assert!(
+            evidence_hits
+                .iter()
+                .all(|hit| hit.embedding_space_id == NOMIC_TEXT_SPACE),
+            "evidence_search must keep Nomic space identity on every hit, hits={evidence_hits:?}"
+        );
+    }
+
+    #[test]
+    fn registered_embeddinggemma_space_searches_text_evidence_and_refuses_cross_space_vector_query()
+    {
+        let dir = tempfile::tempdir().expect("store dir");
+        let mut sibling_vector = vec![0.0; 768];
+        sibling_vector[0] = 1.0;
+        let sibling = Arc::new(RegisteredTextEmbedder {
+            space_id: SIBLING_TEXT_SPACE.to_string(),
+            vector: sibling_vector.clone(),
+        });
+        let space = sibling.embedding_space();
+        let store = Store::open_with_embedder_registrations(
+            StoreConfig {
+                db_path: dir.path().join("cg.db"),
+                default_text_embedder: None,
+                extra_embedding_spaces: vec![space.clone()],
+                ..Default::default()
+            },
+            vec![EmbedderRegistration {
+                space,
+                embedder: sibling.clone(),
+            }],
+        )
+        .expect("open with sibling embedder");
+        let context_id = ContextId::new_v7();
+        let observation_id = ObservationId::new_v7();
+        let evidence_id = EvidenceId::new_v7();
+        let text = "billing worker retries idempotently after queue restart";
+        let evidence = text_evidence(observation_id, evidence_id, context_id, text);
+        store
+            .record_observation(text_observation(
+                observation_id,
+                EntityId::new_v7(),
+                context_id,
+                evidence.clone(),
+                vec![PrecomputedEmbedding {
+                    id: EmbeddingId::new_v7(),
+                    embedding_space_id: SIBLING_TEXT_SPACE.to_string(),
+                    vector: sibling_vector.clone(),
+                    target: EmbeddingTarget::Evidence(evidence_id),
+                    produced_by: producer(),
+                }],
+            ))
+            .expect("record observation");
+
+        let filters = VectorSearchFilters {
+            context_ids: Some(vec![context_id]),
+            top_k: Some(1),
+            ..Default::default()
+        };
+        let hits = evidence_search(&store, &evidence, Some(SIBLING_TEXT_SPACE), filters)
+            .expect("registered sibling evidence search");
+        assert!(
+            matches!(
+                hits.first().map(|hit| &hit.target),
+                Some(EmbeddingTarget::Evidence(id)) if *id == evidence_id
+            ),
+            "registered sibling text space must be usable for text recall, hits={hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .all(|hit| hit.embedding_space_id == SIBLING_TEXT_SPACE),
+            "registered sibling recall must keep the sibling space id, hits={hits:?}"
+        );
+
+        let cross_space = vector_search(
+            &store,
+            &sibling_vector,
+            NOMIC_TEXT_SPACE,
+            VectorSearchFilters {
+                candidate_embedding_space_ids: vec![SIBLING_TEXT_SPACE.to_string()],
+                candidate_dimensions: vec![(SIBLING_TEXT_SPACE.to_string(), 768)],
+                top_k: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(
+                cross_space,
+                Err(CgError::CrossSpaceQueryRefused {
+                    ref query_space,
+                    ref candidate_space,
+                    query_dim: Some(768),
+                    candidate_dim: Some(768),
+                }) if query_space == NOMIC_TEXT_SPACE
+                    && candidate_space == SIBLING_TEXT_SPACE
+            ),
+            "cross-space Nomic-vs-sibling vector comparison must be refused, result={cross_space:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_default_embeddinggemma_300m_768_via_existing_reindex_no_new_api_surface()
+     {
+        let dir = tempfile::tempdir().expect("store dir");
+        let mut old_vector = vec![0.0; 768];
+        old_vector[1] = 1.0;
+        let mut reindexed_vector = vec![0.0; 768];
+        reindexed_vector[2] = 1.0;
+        let sibling = Arc::new(RegisteredTextEmbedder {
+            space_id: SIBLING_TEXT_SPACE.to_string(),
+            vector: reindexed_vector.clone(),
+        });
+        let sibling_space = sibling.embedding_space();
+        let store = Store::open_with_embedder_registrations(
+            StoreConfig {
+                db_path: dir.path().join("cg.db"),
+                extra_embedding_spaces: vec![sibling_space.clone()],
+                ..Default::default()
+            },
+            vec![EmbedderRegistration {
+                space: sibling_space,
+                embedder: sibling,
+            }],
+        )
+        .expect("open with Nomic default and registered sibling text space");
+        let spaces = store.list_embedding_spaces().expect("embedding spaces");
+        let context_id = ContextId::new_v7();
+        let observation_id = ObservationId::new_v7();
+        let evidence_id = EvidenceId::new_v7();
+        let evidence = text_evidence(
+            observation_id,
+            evidence_id,
+            context_id,
+            "embeddinggemma reindex keeps prior text searchable",
+        );
+
+        assert!(
+            spaces
+                .iter()
+                .any(|space| space.embedding_space_id == NOMIC_TEXT_SPACE)
+        );
+        assert!(
+            spaces
+                .iter()
+                .any(|space| space.embedding_space_id == SIBLING_TEXT_SPACE)
+        );
+        store
+            .record_observation(text_observation(
+                observation_id,
+                EntityId::new_v7(),
+                context_id,
+                evidence,
+                vec![PrecomputedEmbedding {
+                    id: EmbeddingId::new_v7(),
+                    embedding_space_id: SIBLING_TEXT_SPACE.to_string(),
+                    vector: old_vector,
+                    target: EmbeddingTarget::Evidence(evidence_id),
+                    produced_by: producer(),
+                }],
+            ))
+            .expect("seed sibling target-space handle");
+        store
+            .reindex_space(SIBLING_TEXT_SPACE, ReindexOptions::default())
+            .expect("reindex sibling target-space handle");
+        let events = store.drain_reindex_events();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ReindexEvent::Completed {
+                    embedding_space_id,
+                    rows_processed: 1,
+                    ..
+                } if embedding_space_id == SIBLING_TEXT_SPACE
+            )),
+            "expected sibling-space reindex completion, events={events:?}"
+        );
+        let hits = vector_search(
+            &store,
+            &reindexed_vector,
+            SIBLING_TEXT_SPACE,
+            VectorSearchFilters {
+                top_k: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("query refreshed sibling-space vector");
+        assert!(
+            matches!(
+                hits.first(),
+                Some(hit)
+                    if hit.embedding_space_id == SIBLING_TEXT_SPACE
+                        && hit.target == EmbeddingTarget::Evidence(evidence_id)
+                        && hit.score > 0.99
+            ),
+            "vector_search through sibling space must return the reindexed text evidence, hits={hits:?}"
+        );
+    }
+
+    #[test]
+    fn vector_search_with_embedding_space_id_text_default_nomic_v1_5_768_refuses_query_vectors_of_mismatched_dimension()
+     {
+        let dir = tempfile::tempdir().expect("store dir");
+        let store = Store::open(StoreConfig {
+            db_path: dir.path().join("cg.db"),
+            default_text_embedder: Some(EmbedderConfig::disabled()),
+            ..Default::default()
+        })
+        .expect("open with disabled text embedder still seeds Nomic space");
+        let query = vec![0.0; 384];
+
+        let err = vector_search(
+            &store,
+            &query,
+            NOMIC_TEXT_SPACE,
+            VectorSearchFilters::default(),
+        )
+        .expect_err("384-dim query must be refused against the 768-dim Nomic space");
+
+        assert!(
+            matches!(
+                err,
+                CgError::EmbeddingDimensionMismatch {
+                    ref space_id,
+                    expected: 768,
+                    found: 384
+                } if space_id == NOMIC_TEXT_SPACE
+            ),
+            "expected typed Nomic dimension mismatch, got {err:?}"
+        );
+    }
+
+    struct RegisteredTextEmbedder {
+        space_id: String,
+        vector: Vec<f32>,
+    }
+
+    impl Embedder for RegisteredTextEmbedder {
+        fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput> {
+            match input {
+                EmbeddingInput::Text(_) => Ok(EmbeddingOutput {
+                    embedding_space_id: self.space_id.clone(),
+                    vector: self.vector.clone(),
+                    dimension: self.vector.len(),
+                    producer: producer(),
+                }),
+                EmbeddingInput::ImageFrame { .. } => Err(CgError::UnsupportedEvidenceKind {
+                    kind: EvidenceKind::ImageFrame,
+                }),
+                EmbeddingInput::AudioSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
+                    kind: EvidenceKind::AudioSegment,
+                }),
+                EmbeddingInput::VideoSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
+                    kind: EvidenceKind::VideoSegment,
+                }),
+                EmbeddingInput::StructuredSignal(_) => Err(CgError::UnsupportedEvidenceKind {
+                    kind: EvidenceKind::StructuredSignal,
+                }),
+            }
+        }
+
+        fn supported_inputs(&self) -> Vec<EvidenceKind> {
+            vec![EvidenceKind::Text]
+        }
+
+        fn embedding_space(&self) -> EmbeddingSpace {
+            EmbeddingSpace {
+                embedding_space_id: self.space_id.clone(),
+                dimension: self.vector.len(),
+                metric: DistanceMetric::Cosine,
+                model_family: "text".to_string(),
+                model_name: "registered-text".to_string(),
+                model_version: "1".to_string(),
+                supported_evidence_kinds: vec![EvidenceKind::Text],
+                default_for_evidence_kind: Some(EvidenceKind::Text),
+                bindings: vec![EmbeddingSpaceBinding {
+                    embedding_space_id: self.space_id.clone(),
+                    table_name: "evidence".to_string(),
+                    vector_column: "vector_text".to_string(),
+                }],
+            }
+        }
+    }
+
+    fn text_evidence(
+        observation_id: ObservationId,
+        evidence_id: EvidenceId,
+        context_id: ContextId,
+        text: &str,
+    ) -> EvidenceRef {
+        EvidenceRef {
+            id: evidence_id,
+            observation_id,
+            context_id,
+            kind: EvidenceKind::Text,
+            source_ref:
+                "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            content_hash: Some(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            captured_at: Some(Utc::now()),
+            producer: producer(),
+            text_projection: Some(text.to_string()),
+            retention_status: RetentionStatus::RetainedExternal,
+            ..Default::default()
+        }
+    }
+
+    fn text_observation(
+        id: ObservationId,
+        entity_id: EntityId,
+        context_id: ContextId,
+        evidence: EvidenceRef,
+        embeddings: Vec<PrecomputedEmbedding>,
+    ) -> RecordObservation {
+        RecordObservation {
+            id,
+            entity_id,
+            context_id,
+            observation_type: "unit".to_string(),
+            source: "unit".to_string(),
+            observed_at: Utc::now(),
+            evidence: vec![evidence],
+            observed_properties: BTreeMap::from([(
+                "component".to_string(),
+                serde_json::json!("auth"),
+            )]),
+            state_delta: BTreeMap::new(),
+            properties: BTreeMap::new(),
+            embeddings,
+        }
+    }
+
+    fn producer() -> EvidenceProducer {
+        EvidenceProducer {
+            system: "unit".to_string(),
+            model_name: "fixture".to_string(),
+            model_version: "1".to_string(),
+            pipeline_version: "1".to_string(),
+        }
     }
 }

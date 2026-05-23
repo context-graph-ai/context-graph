@@ -18,7 +18,7 @@ use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const CONSUMER_SPACE: &str = "consumer_trait_text_768";
 const TOKEN_EMBEDDING_TENSOR: &str = "model.embed_tokens.weight";
 const Q_PROJ_TENSOR: &str = "model.layers.0.self_attn.q_proj.weight";
@@ -356,133 +356,6 @@ fn stage_wrong_identity_17_tensor_embeddinggemma_cache(cache_dir: &Path) -> Path
         })
         .collect::<Vec<_>>();
     let model_bytes = safetensors::tensor::serialize(tensor_views, None).expect("safetensors");
-    std::fs::write(model_dir.join("model.safetensors"), model_bytes).expect("model");
-    write_tokenizer_and_revision(&model_dir, b"metadata-rev");
-    std::fs::write(
-        model_dir.join("config.json"),
-        serde_json::json!({
-            "model_type": "embeddinggemma",
-            "architectures": ["EmbeddingGemmaTextModel"],
-            "hidden_size": 4,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 1,
-            "intermediate_size": 8,
-            "projection_dim": 768,
-            "projection_intermediate_size": 8,
-            "matryoshka_dimensions": [768, 512, 256, 128],
-            "required_tensors": required_graph_tensors(),
-        })
-        .to_string(),
-    )
-    .expect("config");
-    model_dir
-}
-
-fn stage_local_embeddinggemma_cache(cache_dir: &Path) -> PathBuf {
-    let model_dir = cache_dir.join("embeddinggemma-300m");
-    std::fs::create_dir_all(&model_dir).expect("model dir");
-    let seed = uuid::Uuid::now_v7().as_u128();
-    let token_embedding = seeded_values(seed, 16, 1.0);
-    let q_proj = seeded_values(seed.rotate_left(1), 4 * 4, 0.2);
-    let k_proj = seeded_values(seed.rotate_left(2), 4 * 4, 0.2);
-    let v_proj = seeded_values(seed.rotate_left(3), 4 * 4, 0.2);
-    let o_proj = seeded_values(seed.rotate_left(4), 4 * 4, 0.2);
-    let q_norm = seeded_values(seed.rotate_left(5), 4, 0.05);
-    let k_norm = seeded_values(seed.rotate_left(6), 4, 0.05);
-    let input_layernorm = seeded_values(seed.rotate_left(7), 4, 0.05);
-    let pre_feedforward_layernorm = seeded_values(seed.rotate_left(8), 4, 0.05);
-    let post_feedforward_layernorm = seeded_values(seed.rotate_left(9), 4, 0.05);
-    let post_attention_layernorm = seeded_values(seed.rotate_left(10), 4, 0.05);
-    let gate_proj = seeded_values(seed.rotate_left(11), 4 * 8, 0.15);
-    let up_proj = seeded_values(seed.rotate_left(12), 4 * 8, 0.15);
-    let down_proj = seeded_values(seed.rotate_left(13), 8 * 4, 0.15);
-    let final_norm = seeded_values(seed.rotate_left(14), 4, 0.5);
-    let text_projection_up = seeded_values(seed.rotate_left(15), 4 * 8, 0.2);
-    let text_projection_down = seeded_values(seed.reverse_bits(), 8 * 768, 0.2);
-
-    let token_embedding_bytes = tensor_bytes(&token_embedding);
-    let q_proj_bytes = tensor_bytes(&q_proj);
-    let k_proj_bytes = tensor_bytes(&k_proj);
-    let v_proj_bytes = tensor_bytes(&v_proj);
-    let o_proj_bytes = tensor_bytes(&o_proj);
-    let q_norm_bytes = tensor_bytes(&q_norm);
-    let k_norm_bytes = tensor_bytes(&k_norm);
-    let input_layernorm_bytes = tensor_bytes(&input_layernorm);
-    let pre_feedforward_layernorm_bytes = tensor_bytes(&pre_feedforward_layernorm);
-    let post_feedforward_layernorm_bytes = tensor_bytes(&post_feedforward_layernorm);
-    let post_attention_layernorm_bytes = tensor_bytes(&post_attention_layernorm);
-    let gate_proj_bytes = tensor_bytes(&gate_proj);
-    let up_proj_bytes = tensor_bytes(&up_proj);
-    let down_proj_bytes = tensor_bytes(&down_proj);
-    let final_norm_bytes = tensor_bytes(&final_norm);
-    let text_projection_up_bytes = tensor_bytes(&text_projection_up);
-    let text_projection_down_bytes = tensor_bytes(&text_projection_down);
-
-    let token_tensor =
-        TensorView::new(Dtype::F32, vec![4, 4], &token_embedding_bytes).expect("token tensor");
-    let q_tensor = TensorView::new(Dtype::F32, vec![4, 4], &q_proj_bytes).expect("q tensor");
-    let k_tensor = TensorView::new(Dtype::F32, vec![4, 4], &k_proj_bytes).expect("k tensor");
-    let v_tensor = TensorView::new(Dtype::F32, vec![4, 4], &v_proj_bytes).expect("v tensor");
-    let o_tensor = TensorView::new(Dtype::F32, vec![4, 4], &o_proj_bytes).expect("o tensor");
-    let q_norm_tensor = TensorView::new(Dtype::F32, vec![4], &q_norm_bytes).expect("q norm tensor");
-    let k_norm_tensor = TensorView::new(Dtype::F32, vec![4], &k_norm_bytes).expect("k norm tensor");
-    let input_layernorm_tensor =
-        TensorView::new(Dtype::F32, vec![4], &input_layernorm_bytes).expect("input norm tensor");
-    let pre_feedforward_layernorm_tensor =
-        TensorView::new(Dtype::F32, vec![4], &pre_feedforward_layernorm_bytes)
-            .expect("pre feedforward norm tensor");
-    let post_feedforward_layernorm_tensor =
-        TensorView::new(Dtype::F32, vec![4], &post_feedforward_layernorm_bytes)
-            .expect("post feedforward norm tensor");
-    let post_attention_layernorm_tensor =
-        TensorView::new(Dtype::F32, vec![4], &post_attention_layernorm_bytes)
-            .expect("post attention norm tensor");
-    let gate_tensor =
-        TensorView::new(Dtype::F32, vec![4, 8], &gate_proj_bytes).expect("gate tensor");
-    let up_tensor = TensorView::new(Dtype::F32, vec![4, 8], &up_proj_bytes).expect("up tensor");
-    let down_tensor =
-        TensorView::new(Dtype::F32, vec![8, 4], &down_proj_bytes).expect("down tensor");
-    let final_norm_tensor =
-        TensorView::new(Dtype::F32, vec![4], &final_norm_bytes).expect("norm tensor");
-    let text_projection_up_tensor =
-        TensorView::new(Dtype::F32, vec![4, 8], &text_projection_up_bytes)
-            .expect("projection up tensor");
-    let text_projection_down_tensor =
-        TensorView::new(Dtype::F32, vec![8, 768], &text_projection_down_bytes)
-            .expect("projection down tensor");
-
-    let model_bytes = safetensors::tensor::serialize(
-        [
-            (TOKEN_EMBEDDING_TENSOR, token_tensor),
-            (Q_PROJ_TENSOR, q_tensor),
-            (K_PROJ_TENSOR, k_tensor),
-            (V_PROJ_TENSOR, v_tensor),
-            (O_PROJ_TENSOR, o_tensor),
-            (Q_NORM_TENSOR, q_norm_tensor),
-            (K_NORM_TENSOR, k_norm_tensor),
-            (INPUT_LAYERNORM_TENSOR, input_layernorm_tensor),
-            (
-                PRE_FEEDFORWARD_LAYERNORM_TENSOR,
-                pre_feedforward_layernorm_tensor,
-            ),
-            (
-                POST_FEEDFORWARD_LAYERNORM_TENSOR,
-                post_feedforward_layernorm_tensor,
-            ),
-            (
-                POST_ATTENTION_LAYERNORM_TENSOR,
-                post_attention_layernorm_tensor,
-            ),
-            (GATE_PROJ_TENSOR, gate_tensor),
-            (UP_PROJ_TENSOR, up_tensor),
-            (DOWN_PROJ_TENSOR, down_tensor),
-            (FINAL_NORM_TENSOR, final_norm_tensor),
-            (TEXT_PROJECTION_UP_TENSOR, text_projection_up_tensor),
-            (TEXT_PROJECTION_DOWN_TENSOR, text_projection_down_tensor),
-        ],
-        None,
-    )
-    .expect("safetensors");
     std::fs::write(model_dir.join("model.safetensors"), model_bytes).expect("model");
     write_tokenizer_and_revision(&model_dir, b"metadata-rev");
     std::fs::write(
@@ -945,13 +818,8 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
         );
 
     let bundled_dir = tempfile::tempdir().expect("bundled dir");
-    let bundled_model = stage_local_embeddinggemma_cache(bundled_dir.path());
     let bundled_config = StoreConfig {
         db_path: bundled_dir.path().join("bundled.db"),
-        default_text_embedder: Some(bundled_config(
-            bundled_model,
-            bundled_dir.path().to_path_buf(),
-        )),
         ..Default::default()
     };
     let (bundled, _bundled_error, bundled_debug) =
@@ -1024,7 +892,6 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
         ("pipeline_version".to_string(), "string"),
         ("system".to_string(), "string"),
     ];
-
     assert!(
         one_tensor_projection.is_none()
             && corrupt_model_error(&one_tensor_error)

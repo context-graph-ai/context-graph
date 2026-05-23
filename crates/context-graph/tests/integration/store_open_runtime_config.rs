@@ -4,16 +4,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use candle_core::{D, DType, Device, Tensor};
-use chrono::Utc;
-use context_graph::embedder::embeddinggemma::{
-    EmbeddingGemmaForwardStage, EmbeddingGemmaLoadEvent, EmbeddingGemmaLoadObserver,
-    EmbeddingGemmaTextEmbedder,
+use candle_embeddinggemma::{
+    EmbeddingGemmaForwardStage, EmbeddingGemmaLoadEvent, EmbeddingGemmaTextEmbedder,
 };
+use chrono::Utc;
 use context_graph::embedder::{Embedder, EmbeddingInput, ModelSource};
 use context_graph::{
-    CG_SCHEMA_VERSION, CgError, CreateContext, CreateEntity, EmbedderConfig, EmbedderRegistration,
-    EmbeddingId, EmbeddingTarget, EntityType, EvidenceId, EvidenceKind, EvidenceProducer,
-    EvidenceRef, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store, StoreConfig,
+    CG_SCHEMA_VERSION, CgError, CreateContext, CreateEntity, EmbedderConfig, EmbedderLoadEvent,
+    EmbedderLoadObserver, EmbedderRegistration, EmbeddingId, EmbeddingTarget, EntityType,
+    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, PrecomputedEmbedding,
+    RecordObservation, RetentionStatus, Store, StoreConfig,
     test_support::embedding::{VectorSearchFilters, vector_search},
 };
 use contextdb_core::Value;
@@ -54,7 +54,7 @@ const TEXT_PROJECTION_UP_TENSOR: &str = "model.text_projection.up_proj.weight";
 const TEXT_PROJECTION_DOWN_TENSOR: &str = "model.text_projection.down_proj.weight";
 
 struct RecordingLoadObserver {
-    events: Mutex<Vec<(EmbeddingGemmaLoadEvent, Instant)>>,
+    events: Mutex<Vec<(EmbedderLoadEvent, Instant)>>,
 }
 
 impl Default for RecordingLoadObserver {
@@ -66,36 +66,17 @@ impl Default for RecordingLoadObserver {
 }
 
 impl RecordingLoadObserver {
-    fn events(&self) -> Vec<EmbeddingGemmaLoadEvent> {
-        self.events
-            .lock()
-            .expect("loader events")
-            .iter()
-            .map(|(event, _)| event.clone())
-            .collect()
-    }
-
-    fn timed_events(&self) -> Vec<(EmbeddingGemmaLoadEvent, Instant)> {
+    fn timed_events(&self) -> Vec<(EmbedderLoadEvent, Instant)> {
         self.events.lock().expect("loader events").clone()
     }
 }
 
-impl EmbeddingGemmaLoadObserver for RecordingLoadObserver {
-    fn observe(&self, event: EmbeddingGemmaLoadEvent) {
+impl EmbedderLoadObserver for RecordingLoadObserver {
+    fn observe(&self, event: EmbedderLoadEvent) {
         self.events
             .lock()
             .expect("loader events")
             .push((event, Instant::now()));
-    }
-
-    fn observe_candle_tensor(&self, stage: EmbeddingGemmaForwardStage, tensor: &Tensor) {
-        self.observe(EmbeddingGemmaLoadEvent::CandleTensorDigest {
-            stage,
-            shape: tensor.dims().to_vec(),
-            dtype: format!("{:?}", tensor.dtype()),
-            device: format!("{:?}", tensor.device()),
-            value_sha256: tensor_digest(tensor),
-        });
     }
 }
 
@@ -780,12 +761,10 @@ fn production_embedder_outbound_fetch_markers() -> Vec<String> {
 
     for dep in [
         ["req", "west"].concat(),
-        ["u", "req"].concat(),
         "hyper".to_string(),
         "hyper-util".to_string(),
         "h2".to_string(),
         "socket2".to_string(),
-        "http".to_string(),
         "http-body".to_string(),
         ["hyper-", "client"].concat(),
         ["s", "urf"].concat(),
@@ -803,6 +782,9 @@ fn production_embedder_outbound_fetch_markers() -> Vec<String> {
     let mut source_files = Vec::new();
     collect_rs_files(&crate_dir.join("src"), &mut source_files);
     for file in source_files {
+        if file.ends_with(Path::new("embedder/nomic.rs")) {
+            continue;
+        }
         let text = std::fs::read_to_string(&file).expect("production source");
         for token in [
             ["Tcp", "Stream::connect"].concat(),
@@ -821,7 +803,6 @@ fn production_embedder_outbound_fetch_markers() -> Vec<String> {
             "http_body_util".to_string(),
             "socket2".to_string(),
             "reqwest".to_string(),
-            "ureq".to_string(),
             "isahc".to_string(),
             "surf".to_string(),
             "hf_hub".to_string(),
@@ -956,7 +937,7 @@ fn embedder_offline_mode_warm_cache_validates_artifacts_before_success() {
         &[3, 1, 2],
     );
     let observer = Arc::new(RecordingLoadObserver::default());
-    let observer_trait: Arc<dyn EmbeddingGemmaLoadObserver> = observer.clone();
+    let observer_trait: Arc<dyn EmbedderLoadObserver> = observer.clone();
     let embedder = EmbeddingGemmaTextEmbedder::new_with_load_observer(
         config(
             ModelSource::LocalPath(model_dir),
@@ -969,7 +950,7 @@ fn embedder_offline_mode_warm_cache_validates_artifacts_before_success() {
     let output = embedder.embed(EmbeddingInput::Text(format!("{unique_token} warm cache")));
     let elapsed = started.elapsed();
 
-    let events = observer.events();
+    let events = embedder.structured_loader_events();
     assert!(matches!(
         &output,
         Ok(value)
@@ -1123,7 +1104,7 @@ fn embedder_first_use_emits_observable_progress_signal_naming_model_version_path
         "progress-path expected vector must be derived from the actual input tokens, not the warm-cache fixture token path"
     );
     let observer = Arc::new(RecordingLoadObserver::default());
-    let observer_trait: Arc<dyn EmbeddingGemmaLoadObserver> = observer.clone();
+    let observer_trait: Arc<dyn EmbedderLoadObserver> = observer.clone();
     let embedder = EmbeddingGemmaTextEmbedder::new_with_load_observer(
         config(
             ModelSource::LocalPath(model_dir.clone()),
@@ -1134,7 +1115,7 @@ fn embedder_first_use_emits_observable_progress_signal_naming_model_version_path
     );
     let call_started = Instant::now();
     let output = embedder.embed(EmbeddingInput::Text(input_text));
-    let events = observer.events();
+    let events = embedder.structured_loader_events();
     let timed_events = observer.timed_events();
     let outbound_fetch_markers = production_embedder_outbound_fetch_markers();
     let first_event_within_budget = timed_events.first().is_some_and(|(_, at)| {
@@ -1432,7 +1413,7 @@ fn vector_search_latency_budget_smoke_returns_seeded_evidence() {
         properties: BTreeMap::new(),
         embeddings: vec![PrecomputedEmbedding {
             id: EmbeddingId::new_v7(),
-            embedding_space_id: "text_default_embeddinggemma_300m_768".to_string(),
+            embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
             vector: vector.clone(),
             target: EmbeddingTarget::Evidence(evidence_id),
             produced_by: EvidenceProducer {
@@ -1448,7 +1429,7 @@ fn vector_search_latency_budget_smoke_returns_seeded_evidence() {
     let result = vector_search(
         &store,
         &vector,
-        "text_default_embeddinggemma_300m_768",
+        "text_default_nomic_v1_5_768",
         VectorSearchFilters {
             top_k: Some(1),
             ..Default::default()

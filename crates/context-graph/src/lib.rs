@@ -11,6 +11,7 @@ pub mod types;
 pub use contextdb_core::TxId;
 pub use embedder::{
     Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput, ModelSource,
+    load_observer::{EmbedderLoadEvent, EmbedderLoadObserver},
 };
 pub use error::CgError;
 pub use messaging::{MessageBody, MismatchKind, OverrideFailureReason};

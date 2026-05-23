@@ -28,7 +28,7 @@ use contextdb_core::{ColumnType, Error as EngineError, TxId, Value};
 use contextdb_engine::{Database, plugin::DatabasePlugin};
 
 use crate::Result;
-use crate::embedder::embeddinggemma::EmbeddingGemmaTextEmbedder;
+use crate::embedder::nomic::NomicTextEmbedder;
 use crate::embedding_space::default_text_embedding_space;
 use crate::error::CgError;
 use crate::schema::{INDEXES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES};
@@ -154,7 +154,7 @@ impl Store {
                     == default_text_embedding_space().embedding_space_id
             })
         {
-            let embedder = Arc::new(EmbeddingGemmaTextEmbedder::new(config));
+            let embedder = Arc::new(NomicTextEmbedder::new(config));
             registrations.push(EmbedderRegistration {
                 space: embedder.embedding_space(),
                 embedder,

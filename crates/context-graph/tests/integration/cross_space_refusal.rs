@@ -11,7 +11,7 @@ use context_graph::{
     EvidenceRef, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store, StoreConfig,
 };
 
-const TEXT_SPACE: &str = "text_default_embeddinggemma_300m_768";
+const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const IMAGE_SPACE: &str = "image_clip_v1_4";
 
 fn producer() -> EvidenceProducer {
@@ -176,7 +176,7 @@ fn cross_space_cosine_refused_at_query_surface_when_dimensions_differ() {
             query_dim,
             candidate_dim
         }) if query_space == "vision_clip_512"
-            && candidate_space == "text_default_embeddinggemma_300m_768"
+            && candidate_space == "text_default_nomic_v1_5_768"
             && query_dim == Some(512)
             && candidate_dim == Some(768)
     ));

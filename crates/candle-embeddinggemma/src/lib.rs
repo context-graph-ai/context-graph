@@ -1,8 +1,7 @@
 mod embeddinggemma;
 
 pub use embeddinggemma::{
-    EmbeddingGemmaForwardStage, EmbeddingGemmaLoadEvent, EmbeddingGemmaLoadObserver,
-    EmbeddingGemmaTextEmbedder, LazyHandle,
+    EmbeddingGemmaForwardStage, EmbeddingGemmaLoadEvent, EmbeddingGemmaTextEmbedder, LazyHandle,
 };
 
 pub fn default_embeddinggemma_offline_config() -> context_graph::EmbedderConfig {
