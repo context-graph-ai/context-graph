@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/context-graph"]
+members = ["crates/context-graph", "crates/candle-embeddinggemma"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,3 +28,4 @@ sha2 = "0.10.9"
 tempfile = "3.23.0"
 tokenizers = "0.23.1"
 trybuild = "1.0.112"
+serde_yml = "0.0.12"

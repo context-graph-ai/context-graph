@@ -12,6 +12,7 @@ mod impact_analysis;
 mod invalidation_lifecycle;
 #[cfg(context_graph_internal_test_support)]
 mod local_entity_face_match_override;
+mod nomic_loads;
 mod producer_lineage_audit_render;
 mod school_gate_entity_alert_render;
 #[cfg(context_graph_internal_test_support)]

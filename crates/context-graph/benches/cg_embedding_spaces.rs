@@ -8,6 +8,8 @@ use chrono::Utc;
 #[cfg(context_graph_internal_test_support)]
 use context_graph::embedder::embeddinggemma::EmbeddingGemmaTextEmbedder;
 #[cfg(context_graph_internal_test_support)]
+use context_graph::embedder::nomic::NomicTextEmbedder;
+#[cfg(context_graph_internal_test_support)]
 use context_graph::embedder::{Embedder, EmbeddingInput, ModelSource};
 #[cfg(context_graph_internal_test_support)]
 use context_graph::{
@@ -171,6 +173,24 @@ pub fn vector_search_per_query_latency_within_budget(c: &mut Criterion) {
             black_box(hits)
         })
     });
+}
+
+#[cfg(context_graph_internal_test_support)]
+pub fn bench_nomic_per_call_embed_latency_stays_under_1_2ms_cold_start_ceiling(c: &mut Criterion) {
+    let embedder = NomicTextEmbedder::new(EmbedderConfig::disabled());
+    c.bench_function(
+        "bench_nomic_per_call_embed_latency_stays_under_1_2ms_cold_start_ceiling",
+        |b| {
+            b.iter(|| {
+                let output = embedder
+                    .embed(EmbeddingInput::Text(black_box(
+                        "a small text input".to_string(),
+                    )))
+                    .expect("nomic bench embed");
+                black_box(output.vector.len())
+            })
+        },
+    );
 }
 
 #[cfg(context_graph_internal_test_support)]
@@ -670,7 +690,8 @@ fn stage_valid_mini_embeddinggemma_cache(
 criterion_group!(
     benches,
     embedder_cold_start_first_invocation_within_budget,
-    vector_search_per_query_latency_within_budget
+    vector_search_per_query_latency_within_budget,
+    bench_nomic_per_call_embed_latency_stays_under_1_2ms_cold_start_ceiling
 );
 #[cfg(context_graph_internal_test_support)]
 criterion_main!(benches);

@@ -1,0 +1,4 @@
+pub trait Embedder
+pub struct EmbedderConfig
+pub struct EmbedderRegistration
+pub const TEXT_DEFAULT_ID: text_default_embeddinggemma_300m_768

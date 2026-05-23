@@ -1,5 +1,7 @@
 pub mod embeddinggemma;
+pub mod load_observer;
 pub mod mock;
+pub mod nomic;
 
 use std::path::PathBuf;
 use std::sync::Arc;
