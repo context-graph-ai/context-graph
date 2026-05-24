@@ -24,7 +24,7 @@ use crate::{
 const NOMIC_TEXT_DEFAULT_ID: &str = "text_default_nomic_v1_5_768";
 const NOMIC_MODEL_ID: &str = "nomic-embed-text-v1.5";
 const NOMIC_DEFAULT_DIMENSION: usize = 768;
-const NOMIC_MODEL_BYTES: u64 = 547_112_608;
+const NOMIC_MODEL_DOWNLOAD_LIMIT_BYTES: u64 = 600 * 1024 * 1024;
 
 const NOMIC_REQUIRED_TENSORS: &[(&str, &[usize])] = &[
     ("embeddings.word_embeddings.weight", &[30_528, 768]),
@@ -154,18 +154,26 @@ impl NomicTextEmbedder {
             && cache_file_present(&tokenizer_path)?
             && cache_file_present(&config_path)?;
         if all_present {
-            cache_files_parse(
+            match cache_files_parse(
                 &model_path,
                 &tokenizer_path,
                 &config_path,
                 &revision_path,
                 self.config.pinned_revision.as_deref(),
-            )?;
-            self.observe(EmbedderLoadEvent::CacheHit {
-                model_id: NOMIC_MODEL_ID.to_string(),
-                destination: model_dir.to_path_buf(),
-            });
-            return Ok(());
+            ) {
+                Ok(()) => {
+                    self.observe(EmbedderLoadEvent::CacheHit {
+                        model_id: NOMIC_MODEL_ID.to_string(),
+                        destination: model_dir.to_path_buf(),
+                    });
+                    return Ok(());
+                }
+                Err(CgError::EmbedderModelRevisionMismatch { .. })
+                    if matches!(self.config.source, ModelSource::HuggingFace { .. })
+                        && !self.config.offline
+                        && !self.config.network_policy.contains("offline") => {}
+                Err(err) => return Err(err),
+            }
         }
         if !matches!(self.config.source, ModelSource::HuggingFace { .. }) {
             return Err(CgError::EmbedderModelNotAvailable {
@@ -183,7 +191,7 @@ impl NomicTextEmbedder {
         let started = Instant::now();
         self.observe(EmbedderLoadEvent::FetchStarted {
             model_id: NOMIC_MODEL_ID.to_string(),
-            byte_size: Some(NOMIC_MODEL_BYTES),
+            byte_size: None,
             destination: model_dir.to_path_buf(),
         });
         eprintln!(
@@ -207,7 +215,7 @@ impl NomicTextEmbedder {
             revision,
             "model.safetensors",
             &model_path,
-            NOMIC_MODEL_BYTES + 16_777_216,
+            NOMIC_MODEL_DOWNLOAD_LIMIT_BYTES,
         )?;
         download_hf_file(
             repo,
@@ -231,9 +239,12 @@ impl NomicTextEmbedder {
             self.config.pinned_revision.as_deref(),
         )?;
         let elapsed = started.elapsed();
+        let model_byte_size = file_system::metadata(&model_path)
+            .map(|metadata| metadata.len())
+            .ok();
         self.observe(EmbedderLoadEvent::FetchCompleted {
             model_id: NOMIC_MODEL_ID.to_string(),
-            byte_size: Some(NOMIC_MODEL_BYTES),
+            byte_size: model_byte_size,
             destination: model_dir.to_path_buf(),
             elapsed,
         });
@@ -499,6 +510,14 @@ fn download_hf_file(
         source: format!("HuggingFace({repo})"),
         path: destination.display().to_string(),
     })?;
+    if destination.exists() {
+        file_system::remove_file(destination).map_err(|err| {
+            CgError::Engine(format!(
+                "nomic artifact replace failed at {}: {err}",
+                destination.display()
+            ))
+        })?;
+    }
     file_system::rename(&tmp, destination).map_err(|err| {
         CgError::Engine(format!(
             "nomic artifact move failed {} -> {}: {err}",

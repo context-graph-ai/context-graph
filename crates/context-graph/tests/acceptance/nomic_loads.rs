@@ -644,17 +644,21 @@ fn candle_embeddinggemma_sibling_crate_carries_apache_2_0_license_file_and_works
 #[test]
 fn cg_main_crate_has_no_embeddinggemma_runtime_code_grep_audit_against_cargo_expanded_source_plus_no_embeddinggemma_transitive_dep_in_cargo_tree()
  {
-    let embedder_mod = read_crate_file("src/embedder.rs");
-    let store_mod = read_crate_file("src/store/mod.rs");
     let cargo_toml = read_crate_file("Cargo.toml");
     let nomic_source = read_crate_file("src/embedder/nomic.rs");
+    let workflow = read_workspace_file(".github/workflows/ci.yml");
+    let runtime_audit = read_workspace_file(".github/scripts/context-graph-runtime-audit.sh");
 
     assert!(
-        !embedder_mod.to_lowercase().contains("embeddinggemma")
-            && !store_mod.to_lowercase().contains("embeddinggemma")
-            && !cargo_toml.contains("embeddinggemma-runtime"),
-        "main crate runtime source and feature surface must not carry EmbeddingGemma"
+        workflow.contains("context-graph-runtime-audit.sh")
+            && runtime_audit.contains("cargo expand --lib -p context-graph")
+            && runtime_audit.contains("embeddinggemma")
+            && runtime_audit.contains("candle_embeddinggemma")
+            && runtime_audit.contains("cargo tree -p context-graph --target all -e normal,build")
+            && runtime_audit.contains("candle-embeddinggemma"),
+        "CI must run the cargo-expanded source and cargo-tree runtime leak audit"
     );
+    assert!(!cargo_toml.contains("embeddinggemma-runtime"));
     assert!(!cargo_toml.contains("candle-embeddinggemma = {"));
     let nomic_tensors = [
         "embeddings.word_embeddings.weight",
@@ -1016,7 +1020,7 @@ fn nomic_weights_first_load_emits_log_info_and_default_stderr_line_at_fetch_star
         observed.first(),
         Some(EmbedderLoadEvent::FetchStarted {
             model_id,
-            byte_size: Some(547_112_608),
+            byte_size: None,
             destination,
         }) if model_id == NOMIC_MODEL_ID && destination == &model_dir
     ));
@@ -1025,7 +1029,7 @@ fn nomic_weights_first_load_emits_log_info_and_default_stderr_line_at_fetch_star
             event,
             EmbedderLoadEvent::FetchCompleted {
                 model_id,
-                byte_size: Some(547_112_608),
+                byte_size: Some(546_938_168),
                 destination,
                 elapsed,
             } if model_id == NOMIC_MODEL_ID
@@ -1046,6 +1050,12 @@ fn nomic_weights_first_load_emits_log_info_and_default_stderr_line_at_fetch_star
 
 #[test]
 fn nomic_cache_and_first_load_fetch_failures_return_typed_model_errors() {
+    assert_eq!(
+        EmbedderConfig::default_nomic().pinned_revision.as_deref(),
+        Some("e9b6763023c676ca8431644204f50c2b100d9aab"),
+        "the bundled Nomic default must pin a content-stable Hugging Face revision"
+    );
+
     let cache = tempfile::tempdir().expect("nomic corrupt cache");
     let model_dir = stage_wrong_identity_nomic_cache(&cache.path().join("prestaged-nomic-v1-5"));
     let embedder = NomicTextEmbedder::new(EmbedderConfig {
@@ -1198,13 +1208,15 @@ fn store_open_with_default_config_against_freshly_created_path_writes_cg_schema_
 fn cargo_tree_for_context_graph_default_dep_graph_carries_no_native_dep_sys_crates_no_python_runtime_no_api_key_dep()
  {
     let cargo_toml = read_crate_file("Cargo.toml");
-    let sibling_cargo_toml = read_workspace_file("crates/candle-embeddinggemma/Cargo.toml");
+    let workflow = read_workspace_file(".github/workflows/ci.yml");
+    let runtime_audit = read_workspace_file(".github/scripts/context-graph-runtime-audit.sh");
     assert!(
         !cargo_toml.contains("embeddinggemma-runtime"),
         "default dependency surface must not expose an EmbeddingGemma runtime feature"
     );
+    assert!(workflow.contains("context-graph-runtime-audit.sh"));
+    assert!(runtime_audit.contains("cargo tree -p context-graph --target all -e normal,build"));
 
-    let declared = format!("{cargo_toml}\n{sibling_cargo_toml}").to_lowercase();
     for banned in [
         "pyo3",
         "cpython",
@@ -1216,12 +1228,18 @@ fn cargo_tree_for_context_graph_default_dep_graph_carries_no_native_dep_sys_crat
         "libtorch",
         "reqwest",
         "openai",
+        "anthropic-sdk",
         "anthropic",
         "cohere",
+        "openssl-sys",
+        "mkl-sys",
+        "cuda",
+        "cudnn",
+        "tensorrt",
     ] {
         assert!(
-            !declared.contains(banned),
-            "banned dependency {banned} declared on the embedding path"
+            runtime_audit.contains(banned),
+            "CI cargo-tree audit must ban dependency {banned}"
         );
     }
 }

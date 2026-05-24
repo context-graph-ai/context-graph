@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{EmbeddingSpace, EmbeddingSpaceDecl, EvidenceKind, EvidenceProducer, Result};
 
+const NOMIC_DEFAULT_REVISION: &str = "e9b6763023c676ca8431644204f50c2b100d9aab";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EmbeddingInput {
     Text(String),
@@ -74,7 +76,7 @@ impl EmbedderConfig {
             },
             offline: false,
             cache_dir: None,
-            pinned_revision: None,
+            pinned_revision: Some(NOMIC_DEFAULT_REVISION.to_string()),
             network_policy: "allow-download".to_string(),
         }
     }
