@@ -1,0 +1,9 @@
+Model id: embeddinggemma-300m
+Model card: https://huggingface.co/google/embeddinggemma-300m
+License: https://ai.google.dev/gemma/terms
+Target cache path: {cache_root}/embeddinggemma-300m
+Artifacts:
+- model.safetensors sha256=cbf5a78393b6a033e0b8a63a57549964f7ed5c6fbeb4ba0694214f36123f2fd2
+- tokenizer.json sha256=6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e
+- config.json sha256=8f863f76e2d9c710cc833dc92efa898c9adfd41031c786507cc6b0e49c2e3e68
+- REVISION sha256=240bf6458e37b64ab66077a6e6900fdb4089c848f8372fa64b8dc490d4ef81e3

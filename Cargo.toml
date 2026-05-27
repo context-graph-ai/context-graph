@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/context-graph", "crates/candle-embeddinggemma"]
+members = [
+    "crates/context-graph",
+    "crates/candle-embeddinggemma",
+    "crates/cg-catalog",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,6 +32,13 @@ safetensors = "0.7.0"
 sha2 = "0.10.9"
 tempfile = "3.23.0"
 tokenizers = "0.23.1"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3.22", features = ["json"] }
 trybuild = "1.0.112"
-serde_yml = "0.0.12"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+fs4 = "0.13.1"
+indicatif = "0.18.3"
+toml = "0.9.8"
+serde_yaml_ng = "0.10.0"
+tiny_http = "0.12.0"
+which = "8.0.0"

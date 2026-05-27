@@ -1,0 +1,1573 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use context_graph::embedder::mock::MockEmbedder;
+use context_graph::embedder::nomic::NomicTextEmbedder;
+use context_graph::{
+    CG_SCHEMA_VERSION, CgError, Embedder, EmbedderConfig, EmbeddingInput, EvidenceKind, Store,
+    StoreConfig,
+};
+use contextdb_core::Value;
+use contextdb_engine::Database;
+use serde_yaml_ng::{Mapping, Value as YamlValue};
+
+const CARGO_AUDIT_ALIASES: &[&str] = &["deny", "expand"];
+const COMMAND_LOOKUP_ENV_KEYS: &[&str] = &["PATH", "BASH_ENV", "ENV", "SHELLOPTS", "IFS"];
+const AUDIT_TOOL_PATH_MARKERS: &[&str] = &[
+    ".cargo",
+    ".cargo/bin",
+    ".local/bin",
+    "CARGO_HOME",
+    "/usr/local",
+    "/usr/local/bin",
+    "/usr",
+    "/usr/bin",
+    "/bin",
+    "RUNNER_TOOL_CACHE",
+];
+const AUDIT_CAPTURE_PRODUCER_LINES: &[&str] = &[
+    "cargo expand --lib -p context-graph | tee \"$RUNNER_TEMP/context-graph-expanded.rs\"",
+    "cargo tree -p context-graph -e normal,build | tee \"$RUNNER_TEMP/context-graph-tree.txt\"",
+    "cargo tree -p context-graph --edges normal,build | tee \"$RUNNER_TEMP/context-graph-tree.txt\"",
+];
+const AUDIT_CAPTURE_PATHS: &[&str] = &[
+    "$RUNNER_TEMP/context-graph-expanded.rs",
+    "$RUNNER_TEMP/context-graph-tree.txt",
+];
+const COMMAND_LOOKUP_SAFE_ACTIONS: &[&str] = &[
+    "actions/checkout@v4",
+    "actions/cache@v4",
+    "dtolnay/rust-toolchain@stable",
+    "taiki-e/install-action@v2",
+];
+const OPAQUE_DELEGATION_COMMANDS: &[&str] = &[
+    "make", "gmake", "just", "npm", "npx", "pnpm", "yarn", "bun", "go", "gradle", "mvn", "bazel",
+    "cmake", "ninja", "tox",
+];
+const OPAQUE_CARGO_SUBCOMMANDS: &[&str] = &["run", "make", "xtask", "script"];
+const AUDIT_CARGO_SUBCOMMANDS: &[&str] = &["deny", "expand", "tree"];
+const OPAQUE_INTERPRETER_COMMANDS: &[&str] = &[
+    "awk",
+    "busybox",
+    "cmd",
+    "cmd.exe",
+    "dash",
+    "deno",
+    "fish",
+    "julia",
+    "lua",
+    "node",
+    "perl",
+    "php",
+    "powershell",
+    "pwsh",
+    "ruby",
+    "sed",
+    "wscript",
+    "cscript",
+    "zsh",
+];
+const SAFE_GITHUB_HOSTED_RUNNERS: &[&str] = &["ubuntu-latest", "macos-latest", "windows-latest"];
+
+fn crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn workspace_root() -> PathBuf {
+    crate_root()
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn read_workspace_file(path: &str) -> String {
+    std::fs::read_to_string(workspace_root().join(path)).expect("workspace file readable")
+}
+
+fn read_workflow_yaml() -> YamlValue {
+    serde_yaml_ng::from_str(&read_workspace_file(".github/workflows/ci.yml"))
+        .expect("workflow yaml")
+}
+
+fn assert_no_cargo_audit_aliases() {
+    let aliases = cargo_config_audit_aliases();
+    assert!(
+        aliases.is_empty(),
+        "cargo config aliases can shadow cargo-deny/cargo-expand while CI text stays exact; remove audit-tool aliases: {aliases:?}"
+    );
+}
+
+fn cargo_config_audit_aliases() -> Vec<String> {
+    [".cargo/config.toml", ".cargo/config"]
+        .into_iter()
+        .flat_map(|relative| {
+            let path = workspace_root().join(relative);
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                return Vec::new();
+            };
+            let mut in_alias_table = false;
+            let mut multiline_string = None;
+            contents
+                .lines()
+                .filter_map(|raw_line| {
+                    let line = strip_unquoted_toml_comment(raw_line, &mut multiline_string);
+                    let line = line.trim();
+                    if line.is_empty() {
+                        return None;
+                    }
+                    if line.starts_with('[') {
+                        in_alias_table = toml_table_name(line) == Some("alias".to_string());
+                        return None;
+                    }
+                    cargo_audit_alias_on_line(line, in_alias_table)
+                        .map(|alias| format!("{} defines cargo alias `{alias}`", path.display()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn cargo_audit_alias_on_line(line: &str, in_alias_table: bool) -> Option<&'static str> {
+    let (raw_key, value) = line.split_once('=')?;
+    let key_parts = toml_key_parts(raw_key);
+    CARGO_AUDIT_ALIASES.iter().copied().find(|alias| {
+        (in_alias_table && key_parts.as_slice() == [*alias])
+            || key_parts.as_slice() == ["alias", *alias]
+            || (key_parts.as_slice() == ["alias"] && toml_inline_table_mentions_key(value, alias))
+    })
+}
+
+fn toml_inline_table_mentions_key(value: &str, key: &str) -> bool {
+    value
+        .split([',', '{', '}'])
+        .filter_map(|entry| entry.split_once('='))
+        .any(|(raw_key, _)| toml_key_parts(raw_key).as_slice() == [key])
+}
+
+fn toml_table_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let inner = inner.strip_prefix('[').unwrap_or(inner);
+    let inner = inner.strip_suffix(']').unwrap_or(inner);
+    Some(toml_key_parts(inner).join("."))
+}
+
+fn toml_key_parts(key: &str) -> Vec<String> {
+    key.split('.')
+        .map(|part| toml_key_part(part.trim()))
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn toml_key_part(part: &str) -> String {
+    let stripped = part.trim_matches('"').trim_matches('\'');
+    decode_toml_key_escapes(stripped)
+}
+
+fn decode_toml_key_escapes(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut decoded = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '\\' {
+            decoded.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        if index + 1 >= chars.len() {
+            decoded.push('\\');
+            break;
+        }
+        match chars[index + 1] {
+            'u' if index + 5 < chars.len() => {
+                let hex: String = chars[index + 2..index + 6].iter().collect();
+                if let Ok(codepoint) = u32::from_str_radix(&hex, 16)
+                    && let Some(ch) = char::from_u32(codepoint)
+                {
+                    decoded.push(ch);
+                    index += 6;
+                    continue;
+                }
+                decoded.push('\\');
+                index += 1;
+            }
+            'U' if index + 9 < chars.len() => {
+                let hex: String = chars[index + 2..index + 10].iter().collect();
+                if let Ok(codepoint) = u32::from_str_radix(&hex, 16)
+                    && let Some(ch) = char::from_u32(codepoint)
+                {
+                    decoded.push(ch);
+                    index += 10;
+                    continue;
+                }
+                decoded.push('\\');
+                index += 1;
+            }
+            escaped => {
+                decoded.push(escaped);
+                index += 2;
+            }
+        }
+    }
+    decoded
+}
+
+#[derive(Clone, Copy)]
+enum TomlMultilineString {
+    Basic,
+    Literal,
+}
+
+impl TomlMultilineString {
+    fn delimiter(self) -> &'static str {
+        match self {
+            TomlMultilineString::Basic => "\"\"\"",
+            TomlMultilineString::Literal => "'''",
+        }
+    }
+}
+
+fn strip_unquoted_toml_comment(line: &str, multiline: &mut Option<TomlMultilineString>) -> String {
+    let mut code = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < line.len() {
+        if let Some(kind) = *multiline {
+            let delimiter = kind.delimiter();
+            let delimiter_closes = line[index..].starts_with(delimiter)
+                && (!matches!(kind, TomlMultilineString::Basic)
+                    || !toml_basic_delimiter_escaped(line, index));
+            if delimiter_closes {
+                *multiline = None;
+                index += delimiter.len();
+                continue;
+            }
+            let ch = line[index..].chars().next().expect("char boundary");
+            index += ch.len_utf8();
+            continue;
+        }
+        if !in_single && !in_double && line[index..].starts_with("\"\"\"") {
+            *multiline = Some(TomlMultilineString::Basic);
+            index += 3;
+            continue;
+        }
+        if !in_single && !in_double && line[index..].starts_with("'''") {
+            *multiline = Some(TomlMultilineString::Literal);
+            index += 3;
+            continue;
+        }
+        let ch = line[index..].chars().next().expect("char boundary");
+        if escaped {
+            code.push(ch);
+            escaped = false;
+            index += ch.len_utf8();
+            continue;
+        }
+        if in_double && ch == '\\' {
+            code.push(ch);
+            escaped = true;
+            index += ch.len_utf8();
+            continue;
+        }
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                code.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                code.push(ch);
+            }
+            '#' if !in_single && !in_double => {
+                break;
+            }
+            _ => {
+                code.push(ch);
+            }
+        }
+        index += ch.len_utf8();
+    }
+    code
+}
+
+fn toml_basic_delimiter_escaped(line: &str, delimiter_index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut cursor = delimiter_index;
+    while cursor > 0 {
+        let Some(previous) = line[..cursor].chars().next_back() else {
+            break;
+        };
+        if previous != '\\' {
+            break;
+        }
+        backslashes += 1;
+        cursor -= previous.len_utf8();
+    }
+    backslashes % 2 == 1
+}
+
+fn value_mapping_get<'a>(value: &'a YamlValue, key: &str) -> Option<&'a YamlValue> {
+    let key = YamlValue::String(key.to_string());
+    value.as_mapping()?.get(&key)
+}
+
+fn mapping_get<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a YamlValue> {
+    let key = YamlValue::String(key.to_string());
+    mapping.get(&key)
+}
+
+fn workflow_steps(yaml: &YamlValue) -> Vec<&Mapping> {
+    let jobs = value_mapping_get(yaml, "jobs")
+        .and_then(YamlValue::as_mapping)
+        .expect("workflow jobs map");
+    jobs.values()
+        .flat_map(|job| {
+            value_mapping_get(job, "steps")
+                .and_then(YamlValue::as_sequence)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(YamlValue::as_mapping)
+        .collect()
+}
+
+fn workflow_step_contexts(yaml: &YamlValue) -> Vec<(&Mapping, &Mapping)> {
+    let jobs = value_mapping_get(yaml, "jobs")
+        .and_then(YamlValue::as_mapping)
+        .expect("workflow jobs map");
+    let mut contexts = Vec::new();
+    for job_value in jobs.values() {
+        let Some(job) = job_value.as_mapping() else {
+            continue;
+        };
+        if let Some(steps) = value_mapping_get(job_value, "steps").and_then(YamlValue::as_sequence)
+        {
+            for step_value in steps {
+                if let Some(step) = step_value.as_mapping() {
+                    contexts.push((job, step));
+                }
+            }
+        }
+    }
+    contexts
+}
+
+fn workflow_job_steps(yaml: &YamlValue) -> Vec<(&Mapping, Vec<&Mapping>)> {
+    let jobs = value_mapping_get(yaml, "jobs")
+        .and_then(YamlValue::as_mapping)
+        .expect("workflow jobs map");
+    let mut job_steps = Vec::new();
+    for job_value in jobs.values() {
+        let Some(job) = job_value.as_mapping() else {
+            continue;
+        };
+        let steps = value_mapping_get(job_value, "steps")
+            .and_then(YamlValue::as_sequence)
+            .into_iter()
+            .flatten()
+            .filter_map(YamlValue::as_mapping)
+            .collect();
+        job_steps.push((job, steps));
+    }
+    job_steps
+}
+
+fn step_run(step: &Mapping) -> Option<&str> {
+    mapping_get(step, "run").and_then(YamlValue::as_str)
+}
+
+fn step_uses_can_mask_command_lookup(step: &Mapping) -> bool {
+    match step_uses(step) {
+        None => false,
+        Some("actions/checkout@v4") => checkout_inputs_can_shadow_workspace(step),
+        Some("taiki-e/install-action@v2") => {
+            !step_tool_set_equals(step, &["cargo-deny", "cargo-expand"])
+        }
+        Some("actions/cache@v4") => cache_inputs_can_shadow_workspace_or_command_lookup(step),
+        Some("Swatinem/rust-cache@v2") => rust_cache_inputs_can_shadow_command_lookup(step),
+        Some(uses) => !COMMAND_LOOKUP_SAFE_ACTIONS.contains(&uses),
+    }
+}
+
+fn checkout_inputs_can_shadow_workspace(step: &Mapping) -> bool {
+    step_with_fields(step).is_some_and(|with| !with.is_empty())
+}
+
+fn cache_inputs_can_shadow_workspace_or_command_lookup(step: &Mapping) -> bool {
+    let Some(path) = step_with_field(step, "path") else {
+        return true;
+    };
+    field_mentions_command_lookup_target(path) || !cache_path_is_model_cache_only(path)
+}
+
+fn rust_cache_inputs_can_shadow_command_lookup(step: &Mapping) -> bool {
+    let Some(with) = step_with_fields(step) else {
+        return true;
+    };
+    if !step_with_field(step, "cache-bin").is_some_and(yaml_explicit_false) {
+        return true;
+    }
+    with.iter().any(|(key, value)| {
+        let key = key.as_str().unwrap_or_default();
+        match key {
+            "cache-bin" => !yaml_explicit_false(value),
+            "cache-directories" => true,
+            _ => field_mentions_command_lookup_target(value),
+        }
+    })
+}
+
+fn cache_path_is_model_cache_only(value: &YamlValue) -> bool {
+    let mut lines = Vec::new();
+    collect_yaml_string_lines(value, &mut lines);
+    !lines.is_empty()
+        && lines.iter().all(|line| {
+            let normalized = line.replace('\\', "/");
+            allowed_model_cache_path(&normalized)
+                && !normalized.contains("github.workspace")
+                && !normalized.contains("GITHUB_WORKSPACE")
+        })
+}
+
+fn allowed_model_cache_path(path: &str) -> bool {
+    [
+        "~/.cache/cg/embedders",
+        "~/AppData/Local/cg/embedders",
+        "~/Library/Caches/cg/embedders",
+        "$HOME/.cache/cg/embedders",
+        "${HOME}/.cache/cg/embedders",
+        "$HOME/AppData/Local/cg/embedders",
+        "${HOME}/AppData/Local/cg/embedders",
+        "$HOME/Library/Caches/cg/embedders",
+        "${HOME}/Library/Caches/cg/embedders",
+        "$LOCALAPPDATA/cg/embedders",
+        "${LOCALAPPDATA}/cg/embedders",
+    ]
+    .iter()
+    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+fn collect_yaml_string_lines<'a>(value: &'a YamlValue, lines: &mut Vec<&'a str>) {
+    match value {
+        YamlValue::String(value) => {
+            lines.extend(value.lines().map(str::trim).filter(|line| !line.is_empty()));
+        }
+        YamlValue::Sequence(values) => values
+            .iter()
+            .for_each(|value| collect_yaml_string_lines(value, lines)),
+        YamlValue::Mapping(values) => values
+            .values()
+            .for_each(|value| collect_yaml_string_lines(value, lines)),
+        _ => {}
+    }
+}
+
+fn field_mentions_command_lookup_target(value: &YamlValue) -> bool {
+    AUDIT_TOOL_PATH_MARKERS
+        .iter()
+        .any(|marker| yaml_field_contains(value, marker))
+        || COMMAND_LOOKUP_ENV_KEYS
+            .iter()
+            .any(|key| yaml_field_contains(value, key))
+}
+
+fn yaml_explicit_false(value: &YamlValue) -> bool {
+    match value {
+        YamlValue::Bool(value) => !value,
+        YamlValue::String(value) => value.trim().eq_ignore_ascii_case("false"),
+        _ => false,
+    }
+}
+
+fn step_continue_on_error_can_mask_failures(step: &Mapping) -> bool {
+    mapping_get(step, "continue-on-error").is_some_and(|value| !yaml_explicit_false(value))
+}
+
+fn job_continue_on_error_can_mask_failures(job: &Mapping) -> bool {
+    mapping_get(job, "continue-on-error").is_some_and(|value| !yaml_explicit_false(value))
+}
+
+fn step_if_field_can_disable_guard(step: &Mapping) -> bool {
+    mapping_get(step, "if").is_some()
+}
+
+fn job_if_field_can_disable_guard(job: &Mapping) -> bool {
+    mapping_get(job, "if").is_some()
+}
+
+fn value_default_run_shell(value: &YamlValue) -> Option<&str> {
+    value_mapping_get(value, "defaults")
+        .and_then(YamlValue::as_mapping)
+        .and_then(|defaults| mapping_get(defaults, "run"))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|run| mapping_get(run, "shell"))
+        .and_then(YamlValue::as_str)
+}
+
+fn mapping_default_run_shell(mapping: &Mapping) -> Option<&str> {
+    mapping_get(mapping, "defaults")
+        .and_then(YamlValue::as_mapping)
+        .and_then(|defaults| mapping_get(defaults, "run"))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|run| mapping_get(run, "shell"))
+        .and_then(YamlValue::as_str)
+}
+
+fn value_default_run_working_directory(value: &YamlValue) -> Option<&YamlValue> {
+    value_mapping_get(value, "defaults")
+        .and_then(YamlValue::as_mapping)
+        .and_then(|defaults| mapping_get(defaults, "run"))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|run| mapping_get(run, "working-directory"))
+}
+
+fn mapping_default_run_working_directory(mapping: &Mapping) -> Option<&YamlValue> {
+    mapping_get(mapping, "defaults")
+        .and_then(YamlValue::as_mapping)
+        .and_then(|defaults| mapping_get(defaults, "run"))
+        .and_then(YamlValue::as_mapping)
+        .and_then(|run| mapping_get(run, "working-directory"))
+}
+
+fn env_overrides_command_lookup(value: &YamlValue) -> bool {
+    value.as_mapping().is_some_and(|env| !env.is_empty())
+}
+
+fn step_shell_can_mask_failures(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    let Some(shell) = mapping_get(step, "shell")
+        .and_then(YamlValue::as_str)
+        .or_else(|| mapping_default_run_shell(job))
+        .or_else(|| value_default_run_shell(workflow))
+    else {
+        return true;
+    };
+    shell.trim() != "bash"
+}
+
+fn step_working_directory_can_shadow_workspace(
+    workflow: &YamlValue,
+    job: &Mapping,
+    step: &Mapping,
+) -> bool {
+    mapping_get(step, "working-directory").is_some()
+        || mapping_default_run_working_directory(job).is_some()
+        || value_default_run_working_directory(workflow).is_some()
+}
+
+fn workflow_command_lookup_can_mask_failures(workflow: &YamlValue) -> bool {
+    if value_mapping_get(workflow, "env").is_some_and(env_overrides_command_lookup) {
+        return true;
+    }
+
+    workflow_step_contexts(workflow).iter().any(|(job, step)| {
+        job_runtime_can_mask_command_lookup(job)
+            || mapping_get(job, "env").is_some_and(env_overrides_command_lookup)
+            || mapping_get(step, "env").is_some_and(env_overrides_command_lookup)
+            || step_uses_can_mask_command_lookup(step)
+            || step_run(step).is_some_and(|run| {
+                all_run_shell_lines(run)
+                    .into_iter()
+                    .any(shell_line_mutates_command_lookup)
+            })
+    })
+}
+
+fn job_runtime_can_mask_command_lookup(job: &Mapping) -> bool {
+    mapping_get(job, "container").is_some()
+        || mapping_get(job, "services").is_some()
+        || !job_runs_on_known_github_hosted_runner(job)
+}
+
+fn job_runs_on_known_github_hosted_runner(job: &Mapping) -> bool {
+    let Some(runs_on) = mapping_get(job, "runs-on") else {
+        return false;
+    };
+    match runs_on {
+        YamlValue::String(runner) => {
+            let runner = runner.trim();
+            is_safe_github_hosted_runner(runner)
+                || (runner.replace(' ', "") == "${{matrix.os}}"
+                    && job_matrix_os_values_are_known_github_hosted(job))
+        }
+        YamlValue::Sequence(runners) => {
+            !runners.is_empty()
+                && runners
+                    .iter()
+                    .all(|runner| runner.as_str().is_some_and(is_safe_github_hosted_runner))
+        }
+        _ => false,
+    }
+}
+
+fn job_matrix_os_values_are_known_github_hosted(job: &Mapping) -> bool {
+    let Some(matrix) = job_matrix(job) else {
+        return false;
+    };
+    mapping_get(matrix, "include").is_none()
+        && mapping_get(matrix, "exclude").is_none()
+        && job_matrix_values(job, "os").is_some_and(|values| {
+            values
+                .iter()
+                .all(|value| is_safe_github_hosted_runner(value))
+        })
+}
+
+fn job_matrix(job: &Mapping) -> Option<&Mapping> {
+    mapping_get(job, "strategy")
+        .and_then(YamlValue::as_mapping)
+        .and_then(|strategy| mapping_get(strategy, "matrix"))
+        .and_then(YamlValue::as_mapping)
+}
+
+fn job_matrix_values(job: &Mapping, key: &str) -> Option<Vec<String>> {
+    let values = job_matrix(job)
+        .and_then(|matrix| mapping_get(matrix, key))
+        .and_then(YamlValue::as_sequence)?;
+    let values = values
+        .iter()
+        .map(YamlValue::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    (!values.is_empty()).then(|| values.into_iter().map(ToOwned::to_owned).collect())
+}
+
+fn is_safe_github_hosted_runner(runner: &str) -> bool {
+    SAFE_GITHUB_HOSTED_RUNNERS.contains(&runner.trim())
+}
+
+fn step_can_enforce_audit_failure(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    !step_continue_on_error_can_mask_failures(step)
+        && !job_continue_on_error_can_mask_failures(job)
+        && !step_if_field_can_disable_guard(step)
+        && !job_if_field_can_disable_guard(job)
+        && !step_shell_can_mask_failures(workflow, job, step)
+        && !step_working_directory_can_shadow_workspace(workflow, job, step)
+        && !workflow_command_lookup_can_mask_failures(workflow)
+}
+
+fn step_enforcing_run<'a>(
+    workflow: &YamlValue,
+    job: &Mapping,
+    step: &'a Mapping,
+) -> Option<&'a str> {
+    step_can_enforce_audit_failure(workflow, job, step).then(|| step_run(step))?
+}
+
+fn step_uses(step: &Mapping) -> Option<&str> {
+    mapping_get(step, "uses").and_then(YamlValue::as_str)
+}
+
+fn step_with_fields(step: &Mapping) -> Option<&Mapping> {
+    mapping_get(step, "with").and_then(YamlValue::as_mapping)
+}
+
+fn step_with_field<'a>(step: &'a Mapping, field: &str) -> Option<&'a YamlValue> {
+    step_with_fields(step).and_then(|with| mapping_get(with, field))
+}
+
+fn action_step_can_enforce_failure(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    !step_continue_on_error_can_mask_failures(step)
+        && !job_continue_on_error_can_mask_failures(job)
+        && !step_if_field_can_disable_guard(step)
+        && !job_if_field_can_disable_guard(job)
+        && !workflow_command_lookup_can_mask_failures(workflow)
+}
+
+fn step_installs_tools(
+    workflow: &YamlValue,
+    job: &Mapping,
+    step: &Mapping,
+    required_tools: &[&str],
+) -> bool {
+    step_uses(step) == Some("taiki-e/install-action@v2")
+        && step_tool_set_equals(step, required_tools)
+        && action_step_can_enforce_failure(workflow, job, step)
+}
+
+fn step_is_default_checkout(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    step_uses(step) == Some("actions/checkout@v4")
+        && !checkout_inputs_can_shadow_workspace(step)
+        && action_step_can_enforce_failure(workflow, job, step)
+}
+
+fn step_pins_stable_rust_toolchain(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    step_uses(step) == Some("dtolnay/rust-toolchain@stable")
+        && action_step_can_enforce_failure(workflow, job, step)
+}
+
+fn step_uses_safe_rust_cache(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    step_uses(step) == Some("Swatinem/rust-cache@v2")
+        && !rust_cache_inputs_can_shadow_command_lookup(step)
+        && action_step_can_enforce_failure(workflow, job, step)
+}
+
+fn step_uses_safe_model_cache(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    step_uses(step) == Some("actions/cache@v4")
+        && !cache_inputs_can_shadow_workspace_or_command_lookup(step)
+        && action_step_can_enforce_failure(workflow, job, step)
+}
+
+fn prior_steps_prepare_audit_tools(
+    workflow: &YamlValue,
+    job: &Mapping,
+    prior_steps: &[&Mapping],
+) -> bool {
+    prior_steps
+        .iter()
+        .any(|step| step_is_default_checkout(workflow, job, step))
+        && prior_steps
+            .iter()
+            .any(|step| step_pins_stable_rust_toolchain(workflow, job, step))
+        && prior_steps
+            .iter()
+            .any(|step| step_uses_safe_rust_cache(workflow, job, step))
+        && prior_steps
+            .iter()
+            .any(|step| step_installs_tools(workflow, job, step, &["cargo-deny", "cargo-expand"]))
+        && prior_steps
+            .iter()
+            .all(|step| prior_step_can_precede_audit(workflow, job, step))
+}
+
+fn prior_step_can_precede_audit(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    step_is_default_checkout(workflow, job, step)
+        || step_pins_stable_rust_toolchain(workflow, job, step)
+        || step_uses_safe_rust_cache(workflow, job, step)
+        || step_uses_safe_model_cache(workflow, job, step)
+        || step_installs_tools(workflow, job, step, &["cargo-deny", "cargo-expand"])
+}
+
+fn workflow_has_enforcing_audit_run_with_setup(
+    workflow: &YamlValue,
+    run_predicate: impl Fn(&str) -> bool,
+) -> bool {
+    workflow_job_steps(workflow).iter().any(|(job, steps)| {
+        steps.iter().enumerate().any(|(index, step)| {
+            step_enforcing_run(workflow, job, step).is_some_and(|run| {
+                run_predicate(run)
+                    && prior_steps_prepare_audit_tools(workflow, job, &steps[..index])
+            })
+        })
+    })
+}
+
+fn step_tool_set_equals(step: &Mapping, required_tools: &[&str]) -> bool {
+    let Some(tool_field) = step_with_field(step, "tool").and_then(YamlValue::as_str) else {
+        return false;
+    };
+    let tools = tool_field
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .map(str::trim)
+        .filter(|tool| !tool.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = required_tools
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    tools == expected
+}
+
+fn yaml_field_contains(value: &YamlValue, needle: &str) -> bool {
+    match value {
+        YamlValue::String(value) => value.contains(needle),
+        YamlValue::Sequence(values) => values
+            .iter()
+            .any(|value| yaml_field_contains(value, needle)),
+        YamlValue::Mapping(values) => values
+            .values()
+            .any(|value| yaml_field_contains(value, needle)),
+        _ => false,
+    }
+}
+
+fn active_shell_line(line: &str) -> Option<&str> {
+    let line = strip_unquoted_comment(line).trim();
+    if line.is_empty() { None } else { Some(line) }
+}
+
+fn heredoc_delimiter(line: &str) -> Option<String> {
+    let line = strip_unquoted_comment(line).trim();
+    let marker = find_unquoted(line, "<<")?;
+    let after_marker = line[marker + 2..].trim_start();
+    let after_marker = after_marker.strip_prefix('-').unwrap_or(after_marker);
+    let token = after_marker.split_whitespace().next()?;
+    let token = token
+        .trim_matches('\'')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('"');
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+fn active_run_lines(run: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut heredoc_end = None::<String>;
+    for raw_line in run.lines() {
+        let trimmed = raw_line.trim();
+        if heredoc_end.as_deref() == Some(trimmed) {
+            heredoc_end = None;
+            continue;
+        }
+        if heredoc_end.is_some() {
+            continue;
+        }
+        if let Some(line) = active_shell_line(raw_line) {
+            if let Some(delimiter) = heredoc_delimiter(line) {
+                heredoc_end = Some(delimiter);
+            }
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn all_run_shell_lines(run: &str) -> Vec<&str> {
+    run.lines().filter_map(active_shell_line).collect()
+}
+
+fn failure_neutered(line: &str) -> bool {
+    line.contains("||")
+        || line.contains("; true")
+        || line.contains("&& true")
+        || line.contains("; :")
+        || line.contains("&& :")
+        || line.contains("; exit 0")
+        || line.contains("&& exit 0")
+        || line_contains_unquoted(line, "| true")
+        || line_contains_unquoted(line, "| false")
+        || line_contains_unquoted(line, "| :")
+}
+
+fn set_command_masks_failures(segment: &str) -> bool {
+    let words = segment
+        .split_whitespace()
+        .map(|word| word.replace(['\'', '"'], "").replace('\\', ""))
+        .collect::<Vec<_>>();
+    let Some(set_index) = first_set_word_index(&words) else {
+        return false;
+    };
+    let words = &words[set_index + 1..];
+    words
+        .iter()
+        .any(|word| word.starts_with('+') && word.chars().skip(1).any(|option| option == 'e'))
+        || words
+            .windows(2)
+            .any(|window| window == ["+o", "pipefail"] || window == ["+o", "errexit"])
+}
+
+fn first_set_word_index(words: &[String]) -> Option<usize> {
+    let mut index = 0;
+    let mut after_time = false;
+    while let Some(word) = words.get(index) {
+        if word == "!" || word == "time" {
+            after_time = word == "time";
+            index += 1;
+            continue;
+        }
+        if after_time && word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return (word == "set").then_some(index);
+    }
+    None
+}
+
+fn run_has_failure_neutering(run: &str) -> bool {
+    active_run_lines(run).into_iter().any(|line| {
+        failure_neutered(line)
+            || shell_line_uses_unmodeled_control_flow(line)
+            || line.split(';').any(|segment| {
+                let segment = segment.trim();
+                set_command_masks_failures(segment)
+                    || segment == "true"
+                    || segment == ":"
+                    || segment == "exit 0"
+            })
+    })
+}
+
+fn line_contains_unquoted(line: &str, needle: &str) -> bool {
+    find_unquoted(line, needle).is_some()
+}
+
+fn line_contains_shell_word(line: &str, word: &str) -> bool {
+    let line = line.replace(['\'', '"'], "");
+    line.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.'))
+        .any(|token| token == word)
+}
+
+fn first_shell_word(line: &str) -> String {
+    line.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .replace(['\'', '"'], "")
+}
+
+fn shell_command_words_use_expansion_escape_or_glob(line: &str) -> bool {
+    shell_command_segments(line)
+        .into_iter()
+        .filter_map(first_command_word_in_segment)
+        .any(command_word_uses_expansion_escape_or_glob)
+}
+
+fn shell_command_segments(line: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_double && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                continue;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                continue;
+            }
+            ';' | '|' | '&' if !in_single && !in_double => {
+                segments.push(&line[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    segments.push(&line[start..]);
+    segments
+}
+
+fn first_command_word_in_segment(segment: &str) -> Option<&str> {
+    let mut rest = segment.trim_start();
+    let mut after_time = false;
+    loop {
+        let word = rest.split_whitespace().next()?;
+        let normalized = word.replace(['\'', '"'], "");
+        if normalized == "!" || normalized == "time" {
+            rest = rest[word.len()..].trim_start();
+            after_time = normalized == "time";
+            continue;
+        }
+        if after_time && normalized.starts_with('-') {
+            rest = rest[word.len()..].trim_start();
+            continue;
+        }
+        return Some(word);
+    }
+}
+
+fn command_word_uses_expansion_escape_or_glob(word: &str) -> bool {
+    word.contains('$')
+        || word.contains('\\')
+        || word.contains('*')
+        || word.contains('?')
+        || word.contains('[')
+        || word.contains(']')
+}
+
+fn strip_unquoted_comment(line: &str) -> &str {
+    find_unquoted_comment_start(line)
+        .map(|index| &line[..index])
+        .unwrap_or(line)
+}
+
+fn find_unquoted_comment_start(line: &str) -> Option<usize> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_double && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                continue;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                continue;
+            }
+            '#' if !in_single && !in_double && starts_shell_word(line, index) => {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn starts_shell_word(line: &str, index: usize) -> bool {
+    match line[..index].chars().next_back() {
+        None => true,
+        Some(ch) => ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '(' | ')' | '<' | '>'),
+    }
+}
+
+fn find_unquoted(line: &str, needle: &str) -> Option<usize> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_double && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                continue;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                continue;
+            }
+            _ => {}
+        }
+        if !in_single && !in_double && line[index..].starts_with(needle) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn shell_line_uses_unmodeled_control_flow(line: &str) -> bool {
+    let first_word = first_shell_word(line);
+    line_contains_unquoted(line, "<<")
+        || line_contains_unquoted(line, ">")
+        || line_contains_unquoted(line, "<")
+        || line_contains_unquoted(line, "&")
+        || line_contains_unquoted(line, "{")
+        || line_contains_unquoted(line, "}")
+        || line_contains_unquoted(line, "(")
+        || line_contains_unquoted(line, ")")
+        || line_contains_unquoted(line, "&&")
+        || line_contains_unquoted(line, "$(")
+        || line.trim_end().ends_with('\\')
+        || line
+            .split_whitespace()
+            .any(|word| word.replace(['\'', '"'], "") == "trap")
+        || line_mutates_command_lookup(line)
+        || line_uses_unexpected_audit_cargo_subcommand(line)
+        || line.starts_with("function ")
+        || line.contains("() {")
+        || line.contains("(){")
+        || matches!(
+            first_word.as_str(),
+            "if" | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "for"
+                | "while"
+                | "until"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "select"
+                | "trap"
+                | "alias"
+                | "unalias"
+                | "shopt"
+                | "command"
+                | "builtin"
+                | "export"
+                | "env"
+                | "source"
+                | "."
+                | "eval"
+                | "hash"
+                | "enable"
+                | "declare"
+                | "typeset"
+                | "readonly"
+        )
+}
+
+fn line_mutates_command_lookup(line: &str) -> bool {
+    let quote_stripped = line.replace(['\'', '"'], "");
+    line.contains("${!")
+        || line.contains("${")
+        || line.contains("$'")
+        || line.contains("$\"")
+        || line.contains("$[")
+        || line.contains("$(")
+        || line.contains('`')
+        || shell_command_words_use_expansion_escape_or_glob(line)
+        || line_contains_shell_word(line, "printenv")
+        || ["sh", "bash", "xargs"]
+            .iter()
+            .any(|command| line_contains_shell_word(line, command))
+        || line_uses_interpreter_delegation(line)
+        || line_assigns_shell_variable(line)
+        || line_printf_assigns_command_lookup(line)
+        || line_uses_unsafe_tee(line)
+        || line_touches_audit_capture_unsafely(line)
+        || line_writes_audit_tool_path(line)
+        || line_invokes_path_executable(line)
+        || line_invokes_cargo_install(line)
+        || line_uses_opaque_delegation(line)
+        || quote_stripped.contains("GITHUB_PATH")
+        || quote_stripped.contains("GITHUB_ENV")
+        // GitHub file-command names are too easy to split-spell and resolve
+        // indirectly, so this audit workflow rejects command substitution
+        // and executable GITHUB_* use. Env introspection and audit-tool
+        // shadow writes are rejected for the same command-lookup reason.
+        || quote_stripped.contains("GITHUB_")
+        || line
+            .split(|ch: char| ch == ';' || ch.is_whitespace())
+            .any(|segment| {
+                let segment = segment.trim_start();
+                COMMAND_LOOKUP_ENV_KEYS.iter().any(|key| {
+                    segment.starts_with(&format!("{key}="))
+                        || segment.starts_with(&format!("{key}+="))
+                })
+            })
+}
+
+fn line_writes_audit_tool_path(line: &str) -> bool {
+    let quote_stripped = line.replace(['\'', '"'], "").replace('\\', "");
+    AUDIT_TOOL_PATH_MARKERS
+        .iter()
+        .any(|marker| quote_stripped.contains(marker))
+}
+
+fn line_invokes_path_executable(line: &str) -> bool {
+    shell_command_segments(line)
+        .into_iter()
+        .filter_map(first_command_word_in_segment)
+        .map(|word| word.replace(['\'', '"'], "").replace('\\', ""))
+        .any(|word| word.contains('/'))
+}
+
+fn line_invokes_cargo_install(line: &str) -> bool {
+    shell_command_segments(line).into_iter().any(|segment| {
+        let words = shell_segment_words(segment);
+        let Some(cargo_index) = first_cargo_word_index(&words) else {
+            return false;
+        };
+        cargo_words_after_cargo_use_expansion_escape_or_glob(&words, cargo_index)
+            || cargo_subcommand_after_cargo(&words, cargo_index) == Some("install")
+    })
+}
+
+fn line_uses_opaque_delegation(line: &str) -> bool {
+    shell_command_segments(line).into_iter().any(|segment| {
+        let words = shell_segment_words(segment);
+        let Some(first_word) = first_command_word_in_segment(segment) else {
+            return false;
+        };
+        let first_word = first_word.replace(['\'', '"'], "").replace('\\', "");
+        if OPAQUE_DELEGATION_COMMANDS.contains(&first_word.as_str()) {
+            return true;
+        }
+        let Some(cargo_index) = first_cargo_word_index(&words) else {
+            return false;
+        };
+        cargo_words_after_cargo_use_expansion_escape_or_glob(&words, cargo_index)
+            || cargo_subcommand_after_cargo(&words, cargo_index)
+                .is_some_and(|word| OPAQUE_CARGO_SUBCOMMANDS.contains(&word))
+    })
+}
+
+fn line_uses_unexpected_audit_cargo_subcommand(line: &str) -> bool {
+    shell_command_segments(line).into_iter().any(|segment| {
+        let words = shell_segment_words(segment);
+        let Some(cargo_index) = first_cargo_word_index(&words) else {
+            return false;
+        };
+        cargo_words_after_cargo_use_expansion_escape_or_glob(&words, cargo_index)
+            || !cargo_subcommand_after_cargo(&words, cargo_index)
+                .is_some_and(|word| AUDIT_CARGO_SUBCOMMANDS.contains(&word))
+    })
+}
+
+fn shell_segment_words(segment: &str) -> Vec<String> {
+    segment
+        .split_whitespace()
+        .map(|word| word.replace(['\'', '"'], "").replace('\\', ""))
+        .collect()
+}
+
+fn first_cargo_word_index(words: &[String]) -> Option<usize> {
+    let mut index = 0;
+    let mut after_time = false;
+    while let Some(word) = words.get(index) {
+        if word == "!" || word == "time" {
+            after_time = word == "time";
+            index += 1;
+            continue;
+        }
+        if after_time && word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return (word == "cargo").then_some(index);
+    }
+    None
+}
+
+fn cargo_subcommand_after_cargo(words: &[String], cargo_index: usize) -> Option<&str> {
+    words
+        .iter()
+        .skip(cargo_index + 1)
+        .find(|word| !word.starts_with('+') && !word.starts_with('-'))
+        .map(String::as_str)
+}
+
+fn cargo_words_after_cargo_use_expansion_escape_or_glob(
+    words: &[String],
+    cargo_index: usize,
+) -> bool {
+    words
+        .iter()
+        .skip(cargo_index + 1)
+        .any(|word| command_word_uses_expansion_escape_or_glob(word))
+}
+
+fn line_uses_interpreter_delegation(line: &str) -> bool {
+    let line = line.replace(['\'', '"'], "");
+    line.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.'))
+        .any(|token| {
+            let token = token.to_ascii_lowercase();
+            OPAQUE_INTERPRETER_COMMANDS.contains(&token.as_str())
+                || token == "python"
+                || token.starts_with("python2")
+                || token.starts_with("python3")
+                || token == "rscript"
+        })
+}
+
+fn line_touches_audit_capture_unsafely(line: &str) -> bool {
+    let quote_stripped = line.replace(['\'', '"'], "");
+    let mentions_capture = AUDIT_CAPTURE_PATHS
+        .iter()
+        .any(|path| quote_stripped.contains(path));
+    mentions_capture && !line_uses_audit_capture_safely(line)
+}
+
+fn line_uses_audit_capture_safely(line: &str) -> bool {
+    AUDIT_CAPTURE_PRODUCER_LINES.contains(&line)
+        || line == "test -s \"$RUNNER_TEMP/context-graph-expanded.rs\""
+        || line == "test -s \"$RUNNER_TEMP/context-graph-tree.txt\""
+        || (line.starts_with("rg --files-without-match ")
+            && AUDIT_CAPTURE_PATHS
+                .iter()
+                .any(|path| line.ends_with(&format!("\"{path}\""))))
+}
+
+fn line_assigns_shell_variable(line: &str) -> bool {
+    line.split(|ch: char| ch == ';' || ch.is_whitespace())
+        .map(str::trim_start)
+        .any(|segment| {
+            let Some((name, _value)) = segment.split_once('=') else {
+                return false;
+            };
+            let name = name.trim_end_matches('+');
+            let mut chars = name.chars();
+            chars
+                .next()
+                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        })
+}
+
+fn line_printf_assigns_command_lookup(line: &str) -> bool {
+    let quote_stripped = line.replace(['\'', '"'], "").replace('\\', "");
+    quote_stripped.split(';').any(|segment| {
+        let words: Vec<_> = segment.split_whitespace().collect();
+        let Some(printf_index) = first_printf_word_index(&words) else {
+            return false;
+        };
+        let mut words = words.into_iter().skip(printf_index + 1);
+        while let Some(word) = words.next() {
+            if word == "-v" {
+                return words
+                    .next()
+                    .is_some_and(printf_v_target_can_mutate_command_lookup);
+            }
+        }
+        false
+    })
+}
+
+fn printf_v_target_can_mutate_command_lookup(name: &str) -> bool {
+    let name = name.trim_end_matches('+');
+    COMMAND_LOOKUP_ENV_KEYS.contains(&name) || command_word_uses_expansion_escape_or_glob(name)
+}
+
+fn first_printf_word_index(words: &[&str]) -> Option<usize> {
+    let mut index = 0;
+    let mut after_time = false;
+    while let Some(word) = words.get(index) {
+        if *word == "!" || *word == "time" {
+            after_time = *word == "time";
+            index += 1;
+            continue;
+        }
+        if after_time && word.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return (*word == "printf").then_some(index);
+    }
+    None
+}
+
+fn line_uses_unsafe_tee(line: &str) -> bool {
+    if !line_contains_shell_word(line, "tee") {
+        return false;
+    }
+    !AUDIT_CAPTURE_PRODUCER_LINES.contains(&line)
+}
+
+fn shell_line_mutates_command_lookup(line: &str) -> bool {
+    line_mutates_command_lookup(line)
+        || shell_command_segments(line)
+            .into_iter()
+            .filter_map(first_command_word_in_segment)
+            .map(|word| word.replace(['\'', '"'], ""))
+            .any(|word| {
+                matches!(
+                    word.as_str(),
+                    "alias"
+                        | "unalias"
+                        | "shopt"
+                        | "command"
+                        | "builtin"
+                        | "export"
+                        | "env"
+                        | "source"
+                        | "."
+                        | "eval"
+                        | "hash"
+                        | "enable"
+                        | "declare"
+                        | "typeset"
+                        | "readonly"
+                        | "cd"
+                        | "pushd"
+                        | "popd"
+                )
+            })
+}
+
+fn run_prunes_deny_graph(run: &str) -> bool {
+    active_run_lines(run)
+        .into_iter()
+        .any(|line| line.contains("--exclude"))
+}
+
+fn run_invokes_deny_against_workspace_config(run: &str) -> bool {
+    if run_has_failure_neutering(run) || run_prunes_deny_graph(run) {
+        return false;
+    }
+    active_run_lines(run).into_iter().any(|line| {
+        line == "cargo deny check --config deny.toml" || line == "cargo deny check -c deny.toml"
+    })
+}
+
+fn run_invokes_negative_symbol_check(run: &str) -> bool {
+    const PATTERN_SINGLE: &str = "'embeddinggemma|candle_embeddinggemma'";
+    const PATTERN_DOUBLE: &str = "\"embeddinggemma|candle_embeddinggemma\"";
+    if run_has_failure_neutering(run) {
+        return false;
+    }
+    [
+        format!(
+            "rg --files-without-match {PATTERN_SINGLE} \"$RUNNER_TEMP/context-graph-expanded.rs\""
+        ),
+        format!(
+            "rg --files-without-match {PATTERN_DOUBLE} \"$RUNNER_TEMP/context-graph-expanded.rs\""
+        ),
+    ]
+    .iter()
+    .any(|rg_line| {
+        run_contains_consecutive_lines(
+            run,
+            &[
+                "cargo expand --lib -p context-graph | tee \"$RUNNER_TEMP/context-graph-expanded.rs\"",
+                "test -s \"$RUNNER_TEMP/context-graph-expanded.rs\"",
+                rg_line.as_str(),
+            ],
+        )
+    })
+}
+
+fn run_contains_consecutive_lines(run: &str, expected: &[&str]) -> bool {
+    active_run_lines(run)
+        .windows(expected.len())
+        .any(|window| window == expected)
+}
+
+#[test]
+fn ci_runs_cargo_deny_and_cargo_expand_symbol_check() {
+    assert_no_cargo_audit_aliases();
+    let yaml = read_workflow_yaml();
+    let steps = workflow_steps(&yaml);
+    let run_steps = steps
+        .iter()
+        .filter_map(|step| step_run(step))
+        .collect::<Vec<_>>();
+    let enforcing_run_steps = workflow_step_contexts(&yaml)
+        .iter()
+        .filter_map(|(job, step)| step_enforcing_run(&yaml, job, step))
+        .collect::<Vec<_>>();
+    let combined_audit_step = run_steps.iter().find(|run| {
+        run_invokes_deny_against_workspace_config(run) && run_invokes_negative_symbol_check(run)
+    });
+    assert!(
+        combined_audit_step.is_some(),
+        "CI should run cargo deny check against deny.toml and cargo expand symbol inspection inside the same run block"
+    );
+    assert!(
+        enforcing_run_steps.iter().any(|run| {
+            run_invokes_deny_against_workspace_config(run) && run_invokes_negative_symbol_check(run)
+        }),
+        "CI audit guard must be an unconditional failure-loud workflow step"
+    );
+    assert!(
+        workflow_has_enforcing_audit_run_with_setup(&yaml, |run| {
+            run_invokes_deny_against_workspace_config(run) && run_invokes_negative_symbol_check(run)
+        }),
+        "CI audit guard must run in the same job after default checkout, stable Rust, safe rust-cache, and taiki cargo-deny/cargo-expand setup"
+    );
+    let expand_check = run_steps
+        .iter()
+        .find(|run| run_invokes_negative_symbol_check(run));
+    assert!(
+        expand_check.is_some(),
+        "CI should run cargo expand directly and fail when embeddinggemma symbols appear"
+    );
+    assert!(
+        enforcing_run_steps
+            .iter()
+            .any(|run| run_invokes_negative_symbol_check(run)),
+        "CI expanded-source guard must not be hidden behind if, continue-on-error, or a failure-soft shell"
+    );
+    assert!(
+        run_steps
+            .iter()
+            .all(|run| !run.contains("context-graph-runtime-audit.sh"))
+    );
+    assert!(
+        workflow_has_enforcing_audit_run_with_setup(&yaml, run_invokes_negative_symbol_check),
+        "CI should install cargo-deny and cargo-expand through taiki-e/install-action@v2 before the enforcing audit step in the same job"
+    );
+    assert!(
+        run_steps
+            .iter()
+            .flat_map(|run| run.lines())
+            .filter_map(active_shell_line)
+            .all(|line| !line_invokes_cargo_install(line)),
+        "CI should not hide audit-tool or path-installed cargo subcommand installation behind cargo install"
+    );
+    assert!(
+        !yaml_field_contains(&yaml, "--exclude"),
+        "CI should not prune cargo-deny's graph with --exclude in run lines, env, or action fields"
+    );
+    for step in &steps {
+        let _ = step_with_fields(step);
+    }
+}
+
+#[test]
+fn embedder_trait_surface_remains_byte_identical_with_catalog_workspace_member() {
+    let embedder: Box<dyn Embedder> = Box::new(MockEmbedder::new("acceptance_mock_text", 8));
+    let output = embedder
+        .embed(EmbeddingInput::Text("dependency audit probe".to_string()))
+        .expect("mock embedder output");
+    assert_eq!("acceptance_mock_text", output.embedding_space_id);
+    assert_eq!(8, output.dimension);
+    assert_eq!(8, output.vector.len());
+    assert_eq!(vec![EvidenceKind::Text], embedder.supported_inputs());
+    assert_eq!(8, embedder.embedding_space().dimension);
+
+    let disabled_nomic = NomicTextEmbedder::new(EmbedderConfig::disabled());
+    let error = disabled_nomic
+        .embed(EmbeddingInput::Text("must not download".to_string()))
+        .expect_err("disabled Nomic embedder should not load a model");
+    assert!(matches!(error, CgError::TextEmbedderDisabled));
+}
+
+#[test]
+fn store_open_with_default_config_against_freshly_created_path_writes_cg_schema_version_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("fresh-main-crate-store.db");
+    let mut config = StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    };
+    config.default_text_embedder = Some(EmbedderConfig::disabled());
+
+    let store = Store::open(config).expect("fresh store opens");
+    assert_eq!(
+        "embedding_loader=disabled",
+        store.last_query_trace().expect("loader trace")
+    );
+    assert!(
+        !store
+            .list_embedding_spaces()
+            .expect("embedding spaces")
+            .is_empty()
+    );
+    drop(store);
+
+    let db = Database::open(&db_path).expect("reopen contextdb file");
+    let rows = db
+        .execute("SELECT version FROM cg_schema_version", &HashMap::new())
+        .expect("schema version query");
+    assert_eq!(1, rows.rows.len(), "schema version row count");
+    assert_eq!(
+        Some(&Value::Int64(CG_SCHEMA_VERSION as i64)),
+        rows.rows.first().and_then(|row| row.first())
+    );
+}
+
+#[test]
+fn nomic_loads_existing_acceptance_tests_remain_registered_with_catalog_workspace_member() {
+    let main_rs = std::fs::read_to_string(crate_root().join("tests/acceptance/main.rs"))
+        .expect("acceptance main readable");
+    assert!(
+        main_rs.contains("mod nomic_loads;"),
+        "nomic_loads acceptance module should remain wired into the acceptance binary"
+    );
+    let tests = std::fs::read_to_string(crate_root().join("tests/acceptance/nomic_loads.rs"))
+        .expect("nomic_loads source readable");
+    for required in [
+        "fn nomic_embed_text_adapter_implements_embedder_trait_with_declared_dimension_768_and_l2_normalized_output",
+        "fn store_open_with_default_config_against_freshly_created_path_writes_cg_schema_version_row_matching_current_version_and_emits_no_legacy_or_migration_observable",
+    ] {
+        assert!(
+            tests.contains(required),
+            "missing acceptance test {required}"
+        );
+    }
+    for retired in [
+        "cg_main_crate_has_no_embeddinggemma_runtime_code_grep_audit_against_cargo_expanded_source_plus_no_embeddinggemma_transitive_dep_in_cargo_tree",
+        "cargo_tree_for_context_graph_default_dep_graph_carries_no_native_dep_sys_crates_no_python_runtime_no_api_key_dep",
+    ] {
+        assert!(!tests.contains(retired), "retired audit still registered");
+    }
+}

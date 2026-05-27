@@ -642,42 +642,6 @@ fn candle_embeddinggemma_sibling_crate_carries_apache_2_0_license_file_and_works
 }
 
 #[test]
-fn cg_main_crate_has_no_embeddinggemma_runtime_code_grep_audit_against_cargo_expanded_source_plus_no_embeddinggemma_transitive_dep_in_cargo_tree()
- {
-    let cargo_toml = read_crate_file("Cargo.toml");
-    let nomic_source = read_crate_file("src/embedder/nomic.rs");
-    let workflow = read_workspace_file(".github/workflows/ci.yml");
-    let runtime_audit = read_workspace_file(".github/scripts/context-graph-runtime-audit.sh");
-
-    assert!(
-        workflow.contains("context-graph-runtime-audit.sh")
-            && runtime_audit.contains("cargo expand --lib -p context-graph")
-            && runtime_audit.contains("embeddinggemma")
-            && runtime_audit.contains("candle_embeddinggemma")
-            && runtime_audit.contains("cargo tree -p context-graph --target all -e normal,build")
-            && runtime_audit.contains("candle-embeddinggemma"),
-        "CI must run the cargo-expanded source and cargo-tree runtime leak audit"
-    );
-    assert!(!cargo_toml.contains("embeddinggemma-runtime"));
-    assert!(!cargo_toml.contains("candle-embeddinggemma = {"));
-    let nomic_tensors = [
-        "embeddings.word_embeddings.weight",
-        "encoder.layers.0.attn.Wqkv.weight",
-        "encoder.layers.0.attn.out_proj.weight",
-        "encoder.layers.0.mlp.fc11.weight",
-        "encoder.layers.11.attn.Wqkv.weight",
-    ];
-    let fingerprint_count = nomic_tensors
-        .iter()
-        .filter(|tensor| nomic_source.contains(**tensor))
-        .count();
-    assert!(
-        fingerprint_count >= 3,
-        "Nomic adapter must reference upstream Nomic-BERT tensor identifiers"
-    );
-}
-
-#[test]
 fn embedder_trait_surface_remains_byte_identical_across_default_embedder_pivot() {
     fn assert_embed_signature(embedder: &dyn Embedder, input: EmbeddingInput) {
         let _ = embedder.embed(input);
@@ -1205,46 +1169,6 @@ fn store_open_with_default_config_against_freshly_created_path_writes_cg_schema_
 }
 
 #[test]
-fn cargo_tree_for_context_graph_default_dep_graph_carries_no_native_dep_sys_crates_no_python_runtime_no_api_key_dep()
- {
-    let cargo_toml = read_crate_file("Cargo.toml");
-    let workflow = read_workspace_file(".github/workflows/ci.yml");
-    let runtime_audit = read_workspace_file(".github/scripts/context-graph-runtime-audit.sh");
-    assert!(
-        !cargo_toml.contains("embeddinggemma-runtime"),
-        "default dependency surface must not expose an EmbeddingGemma runtime feature"
-    );
-    assert!(workflow.contains("context-graph-runtime-audit.sh"));
-    assert!(runtime_audit.contains("cargo tree -p context-graph --target all -e normal,build"));
-
-    for banned in [
-        "pyo3",
-        "cpython",
-        "tch",
-        "ort",
-        "tensorflow",
-        "tflite",
-        "onnxruntime",
-        "libtorch",
-        "reqwest",
-        "openai",
-        "anthropic-sdk",
-        "anthropic",
-        "cohere",
-        "openssl-sys",
-        "mkl-sys",
-        "cuda",
-        "cudnn",
-        "tensorrt",
-    ] {
-        assert!(
-            runtime_audit.contains(banned),
-            "CI cargo-tree audit must ban dependency {banned}"
-        );
-    }
-}
-
-#[test]
 fn vigil_pattern_extra_embedding_space_declares_face_reid_v1_under_dim_512_entity_reference_lane_unaffected_by_default_swap()
  {
     let (_dir, mut config) = disabled_store_config("vigil-face");
@@ -1299,7 +1223,7 @@ fn cg_github_actions_workflow_runs_on_matrix_of_windows_latest_macos_latest_ubun
  {
     let workflow = read_workspace_file(".github/workflows/ci.yml");
     assert!(
-        serde_yml::from_str::<serde_yml::Value>(&workflow).is_ok(),
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&workflow).is_ok(),
         "CI workflow must be valid YAML"
     );
     for os in ["windows-latest", "macos-latest", "ubuntu-latest"] {

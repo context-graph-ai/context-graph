@@ -1,0 +1,32 @@
+[bans]
+deny = [
+    { name = "candle-embeddinggemma", version = "*" },
+    { name = "pyo3", version = "*" },
+    { name = "cpython", version = "*" },
+    { name = "tch", version = "*" },
+    { name = "ort", version = "*" },
+    { name = "tensorflow", version = "*" },
+    { name = "tflite", version = "*" },
+    { name = "onnxruntime", version = "*" },
+    { name = "libtorch", version = "*" },
+    { name = "reqwest", version = "*" },
+    { name = "openai", version = "*" },
+    { name = "anthropic-sdk", version = "*" },
+    { name = "anthropic", version = "*" },
+    { name = "cohere", version = "*" },
+    { name = "openssl-sys", version = "*" },
+    { name = "mkl-sys", version = "*" },
+    { name = "cuda", version = "*" },
+    { name = "cudnn", version = "*" },
+    { name = "tensorrt", version = "*" },
+]
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-DFS-2016"]
+
+[advisories]
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

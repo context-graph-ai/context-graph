@@ -1,3 +1,4 @@
+mod cg_main_dep_audit;
 mod context_isolation;
 mod crud;
 mod discovery;

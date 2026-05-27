@@ -38,7 +38,7 @@ contextdb-vector = { workspace = true, features = ["test-seams"] }
 criterion.workspace = true
 safetensors.workspace = true
 sha2.workspace = true
-serde_yml.workspace = true
+serde_yaml_ng.workspace = true
 tempfile.workspace = true
 tokenizers.workspace = true
 trybuild.workspace = true
