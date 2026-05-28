@@ -3,6 +3,7 @@ use cg_catalog::{
     validate_artifact_identity,
 };
 use serde_json::json;
+use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -11,8 +12,9 @@ use crate::common::{
     CANONICAL_LICENSE_GATE_MESSAGE, FIXTURE_NOMIC_CONFIG_JSON_SHA,
     FIXTURE_NOMIC_MODEL_SAFETENSORS_SHA, FIXTURE_NOMIC_REVISION_SHA,
     FIXTURE_NOMIC_TOKENIZER_JSON_SHA, GEMMA_ID, NOMIC_ID, NOMIC_REVISION, TEST_NEW_NOMIC_REVISION,
-    catalog_at, corrupt_fixture_dir, fixture_dir, fixture_sha, hold_model_lock,
-    serve_nomic_fixture_until_idle_counted, write_nomic_cache, write_source_override,
+    acceptance, acceptance_records, catalog_at, corrupt_fixture_dir, fixture_dir, fixture_sha,
+    hold_model_lock, serve_nomic_fixture_until_idle_counted, write_nomic_cache,
+    write_source_override, write_source_override_with_actual_shas,
 };
 
 fn stub_base_url(server: &tiny_http::Server) -> String {
@@ -243,16 +245,108 @@ fn air_gap_fetch_from_path_with_corrupted_artifact_refuses_with_typed_error() {
 fn air_gap_fetch_from_path_for_license_gated_model_still_requires_acceptance_record_before_use() {
     // Manual install of bytes should not bypass license acceptance.
     let temp = tempfile::tempdir().expect("tempdir");
-    write_source_override(
+    let source = temp.path().join("manual-gemma-airgap-import");
+    fs::create_dir_all(&source).expect("manual source dir created");
+    fs::write(
+        source.join("model.safetensors"),
+        b"unique gated Gemma air-gap model bytes\n",
+    )
+    .expect("manual model artifact written");
+    fs::write(
+        source.join("tokenizer.json"),
+        json!({"fixture": "unique-gemma-airgap-tokenizer"})
+            .to_string()
+            .as_bytes(),
+    )
+    .expect("manual tokenizer artifact written");
+    fs::write(
+        source.join("config.json"),
+        json!({"fixture": "unique-gemma-airgap-config", "dimension": 768})
+            .to_string()
+            .as_bytes(),
+    )
+    .expect("manual config artifact written");
+    fs::write(source.join("REVISION"), b"unique-gemma-airgap-revision\n")
+        .expect("manual revision artifact written");
+    let expected_source = [
+        (
+            "model.safetensors",
+            fixture_sha(&source.join("model.safetensors")),
+            fs::read(source.join("model.safetensors")).expect("manual model readable"),
+        ),
+        (
+            "tokenizer.json",
+            fixture_sha(&source.join("tokenizer.json")),
+            fs::read(source.join("tokenizer.json")).expect("manual tokenizer readable"),
+        ),
+        (
+            "config.json",
+            fixture_sha(&source.join("config.json")),
+            fs::read(source.join("config.json")).expect("manual config readable"),
+        ),
+        (
+            "REVISION",
+            fixture_sha(&source.join("REVISION")),
+            fs::read(source.join("REVISION")).expect("manual revision readable"),
+        ),
+    ];
+    write_source_override_with_actual_shas(
         temp.path(),
         GEMMA_ID,
-        &format!("file://{}", fixture_dir("embeddinggemma").display()),
-        "embeddinggemma-fixture-revision",
+        &format!("file://{}", source.display()),
+        "unique-gemma-airgap-revision",
+        &source,
     );
     let catalog = catalog_at(temp.path(), "host-A");
-    let _result = catalog
-        .fetch_from_path(GEMMA_ID, fixture_dir("embeddinggemma"))
+    let result = catalog
+        .fetch_from_path(GEMMA_ID, &source)
         .expect("from-path returns");
+    assert_eq!(result, FetchResult::CompletedAcceptanceRequired);
+    for (file, expected_sha, expected_bytes) in expected_source.iter() {
+        let source_bytes = fs::read(source.join(*file)).expect("manual source still readable");
+        assert_eq!(
+            source_bytes.as_slice(),
+            expected_bytes.as_slice(),
+            "from-path import must not rewrite caller-supplied source {file}"
+        );
+        let cached_path = temp.path().join(GEMMA_ID).join(file);
+        assert!(
+            cached_path.exists(),
+            "from-path import should land gated {file} bytes before acceptance"
+        );
+        let cached_metadata =
+            fs::symlink_metadata(&cached_path).expect("cached artifact metadata readable");
+        assert!(
+            cached_metadata.file_type().is_file(),
+            "from-path import should land a regular cached file for {file}, not a link"
+        );
+        assert!(
+            !cached_metadata.file_type().is_symlink(),
+            "from-path import should not symlink cached {file} back to the caller source"
+        );
+        let cached_bytes = fs::read(&cached_path).expect("cached artifact readable");
+        assert_eq!(
+            cached_bytes.as_slice(),
+            expected_bytes.as_slice(),
+            "from-path import should preserve caller-supplied {file} bytes"
+        );
+        assert_eq!(fixture_sha(&cached_path), expected_sha.as_str());
+    }
+    let detached_source = temp.path().join("manual-gemma-airgap-import-detached");
+    fs::rename(&source, &detached_source).expect("manual source detached after import");
+    for (file, expected_sha, expected_bytes) in expected_source.iter() {
+        let cached_path = temp.path().join(GEMMA_ID).join(file);
+        let cached_bytes = fs::read(&cached_path)
+            .expect("cached artifact should survive after source dir is detached");
+        assert_eq!(cached_bytes.as_slice(), expected_bytes.as_slice());
+        assert_eq!(fixture_sha(&cached_path), expected_sha.as_str());
+    }
+    let shown = catalog.show(GEMMA_ID).expect("show returns");
+    assert_eq!(shown.cache_status, CacheStatus::Cached);
+    assert!(
+        !shown.acceptance_recorded,
+        "fetch_from_path must not auto-accept a gated model"
+    );
     let fetch = catalog.fetch(None, GEMMA_ID, OutputMode::Interactive);
     assert!(matches!(
         fetch,
@@ -261,6 +355,52 @@ fn air_gap_fetch_from_path_for_license_gated_model_still_requires_acceptance_rec
             ..
         }) if canonical_message == CANONICAL_LICENSE_GATE_MESSAGE
     ));
+    let expected_artifact_sha = expected_source
+        .iter()
+        .find_map(|(file, sha, _)| (*file == "model.safetensors").then(|| sha.clone()))
+        .expect("expected model sha captured");
+    let manifest_path = temp.path().join(GEMMA_ID).join("catalog.toml");
+    let manifest_before_stale_record =
+        fs::read(&manifest_path).expect("manifest readable before stale acceptance");
+    let mut stale_record = acceptance("host-A");
+    stale_record.artifact_sha = "stale-gemma-artifact-sha".to_string();
+    let stale_result = catalog.record_acceptance(GEMMA_ID, stale_record);
+    assert!(matches!(
+        stale_result,
+        Err(CgCatalogError::ArtifactShaMismatch { expected, actual })
+            if expected == expected_artifact_sha && actual == "stale-gemma-artifact-sha"
+    ));
+    let manifest_after_stale_record =
+        fs::read(&manifest_path).expect("manifest readable after stale acceptance");
+    assert_eq!(
+        manifest_after_stale_record, manifest_before_stale_record,
+        "stale artifact acceptance must not mutate the durable manifest"
+    );
+    let shown_after_stale_record = catalog.show(GEMMA_ID).expect("show returns");
+    assert!(
+        !shown_after_stale_record.acceptance_recorded,
+        "stale artifact acceptance must not mutate acceptance state"
+    );
+    let stale_records = acceptance_records(temp.path(), GEMMA_ID);
+    assert!(
+        stale_records.is_empty(),
+        "stale artifact acceptance must not append to the on-disk ledger"
+    );
+    let mut record = acceptance("host-A");
+    record.artifact_sha = expected_artifact_sha.clone();
+    catalog
+        .record_acceptance(GEMMA_ID, record)
+        .expect("explicit acceptance returns");
+    let records = acceptance_records(temp.path(), GEMMA_ID);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].get("artifact_sha").and_then(toml::Value::as_str),
+        Some(expected_artifact_sha.as_str())
+    );
+    let accepted_fetch = catalog
+        .fetch(None, GEMMA_ID, OutputMode::Interactive)
+        .expect("accepted gated cache fetches");
+    assert_eq!(accepted_fetch, FetchResult::AlreadyCachedAndAccepted);
 }
 
 #[test]

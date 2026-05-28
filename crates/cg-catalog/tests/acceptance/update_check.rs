@@ -20,6 +20,9 @@ use crate::common::{
     write_valid_mini_gemma_acceptance,
 };
 
+const CG_BINARY_ID: &str = "cg-binary";
+const TEST_NEW_CG_BINARY_RELEASE: &str = "cg-2026-05-28-test-release";
+
 fn json_props(entries: &[(&str, serde_json::Value)]) -> BTreeMap<String, serde_json::Value> {
     entries
         .iter()
@@ -157,6 +160,30 @@ fn serve_nomic_fixture_until_idle(server: tiny_http::Server) -> std::thread::Joi
         TEST_NEW_NOMIC_REVISION,
         Arc::new(AtomicUsize::new(0)),
     )
+}
+
+fn serve_revision_source_until_idle_counted(
+    server: tiny_http::Server,
+    revision: &'static str,
+    request_count: Arc<AtomicUsize>,
+    request_urls: Arc<Mutex<Vec<String>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(2)) {
+            request_count.fetch_add(1, Ordering::SeqCst);
+            let url = request.url().to_string();
+            request_urls
+                .lock()
+                .expect("request url log")
+                .push(url.clone());
+            let bytes = if url.ends_with("REVISION") {
+                revision.as_bytes().to_vec()
+            } else {
+                Vec::new()
+            };
+            let _ = request.respond(tiny_http::Response::from_data(bytes));
+        }
+    })
 }
 
 fn start_update_revision_source(
@@ -493,6 +520,12 @@ fn cg_update_check_auto_flag_applies_apache_updates_and_refuses_to_apply_license
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
     let base_url = stub_base_url(&server);
     write_source_override(temp.path(), NOMIC_ID, &base_url, NOMIC_REVISION);
+    write_source_override(
+        temp.path(),
+        GEMMA_ID,
+        &base_url,
+        "embeddinggemma-fixture-revision",
+    );
     let server_thread = serve_nomic_fixture_until_idle(server);
     let (_store_temp, store) = separate_store();
     let observations = catalog
@@ -552,19 +585,68 @@ fn cg_update_check_writes_observation_on_per_binary_cg_entity_for_cg_binary_itse
     // The cg binary update path is tracked as its own entity, not as graph catalog state.
     let temp = tempfile::tempdir().expect("tempdir");
     let (_store_temp, store) = separate_store();
-    let (_request_count, server_thread) =
-        start_update_revision_source(temp.path(), NOMIC_REVISION, TEST_NEW_NOMIC_REVISION);
-    let _observations = catalog_at(temp.path(), "host-A")
+    let nomic_server = tiny_http::Server::http("127.0.0.1:0").expect("nomic stub server");
+    let nomic_base_url = stub_base_url(&nomic_server);
+    write_source_override(temp.path(), NOMIC_ID, &nomic_base_url, NOMIC_REVISION);
+    let binary_server = tiny_http::Server::http("127.0.0.1:0").expect("binary stub server");
+    let binary_base_url = format!("{}/cg-binary-release-source", stub_base_url(&binary_server));
+    write_source_override(
+        temp.path(),
+        CG_BINARY_ID,
+        &binary_base_url,
+        env!("CARGO_PKG_VERSION"),
+    );
+    let nomic_request_count = Arc::new(AtomicUsize::new(0));
+    let nomic_request_urls = Arc::new(Mutex::new(Vec::new()));
+    let nomic_server_thread = serve_revision_source_until_idle_counted(
+        nomic_server,
+        TEST_NEW_NOMIC_REVISION,
+        Arc::clone(&nomic_request_count),
+        Arc::clone(&nomic_request_urls),
+    );
+    let binary_request_count = Arc::new(AtomicUsize::new(0));
+    let binary_request_urls = Arc::new(Mutex::new(Vec::new()));
+    let binary_server_thread = serve_revision_source_until_idle_counted(
+        binary_server,
+        TEST_NEW_CG_BINARY_RELEASE,
+        Arc::clone(&binary_request_count),
+        Arc::clone(&binary_request_urls),
+    );
+    let returned_observations = catalog_at(temp.path(), "host-A")
         .update_check(&store)
         .expect("update check returns");
-    server_thread.join().expect("server thread joins");
+    nomic_server_thread
+        .join()
+        .expect("nomic server thread joins");
+    binary_server_thread
+        .join()
+        .expect("binary server thread joins");
+    assert!(
+        binary_request_count.load(Ordering::SeqCst) > 0,
+        "binary update check should poll its configured release source, not infer from model updates"
+    );
+    let binary_urls = binary_request_urls.lock().expect("binary request urls");
+    assert!(
+        binary_urls
+            .iter()
+            .any(|url| url.contains("/cg-binary-release-source/") && url.ends_with("REVISION")),
+        "binary update check must request REVISION from the configured cg-binary source path, urls={binary_urls:?}"
+    );
+    assert!(
+        returned_observations.iter().any(|observation| {
+            observation.observation_type == "binary_update_available"
+                && observation.state_delta.get("new_release")
+                    == Some(&serde_json::json!(TEST_NEW_CG_BINARY_RELEASE))
+        }),
+        "returned binary update must carry the release tag read from the cg-binary source, observations={returned_observations:?}"
+    );
     let observations = store
         .list_observations(Some(*CG_CATALOG_CONTEXT_ID))
         .expect("observations readable");
-    assert!(
-        observations
-            .iter()
-            .any(|observation| observation.properties.get("binary")
-                == Some(&serde_json::json!("cg")))
-    );
+    assert!(observations.iter().any(|observation| {
+        observation.observation_type == "binary_update_available"
+            && observation.properties.get("binary") == Some(&serde_json::json!("cg"))
+            && observation.state_delta.get("new_release")
+                == Some(&Some(serde_json::json!(TEST_NEW_CG_BINARY_RELEASE)))
+    }));
 }

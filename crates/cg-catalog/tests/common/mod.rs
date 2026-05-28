@@ -38,7 +38,7 @@ pub const FIXTURE_GEMMA_CONFIG_JSON_SHA: &str =
     "178e387336a35b5e234826c0e0b0e0b3f2029b3dbe9902c2e25576b13c7874de";
 pub const FIXTURE_GEMMA_REVISION_SHA: &str =
     "fa314f5bc6abbf4ecd0b7871494525bb78e10964bc83c919b9a1615485307312";
-pub const FOOTNOTE_EMBEDDINGGEMMA: &str = "OSS purity is enforced by repository CI; a downstream consumer's own dependency is outside this audit.";
+pub const FOOTNOTE_EMBEDDINGGEMMA: &str = "OSS purity is enforced by .github/workflows/ci.yml; a downstream consumer's own dependency is outside this audit.";
 pub const CANONICAL_LICENSE_GATE_MESSAGE: &str =
     include_str!("../fixtures/canonical_license_gate_embeddinggemma.txt");
 

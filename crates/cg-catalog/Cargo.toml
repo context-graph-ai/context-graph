@@ -25,6 +25,8 @@ uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 [dev-dependencies]
 candle-embeddinggemma.workspace = true
 chrono.workspace = true
+contextdb-core.workspace = true
+contextdb-engine.workspace = true
 safetensors.workspace = true
 serde_yaml_ng.workspace = true
 tempfile.workspace = true

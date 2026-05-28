@@ -370,6 +370,8 @@ dependencies = [
  "candle-embeddinggemma",
  "chrono",
  "context-graph",
+ "contextdb-core",
+ "contextdb-engine",
  "fs4",
  "indicatif",
  "safetensors",

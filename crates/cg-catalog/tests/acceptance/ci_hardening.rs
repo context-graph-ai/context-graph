@@ -1586,9 +1586,7 @@ fn ci_workflow_uses_concurrency_cancel_in_progress_at_workflow_level_parsed_yaml
         group.is_some(),
         "workflow concurrency should name a stable group"
     );
-    let group = group.unwrap_or("");
-    assert!(group.contains("github.workflow"));
-    assert!(group.contains("github.ref") || group.contains("github.head_ref"));
+    assert_eq!(group, Some("ci-${{ github.ref }}"));
     assert_eq!(
         mapping_get(concurrency, "cancel-in-progress").and_then(Value::as_bool),
         Some(true)

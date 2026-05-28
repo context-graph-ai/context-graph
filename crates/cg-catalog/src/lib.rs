@@ -374,6 +374,7 @@ impl Catalog {
 
     pub fn set_default(
         &self,
+        _store: &Store,
         _kind: ModelKind,
         _new_id: impl AsRef<str>,
         confirmation: Option<SwapOption>,
