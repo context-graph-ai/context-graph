@@ -1772,6 +1772,12 @@ fn contains_raw_media_value(value: &JsonValue) -> bool {
 
 fn is_raw_media_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
+    if matches!(
+        key.as_str(),
+        "expected_bytes" | "byte_size" | "total_byte_budget"
+    ) {
+        return false;
+    }
     key.contains("raw_media")
         || key.contains("rawmedia")
         || key.contains("media_payload")

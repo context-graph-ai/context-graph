@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use candle_embeddinggemma::EmbeddingGemmaTextEmbedder;
+use cg_catalog::embeddinggemma_test_support::EmbeddingGemmaTextEmbedder;
 use chrono::Utc;
 use context_graph::embedder::{Embedder, EmbeddingInput};
 use context_graph::test_support::embedding::{VectorSearchFilters, vector_search};

@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_embeddinggemma::{EmbeddingGemmaTextEmbedder, default_embeddinggemma_offline_config};
+use cg_catalog::embeddinggemma_test_support::{
+    EmbeddingGemmaTextEmbedder, default_embeddinggemma_offline_config,
+};
 use chrono::Utc;
 use context_graph::embedder::nomic::NomicTextEmbedder;
 use context_graph::embedding_space::{BuiltinSpaceRegistry, default_text_embedding_space};

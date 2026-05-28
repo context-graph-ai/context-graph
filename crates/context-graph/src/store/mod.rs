@@ -273,6 +273,38 @@ impl Store {
         &self.db
     }
 
+    pub fn register_embedding_space(&self, decl: EmbeddingSpaceDecl) -> Result<()> {
+        validate_runtime_embedding_space_declaration(&decl)?;
+        ensure_runtime_vector_columns(&self.db, &decl)?;
+        ensure_entity_reference_embedding_tables(&self.db, std::slice::from_ref(&decl))?;
+        seed_embedding_space(&self.db, &decl)?;
+        Ok(())
+    }
+
+    pub fn count_vectors_in_space(&self, space_id: &str) -> Result<u64> {
+        self.embedding_space_for_id(space_id)?;
+        let snapshot = self.db.snapshot();
+        let mut count = 0_u64;
+        for table in [
+            "evidence_embedding_handles",
+            "entity_reference_embedding_handles",
+            "digest_embedding_handles",
+        ] {
+            let Some(_) = self.db.table_meta(table) else {
+                continue;
+            };
+            for row in self.db.scan(table, snapshot).map_err(map_engine_err)? {
+                if matches!(
+                    row.values.get("embedding_space_id"),
+                    Some(Value::Text(existing)) if existing == space_id
+                ) {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     pub(crate) fn set_trace(&self, s: impl Into<String>) {
         let mut guard = self.trace.lock().expect("trace lock");
         *guard = s.into();
@@ -546,6 +578,91 @@ fn ensure_entity_reference_embedding_tables(
             "CREATE TABLE {table} (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL, label TEXT, vector VECTOR({dimension}), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON, created_at TXID NOT NULL, UNIQUE (entity_id, label), UNIQUE (context_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id))"
         );
         db.execute(&ddl, &HashMap::new()).map_err(map_engine_err)?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_embedding_space_declaration(space: &EmbeddingSpaceDecl) -> Result<()> {
+    validate_embedding_space_id(&space.embedding_space_id)?;
+    if space.supported_evidence_kinds.is_empty() {
+        return Err(CgError::EmbedderDeclaresNoSupportedInputs {
+            embedding_space_id: space.embedding_space_id.clone(),
+        });
+    }
+    if let Some(kind) = space.default_for_evidence_kind
+        && !space.supported_evidence_kinds.contains(&kind)
+    {
+        return Err(CgError::InconsistentEmbeddingSpaceDeclaration {
+            space_id: space.embedding_space_id.clone(),
+        });
+    }
+    for binding in &space.bindings {
+        if binding.embedding_space_id != space.embedding_space_id {
+            return Err(CgError::EmbeddingSpaceConfigMismatch {
+                field: "bindings",
+                expected: space.embedding_space_id.clone(),
+                actual: binding.embedding_space_id.clone(),
+            });
+        }
+        validate_runtime_identifier(&binding.table_name)?;
+        validate_runtime_identifier(&binding.vector_column)?;
+    }
+    Ok(())
+}
+
+fn ensure_runtime_vector_columns(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()> {
+    for binding in &space.bindings {
+        let Some(meta) = db.table_meta(&binding.table_name) else {
+            return Err(CgError::MissingVectorColumnForSpace {
+                table: binding.table_name.clone(),
+                column: binding.vector_column.clone(),
+            });
+        };
+        if let Some(column) = meta
+            .columns
+            .iter()
+            .find(|column| column.name == binding.vector_column)
+        {
+            match column.column_type {
+                ColumnType::Vector(dimension) if dimension == space.dimension => continue,
+                ColumnType::Vector(actual_dimension) => {
+                    return Err(CgError::EmbeddingSpaceConfigMismatch {
+                        field: "dimension",
+                        expected: space.dimension.to_string(),
+                        actual: actual_dimension.to_string(),
+                    });
+                }
+                _ => {
+                    return Err(CgError::MissingVectorColumnForSpace {
+                        table: binding.table_name.clone(),
+                        column: binding.vector_column.clone(),
+                    });
+                }
+            }
+        }
+        let ddl = format!(
+            "ALTER TABLE {} ADD COLUMN {} VECTOR({})",
+            binding.table_name, binding.vector_column, space.dimension
+        );
+        db.execute(&ddl, &HashMap::new()).map_err(map_engine_err)?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_identifier(identifier: &str) -> Result<()> {
+    let mut chars = identifier.chars();
+    let Some(first) = chars.next() else {
+        return Err(CgError::InvalidEmbeddingSpaceId { reason: "empty_id" });
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(CgError::InvalidEmbeddingSpaceId {
+            reason: "invalid_identifier",
+        });
+    }
+    if chars.any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric())) {
+        return Err(CgError::InvalidEmbeddingSpaceId {
+            reason: "invalid_identifier",
+        });
     }
     Ok(())
 }

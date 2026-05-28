@@ -7,18 +7,27 @@ repository.workspace = true
 description = "Kind-agnostic model catalog and cache lifecycle library"
 edition = "2024"
 
+[features]
+default = []
+embeddinggemma-test-support = []
+
 [lib]
 name = "cg_catalog"
 path = "src/lib.rs"
 
 [dependencies]
+candle-embeddinggemma.workspace = true
 context-graph = { path = "../context-graph" }
+contextdb-core.workspace = true
+contextdb-engine.workspace = true
+chrono.workspace = true
 fs4.workspace = true
 indicatif.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
+tracing.workspace = true
 ureq.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 

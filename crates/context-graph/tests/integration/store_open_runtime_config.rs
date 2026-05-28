@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use candle_core::{D, DType, Device, Tensor};
-use candle_embeddinggemma::{
+use cg_catalog::embeddinggemma_test_support::{
     EmbeddingGemmaForwardStage, EmbeddingGemmaLoadEvent, EmbeddingGemmaTextEmbedder,
 };
 use chrono::Utc;

@@ -25,6 +25,8 @@ const NOMIC_TEXT_DEFAULT_ID: &str = "text_default_nomic_v1_5_768";
 const NOMIC_MODEL_ID: &str = "nomic-embed-text-v1.5";
 const NOMIC_DEFAULT_DIMENSION: usize = 768;
 const NOMIC_MODEL_DOWNLOAD_LIMIT_BYTES: u64 = 600 * 1024 * 1024;
+const CG_MODEL_CACHE_ROOT_ENV: &str = "CG_MODEL_CACHE_ROOT";
+const LEGACY_EMBEDDER_CACHE_COMPONENT: &str = "embedders";
 
 const NOMIC_REQUIRED_TENSORS: &[(&str, &[usize])] = &[
     ("embeddings.word_embeddings.weight", &[30_528, 768]),
@@ -579,12 +581,14 @@ fn source_name(config: &EmbedderConfig) -> String {
 }
 
 fn default_cache_root() -> PathBuf {
-    if cfg!(target_os = "windows") {
+    if let Some(path) = std::env::var_os(CG_MODEL_CACHE_ROOT_ENV) {
+        return PathBuf::from(path);
+    }
+    let base = if cfg!(target_os = "windows") {
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join("cg")
-            .join("embedders")
     } else {
         std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
@@ -595,7 +599,13 @@ fn default_cache_root() -> PathBuf {
             })
             .unwrap_or_else(std::env::temp_dir)
             .join("cg")
-            .join("embedders")
+    };
+    let models = base.join("models");
+    let legacy = base.join(LEGACY_EMBEDDER_CACHE_COMPONENT);
+    if legacy.join(NOMIC_MODEL_ID).exists() && !models.join(NOMIC_MODEL_ID).exists() {
+        legacy
+    } else {
+        models
     }
 }
 

@@ -510,9 +510,9 @@ name = "context-graph"
 version = "0.1.0"
 dependencies = [
  "candle-core",
- "candle-embeddinggemma",
  "candle-nn",
  "candle-transformers",
+ "cg-catalog",
  "chrono",
  "contextdb-core",
  "contextdb-engine",
