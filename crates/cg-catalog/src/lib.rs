@@ -1,4 +1,5 @@
 mod error;
+mod model_connection;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -33,6 +34,7 @@ use context_graph::{
     Principal, ReasoningStep, RecordObservation, ReindexOptions, RetentionStatus, Store, TxId,
 };
 pub use error::{ArtifactValidationMismatch, CgCatalogError};
+pub use model_connection::*;
 
 pub type Result<T> = std::result::Result<T, CgCatalogError>;
 pub type ModelId = String;
@@ -120,6 +122,9 @@ pub enum Source {
         provider: String,
         model: String,
         auth_env_var: String,
+    },
+    NamedConnection {
+        connection_name: String,
     },
     #[default]
     BundledBinary,
@@ -1083,6 +1088,12 @@ impl Catalog {
                 model: model.clone(),
                 auth_env_var: auth_env_var.clone(),
             }
+        } else if let Some(Source::NamedConnection { connection_name }) =
+            registration.map(|entry| &entry.source)
+        {
+            Source::NamedConnection {
+                connection_name: connection_name.clone(),
+            }
         } else if repo.is_empty() {
             match registration.map(|entry| &entry.source) {
                 Some(Source::LocalPath { dir }) => Source::LocalPath { dir: dir.clone() },
@@ -1094,13 +1105,16 @@ impl Catalog {
                 revision: revision.to_string(),
             }
         };
-        let is_api_endpoint = matches!(&source, Source::ApiEndpoint { .. });
-        let cache_status = if is_api_endpoint {
+        let is_remote_reference = matches!(
+            &source,
+            Source::ApiEndpoint { .. } | Source::NamedConnection { .. }
+        );
+        let cache_status = if is_remote_reference {
             CacheStatus::Cached
         } else {
             self.cache_status(id, manifest.as_ref(), spec.as_ref())?
         };
-        let artifact_filenames = if is_api_endpoint {
+        let artifact_filenames = if is_remote_reference {
             Vec::new()
         } else if manifest.is_none() {
             registration
@@ -1109,7 +1123,7 @@ impl Catalog {
         } else {
             artifact_filenames(&model_dir, manifest.as_ref(), &cache_status)
         };
-        let per_file_sha256 = if is_api_endpoint {
+        let per_file_sha256 = if is_remote_reference {
             Vec::new()
         } else if manifest.is_none() {
             if let Some(registration) = registration {
@@ -1120,7 +1134,7 @@ impl Catalog {
         } else {
             per_file_sha256(&model_dir, manifest.as_ref(), spec.as_ref())?
         };
-        let byte_size = if is_api_endpoint {
+        let byte_size = if is_remote_reference {
             0
         } else {
             manifest
@@ -1188,7 +1202,7 @@ impl Catalog {
                 .map(|record| record.license_url_sha.clone()),
             acceptance_records,
         };
-        let local_path = if is_api_endpoint {
+        let local_path = if is_remote_reference {
             None
         } else {
             (cache_status == CacheStatus::Cached).then_some(model_dir)

@@ -2,6 +2,7 @@ pub mod embedder;
 pub mod embedding_space;
 pub mod embedding_target;
 pub mod error;
+pub mod llm;
 pub mod messaging;
 pub mod producer;
 pub mod schema;
@@ -14,6 +15,7 @@ pub use embedder::{
     load_observer::{EmbedderLoadEvent, EmbedderLoadObserver},
 };
 pub use error::CgError;
+pub use llm::*;
 pub use messaging::{MessageBody, MismatchKind, OverrideFailureReason};
 pub use producer::CG_EDGE_SYSTEM_TAG;
 pub use store::{ReindexEvent, ReindexOptions, Store};

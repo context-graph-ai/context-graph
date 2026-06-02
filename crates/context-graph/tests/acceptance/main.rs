@@ -10,8 +10,10 @@ mod graph_precedent_chain;
 mod graph_traverse;
 mod impact_analysis;
 mod invalidation_lifecycle;
+mod llm_runtime;
 #[cfg(context_graph_internal_test_support)]
 mod local_entity_face_match_override;
+mod model_connection;
 mod nomic_loads;
 mod producer_lineage_audit_render;
 mod school_gate_entity_alert_render;
