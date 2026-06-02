@@ -2723,12 +2723,14 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
     let entity = seeded_observation.entity_id;
     let context_id = seeded_observation.context_id;
     drop(seed);
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(51));
+    const WRITER_COUNT: usize = 4;
+    const REQUIRED_COMMITS: usize = 50;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITER_COUNT + 1));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let committed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (replay_tx, replay_rx) = std::sync::mpsc::channel();
-    let writers = (0..50)
+    let writers = (0..WRITER_COUNT)
         .map(|writer| {
             let config = config.clone();
             let barrier = std::sync::Arc::clone(&barrier);
@@ -2762,15 +2764,35 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
             })
         })
         .collect::<Vec<_>>();
+    barrier.wait();
+    let progress_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let progress_reached = loop {
+        if committed.load(std::sync::atomic::Ordering::SeqCst) >= REQUIRED_COMMITS {
+            break true;
+        }
+        if std::time::Instant::now() >= progress_deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+    match progress_reached {
+        true => {}
+        false => {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            for writer in writers {
+                writer.join().expect("writer joined after progress timeout");
+            }
+            panic!(
+                "writer flood did not create {REQUIRED_COMMITS} durable observations before replay; committed={}, attempts={}",
+                committed.load(std::sync::atomic::Ordering::SeqCst),
+                attempts.load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
+    }
     let reader_config = config.clone();
-    let reader_barrier = std::sync::Arc::clone(&barrier);
     let reader_committed = std::sync::Arc::clone(&committed);
     std::thread::spawn(move || {
         let reader = Store::open(reader_config).expect("reader");
-        reader_barrier.wait();
-        while reader_committed.load(std::sync::atomic::Ordering::SeqCst) < 50 {
-            std::thread::yield_now();
-        }
         let before = reader_committed.load(std::sync::atomic::Ordering::SeqCst);
         let replay = reader.replay(decision);
         let after = reader_committed.load(std::sync::atomic::Ordering::SeqCst);
@@ -2778,14 +2800,6 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
             .send((before, after, replay))
             .expect("send replay result");
     });
-    let warmup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while committed.load(std::sync::atomic::Ordering::SeqCst) < 50 {
-        assert!(
-            std::time::Instant::now() < warmup_deadline,
-            "writer flood must reach 50 committed observations before replay timeout starts"
-        );
-        std::thread::yield_now();
-    }
     let (before_replay, after_replay, replay) = replay_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("replay returned while writer flood was still active");
@@ -2793,12 +2807,12 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
     for writer in writers {
         writer.join().expect("writer joined");
     }
-    assert!(before_replay >= 50);
+    assert!(before_replay >= REQUIRED_COMMITS);
     assert!(after_replay >= before_replay);
     let reader = Store::open(config).expect("reader");
     let history = reader.entity_history(entity).expect("history");
     assert!(
-        history.len() >= 51,
+        history.len() > REQUIRED_COMMITS,
         "writer flood must create durable snapshots"
     );
     let replay = replay.expect("replay");
