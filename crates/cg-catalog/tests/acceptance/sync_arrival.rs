@@ -4,15 +4,15 @@ use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
 use std::time::Duration;
 
 use crate::common::{
     CANONICAL_LICENSE_GATE_MESSAGE, GEMMA_ID, NOMIC_BYTES, NOMIC_ID, NOMIC_REVISION, catalog_at,
-    fixture_dir, hold_model_lock, separate_store, serve_nomic_fixture_until_idle_counted,
-    stub_base_url, write_nomic_cache, write_source_override, write_valid_mini_gemma_acceptance,
+    fixture_dir, hold_model_lock, separate_store, stub_base_url, write_nomic_cache,
+    write_source_override, write_valid_mini_gemma_acceptance,
 };
 
 fn comparable_observation(observation: &Observation) -> serde_json::Value {
@@ -188,17 +188,48 @@ fn start_first_response_gated_nomic_server(
     (first_request_rx, release_tx, server_thread)
 }
 
-fn start_counted_nomic_source_override(
-    roots: &[&std::path::Path],
-) -> (Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+struct CountedNomicSourceOverride {
+    request_count: Arc<AtomicUsize>,
+    shutdown: Arc<AtomicBool>,
+    server_thread: std::thread::JoinHandle<()>,
+}
+
+impl CountedNomicSourceOverride {
+    fn shutdown_and_join(self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.server_thread
+            .join()
+            .expect("counted source server joins");
+    }
+}
+
+fn start_counted_nomic_source_override(roots: &[&std::path::Path]) -> CountedNomicSourceOverride {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
     let base_url = stub_base_url(&server);
     for root in roots {
         write_source_override(root, NOMIC_ID, &base_url, NOMIC_REVISION);
     }
     let request_count = Arc::new(AtomicUsize::new(0));
-    let server_thread = serve_nomic_fixture_until_idle_counted(server, Arc::clone(&request_count));
-    (request_count, server_thread)
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let counter = Arc::clone(&request_count);
+    let server_shutdown = Arc::clone(&shutdown);
+    let server_thread = std::thread::spawn(move || {
+        while !server_shutdown.load(Ordering::SeqCst) {
+            match server.recv_timeout(Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    respond_with_nomic_fixture(request);
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    CountedNomicSourceOverride {
+        request_count,
+        shutdown,
+        server_thread,
+    }
 }
 
 fn assert_headless_progress_payload(line: &str, target_path: &std::path::Path) {
@@ -255,8 +286,9 @@ fn sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode
     }
     let interactive_temp = tempfile::tempdir().expect("interactive tempdir");
     let headless_temp = tempfile::tempdir().expect("headless tempdir");
-    let (request_count, server_thread) =
+    let source_server =
         start_counted_nomic_source_override(&[interactive_temp.path(), headless_temp.path()]);
+    let request_count = Arc::clone(&source_server.request_count);
     let (_interactive_store_temp, interactive_store) = separate_store();
     let interactive = catalog_at(interactive_temp.path(), "host-A")
         .fetch(Some(&interactive_store), NOMIC_ID, OutputMode::Interactive)
@@ -265,7 +297,7 @@ fn sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode
     let headless = catalog_at(headless_temp.path(), "host-A")
         .resolve_for_sync_arrival(&headless_store, NOMIC_ID, OutputMode::Headless)
         .expect("headless resolve returns");
-    server_thread.join().expect("server thread joins");
+    source_server.shutdown_and_join();
     assert!(
         request_count.load(Ordering::SeqCst) >= 2,
         "interactive and headless cold paths should both use the configured local source override"
@@ -475,8 +507,8 @@ fn headless_mode_log_sink_receives_model_source_byte_size_payload_within_two_hun
         return;
     }
     let lock_temp = tempfile::tempdir().expect("lock tempdir");
-    let (log_request_count, log_server_thread) =
-        start_counted_nomic_source_override(&[lock_temp.path()]);
+    let log_source_server = start_counted_nomic_source_override(&[lock_temp.path()]);
+    let log_request_count = Arc::clone(&log_source_server.request_count);
     let held_lock = hold_model_lock(lock_temp.path(), NOMIC_ID);
     let (line_tx, line_rx) = mpsc::channel();
     let (call_tx, call_rx) = mpsc::channel();
@@ -515,19 +547,20 @@ fn headless_mode_log_sink_receives_model_source_byte_size_payload_within_two_hun
         fetch.join().expect("headless fetch thread joins"),
         Ok(FetchResult::Completed)
     );
-    log_server_thread.join().expect("log server thread joins");
+    log_source_server.shutdown_and_join();
     assert!(
         log_request_count.load(Ordering::SeqCst) > 0,
         "headless log child should complete through the local source override after lock release"
     );
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let (request_count, server_thread) = start_counted_nomic_source_override(&[temp.path()]);
+    let source_server = start_counted_nomic_source_override(&[temp.path()]);
+    let request_count = Arc::clone(&source_server.request_count);
     let (_store_temp, store) = separate_store();
     let _ = catalog_at(temp.path(), "host-A")
         .resolve_for_sync_arrival(&store, NOMIC_ID, OutputMode::Headless)
         .expect("resolve returns");
-    server_thread.join().expect("server thread joins");
+    source_server.shutdown_and_join();
     assert!(
         request_count.load(Ordering::SeqCst) > 0,
         "headless observation path should use the configured local source override"
@@ -544,8 +577,8 @@ fn headless_mode_log_sink_receives_model_source_byte_size_payload_within_two_hun
             }))
     }));
     let stderr_temp = tempfile::tempdir().expect("stderr child tempdir");
-    let (stderr_request_count, stderr_server_thread) =
-        start_counted_nomic_source_override(&[stderr_temp.path()]);
+    let stderr_source_server = start_counted_nomic_source_override(&[stderr_temp.path()]);
+    let stderr_request_count = Arc::clone(&stderr_source_server.request_count);
     let output = Command::new(std::env::current_exe().expect("current test binary"))
         .arg("--exact")
         .arg("sync_arrival::headless_mode_log_sink_receives_model_source_byte_size_payload_within_two_hundred_fifty_milliseconds")
@@ -555,9 +588,7 @@ fn headless_mode_log_sink_receives_model_source_byte_size_payload_within_two_hun
         .stderr(Stdio::piped())
         .output()
         .expect("headless stderr child runs");
-    stderr_server_thread
-        .join()
-        .expect("stderr server thread joins");
+    stderr_source_server.shutdown_and_join();
     assert!(
         stderr_request_count.load(Ordering::SeqCst) > 0,
         "headless stderr probe should resolve through the local source override"

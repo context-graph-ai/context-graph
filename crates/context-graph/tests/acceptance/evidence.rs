@@ -3604,15 +3604,35 @@ fn basis_diff_under_concurrent_writer_returns_one_consistent_basis_to_current_dr
             })
         })
         .collect::<Vec<_>>();
+    barrier.wait();
+    let progress_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let progress_reached = loop {
+        if committed.load(std::sync::atomic::Ordering::SeqCst) >= 50 {
+            break true;
+        }
+        if std::time::Instant::now() >= progress_deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+    match progress_reached {
+        true => {}
+        false => {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            for writer in writers {
+                writer.join().expect("writer joined after progress timeout");
+            }
+            panic!(
+                "writer flood did not create 50 durable snapshots before basis_diff; committed={}, attempts={}",
+                committed.load(std::sync::atomic::Ordering::SeqCst),
+                attempts.load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
+    }
     let diff_config = config.clone();
-    let diff_barrier = std::sync::Arc::clone(&barrier);
     let diff_committed = std::sync::Arc::clone(&committed);
     std::thread::spawn(move || {
         let reader = Store::open(diff_config).expect("reader");
-        diff_barrier.wait();
-        while diff_committed.load(std::sync::atomic::Ordering::SeqCst) < 50 {
-            std::thread::yield_now();
-        }
         let before = diff_committed.load(std::sync::atomic::Ordering::SeqCst);
         let diff = reader.basis_diff(decision);
         let after = diff_committed.load(std::sync::atomic::Ordering::SeqCst);

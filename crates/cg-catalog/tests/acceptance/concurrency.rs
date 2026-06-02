@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc, Barrier, Mutex,
+    Arc, Barrier, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -192,13 +192,52 @@ fn start_first_response_gated_nomic_server(
     (first_request_rx, release_tx, request_count, server_thread)
 }
 
-struct DelayedSourceProbe {
+struct OverlapSourceProbe {
     nomic_model_requests: Arc<std::sync::atomic::AtomicUsize>,
     gemma_model_requests: Arc<std::sync::atomic::AtomicUsize>,
+    overlap_gate: Arc<(Mutex<ModelRequestOverlapState>, Condvar)>,
     server_thread: std::thread::JoinHandle<()>,
 }
 
-fn start_delayed_nomic_and_gemma_source_server(root: &std::path::Path) -> DelayedSourceProbe {
+#[derive(Default)]
+struct ModelRequestOverlapState {
+    active: usize,
+    max_active: usize,
+    overlap_observed: bool,
+    timed_out_waiting_for_overlap: bool,
+}
+
+fn wait_for_model_request_overlap(gate: &Arc<(Mutex<ModelRequestOverlapState>, Condvar)>) {
+    let (lock, cvar) = &**gate;
+    let mut state = lock.lock().expect("overlap state lock");
+    state.active += 1;
+    state.max_active = state.max_active.max(state.active);
+    if state.active >= 2 {
+        state.overlap_observed = true;
+        cvar.notify_all();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !state.overlap_observed {
+        let now = Instant::now();
+        if now >= deadline {
+            state.timed_out_waiting_for_overlap = true;
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let (next, wait_result) = cvar
+            .wait_timeout(state, remaining)
+            .expect("overlap cvar wait");
+        state = next;
+        if wait_result.timed_out() && !state.overlap_observed {
+            state.timed_out_waiting_for_overlap = true;
+            break;
+        }
+    }
+    state.active -= 1;
+    cvar.notify_all();
+}
+
+fn start_overlap_gated_nomic_and_gemma_source_server(root: &std::path::Path) -> OverlapSourceProbe {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
     let base_url = stub_base_url(&server);
     let (gemma_source_dir, _unique_token) =
@@ -218,8 +257,13 @@ fn start_delayed_nomic_and_gemma_source_server(root: &std::path::Path) -> Delaye
     );
     let nomic_model_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gemma_model_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let overlap_gate = Arc::new((
+        Mutex::new(ModelRequestOverlapState::default()),
+        Condvar::new(),
+    ));
     let nomic_counter = Arc::clone(&nomic_model_requests);
     let gemma_counter = Arc::clone(&gemma_model_requests);
+    let server_overlap_gate = Arc::clone(&overlap_gate);
     let server_thread = std::thread::spawn(move || {
         while let Ok(Some(request)) = server.recv_timeout(Duration::from_secs(5)) {
             let url = request.url().to_string();
@@ -229,8 +273,11 @@ fn start_delayed_nomic_and_gemma_source_server(root: &std::path::Path) -> Delaye
                     gemma_counter.fetch_add(1, Ordering::SeqCst);
                 }
                 let gemma_source_dir = gemma_source_dir.clone();
+                let overlap_gate = Arc::clone(&server_overlap_gate);
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(200));
+                    if is_model {
+                        wait_for_model_request_overlap(&overlap_gate);
+                    }
                     respond_with_model_dir(request, &gemma_source_dir);
                 });
             } else {
@@ -238,16 +285,20 @@ fn start_delayed_nomic_and_gemma_source_server(root: &std::path::Path) -> Delaye
                     assert!(url.contains(NOMIC_ID), "unexpected source URL {url}");
                     nomic_counter.fetch_add(1, Ordering::SeqCst);
                 }
+                let overlap_gate = Arc::clone(&server_overlap_gate);
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(200));
+                    if is_model {
+                        wait_for_model_request_overlap(&overlap_gate);
+                    }
                     respond_with_fixture_for_model(request, "nomic");
                 });
             }
         }
     });
-    DelayedSourceProbe {
+    OverlapSourceProbe {
         nomic_model_requests,
         gemma_model_requests,
+        overlap_gate,
         server_thread,
     }
 }
@@ -406,65 +457,40 @@ fn concurrent_writers_to_different_model_dirs_do_not_block_each_other() {
         return;
     }
     let temp = tempfile::tempdir().expect("tempdir");
-
-    let baseline_root = temp.path().join("baseline");
-    fs::create_dir_all(&baseline_root).expect("baseline root created");
-    let baseline_probe = start_delayed_nomic_and_gemma_source_server(&baseline_root);
-    let baseline_started = Instant::now();
-    let baseline_result =
-        catalog_at(&baseline_root, "host-A").fetch(None, NOMIC_ID, OutputMode::Headless);
-    let t1 = baseline_started.elapsed();
-    baseline_probe
-        .server_thread
-        .join()
-        .expect("baseline source server joins");
-    assert_eq!(baseline_result, Ok(FetchResult::Completed));
-    assert!(
-        t1 > Duration::from_millis(100),
-        "single-fetch baseline must prove the delayed stub is actually slow"
-    );
-    assert_eq!(
-        baseline_probe.nomic_model_requests.load(Ordering::SeqCst),
-        1,
-        "baseline should make exactly one Nomic model.safetensors request"
-    );
-
     let parallel_root = temp.path().join("parallel");
     fs::create_dir_all(&parallel_root).expect("parallel root created");
     prepare_preaccepted_gemma_for_fetch(&parallel_root);
-    let parallel_probe = start_delayed_nomic_and_gemma_source_server(&parallel_root);
+    let parallel_probe = start_overlap_gated_nomic_and_gemma_source_server(&parallel_root);
     let barrier = Arc::new(Barrier::new(2));
-    let parallel_started = Instant::now();
     let nomic_barrier = Arc::clone(&barrier);
     let nomic_root = parallel_root.clone();
     let nomic = std::thread::spawn(move || {
         nomic_barrier.wait();
-        let result = catalog_at(nomic_root, "host-A").fetch(None, NOMIC_ID, OutputMode::Headless);
-        (result, Instant::now())
+        catalog_at(nomic_root, "host-A").fetch(None, NOMIC_ID, OutputMode::Headless)
     });
     let gemma_barrier = Arc::clone(&barrier);
     let gemma_root = parallel_root.clone();
     let gemma = std::thread::spawn(move || {
         gemma_barrier.wait();
-        let result = catalog_at(gemma_root, "host-A").fetch(None, GEMMA_ID, OutputMode::Headless);
-        (result, Instant::now())
+        catalog_at(gemma_root, "host-A").fetch(None, GEMMA_ID, OutputMode::Headless)
     });
-    let (nomic_result, nomic_done) = nomic.join().expect("nomic fetch thread joins");
-    let (gemma_result, gemma_done) = gemma.join().expect("gemma fetch thread joins");
-    let t2 = std::cmp::max(nomic_done, gemma_done).duration_since(parallel_started);
+    let nomic_result = nomic.join().expect("nomic fetch thread joins");
+    let gemma_result = gemma.join().expect("gemma fetch thread joins");
     parallel_probe
         .server_thread
         .join()
         .expect("parallel source server joins");
     assert_eq!(nomic_result, Ok(FetchResult::Completed));
     assert_eq!(gemma_result, Ok(FetchResult::Completed));
-    assert!(
-        t2 < Duration::from_millis(150) + t1,
-        "parallel two-model fetch should stay near the single-fetch baseline"
+    let (overlap_lock, _) = &*parallel_probe.overlap_gate;
+    let overlap_state = overlap_lock.lock().expect("overlap state lock");
+    assert_eq!(
+        overlap_state.max_active, 2,
+        "parallel two-model fetch should put both model.safetensors requests in flight together"
     );
     assert!(
-        t2 < (t1 * 2) - Duration::from_millis(50),
-        "parallel two-model fetch should not serialize behind a global lock"
+        !overlap_state.timed_out_waiting_for_overlap,
+        "one model.safetensors request waited without observing the other model in flight"
     );
     assert_eq!(
         parallel_probe.nomic_model_requests.load(Ordering::SeqCst),
