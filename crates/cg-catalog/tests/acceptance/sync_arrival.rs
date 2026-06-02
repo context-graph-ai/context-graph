@@ -112,8 +112,15 @@ fn sync_fetch_child_if_requested() -> bool {
     let model_id = std::env::var("CG_CATALOG_SYNC_FETCH_MODEL").expect("model env");
     let root = std::path::PathBuf::from(root);
     let (_store_temp, store) = separate_store();
-    let result =
-        catalog_at(root, "host-A").resolve_for_sync_arrival(&store, model_id, OutputMode::Headless);
+    let mut catalog = catalog_at(root, "host-A");
+    if let Some(progress_file) = std::env::var_os("CG_CATALOG_SYNC_FETCH_PROGRESS_FILE") {
+        let progress_file = std::path::PathBuf::from(progress_file);
+        catalog = catalog.with_progress_observer(move |_| {
+            std::fs::write(&progress_file, b"fetch-starting")
+                .expect("sync fetch progress file written");
+        });
+    }
+    let result = catalog.resolve_for_sync_arrival(&store, model_id, OutputMode::Headless);
     match result {
         Ok(result) => {
             if let Ok(expected) = std::env::var("CG_CATALOG_SYNC_EXPECT_RESULT") {
@@ -134,16 +141,73 @@ fn spawn_sync_fetch_child(
     model_id: &str,
     expected_result: &str,
 ) -> Child {
-    Command::new(std::env::current_exe().expect("current test binary"))
+    spawn_sync_fetch_child_inner(test_name, root, model_id, expected_result, None)
+}
+
+fn spawn_sync_fetch_child_with_progress_file(
+    test_name: &str,
+    root: &std::path::Path,
+    model_id: &str,
+    expected_result: &str,
+    progress_file: &std::path::Path,
+) -> Child {
+    spawn_sync_fetch_child_inner(
+        test_name,
+        root,
+        model_id,
+        expected_result,
+        Some(progress_file),
+    )
+}
+
+fn spawn_sync_fetch_child_inner(
+    test_name: &str,
+    root: &std::path::Path,
+    model_id: &str,
+    expected_result: &str,
+    progress_file: Option<&std::path::Path>,
+) -> Child {
+    let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+    command
         .arg("--exact")
         .arg(test_name)
         .env("CG_CATALOG_SYNC_FETCH_ROOT", root)
         .env("CG_CATALOG_SYNC_FETCH_MODEL", model_id)
-        .env("CG_CATALOG_SYNC_EXPECT_RESULT", expected_result)
+        .env("CG_CATALOG_SYNC_EXPECT_RESULT", expected_result);
+    if let Some(progress_file) = progress_file {
+        command.env("CG_CATALOG_SYNC_FETCH_PROGRESS_FILE", progress_file);
+    }
+    command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("sync fetch child starts")
+}
+
+fn assert_child_success(child: Child, label: &str) {
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("{label} output collected: {err:?}"));
+    assert!(
+        output.status.success(),
+        "{label} exited unsuccessfully\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn wait_for_child_progress_file(child: &mut Child, progress_file: &std::path::Path, label: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !progress_file.exists() {
+        if let Some(status) = child.try_wait().expect("child status readable") {
+            panic!("{label} exited before reaching fetch progress path: {status}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label} did not reach fetch progress path before timeout"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn respond_with_nomic_fixture(request: tiny_http::Request) {
@@ -156,36 +220,61 @@ fn respond_with_nomic_fixture(request: tiny_http::Request) {
     let _ = request.respond(tiny_http::Response::from_data(bytes));
 }
 
+struct FirstResponseGatedNomicServer {
+    first_request_rx: mpsc::Receiver<()>,
+    release_tx: mpsc::Sender<()>,
+    shutdown: Arc<AtomicBool>,
+    server_thread: std::thread::JoinHandle<()>,
+}
+
+impl FirstResponseGatedNomicServer {
+    fn shutdown_and_join(self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.server_thread
+            .join()
+            .expect("gated source server joins");
+    }
+}
+
 fn start_first_response_gated_nomic_server(
     root: &std::path::Path,
-) -> (
-    mpsc::Receiver<()>,
-    mpsc::Sender<()>,
-    std::thread::JoinHandle<()>,
-) {
+) -> FirstResponseGatedNomicServer {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
     let base_url = stub_base_url(&server);
     write_source_override(root, NOMIC_ID, &base_url, NOMIC_REVISION);
     let (first_request_tx, first_request_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
     let server_thread = std::thread::spawn(move || {
         let mut first_release = Some(release_rx);
-        while let Ok(Some(request)) = server.recv_timeout(Duration::from_secs(5)) {
-            if let Some(release_rx) = first_release.take() {
-                let first_request_tx = first_request_tx.clone();
-                std::thread::spawn(move || {
-                    first_request_tx.send(()).expect("first request signalled");
-                    release_rx
-                        .recv_timeout(Duration::from_secs(3))
-                        .expect("first response release signal");
-                    respond_with_nomic_fixture(request);
-                });
-            } else {
-                std::thread::spawn(move || respond_with_nomic_fixture(request));
+        while !server_shutdown.load(Ordering::SeqCst) {
+            match server.recv_timeout(Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    if let Some(release_rx) = first_release.take() {
+                        let first_request_tx = first_request_tx.clone();
+                        std::thread::spawn(move || {
+                            first_request_tx.send(()).expect("first request signalled");
+                            release_rx
+                                .recv_timeout(Duration::from_secs(30))
+                                .expect("first response release signal");
+                            respond_with_nomic_fixture(request);
+                        });
+                    } else {
+                        std::thread::spawn(move || respond_with_nomic_fixture(request));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => break,
             }
         }
     });
-    (first_request_rx, release_tx, server_thread)
+    FirstResponseGatedNomicServer {
+        first_request_rx,
+        release_tx,
+        shutdown,
+        server_thread,
+    }
 }
 
 struct CountedNomicSourceOverride {
@@ -341,35 +430,40 @@ fn sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode
     );
 
     let lock_temp = tempfile::tempdir().expect("lock tempdir");
-    let (first_request_rx, release_tx, server_thread) =
-        start_first_response_gated_nomic_server(lock_temp.path());
-    let mut winner = spawn_sync_fetch_child(
+    let gated_server = start_first_response_gated_nomic_server(lock_temp.path());
+    let winner = spawn_sync_fetch_child(
         "sync_arrival::sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode_observation_single_producer_lockfile_serialises_writers",
         lock_temp.path(),
         NOMIC_ID,
         "Completed",
     );
     assert!(
-        first_request_rx
+        gated_server
+            .first_request_rx
             .recv_timeout(Duration::from_millis(700))
             .is_ok(),
         "first headless resolver should reach the configured source before publishing artifacts"
     );
-    let mut blocked = spawn_sync_fetch_child(
+    let blocked_progress_file = lock_temp.path().join(".blocked-sync-fetch-started");
+    let mut blocked = spawn_sync_fetch_child_with_progress_file(
         "sync_arrival::sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode_observation_single_producer_lockfile_serialises_writers",
         lock_temp.path(),
         NOMIC_ID,
         "AlreadyCachedByConcurrentWinner",
+        &blocked_progress_file,
     );
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    wait_for_child_progress_file(&mut blocked, &blocked_progress_file, "blocked sync child");
     assert!(
         blocked.try_wait().expect("child status readable").is_none(),
         "headless sync-arrival should block on the same per-model lockfile as interactive fetch"
     );
-    release_tx.send(()).expect("release first source response");
-    assert!(winner.wait().expect("winner sync child waits").success());
-    assert!(blocked.wait().expect("sync child waits").success());
-    server_thread.join().expect("server thread joins");
+    gated_server
+        .release_tx
+        .send(())
+        .expect("release first source response");
+    assert_child_success(winner, "winner sync child");
+    assert_child_success(blocked, "blocked sync child");
+    gated_server.shutdown_and_join();
 }
 
 #[test]
