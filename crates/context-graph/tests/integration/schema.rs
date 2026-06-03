@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 use context_graph::schema::{DIGEST_VECTOR_DIMENSION, TABLES};
 use contextdb_core::{Error, TxId, Value};
@@ -199,6 +200,121 @@ fn store_decision_context(
         .expect("decision")
         .expect("decision row")
         .context_id
+}
+
+#[derive(Debug)]
+enum ConcurrentInvalidationReady {
+    Opened {
+        writer: usize,
+    },
+    OpenFailed {
+        writer: usize,
+        error: context_graph::CgError,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConcurrentInvalidationRelease {
+    Run,
+    Abort,
+}
+
+#[derive(Debug)]
+enum ConcurrentInvalidationWriterResult {
+    Winner {
+        writer: usize,
+    },
+    IllegalLoser {
+        writer: usize,
+        from: context_graph::DecisionStatus,
+        to: context_graph::DecisionStatus,
+    },
+    OtherError {
+        writer: usize,
+        error: context_graph::CgError,
+    },
+    OpenFailed {
+        writer: usize,
+        error: context_graph::CgError,
+    },
+    ReleaseAborted {
+        writer: usize,
+    },
+    ReleaseChannelClosed {
+        writer: usize,
+    },
+}
+
+impl ConcurrentInvalidationWriterResult {
+    fn is_winner(&self) -> bool {
+        matches!(self, Self::Winner { .. })
+    }
+
+    fn is_intended_loser(&self) -> bool {
+        matches!(
+            self,
+            Self::IllegalLoser {
+                from: context_graph::DecisionStatus::Invalidated,
+                to: context_graph::DecisionStatus::Invalidated,
+                ..
+            }
+        )
+    }
+}
+
+fn classify_invalidation_writer_result(
+    writer: usize,
+    result: context_graph::Result<context_graph::DecisionInvalidationResult>,
+) -> ConcurrentInvalidationWriterResult {
+    match result {
+        Ok(_) => ConcurrentInvalidationWriterResult::Winner { writer },
+        Err(context_graph::CgError::IllegalTransition { from, to }) => {
+            ConcurrentInvalidationWriterResult::IllegalLoser { writer, from, to }
+        }
+        Err(error) => ConcurrentInvalidationWriterResult::OtherError { writer, error },
+    }
+}
+
+fn concurrent_invalidation_ready_summary(statuses: &[ConcurrentInvalidationReady]) -> Vec<String> {
+    statuses
+        .iter()
+        .map(|status| match status {
+            ConcurrentInvalidationReady::Opened { writer } => {
+                format!("writer {writer}: opened")
+            }
+            ConcurrentInvalidationReady::OpenFailed { writer, error } => {
+                format!("writer {writer}: open failed: {error:?}")
+            }
+        })
+        .collect()
+}
+
+fn concurrent_invalidation_result_summary(
+    results: &[ConcurrentInvalidationWriterResult],
+) -> Vec<String> {
+    results
+        .iter()
+        .map(|result| match result {
+            ConcurrentInvalidationWriterResult::Winner { writer } => {
+                format!("writer {writer}: winner")
+            }
+            ConcurrentInvalidationWriterResult::IllegalLoser { writer, from, to } => {
+                format!("writer {writer}: illegal loser {from:?} -> {to:?}")
+            }
+            ConcurrentInvalidationWriterResult::OtherError { writer, error } => {
+                format!("writer {writer}: other error {error:?}")
+            }
+            ConcurrentInvalidationWriterResult::OpenFailed { writer, error } => {
+                format!("writer {writer}: open failed {error:?}")
+            }
+            ConcurrentInvalidationWriterResult::ReleaseAborted { writer } => {
+                format!("writer {writer}: release aborted")
+            }
+            ConcurrentInvalidationWriterResult::ReleaseChannelClosed { writer } => {
+                format!("writer {writer}: release channel closed")
+            }
+        })
+        .collect()
 }
 
 fn uuid(n: u128) -> String {
@@ -2832,31 +2948,79 @@ fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidati
         ..Default::default()
     };
     let (decision_id, trigger_id) = seed_store_decision(&config);
-    let barrier = Arc::new(Barrier::new(4));
-    let handles: Vec<_> = (0..4)
+    const WRITER_COUNT: usize = 4;
+    let barrier = Arc::new(Barrier::new(WRITER_COUNT));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let mut release_txs = Vec::with_capacity(WRITER_COUNT);
+    let mut handles = Vec::with_capacity(WRITER_COUNT);
+    for writer in 0..WRITER_COUNT {
+        let config = config.clone();
+        let barrier = Arc::clone(&barrier);
+        let ready_tx = ready_tx.clone();
+        let (release_tx, release_rx) = mpsc::channel();
+        release_txs.push(release_tx);
+        handles.push(std::thread::spawn(move || {
+            let store = match context_graph::Store::open(config) {
+                Ok(store) => store,
+                Err(error) => {
+                    let _ = ready_tx.send(ConcurrentInvalidationReady::OpenFailed {
+                        writer,
+                        error: error.clone(),
+                    });
+                    return ConcurrentInvalidationWriterResult::OpenFailed { writer, error };
+                }
+            };
+            ready_tx
+                .send(ConcurrentInvalidationReady::Opened { writer })
+                .expect("writer ready sent");
+            match release_rx.recv() {
+                Ok(ConcurrentInvalidationRelease::Run) => {}
+                Ok(ConcurrentInvalidationRelease::Abort) => {
+                    return ConcurrentInvalidationWriterResult::ReleaseAborted { writer };
+                }
+                Err(_) => {
+                    return ConcurrentInvalidationWriterResult::ReleaseChannelClosed { writer };
+                }
+            }
+            barrier.wait();
+            classify_invalidation_writer_result(
+                writer,
+                store.invalidate_decision(decision_id, trigger_id, "basis drift"),
+            )
+        }));
+    }
+    drop(ready_tx);
+    let ready = (0..WRITER_COUNT)
         .map(|_| {
-            let config = config.clone();
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                let store = context_graph::Store::open(config).expect("writer open");
-                barrier.wait();
-                store.invalidate_decision(decision_id, trigger_id, "basis drift")
-            })
+            ready_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("all invalidation writers report readiness")
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let all_opened = ready
+        .iter()
+        .all(|status| matches!(status, ConcurrentInvalidationReady::Opened { .. }));
+    for release_tx in release_txs {
+        let _ = release_tx.send(if all_opened {
+            ConcurrentInvalidationRelease::Run
+        } else {
+            ConcurrentInvalidationRelease::Abort
+        });
+    }
     let results: Vec<_> = handles
         .into_iter()
         .map(|handle| handle.join().expect("writer joined"))
         .collect();
-    let ok_count = results.iter().filter(|result| result.is_ok()).count();
+    let ready_summary = concurrent_invalidation_ready_summary(&ready);
+    let result_summary = concurrent_invalidation_result_summary(&results);
+    assert!(
+        all_opened,
+        "all invalidation writers must open before contention\nready: {ready_summary:#?}\nresults: {result_summary:#?}"
+    );
+    let ok_count = results.iter().filter(|result| result.is_winner()).count();
     let illegal_count = results
         .iter()
-        .filter(|result| {
-            matches!(
-                result,
-                Err(context_graph::CgError::IllegalTransition { .. })
-            )
-        })
+        .filter(|result| result.is_intended_loser())
         .count();
     let reader = context_graph::Store::open(config).expect("reader");
     let invalidation_rows = reader
@@ -2868,10 +3032,17 @@ fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidati
         .expect("invalidations");
     assert_eq!(
         ok_count, 1,
-        "conditional invalidation must have exactly one winner"
+        "conditional invalidation must have exactly one winner\nresults: {result_summary:#?}\ninvalidation rows: {invalidation_rows:#?}"
     );
-    assert_eq!(illegal_count, 3);
-    assert_eq!(invalidation_rows.len(), 1);
+    assert_eq!(
+        illegal_count, 3,
+        "losing contenders must surface the intended Invalidated -> Invalidated transition\nresults: {result_summary:#?}\ninvalidation rows: {invalidation_rows:#?}"
+    );
+    assert_eq!(
+        invalidation_rows.len(),
+        1,
+        "contended invalidation must commit exactly one row\nresults: {result_summary:#?}\ninvalidation rows: {invalidation_rows:#?}"
+    );
 }
 
 #[test]
