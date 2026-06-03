@@ -17,12 +17,14 @@ path = "src/lib.rs"
 
 [dependencies]
 candle-embeddinggemma.workspace = true
+candle-core.workspace = true
 context-graph = { path = "../context-graph" }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 chrono.workspace = true
 fs4.workspace = true
 indicatif.workspace = true
+safetensors.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
