@@ -90,6 +90,63 @@ fn read_workflow_yaml() -> YamlValue {
         .expect("workflow yaml")
 }
 
+fn default_build_dependency_names(manifest_path: &str) -> Vec<String> {
+    let contents = read_workspace_file(manifest_path);
+    let mut dependencies = Vec::new();
+    let mut active_default_build_section = false;
+    let mut multiline = None;
+    for raw_line in contents.lines() {
+        let line = strip_unquoted_toml_comment(raw_line, &mut multiline);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            let section = toml_table_name(line);
+            active_default_build_section = matches!(
+                section.as_deref(),
+                Some("dependencies" | "build-dependencies")
+            );
+            continue;
+        }
+        if active_default_build_section
+            && let Some((raw_key, _)) = line.split_once('=')
+            && let Some(name) = toml_key_parts(raw_key).first()
+        {
+            dependencies.push(name.clone());
+        }
+    }
+    dependencies
+}
+
+fn locked_package_names() -> Vec<String> {
+    let lockfile = read_workspace_file("Cargo.lock");
+    let mut names = Vec::new();
+    let mut in_package = false;
+    let mut multiline = None;
+    for raw_line in lockfile.lines() {
+        let line = strip_unquoted_toml_comment(raw_line, &mut multiline);
+        let line = line.trim();
+        if line == "[[package]]" {
+            in_package = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            in_package = false;
+            continue;
+        }
+        if in_package
+            && let Some((raw_key, raw_value)) = line.split_once('=')
+            && toml_key_parts(raw_key).as_slice() == ["name"]
+        {
+            let value = raw_value.trim().trim_matches('"').trim_matches('\'');
+            names.push(decode_toml_key_escapes(value));
+            in_package = false;
+        }
+    }
+    names
+}
+
 fn assert_no_cargo_audit_aliases() {
     let aliases = cargo_config_audit_aliases();
     assert!(
@@ -1490,6 +1547,27 @@ fn ci_runs_cargo_deny_and_cargo_expand_symbol_check() {
     for step in &steps {
         let _ = step_with_fields(step);
     }
+}
+
+#[test]
+fn default_build_dep_tree_for_context_graph_and_cg_catalog_has_no_tokio_runtime() {
+    let root_manifests = [
+        "crates/context-graph/Cargo.toml",
+        "crates/cg-catalog/Cargo.toml",
+    ];
+    let direct_default_build_deps = root_manifests
+        .iter()
+        .flat_map(|manifest| default_build_dependency_names(manifest))
+        .collect::<Vec<_>>();
+    assert!(
+        !direct_default_build_deps.iter().any(|name| name == "tokio"),
+        "context-graph + cg-catalog default-build manifests must not directly depend on tokio: {direct_default_build_deps:?}"
+    );
+    let locked_packages = locked_package_names();
+    assert!(
+        !locked_packages.iter().any(|name| name == "tokio"),
+        "context-graph + cg-catalog default-build dependency tree must not pull tokio; Cargo.lock contains package `tokio`"
+    );
 }
 
 #[test]
