@@ -4,6 +4,7 @@ members = [
     "crates/context-graph",
     "crates/candle-embeddinggemma",
     "crates/cg-catalog",
+    "crates/cg-cli",
 ]
 
 [workspace.package]

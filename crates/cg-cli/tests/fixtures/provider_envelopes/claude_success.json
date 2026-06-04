@@ -1,0 +1,26 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "api_error_status": null,
+  "duration_ms": 2427,
+  "duration_api_ms": 1896,
+  "num_turns": 1,
+  "result": "Host session proof received. I can answer through the logged-in Claude CLI; turn capture should stay off until ingestion ships.",
+  "session_id": "6d8b4cb2-7f16-4c84-9e7f-9a43d7a51c30",
+  "total_cost_usd": 0.000278,
+  "usage": {
+    "input_tokens": 41,
+    "output_tokens": 24,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  },
+  "modelUsage": {
+    "claude-sonnet-4-20250514": {
+      "inputTokens": 41,
+      "outputTokens": 24,
+      "cacheCreationInputTokens": 0,
+      "cacheReadInputTokens": 0
+    }
+  }
+}

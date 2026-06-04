@@ -1,0 +1,25 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": true,
+  "api_error_status": 401,
+  "duration_ms": 431,
+  "duration_api_ms": 129,
+  "num_turns": 1,
+  "result": "Invalid API key. Please run /login in Claude Code or clear ANTHROPIC_API_KEY before retrying.",
+  "session_id": "8d5401f0-0f90-49de-9e34-8de97d89ad2c",
+  "usage": {
+    "input_tokens": 19,
+    "output_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  },
+  "modelUsage": {
+    "claude-sonnet-4-20250514": {
+      "inputTokens": 19,
+      "outputTokens": 0,
+      "cacheCreationInputTokens": 0,
+      "cacheReadInputTokens": 0
+    }
+  }
+}

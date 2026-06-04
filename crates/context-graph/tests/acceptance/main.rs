@@ -8,6 +8,7 @@ mod graph_entity_neighborhood;
 mod graph_intention_tree;
 mod graph_precedent_chain;
 mod graph_traverse;
+mod host_session_substrate_guards;
 mod impact_analysis;
 mod invalidation_lifecycle;
 mod llm_runtime;
