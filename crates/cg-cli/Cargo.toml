@@ -16,11 +16,11 @@ name = "cg"
 path = "src/main.rs"
 
 [dependencies]
+cg-catalog = { path = "../cg-catalog" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-cg-catalog = { path = "../cg-catalog" }
 context-graph = { path = "../context-graph" }
 tempfile.workspace = true

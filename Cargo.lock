@@ -535,6 +535,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "context-graph-cli"
+version = "0.1.0"
+dependencies = [
+ "cg-catalog",
+ "context-graph",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "contextdb-core"
 version = "1.0.0"
 dependencies = [

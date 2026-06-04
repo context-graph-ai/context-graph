@@ -69,8 +69,22 @@ impl LlmClient for NativeLlmClient {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CredentialSource {
-    EnvVar { env_var: String },
-    StoredSecret { secret_ref: String },
+    EnvVar {
+        env_var: String,
+    },
+    StoredSecret {
+        secret_ref: String,
+    },
+    HostSession {
+        provider: String,
+        account: String,
+        #[serde(default = "default_true")]
+        account_exposed: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for CredentialSource {
@@ -96,6 +110,17 @@ impl CredentialReference {
                 env_var: env_var.clone(),
             },
             env_var,
+        }
+    }
+
+    fn host_session(provider: String, account: String, account_exposed: bool) -> Self {
+        Self {
+            source: CredentialSource::HostSession {
+                provider,
+                account,
+                account_exposed,
+            },
+            env_var: String::new(),
         }
     }
 
@@ -260,6 +285,8 @@ struct ContextModelBinding {
 struct ModelConnectionCatalogFile {
     #[serde(default)]
     write_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_connection_name: Option<String>,
     connections: Vec<ConnectionRead>,
     models: Vec<ModelRead>,
     context_models: Vec<ContextModelBinding>,
@@ -273,6 +300,7 @@ pub struct ModelConnectionCatalog {
     models: BTreeMap<String, ModelRead>,
     context_models: BTreeMap<ContextId, String>,
     migration_records: Vec<MigrationRecord>,
+    active_connection_name: Option<String>,
     resolved_connection_log: Vec<String>,
     write_sequence: u64,
     persistence_errors: Arc<Mutex<Vec<String>>>,
@@ -316,6 +344,7 @@ impl ModelConnectionCatalog {
         let file = toml::from_str::<ModelConnectionCatalogFile>(&text)
             .map_err(|err| format!("parse {} failed: {err}", path.display()))?;
         self.write_sequence = file.write_sequence;
+        self.active_connection_name = file.active_connection_name;
         self.connections = file
             .connections
             .into_iter()
@@ -366,6 +395,7 @@ impl ModelConnectionCatalog {
         self.write_sequence = self.write_sequence.saturating_add(1);
         let file = ModelConnectionCatalogFile {
             write_sequence: self.write_sequence,
+            active_connection_name: self.active_connection_name.clone(),
             connections: self.connections.values().cloned().collect(),
             models: self.models.values().cloned().collect(),
             context_models: self
@@ -527,6 +557,67 @@ impl ModelConnectionCatalog {
             spend_owner: "unknown".to_string(),
         };
         self.connections.insert(name, read.clone());
+        self.active_connection_name = Some(read.name.clone());
+        self.persist();
+        read
+    }
+
+    pub fn connect_host_session(
+        &mut self,
+        name: impl Into<String>,
+        provider: impl Into<String>,
+        account: impl Into<String>,
+    ) -> ConnectionRead {
+        self.connect_host_session_with_account_exposure(name, provider, account, true)
+    }
+
+    pub fn connect_host_session_with_account_exposure(
+        &mut self,
+        name: impl Into<String>,
+        provider: impl Into<String>,
+        account: impl Into<String>,
+        account_exposed: bool,
+    ) -> ConnectionRead {
+        let name = name.into();
+        let provider = provider.into();
+        let account = account.into();
+        let existing = self.connections.get(&name).cloned();
+        let same_host_session = existing.as_ref().is_some_and(|connection| {
+            matches!(
+                &connection.credential_reference.source,
+                CredentialSource::HostSession {
+                    provider: existing_provider,
+                    account: existing_account,
+                    account_exposed: existing_account_exposed,
+                } if account_exposed
+                    && *existing_account_exposed
+                    && existing_provider == &provider
+                    && existing_account == &account
+            )
+        });
+        let read = ConnectionRead {
+            name: name.clone(),
+            credential_reference: CredentialReference::host_session(
+                provider,
+                account.clone(),
+                account_exposed,
+            ),
+            exposed_secret: None,
+            consent_recorded: existing
+                .as_ref()
+                .is_some_and(|connection| connection.consent_recorded && same_host_session),
+            spend_owner: existing
+                .and_then(|connection| {
+                    if connection.consent_recorded && same_host_session {
+                        Some(connection.spend_owner)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(account),
+        };
+        self.connections.insert(name, read.clone());
+        self.active_connection_name = Some(read.name.clone());
         self.persist();
         read
     }
@@ -733,11 +824,31 @@ impl ModelConnectionCatalog {
         self.connections.get(name).cloned()
     }
 
+    pub fn active_connection_name(&self) -> Option<String> {
+        self.active_connection_name.clone()
+    }
+
+    pub fn list_connections(&self) -> Vec<ConnectionRead> {
+        self.connections.values().cloned().collect()
+    }
+
     pub fn read_model(&self, id: &str) -> Option<ModelRead> {
         self.models
             .get(id)
             .cloned()
             .or_else(|| self.shipped_model(id))
+    }
+
+    pub fn list_models(&self) -> Vec<ModelRead> {
+        let mut models = self.models.clone();
+        if let Some(entries) = self.registered_entries() {
+            for entry in entries {
+                models
+                    .entry(entry.id.clone())
+                    .or_insert_with(|| model_read_from_entry(&entry));
+            }
+        }
+        models.into_values().collect()
     }
 
     pub fn bind_context_model(&mut self, context_id: ContextId, model_id: impl Into<String>) {
@@ -798,6 +909,7 @@ impl ModelConnectionCatalog {
                 String::new(),
                 config.resolve_stored_secret(principal, secret_ref),
             ),
+            CredentialSource::HostSession { .. } => (String::new(), None),
         };
         Some(CredentialResolution {
             connection_name: connection.name,

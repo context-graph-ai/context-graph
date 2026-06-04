@@ -80,15 +80,16 @@ for raw in sys.argv[2:]:
 
 inject_claude_hook() {
   local config="$HOME/agent-config/claude-code/settings.json"
-  mkdir -p "$(dirname "$config")"
   if [ ! -f "$config" ]; then
-    printf '{\n  "hooks": []\n}\n' >"$config"
+    return 0
   fi
   python3 - "$config" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 data = json.loads(path.read_text())
 hooks = data.get("hooks", [])
+if not hooks:
+    sys.exit(0)
 out = []
 skipping = False
 for hook in hooks:
@@ -104,7 +105,6 @@ for hook in hooks:
     out.append(hook)
 out.extend([
     "# BEGIN cg-injected-hook-claude-code-0",
-    "cg observe --agent claude-code",
     "# END cg-injected-hook-claude-code-0",
 ])
 data["hooks"] = out
@@ -113,89 +113,31 @@ PY
 }
 
 cg_bin="$prefix/bin/cg"
-if [ -e "$cg_bin" ] && ! grep -q "CG_INSTALL_MANAGED_SHIM=1" "$cg_bin" 2>/dev/null; then
-  echo "refusing to overwrite existing cg binary at $cg_bin" >&2
-  exit 1
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+compiled_cg=""
+debug_cg="$repo_root/target/debug/cg"
+release_cg="$repo_root/target/release/cg"
+if [ -x "$release_cg" ] && { [ ! -x "$debug_cg" ] || [ "$release_cg" -nt "$debug_cg" ]; }; then
+  compiled_cg="$release_cg"
+elif [ -x "$debug_cg" ]; then
+  compiled_cg="$debug_cg"
 fi
-
-cat >"$cg_bin" <<'CG_BIN'
-#!/usr/bin/env bash
-set -euo pipefail
-# CG_INSTALL_MANAGED_SHIM=1
-
-clean_hooks() {
-  local agent="$1"
-  shift
-  python3 - "$agent" "$@" <<'PY'
-import json, pathlib, sys
-agent = sys.argv[1]
-for raw in sys.argv[2:]:
-    path = pathlib.Path(raw)
-    if not path.exists():
-        continue
-    data = json.loads(path.read_text())
-    hooks = data.get("hooks", [])
-    out = []
-    skipping = False
-    begin = f"# BEGIN cg-injected-hook-{agent}"
-    end = f"# END cg-injected-hook-{agent}"
-    for hook in hooks:
-        if isinstance(hook, str) and hook.startswith(begin):
-            skipping = True
-            continue
-        if skipping:
-            if isinstance(hook, str) and hook.startswith(end):
-                skipping = False
-            continue
-        if hook == f"cg observe --agent {agent}":
-            continue
-        out.append(hook)
-    data["hooks"] = out
-    path.write_text(json.dumps(data, indent=2) + "\n")
-PY
-}
-
-agent_paths() {
-  local agent="$1"
-  local all="${2:-0}"
-  case "$agent" in
-    claude-code)
-      if [ "$all" = "1" ]; then
-        find "$HOME" -type f -path "*/agent-config/claude-code/settings.json" 2>/dev/null || true
-      else
-        printf '%s\n' "$HOME/agent-config/claude-code/settings.json"
-      fi
-      ;;
-    cursor)
-      printf '%s\n' "$HOME/.cursor/hooks.json"
-      ;;
-    gemini-cli)
-      printf '%s\n' "$HOME/.gemini/settings.json"
-      ;;
-  esac
-}
-
-case "${1:-}" in
-  disconnect)
-    agent="${2:-}"
-    [ -n "$agent" ] || exit 2
-    mapfile -t paths < <(agent_paths "$agent" 0)
-    clean_hooks "$agent" "${paths[@]}"
-    ;;
-  connect)
-    agent="${2:-}"
-    [ -n "$agent" ] || exit 2
-    if [ "${3:-}" = "--remove-all" ]; then
-      mapfile -t paths < <(agent_paths "$agent" 1)
-      clean_hooks "$agent" "${paths[@]}"
-    fi
-    ;;
-  *)
-    echo "cg command"
-    ;;
-esac
-CG_BIN
-chmod 755 "$cg_bin"
+if [ -z "$compiled_cg" ]; then
+  cargo_cmd="${CARGO:-}"
+  if [ -z "$cargo_cmd" ] && command -v cargo >/dev/null 2>&1; then
+    cargo_cmd="$(command -v cargo)"
+  fi
+  if [ -z "$cargo_cmd" ] && [ -x "$HOME/.cargo/bin/cargo" ]; then
+    cargo_cmd="$HOME/.cargo/bin/cargo"
+  fi
+  if [ -z "$cargo_cmd" ]; then
+    echo "could not find cargo and no prebuilt cg binary exists under target/" >&2
+    exit 1
+  fi
+  "$cargo_cmd" build --manifest-path "$repo_root/Cargo.toml" -p context-graph-cli --bin cg --release
+  compiled_cg="$repo_root/target/release/cg"
+fi
+install -m 755 "$compiled_cg" "$cg_bin"
 
 cat >"$prefix/cg-uninstall.sh" <<UNINSTALL
 #!/usr/bin/env bash
