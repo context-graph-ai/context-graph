@@ -530,7 +530,7 @@ impl Store {
                 &basis_snapshots,
             ) {
                 let _ = self.db.rollback(tx);
-                if decision_basis_retry_unique(&err) && attempt < 7 {
+                if decision_basis_retry_conflict(&err) && attempt < 7 {
                     std::thread::yield_now();
                     continue;
                 }
@@ -538,7 +538,7 @@ impl Store {
             }
             match self.db.commit(tx).map_err(map_engine_err) {
                 Ok(()) => return Ok(()),
-                Err(err) if decision_basis_retry_unique(&err) && attempt < 7 => {
+                Err(err) if decision_basis_retry_conflict(&err) && attempt < 7 => {
                     std::thread::yield_now();
                     continue;
                 }
@@ -1036,14 +1036,18 @@ fn value_diffs(
     diffs
 }
 
-fn decision_basis_retry_unique(err: &CgError) -> bool {
-    matches!(
-        err,
+fn decision_basis_retry_conflict(err: &CgError) -> bool {
+    match err {
         CgError::UniqueViolation {
             entity: "decision_basis_snapshot",
             ..
-        }
-    )
+        } => true,
+        CgError::NotFound {
+            id: Some(id),
+            missing: None,
+        } => id.contains("decision_basis_snapshots"),
+        _ => false,
+    }
 }
 
 pub(super) fn decode_invalidation(columns: &[String], row: &[Value]) -> Result<Invalidation> {

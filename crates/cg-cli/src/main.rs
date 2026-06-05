@@ -1,19 +1,20 @@
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cg_catalog::{Catalog, CredentialSource, ModelConnectionCatalog, Source};
-use cg_cli::{Classification, construct_claude_invocation, extract_reply, load_provider_specs};
+use cg_catalog::{
+    Catalog, CredentialSource, HostSessionProbe, ModelConnectionCatalog, ModelProofError,
+    PrincipalAwareConfig, Source, UnderstandingRuntime, load_provider_specs,
+    model_connection_system_principal, probe_host_session_provider, provider_tool_available,
+    register_model_connection_checks_with_root,
+};
+use cg_cli::{CheckRegistry, run_doctor_checks};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 const INGESTION_EXPECTATION: &str = "automatic capture switches on when ingestion ships";
 const CONNECTION_SCOPE: &str = "connection-substrate";
-const PROVIDERS: [&str; 3] = ["claude", "codex", "agy"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
@@ -28,31 +29,6 @@ struct Candidate {
     account_exposed: bool,
 }
 
-#[derive(Clone, Debug)]
-enum ProbeResult {
-    Valid {
-        account: String,
-        account_exposed: bool,
-    },
-    Expired,
-    NotDrivable,
-    Missing,
-}
-
-#[derive(Clone, Debug)]
-struct AuthAccount {
-    label: String,
-    exposed: bool,
-}
-
-#[derive(Debug)]
-struct ProviderRun {
-    status: Option<ExitStatus>,
-    stdout: String,
-    stderr: String,
-    timed_out: bool,
-}
-
 #[derive(Debug, Deserialize)]
 struct RawCatalogRegistrations {
     entries: Vec<cg_catalog::CatalogEntry>,
@@ -65,6 +41,9 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> i32 {
+    if let Some(message) = format_usage_error(&args) {
+        return usage_error(&message);
+    }
     match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") => {
             print_help();
@@ -87,7 +66,7 @@ fn run(args: Vec<String>) -> i32 {
 
 fn print_help() {
     println!(
-        "Usage: cg <command>\n\nCommands:\n  model auth login    Connect cg to an existing model host session\n  model list          List registered models\n  model show <id>     Show model metadata\n  status              Show model connection status\n  selftest            Spend one consented proof call\n  doctor              Run free model-provider diagnostics"
+        "Usage: cg <command>\n\nCommands:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  status                        Show model connection status\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n\nExamples:\n  cg model auth login --connection claude --consent\n  cg status\n  cg selftest"
     );
 }
 
@@ -98,6 +77,12 @@ fn usage_error(message: &str) -> i32 {
 
 fn handle_model(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
+        Some("--help") | Some("-h") => {
+            println!(
+                "Usage: cg model <command>\n\nCommands:\n  auth login    Connect cg to an existing model host session\n  list          List registered models\n  show <id>     Show model metadata\n\nExamples:\n  cg model auth login --connection claude --consent\n  cg model list\n  cg model show embeddinggemma-300m"
+            );
+            0
+        }
         Some("list") => handle_model_list(&args[1..]),
         Some("show") => handle_model_show(&args[1..]),
         Some("auth") if args.get(1).map(String::as_str) == Some("login") => {
@@ -109,6 +94,12 @@ fn handle_model(args: &[String]) -> i32 {
 }
 
 fn handle_model_list(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg model list [--format json|text]\n\nExamples:\n  cg model list\n  cg model list --format text"
+        );
+        return 0;
+    }
     let format = output_format(args);
     if has_log_info(args) {
         eprintln!("INFO listing registered model connection catalog entries");
@@ -150,6 +141,12 @@ fn handle_model_list(args: &[String]) -> i32 {
 }
 
 fn handle_model_show(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg model show <id> [--format json|text]\n\nExamples:\n  cg model show embeddinggemma-300m\n  cg model show nomic-embed-text-v1.5 --format text"
+        );
+        return 0;
+    }
     let Some(id) = positional_arg(args) else {
         return usage_error("missing model id");
     };
@@ -237,10 +234,21 @@ fn raw_registration_entry(root: &Path, id: &str) -> Option<cg_catalog::CatalogEn
 }
 
 fn handle_status(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg status [--format json|text]\n\nExamples:\n  cg status\n  cg status --format text"
+        );
+        return 0;
+    }
     let format = output_format(args);
     let root = data_root();
     let catalog = ModelConnectionCatalog::open(&root);
     if let Some(error) = catalog.load_error() {
+        return unreadable_connections_file(error);
+    }
+    if let Some(active) = catalog.active_connection_name()
+        && let Some(error) = catalog.unreadable_connection_error(&active)
+    {
         return unreadable_connections_file(error);
     }
     let Some(connection) = selected_connection(&catalog) else {
@@ -258,7 +266,7 @@ fn handle_status(args: &[String]) -> i32 {
         return 0;
     };
     let (provider, account) = provider_account(&connection);
-    let tool_condition = if find_binary(&provider).is_some() {
+    let tool_condition = if provider_tool_available(&root, &provider) {
         Value::Null
     } else {
         json!("host_tool_missing")
@@ -310,19 +318,33 @@ fn handle_status(args: &[String]) -> i32 {
 fn handle_model_auth_login(args: &[String]) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
-            "Usage: cg model auth login [--connection PROVIDER] [--consent] [--format json|text]\n\nConnect cg to an already logged-in agent CLI host session."
+            "Usage: cg model auth login [--connection PROVIDER] [--consent] [--format json|text]\n\nConnect cg to an already logged-in agent CLI host session.\n\nExamples:\n  cg model auth login\n  cg model auth login --connection claude --consent"
         );
         return 0;
     }
 
     let selected = flag_value(args, "--connection");
     let consent_flag = has_flag(args, "--consent");
-    let candidates = discover_candidates();
+    let root = data_root();
+    let candidates = discover_candidates(&root);
 
     if candidates.is_empty() {
-        let expired = PROVIDERS
-            .into_iter()
-            .any(|provider| matches!(probe_provider(provider), ProbeResult::Expired));
+        let unsafe_settings =
+            provider_names(&root).into_iter().find_map(
+                |provider| match probe_host_session_provider(&root, &provider) {
+                    HostSessionProbe::UnsafeSettings { message } => Some(message),
+                    _ => None,
+                },
+            );
+        if let Some(message) = unsafe_settings {
+            return failure(6, "live_call_failed", "billing", &message);
+        }
+        let expired = provider_names(&root).into_iter().any(|provider| {
+            matches!(
+                probe_host_session_provider(&root, &provider),
+                HostSessionProbe::Expired
+            )
+        });
         if expired {
             return failure(
                 6,
@@ -340,14 +362,17 @@ fn handle_model_auth_login(args: &[String]) -> i32 {
             .find(|candidate| candidate.provider == provider)
             .cloned()
         else {
-            let result = probe_provider(&provider);
+            let result = probe_host_session_provider(&root, &provider);
             return match result {
-                ProbeResult::Expired => failure(
+                HostSessionProbe::Expired => failure(
                     6,
                     "host_login_expired",
                     "auth",
                     "Host login expired; re-login with your agent before connecting cg.",
                 ),
+                HostSessionProbe::UnsafeSettings { message } => {
+                    failure(6, "live_call_failed", "billing", &message)
+                }
                 _ => no_host_session_failure(),
             };
         };
@@ -434,224 +459,31 @@ fn selection_required(candidates: &[Candidate]) -> i32 {
     2
 }
 
-fn discover_candidates() -> Vec<Candidate> {
-    PROVIDERS
+fn discover_candidates(root: &Path) -> Vec<Candidate> {
+    provider_names(root)
         .into_iter()
-        .filter_map(|provider| match probe_provider(provider) {
-            ProbeResult::Valid {
-                account,
-                account_exposed,
-            } => Some(Candidate {
-                provider: provider.to_string(),
-                account,
-                account_exposed,
-            }),
-            _ => None,
-        })
+        .filter_map(
+            |provider| match probe_host_session_provider(root, &provider) {
+                HostSessionProbe::Valid {
+                    account,
+                    account_exposed,
+                } => Some(Candidate {
+                    provider,
+                    account,
+                    account_exposed,
+                }),
+                _ => None,
+            },
+        )
         .collect()
 }
 
-fn auth_probe_args(provider: &str) -> Vec<Vec<&'static str>> {
-    match provider {
-        "codex" => vec![vec!["auth", "status"], vec!["login", "status"]],
-        "claude" => vec![vec!["auth", "status"]],
-        "agy" => vec![vec!["auth", "status"], vec!["login", "status"]],
-        _ => vec![vec!["auth", "status"]],
-    }
-}
-
-fn probe_provider(provider: &str) -> ProbeResult {
-    let Some(binary) = find_binary(provider) else {
-        return ProbeResult::Missing;
-    };
-    let mut saw_expired = false;
-    for probe_args in auth_probe_args(provider) {
-        let output = Command::new(&binary)
-            .args(&probe_args)
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CODEX_API_KEY")
-            .stdin(Stdio::null())
-            .output();
-        let Ok(output) = output else {
-            continue;
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{stdout}\n{stderr}");
-        if auth_output_is_explicitly_not_drivable(&combined) {
-            return ProbeResult::NotDrivable;
-        }
-        if auth_output_is_expired(&combined) {
-            saw_expired = true;
-            continue;
-        }
-        if output.status.success()
-            && let Some(account) = parse_auth_account(&combined)
-        {
-            return ProbeResult::Valid {
-                account: account.label,
-                account_exposed: account.exposed,
-            };
-        }
-    }
-    if saw_expired {
-        ProbeResult::Expired
-    } else {
-        ProbeResult::NotDrivable
-    }
-}
-
-fn parse_auth_account(output: &str) -> Option<AuthAccount> {
-    if auth_output_is_expired(output) {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<Value>(output) {
-        if json_auth_succeeds(&value) {
-            return json_account_field(&value)
-                .map(|label| AuthAccount {
-                    label,
-                    exposed: true,
-                })
-                .or_else(|| Some(account_not_exposed()));
-        }
-        return None;
-    }
-    let mut saw_json_auth_line = false;
-    for line in output.lines().rev() {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            saw_json_auth_line = true;
-            if json_auth_succeeds(&value) {
-                return json_account_field(&value)
-                    .map(|label| AuthAccount {
-                        label,
-                        exposed: true,
-                    })
-                    .or_else(|| Some(account_not_exposed()));
-            }
-        }
-    }
-    if saw_json_auth_line {
-        return None;
-    }
-    let lower = output.to_ascii_lowercase();
-    if lower.contains("logged in")
-        || lower.contains("logged-in")
-        || lower.contains("authenticated")
-        || lower.contains("signed in")
-    {
-        return extract_email(output)
-            .map(|label| AuthAccount {
-                label,
-                exposed: true,
-            })
-            .or_else(|| Some(account_not_exposed()));
-    }
-    None
-}
-
-fn json_auth_succeeds(value: &Value) -> bool {
-    value.get("ok").and_then(Value::as_bool) == Some(true)
-        || value.get("loggedIn").and_then(Value::as_bool) == Some(true)
-        || value.get("logged_in").and_then(Value::as_bool) == Some(true)
-        || value.get("authenticated").and_then(Value::as_bool) == Some(true)
-        || value.get("status").and_then(Value::as_str) == Some("logged_in")
-}
-
-fn account_not_exposed() -> AuthAccount {
-    AuthAccount {
-        label: "account not exposed by host CLI".to_string(),
-        exposed: false,
-    }
-}
-
-fn json_account_field(value: &Value) -> Option<String> {
-    value
-        .get("account")
-        .or_else(|| value.get("email"))
-        .or_else(|| value.get("login"))
-        .or_else(|| value.get("username"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            value
-                .get("user")
-                .and_then(|user| user.get("email").or_else(|| user.get("login")))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-}
-
-fn extract_email(output: &str) -> Option<String> {
-    output
-        .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ':' | ';'))
-        .find(|token| token.contains('@') && token.contains('.'))
-        .map(|token| {
-            token
-                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '@' && ch != '.')
-                .to_string()
-        })
-        .filter(|token| !token.is_empty())
-}
-
-fn auth_output_is_expired(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    if let Ok(value) = serde_json::from_str::<Value>(output)
-        && json_auth_is_expired(&value)
-    {
-        return true;
-    }
-    if output.lines().any(|line| {
-        serde_json::from_str::<Value>(line)
-            .map(|value| json_auth_is_expired(&value))
-            .unwrap_or(false)
-    }) {
-        return true;
-    }
-    lower.contains("expired")
-        || lower.contains("invalid api key")
-        || lower.contains("not logged in")
-        || lower.contains("not logged-in")
-        || lower.contains("not authenticated")
-        || lower.contains("not_authenticated")
-        || lower.contains("not signed in")
-        || lower.contains("not signed-in")
-        || lower.contains("unauthenticated")
-        || lower.contains("signed out")
-        || lower.contains("signed-out")
-        || lower.contains("logged out")
-        || lower.contains("logged-out")
-        || lower.contains("login required")
-        || lower.contains("log in required")
-        || lower.contains("sign in required")
-        || lower.contains("please log in")
-        || lower.contains("unauthorized")
-}
-
-fn json_auth_is_expired(value: &Value) -> bool {
-    value.get("ok").and_then(Value::as_bool) == Some(false)
-        || value.get("loggedIn").and_then(Value::as_bool) == Some(false)
-        || value.get("logged_in").and_then(Value::as_bool) == Some(false)
-        || value.get("authenticated").and_then(Value::as_bool) == Some(false)
-        || value
-            .get("status")
-            .and_then(Value::as_str)
-            .map(|status| {
-                matches!(
-                    status,
-                    "not_authenticated"
-                        | "unauthenticated"
-                        | "not_logged_in"
-                        | "logged_out"
-                        | "signed_out"
-                )
-            })
-            .unwrap_or(false)
-}
-
-fn auth_output_is_explicitly_not_drivable(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("non_interactive_probe_failed")
+fn provider_names(root: &Path) -> Vec<String> {
+    load_provider_specs(root, &[])
+        .providers
+        .keys()
+        .cloned()
+        .collect()
 }
 
 fn candidate_envelope(candidates: &[Candidate]) -> Vec<Value> {
@@ -709,304 +541,94 @@ fn selected_connection(catalog: &ModelConnectionCatalog) -> Option<cg_catalog::C
 }
 
 fn handle_selftest(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg selftest [--format json|text]\n\nExamples:\n  cg selftest\n  cg selftest --format text"
+        );
+        return 0;
+    }
     let format = output_format(args);
     let root = data_root();
     let catalog = ModelConnectionCatalog::open(&root);
     if let Some(error) = catalog.load_error() {
         return unreadable_connections_file(error);
     }
+    if let Some(active) = catalog.active_connection_name()
+        && let Some(error) = catalog.unreadable_connection_error(&active)
+    {
+        return unreadable_connections_file(error);
+    }
     let Some(connection) = selected_connection(&catalog) else {
         return no_host_session_failure();
     };
-    if !connection.consent_recorded {
-        return failure(
-            4,
-            "consent_not_recorded",
-            "auth",
-            "Consent is not recorded; run cg model auth login --connection <provider> --consent before cg selftest.",
-        );
-    }
-    let (provider, _account) = provider_account(&connection);
-    let Some(binary) = find_binary(&provider) else {
-        return failure(
-            6,
-            "host_tool_missing",
-            "unknown",
-            "The selected provider tool is gone; re-install it or run cg model auth login again.",
-        );
-    };
     let prompt = "cg host-session proof: answer with the deterministic proof token only.";
-    let specs = load_provider_specs(&root, &[]);
-    let spec = specs
-        .providers
-        .get(&provider)
-        .or_else(|| specs.providers.get("agy"));
-    let framing = spec
-        .map(|spec| spec.reply_framing.as_str())
-        .unwrap_or("text");
-    let timeout_ms = spec.map(|spec| spec.timeout_ms).unwrap_or(10_000);
-    let output_file_guard = if framing == "file" {
-        Some(TempOutputFile::new(temp_output_path(&provider)))
-    } else {
-        None
-    };
-    let output_file = output_file_guard.as_ref().map(TempOutputFile::path);
-    let run = run_provider_completion(
-        &provider,
-        &binary,
-        prompt,
-        output_file,
-        timeout_ms,
-        format == OutputFormat::Text,
+    let connection_name = connection.name.clone();
+    let mut runtime = UnderstandingRuntime::<cg_catalog::NoopLlmClient>::new(
+        catalog,
+        model_connection_system_principal(),
+        PrincipalAwareConfig::default(),
     );
-    if run.timed_out {
-        return failure(
-            6,
-            "live_call_failed",
-            "timeout",
-            "The provider did not complete in time; cg did not retry the proof call.",
-        );
-    }
-    let Some(status) = run.status else {
-        return failure(
-            6,
-            "live_call_failed",
-            "unknown",
-            "provider call failed before a status was available",
-        );
-    };
-    if !status.success() {
-        let diagnostic = if run.stdout.trim().is_empty() {
-            run.stderr.trim()
-        } else {
-            run.stdout.trim()
-        };
-        return classified_failure(&provider, diagnostic);
-    }
-    let reply = match extract_reply(&provider, framing, &run.stdout, output_file) {
-        Ok(reply) if !reply.trim().is_empty() => reply,
-        _ => {
-            return failure(
-                6,
-                "live_call_failed",
-                "format",
-                "provider returned successfully but no proof reply was found",
-            );
-        }
+    let proof = match runtime.prove_host_session_connection(
+        &connection_name,
+        prompt,
+        format == OutputFormat::Text,
+    ) {
+        Ok(proof) => proof,
+        Err(err) => return proof_failure(err),
     };
     if format == OutputFormat::Text {
         println!(
             "one live call through {provider} will spend subscription quota for connection {connection}\nPASS: {reply}\nReply shown and discarded. {INGESTION_EXPECTATION}",
-            connection = connection.name
+            provider = proof.provider,
+            connection = proof.connection_name,
+            reply = proof.reply
         );
     } else {
         print_json(&json!({
             "status": "pass",
-            "connection": connection.name,
-            "provider": provider,
-            "reply": reply,
+            "connection": proof.connection_name,
+            "provider": proof.provider,
+            "reply": proof.reply,
             "bucket": "ok",
-            "message": format!("PASS: one live call through {provider} succeeded; reply shown and discarded. {INGESTION_EXPECTATION}"),
+            "message": format!("PASS: one live call through {} succeeded; reply shown and discarded. {INGESTION_EXPECTATION}", proof.provider),
         }));
     }
     0
 }
 
-fn run_provider_completion(
-    provider: &str,
-    binary: &Path,
-    prompt: &str,
-    output_file: Option<&Path>,
-    timeout_ms: u64,
-    progress_to_stdout: bool,
-) -> ProviderRun {
-    let mut command = Command::new(binary);
-    match provider {
-        "claude" => {
-            let invocation = construct_claude_invocation(prompt);
-            command.args(invocation.argv);
-        }
-        "codex" => {
-            command.arg("exec");
-            if let Some(output_file) = output_file {
-                command.arg(format!("--output-last-message={}", output_file.display()));
-            }
-        }
-        "agy" => {
-            command.arg("--print");
-        }
-        _ => {}
-    }
-    command
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("OPENAI_API_KEY")
-        .env_remove("CODEX_API_KEY")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let Ok(mut child) = command.spawn() else {
-        return ProviderRun {
-            status: None,
-            stdout: String::new(),
-            stderr: "provider spawn failed".to_string(),
-            timed_out: false,
-        };
-    };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = stdout.map(read_stream);
-    let stderr_reader = stderr.map(read_stream);
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes());
-    }
-    thread::sleep(Duration::from_millis(100));
-    eprintln!("waiting on provider {provider}");
-    if progress_to_stdout {
-        println!("waiting on provider {provider}");
-        let _ = std::io::stdout().flush();
-    }
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(500));
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    timed_out = true;
-                    let _ = Command::new("pkill")
-                        .arg("-TERM")
-                        .arg("-P")
-                        .arg(child.id().to_string())
-                        .status();
-                    let _ = child.kill();
-                    break child.wait().ok();
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => break None,
-        }
-    };
-    let stdout = stdout_reader
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let stderr = stderr_reader
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    ProviderRun {
-        status,
-        stdout,
-        stderr,
-        timed_out,
-    }
-}
-
-fn read_stream<R: Read + Send + 'static>(mut stream: R) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut out = String::new();
-        let _ = stream.read_to_string(&mut out);
-        out
-    })
-}
-
-fn classified_failure(provider: &str, diagnostic: &str) -> i32 {
-    match cg_cli::classify_provider_reply(provider, diagnostic) {
-        Classification::Success => failure(
-            6,
-            "live_call_failed",
-            "unknown",
-            "provider failed without an actionable diagnostic",
-        ),
-        Classification::HostLoginExpired { .. } => failure(
-            6,
-            "host_login_expired",
-            "auth",
-            "Host session expired; re-login with your agent before running cg selftest.",
-        ),
-        Classification::BillingRequired { message } => failure(
-            6,
-            "live_call_failed",
-            "billing",
-            &format!("failed: {message}"),
-        ),
-        Classification::RateLimited { message } => failure(
-            6,
-            "live_call_failed",
-            "rate_limit",
-            &format!("failed: {message}"),
-        ),
-        Classification::LiveCallFailed { message } => failure(
-            6,
-            "live_call_failed",
-            "unknown",
-            &format!("failed: {message}"),
-        ),
-    }
-}
-
 fn handle_doctor(args: &[String]) -> i32 {
-    let as_json = has_flag(args, "--json");
-    let mut checks_run = vec!["model/claude/flags-in-help".to_string()];
-    checks_run.sort();
-    let mut findings = Vec::new();
-    if let Some(binary) = find_binary("claude") {
-        let help = Command::new(&binary)
-            .arg("--help")
-            .env_remove("ANTHROPIC_API_KEY")
-            .output()
-            .ok();
-        let version = Command::new(&binary)
-            .arg("--version")
-            .env_remove("ANTHROPIC_API_KEY")
-            .output()
-            .ok();
-        let help_text = help
-            .as_ref()
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_default();
-        let version_text = version
-            .as_ref()
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            .unwrap_or_else(|| "unknown version".to_string());
-        for required in ["--mcp-config", "--tools"] {
-            if !help_text.contains(required) {
-                findings.push(json!({
-                    "check_id": "model/claude/flags-in-help",
-                    "severity": "warning",
-                    "message": format!("claude {version_text} help is missing required host-session flag {required}"),
-                    "target": "claude",
-                    "fix_hint": format!("upgrade claude so cg can pass {required} with equals-form invocation"),
-                }));
-            }
-        }
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!("Usage: cg doctor [--json]\n\nExamples:\n  cg doctor\n  cg doctor --json");
+        return 0;
     }
-    let ok = findings.is_empty();
+    let as_json = has_flag(args, "--json");
+    let mut registry = CheckRegistry::default();
+    register_model_connection_checks_with_root(&mut registry, data_root());
+    let report = run_doctor_checks(&registry);
     if as_json {
-        print_json(&json!({
-            "ok": ok,
-            "checks_run": checks_run,
-            "findings": findings,
-        }));
-    } else if ok {
+        let value = serde_json::to_value(&report).expect("doctor report serializes");
+        print_json(&value);
+    } else if report.ok {
         println!("OK: model provider checks passed");
     } else {
-        for finding in &findings {
+        for finding in &report.findings {
             println!(
                 "{}: {}",
-                finding
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider"),
-                finding
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider drift")
+                finding.target.as_deref().unwrap_or("provider"),
+                finding.message
             );
         }
     }
-    if ok { 0 } else { 1 }
+    if report.ok { 0 } else { 1 }
 }
 
 fn handle_disconnect(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg disconnect <agent>\n\nExamples:\n  cg disconnect claude-code\n  cg disconnect cursor"
+        );
+        return 0;
+    }
     let Some(agent) = args.first() else {
         return usage_error("missing agent for disconnect");
     };
@@ -1017,13 +639,20 @@ fn handle_disconnect(args: &[String]) -> i32 {
 }
 
 fn handle_connect_cleanup(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg connect <agent> --remove-all\n\nExamples:\n  cg connect claude-code --remove-all"
+        );
+        return 0;
+    }
     let Some(agent) = args.first() else {
         return usage_error("missing agent for connect");
     };
-    if args.get(1).map(String::as_str) == Some("--remove-all") {
-        for path in agent_paths(agent, true) {
-            clean_hooks(agent, &path);
-        }
+    if args.get(1).map(String::as_str) != Some("--remove-all") {
+        return usage_error("cg connect cleanup requires --remove-all");
+    }
+    for path in agent_paths(agent, true) {
+        clean_hooks(agent, &path);
     }
     0
 }
@@ -1126,6 +755,18 @@ fn failure(code: i32, condition: &str, bucket: &str, message: &str) -> i32 {
     code
 }
 
+fn proof_failure(error: ModelProofError) -> i32 {
+    let code = match &error {
+        ModelProofError::NoHostSession | ModelProofError::ConsentNotRecorded => 4,
+        ModelProofError::HostToolMissing { .. }
+        | ModelProofError::HostLoginExpired { .. }
+        | ModelProofError::LiveCallFailed { .. }
+        | ModelProofError::ReplyFormat { .. }
+        | ModelProofError::UnsafeSettings { .. } => 6,
+    };
+    failure(code, error.condition(), error.bucket(), &error.message())
+}
+
 fn provider_account(connection: &cg_catalog::ConnectionRead) -> (String, String) {
     match &connection.credential_reference.source {
         CredentialSource::HostSession {
@@ -1145,6 +786,30 @@ fn output_format(args: &[String]) -> OutputFormat {
     }
 }
 
+fn format_usage_error(args: &[String]) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix("--format=")
+            && value != "json"
+            && value != "text"
+        {
+            return Some(format!(
+                "invalid --format value `{value}`; expected `json` or `text`"
+            ));
+        }
+        if arg == "--format" {
+            let Some(value) = args.get(index + 1) else {
+                return Some("--format requires `json` or `text`".to_string());
+            };
+            if value != "json" && value != "text" {
+                return Some(format!(
+                    "invalid --format value `{value}`; expected `json` or `text`"
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn has_log_info(args: &[String]) -> bool {
     flag_value(args, "--log")
         .as_deref()
@@ -1156,19 +821,41 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2).find_map(|window| {
-        if window[0] == flag {
-            Some(window[1].clone())
-        } else {
-            None
-        }
-    })
+    let prefix = format!("{flag}=");
+    args.iter()
+        .find_map(|arg| arg.strip_prefix(&prefix).map(ToString::to_string))
+        .or_else(|| {
+            args.windows(2).find_map(|window| {
+                if window[0] == flag {
+                    Some(window[1].clone())
+                } else {
+                    None
+                }
+            })
+        })
 }
 
 fn positional_arg(args: &[String]) -> Option<String> {
-    args.iter()
-        .find(|arg| !arg.starts_with('-'))
-        .map(ToString::to_string)
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(arg.as_str(), "--format" | "--connection" | "--log") {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with("--format=")
+            || arg.starts_with("--connection=")
+            || arg.starts_with("--log=")
+            || arg.starts_with('-')
+        {
+            continue;
+        }
+        return Some(arg.clone());
+    }
+    None
 }
 
 fn print_json(value: &Value) {
@@ -1189,50 +876,4 @@ fn home_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn find_binary(name: &str) -> Option<PathBuf> {
-    let candidate = PathBuf::from(name);
-    if candidate.components().count() > 1 && is_executable_file(&candidate) {
-        return Some(candidate);
-    }
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|path| is_executable_file(path))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
-}
-
-fn temp_output_path(provider: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    env::temp_dir().join(format!(
-        "cg-{provider}-last-message-{}-{nanos}.txt",
-        std::process::id()
-    ))
-}
-
-struct TempOutputFile {
-    path: PathBuf,
-}
-
-impl TempOutputFile {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempOutputFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }

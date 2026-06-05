@@ -369,6 +369,7 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-embeddinggemma",
+ "cg-cli-conventions",
  "chrono",
  "context-graph",
  "contextdb-core",
@@ -389,6 +390,14 @@ dependencies = [
  "ureq",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "cg-cli-conventions"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -539,6 +548,7 @@ name = "context-graph-cli"
 version = "0.1.0"
 dependencies = [
  "cg-catalog",
+ "cg-cli-conventions",
  "context-graph",
  "serde",
  "serde_json",

@@ -1,0 +1,100 @@
+[providers.claude]
+binary = "claude"
+prompt_delivery = "stdin"
+completion_args = [
+  "-p",
+  "--output-format=json",
+  "--strict-mcp-config",
+  "--mcp-config={\"mcpServers\":{}}",
+  "--tools=\"\"",
+]
+env_remove = [
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "ANTHROPIC_BASE_URL",
+]
+env_preserve = ["CLAUDE_CODE_OAUTH_TOKEN"]
+reply_framing = "json"
+reply_path = "/result"
+timeout_ms = 2500
+consent_required = true
+required_help_flags = ["--output-format", "--mcp-config", "--strict-mcp-config", "--tools"]
+last_verified = "claude 2.1.162"
+auth_probe_args = ["auth", "status"]
+auth_account_paths = ["/account", "/email", "/user/email", "/login", "/username"]
+
+[providers.claude.success]
+path = "/is_error"
+equals = false
+
+[providers.claude.auth_success]
+any_of = [
+  { path = "/loggedIn", equals = true },
+  { path = "/ok", equals = true },
+  { path = "/authenticated", equals = true },
+  { path = "/status", equals = "logged_in" },
+]
+
+[providers.claude.auth_required]
+all_of = [
+  { path = "/apiProvider", equals = "firstParty" },
+]
+
+[providers.codex]
+binary = "codex"
+prompt_delivery = "stdin"
+completion_args = [
+  "exec",
+  "--output-last-message={output_file}",
+  "-C",
+  "{cwd}",
+  "--skip-git-repo-check",
+  "--ignore-user-config",
+  "--ephemeral",
+  "-c",
+  "model_reasoning_effort=\"low\"",
+]
+env_remove = ["OPENAI_API_KEY", "CODEX_API_KEY"]
+env_preserve = []
+reply_framing = "file"
+reply_path = "output_file"
+timeout_ms = 2500
+consent_required = true
+required_help_flags = ["--output-last-message"]
+last_verified = "codex 0.136.0"
+auth_probe_args = ["auth", "status"]
+auth_account_paths = ["/account", "/email", "/user/email", "/login", "/username"]
+
+[providers.codex.auth_success]
+any_of = [
+  { path = "/loggedIn", equals = true },
+  { path = "/ok", equals = true },
+  { path = "/authenticated", equals = true },
+  { path = "/status", equals = "logged_in" },
+]
+
+[providers.agy]
+binary = "agy"
+prompt_delivery = "stdin"
+completion_args = ["--print"]
+env_remove = []
+env_preserve = []
+reply_framing = "text"
+reply_path = "stdout"
+timeout_ms = 2500
+consent_required = true
+required_help_flags = []
+last_verified = "agy --print confirmed 2026-06-04"
+auth_probe_args = ["auth", "status"]
+auth_account_paths = ["/account", "/email", "/user/email", "/login", "/username"]
+
+[providers.agy.auth_success]
+any_of = [
+  { path = "/loggedIn", equals = true },
+  { path = "/ok", equals = true },
+  { path = "/authenticated", equals = true },
+  { path = "/status", equals = "logged_in" },
+]

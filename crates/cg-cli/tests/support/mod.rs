@@ -95,6 +95,7 @@ pub fn run_cg(
     command
         .args(args)
         .env("CG_DATA_ROOT", data_root)
+        .env("HOME", data_root)
         .env("PATH", path_env)
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
@@ -134,6 +135,7 @@ pub fn run_cg_observing_provider_before_exit(
     command
         .args(args)
         .env("CG_DATA_ROOT", data_root)
+        .env("HOME", data_root)
         .env("PATH", path_env)
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
@@ -364,6 +366,15 @@ impl FakeProviderRig {
         );
     }
 
+    pub fn set_auth_probe_stderr(&self, provider: Provider, warning: &str) {
+        write_file(
+            self.fixture_dir
+                .join(provider.binary_name())
+                .join("auth_stderr"),
+            warning,
+        );
+    }
+
     pub fn set_login_state(&self, provider: Provider, login_state: LoginState) {
         write_file(
             self.fixture_dir
@@ -509,8 +520,26 @@ def read(name, default=""):
         return path.read_text().strip()
     return default
 
+TRACKED_ENV = [
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+]
+
 def write_log(mode, prompt=""):
-    record = {"provider": provider, "mode": mode, "argv": args, "prompt": prompt}
+    record = {
+        "provider": provider,
+        "mode": mode,
+        "argv": args,
+        "prompt": prompt,
+        "env": {name: os.environ[name] for name in TRACKED_ENV if name in os.environ},
+    }
     with log_path.open("a") as out:
         out.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -554,6 +583,9 @@ if "auth" in args and "status" in args:
         print(json.dumps({"ok": False, "error": read("expired_marker", "expired")}))
         sys.exit(1)
     print(json.dumps({"ok": True, "account": read("account_label", "dev@example.test"), "apiProvider": "firstParty"}))
+    warning = read("auth_stderr")
+    if warning:
+        print(warning, file=sys.stderr)
     sys.exit(0)
 
 prompt = sys.stdin.read()
@@ -679,11 +711,25 @@ pub fn run_variadic_fake(argv: &[&str], stdin: &str) -> CommandOutput {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn fake claude");
-    if let Some(mut child_stdin) = child.stdin.take() {
-        child_stdin
-            .write_all(stdin.as_bytes())
-            .expect("write fake claude stdin");
+    let mut attempts = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(err) if err.raw_os_error() == Some(26) && attempts < 20 => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("spawn fake claude: {err}"),
+        }
+    };
+    if let Some(mut child_stdin) = child.stdin.take()
+        && let Err(err) = child_stdin.write_all(stdin.as_bytes())
+    {
+        assert_eq!(
+            err.kind(),
+            ErrorKind::BrokenPipe,
+            "write fake claude stdin: {err}"
+        );
     }
     let output = child.wait_with_output().expect("fake claude output");
     CommandOutput {

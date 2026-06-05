@@ -1,0 +1,10 @@
+[package]
+name = "cg-cli-conventions"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

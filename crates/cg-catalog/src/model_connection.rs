@@ -1,18 +1,22 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use candle_core::{Device, Tensor};
+use cg_cli_conventions::{CheckRegistrar, DiagnosticCheck, Finding};
 use context_graph::{
-    CgError, ContextId, LlmClient, ModelInvocation, Principal, UnderstandingOutcome,
-    UnderstandingRequest,
+    CgError, ContextId, DeploymentSurface, LlmClient, ModelInvocation, ModelReply, Principal,
+    UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
 };
 use fs4::fs_std::FileExt;
 use safetensors::SafeTensors;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{CacheStatus, Capability, Catalog, CatalogEntry, License, ModelKind, Source};
@@ -21,6 +25,1179 @@ pub const DEGRADED_MARKER: &str = "running without a connected model";
 const HOSTED_TIMEOUT: Duration = Duration::from_secs(10);
 const HOSTED_BODY_LIMIT: u64 = 1024 * 1024;
 const CONNECTION_CATALOG_SCOPE: &str = "connection-substrate";
+const EMBEDDED_PROVIDER_SPECS: &str = include_str!("../providers.toml");
+const CLAUDE_PROTECTED_ENV: [&str; 6] = [
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_BASE_URL",
+];
+const CODEX_PROTECTED_ENV: [&str; 2] = ["OPENAI_API_KEY", "CODEX_API_KEY"];
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderSpecs {
+    pub providers: BTreeMap<String, ProviderSpec>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSpec {
+    pub binary: String,
+    #[serde(default)]
+    pub completion_args: Vec<String>,
+    pub prompt_delivery: String,
+    #[serde(default)]
+    pub env_remove: Vec<String>,
+    #[serde(default)]
+    pub env_preserve: Vec<String>,
+    pub reply_framing: String,
+    #[serde(default)]
+    pub reply_path: String,
+    #[serde(default)]
+    pub success: Option<PredicateSpec>,
+    pub timeout_ms: u64,
+    pub consent_required: bool,
+    #[serde(default)]
+    pub required_help_flags: Vec<String>,
+    #[serde(default)]
+    pub last_verified: String,
+    #[serde(default)]
+    pub auth_probe_args: Vec<String>,
+    #[serde(default)]
+    pub auth_success: Option<PredicateSpec>,
+    #[serde(default)]
+    pub auth_required: Option<PredicateSpec>,
+    #[serde(default)]
+    pub auth_account_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equals: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exists: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<String>,
+    #[serde(default)]
+    pub all_of: Vec<PredicateSpec>,
+    #[serde(default)]
+    pub any_of: Vec<PredicateSpec>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderOverride {
+    pub provider: String,
+    pub timeout_ms: Option<u64>,
+    pub remove_env: Option<Vec<String>>,
+    pub consent_required: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Invocation {
+    pub argv: Vec<String>,
+    pub stdin: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplyError {
+    MissingPath { path: String, framing: String },
+    Unsuccessful { diagnostic: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Classification {
+    Success,
+    HostLoginExpired { message: String },
+    RateLimited { message: String },
+    BillingRequired { message: String },
+    LiveCallFailed { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostSessionProbe {
+    Valid {
+        account: String,
+        account_exposed: bool,
+    },
+    Expired,
+    NotDrivable,
+    Missing,
+    UnsafeSettings {
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelProof {
+    pub connection_name: String,
+    pub provider: String,
+    pub reply: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelProofError {
+    NoHostSession,
+    ConsentNotRecorded,
+    HostToolMissing { provider: String },
+    HostLoginExpired { message: String },
+    LiveCallFailed { bucket: String, message: String },
+    ReplyFormat { path: String, framing: String },
+    UnsafeSettings { message: String },
+}
+
+impl ModelProofError {
+    pub fn condition(&self) -> &'static str {
+        match self {
+            Self::NoHostSession => "no_host_session",
+            Self::ConsentNotRecorded => "consent_not_recorded",
+            Self::HostToolMissing { .. } => "host_tool_missing",
+            Self::HostLoginExpired { .. } => "host_login_expired",
+            Self::LiveCallFailed { .. } | Self::ReplyFormat { .. } => "live_call_failed",
+            Self::UnsafeSettings { .. } => "live_call_failed",
+        }
+    }
+
+    pub fn bucket(&self) -> &str {
+        match self {
+            Self::HostLoginExpired { .. } => "auth",
+            Self::LiveCallFailed { bucket, .. } => bucket.as_str(),
+            Self::ReplyFormat { .. } => "format",
+            Self::UnsafeSettings { .. } => "billing",
+            _ => "unknown",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::NoHostSession => "No drivable host session was found. Use a local model first; env-var key setup is a later fallback.".to_string(),
+            Self::ConsentNotRecorded => "Consent is not recorded; run cg model auth login --connection <provider> --consent before cg selftest.".to_string(),
+            Self::HostToolMissing { .. } => "The selected provider tool is gone; re-install it or run cg model auth login again.".to_string(),
+            Self::HostLoginExpired { .. } => {
+                "Host session expired; re-login with your agent before running cg selftest.".to_string()
+            }
+            Self::LiveCallFailed { message, .. } => message.clone(),
+            Self::ReplyFormat { path, framing } => {
+                format!("{path} absent in {framing} reply envelope")
+            }
+            Self::UnsafeSettings { message } => message.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProviderSpecsFile {
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderSpec>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProviderOverridesFile {
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderSpecOverride>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ProviderSpecOverride {
+    binary: Option<String>,
+    completion_args: Option<Vec<String>>,
+    prompt_delivery: Option<String>,
+    env_remove: Option<Vec<String>>,
+    env_preserve: Option<Vec<String>>,
+    reply_framing: Option<String>,
+    reply_path: Option<String>,
+    success: Option<PredicateSpec>,
+    timeout_ms: Option<u64>,
+    consent_required: Option<bool>,
+    required_help_flags: Option<Vec<String>>,
+    last_verified: Option<String>,
+    auth_probe_args: Option<Vec<String>>,
+    auth_success: Option<PredicateSpec>,
+    auth_required: Option<PredicateSpec>,
+    auth_account_paths: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+struct ProviderRun {
+    status: Option<ExitStatus>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+pub fn load_provider_specs(root: &Path, overrides: &[ProviderOverride]) -> ProviderSpecs {
+    let mut providers = parse_provider_specs(EMBEDDED_PROVIDER_SPECS)
+        .expect("embedded provider spec must parse")
+        .providers;
+    let user_spec_path = root.join("cg/providers.toml");
+    if let Ok(text) = fs::read_to_string(&user_spec_path)
+        && let Ok(file) = toml::from_str::<ProviderOverridesFile>(&text)
+    {
+        for (provider, override_layer) in file.providers {
+            let spec = providers.entry(provider.clone()).or_default();
+            apply_provider_override(&provider, spec, override_layer);
+        }
+    }
+    for override_layer in overrides {
+        if let Some(spec) = providers.get_mut(&override_layer.provider) {
+            if let Some(timeout_ms) = override_layer.timeout_ms {
+                spec.timeout_ms = timeout_ms;
+            }
+            if let Some(remove_env) = &override_layer.remove_env {
+                for name in remove_env {
+                    push_unique(&mut spec.env_remove, name.clone());
+                }
+            }
+            if override_layer.consent_required == Some(true) {
+                spec.consent_required = true;
+            }
+            protect_provider_spec(&override_layer.provider, spec);
+        }
+    }
+    for (provider, spec) in providers.iter_mut() {
+        protect_provider_spec(provider, spec);
+    }
+    ProviderSpecs { providers }
+}
+
+fn parse_provider_specs(text: &str) -> std::result::Result<ProviderSpecsFile, toml::de::Error> {
+    toml::from_str::<ProviderSpecsFile>(text)
+}
+
+fn apply_provider_override(
+    provider: &str,
+    spec: &mut ProviderSpec,
+    override_layer: ProviderSpecOverride,
+) {
+    if let Some(binary) = override_layer.binary {
+        spec.binary = binary;
+    }
+    if let Some(args) = override_layer.completion_args {
+        spec.completion_args = args;
+    }
+    if let Some(prompt_delivery) = override_layer.prompt_delivery {
+        spec.prompt_delivery = prompt_delivery;
+    }
+    if let Some(env_remove) = override_layer.env_remove {
+        for name in env_remove {
+            push_unique(&mut spec.env_remove, name);
+        }
+    }
+    if let Some(env_preserve) = override_layer.env_preserve {
+        spec.env_preserve = env_preserve;
+    }
+    if let Some(reply_framing) = override_layer.reply_framing {
+        spec.reply_framing = reply_framing;
+    }
+    if let Some(reply_path) = override_layer.reply_path {
+        spec.reply_path = reply_path;
+    }
+    if let Some(success) = override_layer.success {
+        spec.success = Some(success);
+    }
+    if let Some(timeout_ms) = override_layer.timeout_ms {
+        spec.timeout_ms = timeout_ms;
+    }
+    if override_layer.consent_required == Some(true) {
+        spec.consent_required = true;
+    }
+    if let Some(required_help_flags) = override_layer.required_help_flags {
+        spec.required_help_flags = required_help_flags;
+    }
+    if let Some(last_verified) = override_layer.last_verified {
+        spec.last_verified = last_verified;
+    }
+    if let Some(auth_probe_args) = override_layer.auth_probe_args {
+        spec.auth_probe_args = auth_probe_args;
+    }
+    if let Some(auth_success) = override_layer.auth_success {
+        spec.auth_success = Some(auth_success);
+    }
+    if let Some(auth_required) = override_layer.auth_required {
+        spec.auth_required = Some(auth_required);
+    }
+    if let Some(auth_account_paths) = override_layer.auth_account_paths {
+        spec.auth_account_paths = auth_account_paths;
+    }
+    protect_provider_spec(provider, spec);
+}
+
+fn protect_provider_spec(provider: &str, spec: &mut ProviderSpec) {
+    for name in protected_env(provider) {
+        push_unique(&mut spec.env_remove, name.to_string());
+    }
+    spec.consent_required = true;
+}
+
+fn protected_env(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "claude" => &CLAUDE_PROTECTED_ENV,
+        "codex" => &CODEX_PROTECTED_ENV,
+        _ => &[],
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+pub fn construct_claude_invocation(prompt: &str) -> Invocation {
+    let specs = load_provider_specs(Path::new(""), &[]);
+    let Some(spec) = specs.providers.get("claude") else {
+        return Invocation {
+            argv: Vec::new(),
+            stdin: prompt.to_string(),
+        };
+    };
+    construct_provider_invocation(spec, prompt, None, &neutral_cwd())
+}
+
+fn construct_provider_invocation(
+    spec: &ProviderSpec,
+    prompt: &str,
+    output_file: Option<&Path>,
+    cwd: &Path,
+) -> Invocation {
+    let output_file = output_file
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let cwd = cwd.display().to_string();
+    let argv = spec
+        .completion_args
+        .iter()
+        .map(|arg| {
+            arg.replace("{output_file}", &output_file)
+                .replace("{cwd}", &cwd)
+        })
+        .collect();
+    Invocation {
+        argv,
+        stdin: if spec.prompt_delivery == "stdin" {
+            prompt.to_string()
+        } else {
+            String::new()
+        },
+    }
+}
+
+pub fn extract_reply(
+    provider: &str,
+    framing: &str,
+    stdout: &str,
+    output_file: Option<&Path>,
+) -> std::result::Result<String, ReplyError> {
+    let specs = load_provider_specs(Path::new(""), &[]);
+    let fallback = ProviderSpec {
+        reply_framing: framing.to_string(),
+        reply_path: match framing {
+            "file" => "output_file".to_string(),
+            "text" => "stdout".to_string(),
+            _ => "/result".to_string(),
+        },
+        ..ProviderSpec::default()
+    };
+    let spec = specs.providers.get(provider).unwrap_or(&fallback);
+    extract_reply_from_spec(provider, spec, framing, stdout, output_file)
+}
+
+fn extract_reply_from_spec(
+    provider: &str,
+    spec: &ProviderSpec,
+    framing: &str,
+    stdout: &str,
+    output_file: Option<&Path>,
+) -> std::result::Result<String, ReplyError> {
+    let reply_path = if spec.reply_path.is_empty() {
+        "/result"
+    } else {
+        spec.reply_path.as_str()
+    };
+    match framing {
+        "json" => {
+            let value = parse_json_or_last_line(stdout).map_err(|_| ReplyError::MissingPath {
+                path: reply_path.to_string(),
+                framing: framing.to_string(),
+            })?;
+            let reply = json_pointer_string(&value, reply_path);
+            let success = spec
+                .success
+                .as_ref()
+                .map(|predicate| evaluate_predicate(&value, predicate))
+                .unwrap_or(true);
+            if !success {
+                if reply.is_none() {
+                    return Err(ReplyError::MissingPath {
+                        path: reply_path.to_string(),
+                        framing: framing.to_string(),
+                    });
+                }
+                return Err(ReplyError::Unsuccessful {
+                    diagnostic: stdout.to_string(),
+                });
+            }
+            reply.ok_or_else(|| ReplyError::MissingPath {
+                path: reply_path.to_string(),
+                framing: framing.to_string(),
+            })
+        }
+        "jsonl" => {
+            for line in stdout.lines().rev().filter(|line| !line.trim().is_empty()) {
+                if let Ok(value) = serde_json::from_str::<Value>(line) {
+                    let success = spec
+                        .success
+                        .as_ref()
+                        .map(|predicate| evaluate_predicate(&value, predicate))
+                        .unwrap_or(true);
+                    if success && let Some(reply) = json_pointer_string(&value, reply_path) {
+                        return Ok(reply);
+                    }
+                }
+            }
+            Err(ReplyError::MissingPath {
+                path: reply_path.to_string(),
+                framing: framing.to_string(),
+            })
+        }
+        "file" => output_file
+            .and_then(|path| fs::read_to_string(path).ok())
+            .ok_or_else(|| ReplyError::MissingPath {
+                path: "output_file".to_string(),
+                framing: framing.to_string(),
+            }),
+        "text" => Ok(stdout.to_string()),
+        other => Err(ReplyError::MissingPath {
+            path: if provider == "codex" {
+                "output_file".to_string()
+            } else {
+                reply_path.to_string()
+            },
+            framing: other.to_string(),
+        }),
+    }
+}
+
+pub fn classify_provider_reply(_provider: &str, stdout: &str) -> Classification {
+    let parsed = parse_json_or_last_line(stdout);
+    let Ok(value) = parsed else {
+        let message = stdout.trim();
+        return if message.is_empty() {
+            Classification::LiveCallFailed {
+                message: "provider call failed".to_string(),
+            }
+        } else {
+            classify_message(message)
+        };
+    };
+    if value
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let message = value
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("provider call failed")
+            .to_string();
+        return match value.get("api_error_status").and_then(Value::as_i64) {
+            Some(401) => Classification::HostLoginExpired { message },
+            Some(402) => Classification::BillingRequired { message },
+            Some(429) => Classification::RateLimited { message },
+            _ => classify_message(&message),
+        };
+    }
+    Classification::Success
+}
+
+fn parse_json_or_last_line(text: &str) -> serde_json::Result<Value> {
+    serde_json::from_str::<Value>(text).or_else(|_| {
+        let last = text
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(text);
+        serde_json::from_str(last)
+    })
+}
+
+fn classify_message(message: &str) -> Classification {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("invalid api key")
+        || lower.contains("expired")
+        || lower.contains("unauthorized")
+    {
+        Classification::HostLoginExpired {
+            message: message.to_string(),
+        }
+    } else if lower.contains("billing") {
+        Classification::BillingRequired {
+            message: message.to_string(),
+        }
+    } else if lower.contains("rate") || lower.contains("quota") {
+        Classification::RateLimited {
+            message: message.to_string(),
+        }
+    } else {
+        Classification::LiveCallFailed {
+            message: message.to_string(),
+        }
+    }
+}
+
+fn json_pointer_string(value: &Value, path: &str) -> Option<String> {
+    if path == "stdout" {
+        return value.as_str().map(str::to_string);
+    }
+    value.pointer(path).and_then(|value| match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    })
+}
+
+fn evaluate_predicate(value: &Value, predicate: &PredicateSpec) -> bool {
+    if !predicate
+        .all_of
+        .iter()
+        .all(|child| evaluate_predicate(value, child))
+    {
+        return false;
+    }
+    if !predicate.any_of.is_empty()
+        && !predicate
+            .any_of
+            .iter()
+            .any(|child| evaluate_predicate(value, child))
+    {
+        return false;
+    }
+    let target = predicate
+        .path
+        .as_deref()
+        .and_then(|path| value.pointer(path));
+    if let Some(exists) = predicate.exists
+        && (target.is_some() != exists)
+    {
+        return false;
+    }
+    if let Some(expected) = &predicate.equals
+        && target != Some(expected)
+    {
+        return false;
+    }
+    if let Some(pattern) = &predicate.matches {
+        let Some(text) = target.and_then(Value::as_str) else {
+            return false;
+        };
+        if !text.contains(pattern) {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn probe_host_session_provider(root: &Path, provider: &str) -> HostSessionProbe {
+    let specs = load_provider_specs(root, &[]);
+    let Some(spec) = specs.providers.get(provider) else {
+        return HostSessionProbe::NotDrivable;
+    };
+    if provider == "claude"
+        && let Err(message) = inspect_claude_settings_for_reinjection()
+    {
+        return HostSessionProbe::UnsafeSettings { message };
+    }
+    let Some(binary) = find_provider_binary(spec) else {
+        return HostSessionProbe::Missing;
+    };
+    let mut command = Command::new(binary);
+    command
+        .args(&spec.auth_probe_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(neutral_cwd());
+    apply_provider_env_removal(&mut command, provider, spec);
+    let Ok(output) = command.output() else {
+        return HostSessionProbe::NotDrivable;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Ok(value) = parse_json_or_last_line(&stdout)
+        && output.status.success()
+        && auth_value_matches(spec, &value)
+    {
+        return host_session_probe_from_auth_value(spec, &value);
+    }
+
+    let combined = format!("{stdout}\n{stderr}");
+    if auth_output_is_explicitly_not_drivable(&combined) {
+        return HostSessionProbe::NotDrivable;
+    };
+    if auth_output_is_expired(&combined) {
+        return HostSessionProbe::Expired;
+    }
+    let Ok(value) = parse_json_or_last_line(&combined) else {
+        return HostSessionProbe::NotDrivable;
+    };
+    if output.status.success() && auth_value_matches(spec, &value) {
+        return host_session_probe_from_auth_value(spec, &value);
+    }
+    HostSessionProbe::NotDrivable
+}
+
+fn auth_value_matches(spec: &ProviderSpec, value: &Value) -> bool {
+    let success = spec
+        .auth_success
+        .as_ref()
+        .map(|predicate| evaluate_predicate(value, predicate))
+        .unwrap_or(false);
+    let required = spec
+        .auth_required
+        .as_ref()
+        .map(|predicate| evaluate_predicate(value, predicate))
+        .unwrap_or(true);
+    success && required
+}
+
+fn host_session_probe_from_auth_value(spec: &ProviderSpec, value: &Value) -> HostSessionProbe {
+    let account = spec
+        .auth_account_paths
+        .iter()
+        .find_map(|path| json_pointer_string(value, path))
+        .filter(|account| !account.trim().is_empty());
+    let account_exposed = account.is_some();
+    HostSessionProbe::Valid {
+        account: account.unwrap_or_else(|| "account not exposed by host CLI".to_string()),
+        account_exposed,
+    }
+}
+
+fn auth_output_is_expired(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    if let Ok(value) = parse_json_or_last_line(output)
+        && json_auth_is_expired(&value)
+    {
+        return true;
+    }
+    lower.contains("expired")
+        || lower.contains("invalid api key")
+        || lower.contains("not logged in")
+        || lower.contains("not logged-in")
+        || lower.contains("not authenticated")
+        || lower.contains("not_authenticated")
+        || lower.contains("not signed in")
+        || lower.contains("not signed-in")
+        || lower.contains("unauthenticated")
+        || lower.contains("signed out")
+        || lower.contains("signed-out")
+        || lower.contains("logged out")
+        || lower.contains("logged-out")
+        || lower.contains("login required")
+        || lower.contains("log in required")
+        || lower.contains("sign in required")
+        || lower.contains("please log in")
+        || lower.contains("unauthorized")
+}
+
+fn json_auth_is_expired(value: &Value) -> bool {
+    value.get("ok").and_then(Value::as_bool) == Some(false)
+        || value.get("loggedIn").and_then(Value::as_bool) == Some(false)
+        || value.get("logged_in").and_then(Value::as_bool) == Some(false)
+        || value.get("authenticated").and_then(Value::as_bool) == Some(false)
+        || value
+            .get("status")
+            .and_then(Value::as_str)
+            .map(|status| {
+                matches!(
+                    status,
+                    "not_authenticated"
+                        | "unauthenticated"
+                        | "not_logged_in"
+                        | "logged_out"
+                        | "signed_out"
+                )
+            })
+            .unwrap_or(false)
+}
+
+fn auth_output_is_explicitly_not_drivable(output: &str) -> bool {
+    output
+        .to_ascii_lowercase()
+        .contains("non_interactive_probe_failed")
+}
+
+pub fn register_model_connection_checks(registrar: &mut impl CheckRegistrar) {
+    register_model_connection_checks_with_root(registrar, PathBuf::new());
+}
+
+pub fn model_connection_system_principal() -> Principal {
+    Principal::System
+}
+
+pub fn register_model_connection_checks_with_root(
+    registrar: &mut impl CheckRegistrar,
+    root: impl AsRef<Path>,
+) {
+    let root = root.as_ref().to_path_buf();
+    let specs = load_provider_specs(&root, &[]);
+    for provider in provider_names_for_checks(&specs) {
+        let check_root = root.clone();
+        let check_id = format!("model/{provider}/flags-in-help");
+        registrar.register_check(DiagnosticCheck::free(check_id, move || {
+            detect_provider_help_drift(&check_root, &provider)
+        }));
+    }
+    registrar.register_check(DiagnosticCheck::spending(
+        "model/selftest/live-call",
+        || {
+            vec![Finding::error(
+                "model/selftest/live-call",
+                "selftest requires a host binary to wire the consent-gated live proof path",
+                Some("selftest".to_string()),
+                Some("call the model-connection runtime proof seam instead of treating registry execution as proof".to_string()),
+            )]
+        },
+    ));
+}
+
+fn provider_names_for_checks(specs: &ProviderSpecs) -> Vec<String> {
+    let mut names = specs.providers.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    if let Some(index) = names.iter().position(|name| name == "claude") {
+        names.swap(0, index);
+    }
+    names
+}
+
+fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
+    let specs = load_provider_specs(root, &[]);
+    let Some(spec) = specs.providers.get(provider) else {
+        return Vec::new();
+    };
+    let Some(binary) = find_provider_binary(spec) else {
+        return vec![Finding::warning(
+            format!("model/{provider}/flags-in-help"),
+            format!("{provider} provider tool was not found on PATH"),
+            Some(provider.to_string()),
+            Some(format!(
+                "install {provider} or remove it from cg/providers.toml"
+            )),
+        )];
+    };
+    let version = Command::new(&binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "unknown version".to_string());
+    let help = Command::new(&binary)
+        .arg("--help")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    spec.required_help_flags
+        .iter()
+        .filter(|required| !help.contains(required.as_str()))
+        .map(|required| {
+            Finding::warning(
+                format!("model/{provider}/flags-in-help"),
+                format!(
+                    "{provider} {version} help is missing required host-session flag {required}"
+                ),
+                Some(provider.to_string()),
+                Some(format!(
+                    "upgrade {provider} so cg can pass {required} with its declared invocation"
+                )),
+            )
+        })
+        .collect()
+}
+
+pub fn provider_tool_available(root: &Path, provider: &str) -> bool {
+    let specs = load_provider_specs(root, &[]);
+    specs
+        .providers
+        .get(provider)
+        .and_then(find_provider_binary)
+        .is_some()
+}
+
+fn find_provider_binary(spec: &ProviderSpec) -> Option<PathBuf> {
+    if spec.binary.is_empty() {
+        return None;
+    }
+    which::which(&spec.binary).ok()
+}
+
+fn apply_provider_env_removal(command: &mut Command, provider: &str, spec: &ProviderSpec) {
+    for name in spec
+        .env_remove
+        .iter()
+        .map(String::as_str)
+        .chain(protected_env(provider).iter().copied())
+        .chain(CLAUDE_PROTECTED_ENV.iter().copied())
+        .chain(CODEX_PROTECTED_ENV.iter().copied())
+    {
+        command.env_remove(name);
+    }
+}
+
+fn neutral_cwd() -> PathBuf {
+    std::env::temp_dir()
+}
+
+fn temp_output_path(provider: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "cg-{provider}-last-message-{}-{nanos}.txt",
+        std::process::id()
+    ))
+}
+
+struct TempOutputFile {
+    path: PathBuf,
+}
+
+impl TempOutputFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempOutputFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HostSessionLlmClient {
+    provider: String,
+    catalog_root: PathBuf,
+    progress_to_stdout: bool,
+}
+
+impl HostSessionLlmClient {
+    fn prove(
+        &self,
+        invocation: &ModelInvocation,
+    ) -> std::result::Result<ModelReply, ModelProofError> {
+        let specs = load_provider_specs(&self.catalog_root, &[]);
+        let Some(spec) = specs.providers.get(&self.provider) else {
+            return Err(ModelProofError::HostToolMissing {
+                provider: self.provider.clone(),
+            });
+        };
+        if self.provider == "claude"
+            && let Err(message) = inspect_claude_settings_for_reinjection()
+        {
+            return Err(ModelProofError::UnsafeSettings { message });
+        }
+        let Some(binary) = find_provider_binary(spec) else {
+            return Err(ModelProofError::HostToolMissing {
+                provider: self.provider.clone(),
+            });
+        };
+        let output_file_guard = if spec.reply_framing == "file" {
+            Some(TempOutputFile::new(temp_output_path(&self.provider)))
+        } else {
+            None
+        };
+        let output_file = output_file_guard.as_ref().map(TempOutputFile::path);
+        let run = run_provider_completion(
+            &self.provider,
+            &binary,
+            spec,
+            &invocation.request.input,
+            output_file,
+            self.progress_to_stdout,
+        );
+        if run.timed_out {
+            return Err(ModelProofError::LiveCallFailed {
+                bucket: "timeout".to_string(),
+                message: "The provider did not complete in time; cg did not retry the proof call."
+                    .to_string(),
+            });
+        }
+        let Some(status) = run.status else {
+            return Err(ModelProofError::LiveCallFailed {
+                bucket: "unknown".to_string(),
+                message: "provider call failed before a status was available".to_string(),
+            });
+        };
+        if !status.success() {
+            let diagnostic = if run.stdout.trim().is_empty() {
+                run.stderr.trim()
+            } else {
+                run.stdout.trim()
+            };
+            return Err(classified_proof_failure(&self.provider, diagnostic));
+        }
+        let reply = extract_reply_from_spec(
+            &self.provider,
+            spec,
+            &spec.reply_framing,
+            &run.stdout,
+            output_file,
+        )
+        .map_err(|err| match err {
+            ReplyError::MissingPath { path, framing } => {
+                ModelProofError::ReplyFormat { path, framing }
+            }
+            ReplyError::Unsuccessful { diagnostic } => {
+                classified_proof_failure(&self.provider, &diagnostic)
+            }
+        })?;
+        if reply.trim().is_empty() {
+            return Err(ModelProofError::LiveCallFailed {
+                bucket: "format".to_string(),
+                message: "provider returned successfully but no proof reply was found".to_string(),
+            });
+        }
+        Ok(ModelReply {
+            marker: "host-session-proof".to_string(),
+            phrasing: reply,
+            advisory_flag: false,
+            malformed: false,
+        })
+    }
+}
+
+impl LlmClient for HostSessionLlmClient {
+    async fn understand(&self, invocation: &ModelInvocation) -> context_graph::Result<ModelReply> {
+        self.understand_native(invocation)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn understand_native(&self, invocation: &ModelInvocation) -> context_graph::Result<ModelReply> {
+        self.prove(invocation).map_err(|err| {
+            CgError::Engine(format!(
+                "{}:{}:{}",
+                err.condition(),
+                err.bucket(),
+                err.message()
+            ))
+        })
+    }
+}
+
+fn run_provider_completion(
+    provider: &str,
+    binary: &Path,
+    spec: &ProviderSpec,
+    prompt: &str,
+    output_file: Option<&Path>,
+    progress_to_stdout: bool,
+) -> ProviderRun {
+    let cwd = neutral_cwd();
+    let invocation = construct_provider_invocation(spec, prompt, output_file, &cwd);
+    let mut command = Command::new(binary);
+    command
+        .args(&invocation.argv)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_provider_env_removal(&mut command, provider, spec);
+    let Ok(mut child) = command.spawn() else {
+        return ProviderRun {
+            status: None,
+            stdout: String::new(),
+            stderr: "provider spawn failed".to_string(),
+            timed_out: false,
+        };
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = stdout.map(read_stream);
+    let stderr_reader = stderr.map(read_stream);
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(invocation.stdin.as_bytes());
+    }
+    thread::sleep(Duration::from_millis(100));
+    eprintln!("waiting on provider {provider}");
+    if progress_to_stdout {
+        println!("waiting on provider {provider}");
+        let _ = std::io::stdout().flush();
+    }
+    let deadline = Instant::now() + Duration::from_millis(spec.timeout_ms.max(500));
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = Command::new("pkill")
+                        .arg("-TERM")
+                        .arg("-P")
+                        .arg(child.id().to_string())
+                        .status();
+                    let _ = child.kill();
+                    break child.wait().ok();
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break None,
+        }
+    };
+    let stdout = stdout_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    ProviderRun {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    }
+}
+
+fn read_stream<R: Read + Send + 'static>(mut stream: R) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stream.read_to_string(&mut out);
+        out
+    })
+}
+
+fn classified_proof_failure(provider: &str, diagnostic: &str) -> ModelProofError {
+    match classify_provider_reply(provider, diagnostic) {
+        Classification::Success => ModelProofError::LiveCallFailed {
+            bucket: "unknown".to_string(),
+            message: "provider failed without an actionable diagnostic".to_string(),
+        },
+        Classification::HostLoginExpired { message } => {
+            ModelProofError::HostLoginExpired { message }
+        }
+        Classification::BillingRequired { message } => ModelProofError::LiveCallFailed {
+            bucket: "billing".to_string(),
+            message: format!("failed: {message}"),
+        },
+        Classification::RateLimited { message } => ModelProofError::LiveCallFailed {
+            bucket: "rate_limit".to_string(),
+            message: format!("failed: {message}"),
+        },
+        Classification::LiveCallFailed { message } => ModelProofError::LiveCallFailed {
+            bucket: "unknown".to_string(),
+            message: format!("failed: {message}"),
+        },
+    }
+}
+
+fn inspect_claude_settings_for_reinjection() -> std::result::Result<(), String> {
+    let mut candidates = vec![
+        PathBuf::from("/etc/claude-code/settings.json"),
+        PathBuf::from("/etc/claude/settings.json"),
+    ];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".claude/settings.json"));
+        candidates.push(home.join(".claude/settings.local.json"));
+        candidates.push(home.join("agent-config/claude-code/settings.json"));
+    }
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|err| {
+            format!(
+                "read {} failed while checking provider settings: {err}",
+                path.display()
+            )
+        })?;
+        let value = serde_json::from_str::<Value>(&text).map_err(|err| {
+            format!(
+                "parse {} failed while checking provider settings: {err}",
+                path.display()
+            )
+        })?;
+        if json_contains_key(&value, "apiKeyHelper") {
+            return Err(format!(
+                "{} contains apiKeyHelper; refusing host-session drive because it can re-inject metered API-key billing",
+                path.display()
+            ));
+        }
+        if let Some(name) = json_env_reinjects_protected_key(&value) {
+            return Err(format!(
+                "{} env block sets {name}; refusing host-session drive because it can re-inject metered API-key billing",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_contains_key(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key == needle || json_contains_key(value, needle)),
+        Value::Array(values) => values.iter().any(|value| json_contains_key(value, needle)),
+        _ => false,
+    }
+}
+
+fn json_env_reinjects_protected_key(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "env"
+                    && let Some(name) = json_contains_protected_env_key(value)
+                {
+                    return Some(name);
+                }
+                if let Some(name) = json_env_reinjects_protected_key(value) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(json_env_reinjects_protected_key),
+        _ => None,
+    }
+}
+
+fn json_contains_protected_env_key(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Object(map) => {
+            for name in CLAUDE_PROTECTED_ENV
+                .iter()
+                .chain(CODEX_PROTECTED_ENV.iter())
+            {
+                if map.contains_key(*name) {
+                    return Some(*name);
+                }
+            }
+            map.values().find_map(json_contains_protected_env_key)
+        }
+        Value::Array(values) => values.iter().find_map(json_contains_protected_env_key),
+        _ => None,
+    }
+}
+
+fn raw_connection_name(value: &toml::Value) -> Option<String> {
+    value
+        .get("name")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+}
 
 #[derive(Debug, Default)]
 pub struct NoopLlmClient;
@@ -281,13 +1458,29 @@ struct ContextModelBinding {
     model_id: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct ModelConnectionCatalogFile {
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RawModelConnectionCatalogFile {
     #[serde(default)]
     write_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_connection_name: Option<String>,
-    connections: Vec<ConnectionRead>,
+    #[serde(default)]
+    connections: Vec<toml::Value>,
+    #[serde(default)]
+    models: Vec<ModelRead>,
+    #[serde(default)]
+    context_models: Vec<ContextModelBinding>,
+    #[serde(default)]
+    migration_records: Vec<MigrationRecord>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct PersistModelConnectionCatalogFile {
+    #[serde(default)]
+    write_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_connection_name: Option<String>,
+    connections: Vec<toml::Value>,
     models: Vec<ModelRead>,
     context_models: Vec<ContextModelBinding>,
     migration_records: Vec<MigrationRecord>,
@@ -297,6 +1490,8 @@ struct ModelConnectionCatalogFile {
 pub struct ModelConnectionCatalog {
     root: PathBuf,
     connections: BTreeMap<String, ConnectionRead>,
+    unreadable_connections: BTreeMap<String, String>,
+    unknown_connection_records: Vec<toml::Value>,
     models: BTreeMap<String, ModelRead>,
     context_models: BTreeMap<ContextId, String>,
     migration_records: Vec<MigrationRecord>,
@@ -341,18 +1536,28 @@ impl ModelConnectionCatalog {
         }
         let text = fs::read_to_string(&path)
             .map_err(|err| format!("read {} failed: {err}", path.display()))?;
-        let file = toml::from_str::<ModelConnectionCatalogFile>(&text)
+        let file = toml::from_str::<RawModelConnectionCatalogFile>(&text)
             .map_err(|err| format!("parse {} failed: {err}", path.display()))?;
         self.write_sequence = file.write_sequence;
         self.active_connection_name = file.active_connection_name;
-        self.connections = file
-            .connections
-            .into_iter()
-            .map(|mut connection| {
-                connection.credential_reference = connection.credential_reference.normalized();
-                (connection.name.clone(), connection)
-            })
-            .collect();
+        self.connections.clear();
+        self.unreadable_connections.clear();
+        self.unknown_connection_records.clear();
+        for raw_connection in file.connections {
+            match raw_connection.clone().try_into::<ConnectionRead>() {
+                Ok(mut connection) => {
+                    connection.credential_reference = connection.credential_reference.normalized();
+                    self.connections.insert(connection.name.clone(), connection);
+                }
+                Err(err) => {
+                    let name = raw_connection_name(&raw_connection).unwrap_or_else(|| {
+                        format!("unreadable-{}", self.unreadable_connections.len())
+                    });
+                    self.unreadable_connections.insert(name, err.to_string());
+                    self.unknown_connection_records.push(raw_connection);
+                }
+            }
+        }
         self.models = file
             .models
             .into_iter()
@@ -393,10 +1598,23 @@ impl ModelConnectionCatalog {
         lock.lock_exclusive()
             .map_err(|err| format!("lock {} failed: {err}", lock_path.display()))?;
         self.write_sequence = self.write_sequence.saturating_add(1);
-        let file = ModelConnectionCatalogFile {
+        let mut connections = Vec::new();
+        for connection in self.connections.values() {
+            let value = toml::Value::try_from(connection.clone())
+                .map_err(|err| format!("serialize connection {} failed: {err}", connection.name))?;
+            connections.push(value);
+        }
+        for raw_connection in &self.unknown_connection_records {
+            let conflicts_with_known = raw_connection_name(raw_connection)
+                .is_some_and(|name| self.connections.contains_key(&name));
+            if !conflicts_with_known {
+                connections.push(raw_connection.clone());
+            }
+        }
+        let file = PersistModelConnectionCatalogFile {
             write_sequence: self.write_sequence,
             active_connection_name: self.active_connection_name.clone(),
-            connections: self.connections.values().cloned().collect(),
+            connections,
             models: self.models.values().cloned().collect(),
             context_models: self
                 .context_models
@@ -976,6 +2194,12 @@ impl ModelConnectionCatalog {
         self.load_error.as_deref()
     }
 
+    pub fn unreadable_connection_error(&self, connection_name: &str) -> Option<&str> {
+        self.unreadable_connections
+            .get(connection_name)
+            .map(String::as_str)
+    }
+
     pub fn write_sequence(&self) -> u64 {
         self.write_sequence
     }
@@ -1161,6 +2385,64 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
 
     pub fn config(&self) -> &PrincipalAwareConfig {
         &self.config
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prove_host_session_connection(
+        &mut self,
+        connection_name: &str,
+        prompt: &str,
+        progress_to_stdout: bool,
+    ) -> std::result::Result<ModelProof, ModelProofError> {
+        let Some(connection) = self.catalog.connections.get(connection_name).cloned() else {
+            return Err(ModelProofError::NoHostSession);
+        };
+        let CredentialSource::HostSession { provider, .. } =
+            connection.credential_reference.source.clone()
+        else {
+            return Err(ModelProofError::NoHostSession);
+        };
+        let resolution = self.catalog.resolve_credential_for_paid_call(
+            connection_name,
+            &self.principal,
+            &mut self.config,
+        );
+        let Some(resolution) = resolution else {
+            return if connection.consent_recorded {
+                Err(ModelProofError::NoHostSession)
+            } else {
+                Err(ModelProofError::ConsentNotRecorded)
+            };
+        };
+        let request = UnderstandingRequest {
+            context_id: ContextId::new_v7(),
+            consumer: UnderstandingConsumer::ConversationCondensation,
+            deployment: DeploymentSurface::Edge,
+            input: prompt.to_string(),
+            paid: true,
+        };
+        let invocation = unsafe {
+            ModelInvocation::from_authorized_runtime_parts(
+                request,
+                Some(resolution.connection_name.clone()),
+                resolution.secret,
+                None,
+                None,
+                Vec::new(),
+                false,
+            )
+        };
+        let client = HostSessionLlmClient {
+            provider: provider.clone(),
+            catalog_root: self.catalog.root.clone(),
+            progress_to_stdout,
+        };
+        let reply = client.prove(&invocation)?;
+        Ok(ModelProof {
+            connection_name: resolution.connection_name,
+            provider,
+            reply: reply.phrasing,
+        })
     }
 
     pub async fn understand_async(

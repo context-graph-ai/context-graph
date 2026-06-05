@@ -50,68 +50,6 @@ nomic_revision_sha="b6e8c34dc906161922aedff26e55cc6ec85162b83826c43ef604452489c4
 
 mkdir -p "$prefix/bin" "$HOME/.config/cg"
 
-python_clean_hooks='
-import json, pathlib, sys
-agent = sys.argv[1]
-for raw in sys.argv[2:]:
-    path = pathlib.Path(raw)
-    if not path.exists():
-        continue
-    data = json.loads(path.read_text())
-    hooks = data.get("hooks", [])
-    out = []
-    skipping = False
-    begin = f"# BEGIN cg-injected-hook-{agent}"
-    end = f"# END cg-injected-hook-{agent}"
-    for hook in hooks:
-        if isinstance(hook, str) and hook.startswith(begin):
-            skipping = True
-            continue
-        if skipping:
-            if isinstance(hook, str) and hook.startswith(end):
-                skipping = False
-            continue
-        if hook == f"cg observe --agent {agent}":
-            continue
-        out.append(hook)
-    data["hooks"] = out
-    path.write_text(json.dumps(data, indent=2) + "\n")
-'
-
-inject_claude_hook() {
-  local config="$HOME/agent-config/claude-code/settings.json"
-  if [ ! -f "$config" ]; then
-    return 0
-  fi
-  python3 - "$config" <<'PY'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-data = json.loads(path.read_text())
-hooks = data.get("hooks", [])
-if not hooks:
-    sys.exit(0)
-out = []
-skipping = False
-for hook in hooks:
-    if isinstance(hook, str) and hook.startswith("# BEGIN cg-injected-hook-claude-code"):
-        skipping = True
-        continue
-    if skipping:
-        if isinstance(hook, str) and hook.startswith("# END cg-injected-hook-claude-code"):
-            skipping = False
-        continue
-    if hook == "cg observe --agent claude-code":
-        continue
-    out.append(hook)
-out.extend([
-    "# BEGIN cg-injected-hook-claude-code-0",
-    "# END cg-injected-hook-claude-code-0",
-])
-data["hooks"] = out
-path.write_text(json.dumps(data, indent=2) + "\n")
-PY
-}
-
 cg_bin="$prefix/bin/cg"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compiled_cg=""
@@ -138,6 +76,35 @@ if [ -z "$compiled_cg" ]; then
   compiled_cg="$repo_root/target/release/cg"
 fi
 install -m 755 "$compiled_cg" "$cg_bin"
+
+python3 - "$HOME" <<'PY'
+import json, pathlib, sys
+
+home = pathlib.Path(sys.argv[1])
+path = home / "agent-config/claude-code/settings.json"
+if not path.exists():
+    sys.exit(0)
+
+data = json.loads(path.read_text())
+hooks = data.get("hooks")
+if not isinstance(hooks, list) or not hooks:
+    sys.exit(0)
+
+has_marker = any(isinstance(hook, str) and hook.startswith("# BEGIN cg-injected-hook-") for hook in hooks)
+cleaned = [
+    hook
+    for hook in hooks
+    if hook != "cg observe --agent claude-code"
+]
+if has_marker:
+    if cleaned == hooks:
+        sys.exit(0)
+else:
+    cleaned.append("# BEGIN cg-injected-hook-claude-code-0")
+    cleaned.append("# END cg-injected-hook-claude-code-0")
+data["hooks"] = cleaned
+path.write_text(json.dumps(data, indent=2) + "\n")
+PY
 
 cat >"$prefix/cg-uninstall.sh" <<UNINSTALL
 #!/usr/bin/env bash
@@ -203,8 +170,6 @@ else
 fi
 UNINSTALL
 chmod 755 "$prefix/cg-uninstall.sh"
-
-inject_claude_hook
 
 download_artifact() {
   local url="$1"

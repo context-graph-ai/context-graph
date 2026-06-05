@@ -9,17 +9,17 @@ use cg_catalog::{
 };
 use cg_cli::{
     Classification, ProviderOverride, classify_provider_reply, construct_claude_invocation,
-    extract_reply, load_provider_specs, register_model_connection_checks, run_doctor_checks,
-    run_selftest_checks,
+    extract_reply, load_provider_specs, register_model_connection_checks_with_root,
 };
+use cg_cli_conventions::{CheckRegistry, run_doctor_checks, run_selftest_checks};
 use context_graph::{ContextId, Principal};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use support::{
     CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider, base64_basic,
-    catalog_disk_contains, file_inventory, parse_single_json, parse_single_json_object, repo_root,
-    run_cg, run_variadic_fake, unique_label, write_file,
+    catalog_disk_contains, cg_bin, file_inventory, parse_single_json, parse_single_json_object,
+    repo_root, run_cg, run_variadic_fake, unique_label, write_file,
 };
 
 const INGESTION_EXPECTATION: &str = "automatic capture switches on when ingestion ships";
@@ -243,7 +243,9 @@ fn cli_help_root() {
     assert!(
         help.stdout.contains("model")
             && help.stdout.contains("status")
-            && help.stdout.contains("selftest"),
+            && help.stdout.contains("selftest")
+            && help.stdout.contains("disconnect <agent>")
+            && help.stdout.contains("connect <agent> --remove-all"),
         "root help must list the shipped verb groups; stdout={:?}",
         help.stdout
     );
@@ -258,6 +260,41 @@ fn cli_help_root() {
         bare.stdout.contains("model auth login"),
         "bare cg must show help text, got {:?}",
         bare.stdout
+    );
+    let invalid_cleanup = harness.run(&["connect", "claude-code"]);
+    assert_eq!(
+        invalid_cleanup.code, 2,
+        "cleanup connect without --remove-all must be usage, not a no-op"
+    );
+}
+
+#[test]
+fn invalid_format_values_are_typed_usage_errors() {
+    let harness = CliHarness::new();
+    for args in [
+        &["status", "--format", "yaml"][..],
+        &["status", "--format=yaml"][..],
+    ] {
+        let output = harness.run(args);
+        assert_eq!(
+            output.code, 2,
+            "invalid --format must exit with usage code 2"
+        );
+        assert!(
+            output.stderr.contains("invalid --format value"),
+            "invalid --format must be explained on stderr, got {:?}",
+            output.stderr
+        );
+    }
+    let missing_id = harness.run(&["model", "show", "--format", "text"]);
+    assert_eq!(
+        missing_id.code, 2,
+        "model show --format text without an id must be usage, not model `text` lookup"
+    );
+    assert!(
+        missing_id.stderr.contains("missing model id"),
+        "missing model id must be explained on stderr, got {:?}",
+        missing_id.stderr
     );
 }
 
@@ -583,6 +620,9 @@ fn model_auth_login_offers_present_host_session_first_by_name() {
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
+    harness
+        .providers
+        .set_auth_probe_stderr(Provider::Claude, "warning: config file is deprecated");
     let output = harness.run(&["model", "auth", "login", "--format", "json"]);
     assert_eq!(
         output.code, 0,
@@ -1414,6 +1454,32 @@ fn connect_with_expired_host_login_says_relogin_not_no_host_session() {
 }
 
 #[test]
+fn connect_with_unsafe_host_settings_reports_billing_risk_not_no_host_session() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Claude,
+        &unique_label("dev"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    write_file(
+        harness.data_root.path().join(".claude/settings.json"),
+        r#"{"env":{"ANTHROPIC_API_KEY":"metered-key"}}"#,
+    );
+    let output = harness.run(&["model", "auth", "login", "--connection", "claude"]);
+    assert_eq!(
+        output.code, 6,
+        "unsafe settings must fail as provider/billing risk"
+    );
+    assert_condition(&output, "live_call_failed");
+    assert_bucket(&output, "billing");
+    assert!(
+        output.stdout.contains("ANTHROPIC_API_KEY") && !output.stdout.contains("no_host_session"),
+        "unsafe settings must name the protected key instead of hiding as no host session"
+    );
+}
+
+#[test]
 fn stale_host_login_says_relogin_with_your_agent() {
     let harness = CliHarness::new();
     harness.providers.install(
@@ -1543,6 +1609,57 @@ fn corrupted_connections_file_fails_loud_and_typed() {
         fs::read_to_string(state_file).unwrap_or_default(),
         "not valid toml {{{",
         "garbage state must not be silently overwritten"
+    );
+}
+
+#[test]
+fn forward_unknown_connection_records_survive_known_connection_persist() {
+    let harness = CliHarness::new();
+    let state_file = harness.data_root.path().join("cg/model-connections.toml");
+    write_file(
+        &state_file,
+        r#"write_sequence = 7
+active_connection_name = "future"
+
+[[connections]]
+name = "future"
+consent_recorded = true
+spend_owner = "future@example.test"
+
+[connections.credential_reference]
+env_var = ""
+
+[connections.credential_reference.source.FutureHostSession]
+provider = "future"
+account = "future@example.test"
+"#,
+    );
+    let catalog = ModelConnectionCatalog::open(harness.data_root.path());
+    assert!(
+        catalog.unreadable_connection_error("future").is_some(),
+        "unknown future connection source must be tolerated per-record instead of corrupting the whole file"
+    );
+    harness.providers.install(
+        Provider::Claude,
+        &unique_label("dev"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    let output = harness.run(&[
+        "model",
+        "auth",
+        "login",
+        "--connection",
+        "claude",
+        "--consent",
+    ]);
+    assert_eq!(output.code, 0);
+    let after = fs::read_to_string(&state_file).expect("state file after known persist");
+    assert!(
+        after.contains("FutureHostSession")
+            && after.contains("name = \"future\"")
+            && after.contains("name = \"claude\""),
+        "known writes must preserve forward-compatible unknown records and add the new known record, got {after}"
     );
 }
 
@@ -1783,19 +1900,16 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
 fn claude_invocation_uses_equals_form_and_stdin_prompt() {
     let prompt = "prove the host session path";
     let invocation = construct_claude_invocation(prompt);
-    assert!(
-        invocation
-            .argv
-            .iter()
-            .any(|arg| arg.starts_with("--tools=")),
-        "claude invocation must use equals form for variadic value flags"
-    );
-    assert!(
-        invocation
-            .argv
-            .iter()
-            .any(|arg| arg.starts_with("--mcp-config=")),
-        "claude invocation must use equals form for --mcp-config"
+    assert_eq!(
+        invocation.argv,
+        vec![
+            "-p".to_string(),
+            "--output-format=json".to_string(),
+            "--strict-mcp-config".to_string(),
+            "--mcp-config={\"mcpServers\":{}}".to_string(),
+            "--tools=\"\"".to_string(),
+        ],
+        "claude invocation must pin the exact host-session argv"
     );
     assert_eq!(
         invocation.stdin, prompt,
@@ -1806,15 +1920,12 @@ fn claude_invocation_uses_equals_form_and_stdin_prompt() {
         "prompt must not be a trailing positional argument"
     );
 
-    let positive = run_variadic_fake(
-        &[
-            "-p",
-            "--mcp-config={}",
-            "--tools=[]",
-            "--output-format=json",
-        ],
-        prompt,
-    );
+    let argv = invocation
+        .argv
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let positive = run_variadic_fake(&argv, prompt);
     assert_eq!(positive.code, 0);
     assert!(
         positive.stdout.contains("proof-"),
@@ -1823,6 +1934,70 @@ fn claude_invocation_uses_equals_form_and_stdin_prompt() {
     let negative = run_variadic_fake(&["-p", "--mcp-config", prompt], "");
     assert_ne!(negative.code, 0);
     assert!(negative.stderr.contains("MCP config not found"));
+
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Claude,
+        &unique_label("dev"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    let connected = harness.run(&[
+        "model",
+        "auth",
+        "login",
+        "--connection",
+        "claude",
+        "--consent",
+    ]);
+    assert_eq!(connected.code, 0);
+    let output = Command::new(cg_bin())
+        .args(["selftest"])
+        .env("CG_DATA_ROOT", harness.data_root.path())
+        .env("PATH", harness.providers.path_env())
+        .env("HOME", harness.data_root.path())
+        .env("ANTHROPIC_AUTH_TOKEN", "junk-auth-token")
+        .env("ANTHROPIC_API_KEY", "junk-api-key")
+        .env("CLAUDE_CODE_USE_BEDROCK", "1")
+        .env("CLAUDE_CODE_USE_VERTEX", "1")
+        .env("CLAUDE_CODE_USE_FOUNDRY", "1")
+        .env("ANTHROPIC_BASE_URL", "https://metered.example.invalid")
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "subscription-oauth-token")
+        .env("OPENAI_API_KEY", "junk-openai")
+        .env("CODEX_API_KEY", "junk-codex")
+        .output()
+        .expect("run cg selftest with junk env");
+    assert!(
+        output.status.success(),
+        "selftest should pass through fake provider"
+    );
+    let records = harness.providers.completion_records();
+    let env = records
+        .last()
+        .and_then(|record| record.get("env"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for name in [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+    ] {
+        assert!(
+            !env.contains_key(name),
+            "fake provider must not observe protected env var {name}"
+        );
+    }
+    assert_eq!(
+        env.get("CLAUDE_CODE_OAUTH_TOKEN").and_then(Value::as_str),
+        Some("subscription-oauth-token"),
+        "host-session drive must preserve the subscription OAuth credential path"
+    );
 }
 
 #[test]
@@ -1863,6 +2038,19 @@ fn reply_extraction_engine_matches_recorded_envelopes() {
                 if path == "/result" && framing == "json"
         ),
         "missing-path errors must name /result and the framing"
+    );
+    let error_with_result = extract_reply(
+        "claude",
+        "json",
+        r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":402,"result":"billing required"}"#,
+        None,
+    );
+    assert!(
+        matches!(
+            error_with_result,
+            Err(cg_cli::ReplyError::Unsuccessful { .. })
+        ),
+        "json success predicates must reject provider error envelopes even when /result exists"
     );
 }
 
@@ -1915,8 +2103,26 @@ fn classify_rules_map_401_to_host_login_expired_via_is_error_not_subtype() {
 
 #[test]
 fn cg_doctor_and_selftest_runners_mount_from_shared_conventions_layer() {
-    let mut registry = cg_cli::CheckRegistry::default();
-    register_model_connection_checks(&mut registry);
+    let dir = TempDir::new().expect("doctor registry override root");
+    write_file(
+        dir.path().join("cg/providers.toml"),
+        r#"[providers.claude]
+required_help_flags = ["--cg-test-only-missing-flag"]
+"#,
+    );
+    let mut registry = CheckRegistry::default();
+    register_model_connection_checks_with_root(&mut registry, dir.path());
+    assert!(
+        registry
+            .checks()
+            .iter()
+            .any(|check| check.check_id == "model/claude/flags-in-help" && !check.spending),
+        "model-connection checks must register through the host-handed conventions registrar"
+    );
+    assert!(
+        registry.checks().iter().any(|check| check.spending),
+        "shared registry must preserve the free-vs-spending marker"
+    );
     let doctor = run_doctor_checks(&registry);
     assert!(
         doctor
@@ -1934,7 +2140,47 @@ fn cg_doctor_and_selftest_runners_mount_from_shared_conventions_layer() {
     );
     let selftest = run_selftest_checks(&registry);
     assert!(
+        !selftest.ok,
+        "shared selftest runner must fail closed unless the host binary wires a live proof"
+    );
+    assert!(
         selftest.checks_run.iter().any(|id| id.contains("model")),
         "selftest runner must mount from the same conventions registry"
+    );
+    assert!(
+        !selftest
+            .checks_run
+            .iter()
+            .any(|id| id == "model/claude/flags-in-help"),
+        "selftest runner must not execute free doctor-only checks"
+    );
+
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Claude,
+        &unique_label("dev"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    write_file(
+        harness
+            .providers
+            .fixture_dir
+            .join("claude")
+            .join("help_flags"),
+        "--output-format\n",
+    );
+    let output = harness.run(&["doctor", "--json"]);
+    let parsed = parse_single_json_object(&output.stdout).unwrap_or_default();
+    let checks_run = parsed
+        .get("checks_run")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        checks_run
+            .iter()
+            .any(|id| id.as_str() == Some("model/claude/flags-in-help")),
+        "cg doctor binary output must come from the same registered conventions runner"
     );
 }
