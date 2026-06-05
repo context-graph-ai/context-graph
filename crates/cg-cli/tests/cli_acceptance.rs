@@ -2099,6 +2099,31 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
         "doctor finding must name the provider drift"
     );
     assert_eq!(completion_count(&harness), 0, "doctor never spends");
+
+    let stderr_help = CliHarness::new();
+    stderr_help.providers.install(
+        Provider::Agy,
+        &unique_label("agy"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    write_file(
+        stderr_help.data_root.path().join("cg/providers.toml"),
+        r#"[providers.agy]
+required_help_flags = ["--cg-test-only-missing-flag"]
+"#,
+    );
+
+    let output = stderr_help.run(&["doctor"]);
+
+    assert_eq!(output.code, 1);
+    assert!(
+        output.stdout.contains(
+            "agy fixture-provider 2026.6.4 help is missing required host-session flag --cg-test-only-missing-flag"
+        ),
+        "doctor must capture version text from stderr when a stderr-help provider has a genuine missing flag"
+    );
+    assert_eq!(completion_count(&stderr_help), 0, "doctor never spends");
 }
 
 #[test]

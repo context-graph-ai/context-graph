@@ -711,6 +711,8 @@ if "--help" in args:
         time.sleep(120)
     if provider == "codex" and args and args[0] == "exec":
         print(read("exec_help_flags", "--output-last-message\n-C"))
+    elif provider == "agy":
+        print(read("help_flags", "--print\n"), file=sys.stderr)
     else:
         print(read("help_flags", "--output-format\n--mcp-config\n--strict-mcp-config\n--tools"))
     sys.exit(0)
@@ -720,7 +722,10 @@ if "--version" in args:
     if read("version_probe_behavior", "normal") == "fail":
         print("version probe failed", file=sys.stderr)
         sys.exit(2)
-    print(read("version", "fixture-provider 0"))
+    if provider == "agy":
+        print(read("version", "fixture-provider 0"), file=sys.stderr)
+    else:
+        print(read("version", "fixture-provider 0"))
     sys.exit(0)
 
 if "auth" in args and "status" in args:

@@ -1385,10 +1385,8 @@ fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
             Some(format!("repair {provider} host CLI installation")),
         )];
     }
-    let version = version_run
-        .stdout
+    let version = provider_run_combined_output(&version_run)
         .trim()
-        .to_string()
         .chars()
         .take(120)
         .collect::<String>();
@@ -1413,7 +1411,7 @@ fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
             )),
         )];
     }
-    let help = help_run.stdout;
+    let help = provider_run_combined_output(&help_run);
     spec.required_help_flags
         .iter()
         .filter(|required| !help.contains(required.as_str()))
@@ -1456,6 +1454,15 @@ fn provider_run_output_summary(run: &ProviderRun) -> String {
         output
     };
     output.chars().take(160).collect()
+}
+
+fn provider_run_combined_output(run: &ProviderRun) -> String {
+    match (run.stdout.trim().is_empty(), run.stderr.trim().is_empty()) {
+        (false, false) => format!("{}\n{}", run.stdout, run.stderr),
+        (false, true) => run.stdout.clone(),
+        (true, false) => run.stderr.clone(),
+        (true, true) => String::new(),
+    }
 }
 
 pub fn provider_tool_available(root: &Path, provider: &str) -> bool {
