@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use cg_catalog::{
     Catalog, CredentialSource, HostSessionProbe, ModelConnectionCatalog, ModelProofError,
-    PrincipalAwareConfig, Source, UnderstandingRuntime, load_provider_specs,
+    PrincipalAwareConfig, ProviderSpecLoadError, Source, UnderstandingRuntime, load_provider_specs,
     model_connection_system_principal, probe_host_session_provider, provider_tool_available,
-    register_model_connection_checks_with_root,
+    register_model_connection_checks_with_root, try_load_provider_specs,
 };
 use cg_cli::{CheckRegistry, run_doctor_checks};
 use serde::Deserialize;
@@ -242,6 +242,9 @@ fn handle_status(args: &[String]) -> i32 {
     }
     let format = output_format(args);
     let root = data_root();
+    if let Err(err) = try_load_provider_specs(&root, &[]) {
+        return provider_spec_failure(&err);
+    }
     let catalog = ModelConnectionCatalog::open(&root);
     if let Some(error) = catalog.load_error() {
         return unreadable_connections_file(error);
@@ -326,6 +329,9 @@ fn handle_model_auth_login(args: &[String]) -> i32 {
     let selected = flag_value(args, "--connection");
     let consent_flag = has_flag(args, "--consent");
     let root = data_root();
+    if let Err(err) = try_load_provider_specs(&root, &[]) {
+        return provider_spec_failure(&err);
+    }
     let candidates = discover_candidates(&root);
 
     if candidates.is_empty() {
@@ -584,6 +590,9 @@ fn handle_selftest(args: &[String]) -> i32 {
     }
     let format = output_format(args);
     let root = data_root();
+    if let Err(err) = try_load_provider_specs(&root, &[]) {
+        return provider_spec_failure(&err);
+    }
     let catalog = ModelConnectionCatalog::open(&root);
     if let Some(error) = catalog.load_error() {
         return unreadable_connections_file(error);
@@ -637,8 +646,12 @@ fn handle_doctor(args: &[String]) -> i32 {
         return 0;
     }
     let as_json = has_flag(args, "--json");
+    let root = data_root();
+    if let Err(err) = try_load_provider_specs(&root, &[]) {
+        return provider_spec_failure(&err);
+    }
     let mut registry = CheckRegistry::default();
-    register_model_connection_checks_with_root(&mut registry, data_root());
+    register_model_connection_checks_with_root(&mut registry, root);
     let report = run_doctor_checks(&registry);
     if as_json {
         let value = serde_json::to_value(&report).expect("doctor report serializes");
@@ -804,6 +817,20 @@ fn unreadable_connections_file(error: &str) -> i32 {
         "unknown",
         &format!("model-connections.toml could not be read: {error}"),
     )
+}
+
+fn provider_spec_failure(error: &ProviderSpecLoadError) -> i32 {
+    print_json(&json!({
+        "condition": "provider_spec_invalid",
+        "bucket": "config",
+        "provider": error.provider,
+        "field": error.field,
+        "value": error.value,
+        "accepted": error.accepted,
+        "path": error.path.as_ref().map(|path| path.display().to_string()),
+        "message": error.message(),
+    }));
+    1
 }
 
 fn failure(code: i32, condition: &str, bucket: &str, message: &str) -> i32 {

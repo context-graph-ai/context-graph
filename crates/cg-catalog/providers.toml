@@ -68,7 +68,7 @@ last_verified = "codex 0.136.0"
 
 [providers.agy]
 binary = "agy"
-prompt_delivery = "stdin"
+prompt_delivery = "argv"
 completion_args = ["--print"]
 env_remove = []
 env_preserve = []
@@ -76,5 +76,5 @@ reply_framing = "text"
 reply_path = "stdout"
 timeout_ms = 360000
 consent_required = true
-required_help_flags = []
-last_verified = "agy --print confirmed 2026-06-04"
+required_help_flags = ["--print"]
+last_verified = "agy --print <prompt> argv delivery confirmed 2026-06-05"

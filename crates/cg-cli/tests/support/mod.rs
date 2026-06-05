@@ -487,6 +487,15 @@ impl FakeProviderRig {
         );
     }
 
+    pub fn set_version_probe_fails(&self, provider: Provider) {
+        write_file(
+            self.fixture_dir
+                .join(provider.binary_name())
+                .join("version_probe_behavior"),
+            "fail",
+        );
+    }
+
     pub fn set_auth_probe_stderr(&self, provider: Provider, warning: &str) {
         write_file(
             self.fixture_dir
@@ -708,6 +717,9 @@ if "--help" in args:
 
 if "--version" in args:
     write_log("probe")
+    if read("version_probe_behavior", "normal") == "fail":
+        print("version probe failed", file=sys.stderr)
+        sys.exit(2)
     print(read("version", "fixture-provider 0"))
     sys.exit(0)
 
@@ -732,6 +744,21 @@ if "auth" in args and "status" in args:
     sys.exit(0)
 
 prompt = sys.stdin.read()
+if provider == "agy":
+    if "--print" not in args:
+        write_log("completion", prompt)
+        mark("completion_started")
+        mark("completion_exited")
+        print("flag needs an argument: -print", file=sys.stderr)
+        sys.exit(2)
+    print_index = args.index("--print")
+    if print_index + 1 >= len(args):
+        write_log("completion", prompt)
+        mark("completion_started")
+        mark("completion_exited")
+        print("flag needs an argument: -print", file=sys.stderr)
+        sys.exit(2)
+    prompt = args[print_index + 1]
 variadic_failure = False
 positionals = []
 skip_next = False

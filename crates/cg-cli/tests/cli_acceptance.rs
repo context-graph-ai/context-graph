@@ -10,6 +10,7 @@ use cg_catalog::{
 use cg_cli::{
     Classification, ProviderOverride, classify_provider_reply, construct_claude_invocation,
     extract_reply, load_provider_specs, register_model_connection_checks_with_root,
+    try_load_provider_specs, validate_embedded_provider_specs,
 };
 use cg_cli_conventions::{CheckRegistry, run_doctor_checks, run_selftest_checks};
 use context_graph::{ContextId, Principal};
@@ -170,6 +171,65 @@ fn assert_bucket(output: &CommandOutput, expected: &str) {
         bucket,
         Some(expected),
         "selftest bucket must be the closed-set value `{expected}`"
+    );
+}
+
+fn assert_provider_spec_invalid(
+    output: &CommandOutput,
+    provider: &str,
+    field: &str,
+    value_fragment: &str,
+    accepted_fragment: &str,
+) {
+    assert_eq!(
+        output.code, 1,
+        "invalid provider spec must exit as config failure"
+    );
+    let parsed = parse_single_json_object(&output.stdout);
+    assert!(
+        parsed.is_ok(),
+        "provider-spec failure must be exactly one JSON object, got stdout={:?}, stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+    let object = parsed.unwrap_or_default();
+    assert_eq!(
+        object.get("condition").and_then(Value::as_str),
+        Some("provider_spec_invalid")
+    );
+    assert_eq!(object.get("bucket").and_then(Value::as_str), Some("config"));
+    assert_eq!(
+        object.get("provider").and_then(Value::as_str),
+        Some(provider)
+    );
+    assert_eq!(object.get("field").and_then(Value::as_str), Some(field));
+    assert!(
+        object
+            .get("value")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.contains(value_fragment)),
+        "failure must name offending value `{value_fragment}`, got {object:?}"
+    );
+    let accepted = object
+        .get("accepted")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(
+        accepted
+            .iter()
+            .any(|value| value.contains(accepted_fragment)),
+        "failure must name accepted set containing `{accepted_fragment}`, got {accepted:?}"
+    );
+    assert!(
+        object
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.ends_with("cg/providers.toml")),
+        "override-layer errors must name the providers.toml path, got {object:?}"
     );
 }
 
@@ -1278,6 +1338,65 @@ fn selftest_pass_shows_reply_from_driven_cli_and_discard_line() {
 }
 
 #[test]
+fn selftest_delivers_prompt_by_argv_when_provider_spec_declares_argv_mode() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Agy,
+        &unique_label("agy"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    harness
+        .providers
+        .write_secret(Provider::Agy, "agy-argv-secret");
+    let connected = harness.run(&["model", "auth", "login", "--connection", "agy", "--consent"]);
+    assert_eq!(connected.code, 0, "probe-less agy connection must persist");
+
+    let output = harness.run(&["selftest"]);
+
+    assert_eq!(output.code, 0, "agy argv-mode selftest must pass");
+    assert!(output.stdout.contains("PASS"));
+    assert_eq!(
+        completion_count(&harness),
+        1,
+        "agy proof must spend exactly one completion"
+    );
+    let record = harness
+        .providers
+        .completion_records()
+        .pop()
+        .expect("agy completion record");
+    let argv = record
+        .get("argv")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        argv.first().map(String::as_str),
+        Some("--print"),
+        "agy invocation must use the declared print flag"
+    );
+    let prompt_from_argv = argv.get(1).cloned().unwrap_or_default();
+    assert!(
+        prompt_from_argv.contains("cg host-session proof"),
+        "prompt must be appended as --print's argv argument, got {argv:?}"
+    );
+    assert_eq!(
+        record.get("prompt").and_then(Value::as_str),
+        Some(prompt_from_argv.as_str()),
+        "fake agy must compute the reply from argv-delivered prompt, not stdin"
+    );
+    let expected = harness.providers.expected_reply(Provider::Agy);
+    assert!(
+        expected.is_some_and(|reply| output.stdout.contains(&reply)),
+        "shown proof must come from the argv-delivered prompt"
+    );
+}
+
+#[test]
 fn selftest_fails_when_binary_and_login_present_but_live_call_fails() {
     let harness = CliHarness::new();
     harness.providers.install(
@@ -2011,8 +2130,109 @@ timeout_ms = 700
 }
 
 #[test]
+fn cg_doctor_empty_required_help_flags_still_checks_binary_and_version() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Agy,
+        &unique_label("agy"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    write_file(
+        harness.data_root.path().join("cg/providers.toml"),
+        r#"[providers.agy]
+required_help_flags = []
+"#,
+    );
+
+    let output = harness.run(&["doctor"]);
+
+    assert!(
+        output.stdout.contains("OK: model/agy/flags-in-help"),
+        "empty flags may render OK only after the provider binary/version path ran"
+    );
+    let agy_probe_records = harness
+        .providers
+        .probe_records()
+        .into_iter()
+        .filter(|record| record.get("provider").and_then(Value::as_str) == Some("agy"))
+        .collect::<Vec<_>>();
+    assert!(
+        agy_probe_records.iter().any(|record| {
+            record
+                .get("argv")
+                .and_then(Value::as_array)
+                .is_some_and(|argv| argv == &vec![json!("--version")])
+        }),
+        "doctor must resolve agy and run --version even when no help flags are required"
+    );
+    assert!(
+        !agy_probe_records.iter().any(|record| {
+            record
+                .get("argv")
+                .and_then(Value::as_array)
+                .is_some_and(|argv| argv == &vec![json!("--help")])
+        }),
+        "empty required_help_flags skips only flag-presence assertions"
+    );
+    assert_eq!(completion_count(&harness), 0, "doctor never spends");
+
+    let missing = CliHarness::new();
+    write_file(
+        missing.data_root.path().join("cg/providers.toml"),
+        r#"[providers.agy]
+required_help_flags = []
+"#,
+    );
+    let output = missing.run(&["doctor"]);
+    assert!(
+        output
+            .stdout
+            .contains("agy provider tool was not found on PATH"),
+        "missing provider with empty flags must warn instead of returning vacuous OK"
+    );
+    assert!(
+        !output.stdout.contains("OK: model/agy/flags-in-help"),
+        "doctor must never print OK for an unresolved provider"
+    );
+
+    let failed_version = CliHarness::new();
+    failed_version.providers.install(
+        Provider::Agy,
+        &unique_label("agy"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    failed_version
+        .providers
+        .set_version_probe_fails(Provider::Agy);
+    write_file(
+        failed_version.data_root.path().join("cg/providers.toml"),
+        r#"[providers.agy]
+required_help_flags = []
+"#,
+    );
+    let output = failed_version.run(&["doctor"]);
+    assert_eq!(output.code, 1);
+    assert!(
+        output
+            .stdout
+            .contains("agy version check exited unsuccessfully"),
+        "failed --version must be reported before empty help flags can produce OK"
+    );
+    assert!(
+        !output.stdout.contains("OK: model/agy/flags-in-help"),
+        "doctor must not render OK when --version exits unsuccessfully"
+    );
+}
+
+#[test]
 fn provider_spec_loads_embedded_and_user_override_layers() {
     let dir = TempDir::new().expect("provider spec tempdir");
+    assert!(
+        validate_embedded_provider_specs().is_ok(),
+        "embedded provider specs must validate before any user command can load them"
+    );
     let specs = load_provider_specs(dir.path(), &[]);
     for provider in ["claude", "codex", "agy"] {
         assert!(
@@ -2024,12 +2244,12 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
     assert!(
         claude.is_some_and(|spec| {
             spec.binary == "claude"
-                && spec.prompt_delivery == "stdin"
+                && spec.prompt_delivery.as_str() == "stdin"
                 && spec
                     .env_remove
                     .iter()
                     .any(|name| name == "ANTHROPIC_API_KEY")
-                && spec.reply_framing == "json"
+                && spec.reply_framing.as_str() == "json"
                 && spec.consent_required
         }),
         "claude spec must declare binary, stdin prompt, env removal, JSON framing, and consent"
@@ -2045,8 +2265,15 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
     );
     let agy = specs.providers.get("agy").expect("agy spec");
     assert!(
-        agy.auth_probe_args.is_empty() && agy.timeout_ms > 300_000,
-        "agy spec must be probe-less with headroom beyond the provider's default wait"
+        agy.auth_probe_args.is_empty()
+            && agy.timeout_ms > 300_000
+            && agy.prompt_delivery.as_str() == "argv"
+            && agy.completion_args == vec!["--print".to_string()]
+            && agy.required_help_flags == vec!["--print".to_string()]
+            && agy
+                .last_verified
+                .contains("argv delivery confirmed 2026-06-05"),
+        "agy spec must be probe-less, argv-delivered through --print, and drift-checked against the real flag"
     );
 
     let overrides = [ProviderOverride {
@@ -2067,6 +2294,157 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
                 && spec.consent_required
         }),
         "overrides may change capability description but not env-removal or consent ownership"
+    );
+}
+
+#[test]
+fn provider_spec_rejects_uninterpretable_override_values_before_any_provider_spawn() {
+    for (toml, field, value, accepted) in [
+        (
+            r#"[providers.claude]
+prompt_delivery = "telepathy"
+"#,
+            "prompt_delivery",
+            "telepathy",
+            "stdin",
+        ),
+        (
+            r#"[providers.claude]
+reply_framing = "markdown"
+"#,
+            "reply_framing",
+            "markdown",
+            "json",
+        ),
+        (
+            r#"[providers.claude]
+completion_args = ["-p", "{prompt}"]
+"#,
+            "completion_args",
+            "{prompt}",
+            "{output_file}",
+        ),
+        (
+            r#"[providers.claude.success]
+path = "/is_error"
+"#,
+            "success",
+            "no recognized clause",
+            "equals",
+        ),
+        (
+            r#"[providers.claude]
+prompt_delviery = "stdin"
+"#,
+            "prompt_delviery",
+            "prompt_delviery",
+            "known provider spec fields",
+        ),
+    ] {
+        let harness = CliHarness::new();
+        harness.providers.install(
+            Provider::Claude,
+            &unique_label("claude"),
+            LoginState::Valid,
+            CompletionBehavior::Succeed,
+        );
+        write_file(harness.data_root.path().join("cg/providers.toml"), toml);
+
+        let output = harness.run(&["model", "auth", "login", "--format", "json"]);
+
+        assert_provider_spec_invalid(&output, "claude", field, value, accepted);
+        assert_eq!(
+            harness.providers.probe_count(),
+            0,
+            "invalid `{field}` must be rejected before doctor/auth/help probes"
+        );
+        assert_eq!(
+            completion_count(&harness),
+            0,
+            "invalid `{field}` must be rejected before any completion spend"
+        );
+        assert!(
+            try_load_provider_specs(harness.data_root.path(), &[]).is_err(),
+            "library loader must reject the same invalid override instead of falling back to embedded specs"
+        );
+    }
+}
+
+#[test]
+fn provider_spec_rejects_incomplete_new_provider_before_any_provider_spawn() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Agy,
+        &unique_label("agy"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    write_file(
+        harness.data_root.path().join("cg/providers.toml"),
+        r#"[providers.shadow]
+binary = "agy"
+"#,
+    );
+
+    let output = harness.run(&["model", "auth", "login", "--format", "json"]);
+
+    assert_provider_spec_invalid(
+        &output,
+        "shadow",
+        "prompt_delivery",
+        "missing required",
+        "new providers must declare",
+    );
+    assert_eq!(
+        harness.providers.probe_count(),
+        0,
+        "incomplete new provider spec must fail before auth/help probes"
+    );
+    assert_eq!(
+        completion_count(&harness),
+        0,
+        "incomplete new provider spec must fail before any completion spend"
+    );
+    assert!(
+        try_load_provider_specs(harness.data_root.path(), &[]).is_err(),
+        "library loader must not create a drivable provider from implicit defaults"
+    );
+}
+
+#[test]
+fn provider_spec_unreadable_override_path_fails_loud_before_any_provider_spawn() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Claude,
+        &unique_label("claude"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    fs::create_dir_all(harness.data_root.path().join("cg/providers.toml"))
+        .expect("create unreadable provider override path");
+
+    let output = harness.run(&["model", "auth", "login", "--format", "json"]);
+
+    assert_provider_spec_invalid(
+        &output,
+        "<override>",
+        "providers.toml",
+        "directory",
+        "readable TOML",
+    );
+    assert_eq!(
+        harness.providers.probe_count(),
+        0,
+        "unreadable override path must be rejected before auth/help probes"
+    );
+    assert_eq!(
+        completion_count(&harness),
+        0,
+        "unreadable override path must be rejected before any completion spend"
+    );
+    assert!(
+        try_load_provider_specs(harness.data_root.path(), &[]).is_err(),
+        "library loader must not fall back to embedded specs when the override path is present but unreadable"
     );
 }
 

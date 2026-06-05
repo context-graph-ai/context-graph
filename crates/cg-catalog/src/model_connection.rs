@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,13 @@ const HOSTED_TIMEOUT: Duration = Duration::from_secs(10);
 const HOSTED_BODY_LIMIT: u64 = 1024 * 1024;
 const CONNECTION_CATALOG_SCOPE: &str = "connection-substrate";
 const EMBEDDED_PROVIDER_SPECS: &str = include_str!("../providers.toml");
+const NEW_PROVIDER_REQUIRED_FIELDS: &[&str] = &[
+    "binary",
+    "prompt_delivery",
+    "reply_framing",
+    "timeout_ms",
+    "consent_required",
+];
 const PROBELESS_HOST_ACCOUNT: &str = "account not exposed by host CLI";
 const DOCTOR_COMMAND_TIMEOUT_MS: u64 = 5_000;
 const CLAUDE_PROTECTED_ENV: [&str; 6] = [
@@ -43,17 +50,78 @@ pub struct ProviderSpecs {
     pub providers: BTreeMap<String, ProviderSpec>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDelivery {
+    #[default]
+    Stdin,
+    Argv,
+}
+
+impl PromptDelivery {
+    pub const ACCEPTED: &'static [&'static str] = &["stdin", "argv"];
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "stdin" => Some(Self::Stdin),
+            "argv" => Some(Self::Argv),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdin => "stdin",
+            Self::Argv => "argv",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyFraming {
+    Json,
+    Jsonl,
+    File,
+    #[default]
+    Text,
+}
+
+impl ReplyFraming {
+    pub const ACCEPTED: &'static [&'static str] = &["json", "jsonl", "file", "text"];
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "json" => Some(Self::Json),
+            "jsonl" => Some(Self::Jsonl),
+            "file" => Some(Self::File),
+            "text" => Some(Self::Text),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Jsonl => "jsonl",
+            Self::File => "file",
+            Self::Text => "text",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderSpec {
     pub binary: String,
     #[serde(default)]
     pub completion_args: Vec<String>,
-    pub prompt_delivery: String,
+    pub prompt_delivery: PromptDelivery,
     #[serde(default)]
     pub env_remove: Vec<String>,
     #[serde(default)]
     pub env_preserve: Vec<String>,
-    pub reply_framing: String,
+    pub reply_framing: ReplyFraming,
     #[serde(default)]
     pub reply_path: String,
     #[serde(default)]
@@ -75,6 +143,7 @@ pub struct ProviderSpec {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PredicateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -88,6 +157,32 @@ pub struct PredicateSpec {
     pub all_of: Vec<PredicateSpec>,
     #[serde(default)]
     pub any_of: Vec<PredicateSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderSpecLoadError {
+    pub path: Option<PathBuf>,
+    pub provider: String,
+    pub field: String,
+    pub value: String,
+    pub accepted: Vec<String>,
+}
+
+impl ProviderSpecLoadError {
+    pub fn message(&self) -> String {
+        let path = self
+            .path
+            .as_ref()
+            .map(|path| format!("{}: ", path.display()))
+            .unwrap_or_default();
+        format!(
+            "{path}provider `{}` has invalid `{}` value `{}`; accepted: {}",
+            self.provider,
+            self.field,
+            self.value,
+            self.accepted.join(", ")
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -193,18 +288,53 @@ impl ModelProofError {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProviderSpecsFile {
     #[serde(default)]
-    providers: BTreeMap<String, ProviderSpec>,
+    providers: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProviderOverridesFile {
     #[serde(default)]
-    providers: BTreeMap<String, ProviderSpecOverride>,
+    providers: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProviderSpec {
+    binary: String,
+    #[serde(default)]
+    completion_args: Vec<String>,
+    prompt_delivery: String,
+    #[serde(default)]
+    env_remove: Vec<String>,
+    #[serde(default)]
+    env_preserve: Vec<String>,
+    reply_framing: String,
+    #[serde(default)]
+    reply_path: String,
+    #[serde(default)]
+    success: Option<PredicateSpec>,
+    timeout_ms: u64,
+    consent_required: bool,
+    #[serde(default)]
+    required_help_flags: Vec<String>,
+    #[serde(default)]
+    last_verified: String,
+    #[serde(default)]
+    auth_probe_args: Vec<String>,
+    #[serde(default)]
+    auth_success: Option<PredicateSpec>,
+    #[serde(default)]
+    auth_required: Option<PredicateSpec>,
+    #[serde(default)]
+    auth_account_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProviderSpecOverride {
     binary: Option<String>,
     completion_args: Option<Vec<String>>,
@@ -233,16 +363,46 @@ struct ProviderRun {
 }
 
 pub fn load_provider_specs(root: &Path, overrides: &[ProviderOverride]) -> ProviderSpecs {
-    let mut providers = parse_provider_specs(EMBEDDED_PROVIDER_SPECS)
-        .expect("embedded provider spec must parse")
-        .providers;
+    try_load_provider_specs(root, overrides)
+        .expect("provider spec validation should be preflighted")
+}
+
+pub fn validate_embedded_provider_specs() -> std::result::Result<(), ProviderSpecLoadError> {
+    parse_provider_specs(EMBEDDED_PROVIDER_SPECS, None).map(|_| ())
+}
+
+pub fn try_load_provider_specs(
+    root: &Path,
+    overrides: &[ProviderOverride],
+) -> std::result::Result<ProviderSpecs, ProviderSpecLoadError> {
+    let mut providers = parse_provider_specs(EMBEDDED_PROVIDER_SPECS, None)?.providers;
     let user_spec_path = root.join("cg/providers.toml");
-    if let Ok(text) = fs::read_to_string(&user_spec_path)
-        && let Ok(file) = toml::from_str::<ProviderOverridesFile>(&text)
-    {
-        for (provider, override_layer) in file.providers {
-            let spec = providers.entry(provider.clone()).or_default();
-            apply_provider_override(&provider, spec, override_layer);
+    match fs::read_to_string(&user_spec_path) {
+        Ok(text) => {
+            let file = parse_provider_overrides(&text, &user_spec_path)?;
+            for (provider, override_layer) in file {
+                if let Some(spec) = providers.get_mut(&provider) {
+                    apply_provider_override(&provider, spec, override_layer)?;
+                } else {
+                    let spec =
+                        provider_spec_from_override(&provider, override_layer, &user_spec_path)?;
+                    providers.insert(provider.clone(), spec);
+                }
+                let spec = providers
+                    .get(&provider)
+                    .expect("provider must exist after override application");
+                validate_provider_spec(&provider, spec, Some(&user_spec_path))?;
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(ProviderSpecLoadError {
+                path: Some(user_spec_path),
+                provider: "<override>".to_string(),
+                field: "providers.toml".to_string(),
+                value: err.to_string(),
+                accepted: vec!["readable TOML provider override file or no file".to_string()],
+            });
         }
     }
     for override_layer in overrides {
@@ -259,23 +419,368 @@ pub fn load_provider_specs(root: &Path, overrides: &[ProviderOverride]) -> Provi
                 spec.consent_required = true;
             }
             protect_provider_spec(&override_layer.provider, spec);
+            validate_provider_spec(&override_layer.provider, spec, None)?;
         }
     }
     for (provider, spec) in providers.iter_mut() {
         protect_provider_spec(provider, spec);
+        validate_provider_spec(provider, spec, None)?;
     }
-    ProviderSpecs { providers }
+    Ok(ProviderSpecs { providers })
 }
 
-fn parse_provider_specs(text: &str) -> std::result::Result<ProviderSpecsFile, toml::de::Error> {
-    toml::from_str::<ProviderSpecsFile>(text)
+fn parse_provider_specs(
+    text: &str,
+    path: Option<&Path>,
+) -> std::result::Result<ProviderSpecs, ProviderSpecLoadError> {
+    let raw = toml::from_str::<ProviderSpecsFile>(text)
+        .map_err(|err| parse_error(path, "<root>", "providers", err.to_string()))?;
+    let mut providers = BTreeMap::new();
+    for (provider, value) in raw.providers {
+        let raw_spec = value
+            .try_into::<RawProviderSpec>()
+            .map_err(|err| parse_error(path, &provider, "provider", err.to_string()))?;
+        let spec = provider_spec_from_raw(&provider, raw_spec, path)?;
+        validate_provider_spec(&provider, &spec, path)?;
+        providers.insert(provider, spec);
+    }
+    Ok(ProviderSpecs { providers })
+}
+
+fn parse_provider_overrides(
+    text: &str,
+    path: &Path,
+) -> std::result::Result<BTreeMap<String, ProviderSpecOverride>, ProviderSpecLoadError> {
+    let raw = toml::from_str::<ProviderOverridesFile>(text)
+        .map_err(|err| parse_error(Some(path), "<root>", "providers", err.to_string()))?;
+    let mut providers = BTreeMap::new();
+    for (provider, value) in raw.providers {
+        let override_layer = value
+            .try_into::<ProviderSpecOverride>()
+            .map_err(|err| parse_error(Some(path), &provider, "provider", err.to_string()))?;
+        validate_provider_override(&provider, &override_layer, path)?;
+        providers.insert(provider, override_layer);
+    }
+    Ok(providers)
+}
+
+fn parse_error(
+    path: Option<&Path>,
+    provider: &str,
+    field: &str,
+    message: String,
+) -> ProviderSpecLoadError {
+    let field = unknown_field_from_message(&message).unwrap_or_else(|| field.to_string());
+    ProviderSpecLoadError {
+        path: path.map(Path::to_path_buf),
+        provider: provider.to_string(),
+        field,
+        value: message,
+        accepted: vec!["known provider spec fields".to_string()],
+    }
+}
+
+fn unknown_field_from_message(message: &str) -> Option<String> {
+    let marker = "unknown field `";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
+}
+
+fn provider_spec_from_raw(
+    provider: &str,
+    raw: RawProviderSpec,
+    path: Option<&Path>,
+) -> std::result::Result<ProviderSpec, ProviderSpecLoadError> {
+    let prompt_delivery = PromptDelivery::parse(&raw.prompt_delivery).ok_or_else(|| {
+        invalid_value(
+            path,
+            provider,
+            "prompt_delivery",
+            raw.prompt_delivery.clone(),
+            PromptDelivery::ACCEPTED,
+        )
+    })?;
+    let reply_framing = ReplyFraming::parse(&raw.reply_framing).ok_or_else(|| {
+        invalid_value(
+            path,
+            provider,
+            "reply_framing",
+            raw.reply_framing.clone(),
+            ReplyFraming::ACCEPTED,
+        )
+    })?;
+    Ok(ProviderSpec {
+        binary: raw.binary,
+        completion_args: raw.completion_args,
+        prompt_delivery,
+        env_remove: raw.env_remove,
+        env_preserve: raw.env_preserve,
+        reply_framing,
+        reply_path: raw.reply_path,
+        success: raw.success,
+        timeout_ms: raw.timeout_ms,
+        consent_required: raw.consent_required,
+        required_help_flags: raw.required_help_flags,
+        last_verified: raw.last_verified,
+        auth_probe_args: raw.auth_probe_args,
+        auth_success: raw.auth_success,
+        auth_required: raw.auth_required,
+        auth_account_paths: raw.auth_account_paths,
+    })
+}
+
+fn validate_provider_override(
+    provider: &str,
+    override_layer: &ProviderSpecOverride,
+    path: &Path,
+) -> std::result::Result<(), ProviderSpecLoadError> {
+    if let Some(value) = &override_layer.prompt_delivery
+        && PromptDelivery::parse(value).is_none()
+    {
+        return Err(invalid_value(
+            Some(path),
+            provider,
+            "prompt_delivery",
+            value.clone(),
+            PromptDelivery::ACCEPTED,
+        ));
+    }
+    if let Some(value) = &override_layer.reply_framing
+        && ReplyFraming::parse(value).is_none()
+    {
+        return Err(invalid_value(
+            Some(path),
+            provider,
+            "reply_framing",
+            value.clone(),
+            ReplyFraming::ACCEPTED,
+        ));
+    }
+    if let Some(args) = &override_layer.completion_args {
+        validate_completion_arg_placeholders(provider, args, Some(path))?;
+    }
+    validate_optional_predicate(
+        provider,
+        "success",
+        override_layer.success.as_ref(),
+        Some(path),
+    )?;
+    validate_optional_predicate(
+        provider,
+        "auth_success",
+        override_layer.auth_success.as_ref(),
+        Some(path),
+    )?;
+    validate_optional_predicate(
+        provider,
+        "auth_required",
+        override_layer.auth_required.as_ref(),
+        Some(path),
+    )?;
+    Ok(())
+}
+
+fn validate_provider_spec(
+    provider: &str,
+    spec: &ProviderSpec,
+    path: Option<&Path>,
+) -> std::result::Result<(), ProviderSpecLoadError> {
+    validate_completion_arg_placeholders(provider, &spec.completion_args, path)?;
+    validate_optional_predicate(provider, "success", spec.success.as_ref(), path)?;
+    validate_optional_predicate(provider, "auth_success", spec.auth_success.as_ref(), path)?;
+    validate_optional_predicate(provider, "auth_required", spec.auth_required.as_ref(), path)?;
+    Ok(())
+}
+
+fn provider_spec_from_override(
+    provider: &str,
+    override_layer: ProviderSpecOverride,
+    path: &Path,
+) -> std::result::Result<ProviderSpec, ProviderSpecLoadError> {
+    let binary = require_override_field(provider, "binary", override_layer.binary, path)?;
+    let prompt_delivery = require_override_field(
+        provider,
+        "prompt_delivery",
+        override_layer.prompt_delivery,
+        path,
+    )?;
+    let prompt_delivery = PromptDelivery::parse(&prompt_delivery).ok_or_else(|| {
+        invalid_value(
+            Some(path),
+            provider,
+            "prompt_delivery",
+            prompt_delivery.clone(),
+            PromptDelivery::ACCEPTED,
+        )
+    })?;
+    let reply_framing = require_override_field(
+        provider,
+        "reply_framing",
+        override_layer.reply_framing,
+        path,
+    )?;
+    let reply_framing = ReplyFraming::parse(&reply_framing).ok_or_else(|| {
+        invalid_value(
+            Some(path),
+            provider,
+            "reply_framing",
+            reply_framing.clone(),
+            ReplyFraming::ACCEPTED,
+        )
+    })?;
+    let timeout_ms =
+        require_override_field(provider, "timeout_ms", override_layer.timeout_ms, path)?;
+    let consent_required = require_override_field(
+        provider,
+        "consent_required",
+        override_layer.consent_required,
+        path,
+    )?;
+    let mut spec = ProviderSpec {
+        binary,
+        completion_args: override_layer.completion_args.unwrap_or_default(),
+        prompt_delivery,
+        env_remove: override_layer.env_remove.unwrap_or_default(),
+        env_preserve: override_layer.env_preserve.unwrap_or_default(),
+        reply_framing,
+        reply_path: override_layer.reply_path.unwrap_or_default(),
+        success: override_layer.success,
+        timeout_ms,
+        consent_required,
+        required_help_flags: override_layer.required_help_flags.unwrap_or_default(),
+        last_verified: override_layer.last_verified.unwrap_or_default(),
+        auth_probe_args: override_layer.auth_probe_args.unwrap_or_default(),
+        auth_success: override_layer.auth_success,
+        auth_required: override_layer.auth_required,
+        auth_account_paths: override_layer.auth_account_paths.unwrap_or_default(),
+    };
+    protect_provider_spec(provider, &mut spec);
+    Ok(spec)
+}
+
+fn require_override_field<T>(
+    provider: &str,
+    field: &str,
+    value: Option<T>,
+    path: &Path,
+) -> std::result::Result<T, ProviderSpecLoadError> {
+    value.ok_or_else(|| ProviderSpecLoadError {
+        path: Some(path.to_path_buf()),
+        provider: provider.to_string(),
+        field: field.to_string(),
+        value: "missing required provider spec field".to_string(),
+        accepted: vec![format!(
+            "new providers must declare {}",
+            NEW_PROVIDER_REQUIRED_FIELDS.join(", ")
+        )],
+    })
+}
+
+fn validate_optional_predicate(
+    provider: &str,
+    field: &str,
+    predicate: Option<&PredicateSpec>,
+    path: Option<&Path>,
+) -> std::result::Result<(), ProviderSpecLoadError> {
+    if let Some(predicate) = predicate {
+        validate_predicate(provider, field, predicate, path)?;
+    }
+    Ok(())
+}
+
+fn validate_predicate(
+    provider: &str,
+    field: &str,
+    predicate: &PredicateSpec,
+    path: Option<&Path>,
+) -> std::result::Result<(), ProviderSpecLoadError> {
+    let has_clause = predicate.equals.is_some()
+        || predicate.exists.is_some()
+        || predicate.matches.is_some()
+        || !predicate.all_of.is_empty()
+        || !predicate.any_of.is_empty();
+    if !has_clause {
+        return Err(ProviderSpecLoadError {
+            path: path.map(Path::to_path_buf),
+            provider: provider.to_string(),
+            field: field.to_string(),
+            value: "predicate has no recognized clause".to_string(),
+            accepted: vec![
+                "equals".to_string(),
+                "exists".to_string(),
+                "matches".to_string(),
+                "all_of".to_string(),
+                "any_of".to_string(),
+            ],
+        });
+    }
+    for child in &predicate.all_of {
+        validate_predicate(provider, field, child, path)?;
+    }
+    for child in &predicate.any_of {
+        validate_predicate(provider, field, child, path)?;
+    }
+    Ok(())
+}
+
+fn validate_completion_arg_placeholders(
+    provider: &str,
+    args: &[String],
+    path: Option<&Path>,
+) -> std::result::Result<(), ProviderSpecLoadError> {
+    for arg in args {
+        let mut rest = arg.as_str();
+        while let Some(open) = rest.find('{') {
+            let after_open = &rest[open + 1..];
+            let Some(close) = after_open.find('}') else {
+                break;
+            };
+            let token = &after_open[..close];
+            if is_placeholder_token(token) && !matches!(token, "output_file" | "cwd") {
+                return Err(invalid_value(
+                    path,
+                    provider,
+                    "completion_args",
+                    format!("{{{token}}}"),
+                    &["{output_file}", "{cwd}"],
+                ));
+            }
+            rest = &after_open[close + 1..];
+        }
+    }
+    Ok(())
+}
+
+fn is_placeholder_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn invalid_value(
+    path: Option<&Path>,
+    provider: &str,
+    field: &str,
+    value: String,
+    accepted: &[&str],
+) -> ProviderSpecLoadError {
+    ProviderSpecLoadError {
+        path: path.map(Path::to_path_buf),
+        provider: provider.to_string(),
+        field: field.to_string(),
+        value,
+        accepted: accepted.iter().map(|value| value.to_string()).collect(),
+    }
 }
 
 fn apply_provider_override(
     provider: &str,
     spec: &mut ProviderSpec,
     override_layer: ProviderSpecOverride,
-) {
+) -> std::result::Result<(), ProviderSpecLoadError> {
     if let Some(binary) = override_layer.binary {
         spec.binary = binary;
     }
@@ -283,7 +788,15 @@ fn apply_provider_override(
         spec.completion_args = args;
     }
     if let Some(prompt_delivery) = override_layer.prompt_delivery {
-        spec.prompt_delivery = prompt_delivery;
+        spec.prompt_delivery = PromptDelivery::parse(&prompt_delivery).ok_or_else(|| {
+            invalid_value(
+                None,
+                provider,
+                "prompt_delivery",
+                prompt_delivery.clone(),
+                PromptDelivery::ACCEPTED,
+            )
+        })?;
     }
     if let Some(env_remove) = override_layer.env_remove {
         for name in env_remove {
@@ -294,7 +807,15 @@ fn apply_provider_override(
         spec.env_preserve = env_preserve;
     }
     if let Some(reply_framing) = override_layer.reply_framing {
-        spec.reply_framing = reply_framing;
+        spec.reply_framing = ReplyFraming::parse(&reply_framing).ok_or_else(|| {
+            invalid_value(
+                None,
+                provider,
+                "reply_framing",
+                reply_framing.clone(),
+                ReplyFraming::ACCEPTED,
+            )
+        })?;
     }
     if let Some(reply_path) = override_layer.reply_path {
         spec.reply_path = reply_path;
@@ -327,6 +848,7 @@ fn apply_provider_override(
         spec.auth_account_paths = auth_account_paths;
     }
     protect_provider_spec(provider, spec);
+    Ok(())
 }
 
 fn protect_provider_spec(provider: &str, spec: &mut ProviderSpec) {
@@ -371,7 +893,7 @@ fn construct_provider_invocation(
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     let cwd = cwd.display().to_string();
-    let argv = spec
+    let mut argv: Vec<String> = spec
         .completion_args
         .iter()
         .map(|arg| {
@@ -379,14 +901,14 @@ fn construct_provider_invocation(
                 .replace("{cwd}", &cwd)
         })
         .collect();
-    Invocation {
-        argv,
-        stdin: if spec.prompt_delivery == "stdin" {
-            prompt.to_string()
-        } else {
+    let stdin = match spec.prompt_delivery {
+        PromptDelivery::Stdin => prompt.to_string(),
+        PromptDelivery::Argv => {
+            argv.push(prompt.to_string());
             String::new()
-        },
-    }
+        }
+    };
+    Invocation { argv, stdin }
 }
 
 pub fn extract_reply(
@@ -395,9 +917,19 @@ pub fn extract_reply(
     stdout: &str,
     output_file: Option<&Path>,
 ) -> std::result::Result<String, ReplyError> {
+    let Some(framing_kind) = ReplyFraming::parse(framing) else {
+        return Err(ReplyError::MissingPath {
+            path: if provider == "codex" {
+                "output_file".to_string()
+            } else {
+                "/result".to_string()
+            },
+            framing: framing.to_string(),
+        });
+    };
     let specs = load_provider_specs(Path::new(""), &[]);
     let fallback = ProviderSpec {
-        reply_framing: framing.to_string(),
+        reply_framing: framing_kind,
         reply_path: match framing {
             "file" => "output_file".to_string(),
             "text" => "stdout".to_string(),
@@ -406,26 +938,27 @@ pub fn extract_reply(
         ..ProviderSpec::default()
     };
     let spec = specs.providers.get(provider).unwrap_or(&fallback);
-    extract_reply_from_spec(provider, spec, framing, stdout, output_file)
+    extract_reply_from_spec(provider, spec, framing_kind, stdout, output_file)
 }
 
 fn extract_reply_from_spec(
-    provider: &str,
+    _provider: &str,
     spec: &ProviderSpec,
-    framing: &str,
+    framing: ReplyFraming,
     stdout: &str,
     output_file: Option<&Path>,
 ) -> std::result::Result<String, ReplyError> {
+    let framing_name = framing.as_str();
     let reply_path = if spec.reply_path.is_empty() {
         "/result"
     } else {
         spec.reply_path.as_str()
     };
     match framing {
-        "json" => {
+        ReplyFraming::Json => {
             let value = parse_json_or_last_line(stdout).map_err(|_| ReplyError::MissingPath {
                 path: reply_path.to_string(),
-                framing: framing.to_string(),
+                framing: framing_name.to_string(),
             })?;
             let reply = json_pointer_string(&value, reply_path);
             let success = spec
@@ -437,7 +970,7 @@ fn extract_reply_from_spec(
                 if reply.is_none() {
                     return Err(ReplyError::MissingPath {
                         path: reply_path.to_string(),
-                        framing: framing.to_string(),
+                        framing: framing_name.to_string(),
                     });
                 }
                 return Err(ReplyError::Unsuccessful {
@@ -446,10 +979,10 @@ fn extract_reply_from_spec(
             }
             reply.ok_or_else(|| ReplyError::MissingPath {
                 path: reply_path.to_string(),
-                framing: framing.to_string(),
+                framing: framing_name.to_string(),
             })
         }
-        "jsonl" => {
+        ReplyFraming::Jsonl => {
             for line in stdout.lines().rev().filter(|line| !line.trim().is_empty()) {
                 if let Ok(value) = serde_json::from_str::<Value>(line) {
                     let success = spec
@@ -464,24 +997,16 @@ fn extract_reply_from_spec(
             }
             Err(ReplyError::MissingPath {
                 path: reply_path.to_string(),
-                framing: framing.to_string(),
+                framing: framing_name.to_string(),
             })
         }
-        "file" => output_file
+        ReplyFraming::File => output_file
             .and_then(|path| fs::read_to_string(path).ok())
             .ok_or_else(|| ReplyError::MissingPath {
                 path: "output_file".to_string(),
-                framing: framing.to_string(),
+                framing: framing_name.to_string(),
             }),
-        "text" => Ok(stdout.to_string()),
-        other => Err(ReplyError::MissingPath {
-            path: if provider == "codex" {
-                "output_file".to_string()
-            } else {
-                reply_path.to_string()
-            },
-            framing: other.to_string(),
-        }),
+        ReplyFraming::Text => Ok(stdout.to_string()),
     }
 }
 
@@ -605,7 +1130,10 @@ fn evaluate_predicate(value: &Value, predicate: &PredicateSpec) -> bool {
 }
 
 pub fn probe_host_session_provider(root: &Path, provider: &str) -> HostSessionProbe {
-    let specs = load_provider_specs(root, &[]);
+    let specs = match try_load_provider_specs(root, &[]) {
+        Ok(specs) => specs,
+        Err(err) => return not_drivable(err.message()),
+    };
     let Some(spec) = specs.providers.get(provider) else {
         return not_drivable("provider spec is missing");
     };
@@ -758,7 +1286,26 @@ pub fn register_model_connection_checks_with_root(
     root: impl AsRef<Path>,
 ) {
     let root = root.as_ref().to_path_buf();
-    let specs = load_provider_specs(&root, &[]);
+    let specs = match try_load_provider_specs(&root, &[]) {
+        Ok(specs) => specs,
+        Err(err) => {
+            registrar.register_check(DiagnosticCheck::free(
+                "model/provider-spec/valid",
+                move || {
+                    vec![Finding::error(
+                        "model/provider-spec/valid",
+                        err.message(),
+                        Some(err.provider.clone()),
+                        Some(
+                            "fix cg/providers.toml so every provider field is interpretable"
+                                .to_string(),
+                        ),
+                    )]
+                },
+            ));
+            return;
+        }
+    };
     for provider in provider_names_for_checks(&specs) {
         let check_root = root.clone();
         let check_id = format!("model/{provider}/flags-in-help");
@@ -789,13 +1336,20 @@ fn provider_names_for_checks(specs: &ProviderSpecs) -> Vec<String> {
 }
 
 fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
-    let specs = load_provider_specs(root, &[]);
+    let specs = match try_load_provider_specs(root, &[]) {
+        Ok(specs) => specs,
+        Err(err) => {
+            return vec![Finding::error(
+                "model/provider-spec/valid",
+                err.message(),
+                Some(err.provider.clone()),
+                Some("fix cg/providers.toml so every provider field is interpretable".to_string()),
+            )];
+        }
+    };
     let Some(spec) = specs.providers.get(provider) else {
         return Vec::new();
     };
-    if spec.required_help_flags.is_empty() {
-        return Vec::new();
-    }
     let Some(binary) = find_provider_binary(spec) else {
         return vec![Finding::warning(
             format!("model/{provider}/flags-in-help"),
@@ -820,6 +1374,17 @@ fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
             )),
         )];
     }
+    if !version_run.status.is_some_and(|status| status.success()) {
+        return vec![Finding::warning(
+            format!("model/{provider}/flags-in-help"),
+            format!(
+                "{provider} version check exited unsuccessfully: {}",
+                provider_run_output_summary(&version_run)
+            ),
+            Some(provider.to_string()),
+            Some(format!("repair {provider} host CLI installation")),
+        )];
+    }
     let version = version_run
         .stdout
         .trim()
@@ -832,6 +1397,9 @@ fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
     } else {
         version
     };
+    if spec.required_help_flags.is_empty() {
+        return Vec::new();
+    }
     let help_args = provider_help_args(spec);
     let help_run = run_provider_command(provider, &binary, spec, &help_args, None, timeout_ms);
     if help_run.timed_out {
@@ -876,8 +1444,24 @@ fn provider_help_args(spec: &ProviderSpec) -> Vec<String> {
     args
 }
 
+fn provider_run_output_summary(run: &ProviderRun) -> String {
+    let output = if run.stderr.trim().is_empty() {
+        run.stdout.trim()
+    } else {
+        run.stderr.trim()
+    };
+    let output = if output.is_empty() {
+        "no output"
+    } else {
+        output
+    };
+    output.chars().take(160).collect()
+}
+
 pub fn provider_tool_available(root: &Path, provider: &str) -> bool {
-    let specs = load_provider_specs(root, &[]);
+    let Ok(specs) = try_load_provider_specs(root, &[]) else {
+        return false;
+    };
     specs
         .providers
         .get(provider)
@@ -952,7 +1536,12 @@ impl HostSessionLlmClient {
         &self,
         invocation: &ModelInvocation,
     ) -> std::result::Result<ModelReply, ModelProofError> {
-        let specs = load_provider_specs(&self.catalog_root, &[]);
+        let specs = try_load_provider_specs(&self.catalog_root, &[]).map_err(|err| {
+            ModelProofError::LiveCallFailed {
+                bucket: "config".to_string(),
+                message: err.message(),
+            }
+        })?;
         let Some(spec) = specs.providers.get(&self.provider) else {
             return Err(ModelProofError::HostToolMissing {
                 provider: self.provider.clone(),
@@ -968,7 +1557,7 @@ impl HostSessionLlmClient {
                 provider: self.provider.clone(),
             });
         };
-        let output_file_guard = if spec.reply_framing == "file" {
+        let output_file_guard = if spec.reply_framing == ReplyFraming::File {
             Some(TempOutputFile::new(temp_output_path(&self.provider)))
         } else {
             None
@@ -1006,7 +1595,7 @@ impl HostSessionLlmClient {
         let reply = extract_reply_from_spec(
             &self.provider,
             spec,
-            &spec.reply_framing,
+            spec.reply_framing,
             &run.stdout,
             output_file,
         )
