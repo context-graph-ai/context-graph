@@ -71,6 +71,21 @@ impl CliHarness {
             &self.providers.completion_exited_marker(provider),
         )
     }
+
+    pub fn run_writing_stdin_after_output(
+        &self,
+        args: &[&str],
+        needle: &str,
+        stdin_after: &str,
+    ) -> ObservedCommandOutput {
+        run_cg_writing_stdin_after_output(
+            args,
+            self.data_root.path(),
+            &self.providers.path_env(),
+            needle,
+            stdin_after,
+        )
+    }
 }
 
 pub fn cg_bin() -> PathBuf {
@@ -181,6 +196,71 @@ pub fn run_cg_observing_provider_before_exit(
         },
         observed_before_exit,
         observed_while_provider_running,
+    }
+}
+
+pub fn run_cg_writing_stdin_after_output(
+    args: &[&str],
+    data_root: &Path,
+    path_env: &str,
+    needle: &str,
+    stdin_after: &str,
+) -> ObservedCommandOutput {
+    let mut command = Command::new(cg_bin());
+    command
+        .args(args)
+        .env("CG_DATA_ROOT", data_root)
+        .env("HOME", data_root)
+        .env("PATH", path_env)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("spawn compiled cg binary");
+    let mut stdin = Some(child.stdin.take().expect("take cg stdin"));
+    let stdout = child.stdout.take().expect("take cg stdout");
+    let stderr = child.stderr.take().expect("take cg stderr");
+    let (tx, rx) = mpsc::channel();
+    let stdout_handle = spawn_stream_reader(stdout, tx.clone());
+    let stderr_handle = spawn_stream_reader(stderr, tx);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut observed_before_exit = false;
+    let mut held_stdin = None;
+    let status = loop {
+        while let Ok(chunk) = rx.try_recv() {
+            if chunk.contains(needle) {
+                observed_before_exit = true;
+            }
+        }
+        if observed_before_exit && let Some(mut child_stdin) = stdin.take() {
+            child_stdin
+                .write_all(stdin_after.as_bytes())
+                .expect("write delayed cg stdin");
+            held_stdin = Some(child_stdin);
+        }
+        if let Some(status) = child.try_wait().expect("poll cg child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill timed-out cg child");
+            break child.wait().expect("collect killed cg child");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout_handle.join().expect("join stdout reader");
+    let stderr = stderr_handle.join().expect("join stderr reader");
+    drop(held_stdin);
+    ObservedCommandOutput {
+        output: CommandOutput {
+            code: status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        },
+        observed_before_exit,
+        observed_while_provider_running: false,
     }
 }
 
@@ -333,10 +413,24 @@ impl FakeProviderRig {
             &format!("failure-marker-{account_label}"),
         );
         write_file(provider_dir.join("secret"), &unique_label("secret"));
-        write_file(
-            provider_dir.join("help_flags"),
-            "--output-format\n--mcp-config\n--tools\n--output-last-message\n",
-        );
+        match provider {
+            Provider::Claude => {
+                write_file(
+                    provider_dir.join("help_flags"),
+                    "--output-format\n--mcp-config\n--strict-mcp-config\n--tools\n",
+                );
+            }
+            Provider::Codex => {
+                write_file(provider_dir.join("help_flags"), "exec\nlogin\nlogout\n");
+                write_file(
+                    provider_dir.join("exec_help_flags"),
+                    "--output-last-message\n-C\n--skip-git-repo-check\n--ignore-user-config\n--ephemeral\n",
+                );
+            }
+            Provider::Agy => {
+                write_file(provider_dir.join("help_flags"), "--print\n");
+            }
+        }
         write_file(provider_dir.join("version"), "fixture-provider 2026.6.4");
         self.write_wrapper(provider);
     }
@@ -363,6 +457,33 @@ impl FakeProviderRig {
                 .join(provider.binary_name())
                 .join("auth_probe_drivable"),
             if drivable { "true" } else { "false" },
+        );
+    }
+
+    pub fn set_auth_probe_hangs(&self, provider: Provider) {
+        write_file(
+            self.fixture_dir
+                .join(provider.binary_name())
+                .join("auth_probe_behavior"),
+            "hang",
+        );
+    }
+
+    pub fn set_auth_probe_unsupported(&self, provider: Provider) {
+        write_file(
+            self.fixture_dir
+                .join(provider.binary_name())
+                .join("auth_probe_behavior"),
+            "unsupported",
+        );
+    }
+
+    pub fn set_help_probe_hangs(&self, provider: Provider) {
+        write_file(
+            self.fixture_dir
+                .join(provider.binary_name())
+                .join("help_probe_behavior"),
+            "hang",
         );
     }
 
@@ -448,6 +569,17 @@ impl FakeProviderRig {
             .into_iter()
             .filter(|record| {
                 record.get("mode").and_then(Value::as_str) == Some("auth-status-probe")
+            })
+            .count()
+    }
+
+    pub fn auth_status_probe_count_for(&self, provider: Provider) -> usize {
+        self.probe_records()
+            .into_iter()
+            .filter(|record| {
+                record.get("mode").and_then(Value::as_str) == Some("auth-status-probe")
+                    && record.get("provider").and_then(Value::as_str)
+                        == Some(provider.binary_name())
             })
             .count()
     }
@@ -566,7 +698,12 @@ def claude_envelope(reply, is_error=False, status=None):
 
 if "--help" in args:
     write_log("probe")
-    print(read("help_flags", "--output-format\n--mcp-config\n--tools"))
+    if read("help_probe_behavior", "normal") == "hang":
+        time.sleep(120)
+    if provider == "codex" and args and args[0] == "exec":
+        print(read("exec_help_flags", "--output-last-message\n-C"))
+    else:
+        print(read("help_flags", "--output-format\n--mcp-config\n--strict-mcp-config\n--tools"))
     sys.exit(0)
 
 if "--version" in args:
@@ -576,6 +713,12 @@ if "--version" in args:
 
 if "auth" in args and "status" in args:
     write_log("auth-status-probe")
+    probe_behavior = read("auth_probe_behavior", "normal")
+    if probe_behavior == "hang":
+        time.sleep(120)
+    if probe_behavior == "unsupported":
+        print("unknown command: auth status", file=sys.stderr)
+        sys.exit(2)
     if read("auth_probe_drivable", "true") != "true":
         print(json.dumps({"ok": False, "error": "non_interactive_probe_failed"}))
         sys.exit(1)

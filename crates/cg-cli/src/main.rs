@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use cg_catalog::{
@@ -353,6 +353,16 @@ fn handle_model_auth_login(args: &[String]) -> i32 {
                 "Host login expired; re-login with your agent before connecting cg.",
             );
         }
+        if let Some((provider, reason)) =
+            provider_names(&root).into_iter().find_map(
+                |provider| match probe_host_session_provider(&root, &provider) {
+                    HostSessionProbe::NotDrivable { reason } => Some((provider, reason)),
+                    _ => None,
+                },
+            )
+        {
+            return no_host_session_failure_with_reason(&provider, &reason);
+        }
         return no_host_session_failure();
     }
 
@@ -373,6 +383,9 @@ fn handle_model_auth_login(args: &[String]) -> i32 {
                 HostSessionProbe::UnsafeSettings { message } => {
                     failure(6, "live_call_failed", "billing", &message)
                 }
+                HostSessionProbe::NotDrivable { reason } => {
+                    no_host_session_failure_with_reason(&provider, &reason)
+                }
                 _ => no_host_session_failure(),
             };
         };
@@ -387,8 +400,9 @@ fn handle_model_auth_login(args: &[String]) -> i32 {
     if consent_flag {
         return persist_connection(candidate, true, None);
     }
+    render_consent_prompt(&candidates);
     let mut stdin_text = String::new();
-    let _ = std::io::stdin().read_to_string(&mut stdin_text);
+    let _ = std::io::stdin().lock().read_line(&mut stdin_text);
     match stdin_text.trim().to_ascii_lowercase().as_str() {
         "yes" | "y" => persist_connection(candidate, true, Some(true)),
         "no" | "n" => persist_connection(candidate, false, Some(false)),
@@ -451,12 +465,33 @@ fn persist_connection(candidate: Candidate, consent: bool, interactive: Option<b
 }
 
 fn selection_required(candidates: &[Candidate]) -> i32 {
+    render_selection_prompt(candidates);
     print_json(&json!({
         "condition": "selection_required",
         "message": "Multiple host sessions are available; pass --connection claude, codex, or another listed provider.",
         "candidates": candidate_envelope(candidates),
     }));
     2
+}
+
+fn render_selection_prompt(candidates: &[Candidate]) {
+    eprintln!("Multiple host sessions are available:");
+    for candidate in candidates {
+        eprintln!("- {} ({})", candidate.provider, candidate.account);
+    }
+    eprintln!("Run cg model auth login --connection <provider> --consent to connect one.");
+    let _ = std::io::stderr().flush();
+}
+
+fn render_consent_prompt(candidates: &[Candidate]) {
+    eprintln!("Available host-session candidate:");
+    for candidate in candidates {
+        eprintln!("- {} ({})", candidate.provider, candidate.account);
+    }
+    eprintln!(
+        "Spend uses subscription quota. Type yes to connect with consent, or no to record the reference without consent."
+    );
+    let _ = std::io::stderr().flush();
 }
 
 fn discover_candidates(root: &Path) -> Vec<Candidate> {
@@ -608,18 +643,32 @@ fn handle_doctor(args: &[String]) -> i32 {
     if as_json {
         let value = serde_json::to_value(&report).expect("doctor report serializes");
         print_json(&value);
-    } else if report.ok {
-        println!("OK: model provider checks passed");
     } else {
-        for finding in &report.findings {
+        print_doctor_text(&report);
+    }
+    if report.ok { 0 } else { 1 }
+}
+
+fn print_doctor_text(report: &cg_cli::DoctorReport) {
+    for check_id in &report.checks_run {
+        let mut emitted = false;
+        for finding in report
+            .findings
+            .iter()
+            .filter(|finding| &finding.check_id == check_id)
+        {
+            emitted = true;
+            let severity = format!("{:?}", finding.severity).to_ascii_uppercase();
             println!(
-                "{}: {}",
+                "{severity}: {check_id}: {}: {}",
                 finding.target.as_deref().unwrap_or("provider"),
                 finding.message
             );
         }
+        if !emitted {
+            println!("OK: {check_id}");
+        }
     }
-    if report.ok { 0 } else { 1 }
 }
 
 fn handle_disconnect(args: &[String]) -> i32 {
@@ -734,6 +783,17 @@ fn no_host_session_failure() -> i32 {
         "no_host_session",
         "auth",
         "No drivable host session was found. Use a local model first; env-var key setup is a later fallback.",
+    )
+}
+
+fn no_host_session_failure_with_reason(provider: &str, reason: &str) -> i32 {
+    failure(
+        4,
+        "no_host_session",
+        "auth",
+        &format!(
+            "No drivable host session was found for {provider}: {reason}. Use a local model first; env-var key setup is a later fallback."
+        ),
     )
 }
 

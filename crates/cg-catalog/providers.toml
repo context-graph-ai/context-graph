@@ -19,7 +19,7 @@ env_remove = [
 env_preserve = ["CLAUDE_CODE_OAUTH_TOKEN"]
 reply_framing = "json"
 reply_path = "/result"
-timeout_ms = 2500
+timeout_ms = 15000
 consent_required = true
 required_help_flags = ["--output-format", "--mcp-config", "--strict-mcp-config", "--tools"]
 last_verified = "claude 2.1.162"
@@ -61,20 +61,10 @@ env_remove = ["OPENAI_API_KEY", "CODEX_API_KEY"]
 env_preserve = []
 reply_framing = "file"
 reply_path = "output_file"
-timeout_ms = 2500
+timeout_ms = 30000
 consent_required = true
 required_help_flags = ["--output-last-message"]
 last_verified = "codex 0.136.0"
-auth_probe_args = ["auth", "status"]
-auth_account_paths = ["/account", "/email", "/user/email", "/login", "/username"]
-
-[providers.codex.auth_success]
-any_of = [
-  { path = "/loggedIn", equals = true },
-  { path = "/ok", equals = true },
-  { path = "/authenticated", equals = true },
-  { path = "/status", equals = "logged_in" },
-]
 
 [providers.agy]
 binary = "agy"
@@ -84,17 +74,7 @@ env_remove = []
 env_preserve = []
 reply_framing = "text"
 reply_path = "stdout"
-timeout_ms = 2500
+timeout_ms = 360000
 consent_required = true
 required_help_flags = []
 last_verified = "agy --print confirmed 2026-06-04"
-auth_probe_args = ["auth", "status"]
-auth_account_paths = ["/account", "/email", "/user/email", "/login", "/username"]
-
-[providers.agy.auth_success]
-any_of = [
-  { path = "/loggedIn", equals = true },
-  { path = "/ok", equals = true },
-  { path = "/authenticated", equals = true },
-  { path = "/status", equals = "logged_in" },
-]

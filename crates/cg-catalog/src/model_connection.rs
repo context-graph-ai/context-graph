@@ -26,6 +26,8 @@ const HOSTED_TIMEOUT: Duration = Duration::from_secs(10);
 const HOSTED_BODY_LIMIT: u64 = 1024 * 1024;
 const CONNECTION_CATALOG_SCOPE: &str = "connection-substrate";
 const EMBEDDED_PROVIDER_SPECS: &str = include_str!("../providers.toml");
+const PROBELESS_HOST_ACCOUNT: &str = "account not exposed by host CLI";
+const DOCTOR_COMMAND_TIMEOUT_MS: u64 = 5_000;
 const CLAUDE_PROTECTED_ENV: [&str; 6] = [
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -124,7 +126,9 @@ pub enum HostSessionProbe {
         account_exposed: bool,
     },
     Expired,
-    NotDrivable,
+    NotDrivable {
+        reason: String,
+    },
     Missing,
     UnsafeSettings {
         message: String,
@@ -603,7 +607,7 @@ fn evaluate_predicate(value: &Value, predicate: &PredicateSpec) -> bool {
 pub fn probe_host_session_provider(root: &Path, provider: &str) -> HostSessionProbe {
     let specs = load_provider_specs(root, &[]);
     let Some(spec) = specs.providers.get(provider) else {
-        return HostSessionProbe::NotDrivable;
+        return not_drivable("provider spec is missing");
     };
     if provider == "claude"
         && let Err(message) = inspect_claude_settings_for_reinjection()
@@ -613,21 +617,26 @@ pub fn probe_host_session_provider(root: &Path, provider: &str) -> HostSessionPr
     let Some(binary) = find_provider_binary(spec) else {
         return HostSessionProbe::Missing;
     };
-    let mut command = Command::new(binary);
-    command
-        .args(&spec.auth_probe_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .current_dir(neutral_cwd());
-    apply_provider_env_removal(&mut command, provider, spec);
-    let Ok(output) = command.output() else {
-        return HostSessionProbe::NotDrivable;
+    if spec.auth_probe_args.is_empty() {
+        return HostSessionProbe::Valid {
+            account: PROBELESS_HOST_ACCOUNT.to_string(),
+            account_exposed: false,
+        };
+    }
+    let output = run_provider_probe(provider, &binary, spec);
+    if output.timed_out {
+        return not_drivable(format!(
+            "auth probe timed out after {}ms",
+            spec.timeout_ms.max(500)
+        ));
+    }
+    let Some(status) = output.status else {
+        return not_drivable("auth probe failed before reporting status");
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = output.stdout;
+    let stderr = output.stderr;
     if let Ok(value) = parse_json_or_last_line(&stdout)
-        && output.status.success()
+        && status.success()
         && auth_value_matches(spec, &value)
     {
         return host_session_probe_from_auth_value(spec, &value);
@@ -635,18 +644,24 @@ pub fn probe_host_session_provider(root: &Path, provider: &str) -> HostSessionPr
 
     let combined = format!("{stdout}\n{stderr}");
     if auth_output_is_explicitly_not_drivable(&combined) {
-        return HostSessionProbe::NotDrivable;
+        return not_drivable("auth probe reported non-interactive probe failure");
     };
     if auth_output_is_expired(&combined) {
         return HostSessionProbe::Expired;
     }
     let Ok(value) = parse_json_or_last_line(&combined) else {
-        return HostSessionProbe::NotDrivable;
+        return not_drivable("auth probe did not return recognized JSON status");
     };
-    if output.status.success() && auth_value_matches(spec, &value) {
+    if status.success() && auth_value_matches(spec, &value) {
         return host_session_probe_from_auth_value(spec, &value);
     }
-    HostSessionProbe::NotDrivable
+    not_drivable("auth probe did not report a drivable logged-in account")
+}
+
+fn not_drivable(reason: impl Into<String>) -> HostSessionProbe {
+    HostSessionProbe::NotDrivable {
+        reason: reason.into(),
+    }
 }
 
 fn auth_value_matches(spec: &ProviderSpec, value: &Value) -> bool {
@@ -671,7 +686,7 @@ fn host_session_probe_from_auth_value(spec: &ProviderSpec, value: &Value) -> Hos
         .filter(|account| !account.trim().is_empty());
     let account_exposed = account.is_some();
     HostSessionProbe::Valid {
-        account: account.unwrap_or_else(|| "account not exposed by host CLI".to_string()),
+        account: account.unwrap_or_else(|| PROBELESS_HOST_ACCOUNT.to_string()),
         account_exposed,
     }
 }
@@ -778,6 +793,9 @@ fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
     let Some(spec) = specs.providers.get(provider) else {
         return Vec::new();
     };
+    if spec.required_help_flags.is_empty() {
+        return Vec::new();
+    }
     let Some(binary) = find_provider_binary(spec) else {
         return vec![Finding::warning(
             format!("model/{provider}/flags-in-help"),
@@ -788,21 +806,46 @@ fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
             )),
         )];
     };
-    let version = Command::new(&binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| "unknown version".to_string());
-    let help = Command::new(&binary)
-        .arg("--help")
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
+    let timeout_ms = spec.timeout_ms.clamp(500, DOCTOR_COMMAND_TIMEOUT_MS);
+    let version_args = vec!["--version".to_string()];
+    let version_run =
+        run_provider_command(provider, &binary, spec, &version_args, None, timeout_ms);
+    if version_run.timed_out {
+        return vec![Finding::warning(
+            format!("model/{provider}/flags-in-help"),
+            format!("{provider} version check timed out after {timeout_ms}ms"),
+            Some(provider.to_string()),
+            Some(format!(
+                "check that {provider} starts without blocking before running cg doctor again"
+            )),
+        )];
+    }
+    let version = version_run
+        .stdout
+        .trim()
+        .to_string()
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let version = if version.is_empty() {
+        "unknown version".to_string()
+    } else {
+        version
+    };
+    let help_args = provider_help_args(spec);
+    let help_run = run_provider_command(provider, &binary, spec, &help_args, None, timeout_ms);
+    if help_run.timed_out {
+        return vec![Finding::warning(
+            format!("model/{provider}/flags-in-help"),
+            format!("{provider} {version} help check timed out after {timeout_ms}ms"),
+            Some(provider.to_string()),
+            Some(format!(
+                "check that {provider} {:?} completes without blocking",
+                help_args
+            )),
+        )];
+    }
+    let help = help_run.stdout;
     spec.required_help_flags
         .iter()
         .filter(|required| !help.contains(required.as_str()))
@@ -819,6 +862,18 @@ fn detect_provider_help_drift(root: &Path, provider: &str) -> Vec<Finding> {
             )
         })
         .collect()
+}
+
+fn provider_help_args(spec: &ProviderSpec) -> Vec<String> {
+    let mut args = Vec::new();
+    for arg in &spec.completion_args {
+        if arg.starts_with('-') || arg.contains('{') {
+            break;
+        }
+        args.push(arg.clone());
+    }
+    args.push("--help".to_string());
+    args
 }
 
 pub fn provider_tool_available(root: &Path, provider: &str) -> bool {
@@ -1013,6 +1068,7 @@ fn run_provider_completion(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_provider_process(&mut command);
     apply_provider_env_removal(&mut command, provider, spec);
     let Ok(mut child) = command.spawn() else {
         return ProviderRun {
@@ -1043,12 +1099,7 @@ fn run_provider_completion(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     timed_out = true;
-                    let _ = Command::new("pkill")
-                        .arg("-TERM")
-                        .arg("-P")
-                        .arg(child.id().to_string())
-                        .status();
-                    let _ = child.kill();
+                    terminate_provider_process(&mut child);
                     break child.wait().ok();
                 }
                 thread::sleep(Duration::from_millis(20));
@@ -1068,6 +1119,112 @@ fn run_provider_completion(
         stderr,
         timed_out,
     }
+}
+
+fn run_provider_probe(provider: &str, binary: &Path, spec: &ProviderSpec) -> ProviderRun {
+    run_provider_command(
+        provider,
+        binary,
+        spec,
+        &spec.auth_probe_args,
+        None,
+        spec.timeout_ms.max(500),
+    )
+}
+
+fn run_provider_command(
+    provider: &str,
+    binary: &Path,
+    spec: &ProviderSpec,
+    args: &[String],
+    stdin_text: Option<&str>,
+    timeout_ms: u64,
+) -> ProviderRun {
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .current_dir(neutral_cwd())
+        .stdin(if stdin_text.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_provider_process(&mut command);
+    apply_provider_env_removal(&mut command, provider, spec);
+    let Ok(mut child) = command.spawn() else {
+        return ProviderRun {
+            status: None,
+            stdout: String::new(),
+            stderr: "provider command spawn failed".to_string(),
+            timed_out: false,
+        };
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = stdout.map(read_stream);
+    let stderr_reader = stderr.map(read_stream);
+    if let Some(stdin_text) = stdin_text
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let _ = stdin.write_all(stdin_text.as_bytes());
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    terminate_provider_process(&mut child);
+                    break child.wait().ok();
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break None,
+        }
+    };
+    let stdout = stdout_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    ProviderRun {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    }
+}
+
+fn configure_provider_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+fn terminate_provider_process(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg("--")
+            .arg(&pgid)
+            .status();
+        thread::sleep(Duration::from_millis(50));
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg("--")
+            .arg(&pgid)
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn read_stream<R: Read + Send + 'static>(mut stream: R) -> thread::JoinHandle<String> {

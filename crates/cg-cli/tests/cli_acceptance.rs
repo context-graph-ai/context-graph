@@ -29,6 +29,7 @@ const CLAUDE_402: &str = include_str!("fixtures/provider_envelopes/claude_402.js
 const CLAUDE_429: &str = include_str!("fixtures/provider_envelopes/claude_429.json");
 const CODEX_LAST_MESSAGE: &str = include_str!("fixtures/provider_envelopes/codex_last_message.txt");
 const AGY_PLAIN: &str = include_str!("fixtures/provider_envelopes/agy_plain.txt");
+const PROBELESS_HOST_ACCOUNT: &str = "account not exposed by host CLI";
 
 fn developer() -> Principal {
     Principal::Human("developer@example.test".to_string())
@@ -671,7 +672,6 @@ fn model_auth_login_offers_present_host_session_first_by_name() {
 fn model_auth_login_omits_provider_whose_cli_cannot_be_driven() {
     let harness = CliHarness::new();
     let claude_label = unique_label("claude");
-    let codex_label = unique_label("codex");
     harness.providers.install(
         Provider::Claude,
         &claude_label,
@@ -679,14 +679,15 @@ fn model_auth_login_omits_provider_whose_cli_cannot_be_driven() {
         CompletionBehavior::Succeed,
     );
     harness.providers.install(
-        Provider::Codex,
-        &codex_label,
+        Provider::Agy,
+        &unique_label("agy"),
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
     harness
         .providers
-        .set_auth_probe_drivable(Provider::Codex, false);
+        .set_auth_probe_drivable(Provider::Claude, false);
+    harness.providers.set_auth_probe_unsupported(Provider::Agy);
     let first = harness.run(&["model", "auth", "login", "--format", "json"]);
     assert_eq!(
         first.code, 0,
@@ -697,54 +698,129 @@ fn model_auth_login_omits_provider_whose_cli_cannot_be_driven() {
     let first_providers = host_candidate_providers(&first_json.unwrap_or(Value::Null));
     assert_eq!(
         first_providers,
-        vec!["claude".to_string()],
-        "only the drivable host-session provider may be listed"
+        vec!["agy".to_string()],
+        "probe-less providers remain drivable while a failed probed provider is omitted"
     );
     assert!(
-        first.stdout.contains("claude") && !first.stdout.contains("codex"),
-        "undrivable codex fixture must be omitted while drivable claude is present"
+        first.stdout.contains("agy") && !first.stdout.contains("claude"),
+        "failed Claude probe must be omitted while probe-less agy is listed"
     );
     assert_eq!(
         completion_count(&harness),
         0,
         "candidate listing must not spend a completion probe before consent"
     );
-    assert!(
-        harness.providers.auth_status_probe_count() >= 2,
-        "candidate listing must drive provider auth-status probes instead of reading fixture state"
-    );
-
-    harness
-        .providers
-        .set_auth_probe_drivable(Provider::Claude, false);
-    harness
-        .providers
-        .set_auth_probe_drivable(Provider::Codex, true);
-    let second = harness.run(&["model", "auth", "login", "--format", "json"]);
     assert_eq!(
-        second.code, 0,
-        "inverted drivable-filter listing must exit successfully"
-    );
-    let second_json = parse_single_json(&second.stdout);
-    assert!(second_json.is_ok(), "candidate listing must be JSON");
-    let second_providers = host_candidate_providers(&second_json.unwrap_or(Value::Null));
-    assert_eq!(
-        second_providers,
-        vec!["codex".to_string()],
-        "drivability changes must be reflected without hardcoded provider ordering"
-    );
-    assert!(
-        second.stdout.contains("codex") && !second.stdout.contains("claude"),
-        "candidate listing must invert when the probe rigging inverts"
-    );
-    assert_eq!(
-        completion_count(&harness),
+        harness.providers.auth_status_probe_count_for(Provider::Agy),
         0,
-        "drivability listing must still spend zero completion calls"
+        "probe-less agy must not be driven through its unsupported auth status command"
+    );
+    assert_eq!(
+        harness
+            .providers
+            .auth_status_probe_count_for(Provider::Claude),
+        1,
+        "Claude remains gated by the declared auth-status probe"
+    );
+}
+
+#[test]
+fn model_auth_login_treats_probe_less_provider_as_drivable_without_auth_status() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Codex,
+        &unique_label("codex"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    harness
+        .providers
+        .set_auth_probe_unsupported(Provider::Codex);
+
+    let output = harness.run(&["model", "auth", "login", "--format", "json"]);
+    assert_eq!(output.code, 0, "probe-less provider listing exits cleanly");
+    let parsed = parse_single_json(&output.stdout);
+    assert!(parsed.is_ok(), "probe-less listing must be JSON");
+    let value = parsed.unwrap_or(Value::Null);
+    assert_eq!(host_candidate_providers(&value), vec!["codex".to_string()]);
+    assert!(
+        output.stdout.contains(PROBELESS_HOST_ACCOUNT),
+        "probe-less providers must use the explicit account-not-exposed label"
+    );
+    assert_eq!(
+        harness
+            .providers
+            .auth_status_probe_count_for(Provider::Codex),
+        0,
+        "codex must not run the invalid auth status probe"
+    );
+}
+
+#[test]
+fn model_auth_login_bounds_hung_auth_probe_and_omits_provider() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Claude,
+        &unique_label("claude"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    harness.providers.install(
+        Provider::Agy,
+        &unique_label("agy"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    harness.providers.set_auth_probe_hangs(Provider::Claude);
+    write_file(
+        harness.data_root.path().join("cg/providers.toml"),
+        r#"[providers.claude]
+timeout_ms = 700
+"#,
+    );
+    let started = std::time::Instant::now();
+    let output = harness.run(&["model", "auth", "login", "--format", "json"]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "hung auth probe must be bounded by the provider timeout"
+    );
+    assert_eq!(output.code, 0);
+    let parsed = parse_single_json(&output.stdout);
+    assert!(parsed.is_ok(), "bounded-probe listing must be JSON");
+    assert_eq!(
+        host_candidate_providers(&parsed.unwrap_or(Value::Null)),
+        vec!["agy".to_string()],
+        "timed-out probed provider is not drivable; probe-less provider remains available"
     );
     assert!(
-        harness.providers.auth_status_probe_count() >= 4,
-        "the inverted listing must be explained by fresh no-spend probes"
+        harness
+            .providers
+            .auth_status_probe_count_for(Provider::Claude)
+            >= 1,
+        "Claude hung through the auth probe path, not a completion call"
+    );
+    assert_eq!(completion_count(&harness), 0);
+
+    let blocked = CliHarness::new();
+    blocked.providers.install(
+        Provider::Claude,
+        &unique_label("claude"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    blocked.providers.set_auth_probe_hangs(Provider::Claude);
+    write_file(
+        blocked.data_root.path().join("cg/providers.toml"),
+        r#"[providers.claude]
+timeout_ms = 700
+"#,
+    );
+    let output = blocked.run(&["model", "auth", "login", "--connection", "claude"]);
+    assert_eq!(output.code, 4);
+    assert_condition(&output, "no_host_session");
+    assert!(
+        output.stdout.contains("claude") && output.stdout.contains("auth probe timed out"),
+        "not-drivable probe timeout must surface a reason instead of a generic missing-session envelope"
     );
 }
 
@@ -809,9 +885,19 @@ fn model_auth_login_two_host_logins_require_explicit_choice() {
         0,
         "ambiguous connect must not spend before explicit provider selection"
     );
+    assert_eq!(
+        harness
+            .providers
+            .auth_status_probe_count_for(Provider::Codex),
+        0,
+        "ambiguous connect must not run codex auth status because the spec declares no probe"
+    );
     assert!(
-        harness.providers.auth_status_probe_count() >= 2,
-        "ambiguous connect must use no-spend auth-status probes for candidates"
+        harness
+            .providers
+            .auth_status_probe_count_for(Provider::Claude)
+            >= 1,
+        "ambiguous connect must still use Claude's declared no-spend auth-status probe"
     );
     let selected = harness.run(&[
         "model",
@@ -830,13 +916,13 @@ fn model_auth_login_two_host_logins_require_explicit_choice() {
         harness.data_root.path(),
         "codex",
         "codex",
-        &codex_label,
+        PROBELESS_HOST_ACCOUNT,
         true,
     );
     let status = harness.run(&["status"]);
     assert!(
-        status.stdout.contains("codex") && status.stdout.contains(&codex_label),
-        "status must expose the selected provider/account, not a generic or first candidate"
+        status.stdout.contains("codex") && status.stdout.contains(PROBELESS_HOST_ACCOUNT),
+        "status must expose the selected provider and account-exposure state"
     );
     let proof = harness.run(&["selftest"]);
     assert_eq!(proof.code, 0);
@@ -866,10 +952,25 @@ fn model_auth_login_consent_names_account_and_spend_before_anything_spends() {
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
-    let output = harness.run_with_stdin(&["model", "auth", "login"], "yes\n");
+    let observed = harness.run_writing_stdin_after_output(
+        &["model", "auth", "login"],
+        "Type yes to connect with consent",
+        "yes\n",
+    );
+    assert!(
+        observed.observed_before_exit,
+        "interactive login must render and flush the candidate/consent prompt before reading stdin"
+    );
+    let output = observed.output;
     assert!(
         output.stdout.contains(&label) && output.stdout.contains("quota"),
         "consent prompt transcript must name account and spend"
+    );
+    assert!(
+        output.stderr.contains("Available host-session candidate")
+            && output.stderr.contains(&label)
+            && output.stderr.contains("Type yes"),
+        "interactive prompt must name the candidate and consent action"
     );
     assert_eq!(
         completion_count(&harness),
@@ -1548,6 +1649,12 @@ fn selftest_bounds_a_hung_provider_cli_with_typed_failure() {
         LoginState::Valid,
         CompletionBehavior::Hang,
     );
+    write_file(
+        harness.data_root.path().join("cg/providers.toml"),
+        r#"[providers.claude]
+timeout_ms = 700
+"#,
+    );
     let _ = harness.run(&[
         "model",
         "auth",
@@ -1780,6 +1887,18 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
+    harness.providers.install(
+        Provider::Codex,
+        &unique_label("codex"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    harness.providers.install(
+        Provider::Agy,
+        &unique_label("agy"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
     write_file(
         harness
             .providers
@@ -1796,6 +1915,19 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
     assert_eq!(output.code, 1, "doctor drift findings exit 1");
     assert!(output.stdout.contains("--mcp-config"));
     assert!(output.stdout.contains("2.2.0-drift"));
+    assert!(
+        output
+            .stdout
+            .contains("WARNING: model/claude/flags-in-help")
+    );
+    assert!(output.stdout.contains("OK: model/codex/flags-in-help"));
+    assert!(output.stdout.contains("OK: model/agy/flags-in-help"));
+    assert!(
+        !output
+            .stdout
+            .contains("codex fixture-provider 2026.6.4 help is missing"),
+        "doctor must check codex exec --help rather than root help"
+    );
     assert!(!output.stdout.contains("replacement flag"));
     let json_output = harness.run(&["doctor", "--json"]);
     let parsed = parse_single_json_object(&json_output.stdout);
@@ -1851,6 +1983,34 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
 }
 
 #[test]
+fn cg_doctor_bounds_hung_subcommand_help_check() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Codex,
+        &unique_label("codex"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    harness.providers.set_help_probe_hangs(Provider::Codex);
+    write_file(
+        harness.data_root.path().join("cg/providers.toml"),
+        r#"[providers.codex]
+timeout_ms = 700
+"#,
+    );
+    let started = std::time::Instant::now();
+    let output = harness.run(&["doctor"]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "doctor help drift checks must be bounded by the provider metadata timeout"
+    );
+    assert_eq!(output.code, 1);
+    assert!(output.stdout.contains("model/codex/flags-in-help"));
+    assert!(output.stdout.contains("help check timed out"));
+    assert_eq!(completion_count(&harness), 0, "doctor never spends");
+}
+
+#[test]
 fn provider_spec_loads_embedded_and_user_override_layers() {
     let dir = TempDir::new().expect("provider spec tempdir");
     let specs = load_provider_specs(dir.path(), &[]);
@@ -1873,6 +2033,20 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
                 && spec.consent_required
         }),
         "claude spec must declare binary, stdin prompt, env removal, JSON framing, and consent"
+    );
+    let codex = specs.providers.get("codex").expect("codex spec");
+    assert!(
+        codex.auth_probe_args.is_empty()
+            && codex.timeout_ms > 2500
+            && codex
+                .required_help_flags
+                .contains(&"--output-last-message".to_string()),
+        "codex spec must be probe-less, generous-timeout, and checked through its completion subcommand help"
+    );
+    let agy = specs.providers.get("agy").expect("agy spec");
+    assert!(
+        agy.auth_probe_args.is_empty() && agy.timeout_ms > 300_000,
+        "agy spec must be probe-less with headroom beyond the provider's default wait"
     );
 
     let overrides = [ProviderOverride {
