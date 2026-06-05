@@ -605,7 +605,7 @@ fn handle_selftest(args: &[String]) -> i32 {
     let Some(connection) = selected_connection(&catalog) else {
         return no_host_session_failure();
     };
-    let prompt = "cg host-session proof: answer with the deterministic proof token only.";
+    let prompt = "Reply with exactly this text and nothing else: cg-host-session-proof";
     let connection_name = connection.name.clone();
     let mut runtime = UnderstandingRuntime::<cg_catalog::NoopLlmClient>::new(
         catalog,

@@ -65,16 +65,3 @@ timeout_ms = 30000
 consent_required = true
 required_help_flags = ["--output-last-message"]
 last_verified = "codex 0.136.0"
-
-[providers.agy]
-binary = "agy"
-prompt_delivery = "argv"
-completion_args = ["--print"]
-env_remove = []
-env_preserve = []
-reply_framing = "text"
-reply_path = "stdout"
-timeout_ms = 360000
-consent_required = true
-required_help_flags = ["--print"]
-last_verified = "agy --print <prompt> argv delivery confirmed 2026-06-05"

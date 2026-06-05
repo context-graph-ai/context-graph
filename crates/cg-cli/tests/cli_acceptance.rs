@@ -31,6 +31,8 @@ const CLAUDE_429: &str = include_str!("fixtures/provider_envelopes/claude_429.js
 const CODEX_LAST_MESSAGE: &str = include_str!("fixtures/provider_envelopes/codex_last_message.txt");
 const AGY_PLAIN: &str = include_str!("fixtures/provider_envelopes/agy_plain.txt");
 const PROBELESS_HOST_ACCOUNT: &str = "account not exposed by host CLI";
+const SELFTEST_ECHO_PROMPT: &str =
+    "Reply with exactly this text and nothing else: cg-host-session-proof";
 
 fn developer() -> Principal {
     Principal::Human("developer@example.test".to_string())
@@ -99,6 +101,32 @@ fn assert_condition(output: &CommandOutput, expected: &str) {
 
 fn completion_count(output_harness: &CliHarness) -> usize {
     output_harness.providers.completion_count()
+}
+
+fn write_agy_provider_override(root: &std::path::Path, required_help_flags: &[&str]) {
+    let required_help_flags = required_help_flags
+        .iter()
+        .map(|flag| format!("\"{flag}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    write_file(
+        root.join("cg/providers.toml"),
+        &format!(
+            r#"[providers.agy]
+binary = "agy"
+prompt_delivery = "argv"
+completion_args = ["--print"]
+env_remove = []
+env_preserve = []
+reply_framing = "text"
+reply_path = "stdout"
+timeout_ms = 360000
+consent_required = true
+required_help_flags = [{required_help_flags}]
+last_verified = "test override: agy pure-completion drive not embedded"
+"#
+        ),
+    );
 }
 
 fn assert_host_session_catalog_row(
@@ -739,15 +767,14 @@ fn model_auth_login_omits_provider_whose_cli_cannot_be_driven() {
         CompletionBehavior::Succeed,
     );
     harness.providers.install(
-        Provider::Agy,
-        &unique_label("agy"),
+        Provider::Codex,
+        &unique_label("codex"),
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
     harness
         .providers
         .set_auth_probe_drivable(Provider::Claude, false);
-    harness.providers.set_auth_probe_unsupported(Provider::Agy);
     let first = harness.run(&["model", "auth", "login", "--format", "json"]);
     assert_eq!(
         first.code, 0,
@@ -758,12 +785,12 @@ fn model_auth_login_omits_provider_whose_cli_cannot_be_driven() {
     let first_providers = host_candidate_providers(&first_json.unwrap_or(Value::Null));
     assert_eq!(
         first_providers,
-        vec!["agy".to_string()],
-        "probe-less providers remain drivable while a failed probed provider is omitted"
+        vec!["codex".to_string()],
+        "probe-less provider remains drivable while a failed probed provider is omitted"
     );
     assert!(
-        first.stdout.contains("agy") && !first.stdout.contains("claude"),
-        "failed Claude probe must be omitted while probe-less agy is listed"
+        first.stdout.contains("codex") && !first.stdout.contains("claude"),
+        "failed Claude probe must be omitted while probe-less Codex is listed"
     );
     assert_eq!(
         completion_count(&harness),
@@ -771,9 +798,11 @@ fn model_auth_login_omits_provider_whose_cli_cannot_be_driven() {
         "candidate listing must not spend a completion probe before consent"
     );
     assert_eq!(
-        harness.providers.auth_status_probe_count_for(Provider::Agy),
+        harness
+            .providers
+            .auth_status_probe_count_for(Provider::Codex),
         0,
-        "probe-less agy must not be driven through its unsupported auth status command"
+        "probe-less Codex must not be driven through auth status"
     );
     assert_eq!(
         harness
@@ -817,6 +846,38 @@ fn model_auth_login_treats_probe_less_provider_as_drivable_without_auth_status()
 }
 
 #[test]
+fn model_auth_login_explicit_absent_agy_fails_like_any_missing_provider() {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Agy,
+        &unique_label("agy"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    harness.providers.install(
+        Provider::Codex,
+        &unique_label("codex"),
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+
+    let output = harness.run(&["model", "auth", "login", "--connection", "agy", "--consent"]);
+
+    assert_eq!(output.code, 4);
+    assert_condition(&output, "no_host_session");
+    assert!(
+        output.stdout.contains("provider spec is missing"),
+        "absent agy must fail through the normal missing-provider path, got {:?}",
+        output.stdout
+    );
+    assert_eq!(
+        completion_count(&harness),
+        0,
+        "missing provider selection must not spend"
+    );
+}
+
+#[test]
 fn model_auth_login_bounds_hung_auth_probe_and_omits_provider() {
     let harness = CliHarness::new();
     harness.providers.install(
@@ -826,8 +887,8 @@ fn model_auth_login_bounds_hung_auth_probe_and_omits_provider() {
         CompletionBehavior::Succeed,
     );
     harness.providers.install(
-        Provider::Agy,
-        &unique_label("agy"),
+        Provider::Codex,
+        &unique_label("codex"),
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
@@ -849,7 +910,7 @@ timeout_ms = 700
     assert!(parsed.is_ok(), "bounded-probe listing must be JSON");
     assert_eq!(
         host_candidate_providers(&parsed.unwrap_or(Value::Null)),
-        vec!["agy".to_string()],
+        vec!["codex".to_string()],
         "timed-out probed provider is not drivable; probe-less provider remains available"
     );
     assert!(
@@ -1322,6 +1383,11 @@ fn selftest_pass_shows_reply_from_driven_cli_and_discard_line() {
     ]);
     let output = harness.run(&["selftest"]);
     assert!(output.stdout.contains("PASS"));
+    assert_eq!(
+        harness.providers.last_completion_prompt().as_deref(),
+        Some(SELFTEST_ECHO_PROMPT),
+        "selftest prompt must be self-contained and must not imply an external token exists"
+    );
     let expected = harness.providers.expected_reply(Provider::Claude);
     assert!(
         expected.is_some(),
@@ -1346,11 +1412,16 @@ fn selftest_delivers_prompt_by_argv_when_provider_spec_declares_argv_mode() {
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
+    write_agy_provider_override(harness.data_root.path(), &["--print"]);
     harness
         .providers
         .write_secret(Provider::Agy, "agy-argv-secret");
     let connected = harness.run(&["model", "auth", "login", "--connection", "agy", "--consent"]);
-    assert_eq!(connected.code, 0, "probe-less agy connection must persist");
+    assert_eq!(
+        connected.code, 0,
+        "probe-less agy override connection must persist, got stdout={:?} stderr={:?}",
+        connected.stdout, connected.stderr
+    );
 
     let output = harness.run(&["selftest"]);
 
@@ -1380,9 +1451,9 @@ fn selftest_delivers_prompt_by_argv_when_provider_spec_declares_argv_mode() {
         "agy invocation must use the declared print flag"
     );
     let prompt_from_argv = argv.get(1).cloned().unwrap_or_default();
-    assert!(
-        prompt_from_argv.contains("cg host-session proof"),
-        "prompt must be appended as --print's argv argument, got {argv:?}"
+    assert_eq!(
+        prompt_from_argv, SELFTEST_ECHO_PROMPT,
+        "selftest prompt must be a self-contained echo instruction, got {argv:?}"
     );
     assert_eq!(
         record.get("prompt").and_then(Value::as_str),
@@ -2040,7 +2111,10 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
             .contains("WARNING: model/claude/flags-in-help")
     );
     assert!(output.stdout.contains("OK: model/codex/flags-in-help"));
-    assert!(output.stdout.contains("OK: model/agy/flags-in-help"));
+    assert!(
+        !output.stdout.contains("model/agy/flags-in-help"),
+        "doctor must not enumerate a provider withdrawn from embedded specs"
+    );
     assert!(
         !output
             .stdout
@@ -2108,10 +2182,16 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
         CompletionBehavior::Succeed,
     );
     write_file(
-        stderr_help.data_root.path().join("cg/providers.toml"),
-        r#"[providers.agy]
-required_help_flags = ["--cg-test-only-missing-flag"]
-"#,
+        stderr_help
+            .providers
+            .fixture_dir
+            .join("agy")
+            .join("help_flags"),
+        "--print\n",
+    );
+    write_agy_provider_override(
+        stderr_help.data_root.path(),
+        &["--cg-test-only-missing-flag"],
     );
 
     let output = stderr_help.run(&["doctor"]);
@@ -2163,12 +2243,7 @@ fn cg_doctor_empty_required_help_flags_still_checks_binary_and_version() {
         LoginState::Valid,
         CompletionBehavior::Succeed,
     );
-    write_file(
-        harness.data_root.path().join("cg/providers.toml"),
-        r#"[providers.agy]
-required_help_flags = []
-"#,
-    );
+    write_agy_provider_override(harness.data_root.path(), &[]);
 
     let output = harness.run(&["doctor"]);
 
@@ -2203,12 +2278,7 @@ required_help_flags = []
     assert_eq!(completion_count(&harness), 0, "doctor never spends");
 
     let missing = CliHarness::new();
-    write_file(
-        missing.data_root.path().join("cg/providers.toml"),
-        r#"[providers.agy]
-required_help_flags = []
-"#,
-    );
+    write_agy_provider_override(missing.data_root.path(), &[]);
     let output = missing.run(&["doctor"]);
     assert!(
         output
@@ -2231,12 +2301,7 @@ required_help_flags = []
     failed_version
         .providers
         .set_version_probe_fails(Provider::Agy);
-    write_file(
-        failed_version.data_root.path().join("cg/providers.toml"),
-        r#"[providers.agy]
-required_help_flags = []
-"#,
-    );
+    write_agy_provider_override(failed_version.data_root.path(), &[]);
     let output = failed_version.run(&["doctor"]);
     assert_eq!(output.code, 1);
     assert!(
@@ -2259,12 +2324,16 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
         "embedded provider specs must validate before any user command can load them"
     );
     let specs = load_provider_specs(dir.path(), &[]);
-    for provider in ["claude", "codex", "agy"] {
+    for provider in ["claude", "codex"] {
         assert!(
             specs.providers.contains_key(provider),
             "embedded provider spec must include {provider}"
         );
     }
+    assert!(
+        !specs.providers.contains_key("agy"),
+        "agy must not ship as an embedded provider until a pure-completion drive is verified"
+    );
     let claude = specs.providers.get("claude");
     assert!(
         claude.is_some_and(|spec| {
@@ -2288,7 +2357,12 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
                 .contains(&"--output-last-message".to_string()),
         "codex spec must be probe-less, generous-timeout, and checked through its completion subcommand help"
     );
-    let agy = specs.providers.get("agy").expect("agy spec");
+    write_agy_provider_override(dir.path(), &["--print"]);
+    let with_agy_override = load_provider_specs(dir.path(), &[]);
+    let agy = with_agy_override
+        .providers
+        .get("agy")
+        .expect("agy override spec");
     assert!(
         agy.auth_probe_args.is_empty()
             && agy.timeout_ms > 300_000
@@ -2297,8 +2371,8 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
             && agy.required_help_flags == vec!["--print".to_string()]
             && agy
                 .last_verified
-                .contains("argv delivery confirmed 2026-06-05"),
-        "agy spec must be probe-less, argv-delivered through --print, and drift-checked against the real flag"
+                .contains("pure-completion drive not embedded"),
+        "agy may return through a full user override, not through the embedded catalog"
     );
 
     let overrides = [ProviderOverride {
