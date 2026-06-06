@@ -10,6 +10,7 @@ mod graph_precedent_chain;
 mod graph_traverse;
 mod host_session_substrate_guards;
 mod impact_analysis;
+mod impact_cascade_consolidation;
 mod invalidation_lifecycle;
 mod llm_runtime;
 #[cfg(context_graph_internal_test_support)]

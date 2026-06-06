@@ -20,6 +20,7 @@ mod engine_probes {
 #[cfg(context_graph_internal_test_support)]
 mod explain_introspection;
 mod impact_analysis_engine_capabilities;
+mod impact_cascade_probes;
 #[cfg(context_graph_internal_test_support)]
 mod intra_space_modality_agnostic;
 mod invalidation_audit_log;
