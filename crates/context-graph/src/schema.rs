@@ -191,6 +191,11 @@ pub const INDEXES: &[IndexSpec] = &[
         ddl: "CREATE INDEX idx_edges_target_context_type ON edges (target_id, context_id, edge_type)",
     },
     IndexSpec {
+        table: "decisions",
+        name: "idx_decisions_id_status",
+        ddl: "CREATE INDEX idx_decisions_id_status ON decisions (id, status)",
+    },
+    IndexSpec {
         table: "evidence_embedding_handles",
         name: "idx_evidence_embedding_handles_producer_system",
         ddl: "CREATE INDEX idx_evidence_embedding_handles_producer_system ON evidence_embedding_handles (producer_system)",

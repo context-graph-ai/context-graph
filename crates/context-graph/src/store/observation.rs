@@ -1176,6 +1176,17 @@ impl Store {
             .iter()
             .map(|evidence| (evidence.id, evidence))
             .collect::<HashMap<_, _>>();
+        let has_image_frame_evidence_route = routes.iter().any(|route| {
+            let EmbeddingTarget::Evidence(evidence_id) = route.target else {
+                return false;
+            };
+            evidence_by_id
+                .get(&evidence_id)
+                .is_some_and(|evidence| evidence.kind == EvidenceKind::ImageFrame)
+        });
+        if !has_image_frame_evidence_route {
+            return Ok(());
+        }
         let candidates =
             self.active_entity_basis_decisions_in_tx(tx, input.context_id, input.entity_id)?;
         if candidates.is_empty() {
