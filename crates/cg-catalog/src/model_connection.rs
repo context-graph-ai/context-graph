@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -10,16 +11,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use candle_core::{Device, Tensor};
 use cg_cli_conventions::{CheckRegistrar, DiagnosticCheck, Finding};
 use context_graph::{
-    CgError, ContextId, DeploymentSurface, FailureBucket, LlmClient, ModelInvocation, ModelReply,
-    Principal, UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
+    AuthorizedModelInvocationParts, CgError, ContextId, DeploymentSurface, FailureBucket,
+    LlmClient, ModelInvocation, ModelReply, Principal, ProviderInvocationConfig,
+    UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
 };
 use fs4::fs_std::FileExt;
 use safetensors::SafeTensors;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-use crate::{CacheStatus, Capability, Catalog, CatalogEntry, License, ModelKind, Source};
+use crate::{
+    CacheStatus, Capability, Catalog, CatalogEntry, CatalogRegistrations, License, ModelKind,
+    Source,
+};
 
 pub const DEGRADED_MARKER: &str = "running without a connected model";
 const HOSTED_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,6 +39,15 @@ const NEW_PROVIDER_REQUIRED_FIELDS: &[&str] = &[
     "timeout_ms",
     "consent_required",
 ];
+const NEW_HTTP_PROVIDER_REQUIRED_FIELDS: &[&str] = &[
+    "transport",
+    "auth_scheme",
+    "base_url",
+    "dialect",
+    "reply_path",
+];
+const DEFAULT_CHAT_COMPLETIONS_REPLY_PATH: &str = "/choices/0/message/content";
+const SEALED_STORED_SECRET_PREFIX: &str = "sealed:";
 const PROBELESS_HOST_ACCOUNT: &str = "account not exposed by host CLI";
 const DOCTOR_COMMAND_TIMEOUT_MS: u64 = 5_000;
 const CLAUDE_PROTECTED_ENV: [&str; 6] = [
@@ -140,6 +155,8 @@ pub struct ProviderSpec {
     pub auth_scheme: Option<ProviderAuthScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<ProviderDialect>,
     pub binary: String,
@@ -291,11 +308,12 @@ impl ModelProofError {
 
     pub fn bucket(&self) -> &str {
         match self {
+            Self::NoHostSession | Self::ConsentNotRecorded => "auth",
+            Self::HostToolMissing { .. } => "auth",
             Self::HostLoginExpired { .. } => "auth",
             Self::LiveCallFailed { bucket, .. } => bucket.as_str(),
             Self::ReplyFormat { .. } => "format",
             Self::UnsafeSettings { .. } => "billing",
-            _ => "unknown",
         }
     }
 
@@ -340,22 +358,24 @@ struct RawProviderSpec {
     #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
+    default_model: Option<String>,
+    #[serde(default)]
     dialect: Option<ProviderDialect>,
-    binary: String,
+    binary: Option<String>,
     #[serde(default)]
     completion_args: Vec<String>,
-    prompt_delivery: String,
+    prompt_delivery: Option<String>,
     #[serde(default)]
     env_remove: Vec<String>,
     #[serde(default)]
     env_preserve: Vec<String>,
-    reply_framing: String,
+    reply_framing: Option<String>,
     #[serde(default)]
     reply_path: String,
     #[serde(default)]
     success: Option<PredicateSpec>,
-    timeout_ms: u64,
-    consent_required: bool,
+    timeout_ms: Option<u64>,
+    consent_required: Option<bool>,
     #[serde(default)]
     required_help_flags: Vec<String>,
     #[serde(default)]
@@ -376,6 +396,7 @@ struct ProviderSpecOverride {
     transport: Option<ProviderTransport>,
     auth_scheme: Option<ProviderAuthScheme>,
     base_url: Option<String>,
+    default_model: Option<String>,
     dialect: Option<ProviderDialect>,
     binary: Option<String>,
     completion_args: Option<Vec<String>>,
@@ -534,30 +555,69 @@ fn provider_spec_from_raw(
     raw: RawProviderSpec,
     path: Option<&Path>,
 ) -> std::result::Result<ProviderSpec, ProviderSpecLoadError> {
-    let prompt_delivery = PromptDelivery::parse(&raw.prompt_delivery).ok_or_else(|| {
-        invalid_value(
-            path,
-            provider,
-            "prompt_delivery",
-            raw.prompt_delivery.clone(),
-            PromptDelivery::ACCEPTED,
-        )
-    })?;
-    let reply_framing = ReplyFraming::parse(&raw.reply_framing).ok_or_else(|| {
-        invalid_value(
-            path,
-            provider,
-            "reply_framing",
-            raw.reply_framing.clone(),
-            ReplyFraming::ACCEPTED,
-        )
-    })?;
+    let prompt_delivery = match raw.transport {
+        ProviderTransport::CliSubprocess => {
+            let value = require_raw_field(provider, "prompt_delivery", raw.prompt_delivery, path)?;
+            PromptDelivery::parse(&value).ok_or_else(|| {
+                invalid_value(
+                    path,
+                    provider,
+                    "prompt_delivery",
+                    value.clone(),
+                    PromptDelivery::ACCEPTED,
+                )
+            })?
+        }
+        ProviderTransport::Http => raw
+            .prompt_delivery
+            .as_deref()
+            .and_then(PromptDelivery::parse)
+            .unwrap_or_default(),
+    };
+    let reply_framing = match raw.transport {
+        ProviderTransport::CliSubprocess => {
+            let value = require_raw_field(provider, "reply_framing", raw.reply_framing, path)?;
+            ReplyFraming::parse(&value).ok_or_else(|| {
+                invalid_value(
+                    path,
+                    provider,
+                    "reply_framing",
+                    value.clone(),
+                    ReplyFraming::ACCEPTED,
+                )
+            })?
+        }
+        ProviderTransport::Http => raw
+            .reply_framing
+            .as_deref()
+            .and_then(ReplyFraming::parse)
+            .unwrap_or(ReplyFraming::Json),
+    };
+    let binary = match raw.transport {
+        ProviderTransport::CliSubprocess => {
+            require_raw_field(provider, "binary", raw.binary, path)?
+        }
+        ProviderTransport::Http => raw.binary.unwrap_or_default(),
+    };
+    let timeout_ms = match raw.transport {
+        ProviderTransport::CliSubprocess => {
+            require_raw_field(provider, "timeout_ms", raw.timeout_ms, path)?
+        }
+        ProviderTransport::Http => raw.timeout_ms.unwrap_or_else(default_http_timeout_ms),
+    };
+    let consent_required = match raw.transport {
+        ProviderTransport::CliSubprocess => {
+            require_raw_field(provider, "consent_required", raw.consent_required, path)?
+        }
+        ProviderTransport::Http => raw.consent_required.unwrap_or(true),
+    };
     Ok(ProviderSpec {
         transport: raw.transport,
         auth_scheme: raw.auth_scheme,
         base_url: raw.base_url,
+        default_model: raw.default_model,
         dialect: raw.dialect,
-        binary: raw.binary,
+        binary,
         completion_args: raw.completion_args,
         prompt_delivery,
         env_remove: raw.env_remove,
@@ -565,8 +625,8 @@ fn provider_spec_from_raw(
         reply_framing,
         reply_path: raw.reply_path,
         success: raw.success,
-        timeout_ms: raw.timeout_ms,
-        consent_required: raw.consent_required,
+        timeout_ms,
+        consent_required,
         required_help_flags: raw.required_help_flags,
         last_verified: raw.last_verified,
         auth_probe_args: raw.auth_probe_args,
@@ -632,11 +692,184 @@ fn validate_provider_spec(
     spec: &ProviderSpec,
     path: Option<&Path>,
 ) -> std::result::Result<(), ProviderSpecLoadError> {
-    validate_completion_arg_placeholders(provider, &spec.completion_args, path)?;
+    match spec.transport {
+        ProviderTransport::CliSubprocess => {
+            if spec.binary.trim().is_empty() {
+                return Err(missing_provider_field(
+                    path,
+                    provider,
+                    "binary",
+                    NEW_PROVIDER_REQUIRED_FIELDS,
+                ));
+            }
+            validate_completion_arg_placeholders(provider, &spec.completion_args, path)?;
+        }
+        ProviderTransport::Http => {
+            let Some(base_url) = spec.base_url.as_deref() else {
+                return Err(missing_provider_field(
+                    path,
+                    provider,
+                    "base_url",
+                    NEW_HTTP_PROVIDER_REQUIRED_FIELDS,
+                ));
+            };
+            if spec.auth_scheme.is_none() {
+                return Err(missing_provider_field(
+                    path,
+                    provider,
+                    "auth_scheme",
+                    NEW_HTTP_PROVIDER_REQUIRED_FIELDS,
+                ));
+            }
+            validate_http_base_url(provider, base_url, path)?;
+            if let Some(default_model) = spec.default_model.as_deref()
+                && (default_model.trim().is_empty() || default_model == provider)
+            {
+                return Err(invalid_value(
+                    path,
+                    provider,
+                    "default_model",
+                    default_model.to_string(),
+                    &["non-empty model id distinct from the provider row name"],
+                ));
+            }
+            if spec.dialect != Some(ProviderDialect::OpenaiChatCompletions) {
+                return Err(invalid_value(
+                    path,
+                    provider,
+                    "dialect",
+                    spec.dialect
+                        .map(|dialect| format!("{dialect:?}"))
+                        .unwrap_or_else(|| "missing required provider spec field".to_string()),
+                    &["openai-chat-completions"],
+                ));
+            }
+            if spec.reply_path.trim().is_empty() || !spec.reply_path.starts_with('/') {
+                return Err(invalid_value(
+                    path,
+                    provider,
+                    "reply_path",
+                    spec.reply_path.clone(),
+                    &[DEFAULT_CHAT_COMPLETIONS_REPLY_PATH],
+                ));
+            }
+        }
+    }
+    if spec.timeout_ms == 0 {
+        return Err(invalid_value(
+            path,
+            provider,
+            "timeout_ms",
+            "0".to_string(),
+            &["positive timeout in milliseconds"],
+        ));
+    }
     validate_optional_predicate(provider, "success", spec.success.as_ref(), path)?;
     validate_optional_predicate(provider, "auth_success", spec.auth_success.as_ref(), path)?;
     validate_optional_predicate(provider, "auth_required", spec.auth_required.as_ref(), path)?;
     Ok(())
+}
+
+fn validate_http_base_url(
+    provider: &str,
+    base_url: &str,
+    path: Option<&Path>,
+) -> std::result::Result<(), ProviderSpecLoadError> {
+    if !valid_http_base_url(base_url) {
+        return Err(invalid_value(
+            path,
+            provider,
+            "base_url",
+            base_url.to_string(),
+            &["absolute http(s) URL with host and no userinfo, query, or fragment"],
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_hosted_endpoint_base_url(
+    provider: &str,
+    base_url: &str,
+) -> std::result::Result<(), String> {
+    if valid_http_base_url(base_url) {
+        return Ok(());
+    }
+    Err(format!(
+        "provider {provider} endpoint must be an absolute http(s) URL with host and no userinfo, query, or fragment"
+    ))
+}
+
+pub fn validate_hosted_endpoint_base_url_for_auth(
+    provider: &str,
+    base_url: &str,
+    auth_scheme: ProviderAuthScheme,
+) -> std::result::Result<(), String> {
+    validate_hosted_endpoint_base_url(provider, base_url)?;
+    if auth_scheme == ProviderAuthScheme::Bearer && !bearer_endpoint_is_secure_or_loopback(base_url)
+    {
+        return Err(format!(
+            "provider {provider} bearer endpoint must use https, except loopback http for local development"
+        ));
+    }
+    Ok(())
+}
+
+fn valid_http_base_url(base_url: &str) -> bool {
+    let Ok(uri) = base_url.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    !base_url
+        .chars()
+        .any(|char| char.is_whitespace() || char.is_control())
+        && matches!(uri.scheme_str(), Some("http" | "https"))
+        && uri.host().is_some_and(|host| !host.is_empty())
+        && uri.query().is_none()
+        && !base_url.contains('#')
+        && !uri_authority_contains_userinfo(&uri)
+        && !explicit_uri_port_is_invalid(&uri)
+}
+
+fn bearer_endpoint_is_secure_or_loopback(base_url: &str) -> bool {
+    let Ok(uri) = base_url.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => uri.host().is_some_and(host_is_loopback),
+        _ => false,
+    }
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn uri_authority_contains_userinfo(uri: &ureq::http::Uri) -> bool {
+    uri.authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+}
+
+fn explicit_uri_port_is_invalid(uri: &ureq::http::Uri) -> bool {
+    let Some(authority) = uri.authority() else {
+        return true;
+    };
+    let authority = authority.as_str();
+    let explicit_port = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((_, after_host)) = rest.split_once(']') else {
+            return true;
+        };
+        after_host.strip_prefix(':')
+    } else {
+        authority.rsplit_once(':').map(|(_, port)| port)
+    };
+    let Some(port) = explicit_port else {
+        return false;
+    };
+    !port.chars().all(|char| char.is_ascii_digit()) || port.parse::<u16>().is_err()
 }
 
 fn provider_spec_from_override(
@@ -644,49 +877,83 @@ fn provider_spec_from_override(
     override_layer: ProviderSpecOverride,
     path: &Path,
 ) -> std::result::Result<ProviderSpec, ProviderSpecLoadError> {
-    let binary = require_override_field(provider, "binary", override_layer.binary, path)?;
-    let prompt_delivery = require_override_field(
-        provider,
-        "prompt_delivery",
-        override_layer.prompt_delivery,
-        path,
-    )?;
-    let prompt_delivery = PromptDelivery::parse(&prompt_delivery).ok_or_else(|| {
-        invalid_value(
-            Some(path),
+    let transport = override_layer.transport.unwrap_or_default();
+    let binary = match transport {
+        ProviderTransport::CliSubprocess => {
+            require_override_field(provider, "binary", override_layer.binary, path)?
+        }
+        ProviderTransport::Http => override_layer.binary.unwrap_or_default(),
+    };
+    let prompt_delivery = match transport {
+        ProviderTransport::CliSubprocess => {
+            let value = require_override_field(
+                provider,
+                "prompt_delivery",
+                override_layer.prompt_delivery,
+                path,
+            )?;
+            PromptDelivery::parse(&value).ok_or_else(|| {
+                invalid_value(
+                    Some(path),
+                    provider,
+                    "prompt_delivery",
+                    value.clone(),
+                    PromptDelivery::ACCEPTED,
+                )
+            })?
+        }
+        ProviderTransport::Http => override_layer
+            .prompt_delivery
+            .as_deref()
+            .and_then(PromptDelivery::parse)
+            .unwrap_or_default(),
+    };
+    let reply_framing = match transport {
+        ProviderTransport::CliSubprocess => {
+            let value = require_override_field(
+                provider,
+                "reply_framing",
+                override_layer.reply_framing,
+                path,
+            )?;
+            ReplyFraming::parse(&value).ok_or_else(|| {
+                invalid_value(
+                    Some(path),
+                    provider,
+                    "reply_framing",
+                    value.clone(),
+                    ReplyFraming::ACCEPTED,
+                )
+            })?
+        }
+        ProviderTransport::Http => override_layer
+            .reply_framing
+            .as_deref()
+            .and_then(ReplyFraming::parse)
+            .unwrap_or(ReplyFraming::Json),
+    };
+    let timeout_ms = match transport {
+        ProviderTransport::CliSubprocess => {
+            require_override_field(provider, "timeout_ms", override_layer.timeout_ms, path)?
+        }
+        ProviderTransport::Http => override_layer
+            .timeout_ms
+            .unwrap_or_else(default_http_timeout_ms),
+    };
+    let consent_required = match transport {
+        ProviderTransport::CliSubprocess => require_override_field(
             provider,
-            "prompt_delivery",
-            prompt_delivery.clone(),
-            PromptDelivery::ACCEPTED,
-        )
-    })?;
-    let reply_framing = require_override_field(
-        provider,
-        "reply_framing",
-        override_layer.reply_framing,
-        path,
-    )?;
-    let reply_framing = ReplyFraming::parse(&reply_framing).ok_or_else(|| {
-        invalid_value(
-            Some(path),
-            provider,
-            "reply_framing",
-            reply_framing.clone(),
-            ReplyFraming::ACCEPTED,
-        )
-    })?;
-    let timeout_ms =
-        require_override_field(provider, "timeout_ms", override_layer.timeout_ms, path)?;
-    let consent_required = require_override_field(
-        provider,
-        "consent_required",
-        override_layer.consent_required,
-        path,
-    )?;
+            "consent_required",
+            override_layer.consent_required,
+            path,
+        )?,
+        ProviderTransport::Http => override_layer.consent_required.unwrap_or(true),
+    };
     let mut spec = ProviderSpec {
-        transport: override_layer.transport.unwrap_or_default(),
+        transport,
         auth_scheme: override_layer.auth_scheme,
         base_url: override_layer.base_url,
+        default_model: override_layer.default_model,
         dialect: override_layer.dialect,
         binary,
         completion_args: override_layer.completion_args.unwrap_or_default(),
@@ -709,22 +976,42 @@ fn provider_spec_from_override(
     Ok(spec)
 }
 
+fn require_raw_field<T>(
+    provider: &str,
+    field: &str,
+    value: Option<T>,
+    path: Option<&Path>,
+) -> std::result::Result<T, ProviderSpecLoadError> {
+    value.ok_or_else(|| missing_provider_field(path, provider, field, NEW_PROVIDER_REQUIRED_FIELDS))
+}
+
 fn require_override_field<T>(
     provider: &str,
     field: &str,
     value: Option<T>,
     path: &Path,
 ) -> std::result::Result<T, ProviderSpecLoadError> {
-    value.ok_or_else(|| ProviderSpecLoadError {
-        path: Some(path.to_path_buf()),
+    value.ok_or_else(|| {
+        missing_provider_field(Some(path), provider, field, NEW_PROVIDER_REQUIRED_FIELDS)
+    })
+}
+
+fn missing_provider_field(
+    path: Option<&Path>,
+    provider: &str,
+    field: &str,
+    accepted_fields: &[&str],
+) -> ProviderSpecLoadError {
+    ProviderSpecLoadError {
+        path: path.map(Path::to_path_buf),
         provider: provider.to_string(),
         field: field.to_string(),
         value: "missing required provider spec field".to_string(),
         accepted: vec![format!(
             "new providers must declare {}",
-            NEW_PROVIDER_REQUIRED_FIELDS.join(", ")
+            accepted_fields.join(", ")
         )],
-    })
+    }
 }
 
 fn validate_optional_predicate(
@@ -839,6 +1126,9 @@ fn apply_provider_override(
     if let Some(base_url) = override_layer.base_url {
         spec.base_url = Some(base_url);
     }
+    if let Some(default_model) = override_layer.default_model {
+        spec.default_model = Some(default_model);
+    }
     if let Some(dialect) = override_layer.dialect {
         spec.dialect = Some(dialect);
     }
@@ -924,6 +1214,29 @@ fn protected_env(provider: &str) -> &'static [&'static str] {
         "claude" => &CLAUDE_PROTECTED_ENV,
         "codex" => &CODEX_PROTECTED_ENV,
         _ => &[],
+    }
+}
+
+fn default_http_timeout_ms() -> u64 {
+    HOSTED_TIMEOUT.as_millis() as u64
+}
+
+fn http_auth_scheme_name(auth_scheme: ProviderAuthScheme) -> &'static str {
+    match auth_scheme {
+        ProviderAuthScheme::Bearer => "bearer",
+        ProviderAuthScheme::None => "none",
+    }
+}
+
+fn provider_dialect_name(dialect: ProviderDialect) -> &'static str {
+    match dialect {
+        ProviderDialect::OpenaiChatCompletions => "openai-chat-completions",
+    }
+}
+
+fn provider_request_path(dialect: ProviderDialect) -> &'static str {
+    match dialect {
+        ProviderDialect::OpenaiChatCompletions => "/chat/completions",
     }
 }
 
@@ -1142,11 +1455,10 @@ fn json_pointer_string(value: &Value, path: &str) -> Option<String> {
     if path == "stdout" {
         return value.as_str().map(str::to_string);
     }
-    value.pointer(path).and_then(|value| match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Null => None,
-        other => Some(other.to_string()),
-    })
+    value
+        .pointer(path)
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn evaluate_predicate(value: &Value, predicate: &PredicateSpec) -> bool {
@@ -1388,7 +1700,12 @@ pub fn register_model_connection_checks_with_root(
 }
 
 fn provider_names_for_checks(specs: &ProviderSpecs) -> Vec<String> {
-    let mut names = specs.providers.keys().cloned().collect::<Vec<_>>();
+    let mut names = specs
+        .providers
+        .iter()
+        .filter(|(_, spec)| spec.transport == ProviderTransport::CliSubprocess)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
     names.sort();
     if let Some(index) = names.iter().position(|name| name == "claude") {
         names.swap(0, index);
@@ -2054,12 +2371,45 @@ impl LlmClient for NativeLlmClient {
         if invocation.cache_path.is_some() {
             return understand_local_single_file(invocation);
         }
+        Err(CgError::Engine(
+            "native llm client cannot drive hosted HTTP transport".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct HttpChatCompletionsLlmClient;
+
+impl LlmClient for HttpChatCompletionsLlmClient {
+    async fn understand(
+        &self,
+        invocation: &ModelInvocation,
+    ) -> context_graph::Result<context_graph::ModelReply> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.understand_native(invocation)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = invocation;
+            Err(CgError::Engine(
+                "HTTP chat completions client is unavailable on wasm".to_string(),
+            ))
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn understand_native(
+        &self,
+        invocation: &ModelInvocation,
+    ) -> context_graph::Result<context_graph::ModelReply> {
         understand_hosted(invocation)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CredentialSource {
+    NoAuth,
     EnvVar {
         env_var: String,
     },
@@ -2095,6 +2445,13 @@ pub struct CredentialReference {
 }
 
 impl CredentialReference {
+    fn no_auth() -> Self {
+        Self {
+            source: CredentialSource::NoAuth,
+            env_var: String::new(),
+        }
+    }
+
     fn env_var(env_var: String) -> Self {
         Self {
             source: CredentialSource::EnvVar {
@@ -2115,6 +2472,17 @@ impl CredentialReference {
         }
     }
 
+    fn sealed_stored_secret(secret_ref: String, cipher_hex: String) -> Self {
+        Self {
+            source: CredentialSource::StoredSecret { secret_ref },
+            env_var: format!("{SEALED_STORED_SECRET_PREFIX}{cipher_hex}"),
+        }
+    }
+
+    fn sealed_secret_cipher_hex(&self) -> Option<&str> {
+        self.env_var.strip_prefix(SEALED_STORED_SECRET_PREFIX)
+    }
+
     fn normalized(mut self) -> Self {
         if matches!(
             &self.source,
@@ -2124,6 +2492,11 @@ impl CredentialReference {
             self.source = CredentialSource::EnvVar {
                 env_var: self.env_var.clone(),
             };
+        } else if matches!(
+            &self.source,
+            CredentialSource::EnvVar { env_var } if env_var.is_empty()
+        ) {
+            self.source = CredentialSource::NoAuth;
         }
         self
     }
@@ -2161,6 +2534,16 @@ pub struct HostedEndpoint {
     pub provider_model: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedModelConnectionRequest {
+    pub connection_name: String,
+    pub model_id: String,
+    pub base_url: String,
+    pub provider: String,
+    pub provider_model: String,
+    pub consent_owner: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionStatus {
     pub context_id: ContextId,
@@ -2169,6 +2552,29 @@ pub struct ConnectionStatus {
     pub consent_recorded: bool,
     pub spend_owner: Option<String>,
     pub degraded_marker: Option<String>,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_model: Option<String>,
+    #[serde(default)]
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<ConnectionLastError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionLastError {
+    pub condition: String,
+    pub bucket: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2232,6 +2638,13 @@ impl PrincipalAwareConfig {
         self.secrets
             .get(&(principal.encode(), env_var.to_string()))
             .cloned()
+            .or_else(|| {
+                if env_var.is_empty() {
+                    None
+                } else {
+                    std::env::var(env_var).ok()
+                }
+            })
     }
 
     pub fn insert_stored_secret(
@@ -2300,6 +2713,158 @@ struct PersistModelConnectionCatalogFile {
     migration_records: Vec<MigrationRecord>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PersistedSecretStore {
+    #[serde(default)]
+    secrets: Vec<PersistedSecret>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedSecret {
+    principal: String,
+    secret_ref: String,
+    cipher_hex: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PersistedConnectionStatusFile {
+    #[serde(default)]
+    errors: Vec<PersistedConnectionError>,
+    #[serde(default)]
+    successes: Vec<PersistedConnectionSuccess>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedConnectionError {
+    connection_name: String,
+    condition: String,
+    bucket: String,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedConnectionSuccess {
+    connection_name: String,
+    provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_config_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConnectionSelftestStatusSnapshot {
+    errors: Vec<PersistedConnectionError>,
+    successes: Vec<PersistedConnectionSuccess>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConnectionSelftestSuccessTarget {
+    provider: String,
+    endpoint: Option<String>,
+    provider_model: Option<String>,
+    credential_fingerprint: Option<String>,
+    provider_config_fingerprint: Option<String>,
+}
+
+fn success_matches_connection(
+    success: &PersistedConnectionSuccess,
+    connection_name: &str,
+    target: &Option<ConnectionSelftestSuccessTarget>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    success.connection_name == connection_name
+        && success.provider == target.provider
+        && success.endpoint == target.endpoint
+        && success.provider_model == target.provider_model
+        && success.credential_fingerprint == target.credential_fingerprint
+        && success.provider_config_fingerprint == target.provider_config_fingerprint
+}
+
+fn credential_reference_fingerprint(connection: &ConnectionRead) -> Option<String> {
+    credential_reference_fingerprint_with_parts(connection, &[])
+}
+
+fn credential_reference_fingerprint_with_parts(
+    connection: &ConnectionRead,
+    extra_parts: &[(&str, String)],
+) -> Option<String> {
+    let mut material = toml::to_string(&connection.credential_reference).ok()?;
+    material.push_str("\nexposed_secret=");
+    material.push_str(if connection.exposed_secret.is_some() {
+        "present"
+    } else {
+        "absent"
+    });
+    material.push('\n');
+    for (key, value) in extra_parts {
+        material.push_str(key);
+        material.push('=');
+        material.push_str(value);
+        material.push('\n');
+    }
+    let digest = Sha256::digest(material.as_bytes());
+    Some(hex_encode(&digest))
+}
+
+fn live_secret_value_fingerprint(kind: &str, name: &str, secret: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cg-live-credential-fingerprint-v1");
+    digest.update([0]);
+    digest.update(kind.as_bytes());
+    digest.update([0]);
+    digest.update(name.as_bytes());
+    digest.update([0]);
+    digest.update(secret.as_bytes());
+    hex_encode(&digest.finalize())
+}
+
+fn local_secret_key_fingerprint(key: &[u8; 32]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cg-local-secret-key-fingerprint-v1");
+    digest.update([0]);
+    digest.update(key);
+    hex_encode(&digest.finalize())
+}
+
+fn provider_config_fingerprint(config: &ProviderInvocationConfig) -> String {
+    let material = [
+        ("transport", config.transport.as_str()),
+        ("provider", config.provider.as_str()),
+        ("provider_model", config.provider_model.as_str()),
+        ("base_url", config.base_url.as_str()),
+        ("request_path", config.request_path.as_str()),
+        ("auth_scheme", config.auth_scheme.as_str()),
+        ("dialect", config.dialect.as_str()),
+        ("reply_path", config.reply_path.as_str()),
+    ]
+    .into_iter()
+    .map(|(key, value)| format!("{key}={value}\n"))
+    .chain(std::iter::once(format!(
+        "timeout_ms={}\n",
+        config.timeout_ms
+    )))
+    .collect::<String>();
+    let digest = Sha256::digest(material.as_bytes());
+    hex_encode(&digest)
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionRegistrationRollback {
+    previous_connection: Option<ConnectionRead>,
+    model_id: String,
+    previous_model: Option<ModelRead>,
+    stale_models: Vec<ModelRead>,
+    previous_active: Option<String>,
+    previous_status: ConnectionSelftestStatusSnapshot,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ModelConnectionCatalog {
     root: PathBuf,
@@ -2312,6 +2877,10 @@ pub struct ModelConnectionCatalog {
     active_connection_name: Option<String>,
     resolved_connection_log: Vec<String>,
     write_sequence: u64,
+    loaded_connection_names: BTreeSet<String>,
+    loaded_model_ids: BTreeSet<String>,
+    loaded_context_ids: BTreeSet<ContextId>,
+    loaded_active_connection_name: Option<String>,
     persistence_errors: Arc<Mutex<Vec<String>>>,
     load_error: Option<String>,
 }
@@ -2332,6 +2901,30 @@ impl ModelConnectionCatalog {
             None
         } else {
             Some(self.root.join("cg/model-connections.toml"))
+        }
+    }
+
+    fn secret_store_path(&self) -> Option<PathBuf> {
+        if self.root.as_os_str().is_empty() {
+            None
+        } else {
+            Some(self.root.join("cg/model-secrets.toml"))
+        }
+    }
+
+    fn secret_key_path(&self) -> Option<PathBuf> {
+        if self.root.as_os_str().is_empty() {
+            None
+        } else {
+            Some(self.root.join("cg/model-secrets.key"))
+        }
+    }
+
+    fn status_store_path(&self) -> Option<PathBuf> {
+        if self.root.as_os_str().is_empty() {
+            None
+        } else {
+            Some(self.root.join("cg/model-connection-status.toml"))
         }
     }
 
@@ -2383,7 +2976,15 @@ impl ModelConnectionCatalog {
             .map(|binding| (binding.context_id, binding.model_id))
             .collect();
         self.migration_records = file.migration_records;
+        self.refresh_loaded_snapshot();
         Ok(())
+    }
+
+    fn refresh_loaded_snapshot(&mut self) {
+        self.loaded_connection_names = self.connections.keys().cloned().collect();
+        self.loaded_model_ids = self.models.keys().cloned().collect();
+        self.loaded_context_ids = self.context_models.keys().copied().collect();
+        self.loaded_active_connection_name = self.active_connection_name.clone();
     }
 
     fn persist(&mut self) {
@@ -2411,34 +3012,99 @@ impl ModelConnectionCatalog {
             .map_err(|err| format!("open lock {} failed: {err}", lock_path.display()))?;
         lock.lock_exclusive()
             .map_err(|err| format!("lock {} failed: {err}", lock_path.display()))?;
-        self.write_sequence = self.write_sequence.saturating_add(1);
+        let disk_file = if path.exists() {
+            let text = fs::read_to_string(&path)
+                .map_err(|err| format!("read {} failed: {err}", path.display()))?;
+            toml::from_str::<RawModelConnectionCatalogFile>(&text)
+                .map_err(|err| format!("parse {} failed: {err}", path.display()))?
+        } else {
+            RawModelConnectionCatalogFile::default()
+        };
+        let mut merged_connections = self.connections.clone();
+        let mut merged_unknown_connection_records = self.unknown_connection_records.clone();
+        for raw_connection in disk_file.connections {
+            match raw_connection.clone().try_into::<ConnectionRead>() {
+                Ok(mut connection) => {
+                    connection.credential_reference = connection.credential_reference.normalized();
+                    if !merged_connections.contains_key(&connection.name)
+                        && !self.loaded_connection_names.contains(&connection.name)
+                    {
+                        merged_connections.insert(connection.name.clone(), connection);
+                    }
+                }
+                Err(_) => {
+                    let raw_name = raw_connection_name(&raw_connection);
+                    let conflicts_with_known = raw_name
+                        .as_deref()
+                        .is_some_and(|name| merged_connections.contains_key(name));
+                    let already_preserved = merged_unknown_connection_records
+                        .iter()
+                        .any(|existing| raw_connection_name(existing) == raw_name);
+                    if !conflicts_with_known && !already_preserved {
+                        merged_unknown_connection_records.push(raw_connection);
+                    }
+                }
+            }
+        }
+        let mut merged_models = self.models.clone();
+        for model in disk_file.models {
+            if !merged_models.contains_key(&model.id) && !self.loaded_model_ids.contains(&model.id)
+            {
+                merged_models.insert(model.id.clone(), model);
+            }
+        }
+        let mut merged_context_models = self.context_models.clone();
+        for binding in disk_file.context_models {
+            if !merged_context_models.contains_key(&binding.context_id)
+                && !self.loaded_context_ids.contains(&binding.context_id)
+            {
+                merged_context_models.insert(binding.context_id, binding.model_id);
+            }
+        }
+        let mut merged_migration_records = self.migration_records.clone();
+        for record in disk_file.migration_records {
+            if !merged_migration_records.contains(&record) {
+                merged_migration_records.push(record);
+            }
+        }
+        let active_connection_name =
+            if self.active_connection_name == self.loaded_active_connection_name {
+                disk_file
+                    .active_connection_name
+                    .or_else(|| self.active_connection_name.clone())
+            } else {
+                self.active_connection_name.clone()
+            };
+        let write_sequence = disk_file
+            .write_sequence
+            .max(self.write_sequence)
+            .saturating_add(1);
         let mut connections = Vec::new();
-        for connection in self.connections.values() {
+        for connection in merged_connections.values() {
             let value = toml::Value::try_from(connection.clone())
                 .map_err(|err| format!("serialize connection {} failed: {err}", connection.name))?;
             connections.push(value);
         }
-        for raw_connection in &self.unknown_connection_records {
+        for raw_connection in &merged_unknown_connection_records {
             let conflicts_with_known = raw_connection_name(raw_connection)
-                .is_some_and(|name| self.connections.contains_key(&name));
+                .is_some_and(|name| merged_connections.contains_key(&name));
             if !conflicts_with_known {
                 connections.push(raw_connection.clone());
             }
         }
         let file = PersistModelConnectionCatalogFile {
-            write_sequence: self.write_sequence,
-            active_connection_name: self.active_connection_name.clone(),
+            write_sequence,
+            active_connection_name: active_connection_name.clone(),
             connections,
-            models: self.models.values().cloned().collect(),
-            context_models: self
-                .context_models
+            models: merged_models.values().cloned().collect(),
+            context_models: merged_context_models
                 .iter()
                 .map(|(context_id, model_id)| ContextModelBinding {
                     context_id: *context_id,
                     model_id: model_id.clone(),
                 })
                 .collect(),
-            migration_records: self.migration_records.clone(),
+            migration_records: merged_migration_records.clone(),
         };
         let text =
             toml::to_string_pretty(&file).map_err(|err| format!("serialize failed: {err}"))?;
@@ -2459,6 +3125,14 @@ impl ModelConnectionCatalog {
                 path.display()
             )
         })?;
+        self.connections = merged_connections;
+        self.unknown_connection_records = merged_unknown_connection_records;
+        self.models = merged_models;
+        self.context_models = merged_context_models;
+        self.migration_records = merged_migration_records;
+        self.active_connection_name = active_connection_name;
+        self.write_sequence = write_sequence;
+        self.refresh_loaded_snapshot();
         Ok(())
     }
 
@@ -2490,77 +3164,134 @@ impl ModelConnectionCatalog {
         }
     }
 
-    fn write_registered_entries(&mut self, entries: &[CatalogEntry]) -> bool {
+    fn mutate_registered_entries_result(
+        &mut self,
+        mutate: impl FnOnce(&mut Vec<CatalogEntry>),
+    ) -> std::result::Result<(), String> {
         if self.root.as_os_str().is_empty() {
-            return true;
+            return Ok(());
         }
-        if let Ok(catalog) =
-            Catalog::open_with_scope_against_root(&self.root, CONNECTION_CATALOG_SCOPE)
-        {
-            if let Err(err) = catalog.write_registered_entries(entries) {
-                self.record_persistence_error(format!("registered entries write failed: {err}"));
-                false
-            } else {
-                true
-            }
+        let path = self.root.join("cg/catalog-registrations.toml");
+        let Some(parent) = path.parent() else {
+            return Err(format!(
+                "registered entries path has no parent: {}",
+                path.display()
+            ));
+        };
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create {} failed: {err}", parent.display()))?;
+        let lock_path = path.with_extension("toml.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|err| format!("open lock {} failed: {err}", lock_path.display()))?;
+        lock.lock_exclusive()
+            .map_err(|err| format!("lock {} failed: {err}", lock_path.display()))?;
+
+        let mut entries = if path.exists() {
+            let text = fs::read_to_string(&path)
+                .map_err(|err| format!("read {} failed: {err}", path.display()))?;
+            toml::from_str::<CatalogRegistrations>(&text)
+                .map_err(|err| format!("parse {} failed: {err}", path.display()))?
+                .entries
         } else {
-            self.record_persistence_error("registered entries catalog open failed");
-            false
+            Vec::new()
+        };
+        mutate(&mut entries);
+
+        let registrations = CatalogRegistrations { entries };
+        let text = toml::to_string(&registrations)
+            .map_err(|err| format!("serialize registered entries failed: {err}"))?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("catalog-registrations.toml");
+        let tmp = path.with_file_name(format!(
+            ".{file_name}.tmp-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        {
+            let mut out = File::create(&tmp)
+                .map_err(|err| format!("create temp {} failed: {err}", tmp.display()))?;
+            out.write_all(text.as_bytes())
+                .map_err(|err| format!("write temp {} failed: {err}", tmp.display()))?;
+            out.sync_all()
+                .map_err(|err| format!("sync temp {} failed: {err}", tmp.display()))?;
         }
+        fs::rename(&tmp, &path).map_err(|err| {
+            let _ = fs::remove_file(&tmp);
+            format!(
+                "atomic rename {} -> {} failed: {err}",
+                tmp.display(),
+                path.display()
+            )
+        })
+    }
+
+    fn upsert_shipped_catalog_entry_result(
+        &mut self,
+        model: &ModelRead,
+    ) -> std::result::Result<(), String> {
+        self.mutate_registered_entries_result(|entries| {
+            let mut entry = entries
+                .iter()
+                .find(|entry| entry.id == model.id)
+                .cloned()
+                .unwrap_or_else(|| catalog_entry_for_model(model));
+            entry.kind = model.kind.clone();
+            entry.capability = Capability {
+                dimension: None,
+                output_shape: Some("understanding".to_string()),
+                input_modality: Some("text".to_string()),
+            };
+            entry.source = if let Some(connection_name) = &model.connection_name {
+                Source::NamedConnection {
+                    connection_name: connection_name.clone(),
+                }
+            } else if let Some(cache_path) = &model.cache_path {
+                Source::LocalPath {
+                    dir: cache_path.clone(),
+                }
+            } else if let Some(env_var) = &model.welded_auth_env_var {
+                Source::ApiEndpoint {
+                    base_url: "https://provider.example.invalid/v1".to_string(),
+                    provider: "legacy-provider".to_string(),
+                    model: model.id.clone(),
+                    auth_env_var: env_var.clone(),
+                }
+            } else {
+                Source::BundledBinary
+            };
+            entry.cache_status = if matches!(entry.source, Source::NamedConnection { .. }) {
+                CacheStatus::Cached
+            } else {
+                entry.cache_status
+            };
+            entry.byte_size = if matches!(entry.source, Source::NamedConnection { .. }) {
+                0
+            } else {
+                entry.byte_size
+            };
+            entry.local_path = model.cache_path.clone();
+            entry.artifact_filenames = model.artifact_filenames.clone();
+            entry.per_file_sha256 = model.per_file_sha256.clone();
+            entries.retain(|existing| existing.id != model.id);
+            entries.push(entry);
+        })
     }
 
     fn upsert_shipped_catalog_entry(&mut self, model: &ModelRead) -> bool {
-        if self.root.as_os_str().is_empty() {
-            return true;
+        match self.upsert_shipped_catalog_entry_result(model) {
+            Ok(()) => true,
+            Err(err) => {
+                self.record_persistence_error(err);
+                false
+            }
         }
-        let Some(mut entries) = self.registered_entries() else {
-            return false;
-        };
-        let mut entry = entries
-            .iter()
-            .find(|entry| entry.id == model.id)
-            .cloned()
-            .unwrap_or_else(|| catalog_entry_for_model(model));
-        entry.kind = model.kind.clone();
-        entry.capability = Capability {
-            dimension: None,
-            output_shape: Some("understanding".to_string()),
-            input_modality: Some("text".to_string()),
-        };
-        entry.source = if let Some(connection_name) = &model.connection_name {
-            Source::NamedConnection {
-                connection_name: connection_name.clone(),
-            }
-        } else if let Some(cache_path) = &model.cache_path {
-            Source::LocalPath {
-                dir: cache_path.clone(),
-            }
-        } else if let Some(env_var) = &model.welded_auth_env_var {
-            Source::ApiEndpoint {
-                base_url: "https://provider.example.invalid/v1".to_string(),
-                provider: "legacy-provider".to_string(),
-                model: model.id.clone(),
-                auth_env_var: env_var.clone(),
-            }
-        } else {
-            Source::BundledBinary
-        };
-        entry.cache_status = if matches!(entry.source, Source::NamedConnection { .. }) {
-            CacheStatus::Cached
-        } else {
-            entry.cache_status
-        };
-        entry.byte_size = if matches!(entry.source, Source::NamedConnection { .. }) {
-            0
-        } else {
-            entry.byte_size
-        };
-        entry.local_path = model.cache_path.clone();
-        entry.artifact_filenames = model.artifact_filenames.clone();
-        entry.per_file_sha256 = model.per_file_sha256.clone();
-        entries.retain(|existing| existing.id != model.id);
-        entries.push(entry);
-        self.write_registered_entries(&entries)
     }
 
     fn shipped_model(&self, id: &str) -> Option<ModelRead> {
@@ -2581,6 +3312,28 @@ impl ModelConnectionCatalog {
         let _ = (principal, config);
         let name = name.into();
         let env_var = env_var.into();
+        match self.connect_env_var_result(name.clone(), env_var.clone()) {
+            Ok(read) => read,
+            Err(err) => {
+                self.record_persistence_error(err);
+                ConnectionRead {
+                    name,
+                    credential_reference: CredentialReference::env_var(env_var),
+                    exposed_secret: None,
+                    consent_recorded: false,
+                    spend_owner: "unknown".to_string(),
+                }
+            }
+        }
+    }
+
+    pub fn connect_env_var_result(
+        &mut self,
+        name: impl Into<String>,
+        env_var: impl Into<String>,
+    ) -> std::result::Result<ConnectionRead, String> {
+        let name = name.into();
+        let env_var = env_var.into();
         let read = ConnectionRead {
             name: name.clone(),
             credential_reference: CredentialReference::env_var(env_var),
@@ -2588,10 +3341,113 @@ impl ModelConnectionCatalog {
             consent_recorded: false,
             spend_owner: "unknown".to_string(),
         };
-        self.connections.insert(name, read.clone());
+        let previous_connection = self.connections.insert(name, read.clone());
+        let previous_active = self.active_connection_name.clone();
         self.active_connection_name = Some(read.name.clone());
-        self.persist();
-        read
+        if let Err(err) = self.persist_result() {
+            if let Some(previous_connection) = previous_connection.clone() {
+                self.connections
+                    .insert(previous_connection.name.clone(), previous_connection);
+            } else {
+                self.connections.remove(&read.name);
+            }
+            self.active_connection_name = previous_active;
+            self.record_persistence_error(err.clone());
+            return Err(err);
+        }
+        Ok(read)
+    }
+
+    fn remove_stored_secret_ref(&self, secret_ref: &str) -> std::result::Result<(), String> {
+        let Some(path) = self.secret_store_path() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        let Some(parent) = path.parent() else {
+            return Err(format!(
+                "secret store path has no parent: {}",
+                path.display()
+            ));
+        };
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create {} failed: {err}", parent.display()))?;
+        let lock_path = path.with_extension("toml.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|err| format!("open lock {} failed: {err}", lock_path.display()))?;
+        lock.lock_exclusive()
+            .map_err(|err| format!("lock {} failed: {err}", lock_path.display()))?;
+        let text = fs::read_to_string(&path)
+            .map_err(|err| format!("read secret store {} failed: {err}", path.display()))?;
+        let mut store = toml::from_str::<PersistedSecretStore>(&text)
+            .map_err(|err| format!("parse secret store {} failed: {err}", path.display()))?;
+        let original_len = store.secrets.len();
+        store.secrets.retain(|entry| entry.secret_ref != secret_ref);
+        if store.secrets.len() == original_len {
+            return Ok(());
+        }
+        write_secret_store_unlocked(&path, &store)
+    }
+
+    fn local_secret_key(&self) -> std::result::Result<[u8; 32], String> {
+        let Some(path) = self.secret_key_path() else {
+            return Err("stored-secret encryption requires a catalog root".to_string());
+        };
+        let Some(parent) = path.parent() else {
+            return Err(format!("secret key path has no parent: {}", path.display()));
+        };
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create {} failed: {err}", parent.display()))?;
+        let lock_path = path.with_extension("key.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|err| format!("open lock {} failed: {err}", lock_path.display()))?;
+        lock.lock_exclusive()
+            .map_err(|err| format!("lock {} failed: {err}", lock_path.display()))?;
+        if path.exists() {
+            ensure_private_file_permissions(&path)?;
+            let text = fs::read_to_string(&path)
+                .map_err(|err| format!("read secret key {} failed: {err}", path.display()))?;
+            return parse_local_secret_key(&text)
+                .ok_or_else(|| format!("secret key {} is invalid", path.display()));
+        }
+        let key = random_secret_bytes();
+        let text = format!("{}\n", hex_encode(&key));
+        let tmp = path.with_extension(format!("key.tmp.{}", std::process::id()));
+        {
+            let mut file = create_private_file(&tmp)?;
+            file.write_all(text.as_bytes())
+                .map_err(|err| format!("write temp {} failed: {err}", tmp.display()))?;
+            file.sync_all()
+                .map_err(|err| format!("sync temp {} failed: {err}", tmp.display()))?;
+        }
+        fs::rename(&tmp, &path).map_err(|err| {
+            let _ = fs::remove_file(&tmp);
+            format!(
+                "atomic rename {} -> {} failed: {err}",
+                tmp.display(),
+                path.display()
+            )
+        })?;
+        ensure_private_file_permissions(&path)?;
+        Ok(key)
+    }
+
+    fn existing_local_secret_key_fingerprint(&self) -> Option<String> {
+        let path = self.secret_key_path()?;
+        let text = fs::read_to_string(path).ok()?;
+        let key = parse_local_secret_key(&text)?;
+        Some(local_secret_key_fingerprint(&key))
     }
 
     pub fn connect_host_session(
@@ -2687,27 +3543,445 @@ impl ModelConnectionCatalog {
         provider: impl Into<String>,
         provider_model: impl Into<String>,
     ) -> ModelRead {
-        let model = ModelRead {
-            id: id.into(),
-            kind: ModelKind::LlmClient,
-            connection_name: Some(connection_name.into()),
-            welded_auth_env_var: None,
-            exposed_secret: None,
-            cache_path: None,
-            hosted_endpoint: Some(HostedEndpoint {
-                base_url: base_url.into(),
-                provider: provider.into(),
-                provider_model: provider_model.into(),
-            }),
-            artifact_filenames: Vec::new(),
-            per_file_sha256: Vec::new(),
-        };
-        if !self.upsert_shipped_catalog_entry(&model) {
-            return model;
+        let id = id.into();
+        let connection_name = connection_name.into();
+        let base_url = base_url.into();
+        let provider = provider.into();
+        let provider_model = provider_model.into();
+        match self.register_hosted_model_result(
+            id.clone(),
+            connection_name.clone(),
+            base_url.clone(),
+            provider.clone(),
+            provider_model.clone(),
+        ) {
+            Ok(model) => model,
+            Err(err) => {
+                self.record_persistence_error(err);
+                hosted_model_read(id, connection_name, base_url, provider, provider_model)
+            }
         }
-        self.models.insert(model.id.clone(), model.clone());
-        self.persist();
-        model
+    }
+
+    pub fn register_hosted_model_result(
+        &mut self,
+        id: impl Into<String>,
+        connection_name: impl Into<String>,
+        base_url: impl Into<String>,
+        provider: impl Into<String>,
+        provider_model: impl Into<String>,
+    ) -> std::result::Result<ModelRead, String> {
+        let id = id.into();
+        let connection_name = connection_name.into();
+        let base_url = base_url.into();
+        let provider = provider.into();
+        let provider_model = provider_model.into();
+        self.validate_hosted_endpoint_for_provider(&provider, &base_url)?;
+        let model = hosted_model_read(id, connection_name, base_url, provider, provider_model);
+        let previous_model = self.models.insert(model.id.clone(), model.clone());
+        if let Err(err) = self.persist_result() {
+            if let Some(previous_model) = previous_model.clone() {
+                self.models
+                    .insert(previous_model.id.clone(), previous_model);
+            } else {
+                self.models.remove(&model.id);
+            }
+            self.record_persistence_error(err.clone());
+            return Err(err);
+        }
+        if let Err(err) = self.upsert_shipped_catalog_entry_result(&model) {
+            if let Some(previous_model) = previous_model {
+                self.models
+                    .insert(previous_model.id.clone(), previous_model);
+            } else {
+                self.models.remove(&model.id);
+            }
+            if let Err(rollback_err) = self.persist_result() {
+                let message =
+                    format!("{err}; rollback of hosted model registration failed: {rollback_err}");
+                self.record_persistence_error(message.clone());
+                return Err(message);
+            }
+            self.record_persistence_error(err.clone());
+            return Err(err);
+        }
+        Ok(model)
+    }
+
+    fn upsert_connection_and_hosted_model_result(
+        &mut self,
+        connection: ConnectionRead,
+        model: ModelRead,
+    ) -> std::result::Result<ConnectionRead, String> {
+        let connection_name = connection.name.clone();
+        let model_id = model.id.clone();
+        let stale_models = self.hosted_models_for_connection_excluding(&connection_name, &model_id);
+        for stale_model in &stale_models {
+            self.models.remove(&stale_model.id);
+        }
+        let previous_connection = self
+            .connections
+            .insert(connection_name.clone(), connection.clone());
+        let previous_model = self.models.insert(model_id.clone(), model.clone());
+        let previous_active = self.active_connection_name.clone();
+        self.active_connection_name = Some(connection_name.clone());
+        if let Err(err) = self.persist_result() {
+            self.restore_connection_model_state(
+                &connection_name,
+                previous_connection.clone(),
+                &model_id,
+                previous_model.clone(),
+                stale_models.clone(),
+                previous_active.clone(),
+            );
+            self.record_persistence_error(err.clone());
+            return Err(err);
+        }
+        if let Err(err) = self.upsert_shipped_catalog_entry_for_connection_result(
+            &model,
+            &stale_models
+                .iter()
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>(),
+        ) {
+            self.restore_connection_model_state(
+                &connection_name,
+                previous_connection,
+                &model_id,
+                previous_model,
+                stale_models,
+                previous_active,
+            );
+            if let Err(rollback_err) = self.persist_result() {
+                let message = format!(
+                    "{err}; rollback of hosted connection registration failed: {rollback_err}"
+                );
+                self.record_persistence_error(message.clone());
+                return Err(message);
+            }
+            self.record_persistence_error(err.clone());
+            return Err(err);
+        }
+        Ok(connection)
+    }
+
+    fn restore_connection_model_state(
+        &mut self,
+        connection_name: &str,
+        previous_connection: Option<ConnectionRead>,
+        model_id: &str,
+        previous_model: Option<ModelRead>,
+        stale_models: Vec<ModelRead>,
+        previous_active: Option<String>,
+    ) {
+        if let Some(previous_connection) = previous_connection {
+            self.connections
+                .insert(previous_connection.name.clone(), previous_connection);
+        } else {
+            self.connections.remove(connection_name);
+        }
+        if let Some(previous_model) = previous_model {
+            self.models
+                .insert(previous_model.id.clone(), previous_model);
+        } else {
+            self.models.remove(model_id);
+        }
+        for stale_model in stale_models {
+            self.models.insert(stale_model.id.clone(), stale_model);
+        }
+        self.active_connection_name = previous_active;
+    }
+
+    fn hosted_models_for_connection_excluding(
+        &self,
+        connection_name: &str,
+        model_id: &str,
+    ) -> Vec<ModelRead> {
+        self.models
+            .values()
+            .filter(|existing| {
+                existing.connection_name.as_deref() == Some(connection_name)
+                    && existing.id != model_id
+                    && existing.hosted_endpoint.is_some()
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn upsert_shipped_catalog_entry_for_connection_result(
+        &mut self,
+        model: &ModelRead,
+        stale_model_ids: &[String],
+    ) -> std::result::Result<(), String> {
+        self.mutate_registered_entries_result(|entries| {
+            entries.retain(|entry| {
+                entry.id != model.id && !stale_model_ids.iter().any(|id| id == &entry.id)
+            });
+            entries.push(catalog_entry_for_model(model));
+        })
+    }
+
+    fn restore_shipped_catalog_entries_for_connection_result(
+        &mut self,
+        model_id: &str,
+        previous_model: Option<&ModelRead>,
+        stale_models: &[ModelRead],
+    ) -> std::result::Result<(), String> {
+        self.mutate_registered_entries_result(|entries| {
+            entries.retain(|entry| {
+                entry.id != model_id && !stale_models.iter().any(|model| model.id == entry.id)
+            });
+            if let Some(previous_model) = previous_model {
+                entries.push(catalog_entry_for_model(previous_model));
+            }
+            for stale_model in stale_models {
+                entries.push(catalog_entry_for_model(stale_model));
+            }
+        })
+    }
+
+    fn restore_connection_model_registration_result(
+        &mut self,
+        connection_name: &str,
+        previous_connection: Option<ConnectionRead>,
+        model_id: &str,
+        previous_model: Option<ModelRead>,
+        stale_models: Vec<ModelRead>,
+        previous_active: Option<String>,
+    ) -> std::result::Result<(), String> {
+        let previous_model_entry = previous_model.clone();
+        let stale_model_entries = stale_models.clone();
+        self.restore_connection_model_state(
+            connection_name,
+            previous_connection,
+            model_id,
+            previous_model,
+            stale_models,
+            previous_active,
+        );
+        self.persist_result()?;
+        self.restore_shipped_catalog_entries_for_connection_result(
+            model_id,
+            previous_model_entry.as_ref(),
+            &stale_model_entries,
+        )
+    }
+
+    fn restore_connection_model_registration_and_status_result(
+        &mut self,
+        connection_name: &str,
+        rollback: ConnectionRegistrationRollback,
+    ) -> std::result::Result<(), String> {
+        let mut failures = Vec::new();
+        if let Err(err) = self.restore_connection_model_registration_result(
+            connection_name,
+            rollback.previous_connection,
+            &rollback.model_id,
+            rollback.previous_model,
+            rollback.stale_models,
+            rollback.previous_active,
+        ) {
+            failures.push(err);
+        }
+        if let Err(err) =
+            self.restore_connection_selftest_status(connection_name, &rollback.previous_status)
+        {
+            failures.push(err);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    pub fn connect_hosted_env_var_result(
+        &mut self,
+        request: HostedModelConnectionRequest,
+        env_var: impl Into<String>,
+    ) -> std::result::Result<ConnectionRead, String> {
+        self.connect_hosted_credential_reference_result(
+            request,
+            CredentialReference::env_var(env_var.into()),
+        )
+    }
+
+    pub fn connect_hosted_no_auth_result(
+        &mut self,
+        request: HostedModelConnectionRequest,
+    ) -> std::result::Result<ConnectionRead, String> {
+        self.connect_hosted_credential_reference_result(request, CredentialReference::no_auth())
+    }
+
+    fn connect_hosted_credential_reference_result(
+        &mut self,
+        request: HostedModelConnectionRequest,
+        credential_reference: CredentialReference,
+    ) -> std::result::Result<ConnectionRead, String> {
+        self.validate_hosted_endpoint_for_provider(&request.provider, &request.base_url)?;
+        let connection_name = request.connection_name;
+        let model_id = request.model_id;
+        let previous_connection = self.connections.get(&connection_name).cloned();
+        let previous_model = self.models.get(&model_id).cloned();
+        let previous_stale_models =
+            self.hosted_models_for_connection_excluding(&connection_name, &model_id);
+        let previous_active = self.active_connection_name.clone();
+        let previous_status = self.connection_selftest_status_snapshot(&connection_name);
+        let rollback = ConnectionRegistrationRollback {
+            previous_connection: previous_connection.clone(),
+            model_id: model_id.clone(),
+            previous_model: previous_model.clone(),
+            stale_models: previous_stale_models.clone(),
+            previous_active: previous_active.clone(),
+            previous_status,
+        };
+        let previous_secret_ref = previous_connection.as_ref().and_then(|connection| {
+            match &connection.credential_reference.source {
+                CredentialSource::StoredSecret { secret_ref } => Some(secret_ref.clone()),
+                _ => None,
+            }
+        });
+        let (consent_recorded, spend_owner) = request
+            .consent_owner
+            .map(|owner| (true, owner))
+            .unwrap_or_else(|| (false, "unknown".to_string()));
+        let connection = ConnectionRead {
+            name: connection_name.clone(),
+            credential_reference,
+            exposed_secret: None,
+            consent_recorded,
+            spend_owner,
+        };
+        let model = hosted_model_read(
+            model_id.clone(),
+            connection_name.clone(),
+            request.base_url,
+            request.provider,
+            request.provider_model,
+        );
+        let read = self.upsert_connection_and_hosted_model_result(connection, model)?;
+        if let Err(err) = self.remove_connection_selftest_status(&connection_name) {
+            let message = match self.restore_connection_model_registration_and_status_result(
+                &connection_name,
+                rollback.clone(),
+            ) {
+                Ok(()) => err.clone(),
+                Err(rollback_err) => {
+                    format!(
+                        "{err}; rollback after selftest status cleanup failure failed: {rollback_err}"
+                    )
+                }
+            };
+            self.record_persistence_error(message.clone());
+            return Err(message);
+        }
+        if let Some(secret_ref) = previous_secret_ref
+            && let Err(err) = self.remove_stored_secret_ref(&secret_ref)
+        {
+            let message = match self
+                .restore_connection_model_registration_and_status_result(&connection_name, rollback)
+            {
+                Ok(()) => err.clone(),
+                Err(rollback_err) => {
+                    format!(
+                        "{err}; rollback after stored-secret cleanup failure failed: {rollback_err}"
+                    )
+                }
+            };
+            self.record_persistence_error(message.clone());
+            return Err(message);
+        }
+        Ok(read)
+    }
+
+    pub fn connect_hosted_stored_secret_result(
+        &mut self,
+        request: HostedModelConnectionRequest,
+        principal: Principal,
+        config: &mut PrincipalAwareConfig,
+        secret: impl Into<String>,
+    ) -> std::result::Result<ConnectionRead, String> {
+        self.validate_hosted_endpoint_for_provider(&request.provider, &request.base_url)?;
+        let connection_name = request.connection_name;
+        let model_id = request.model_id;
+        let previous_connection = self.connections.get(&connection_name).cloned();
+        let previous_model = self.models.get(&model_id).cloned();
+        let previous_stale_models =
+            self.hosted_models_for_connection_excluding(&connection_name, &model_id);
+        let previous_active = self.active_connection_name.clone();
+        let previous_status = self.connection_selftest_status_snapshot(&connection_name);
+        let rollback = ConnectionRegistrationRollback {
+            previous_connection: previous_connection.clone(),
+            model_id: model_id.clone(),
+            previous_model: previous_model.clone(),
+            stale_models: previous_stale_models.clone(),
+            previous_active: previous_active.clone(),
+            previous_status,
+        };
+        let secret_ref = format!("connection:{connection_name}:api_key");
+        let secret = secret.into();
+        let principal_text = principal.encode();
+        let secret_key = self.local_secret_key()?;
+        let cipher_hex = encode_local_secret(&secret_key, &principal_text, &secret_ref, &secret)?;
+        let (consent_recorded, spend_owner) = request
+            .consent_owner
+            .map(|owner| (true, owner))
+            .unwrap_or_else(|| (false, "unknown".to_string()));
+        let connection = ConnectionRead {
+            name: connection_name.clone(),
+            credential_reference: CredentialReference::sealed_stored_secret(
+                secret_ref.clone(),
+                cipher_hex,
+            ),
+            exposed_secret: None,
+            consent_recorded,
+            spend_owner,
+        };
+        let model = hosted_model_read(
+            model_id.clone(),
+            connection_name.clone(),
+            request.base_url,
+            request.provider,
+            request.provider_model,
+        );
+        let read = self.upsert_connection_and_hosted_model_result(connection, model)?;
+        if let Err(err) = self.remove_connection_selftest_status(&connection_name) {
+            let message = match self.restore_connection_model_registration_and_status_result(
+                &connection_name,
+                rollback.clone(),
+            ) {
+                Ok(()) => err.clone(),
+                Err(rollback_err) => {
+                    format!(
+                        "{err}; rollback after selftest status cleanup failure failed: {rollback_err}"
+                    )
+                }
+            };
+            self.record_persistence_error(message.clone());
+            return Err(message);
+        }
+        if let Some(previous_secret_ref) = previous_connection.as_ref().and_then(|connection| {
+            match &connection.credential_reference.source {
+                CredentialSource::StoredSecret { secret_ref } => Some(secret_ref.clone()),
+                _ => None,
+            }
+        }) && let Err(err) = self.remove_stored_secret_ref(&previous_secret_ref)
+        {
+            let message = match self
+                .restore_connection_model_registration_and_status_result(&connection_name, rollback)
+            {
+                Ok(()) => err.clone(),
+                Err(rollback_err) => {
+                    format!(
+                        "{err}; rollback after legacy stored-secret cleanup failure failed: {rollback_err}"
+                    )
+                }
+            };
+            self.record_persistence_error(message.clone());
+            return Err(message);
+        }
+        config.insert_stored_secret(principal, secret_ref, secret);
+        Ok(read)
     }
 
     pub fn register_local_model(
@@ -2869,6 +4143,17 @@ impl ModelConnectionCatalog {
             .get(id)
             .cloned()
             .or_else(|| self.shipped_model(id))
+            .or_else(|| {
+                self.models
+                    .values()
+                    .find(|model| {
+                        model
+                            .hosted_endpoint
+                            .as_ref()
+                            .is_some_and(|endpoint| endpoint.provider_model == id)
+                    })
+                    .cloned()
+            })
     }
 
     pub fn list_models(&self) -> Vec<ModelRead> {
@@ -2889,11 +4174,31 @@ impl ModelConnectionCatalog {
     }
 
     pub fn record_consent(&mut self, connection_name: &str, spend_owner: impl Into<String>) {
+        if let Err(err) = self.record_consent_result(connection_name, spend_owner) {
+            self.record_persistence_error(err);
+        }
+    }
+
+    pub fn record_consent_result(
+        &mut self,
+        connection_name: &str,
+        spend_owner: impl Into<String>,
+    ) -> std::result::Result<(), String> {
+        let spend_owner = spend_owner.into();
+        let Some(previous_connection) = self.connections.get(connection_name).cloned() else {
+            return Err(format!("connection {connection_name} not found"));
+        };
         if let Some(connection) = self.connections.get_mut(connection_name) {
             connection.consent_recorded = true;
-            connection.spend_owner = spend_owner.into();
-            self.persist();
+            connection.spend_owner = spend_owner;
         }
+        if let Err(err) = self.persist_result() {
+            self.connections
+                .insert(previous_connection.name.clone(), previous_connection);
+            self.record_persistence_error(err.clone());
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn revoke_consent(&mut self, connection_name: &str) {
@@ -2904,14 +4209,44 @@ impl ModelConnectionCatalog {
     }
 
     pub fn status_for_context(&self, context_id: ContextId) -> ConnectionStatus {
-        let model_id = self.context_models.get(&context_id).cloned();
+        let model_id = self
+            .context_models
+            .get(&context_id)
+            .cloned()
+            .or_else(|| self.active_model_id());
+        let model = model_id.as_ref().and_then(|id| self.read_model(id));
         let connection_name = model_id
             .as_ref()
-            .and_then(|id| self.read_model(id))
+            .and_then(|_| model.clone())
             .and_then(|model| model.connection_name.clone());
         let connection = connection_name
             .as_ref()
             .and_then(|name| self.connections.get(name));
+        let hosted = model
+            .as_ref()
+            .and_then(|model| model.hosted_endpoint.as_ref());
+        let last_error = connection_name
+            .as_ref()
+            .and_then(|name| self.connection_last_error(name));
+        let state = if last_error.is_some() {
+            "degraded"
+        } else if connection.is_some() {
+            "ready"
+        } else {
+            "not_connected"
+        };
+        let condition = if connection.is_none() {
+            Some("not_connected".to_string())
+        } else if last_error.is_some() {
+            last_error.as_ref().map(|error| error.condition.clone())
+        } else {
+            None
+        };
+        let bucket = if connection.is_none() {
+            Some("not_connected".to_string())
+        } else {
+            last_error.as_ref().map(|error| error.bucket.clone())
+        };
         ConnectionStatus {
             context_id,
             connection_name,
@@ -2921,7 +4256,79 @@ impl ModelConnectionCatalog {
                 .filter(|connection| connection.consent_recorded)
                 .map(|connection| connection.spend_owner.clone()),
             degraded_marker: None,
+            state: state.to_string(),
+            condition,
+            bucket,
+            provider: hosted.map(|endpoint| endpoint.provider.clone()),
+            endpoint: hosted.map(|endpoint| endpoint.base_url.clone()),
+            provider_model: hosted.map(|endpoint| endpoint.provider_model.clone()),
+            degraded: last_error.is_some(),
+            last_error,
         }
+    }
+
+    pub fn model_for_connection(&self, connection_name: &str) -> Option<ModelRead> {
+        if let Some(model) = self.models.get(connection_name)
+            && model.connection_name.as_deref() == Some(connection_name)
+        {
+            return Some(model.clone());
+        }
+        self.list_models()
+            .into_iter()
+            .find(|model| model.connection_name.as_deref() == Some(connection_name))
+    }
+
+    fn active_model_id(&self) -> Option<String> {
+        let active = self.active_connection_name.as_deref()?;
+        self.model_for_connection(active).map(|model| model.id)
+    }
+
+    pub fn record_connection_last_error_result(
+        &self,
+        connection_name: &str,
+        condition: &str,
+        bucket: &str,
+        message: &str,
+    ) -> std::result::Result<(), String> {
+        self.write_connection_last_error(connection_name, condition, bucket, message)
+    }
+
+    pub fn clear_connection_last_error_result(
+        &self,
+        connection_name: &str,
+    ) -> std::result::Result<(), String> {
+        self.remove_connection_last_error(connection_name)
+    }
+
+    pub fn record_connection_selftest_success_result(
+        &self,
+        connection_name: &str,
+        provider: &str,
+    ) -> std::result::Result<(), String> {
+        self.write_connection_selftest_success(connection_name, provider)
+    }
+
+    pub fn connection_selftest_passed(&self, connection_name: &str) -> bool {
+        let proof_target = self.connection_selftest_success_target(connection_name);
+        let Ok(file) = self.connection_status_file_result() else {
+            return false;
+        };
+        file.successes
+            .into_iter()
+            .any(|success| success_matches_connection(&success, connection_name, &proof_target))
+    }
+
+    pub fn connection_has_selftest_success_record(&self, connection_name: &str) -> bool {
+        let Ok(file) = self.connection_status_file_result() else {
+            return false;
+        };
+        file.successes
+            .into_iter()
+            .any(|success| success.connection_name == connection_name)
+    }
+
+    pub fn last_error_for_connection(&self, connection_name: &str) -> Option<ConnectionLastError> {
+        self.connection_last_error(connection_name)
     }
 
     pub fn resolve_credential(
@@ -2931,22 +4338,341 @@ impl ModelConnectionCatalog {
         config: &mut PrincipalAwareConfig,
     ) -> Option<CredentialResolution> {
         let connection = self.connections.get(connection_name)?.clone();
+        if matches!(
+            connection.credential_reference.source,
+            CredentialSource::StoredSecret { .. }
+        ) && !connection.consent_recorded
+        {
+            return None;
+        }
         self.resolved_connection_log
             .push(connection_name.to_string());
         let (env_var, resolved_secret) = match &connection.credential_reference.source {
+            CredentialSource::NoAuth => (String::new(), None),
             CredentialSource::EnvVar { env_var } => {
                 (env_var.clone(), config.resolve(principal, env_var))
             }
-            CredentialSource::StoredSecret { secret_ref } => (
-                String::new(),
-                config.resolve_stored_secret(principal, secret_ref),
-            ),
+            CredentialSource::StoredSecret { secret_ref } => {
+                let sealed_secret = connection
+                    .credential_reference
+                    .sealed_secret_cipher_hex()
+                    .and_then(|cipher_hex| {
+                        self.decode_persisted_secret(principal, secret_ref, cipher_hex)
+                    });
+                (
+                    String::new(),
+                    config
+                        .resolve_stored_secret(principal, secret_ref)
+                        .or(sealed_secret)
+                        .or_else(|| self.resolve_persisted_secret(principal, secret_ref)),
+                )
+            }
             CredentialSource::HostSession { .. } => (String::new(), None),
         };
         Some(CredentialResolution {
             connection_name: connection.name,
             env_var,
             secret: connection.exposed_secret.or(resolved_secret),
+        })
+    }
+
+    fn resolve_persisted_secret(&self, principal: &Principal, secret_ref: &str) -> Option<String> {
+        let path = self.secret_store_path()?;
+        let text = fs::read_to_string(path).ok()?;
+        let store = toml::from_str::<PersistedSecretStore>(&text).ok()?;
+        let principal = principal.encode();
+        store
+            .secrets
+            .into_iter()
+            .find(|entry| entry.principal == principal && entry.secret_ref == secret_ref)
+            .and_then(|entry| {
+                self.decode_persisted_secret_encoded_principal(
+                    &principal,
+                    secret_ref,
+                    &entry.cipher_hex,
+                )
+            })
+    }
+
+    fn decode_persisted_secret(
+        &self,
+        principal: &Principal,
+        secret_ref: &str,
+        cipher_hex: &str,
+    ) -> Option<String> {
+        let principal = principal.encode();
+        self.decode_persisted_secret_encoded_principal(&principal, secret_ref, cipher_hex)
+    }
+
+    fn decode_persisted_secret_encoded_principal(
+        &self,
+        principal: &str,
+        secret_ref: &str,
+        cipher_hex: &str,
+    ) -> Option<String> {
+        let key = self.local_secret_key().ok()?;
+        decode_local_secret(&key, principal, secret_ref, cipher_hex)
+    }
+
+    fn connection_status_file_result(
+        &self,
+    ) -> std::result::Result<PersistedConnectionStatusFile, String> {
+        let Some(path) = self.status_store_path() else {
+            return Ok(PersistedConnectionStatusFile::default());
+        };
+        if !path.exists() {
+            return Ok(PersistedConnectionStatusFile::default());
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|err| format!("read status store {} failed: {err}", path.display()))?;
+        toml::from_str::<PersistedConnectionStatusFile>(&text)
+            .map_err(|err| format!("parse status store {} failed: {err}", path.display()))
+    }
+
+    fn connection_status_file_or_record_error(&self) -> PersistedConnectionStatusFile {
+        match self.connection_status_file_result() {
+            Ok(file) => file,
+            Err(err) => {
+                self.record_persistence_error(err);
+                PersistedConnectionStatusFile::default()
+            }
+        }
+    }
+
+    fn connection_selftest_status_snapshot(
+        &self,
+        connection_name: &str,
+    ) -> ConnectionSelftestStatusSnapshot {
+        let file = self.connection_status_file_or_record_error();
+        ConnectionSelftestStatusSnapshot {
+            errors: file
+                .errors
+                .into_iter()
+                .filter(|error| error.connection_name == connection_name)
+                .collect(),
+            successes: file
+                .successes
+                .into_iter()
+                .filter(|success| success.connection_name == connection_name)
+                .collect(),
+        }
+    }
+
+    fn connection_last_error(&self, connection_name: &str) -> Option<ConnectionLastError> {
+        match self.connection_status_file_result() {
+            Ok(file) => file
+                .errors
+                .into_iter()
+                .find(|error| error.connection_name == connection_name)
+                .map(|error| ConnectionLastError {
+                    condition: error.condition,
+                    bucket: error.bucket,
+                    message: error.message,
+                }),
+            Err(err) => Some(ConnectionLastError {
+                condition: "status_store_unreadable".to_string(),
+                bucket: "config".to_string(),
+                message: err,
+            }),
+        }
+    }
+
+    fn write_connection_last_error(
+        &self,
+        connection_name: &str,
+        condition: &str,
+        bucket: &str,
+        message: &str,
+    ) -> std::result::Result<(), String> {
+        let Some(path) = self.status_store_path() else {
+            return Ok(());
+        };
+        mutate_status_store(&path, |file| {
+            file.errors
+                .retain(|error| error.connection_name != connection_name);
+            file.successes
+                .retain(|success| success.connection_name != connection_name);
+            file.errors.push(PersistedConnectionError {
+                connection_name: connection_name.to_string(),
+                condition: condition.to_string(),
+                bucket: bucket.to_string(),
+                message: message.to_string(),
+            });
+            true
+        })
+    }
+
+    fn remove_connection_last_error(
+        &self,
+        connection_name: &str,
+    ) -> std::result::Result<(), String> {
+        let Some(path) = self.status_store_path() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        mutate_status_store(&path, |file| {
+            let original_len = file.errors.len();
+            file.errors
+                .retain(|error| error.connection_name != connection_name);
+            file.errors.len() != original_len
+        })
+    }
+
+    fn write_connection_selftest_success(
+        &self,
+        connection_name: &str,
+        provider: &str,
+    ) -> std::result::Result<(), String> {
+        let Some(path) = self.status_store_path() else {
+            return Ok(());
+        };
+        let proof_target = self.connection_selftest_success_target(connection_name);
+        mutate_status_store(&path, |file| {
+            file.errors
+                .retain(|error| error.connection_name != connection_name);
+            file.successes
+                .retain(|success| success.connection_name != connection_name);
+            file.successes.push(PersistedConnectionSuccess {
+                connection_name: connection_name.to_string(),
+                provider: provider.to_string(),
+                endpoint: proof_target
+                    .as_ref()
+                    .and_then(|target| target.endpoint.clone()),
+                provider_model: proof_target
+                    .as_ref()
+                    .and_then(|target| target.provider_model.clone()),
+                credential_fingerprint: proof_target
+                    .as_ref()
+                    .and_then(|target| target.credential_fingerprint.clone()),
+                provider_config_fingerprint: proof_target
+                    .as_ref()
+                    .and_then(|target| target.provider_config_fingerprint.clone()),
+            });
+            true
+        })
+    }
+
+    fn connection_selftest_success_target(
+        &self,
+        connection_name: &str,
+    ) -> Option<ConnectionSelftestSuccessTarget> {
+        let connection = self.connections.get(connection_name)?;
+        match &connection.credential_reference.source {
+            CredentialSource::HostSession { provider, .. } => {
+                Some(ConnectionSelftestSuccessTarget {
+                    provider: provider.clone(),
+                    endpoint: None,
+                    provider_model: None,
+                    credential_fingerprint: credential_reference_fingerprint(connection),
+                    provider_config_fingerprint: None,
+                })
+            }
+            CredentialSource::NoAuth
+            | CredentialSource::EnvVar { .. }
+            | CredentialSource::StoredSecret { .. } => {
+                let model = self.model_for_connection(connection_name)?;
+                let provider_config = self.provider_invocation_config(&model)?;
+                let credential_fingerprint =
+                    self.connection_credential_fingerprint(connection, &provider_config)?;
+                Some(ConnectionSelftestSuccessTarget {
+                    provider: provider_config.provider.clone(),
+                    endpoint: Some(provider_config.base_url.clone()),
+                    provider_model: Some(provider_config.provider_model.clone()),
+                    credential_fingerprint: Some(credential_fingerprint),
+                    provider_config_fingerprint: Some(provider_config_fingerprint(
+                        &provider_config,
+                    )),
+                })
+            }
+        }
+    }
+
+    fn connection_credential_fingerprint(
+        &self,
+        connection: &ConnectionRead,
+        provider_config: &ProviderInvocationConfig,
+    ) -> Option<String> {
+        match &connection.credential_reference.source {
+            CredentialSource::NoAuth => credential_reference_fingerprint(connection),
+            CredentialSource::EnvVar { env_var } => {
+                if provider_config.auth_scheme == "none" {
+                    return credential_reference_fingerprint(connection);
+                }
+                let secret = std::env::var(env_var).ok()?;
+                let secret = secret.trim();
+                if secret.is_empty() {
+                    return None;
+                }
+                let secret_fingerprint = live_secret_value_fingerprint("env", env_var, secret);
+                credential_reference_fingerprint_with_parts(
+                    connection,
+                    &[("live_secret", secret_fingerprint)],
+                )
+            }
+            CredentialSource::StoredSecret { .. } => {
+                let Some(cipher_hex) = connection.credential_reference.sealed_secret_cipher_hex()
+                else {
+                    return credential_reference_fingerprint(connection);
+                };
+                let key_fingerprint = self.existing_local_secret_key_fingerprint()?;
+                credential_reference_fingerprint_with_parts(
+                    connection,
+                    &[
+                        ("sealed_cipher", cipher_hex.to_string()),
+                        ("local_key", key_fingerprint),
+                    ],
+                )
+            }
+            CredentialSource::HostSession { .. } => credential_reference_fingerprint(connection),
+        }
+    }
+
+    fn remove_connection_selftest_status(
+        &self,
+        connection_name: &str,
+    ) -> std::result::Result<(), String> {
+        let Some(path) = self.status_store_path() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+        mutate_status_store(&path, |file| {
+            let original_error_len = file.errors.len();
+            let original_success_len = file.successes.len();
+            file.errors
+                .retain(|error| error.connection_name != connection_name);
+            file.successes
+                .retain(|success| success.connection_name != connection_name);
+            file.errors.len() != original_error_len || file.successes.len() != original_success_len
+        })
+    }
+
+    fn restore_connection_selftest_status(
+        &self,
+        connection_name: &str,
+        snapshot: &ConnectionSelftestStatusSnapshot,
+    ) -> std::result::Result<(), String> {
+        let Some(path) = self.status_store_path() else {
+            return Ok(());
+        };
+        if !path.exists() && snapshot.errors.is_empty() && snapshot.successes.is_empty() {
+            return Ok(());
+        }
+        mutate_status_store(&path, |file| {
+            let original_error_len = file.errors.len();
+            let original_success_len = file.successes.len();
+            file.errors
+                .retain(|error| error.connection_name != connection_name);
+            file.successes
+                .retain(|success| success.connection_name != connection_name);
+            let removed_existing = file.errors.len() != original_error_len
+                || file.successes.len() != original_success_len;
+            file.errors.extend(snapshot.errors.clone());
+            file.successes.extend(snapshot.successes.clone());
+            removed_existing || !snapshot.errors.is_empty() || !snapshot.successes.is_empty()
         })
     }
 
@@ -3124,6 +4850,100 @@ impl ModelConnectionCatalog {
             catalog_authorized: true,
         })
     }
+
+    fn provider_invocation_config(&self, model: &ModelRead) -> Option<ProviderInvocationConfig> {
+        let endpoint = model.hosted_endpoint.as_ref()?;
+        let specs = match try_load_provider_specs(&self.root, &[]) {
+            Ok(specs) => specs,
+            Err(err) => {
+                self.record_persistence_error(err.message());
+                return None;
+            }
+        };
+        let Some(spec) = specs.providers.get(&endpoint.provider) else {
+            self.record_persistence_error(format!(
+                "provider {} has no provider spec row",
+                endpoint.provider
+            ));
+            return None;
+        };
+        if spec.transport != ProviderTransport::Http {
+            return None;
+        }
+        let Some(auth_scheme) = spec.auth_scheme else {
+            self.record_persistence_error(format!(
+                "provider {} missing HTTP auth scheme",
+                endpoint.provider
+            ));
+            return None;
+        };
+        let Some(dialect) = spec.dialect else {
+            self.record_persistence_error(format!(
+                "provider {} missing HTTP dialect",
+                endpoint.provider
+            ));
+            return None;
+        };
+        if spec.reply_path.trim().is_empty() {
+            self.record_persistence_error(format!(
+                "provider {} missing HTTP reply path",
+                endpoint.provider
+            ));
+            return None;
+        }
+        if spec.timeout_ms == 0 {
+            self.record_persistence_error(format!(
+                "provider {} has invalid HTTP timeout",
+                endpoint.provider
+            ));
+            return None;
+        }
+        let base_url = endpoint.base_url.clone();
+        if let Err(err) =
+            validate_hosted_endpoint_base_url_for_auth(&endpoint.provider, &base_url, auth_scheme)
+        {
+            self.record_persistence_error(err);
+            return None;
+        }
+        let reply_path = spec.reply_path.clone();
+        let timeout_ms = spec.timeout_ms;
+        Some(ProviderInvocationConfig {
+            provider: endpoint.provider.clone(),
+            provider_model: endpoint.provider_model.clone(),
+            base_url,
+            request_path: provider_request_path(dialect).to_string(),
+            auth_scheme: http_auth_scheme_name(auth_scheme).to_string(),
+            dialect: provider_dialect_name(dialect).to_string(),
+            reply_path,
+            timeout_ms,
+            transport: "http".to_string(),
+        })
+    }
+
+    fn validate_hosted_endpoint_for_provider(
+        &self,
+        provider: &str,
+        base_url: &str,
+    ) -> std::result::Result<(), String> {
+        let specs = try_load_provider_specs(&self.root, &[]).map_err(|err| err.message())?;
+        let spec = specs
+            .providers
+            .get(provider)
+            .ok_or_else(|| format!("provider {provider} has no provider spec row"))?;
+        if spec.transport != ProviderTransport::Http {
+            return Err(format!("provider {provider} is not an HTTP transport row"));
+        }
+        let Some(auth_scheme) = spec.auth_scheme else {
+            return Err(format!("provider {provider} missing HTTP auth scheme"));
+        };
+        if spec.dialect.is_none() {
+            return Err(format!("provider {provider} missing HTTP dialect"));
+        }
+        if spec.reply_path.trim().is_empty() {
+            return Err(format!("provider {provider} missing HTTP reply path"));
+        }
+        validate_hosted_endpoint_base_url_for_auth(provider, base_url, auth_scheme)
+    }
 }
 
 #[derive(Debug)]
@@ -3211,11 +5031,6 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
         let Some(connection) = self.catalog.connections.get(connection_name).cloned() else {
             return Err(ModelProofError::NoHostSession);
         };
-        let CredentialSource::HostSession { provider, .. } =
-            connection.credential_reference.source.clone()
-        else {
-            return Err(ModelProofError::NoHostSession);
-        };
         let resolution = self.catalog.resolve_credential_for_paid_call(
             connection_name,
             &self.principal,
@@ -3235,26 +5050,71 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
             input: prompt.to_string(),
             paid: true,
         };
+        if let CredentialSource::HostSession { provider, .. } =
+            connection.credential_reference.source.clone()
+        {
+            let invocation = unsafe {
+                ModelInvocation::from_authorized_runtime_parts(AuthorizedModelInvocationParts {
+                    request,
+                    resolved_connection: Some(resolution.connection_name.clone()),
+                    resolved_credential: resolution.secret,
+                    hosted_endpoint: None,
+                    provider_config: None,
+                    cache_path: None,
+                    local_artifacts: Vec::new(),
+                    local_catalog_authorized: false,
+                })
+            };
+            let client = HostSessionLlmClient {
+                provider: provider.clone(),
+                catalog_root: self.catalog.root.clone(),
+                progress_to_stdout,
+            };
+            let reply = client.prove(&invocation)?;
+            return Ok(ModelProof {
+                connection_name: resolution.connection_name,
+                provider,
+                reply: reply.phrasing,
+            });
+        }
+        let Some(model) = self.catalog.model_for_connection(connection_name) else {
+            return Err(ModelProofError::NoHostSession);
+        };
+        let provider_config = self
+            .catalog
+            .provider_invocation_config(&model)
+            .ok_or(ModelProofError::NoHostSession)?;
+        let hosted_endpoint = model
+            .hosted_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.base_url.clone());
         let invocation = unsafe {
-            ModelInvocation::from_authorized_runtime_parts(
+            ModelInvocation::from_authorized_runtime_parts(AuthorizedModelInvocationParts {
                 request,
-                Some(resolution.connection_name.clone()),
-                resolution.secret,
-                None,
-                None,
-                Vec::new(),
-                false,
-            )
+                resolved_connection: Some(resolution.connection_name.clone()),
+                resolved_credential: resolution.secret,
+                hosted_endpoint,
+                provider_config: Some(provider_config.clone()),
+                cache_path: None,
+                local_artifacts: Vec::new(),
+                local_catalog_authorized: false,
+            })
         };
-        let client = HostSessionLlmClient {
-            provider: provider.clone(),
-            catalog_root: self.catalog.root.clone(),
-            progress_to_stdout,
-        };
-        let reply = client.prove(&invocation)?;
+        let reply = HttpChatCompletionsLlmClient
+            .understand_native(&invocation)
+            .map_err(|err| ModelProofError::LiveCallFailed {
+                bucket: proof_bucket_from_failure(failure_bucket_from_error(&err)).to_string(),
+                message: format!("{err}"),
+            })?;
+        if reply.malformed || reply.phrasing.trim().is_empty() {
+            return Err(ModelProofError::ReplyFormat {
+                path: provider_config.reply_path,
+                framing: "json".to_string(),
+            });
+        }
         Ok(ModelProof {
             connection_name: resolution.connection_name,
-            provider,
+            provider: provider_config.provider,
             reply: reply.phrasing,
         })
     }
@@ -3268,12 +5128,14 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                 model_id,
                 invocation,
             } => {
-                let reply = if let Some(client) = self.clients.get(&model_id).cloned() {
+                let reply = if invocation_uses_http_transport(&invocation) {
+                    HttpChatCompletionsLlmClient.understand(&invocation).await
+                } else if let Some(client) = self.clients.get(&model_id).cloned() {
                     client.understand(&invocation).await
                 } else if let Some(native) = self.native_fallback.clone() {
                     native.understand(&invocation).await
                 } else {
-                    return Ok(degraded_outcome(&request));
+                    return Ok(degraded_outcome(&request, FailureBucket::NotConnected));
                 };
                 match reply {
                     Ok(reply) => {
@@ -3281,7 +5143,7 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                     }
                     Err(err) => {
                         self.record_provider_attempt_failure(&model_id, &invocation, &err);
-                        Ok(degraded_outcome(&request))
+                        Ok(degraded_outcome(&request, failure_bucket_from_error(&err)))
                     }
                 }
             }
@@ -3299,12 +5161,14 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                 model_id,
                 invocation,
             } => {
-                let reply = if let Some(client) = self.clients.get(&model_id).cloned() {
+                let reply = if invocation_uses_http_transport(&invocation) {
+                    HttpChatCompletionsLlmClient.understand_native(&invocation)
+                } else if let Some(client) = self.clients.get(&model_id).cloned() {
                     client.understand_native(&invocation)
                 } else if let Some(native) = self.native_fallback.clone() {
                     native.understand_native(&invocation)
                 } else {
-                    return Ok(degraded_outcome(&request));
+                    return Ok(degraded_outcome(&request, FailureBucket::NotConnected));
                 };
                 match reply {
                     Ok(reply) => {
@@ -3312,7 +5176,7 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                     }
                     Err(err) => {
                         self.record_provider_attempt_failure(&model_id, &invocation, &err);
-                        Ok(degraded_outcome(&request))
+                        Ok(degraded_outcome(&request, failure_bucket_from_error(&err)))
                     }
                 }
             }
@@ -3329,25 +5193,42 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
             .context_models
             .get(&request.context_id)
             .cloned()
+            .or_else(|| self.catalog.active_model_id())
             .or_else(|| self.default_model_id.clone());
         let Some(model_id) = model_id else {
-            return Ok(PreparedUnderstanding::Degraded(degraded_outcome(request)));
+            return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
+                request,
+                FailureBucket::NotConnected,
+            )));
         };
         let mut resolved_connection = None;
         let mut resolved_credential = None;
         let mut local_artifacts = Vec::new();
         let mut local_catalog_authorized = false;
         let Some(model) = self.catalog.read_model(&model_id) else {
-            return Ok(PreparedUnderstanding::Degraded(degraded_outcome(request)));
+            return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
+                request,
+                FailureBucket::NotConnected,
+            )));
         };
         if model.kind != ModelKind::LlmClient {
-            return Ok(PreparedUnderstanding::Degraded(degraded_outcome(request)));
+            return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
+                request,
+                FailureBucket::NotConnected,
+            )));
         }
         let mut cache_path = model.cache_path.clone();
         let hosted_endpoint = model
             .hosted_endpoint
             .as_ref()
             .map(|endpoint| endpoint.base_url.clone());
+        let provider_config = self.catalog.provider_invocation_config(&model);
+        if hosted_endpoint.is_some() && provider_config.is_none() {
+            return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
+                request,
+                FailureBucket::Unreachable,
+            )));
+        }
         if cache_path.is_some() {
             match self.catalog.declared_local_model(&model_id, &model) {
                 Ok(Some(local)) => {
@@ -3358,11 +5239,17 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                 Ok(None) => {}
                 Err(err) => {
                     self.catalog.record_persistence_error(err);
-                    return Ok(PreparedUnderstanding::Degraded(degraded_outcome(request)));
+                    return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
+                        request,
+                        FailureBucket::Unreachable,
+                    )));
                 }
             };
             if local_artifacts.is_empty() {
-                return Ok(PreparedUnderstanding::Degraded(degraded_outcome(request)));
+                return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
+                    request,
+                    FailureBucket::NotConnected,
+                )));
             }
         } else {
             if let Some(connection_name) = model.connection_name.as_deref() {
@@ -3373,7 +5260,10 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                     });
                 };
                 if !connection.consent_recorded {
-                    return Ok(PreparedUnderstanding::Degraded(degraded_outcome(request)));
+                    return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
+                        request,
+                        FailureBucket::Unauthorized,
+                    )));
                 }
             }
             if let Some(connection_name) = model.connection_name.as_deref() {
@@ -3413,7 +5303,10 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                         });
                     }
                     MissingConnectionOutcome::Degraded { .. } => {
-                        return Ok(PreparedUnderstanding::Degraded(degraded_outcome(request)));
+                        return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
+                            request,
+                            FailureBucket::NotConnected,
+                        )));
                     }
                 }
             }
@@ -3424,15 +5317,18 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
             // SAFETY: this path has either passed the named-connection consent
             // check above or the local catalog/cache proof branch.
             invocation: unsafe {
-                ModelInvocation::from_authorized_runtime_parts(
-                    request.clone(),
-                    resolved_connection,
-                    resolved_credential,
-                    hosted_endpoint,
-                    cache_path,
-                    local_artifacts,
-                    local_catalog_authorized,
-                )
+                Box::new(ModelInvocation::from_authorized_runtime_parts(
+                    AuthorizedModelInvocationParts {
+                        request: request.clone(),
+                        resolved_connection,
+                        resolved_credential,
+                        hosted_endpoint,
+                        provider_config,
+                        cache_path,
+                        local_artifacts,
+                        local_catalog_authorized,
+                    },
+                ))
             },
         })
     }
@@ -3446,7 +5342,7 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
     ) -> UnderstandingOutcome {
         if reply.malformed {
             self.record_provider_diagnostic(model_id, invocation, "malformed provider reply");
-            degraded_outcome(request)
+            degraded_outcome(request, FailureBucket::ReplyMalformed)
         } else {
             success_outcome(request, invocation, reply)
         }
@@ -3487,9 +5383,16 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
 enum PreparedUnderstanding {
     Invoke {
         model_id: String,
-        invocation: ModelInvocation,
+        invocation: Box<ModelInvocation>,
     },
     Degraded(UnderstandingOutcome),
+}
+
+fn invocation_uses_http_transport(invocation: &ModelInvocation) -> bool {
+    invocation
+        .provider_config
+        .as_ref()
+        .is_some_and(|config| config.transport == "http")
 }
 
 fn success_outcome(
@@ -3657,60 +5560,196 @@ fn understand_hosted(
     if invocation.resolved_connection.is_none() {
         return Err(CgError::Engine("no hosted connection resolved".to_string()));
     }
-    let endpoint = invocation.hosted_endpoint.as_deref().ok_or_else(|| {
-        CgError::Engine("hosted llm endpoint is not configured for this model".to_string())
+    let provider_config = invocation.provider_config.as_ref().ok_or_else(|| {
+        provider_failure(
+            FailureBucket::NotConnected,
+            "hosted llm endpoint is not configured for this model",
+        )
     })?;
-    let credential = invocation.resolved_credential.as_deref().ok_or_else(|| {
-        CgError::Engine("hosted llm credential did not resolve for this principal".to_string())
-    })?;
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(HOSTED_TIMEOUT))
+    if provider_config.transport != "http" || provider_config.dialect != "openai-chat-completions" {
+        return Err(provider_failure(
+            FailureBucket::NotConnected,
+            "hosted llm provider transport is not supported by the native client",
+        ));
+    }
+    let authorization = match provider_config.auth_scheme.as_str() {
+        "bearer" => {
+            let credential = invocation
+                .resolved_credential
+                .as_deref()
+                .unwrap_or_default()
+                .trim();
+            if credential.is_empty() {
+                return Err(provider_failure(
+                    FailureBucket::Unauthorized,
+                    "hosted llm bearer credential did not resolve for this principal",
+                ));
+            }
+            Some(format!("Bearer {credential}"))
+        }
+        "none" => None,
+        _ => {
+            return Err(provider_failure(
+                FailureBucket::Unauthorized,
+                "hosted llm auth scheme is not supported",
+            ));
+        }
+    };
+    let endpoint = provider_request_url(&provider_config.base_url, &provider_config.request_path);
+    let agent_config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(provider_config.timeout_ms)))
+        .max_redirects(0)
+        .http_status_as_error(false)
         .build();
-    let agent: ureq::Agent = config.into();
+    let agent: ureq::Agent = agent_config.into();
     let body = serde_json::json!({
-        "connection": invocation.resolved_connection.as_deref(),
-        "consumer": format!("{:?}", invocation.request.consumer),
-        "deployment": format!("{:?}", invocation.request.deployment),
-        "input": invocation.request.input.as_str(),
-        "paid": invocation.request.paid,
+        "model": provider_config.provider_model.as_str(),
+        "messages": [{
+            "role": "user",
+            "content": invocation.request.input.as_str(),
+        }],
     });
     let body = serde_json::to_string(&body).map_err(|err| {
         CgError::Engine(format!("hosted llm request serialization failed: {err}"))
     })?;
-    let mut response = agent
-        .post(endpoint)
-        .header("Authorization", format!("Bearer {credential}"))
-        .header("Content-Type", "application/json")
+    let mut request = agent
+        .post(&endpoint)
+        .header("Content-Type", "application/json");
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let mut response = request
         .send(body)
-        .map_err(|err| CgError::Engine(format!("hosted llm request failed: {err}")))?;
+        .map_err(|err| provider_failure(ureq_failure_bucket(&err), &format!("{err}")))?;
+    let status = response.status().as_u16();
+    if (400..500).contains(&status) {
+        return Err(provider_failure(
+            FailureBucket::Unauthorized,
+            &format!("hosted llm request returned HTTP {status}"),
+        ));
+    }
+    if status >= 300 {
+        return Err(provider_failure(
+            FailureBucket::Unreachable,
+            &format!("hosted llm request returned HTTP {status}"),
+        ));
+    }
     let reader = response
         .body_mut()
         .with_config()
         .limit(HOSTED_BODY_LIMIT)
         .reader();
-    let payload: serde_json::Value = serde_json::from_reader(reader)
-        .map_err(|err| CgError::Engine(format!("hosted llm response was not json: {err}")))?;
-    let phrasing = payload
-        .get("phrasing")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| CgError::Engine("hosted llm response missing phrasing".to_string()))?;
-    let marker = payload
-        .get("marker")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| understanding_marker(&invocation.request));
+    let mut payload = String::new();
+    let mut reader = reader;
+    reader.read_to_string(&mut payload).map_err(|err| {
+        provider_failure(
+            FailureBucket::Unreachable,
+            &format!("hosted llm response read failed: {err}"),
+        )
+    })?;
+    let spec = ProviderSpec {
+        reply_framing: ReplyFraming::Json,
+        reply_path: invocation
+            .provider_config
+            .as_ref()
+            .map(|config| config.reply_path.clone())
+            .unwrap_or_else(|| DEFAULT_CHAT_COMPLETIONS_REPLY_PATH.to_string()),
+        ..ProviderSpec::default()
+    };
+    let phrasing = match extract_reply_from_spec(
+        invocation
+            .provider_config
+            .as_ref()
+            .map(|config| config.provider.as_str())
+            .unwrap_or("openai-compatible"),
+        &spec,
+        ReplyFraming::Json,
+        &payload,
+        None,
+    ) {
+        Ok(reply) if !reply.trim().is_empty() => reply,
+        Ok(_) | Err(_) => {
+            return Ok(context_graph::ModelReply {
+                marker: understanding_marker(&invocation.request),
+                phrasing: String::new(),
+                advisory_flag: false,
+                malformed: true,
+            });
+        }
+    };
     Ok(context_graph::ModelReply {
-        marker,
-        phrasing: phrasing.to_string(),
-        advisory_flag: payload
-            .get("advisory_flag")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        malformed: payload
-            .get("malformed")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
+        marker: understanding_marker(&invocation.request),
+        phrasing,
+        advisory_flag: false,
+        malformed: false,
     })
+}
+
+const PROVIDER_FAILURE_PREFIX: &str = "llm_provider_failure";
+
+fn provider_failure(bucket: FailureBucket, message: &str) -> CgError {
+    CgError::Engine(format!(
+        "{PROVIDER_FAILURE_PREFIX}:{}:{message}",
+        failure_bucket_name(bucket)
+    ))
+}
+
+fn failure_bucket_from_error(err: &CgError) -> FailureBucket {
+    let CgError::Engine(message) = err else {
+        return FailureBucket::Unreachable;
+    };
+    if let Some(rest) = message.strip_prefix(PROVIDER_FAILURE_PREFIX)
+        && let Some(rest) = rest.strip_prefix(':')
+        && let Some((bucket, _)) = rest.split_once(':')
+    {
+        return failure_bucket_from_name(bucket).unwrap_or(FailureBucket::Unreachable);
+    }
+    FailureBucket::Unreachable
+}
+
+fn failure_bucket_name(bucket: FailureBucket) -> &'static str {
+    match bucket {
+        FailureBucket::NotConnected => "not_connected",
+        FailureBucket::Unauthorized => "unauthorized",
+        FailureBucket::Unreachable => "unreachable",
+        FailureBucket::ReplyMalformed => "reply_malformed",
+    }
+}
+
+fn failure_bucket_from_name(name: &str) -> Option<FailureBucket> {
+    match name {
+        "not_connected" => Some(FailureBucket::NotConnected),
+        "unauthorized" => Some(FailureBucket::Unauthorized),
+        "unreachable" => Some(FailureBucket::Unreachable),
+        "reply_malformed" => Some(FailureBucket::ReplyMalformed),
+        _ => None,
+    }
+}
+
+fn proof_bucket_from_failure(bucket: FailureBucket) -> &'static str {
+    match bucket {
+        FailureBucket::NotConnected => "not_connected",
+        FailureBucket::Unauthorized => "auth",
+        FailureBucket::Unreachable => "unreachable",
+        FailureBucket::ReplyMalformed => "format",
+    }
+}
+
+fn ureq_failure_bucket(err: &ureq::Error) -> FailureBucket {
+    match err {
+        ureq::Error::StatusCode(status) if (400..500).contains(status) => {
+            FailureBucket::Unauthorized
+        }
+        _ => FailureBucket::Unreachable,
+    }
+}
+
+fn provider_request_url(base_url: &str, request_path: &str) -> String {
+    format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        request_path.trim_start_matches('/')
+    )
 }
 
 fn declared_local_artifact_metadata(path: &Path) -> (Vec<String>, Vec<(String, String)>) {
@@ -3751,6 +5790,271 @@ fn sha256_file_hex(path: &Path) -> std::result::Result<String, String> {
     Ok(format!("{digest:x}"))
 }
 
+fn mutate_status_store(
+    path: &Path,
+    mutate: impl FnOnce(&mut PersistedConnectionStatusFile) -> bool,
+) -> std::result::Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "status store path has no parent: {}",
+            path.display()
+        ));
+    };
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("create {} failed: {err}", parent.display()))?;
+    let lock_path = path.with_extension("toml.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| format!("open lock {} failed: {err}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .map_err(|err| format!("lock {} failed: {err}", lock_path.display()))?;
+    let mut file = if path.exists() {
+        let text = fs::read_to_string(path)
+            .map_err(|err| format!("read status store {} failed: {err}", path.display()))?;
+        toml::from_str::<PersistedConnectionStatusFile>(&text)
+            .map_err(|err| format!("parse status store {} failed: {err}", path.display()))?
+    } else {
+        PersistedConnectionStatusFile::default()
+    };
+    if !mutate(&mut file) {
+        return Ok(());
+    }
+    write_status_store_unlocked(path, &file)
+}
+
+fn write_status_store_unlocked(
+    path: &Path,
+    file: &PersistedConnectionStatusFile,
+) -> std::result::Result<(), String> {
+    let text = toml::to_string_pretty(file)
+        .map_err(|err| format!("serialize status store failed: {err}"))?;
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    {
+        let mut out = File::create(&tmp)
+            .map_err(|err| format!("create temp {} failed: {err}", tmp.display()))?;
+        out.write_all(text.as_bytes())
+            .map_err(|err| format!("write temp {} failed: {err}", tmp.display()))?;
+        out.sync_all()
+            .map_err(|err| format!("sync temp {} failed: {err}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "atomic rename {} -> {} failed: {err}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn create_private_file(path: &Path) -> std::result::Result<File, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|err| format!("create private file {} failed: {err}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        File::create(path)
+            .map_err(|err| format!("create private file {} failed: {err}", path.display()))
+    }
+}
+
+fn ensure_private_file_permissions(path: &Path) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(path)
+            .map_err(|err| format!("read permissions for {} failed: {err}", path.display()))?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+                format!("repair permissions for {} failed: {err}", path.display())
+            })?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn write_secret_store_unlocked(
+    path: &Path,
+    store: &PersistedSecretStore,
+) -> std::result::Result<(), String> {
+    let text = toml::to_string_pretty(store)
+        .map_err(|err| format!("serialize secret store failed: {err}"))?;
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    {
+        let mut file = File::create(&tmp)
+            .map_err(|err| format!("create temp {} failed: {err}", tmp.display()))?;
+        file.write_all(text.as_bytes())
+            .map_err(|err| format!("write temp {} failed: {err}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync temp {} failed: {err}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "atomic rename {} -> {} failed: {err}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn parse_local_secret_key(text: &str) -> Option<[u8; 32]> {
+    let bytes = hex_decode(text.trim())?;
+    bytes.try_into().ok()
+}
+
+fn encode_local_secret(
+    key: &[u8; 32],
+    principal: &str,
+    secret_ref: &str,
+    secret: &str,
+) -> std::result::Result<String, String> {
+    let nonce_bytes = random_secret_nonce();
+    let aad = local_secret_aad(principal, secret_ref);
+    let ciphertext =
+        xor_with_local_secret_stream(key, &nonce_bytes, aad.as_bytes(), secret.as_bytes());
+    let tag = local_secret_tag(key, &nonce_bytes, aad.as_bytes(), &ciphertext);
+    let mut payload = nonce_bytes.to_vec();
+    payload.extend(ciphertext);
+    payload.extend(tag);
+    Ok(hex_encode(&payload))
+}
+
+fn decode_local_secret(
+    key: &[u8; 32],
+    principal: &str,
+    secret_ref: &str,
+    cipher_hex: &str,
+) -> Option<String> {
+    let payload = hex_decode(cipher_hex)?;
+    if payload.len() < 44 {
+        return None;
+    }
+    let (nonce, sealed) = payload.split_at(12);
+    let (ciphertext, tag) = sealed.split_at(sealed.len().checked_sub(32)?);
+    let aad = local_secret_aad(principal, secret_ref);
+    let expected_tag = local_secret_tag(key, nonce, aad.as_bytes(), ciphertext);
+    if !constant_time_eq(tag, &expected_tag) {
+        return None;
+    }
+    let plaintext = xor_with_local_secret_stream(key, nonce, aad.as_bytes(), ciphertext);
+    String::from_utf8(plaintext).ok()
+}
+
+fn local_secret_aad(principal: &str, secret_ref: &str) -> String {
+    format!("cg-local-secret-v2\0{principal}\0{secret_ref}")
+}
+
+fn random_secret_bytes() -> [u8; 32] {
+    let mut key = [0_u8; 32];
+    key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    key
+}
+
+fn random_secret_nonce() -> [u8; 12] {
+    let mut nonce = [0_u8; 12];
+    nonce.copy_from_slice(&Uuid::new_v4().as_bytes()[..12]);
+    nonce
+}
+
+fn xor_with_local_secret_stream(key: &[u8; 32], nonce: &[u8], aad: &[u8], input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    for (block_index, chunk) in input.chunks(32).enumerate() {
+        let mut digest = Sha256::new();
+        digest.update(b"cg-local-secret-stream-v1");
+        digest.update(key);
+        digest.update(nonce);
+        digest.update(aad);
+        digest.update((block_index as u64).to_le_bytes());
+        let block = digest.finalize();
+        output.extend(
+            chunk
+                .iter()
+                .zip(block.iter())
+                .map(|(byte, mask)| byte ^ mask),
+        );
+    }
+    output
+}
+
+fn local_secret_tag(key: &[u8; 32], nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"cg-local-secret-tag-v1");
+    digest.update(key);
+    digest.update(nonce);
+    digest.update(aad);
+    digest.update(ciphertext);
+    digest.finalize().into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        out.push((high << 4) | low);
+    }
+    Some(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn public_marker(request: &UnderstandingRequest, reply: &context_graph::ModelReply) -> String {
     let deterministic = understanding_marker(request);
     let scaffold_marker = format!("understood:{}", request.input);
@@ -3779,6 +6083,25 @@ fn understanding_marker(request: &UnderstandingRequest) -> String {
 }
 
 fn catalog_entry_for_model(model: &ModelRead) -> CatalogEntry {
+    let source = if let Some(connection_name) = &model.connection_name {
+        Source::NamedConnection {
+            connection_name: connection_name.clone(),
+        }
+    } else if let Some(cache_path) = &model.cache_path {
+        Source::LocalPath {
+            dir: cache_path.clone(),
+        }
+    } else if let Some(env_var) = &model.welded_auth_env_var {
+        Source::ApiEndpoint {
+            base_url: "https://provider.example.invalid/v1".to_string(),
+            provider: "legacy-provider".to_string(),
+            model: model.id.clone(),
+            auth_env_var: env_var.clone(),
+        }
+    } else {
+        Source::BundledBinary
+    };
+    let named_connection = matches!(source, Source::NamedConnection { .. });
     CatalogEntry {
         id: model.id.clone(),
         kind: model.kind.clone(),
@@ -3792,14 +6115,42 @@ fn catalog_entry_for_model(model: &ModelRead) -> CatalogEntry {
             url: "https://provider.example.invalid/license".to_string(),
             requires_manual_acceptance: false,
         },
-        source: Source::BundledBinary,
+        source,
         byte_size: 0,
-        cache_status: CacheStatus::Cached,
-        local_path: None,
+        cache_status: if named_connection {
+            CacheStatus::Cached
+        } else {
+            CacheStatus::NotCached
+        },
+        local_path: model.cache_path.clone(),
         install_instructions: None,
         audit_footnote: None,
         acceptance_recorded: false,
         manual_install_url: None,
+        artifact_filenames: model.artifact_filenames.clone(),
+        per_file_sha256: model.per_file_sha256.clone(),
+    }
+}
+
+fn hosted_model_read(
+    id: String,
+    connection_name: String,
+    base_url: String,
+    provider: String,
+    provider_model: String,
+) -> ModelRead {
+    ModelRead {
+        id,
+        kind: ModelKind::LlmClient,
+        connection_name: Some(connection_name),
+        welded_auth_env_var: None,
+        exposed_secret: None,
+        cache_path: None,
+        hosted_endpoint: Some(HostedEndpoint {
+            base_url,
+            provider,
+            provider_model,
+        }),
         artifact_filenames: Vec::new(),
         per_file_sha256: Vec::new(),
     }
@@ -3863,15 +6214,18 @@ fn model_read_from_entry(entry: &CatalogEntry) -> ModelRead {
     }
 }
 
-fn degraded_outcome(request: &UnderstandingRequest) -> UnderstandingOutcome {
+fn degraded_outcome(
+    request: &UnderstandingRequest,
+    failure_bucket: FailureBucket,
+) -> UnderstandingOutcome {
     UnderstandingOutcome {
         marker: format!("declarative:{}", request.input),
         degraded_marker: Some(DEGRADED_MARKER.to_string()),
-        failure_bucket: Some(FailureBucket::NotConnected),
+        failure_bucket: Some(failure_bucket),
         phrasing: None,
         model_invoked: false,
         resolved_connection: None,
         cache_path_consulted: None,
-        stored_understanding: None,
+        stored_understanding: Some(request.input.clone()),
     }
 }

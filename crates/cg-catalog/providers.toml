@@ -65,3 +65,50 @@ timeout_ms = 30000
 consent_required = true
 required_help_flags = ["--output-last-message"]
 last_verified = "codex 0.136.0"
+
+[providers.openai]
+transport = "http"
+auth_scheme = "bearer"
+base_url = "https://api.openai.com/v1"
+default_model = "gpt-4.1-mini"
+dialect = "openai-chat-completions"
+reply_path = "/choices/0/message/content"
+timeout_ms = 10000
+consent_required = true
+
+[providers.openai-compatible]
+transport = "http"
+auth_scheme = "bearer"
+base_url = "https://provider.example.invalid/v1"
+dialect = "openai-chat-completions"
+reply_path = "/choices/0/message/content"
+timeout_ms = 10000
+consent_required = true
+
+[providers.nebius]
+transport = "http"
+auth_scheme = "bearer"
+base_url = "https://api.studio.nebius.com/v1"
+dialect = "openai-chat-completions"
+reply_path = "/choices/0/message/content"
+timeout_ms = 10000
+consent_required = true
+
+[providers.openrouter]
+transport = "http"
+auth_scheme = "bearer"
+base_url = "https://openrouter.ai/api/v1"
+dialect = "openai-chat-completions"
+reply_path = "/choices/0/message/content"
+timeout_ms = 10000
+consent_required = true
+
+[providers.local-vllm]
+transport = "http"
+auth_scheme = "none"
+base_url = "http://127.0.0.1:8000/v1"
+default_model = "llama-local"
+dialect = "openai-chat-completions"
+reply_path = "/choices/0/message/content"
+timeout_ms = 10000
+consent_required = true

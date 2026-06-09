@@ -33,6 +33,32 @@ pub struct ModelInvocation {
     pub resolved_connection: Option<String>,
     pub resolved_credential: Option<String>,
     pub hosted_endpoint: Option<String>,
+    pub provider_config: Option<ProviderInvocationConfig>,
+    pub cache_path: Option<PathBuf>,
+    pub local_artifacts: Vec<PathBuf>,
+    pub local_catalog_authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderInvocationConfig {
+    pub provider: String,
+    pub provider_model: String,
+    pub base_url: String,
+    pub request_path: String,
+    pub auth_scheme: String,
+    pub dialect: String,
+    pub reply_path: String,
+    pub timeout_ms: u64,
+    pub transport: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedModelInvocationParts {
+    pub request: UnderstandingRequest,
+    pub resolved_connection: Option<String>,
+    pub resolved_credential: Option<String>,
+    pub hosted_endpoint: Option<String>,
+    pub provider_config: Option<ProviderInvocationConfig>,
     pub cache_path: Option<PathBuf>,
     pub local_artifacts: Vec<PathBuf>,
     pub local_catalog_authorized: bool,
@@ -48,23 +74,16 @@ impl ModelInvocation {
     /// cache metadata. This constructor exists for the catalog runtime boundary;
     /// safe external code cannot forge a struct literal because the type is
     /// non-exhaustive.
-    pub unsafe fn from_authorized_runtime_parts(
-        request: UnderstandingRequest,
-        resolved_connection: Option<String>,
-        resolved_credential: Option<String>,
-        hosted_endpoint: Option<String>,
-        cache_path: Option<PathBuf>,
-        local_artifacts: Vec<PathBuf>,
-        local_catalog_authorized: bool,
-    ) -> Self {
+    pub unsafe fn from_authorized_runtime_parts(parts: AuthorizedModelInvocationParts) -> Self {
         Self {
-            request,
-            resolved_connection,
-            resolved_credential,
-            hosted_endpoint,
-            cache_path,
-            local_artifacts,
-            local_catalog_authorized,
+            request: parts.request,
+            resolved_connection: parts.resolved_connection,
+            resolved_credential: parts.resolved_credential,
+            hosted_endpoint: parts.hosted_endpoint,
+            provider_config: parts.provider_config,
+            cache_path: parts.cache_path,
+            local_artifacts: parts.local_artifacts,
+            local_catalog_authorized: parts.local_catalog_authorized,
         }
     }
 }

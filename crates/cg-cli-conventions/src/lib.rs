@@ -139,6 +139,29 @@ pub fn run_selftest_checks(registry: &CheckRegistry) -> DoctorReport {
     run_checks(registry, true)
 }
 
+pub fn model_byok_status_exit_code(condition: Option<&str>) -> i32 {
+    match condition {
+        Some("consent_not_recorded") => 5,
+        Some(_) => 6,
+        None => 0,
+    }
+}
+
+pub fn model_byok_selftest_failure_exit_code(condition: &str) -> i32 {
+    match condition {
+        "not_connected" | "no_host_session" => 4,
+        "consent_not_recorded" => 5,
+        _ => 6,
+    }
+}
+
+pub fn host_session_selftest_failure_exit_code(condition: &str) -> i32 {
+    match condition {
+        "no_host_session" | "consent_not_recorded" => 4,
+        _ => 6,
+    }
+}
+
 fn run_checks(registry: &CheckRegistry, spending: bool) -> DoctorReport {
     let mut findings = Vec::new();
     let mut checks_run = Vec::new();
