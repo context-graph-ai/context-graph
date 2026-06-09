@@ -13,7 +13,7 @@ use context_graph::embedder::mock::MockEmbedder;
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId,
     DeploymentSurface, Embedder, EmbedderConfig, EmbedderRegistration, EntityType, EvidenceId,
-    EvidenceKind, EvidenceRef, InvalidationSeverity, InvalidationStatus, LlmClient,
+    EvidenceKind, EvidenceRef, FailureBucket, InvalidationSeverity, InvalidationStatus, LlmClient,
     ModelInvocation, ModelReply, ObservationId, Principal, RecordObservation,
     RecordObservationResult, RetentionStatus, Store, StoreConfig, UnderstandingConsumer,
     UnderstandingOutcome, UnderstandingRequest,
@@ -275,6 +275,7 @@ fn completed(
     result.unwrap_or_else(|err| UnderstandingOutcome {
         marker: format!("error:{err:?}"),
         degraded_marker: None,
+        failure_bucket: None,
         phrasing: None,
         model_invoked: false,
         resolved_connection: None,
@@ -283,35 +284,64 @@ fn completed(
     })
 }
 
-fn assert_degraded(input: &str, outcome: UnderstandingOutcome) {
+fn assert_degraded_with_bucket(
+    input: &str,
+    expected_bucket: FailureBucket,
+    outcome: &UnderstandingOutcome,
+) {
     assert_eq!(
-        outcome,
-        UnderstandingOutcome {
-            marker: format!("declarative:{input}"),
-            degraded_marker: Some(DEGRADED_MARKER.to_string()),
-            phrasing: None,
-            model_invoked: false,
-            resolved_connection: None,
-            cache_path_consulted: None,
-            stored_understanding: None,
-        },
-        "degraded operation must complete on the exact visible lesser path"
+        outcome.marker,
+        format!("declarative:{input}"),
+        "degraded operation must complete on the declarative lesser path"
+    );
+    assert_eq!(
+        outcome.degraded_marker.as_deref(),
+        Some(DEGRADED_MARKER),
+        "degraded operation must expose the typed degraded marker"
+    );
+    assert_eq!(
+        outcome.failure_bucket,
+        Some(expected_bucket),
+        "degraded operation must expose the typed failure bucket"
+    );
+    assert_eq!(
+        outcome.phrasing, None,
+        "degraded operation must not fabricate provider phrasing"
+    );
+    assert!(
+        !outcome.model_invoked,
+        "degraded operation must not report a model invocation"
+    );
+    assert_eq!(
+        outcome.resolved_connection, None,
+        "degraded operation must not report a resolved connection"
+    );
+    assert_eq!(
+        outcome.cache_path_consulted, None,
+        "degraded operation must not report a consulted cache path"
+    );
+    assert_eq!(
+        outcome.stored_understanding.as_deref(),
+        Some(input),
+        "degraded operation must retain the uncondensed input as stored understanding"
     );
 }
 
-fn observable_without_connection(
-    outcome: &UnderstandingOutcome,
-) -> (
+type DegradedOutcomeProjection = (
     String,
     Option<String>,
+    Option<FailureBucket>,
     Option<String>,
     bool,
     Option<PathBuf>,
     Option<String>,
-) {
+);
+
+fn observable_without_connection(outcome: &UnderstandingOutcome) -> DegradedOutcomeProjection {
     (
         outcome.marker.clone(),
         outcome.degraded_marker.clone(),
+        outcome.failure_bucket,
         outcome.phrasing.clone(),
         outcome.model_invoked,
         outcome.cache_path_consulted.clone(),
@@ -558,7 +588,11 @@ fn llm_client_implementations_register_as_catalog_entries_of_kind_llm_client() {
         )),
         "registered client without catalog entry",
     );
-    assert_degraded("registered client without catalog entry", no_entry);
+    assert_degraded_with_bucket(
+        "registered client without catalog entry",
+        FailureBucket::NotConnected,
+        &no_entry,
+    );
     assert_eq!(
         no_entry_client.call_count(),
         0,
@@ -585,7 +619,11 @@ fn llm_client_implementations_register_as_catalog_entries_of_kind_llm_client() {
         )),
         "embedder row with client",
     );
-    assert_degraded("embedder row with client", wrong_kind);
+    assert_degraded_with_bucket(
+        "embedder row with client",
+        FailureBucket::NotConnected,
+        &wrong_kind,
+    );
     assert_eq!(
         wrong_kind_client.call_count(),
         0,
@@ -650,6 +688,18 @@ fn llm_client_summarize_routes_through_catalog_irrespective_of_hosted_vs_local_c
         local.marker, hosted.marker,
         "hosted and local routes must expose the same understanding contract"
     );
+
+    std::fs::remove_dir_all(&model_dir).expect("remove routed local model dir");
+    let local_missing = completed(
+        local_runtime.understand(request(
+            local_context,
+            UnderstandingConsumer::ConversationCondensation,
+            DeploymentSurface::Edge,
+            input,
+        )),
+        input,
+    );
+    assert_degraded_with_bucket(input, FailureBucket::Unreachable, &local_missing);
 }
 
 // Use case: removing a local model from the cache should make the runtime visibly degrade instead of pretending it still understood.
@@ -689,7 +739,7 @@ fn llm_client_local_candle_implementation_loads_via_catalog_cache_path() {
         )),
         "local cache missing",
     );
-    assert_degraded("local cache missing", missing);
+    assert_degraded_with_bucket("local cache missing", FailureBucket::Unreachable, &missing);
 }
 
 // Use case: hosted calls should resolve the key through the scoped connection reference, never through a global feature variable.
@@ -769,7 +819,11 @@ fn paid_understand_call_is_refused_unless_consent_is_on_record_for_the_connectio
         )),
         "background condensation",
     );
-    assert_degraded("background condensation", no_consent);
+    assert_degraded_with_bucket(
+        "background condensation",
+        FailureBucket::Unauthorized,
+        &no_consent,
+    );
     assert_eq!(
         no_consent_client.call_count(),
         0,
@@ -836,7 +890,11 @@ fn consent_revoked_between_calls_is_rechecked_on_every_paid_call() {
         "second background condensation",
     );
 
-    assert_degraded("second background condensation", second);
+    assert_degraded_with_bucket(
+        "second background condensation",
+        FailureBucket::Unauthorized,
+        &second,
+    );
     assert_eq!(
         client.call_count(),
         1,
@@ -890,15 +948,20 @@ fn connected_model_returning_error_or_malformed_response_degrades_without_fabric
         "fault isolation proposal",
     );
 
-    assert_degraded("fault isolation proposal", outcome.clone());
+    assert_degraded_with_bucket(
+        "fault isolation proposal",
+        FailureBucket::ReplyMalformed,
+        &outcome,
+    );
     assert_eq!(
         client.call_count(),
         1,
         "malformed output must degrade after attempting the connected backend"
     );
     assert_eq!(
-        outcome.stored_understanding, None,
-        "malformed provider output must not be stored as understanding"
+        outcome.stored_understanding.as_deref(),
+        Some("fault isolation proposal"),
+        "malformed provider output must retain only the uncondensed input as stored understanding"
     );
 }
 
@@ -921,7 +984,7 @@ fn no_model_connected_degrades_to_lesser_path_and_operation_completes() {
         "no model configured",
     );
 
-    assert_degraded("no model configured", outcome);
+    assert_degraded_with_bucket("no model configured", FailureBucket::NotConnected, &outcome);
 }
 
 // Use case: if the provider is unreachable, webhook resolution should complete via declarative mapping rather than returning an operational failure.
@@ -939,7 +1002,11 @@ fn llm_provider_unavailable_falls_back_to_declarative() {
         "payment-svc-prod deploy event",
     );
 
-    assert_degraded("payment-svc-prod deploy event", outcome);
+    assert_degraded_with_bucket(
+        "payment-svc-prod deploy event",
+        FailureBucket::Unreachable,
+        &outcome,
+    );
     assert_eq!(
         client.call_count(),
         1,
@@ -947,7 +1014,7 @@ fn llm_provider_unavailable_falls_back_to_declarative() {
     );
 }
 
-// Use case: from a user's seat, no consent and no connected model are the same visible lesser path and neither spends money.
+// Use case: no consent and no connected model both take the lesser path, but the typed bucket must explain why.
 #[test]
 fn no_consent_outcome_is_observably_identical_to_no_model_outcome() {
     let client = Arc::new(RecordingClient::input_derived());
@@ -977,9 +1044,16 @@ fn no_consent_outcome_is_observably_identical_to_no_model_outcome() {
         "same fallback",
     );
 
-    assert_eq!(
-        no_consent, no_model,
-        "no-consent and no-model outcomes must be indistinguishable to consumers"
+    assert_degraded_with_bucket("same fallback", FailureBucket::Unauthorized, &no_consent);
+    assert_degraded_with_bucket("same fallback", FailureBucket::NotConnected, &no_model);
+    assert_ne!(
+        no_consent.failure_bucket, no_model.failure_bucket,
+        "no-consent and no-model degraded outcomes must expose different buckets"
+    );
+    assert_ne!(
+        observable_without_connection(&no_consent),
+        observable_without_connection(&no_model),
+        "typed degradation buckets make no-consent and no-model outcomes observably distinct"
     );
     assert_eq!(
         client.call_count(),
@@ -1315,7 +1389,11 @@ fn consent_chokepoint_and_determinism_boundary_hold_in_release_profile() {
         0,
         "release profile must not invoke a paid backend without consent"
     );
-    assert_degraded("release profile unchanged observation", outcome.clone());
+    assert_degraded_with_bucket(
+        "release profile unchanged observation",
+        FailureBucket::Unauthorized,
+        &outcome,
+    );
 }
 
 // Use case: the existing local embedder path should still open and produce embeddings without a named connection.

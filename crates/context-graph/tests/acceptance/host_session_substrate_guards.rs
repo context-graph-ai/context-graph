@@ -6,7 +6,7 @@ use cg_catalog::{
     PrincipalAwareConfig, UnderstandingRuntime,
 };
 use context_graph::{
-    ContextId, DeploymentSurface, LlmClient, ModelInvocation, ModelReply, Principal,
+    ContextId, DeploymentSurface, FailureBucket, LlmClient, ModelInvocation, ModelReply, Principal,
     UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
 };
 use tempfile::TempDir;
@@ -64,15 +64,16 @@ impl LlmClient for RecordingClient {
     }
 }
 
-fn degraded(input: &str) -> UnderstandingOutcome {
+fn degraded(input: &str, failure_bucket: FailureBucket) -> UnderstandingOutcome {
     UnderstandingOutcome {
         marker: format!("declarative:{input}"),
         degraded_marker: Some(DEGRADED_MARKER.to_string()),
+        failure_bucket: Some(failure_bucket),
         phrasing: None,
         model_invoked: false,
         resolved_connection: None,
         cache_path_consulted: None,
-        stored_understanding: None,
+        stored_understanding: Some(input.to_string()),
     }
 }
 
@@ -172,7 +173,7 @@ secret_ref = "secret://model"
 }
 
 #[test]
-fn unconsented_connection_never_reaches_paid_call() {
+fn paid_call_requires_recorded_consent_and_uses_named_connection() {
     let dir = TempDir::new().expect("catalog tempdir");
     let principal = developer();
     let mut config = PrincipalAwareConfig::default();
@@ -190,7 +191,10 @@ fn unconsented_connection_never_reaches_paid_call() {
         runtime.understand(request(context_id, "before consent")),
         "understand without consent"
     );
-    assert_eq!(no_consent, degraded("before consent"));
+    assert_eq!(
+        no_consent,
+        degraded("before consent", FailureBucket::Unauthorized)
+    );
     assert_eq!(
         client.observed(),
         Vec::<Option<String>>::new(),
@@ -226,7 +230,10 @@ fn missing_connection_degrades_to_typed_marker_not_crash() {
         runtime.understand(request(ContextId::new_v7(), "no model configured")),
         "understand without configured model"
     );
-    assert_eq!(outcome, degraded("no model configured"));
+    assert_eq!(
+        outcome,
+        degraded("no model configured", FailureBucket::NotConnected)
+    );
     assert_eq!(client.observed(), Vec::<Option<String>>::new());
 }
 

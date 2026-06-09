@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `EvidenceRef: From<String>` is not satisfied
+  --> tests/ui/byok_reply_phrasing_is_not_a_basis.rs:21:39
+   |
+21 |         evidence: vec![reply.phrasing.into()],
+   |                                       ^^^^ the trait `From<String>` is not implemented for `EvidenceRef`
+   |
+   = note: required for `String` to implement `Into<EvidenceRef>`

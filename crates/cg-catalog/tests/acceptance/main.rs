@@ -4,6 +4,8 @@ mod common;
 mod air_gap;
 mod ci_hardening;
 mod concurrency;
+mod generic_llm_credential_integrity;
+mod generic_llm_endpoint;
 mod install_uninstall;
 mod license_gate;
 mod list_show;

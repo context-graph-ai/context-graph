@@ -14,6 +14,7 @@ fn compile_fail_ui_tests() {
     trybuild.compile_fail("tests/ui/composite_query_single_clause_without_fusion_policy.rs");
     trybuild.compile_fail("tests/ui/embedding_module_is_private.rs");
     trybuild.compile_fail("tests/ui/vector_search_primitives_are_private.rs");
+    trybuild.compile_fail("tests/ui/byok_reply_phrasing_is_not_a_basis.rs");
 }
 
 #[test]

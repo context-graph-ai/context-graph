@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use candle_core::{Device, Tensor};
 use cg_cli_conventions::{CheckRegistrar, DiagnosticCheck, Finding};
 use context_graph::{
-    CgError, ContextId, DeploymentSurface, LlmClient, ModelInvocation, ModelReply, Principal,
-    UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
+    CgError, ContextId, DeploymentSurface, FailureBucket, LlmClient, ModelInvocation, ModelReply,
+    Principal, UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
 };
 use fs4::fs_std::FileExt;
 use safetensors::SafeTensors;
@@ -110,9 +110,38 @@ impl ReplyFraming {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderTransport {
+    #[default]
+    CliSubprocess,
+    Http,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderAuthScheme {
+    Bearer,
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderDialect {
+    OpenaiChatCompletions,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSpec {
+    #[serde(default)]
+    pub transport: ProviderTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<ProviderAuthScheme>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<ProviderDialect>,
     pub binary: String,
     #[serde(default)]
     pub completion_args: Vec<String>,
@@ -304,6 +333,14 @@ struct ProviderOverridesFile {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProviderSpec {
+    #[serde(default)]
+    transport: ProviderTransport,
+    #[serde(default)]
+    auth_scheme: Option<ProviderAuthScheme>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    dialect: Option<ProviderDialect>,
     binary: String,
     #[serde(default)]
     completion_args: Vec<String>,
@@ -336,6 +373,10 @@ struct RawProviderSpec {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderSpecOverride {
+    transport: Option<ProviderTransport>,
+    auth_scheme: Option<ProviderAuthScheme>,
+    base_url: Option<String>,
+    dialect: Option<ProviderDialect>,
     binary: Option<String>,
     completion_args: Option<Vec<String>>,
     prompt_delivery: Option<String>,
@@ -512,6 +553,10 @@ fn provider_spec_from_raw(
         )
     })?;
     Ok(ProviderSpec {
+        transport: raw.transport,
+        auth_scheme: raw.auth_scheme,
+        base_url: raw.base_url,
+        dialect: raw.dialect,
         binary: raw.binary,
         completion_args: raw.completion_args,
         prompt_delivery,
@@ -639,6 +684,10 @@ fn provider_spec_from_override(
         path,
     )?;
     let mut spec = ProviderSpec {
+        transport: override_layer.transport.unwrap_or_default(),
+        auth_scheme: override_layer.auth_scheme,
+        base_url: override_layer.base_url,
+        dialect: override_layer.dialect,
         binary,
         completion_args: override_layer.completion_args.unwrap_or_default(),
         prompt_delivery,
@@ -781,6 +830,18 @@ fn apply_provider_override(
     spec: &mut ProviderSpec,
     override_layer: ProviderSpecOverride,
 ) -> std::result::Result<(), ProviderSpecLoadError> {
+    if let Some(transport) = override_layer.transport {
+        spec.transport = transport;
+    }
+    if let Some(auth_scheme) = override_layer.auth_scheme {
+        spec.auth_scheme = Some(auth_scheme);
+    }
+    if let Some(base_url) = override_layer.base_url {
+        spec.base_url = Some(base_url);
+    }
+    if let Some(dialect) = override_layer.dialect {
+        spec.dialect = Some(dialect);
+    }
     if let Some(binary) = override_layer.binary {
         spec.binary = binary;
     }
@@ -3439,6 +3500,7 @@ fn success_outcome(
     UnderstandingOutcome {
         marker: public_marker(request, &reply),
         degraded_marker: None,
+        failure_bucket: None,
         phrasing: Some(reply.phrasing.clone()),
         model_invoked: true,
         resolved_connection: invocation.resolved_connection.clone(),
@@ -3805,6 +3867,7 @@ fn degraded_outcome(request: &UnderstandingRequest) -> UnderstandingOutcome {
     UnderstandingOutcome {
         marker: format!("declarative:{}", request.input),
         degraded_marker: Some(DEGRADED_MARKER.to_string()),
+        failure_bucket: Some(FailureBucket::NotConnected),
         phrasing: None,
         model_invoked: false,
         resolved_connection: None,

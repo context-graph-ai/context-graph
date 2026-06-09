@@ -77,10 +77,19 @@ pub struct ModelReply {
     pub malformed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureBucket {
+    NotConnected,
+    Unauthorized,
+    Unreachable,
+    ReplyMalformed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnderstandingOutcome {
     pub marker: String,
     pub degraded_marker: Option<String>,
+    pub failure_bucket: Option<FailureBucket>,
     pub phrasing: Option<String>,
     pub model_invoked: bool,
     pub resolved_connection: Option<String>,
