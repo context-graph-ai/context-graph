@@ -11,21 +11,32 @@ edition = "2024"
 name = "context_graph"
 path = "src/lib.rs"
 
+[features]
+default = ["nomic-embedder"]
+nomic-embedder = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:safetensors",
+    "dep:tokenizers",
+    "dep:ureq",
+]
+
 [dependencies]
-candle-core.workspace = true
-candle-nn.workspace = true
-candle-transformers.workspace = true
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 pollster.workspace = true
-safetensors.workspace = true
+safetensors = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 strum.workspace = true
-tokenizers.workspace = true
-ureq.workspace = true
+tokenizers = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 
 [dev-dependencies]

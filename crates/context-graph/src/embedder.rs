@@ -1,5 +1,6 @@
 pub mod load_observer;
 pub mod mock;
+#[cfg(feature = "nomic-embedder")]
 pub mod nomic;
 
 use std::path::PathBuf;

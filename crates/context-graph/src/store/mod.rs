@@ -28,12 +28,14 @@ use contextdb_core::{ColumnType, Error as EngineError, TxId, Value};
 use contextdb_engine::{Database, plugin::DatabasePlugin};
 
 use crate::Result;
-use crate::embedder::nomic::NomicTextEmbedder;
 use crate::embedding_space::default_text_embedding_space;
 use crate::error::CgError;
 use crate::schema::{INDEXES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES};
 use crate::types::*;
 use crate::{Embedder, EmbedderRegistration};
+
+#[cfg(feature = "nomic-embedder")]
+use crate::embedder::nomic::NomicTextEmbedder;
 
 use self::conflict_detection::register_conflict_detection_triggers;
 use self::convert::map_engine_err;
@@ -147,19 +149,7 @@ impl Store {
     ) -> Result<Self> {
         let mut registrations = registrations;
         let explicit_registration_count = registrations.len();
-        if let Some(config) = config.default_text_embedder.clone()
-            && !matches!(config.source, crate::ModelSource::Disabled)
-            && !registrations.iter().any(|registration| {
-                registration.space.embedding_space_id
-                    == default_text_embedding_space().embedding_space_id
-            })
-        {
-            let embedder = Arc::new(NomicTextEmbedder::new(config));
-            registrations.push(EmbedderRegistration {
-                space: embedder.embedding_space(),
-                embedder,
-            });
-        }
+        maybe_register_default_text_embedder(&config, &mut registrations)?;
         validate_embedder_registrations(&registrations)?;
         let db_path = config.db_path.clone();
         let authorized_contexts = contexts.clone();
@@ -392,6 +382,39 @@ impl Store {
             });
         }
         Ok(())
+    }
+}
+
+fn maybe_register_default_text_embedder(
+    config: &StoreConfig,
+    registrations: &mut Vec<EmbedderRegistration>,
+) -> Result<()> {
+    let Some(embedder_config) = config.default_text_embedder.clone() else {
+        return Ok(());
+    };
+    if matches!(embedder_config.source, crate::ModelSource::Disabled)
+        || registrations.iter().any(|registration| {
+            registration.space.embedding_space_id
+                == default_text_embedding_space().embedding_space_id
+        })
+    {
+        return Ok(());
+    }
+    #[cfg(feature = "nomic-embedder")]
+    {
+        let embedder = Arc::new(NomicTextEmbedder::new(embedder_config));
+        registrations.push(EmbedderRegistration {
+            space: embedder.embedding_space(),
+            embedder,
+        });
+        Ok(())
+    }
+    #[cfg(not(feature = "nomic-embedder"))]
+    {
+        let _ = embedder_config;
+        Err(CgError::Engine(
+            "default text embedder requires the nomic-embedder feature".to_string(),
+        ))
     }
 }
 
