@@ -50,6 +50,17 @@ const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
 static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
 
+/// Handle to a context-graph store backed by an embedded contextdb database.
+///
+/// `Store` follows contextdb's single-owner model (see the "Store ownership and
+/// concurrency" docs on `contextdb_engine::Database`). Within one process, cg
+/// keeps a single underlying `Database` per database path — opening the same
+/// path again returns a `Store` that shares that owner — but a *separate*
+/// process cannot open a store that is already open; it returns
+/// `Error::DatabaseLocked`. The process that owns the store serves all reads and
+/// writes, including provenance/audit walks; never re-open a live store from a
+/// second process and never keep a consumer-side copy of the data to work around
+/// the lock — route the request to the owner.
 #[derive(Clone)]
 pub struct Store {
     db_path: PathBuf,
@@ -76,6 +87,11 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
+    /// Opens (or, within this process, shares) the store at `config.db_path`,
+    /// becoming the owner of its embedded contextdb handle. A separate process
+    /// that opens the same path while this owner is live gets
+    /// `Error::DatabaseLocked`; the owner serves reads/writes — see the
+    /// ownership note on [`Store`].
     pub fn open(config: StoreConfig) -> Result<Self> {
         Self::open_with_config(config)
     }
