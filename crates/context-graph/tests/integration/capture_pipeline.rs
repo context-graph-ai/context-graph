@@ -413,6 +413,19 @@ fn impact_fires_across_two_separately_captured_sessions() {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let old_decision_row = decision_row(&store, old_decision);
+    let new_decision_row = decision_row(&store, new_decision);
+    let other_decision_row = decision_row(&store, other_decision);
+    let unrelated_decision_invalidations = context_id
+        .and_then(|context_id| {
+            other_decision.map(|other_decision| {
+                store
+                    .list_invalidations(context_id, Some(other_decision), None)
+                    .expect("unrelated persisted invalidations")
+            })
+        })
+        .unwrap_or_default();
+    drop(store);
     let redis_edges = redis_entity
         .zip(other_decision)
         .map(|(redis_entity, other_decision)| {
@@ -474,9 +487,9 @@ fn impact_fires_across_two_separately_captured_sessions() {
             goal.is_some(),
             other_goal.is_some(),
             redis_entity.is_some(),
-            decision_row(&store, old_decision),
-            decision_row(&store, new_decision),
-            decision_row(&store, other_decision),
+            old_decision_row,
+            new_decision_row,
+            other_decision_row,
         ),
         (
             true,
@@ -621,18 +634,7 @@ fn impact_fires_across_two_separately_captured_sessions() {
             goal.into_iter().collect::<Vec<_>>(),
         )]
     );
-    assert!(
-        context_id
-            .and_then(|context_id| {
-                other_decision.map(|other_decision| {
-                    store
-                        .list_invalidations(context_id, Some(other_decision), None)
-                        .expect("unrelated persisted invalidations")
-                })
-            })
-            .unwrap_or_default()
-            .is_empty()
-    );
+    assert!(unrelated_decision_invalidations.is_empty());
     assert!(standing.iter().all(|notice| {
         !notice.decision_text.contains("Redis")
             && !notice.basis_line.contains("redis")
