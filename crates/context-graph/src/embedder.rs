@@ -33,6 +33,9 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput>;
     fn supported_inputs(&self) -> Vec<EvidenceKind>;
     fn embedding_space(&self) -> EmbeddingSpace;
+    fn max_sequence_length(&self) -> usize {
+        usize::MAX
+    }
 }
 
 #[derive(Clone)]

@@ -1296,6 +1296,7 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "entity_history",
     "entity_neighborhood",
     "evidence_availability_log",
+    "find_via_digests",
     "get_context",
     "get_decision",
     "get_digest",

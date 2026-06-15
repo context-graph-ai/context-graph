@@ -152,6 +152,13 @@ pub enum CgError {
     OfflineModeNoCache {
         path: String,
     },
+    UnsupportedImportFormat {
+        format: String,
+    },
+    TranscriptTooLargeForModel {
+        model_context: usize,
+        required: usize,
+    },
     UnsupportedEvidenceKind {
         kind: crate::EvidenceKind,
     },

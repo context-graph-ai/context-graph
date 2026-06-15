@@ -17,10 +17,12 @@ mod entity_reference_embeddings;
 mod engine_probes {
     pub mod embedder_concurrency;
 }
+mod capture_pipeline;
 #[cfg(context_graph_internal_test_support)]
 mod explain_introspection;
 mod impact_analysis_engine_capabilities;
 mod impact_cascade_probes;
+mod ingest_core_streaming;
 #[cfg(context_graph_internal_test_support)]
 mod intra_space_modality_agnostic;
 mod invalidation_audit_log;

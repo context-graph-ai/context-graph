@@ -24,4 +24,7 @@ toml.workspace = true
 
 [dev-dependencies]
 context-graph = { path = "../context-graph" }
+contextdb-core.workspace = true
+contextdb-engine.workspace = true
 tempfile.workspace = true
+uuid.workspace = true

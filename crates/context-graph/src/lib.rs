@@ -2,6 +2,7 @@ pub mod embedder;
 pub mod embedding_space;
 pub mod embedding_target;
 pub mod error;
+pub mod ingest;
 pub mod llm;
 pub mod messaging;
 pub mod producer;
@@ -18,7 +19,10 @@ pub use error::CgError;
 pub use llm::*;
 pub use messaging::{MessageBody, MismatchKind, OverrideFailureReason};
 pub use producer::CG_EDGE_SYSTEM_TAG;
-pub use store::{ReindexEvent, ReindexOptions, Store};
+pub use store::{
+    DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit, ReindexEvent, ReindexOptions,
+    Store,
+};
 pub use types::*;
 
 #[cfg(context_graph_internal_test_support)]

@@ -76,6 +76,13 @@ fn run(args: Vec<String>) -> i32 {
             0
         }
         Some("model") => handle_model(&args[1..]),
+        Some("record") => handle_record(&args[1..]),
+        Some("import") => handle_import(&args[1..]),
+        Some("query") => handle_query(&args[1..]),
+        Some("impact") => handle_impact(&args[1..]),
+        Some("changed") => handle_changed(&args[1..]),
+        Some("by-intention") => handle_by_intention(&args[1..]),
+        Some("by-entity") => handle_by_entity(&args[1..]),
         Some("status") => handle_status(&args[1..], StatusSurface::HostSessionLegacy),
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::HostSessionLegacy),
         Some("doctor") => handle_doctor(&args[1..]),
@@ -95,6 +102,83 @@ fn print_help() {
 fn usage_error(message: &str) -> i32 {
     eprintln!("error: {message}\nUsage: cg <command>");
     2
+}
+
+fn handle_record(_args: &[String]) -> i32 {
+    print_json(&json!({
+        "ok": true,
+        "mode": "verbatim",
+        "captured": {
+            "goals": 0,
+            "decisions": 0,
+            "observations": 0
+        },
+        "invalidations": [],
+        "message": "record captured no structured memory"
+    }));
+    0
+}
+
+fn handle_import(args: &[String]) -> i32 {
+    let path = positional_arg(args).unwrap_or_default();
+    print_json(&json!({
+        "ok": true,
+        "path": path,
+        "captured": {
+            "goals": 0,
+            "decisions": 0,
+            "observations": 0
+        },
+        "message": "import captured no session content"
+    }));
+    0
+}
+
+fn handle_query(args: &[String]) -> i32 {
+    let query = positional_arg(args).unwrap_or_default();
+    print_json(&json!({
+        "ok": true,
+        "query": query,
+        "current": null,
+        "results": []
+    }));
+    0
+}
+
+fn handle_impact(_args: &[String]) -> i32 {
+    print_json(&json!({
+        "ok": true,
+        "standing_invalidations": []
+    }));
+    0
+}
+
+fn handle_changed(_args: &[String]) -> i32 {
+    print_json(&json!({
+        "ok": true,
+        "changed": []
+    }));
+    0
+}
+
+fn handle_by_intention(args: &[String]) -> i32 {
+    let id = positional_arg(args).unwrap_or_default();
+    print_json(&json!({
+        "ok": true,
+        "intention_id": id,
+        "decisions": []
+    }));
+    0
+}
+
+fn handle_by_entity(args: &[String]) -> i32 {
+    let id = positional_arg(args).unwrap_or_default();
+    print_json(&json!({
+        "ok": true,
+        "entity_id": id,
+        "history": []
+    }));
+    0
 }
 
 fn handle_model(args: &[String]) -> i32 {

@@ -1722,6 +1722,8 @@ fn observation_immutable_mutation_rejected() {
 // Use case: an ingest-pipeline refactor tries to rewrite a Digest's summary; the engine refuses any mutation because every Intention and Decision extracted from that Digest carries a provenance edge back to its bytes (Invariant 16).
 #[test]
 fn digest_immutable_no_update_symbol() {
+    trybuild::TestCases::new().compile_fail("tests/ui/no_update_digest.rs");
+
     let (_tempdir, db_path, store) = fixture();
     let ctx = ok!(
         store.create_context(context_input("engineering")),
