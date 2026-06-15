@@ -1,8 +1,10 @@
 mod cg_main_dep_audit;
 mod context_isolation;
 mod crud;
+mod digest_capture;
 mod discovery;
 mod evidence;
+mod find_via_digests;
 mod graph_context_isolation;
 mod graph_entity_neighborhood;
 mod graph_intention_tree;
@@ -11,6 +13,8 @@ mod graph_traverse;
 mod host_session_substrate_guards;
 mod impact_analysis;
 mod impact_cascade_consolidation;
+mod import_parser;
+mod ingest_batch;
 mod invalidation_lifecycle;
 mod llm_runtime;
 #[cfg(context_graph_internal_test_support)]

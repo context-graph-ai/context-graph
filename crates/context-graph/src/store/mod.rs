@@ -39,6 +39,7 @@ use crate::embedder::nomic::NomicTextEmbedder;
 
 use self::conflict_detection::register_conflict_detection_triggers;
 use self::convert::map_engine_err;
+pub use self::digest::{DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit};
 use self::impact_analysis::register_impact_analysis_trigger;
 pub use self::invalidation_lifecycle::ScopedStore;
 use self::precedent_match::register_precedent_match_trigger;

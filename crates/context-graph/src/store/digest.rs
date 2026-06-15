@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use contextdb_core::{Error as EngineError, Value, VectorIndexRef};
 
-use crate::Result;
 use crate::error::CgError;
 use crate::types::*;
+use crate::{Result, TxId};
 
 use super::Store;
 use super::convert::map_engine_err;
@@ -193,6 +193,91 @@ impl Store {
 
     pub fn admin_overwrite_digest(&self, _id: DigestId, _summary: String) -> Result<()> {
         Err(CgError::ImmutableEntity { kind: "digest" })
+    }
+
+    pub fn find_via_digests(
+        &self,
+        _query: &str,
+        _filter: DigestSearchFilter,
+    ) -> Result<Vec<DigestSearchHit>> {
+        Ok(vec![DigestSearchHit::wrong_canned()])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DigestSearchFilter {
+    pub context_id: Option<ContextId>,
+    pub cross_context: Option<Vec<ContextId>>,
+    pub min_similarity: Option<f32>,
+    pub limit: Option<usize>,
+    pub created_after: Option<TxId>,
+    pub created_before: Option<TxId>,
+    pub include_inactive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DigestSearchHit {
+    pub digest_id: DigestId,
+    pub context_id: ContextId,
+    pub context_label: String,
+    pub created_at: TxId,
+    pub similarity: f32,
+    pub summary: String,
+    pub intention_ids: Vec<IntentionId>,
+    pub intention_texts: Vec<String>,
+    pub decision_ids: Vec<DecisionId>,
+    pub decision_statuses: Vec<DecisionStatus>,
+    pub decision_texts: Vec<String>,
+    pub observation_ids: Vec<ObservationId>,
+    pub observation_texts: Vec<String>,
+    pub extracted_from_edges: Vec<DigestExtractedFromEdge>,
+    pub graph_walk: DigestGraphWalkBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestExtractedFromEdge {
+    pub source_id: uuid::Uuid,
+    pub target_digest_id: DigestId,
+    pub relationship: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigestGraphWalkBoundary {
+    pub target_digest_id: DigestId,
+    pub source_ids: Vec<uuid::Uuid>,
+    pub relationship: String,
+    pub engine_plan: String,
+}
+
+impl DigestSearchHit {
+    fn wrong_canned() -> Self {
+        let digest_id = DigestId::new_v7();
+        Self {
+            digest_id,
+            context_id: ContextId::new_v7(),
+            context_label: "wrong-context".to_string(),
+            created_at: TxId(0),
+            similarity: 0.01,
+            summary: "canned digest hit".to_string(),
+            intention_ids: vec![IntentionId::new_v7()],
+            intention_texts: vec!["canned intention".to_string()],
+            decision_ids: vec![DecisionId::new_v7()],
+            decision_statuses: vec![DecisionStatus::Active],
+            decision_texts: vec!["canned decision".to_string()],
+            observation_ids: Vec::new(),
+            observation_texts: Vec::new(),
+            extracted_from_edges: vec![DigestExtractedFromEdge {
+                source_id: uuid::Uuid::nil(),
+                target_digest_id: digest_id,
+                relationship: "EXTRACTED_FROM".to_string(),
+            }],
+            graph_walk: DigestGraphWalkBoundary {
+                target_digest_id: digest_id,
+                source_ids: vec![uuid::Uuid::nil()],
+                relationship: "EXTRACTED_FROM".to_string(),
+                engine_plan: "canned-local-scan".to_string(),
+            },
+        }
     }
 }
 
