@@ -296,7 +296,7 @@ fn long_session_rolling_condensation_covers_both_ends_no_overflow() {
             expected_items
                 .iter()
                 .filter_map(|item_id| {
-                    report.stable_item_ids.get(*item_id).map(|source_id| {
+                    report.stable_item_ids.get(item_id).map(|source_id| {
                         (
                             *source_id,
                             digest_id.as_uuid(),
