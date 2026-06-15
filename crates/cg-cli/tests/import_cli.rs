@@ -251,6 +251,7 @@ fn cli_import_claude_session_becomes_memory() {
     .map(DecisionId::from);
     let persisted = persisted_decisions_for_intention(store.as_ref(), goal_id);
     let audit_persisted = persisted_decisions_for_intention(store.as_ref(), audit_goal_id);
+    drop(store);
     let second_session = harness.data_root.path().join("session-two.jsonl");
     write_file(&second_session, SECOND_CLAUDE_SESSION);
     let second_import = harness.run(&["import", second_session.to_str().expect("utf8 path")]);
@@ -263,6 +264,7 @@ fn cli_import_claude_session_becomes_memory() {
     .map(IntentionId::from);
     let reopened = persisted_store(store_path.clone());
     let second_persisted = persisted_decisions_for_intention(reopened.as_ref(), second_goal_id);
+    drop(reopened);
     let store_path_ref = store_path.as_deref();
     let mut expected_digest_summaries = vec![
         EXPECTED_CLEAN_CLAUDE_SESSION.to_string(),

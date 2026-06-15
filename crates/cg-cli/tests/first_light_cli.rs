@@ -387,6 +387,7 @@ fn cli_query_via_digest() {
     )
     .map(DecisionId::from);
     let persisted = persisted_decisions_for_intention(store.as_ref(), goal);
+    drop(store);
     let provenance_digest_ids = digest_ids_extracted_from_decision(store_path.as_deref(), current);
 
     assert_eq!(
@@ -498,6 +499,7 @@ fn cli_by_intention() {
         .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
         .map(IntentionId::from);
     let persisted = persisted_decisions_for_intention(store.as_ref(), persisted_intention);
+    drop(store);
     let intention_arg = intention_id
         .as_deref()
         .unwrap_or("__missing_intention_id__");
@@ -549,6 +551,7 @@ fn cli_by_entity() {
         .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
         .map(EntityId::from);
     let persisted = persisted_decisions_for_entity(store.as_ref(), persisted_entity);
+    drop(store);
     let entity_arg = entity_id.as_deref().unwrap_or("__missing_entity_id__");
     let walk = harness.run(&["by-entity", entity_arg]);
     let wrong_id = format!("{entity_arg}-wrong");
@@ -724,6 +727,7 @@ fn cli_query_and_impact_emit_stable_ids_consumed_by_walk_verbs() {
         .map(EntityId::from);
     let by_intention_rows = persisted_decisions_for_intention(store.as_ref(), persisted_intention);
     let by_entity_rows = persisted_decisions_for_entity(store.as_ref(), persisted_entity);
+    drop(store);
     let intention_arg = intention_id
         .as_deref()
         .unwrap_or("__missing_intention_id__");
