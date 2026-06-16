@@ -1,9 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use context_graph::ingest::{
-    CaptureMode, CaptureRequest, HarvestCounts, RollingIngestRequest, RuntimeModelInfo,
-    embed_digest_summary_for_connected_embedders, record_conversation, register_runtime_model_info,
-    rolling_condense_for_connected_model, rolling_condense_into_store,
+    CaptureMode, CaptureRequest, ConversationExtractor, EntitySeed, ExtractedEntityType,
+    ExtractionRequest, GoalSeed, HarvestCounts, ObservationSeed, RollingCaptureRequest,
+    RollingIngestRequest, RuntimeModelInfo, StructuredHarvest,
+    capture_rolling_conversation_for_model_with_extractor,
+    capture_rolling_conversation_with_extractor, embed_digest_summary_for_connected_embedders,
+    record_conversation, register_runtime_model_info,
 };
 use context_graph::{
     CgError, Embedder, EmbeddingInput, EmbeddingOutput, EmbeddingSpace, EvidenceKind, Store,
@@ -46,60 +49,6 @@ fn text_values(db_path: &std::path::Path, table: &str, column: &str) -> Vec<Stri
     values
 }
 
-fn uuid_text_rows(
-    db_path: &std::path::Path,
-    table: &str,
-    text_column: &str,
-) -> Vec<(uuid::Uuid, String)> {
-    let db = Database::open(db_path).expect("raw db");
-    let mut rows = db
-        .scan(table, db.snapshot())
-        .expect("scan table")
-        .into_iter()
-        .filter_map(|row| {
-            let id = match row.values.get("id")? {
-                Value::Uuid(id) => *id,
-                _ => return None,
-            };
-            let text = match row.values.get(text_column)? {
-                Value::Text(text) => text.clone(),
-                _ => return None,
-            };
-            Some((id, text))
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    rows
-}
-
-fn persisted_extracted_from_edges(
-    db_path: &std::path::Path,
-) -> Vec<(uuid::Uuid, uuid::Uuid, String)> {
-    let db = Database::open(db_path).expect("raw db");
-    let mut edges = db
-        .scan("edges", db.snapshot())
-        .expect("scan edges")
-        .into_iter()
-        .filter_map(|row| {
-            let relationship = match row.values.get("edge_type")? {
-                Value::Text(edge_type) if edge_type == "EXTRACTED_FROM" => edge_type.clone(),
-                _ => return None,
-            };
-            let source = match row.values.get("source_id")? {
-                Value::Uuid(id) => *id,
-                _ => return None,
-            };
-            let target = match row.values.get("target_id")? {
-                Value::Uuid(id) => *id,
-                _ => return None,
-            };
-            Some((source, target, relationship))
-        })
-        .collect::<Vec<_>>();
-    edges.sort();
-    edges
-}
-
 fn persisted_stream_snapshot(db_path: &std::path::Path) -> (Vec<uuid::Uuid>, usize, usize, usize) {
     let db = Database::open(db_path).expect("raw db");
     let snapshot = db.snapshot();
@@ -135,15 +84,6 @@ fn generated_multi_chunk_session() -> String {
         "chunk 002 MID_ONLY_SENTINEL Observation O_mid: token lifetime policy reviewed. Decision D_mid: JWT access token lifetime is 15 minutes.",
         &"more neutral filler without auth facts. ".repeat(180),
         "chunk 003 LATE_ONLY_SENTINEL Observation O_late: auth module renamed src/auth.py -> src/authentication.py. Decision D_new: auth module at src/authentication.py.",
-    ]
-    .join("\n")
-}
-
-fn generated_final_summary_only_session() -> String {
-    [
-        "chunk 001 EARLY_PIN_SENTINEL Goal I_early: keep the original auth path decision discoverable.",
-        &"intermediate text with no early sentinel. ".repeat(240),
-        "chunk 009 final summary mentions only LATE_SUMMARY_SENTINEL and says auth module now lives at src/authentication.py.",
     ]
     .join("\n")
 }
@@ -201,6 +141,65 @@ fn register_runtime_model(
     .expect("register runtime model metadata");
 }
 
+#[derive(Clone, Default)]
+struct SpyRollingExtractor {
+    prompts: Arc<Mutex<Vec<String>>>,
+}
+
+impl SpyRollingExtractor {
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().expect("spy prompts").clone()
+    }
+}
+
+impl ConversationExtractor for SpyRollingExtractor {
+    fn extract(&self, request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        self.prompts
+            .lock()
+            .expect("spy prompts")
+            .push(request.transcript.to_string());
+        let source = source_chunk_from_prompt(request.transcript);
+        let mut harvest = StructuredHarvest::default();
+        if source.contains("SENTINEL_OPEN") || source.contains("SENTINEL_CLOSE") {
+            harvest.goals.push(GoalSeed {
+                key: "G_sentinel".to_string(),
+                text: "preserve sentinel memory across a long session".to_string(),
+            });
+            harvest.entities.push(EntitySeed {
+                key: "E_sentinel".to_string(),
+                name: "sentinel session memory".to_string(),
+                path: "memory://sentinel-session".to_string(),
+                entity_type: ExtractedEntityType::Document,
+            });
+        }
+        if source.contains("SENTINEL_OPEN") {
+            harvest.observations.push(ObservationSeed {
+                key: "O_open".to_string(),
+                text: "SENTINEL_OPEN appeared near the start of the long session".to_string(),
+                entity_key: Some("E_sentinel".to_string()),
+                path_change: None,
+            });
+        }
+        if source.contains("SENTINEL_CLOSE") {
+            harvest.observations.push(ObservationSeed {
+                key: "O_close".to_string(),
+                text: "SENTINEL_CLOSE appeared near the end of the long session".to_string(),
+                entity_key: Some("E_sentinel".to_string()),
+                path_change: None,
+            });
+        }
+        Ok(harvest)
+    }
+}
+
+fn source_chunk_from_prompt(prompt: &str) -> String {
+    prompt
+        .rsplit_once("Next session chunk:\n")
+        .map(|(_, chunk)| chunk)
+        .unwrap_or(prompt)
+        .to_string()
+}
+
 struct CapturingSequenceEmbedder {
     space_id: &'static str,
     max_sequence: usize,
@@ -245,119 +244,58 @@ impl Embedder for CapturingSequenceEmbedder {
 fn long_session_rolling_condensation_covers_both_ends_no_overflow() {
     let (dir, store) = fresh_store();
     let db_path = dir.path().join("cg.db");
-    let transcript = generated_multi_chunk_session();
-    let report =
-        rolling_condense_into_store(&store, &transcript, 1_024).expect("rolling seam returns");
+    let transcript = format!(
+        "SENTINEL_OPEN{}SENTINEL_CLOSE",
+        "plainprosefiller".repeat(420)
+    );
+    let extractor = SpyRollingExtractor::default();
+    let report = capture_rolling_conversation_with_extractor(
+        &store,
+        RollingCaptureRequest {
+            context_label: "rolling-import".to_string(),
+            transcript: transcript.clone(),
+            chunk_window: 1_024,
+            running_state_cap_tokens: 4_096,
+            model_context_tokens: Some(200_000),
+        },
+        &extractor,
+    )
+    .expect("rolling seam returns");
+    let prompts = extractor.prompts();
+    let source_chunks = prompts
+        .iter()
+        .map(|prompt| source_chunk_from_prompt(prompt))
+        .collect::<Vec<_>>();
     drop(store);
-    let reopened = Store::open(StoreConfig {
-        db_path: db_path.clone(),
-        default_text_embedder: None,
-        ..Default::default()
-    })
-    .expect("reopen after rolling ingest");
-    let text_vectors = reopened
-        .count_vectors_in_space("text_default_nomic_v1_5_768")
-        .expect("count text vectors");
-    drop(reopened);
-    let intention_rows = uuid_text_rows(&db_path, "intentions", "description");
-    let decision_rows = uuid_text_rows(&db_path, "decisions", "description");
     let observation_types = text_values(&db_path, "observations", "observation_type");
-    let persisted_edges = persisted_extracted_from_edges(&db_path);
-    let digest_summaries = text_values(&db_path, "digests", "summary");
 
-    assert!(
-        report.pass_count > 1,
-        "long-session condensation must actually cross at least one chunk boundary"
-    );
-    assert!(
-        report.max_prompt_tokens_seen <= 1_024,
-        "rolling condensation must keep each pass inside the configured window"
-    );
-    assert!(report.wrote_digest);
     assert_eq!(
         (
+            report.import_chunks,
+            prompts.len(),
+            prompts.len() > 1,
+            source_chunks.len(),
+            source_chunks
+                .iter()
+                .all(|chunk| !chunk.is_empty() && chunk.len() <= 1_024),
+            source_chunks.join(""),
             persisted_digest_count(&db_path),
-            text_vectors,
-            intention_rows
+            observation_types
                 .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>(),
-            decision_rows
+                .any(|text| text.contains("SENTINEL_OPEN")),
+            observation_types
                 .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>(),
-            observation_types,
-            report
-                .stable_item_ids
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            persisted_edges,
-            report.discovered_item_ids,
-            report.provenance_edges,
-            digest_summaries
-                .first()
-                .is_some_and(|summary| summary.contains("EARLY_ONLY_SENTINEL")
-                    && summary.contains("LATE_ONLY_SENTINEL")),
+                .any(|text| text.contains("SENTINEL_CLOSE")),
         ),
         (
-            1,
-            1,
-            Vec::<&str>::new(),
-            Vec::<&str>::new(),
-            Vec::<String>::new(),
-            Vec::<&str>::new(),
-            Vec::<(uuid::Uuid, uuid::Uuid, String)>::new(),
-            Vec::<String>::new(),
-            Vec::<context_graph::ingest::ExtractionProvenance>::new(),
+            Some(prompts.len()),
+            prompts.len(),
             true,
-        )
-    );
-}
-
-#[test]
-fn rolling_condensation_preserves_early_and_late_text_without_rederived_items() {
-    let (dir, store) = fresh_store();
-    let db_path = dir.path().join("cg.db");
-    let transcript = generated_final_summary_only_session();
-    let final_summary_only = transcript
-        .rsplit("chunk 009")
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let report =
-        rolling_condense_into_store(&store, &transcript, 512).expect("store-backed rolling ingest");
-    drop(store);
-    let digest_summaries = text_values(&db_path, "digests", "summary");
-
-    assert_eq!(
-        (
-            final_summary_only.contains("EARLY_PIN_SENTINEL"),
-            report.discovered_item_ids,
-            report
-                .stable_item_ids
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            report.provenance_edges,
-            persisted_stream_snapshot(&db_path).1,
-            persisted_stream_snapshot(&db_path).2,
-            persisted_stream_snapshot(&db_path).3,
-            digest_summaries.len(),
-            digest_summaries
-                .first()
-                .is_some_and(|summary| summary.contains("EARLY_PIN_SENTINEL")
-                    && summary.contains("LATE_SUMMARY_SENTINEL")),
-        ),
-        (
-            false,
-            Vec::<String>::new(),
-            Vec::<&str>::new(),
-            Vec::<context_graph::ingest::ExtractionProvenance>::new(),
-            0,
-            0,
-            0,
+            source_chunks.len(),
+            true,
+            transcript,
             1,
+            true,
             true,
         )
     );
@@ -382,7 +320,8 @@ fn streaming_small_context_fails_loud_not_degenerate() {
         ..Default::default()
     })
     .expect("reopen store");
-    let result = rolling_condense_for_connected_model(
+    let extractor = SpyRollingExtractor::default();
+    let result = capture_rolling_conversation_for_model_with_extractor(
         &store,
         rolling_request(
             generated_multi_chunk_session(),
@@ -393,6 +332,7 @@ fn streaming_small_context_fails_loud_not_degenerate() {
             4,
             None,
         ),
+        &extractor,
     );
     drop(store);
     let after = persisted_stream_snapshot(&db_path);
@@ -448,7 +388,8 @@ fn chunk_window_derives_from_connected_model_context_default_haiku_overridable()
         default_text_embedder: None,
         ..Default::default()
     });
-    let big = rolling_condense_for_connected_model(
+    let extractor = SpyRollingExtractor::default();
+    let big = capture_rolling_conversation_for_model_with_extractor(
         &store,
         rolling_request(
             "metadata-driven big model transcript".to_string(),
@@ -459,9 +400,10 @@ fn chunk_window_derives_from_connected_model_context_default_haiku_overridable()
             carried,
             None,
         ),
+        &extractor,
     )
     .expect("big model rolling ingest seam returns");
-    let small = rolling_condense_for_connected_model(
+    let small = capture_rolling_conversation_for_model_with_extractor(
         &store,
         rolling_request(
             "metadata-driven small model transcript".to_string(),
@@ -472,9 +414,10 @@ fn chunk_window_derives_from_connected_model_context_default_haiku_overridable()
             carried,
             None,
         ),
+        &extractor,
     )
     .expect("small model rolling ingest seam returns");
-    let explicit = rolling_condense_for_connected_model(
+    let explicit = capture_rolling_conversation_for_model_with_extractor(
         &store,
         rolling_request(
             "metadata-driven override transcript".to_string(),
@@ -485,6 +428,7 @@ fn chunk_window_derives_from_connected_model_context_default_haiku_overridable()
             carried,
             Some(777),
         ),
+        &extractor,
     )
     .expect("override rolling ingest seam returns");
 
@@ -588,7 +532,8 @@ fn chunk_boundary_exact_window_is_single_pass() {
         default_text_embedder: None,
         ..Default::default()
     });
-    let exact = rolling_condense_for_connected_model(
+    let extractor = SpyRollingExtractor::default();
+    let exact = capture_rolling_conversation_for_model_with_extractor(
         &store,
         rolling_request(
             "x".repeat(window),
@@ -599,9 +544,10 @@ fn chunk_boundary_exact_window_is_single_pass() {
             carried,
             None,
         ),
+        &extractor,
     )
     .expect("exact");
-    let overflow = rolling_condense_for_connected_model(
+    let overflow = capture_rolling_conversation_for_model_with_extractor(
         &store,
         rolling_request(
             "x".repeat(window + 1),
@@ -612,19 +558,20 @@ fn chunk_boundary_exact_window_is_single_pass() {
             carried,
             None,
         ),
+        &extractor,
     )
     .expect("overflow");
 
     assert_eq!(
         (
             exact.resolved_chunk_window,
-            exact.pass_count,
+            exact.import_chunks,
             exact.wrote_digest,
             overflow.resolved_chunk_window,
-            overflow.pass_count,
+            overflow.import_chunks,
             overflow.wrote_digest,
         ),
-        (Some(window), 1, true, Some(window), 2, true)
+        (Some(window), Some(1), true, Some(window), Some(2), true)
     );
 }
 
