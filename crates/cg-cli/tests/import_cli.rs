@@ -4,10 +4,45 @@ use context_graph::{DecisionId, DecisionStatus, DiscoveryFilter, IntentionId, St
 use contextdb_core::Value;
 use contextdb_engine::Database;
 use serde_json::Value as JsonValue;
-use support::{CliHarness, CommandOutput, write_file};
+use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider, write_file};
 
 fn combined(output: &CommandOutput) -> String {
     format!("{}\n{}", output.stdout, output.stderr)
+}
+
+fn extraction_harness() -> CliHarness {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Claude,
+        "developer@example.test",
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    let login = harness.run(&[
+        "model",
+        "auth",
+        "login",
+        "--connection",
+        "claude",
+        "--consent",
+    ]);
+    assert_eq!(
+        login.code,
+        0,
+        "fake host login failed: {}",
+        combined(&login)
+    );
+    let selftest = harness.run(&["selftest"]);
+    assert_eq!(
+        selftest.code,
+        0,
+        "fake host selftest failed: {}",
+        combined(&selftest)
+    );
+    harness
+        .providers
+        .set_behavior(Provider::Claude, CompletionBehavior::ExtractHarvest);
+    harness
 }
 
 fn output_json(output: &CommandOutput) -> Option<JsonValue> {
@@ -190,30 +225,53 @@ fn persisted_text_values(path: Option<&std::path::Path>, table: &str, column: &s
 }
 
 const CLAUDE_SESSION: &str = r#"{"type":"system","content":"Goal: raw system decoy should not persist. Decision: raw system decoy should not persist."}
-{"type":"user","message":{"content":[{"type":"text","text":"Goal: ship password-less login for acme"}]}}
-{"type":"user","message":{"content":[{"type":"text","text":"Goal: keep audit trail for auth migrations"}]}}
-{"type":"assistant","message":{"content":[{"type":"tool_use","name":"grep","input":{"query":"Decision: raw tool-use decoy should not persist"}},{"type":"text","text":"Decision: auth module at src/auth.py"}]}}
+{"type":"user","message":{"content":[{"type":"text","text":"For Acme, we need password-less login to ship this sprint, and we need an audit trail for every auth migration."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"grep","input":{"query":"Decision: raw tool-use decoy should not persist"}},{"type":"text","text":"I found the current auth module at src/auth.py."}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_result","content":"Observation: raw tool-result decoy should not persist"}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Decision: use JWT with 15-min access tokens"}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Decision: write auth migration notes to docs/auth-migration.md"}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Observation: auth module file observed at src/auth.py"}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Observation: auth tests cover password-less login"}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Observation: JWT refresh token TTL remains 7 days"}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Observation: audit trail lives in docs/auth-migration.md"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Let's use JWT with 15-min access tokens for the login flow."}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Write the auth migration notes to docs/auth-migration.md so reviewers can audit the change."}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Current facts: the auth module file is observed at src/auth.py, auth tests cover password-less login, JWT refresh token TTL remains 7 days, and the audit trail lives in docs/auth-migration.md."}]}}
 "#;
 
-const EXPECTED_CLEAN_CLAUDE_SESSION: &str = "User: Goal: ship password-less login for acme\nUser: Goal: keep audit trail for auth migrations\nAssistant: Decision: auth module at src/auth.py\nAssistant: Decision: use JWT with 15-min access tokens\nAssistant: Decision: write auth migration notes to docs/auth-migration.md\nAssistant: Observation: auth module file observed at src/auth.py\nAssistant: Observation: auth tests cover password-less login\nAssistant: Observation: JWT refresh token TTL remains 7 days\nAssistant: Observation: audit trail lives in docs/auth-migration.md\n";
+const EXPECTED_CLEAN_CLAUDE_SESSION: &str = "User: For Acme, we need password-less login to ship this sprint, and we need an audit trail for every auth migration.\nAssistant: I found the current auth module at src/auth.py.\nAssistant: Let's use JWT with 15-min access tokens for the login flow.\nAssistant: Write the auth migration notes to docs/auth-migration.md so reviewers can audit the change.\nAssistant: Current facts: the auth module file is observed at src/auth.py, auth tests cover password-less login, JWT refresh token TTL remains 7 days, and the audit trail lives in docs/auth-migration.md.\n";
 
-const SECOND_CLAUDE_SESSION: &str = r#"{"type":"user","message":{"content":[{"type":"text","text":"Goal: reduce checkout latency"}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Decision: cache product catalog in memory"}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Observation: checkout latency p95 dropped to 220ms"}]}}
+const SECOND_CLAUDE_SESSION: &str = r#"{"type":"user","message":{"content":[{"type":"text","text":"Checkout is slow; the goal is to reduce checkout latency before the next launch."}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"We should cache the product catalog in memory for the checkout service."}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"After the change, checkout latency p95 dropped to 220ms."}]}}
 "#;
 
-const EXPECTED_CLEAN_SECOND_CLAUDE_SESSION: &str = "User: Goal: reduce checkout latency\nAssistant: Decision: cache product catalog in memory\nAssistant: Observation: checkout latency p95 dropped to 220ms\n";
+const EXPECTED_CLEAN_SECOND_CLAUDE_SESSION: &str = "User: Checkout is slow; the goal is to reduce checkout latency before the next launch.\nAssistant: We should cache the product catalog in memory for the checkout service.\nAssistant: After the change, checkout latency p95 dropped to 220ms.\n";
+
+const AUTH_REPLACEMENT_CLAUDE_SESSION: &str = r#"{"type":"user","message":{"content":[{"type":"text","text":"We are migrating the auth handler this week."}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Replace the auth handler with src/authentication.py."}]}}
+"#;
+
+fn compact_expected_session(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn large_chunked_session(lines: usize) -> String {
+    let mut session = String::new();
+    for index in 0..lines {
+        let filler = format!(" background-{index}").repeat(500);
+        let text = format!(
+            "Goal G{index}: keep service-{index} reliable. \
+Entity E{index}: service-{index} path=services/{index}. \
+Decision D{index}: route service-{index} through queue serves G{index} based_on E{index}. \
+Observation O{index}: E{index} queue verified. {filler}"
+        );
+        let encoded = serde_json::to_string(&text).expect("json string");
+        session.push_str(&format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"text","text":{encoded}}}]}}}}"#
+        ));
+        session.push('\n');
+    }
+    session
+}
 
 #[test]
 fn cli_import_claude_session_becomes_memory() {
-    let harness = CliHarness::new();
+    let harness = extraction_harness();
     let session = harness.data_root.path().join("session.jsonl");
     write_file(&session, CLAUDE_SESSION);
 
@@ -267,8 +325,8 @@ fn cli_import_claude_session_becomes_memory() {
     drop(reopened);
     let store_path_ref = store_path.as_deref();
     let mut expected_digest_summaries = vec![
-        EXPECTED_CLEAN_CLAUDE_SESSION.to_string(),
-        EXPECTED_CLEAN_SECOND_CLAUDE_SESSION.to_string(),
+        compact_expected_session(EXPECTED_CLEAN_CLAUDE_SESSION),
+        compact_expected_session(EXPECTED_CLEAN_SECOND_CLAUDE_SESSION),
     ];
     expected_digest_summaries.sort();
 
@@ -311,7 +369,7 @@ fn cli_import_claude_session_becomes_memory() {
             intentions: 3,
             decisions: 4,
             observations: 5,
-            extracted_from_edges: 12,
+            extracted_from_edges: 14,
         }
     );
     assert_eq!(
@@ -369,8 +427,8 @@ fn cli_import_claude_session_becomes_memory() {
         ),
         (
             vec![
-                ("auth module at src/auth.py", DecisionStatus::Active),
                 ("use JWT with 15-min access tokens", DecisionStatus::Active),
+                ("auth module at src/auth.py", DecisionStatus::Active),
             ],
             vec![("cache product catalog in memory", DecisionStatus::Active)],
             vec![(
@@ -410,6 +468,171 @@ fn cli_import_claude_session_becomes_memory() {
 }
 
 #[test]
+fn cli_import_streams_large_jsonl_in_bounded_chunks() {
+    let harness = extraction_harness();
+    let session = harness.data_root.path().join("large-session.jsonl");
+    write_file(&session, &large_chunked_session(18));
+
+    let before_calls = harness.providers.completion_count();
+    let dry_run = harness.run(&["import", "--dry-run", session.to_str().expect("utf8 path")]);
+    let import = harness.run(&["import", session.to_str().expect("utf8 path")]);
+    let completion_calls = harness.providers.completion_count() - before_calls;
+    let import_json = output_json(&import).expect("import json");
+    let dry_run_json = output_json(&dry_run).expect("dry run json");
+    let persisted = persisted_counts(store_path_from(&[&import]).as_deref());
+
+    assert_eq!(dry_run.code, 0, "dry run failed: {}", combined(&dry_run));
+    assert_eq!(import.code, 0, "import failed: {}", combined(&import));
+    assert!(
+        dry_run_json
+            .get("chunks")
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|chunks| chunks > 1),
+        "dry-run must stream the large JSONL into multiple bounded chunks: {}",
+        dry_run.stdout
+    );
+    assert!(
+        completion_calls > 1,
+        "large import must call the extractor once per bounded chunk, before={before_calls}, after={}",
+        harness.providers.completion_count()
+    );
+    assert!(
+        import_json
+            .get("message")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|message| message.starts_with("captured import in ")),
+        "chunked import should report chunked capture: {}",
+        import.stdout
+    );
+    assert!(
+        matches!(memory_counts(&import), Some((goals, decisions, observations)) if goals >= 18 && decisions >= 18 && observations >= 18),
+        "chunked import must aggregate extracted counts: {}",
+        import.stdout
+    );
+    assert!(
+        persisted.digests > 1
+            && persisted.intentions >= 18
+            && persisted.decisions >= 18
+            && persisted.observations >= 18,
+        "chunked import must persist memory from multiple chunks: {persisted:?}"
+    );
+}
+
+#[test]
+fn cli_import_without_model_is_verbatim_no_derived_graph() {
+    let harness = CliHarness::new();
+    let session = harness.data_root.path().join("session.jsonl");
+    write_file(&session, CLAUDE_SESSION);
+
+    let import = harness.run(&["import", session.to_str().expect("utf8 path")]);
+    let status = harness.run(&["status"]);
+    let store_path = store_path_from(&[&import, &status]);
+    let store_path_ref = store_path.as_deref();
+
+    assert_eq!(
+        (
+            import.code,
+            memory_counts(&status),
+            persisted_counts(store_path_ref),
+            persisted_text_values(store_path_ref, "digests", "summary"),
+            persisted_text_values(store_path_ref, "intentions", "description"),
+            persisted_text_values(store_path_ref, "decisions", "description"),
+        ),
+        (
+            0,
+            Some((0, 0, 0)),
+            PersistedCounts {
+                contexts: 1,
+                digests: 1,
+                intentions: 0,
+                decisions: 0,
+                observations: 0,
+                extracted_from_edges: 0,
+            },
+            vec![EXPECTED_CLEAN_CLAUDE_SESSION.trim_end().to_string()],
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        )
+    );
+    let text = combined(&import);
+    assert!(text.contains("model-free capture"));
+    assert!(text.contains("no derived graph"));
+}
+
+#[test]
+fn cli_import_auth_replacement_uses_extractor_not_record_shorthand() {
+    let harness = extraction_harness();
+    let session = harness.data_root.path().join("auth-replacement.jsonl");
+    write_file(&session, AUTH_REPLACEMENT_CLAUDE_SESSION);
+
+    let import = harness.run(&["import", session.to_str().expect("utf8 path")]);
+    let status = harness.run(&["status"]);
+    let store_path = store_path_from(&[&import, &status]);
+    let store_path_ref = store_path.as_deref();
+
+    assert_eq!(
+        (
+            import.code,
+            memory_counts(&status),
+            persisted_counts(store_path_ref),
+            persisted_text_values(store_path_ref, "intentions", "description"),
+            persisted_text_values(store_path_ref, "decisions", "description"),
+        ),
+        (
+            0,
+            Some((1, 1, 0)),
+            PersistedCounts {
+                contexts: 1,
+                digests: 1,
+                intentions: 1,
+                decisions: 1,
+                observations: 0,
+                extracted_from_edges: 3,
+            },
+            vec!["migrate auth handler".to_string()],
+            vec!["replace auth handler with src/authentication.py".to_string()],
+        )
+    );
+}
+
+#[test]
+fn cli_record_auth_replacement_uses_extractor_not_record_shorthand() {
+    let harness = extraction_harness();
+
+    let record = harness.run_with_stdin(
+        &["record"],
+        "We are migrating the auth handler this week. Replace the auth handler with src/authentication.py.",
+    );
+    let status = harness.run(&["status"]);
+    let store_path = store_path_from(&[&record, &status]);
+    let store_path_ref = store_path.as_deref();
+
+    assert_eq!(
+        (
+            record.code,
+            memory_counts(&status),
+            persisted_counts(store_path_ref),
+            persisted_text_values(store_path_ref, "intentions", "description"),
+            persisted_text_values(store_path_ref, "decisions", "description"),
+        ),
+        (
+            0,
+            Some((1, 1, 0)),
+            PersistedCounts {
+                contexts: 1,
+                digests: 1,
+                intentions: 1,
+                decisions: 1,
+                observations: 0,
+                extracted_from_edges: 3,
+            },
+            vec!["migrate auth handler".to_string()],
+            vec!["replace auth handler with src/authentication.py".to_string()],
+        )
+    );
+}
+
+#[test]
 fn cli_import_rejects_bulk_single_file_only() {
     let harness = CliHarness::new();
     let bulk_dir = tempfile::tempdir().expect("bulk dir");
@@ -428,7 +651,7 @@ fn cli_record_is_clean_text_escape_hatch_not_a_parser() {
     let session = harness.data_root.path().join("session.jsonl");
     write_file(&session, CLAUDE_SESSION);
 
-    let import_harness = CliHarness::new();
+    let import_harness = extraction_harness();
     let import_session = import_harness.data_root.path().join("session.jsonl");
     write_file(&import_session, CLAUDE_SESSION);
     let import = import_harness.run(&["import", import_session.to_str().expect("utf8 path")]);
@@ -486,9 +709,9 @@ fn cli_record_is_clean_text_escape_hatch_not_a_parser() {
                 intentions: 2,
                 decisions: 3,
                 observations: 4,
-                extracted_from_edges: 9,
+                extracted_from_edges: 10,
             },
-            vec![EXPECTED_CLEAN_CLAUDE_SESSION.to_string()],
+            vec![compact_expected_session(EXPECTED_CLEAN_CLAUDE_SESSION)],
             vec![
                 "keep audit trail for auth migrations".to_string(),
                 "ship password-less login for acme".to_string(),

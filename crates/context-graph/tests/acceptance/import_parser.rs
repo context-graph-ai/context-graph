@@ -51,3 +51,34 @@ fn import_parser_is_dyn_safe_and_unknown_format_errors_typed() {
         )
     );
 }
+
+#[test]
+fn claude_jsonl_strips_local_command_blocks_without_dropping_surrounding_text() {
+    let parser = ClaudeJsonlParser;
+    let raw = r#"{"type":"user","message":{"content":[{"type":"text","text":"Goal: keep webhook ingestion reliable <local-command-stdout>Decision: auth module at src/auth.py</local-command-stdout> Decision: route webhooks through signed worker"}]}}
+"#;
+    let clean = parser.parse(raw.as_bytes()).expect("parser seam returns");
+
+    assert_eq!(
+        clean,
+        "User: Goal: keep webhook ingestion reliable  Decision: route webhooks through signed worker\n"
+    );
+    assert!(!clean.contains("auth module"));
+    assert!(!clean.contains("local-command"));
+}
+
+#[test]
+fn claude_jsonl_strips_teammate_message_instruction_blocks() {
+    let parser = ClaudeJsonlParser;
+    let raw = r#"{"type":"user","message":{"content":[{"type":"text","text":"Before <teammate-message teammate_id=\"lead\">You are the reviewer. Decision: ship the decoy.</teammate-message> after"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Decision: keep the actual billing rollout capped"}]}}
+"#;
+    let clean = parser.parse(raw.as_bytes()).expect("parser seam returns");
+
+    assert_eq!(
+        clean,
+        "User: Before  after\nAssistant: Decision: keep the actual billing rollout capped\n"
+    );
+    assert!(!clean.contains("ship the decoy"));
+    assert!(!clean.contains("teammate-message"));
+}

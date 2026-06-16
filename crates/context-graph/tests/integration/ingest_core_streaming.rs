@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use context_graph::ingest::{
-    CaptureRequest, HarvestCounts, RollingIngestRequest, RuntimeModelInfo,
+    CaptureMode, CaptureRequest, HarvestCounts, RollingIngestRequest, RuntimeModelInfo,
     embed_digest_summary_for_connected_embedders, record_conversation, register_runtime_model_info,
     rolling_condense_for_connected_model, rolling_condense_into_store,
 };
@@ -12,14 +12,15 @@ use context_graph::{
 use contextdb_core::Value;
 use contextdb_engine::Database;
 
+use super::fake_extractor::open_store_with_lexical_embedder;
+
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(StoreConfig {
+    let store = open_store_with_lexical_embedder(StoreConfig {
         db_path: dir.path().join("cg.db"),
         default_text_embedder: None,
         ..Default::default()
-    })
-    .expect("open store");
+    });
     (dir, store)
 }
 
@@ -308,7 +309,7 @@ fn long_session_rolling_condensation_covers_both_ends_no_overflow() {
         })
         .unwrap_or_default();
 
-    assert_eq!(report.pass_count, 4);
+    assert_eq!(report.pass_count, transcript.len().div_ceil(1_024));
     assert!(report.max_prompt_tokens_seen <= 1_024);
     assert!(report.wrote_digest);
     assert!(source_digest.is_some());
@@ -517,12 +518,11 @@ fn chunk_window_derives_from_connected_model_context_default_haiku_overridable()
         false,
     );
     drop(store);
-    let store = Store::open(StoreConfig {
+    let store = open_store_with_lexical_embedder(StoreConfig {
         db_path,
         default_text_embedder: None,
         ..Default::default()
-    })
-    .expect("reopen store with runtime metadata");
+    });
     let big = rolling_condense_for_connected_model(
         &store,
         rolling_request(
@@ -658,12 +658,11 @@ fn chunk_boundary_exact_window_is_single_pass() {
         true,
     );
     drop(store);
-    let store = Store::open(StoreConfig {
+    let store = open_store_with_lexical_embedder(StoreConfig {
         db_path,
         default_text_embedder: None,
         ..Default::default()
-    })
-    .expect("reopen store with runtime metadata");
+    });
     let exact = rolling_condense_for_connected_model(
         &store,
         rolling_request(
@@ -723,22 +722,23 @@ fn import_empty_jsonl_yields_honest_zero_harvest() {
 }
 
 #[test]
-fn import_tool_only_session_is_honest_empty() {
+fn record_tool_only_without_extractor_stores_verbatim() {
     let (_dir, store) = fresh_store();
     let report = record_conversation(
         &store,
         CaptureRequest {
             context_label: "tool-only-import".to_string(),
             transcript: "tool_use grep\ntool_result src/auth.py".to_string(),
-            model_available: true,
+            model_available: false,
         },
     )
     .expect("capture seam returns");
 
     assert_eq!(report.last_harvest, HarvestCounts::default());
+    assert_eq!(report.mode, CaptureMode::RawVerbatim);
     assert_eq!(
         report.message,
-        "nothing to capture: session contained tool traffic only"
+        "model-free capture: stored verbatim text; no derived graph or impact analysis"
     );
-    assert!(!report.wrote_digest);
+    assert!(report.wrote_digest);
 }

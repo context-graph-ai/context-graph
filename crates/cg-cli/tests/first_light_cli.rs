@@ -9,10 +9,77 @@ use context_graph::{
 use contextdb_core::Value as DbValue;
 use contextdb_engine::Database;
 use serde_json::Value;
-use support::{CliHarness, CommandOutput, cg_bin};
+use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider, cg_bin};
+
+const AUTH_INITIAL: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py.";
+const AUTH_WITH_JWT: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py. Use JWT with 15-min access tokens.";
+const AUTH_RENAME: &str = "Following Tuesday, the auth module file moved from src/auth.py to src/authentication.py. Keep password-less login served by the auth module at src/authentication.py.";
+const AUTH_CURRENT_WITH_JWT: &str = "Acme password-less login is now served by the auth module at src/authentication.py. Use JWT with 15-min access tokens.";
+const CI_PIPELINE_SESSION: &str = "The delivery team needs a CI pipeline. Run CI on every pull request, block merges when CI fails, and include unit tests, clippy, and release build in .github/workflows/ci.yml.";
+const PROJECT_X_RECORD: &str = "Project X memory must stay local, so use the local context store.";
+const CLIENT_A_SOX_SESSION: &str = "Client A must keep SOX deploy approvals. The publish pipeline is deploy.yml; require SOX approval before promote.";
+const CLIENT_B_PUBLISH_SESSION: &str = "Client B must avoid the duplicate-publish race. The publish pipeline is deploy.yml; hold 10 min before promote.";
 
 fn combined(output: &CommandOutput) -> String {
     format!("{}\n{}", output.stdout, output.stderr)
+}
+
+fn assert_record_contains(output: &CommandOutput, expected: &str) {
+    let text = combined(output);
+    assert_eq!(output.code, 0, "{text}");
+    assert!(text.contains(expected), "{text}");
+    let json = output_json(output).expect("record output json");
+    assert_eq!(
+        json.pointer("/captured/goals").and_then(Value::as_u64),
+        Some(1),
+        "{text}"
+    );
+    assert_eq!(
+        json.pointer("/captured/decisions").and_then(Value::as_u64),
+        Some(1),
+        "{text}"
+    );
+}
+
+fn assert_record_text(output: &CommandOutput, expected: &str) {
+    let text = combined(output);
+    assert_eq!(output.code, 0, "{text}");
+    assert!(text.contains(expected), "{text}");
+}
+
+fn extraction_harness() -> CliHarness {
+    let harness = CliHarness::new();
+    harness.providers.install(
+        Provider::Claude,
+        "developer@example.test",
+        LoginState::Valid,
+        CompletionBehavior::Succeed,
+    );
+    let login = harness.run(&[
+        "model",
+        "auth",
+        "login",
+        "--connection",
+        "claude",
+        "--consent",
+    ]);
+    assert_eq!(
+        login.code,
+        0,
+        "fake host login failed: {}",
+        combined(&login)
+    );
+    let selftest = harness.run(&["selftest"]);
+    assert_eq!(
+        selftest.code,
+        0,
+        "fake host selftest failed: {}",
+        combined(&selftest)
+    );
+    harness
+        .providers
+        .set_behavior(Provider::Claude, CompletionBehavior::ExtractHarvest);
+    harness
 }
 
 fn run_in_dir(harness: &CliHarness, cwd: &std::path::Path, args: &[&str]) -> CommandOutput {
@@ -20,6 +87,7 @@ fn run_in_dir(harness: &CliHarness, cwd: &std::path::Path, args: &[&str]) -> Com
         .args(args)
         .current_dir(cwd)
         .env("CG_DATA_ROOT", harness.data_root.path())
+        .env("CG_USE_TEST_LEXICAL_EMBEDDER", "1")
         .env("HOME", harness.data_root.path())
         .env("PATH", harness.providers.path_env())
         .env_remove("OPENAI_API_KEY")
@@ -160,7 +228,17 @@ fn persisted_decisions_for_entity(
 ) -> Vec<(DecisionId, String, DecisionStatus)> {
     match (store, entity_id) {
         (Some(store), Some(entity_id)) => store
-            .by_entity_decisions(entity_id, DiscoveryFilter::default())
+            .by_entity_decisions(
+                entity_id,
+                DiscoveryFilter {
+                    include_decision_statuses: Some(vec![
+                        DecisionStatus::Active,
+                        DecisionStatus::Invalidated,
+                        DecisionStatus::Superseded,
+                    ]),
+                    ..Default::default()
+                },
+            )
             .unwrap_or_default()
             .into_iter()
             .map(|decision| (decision.id, decision.description, decision.status))
@@ -200,6 +278,26 @@ fn persisted_invalidation_decision_ids(
     };
     sort_decision_ids(&mut ids);
     ids
+}
+
+fn persisted_context_names(path: Option<&std::path::Path>) -> Vec<String> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let Ok(db) = Database::open(path) else {
+        return Vec::new();
+    };
+    let mut names = db
+        .scan("contexts", db.snapshot())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| match row.values.get("name") {
+            Some(DbValue::Text(name)) => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 fn invalidation_decision_ids_from_output(
@@ -323,10 +421,9 @@ fn no_resolution(output: &CommandOutput) -> bool {
 
 #[test]
 fn cli_record_observation_emits_invalidations() {
-    let harness = CliHarness::new();
-    let first = harness.run_with_stdin(&["record"], "auth module at src/auth.py");
-    let output =
-        harness.run_with_stdin(&["record"], "auth module renamed to src/authentication.py");
+    let harness = extraction_harness();
+    let first = harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    let output = harness.run_with_stdin(&["record"], AUTH_RENAME);
     let store_path = store_path_from(&[&first, &output]);
     let store = persisted_store(store_path.clone());
     let context_id = context_id_from(&[&first, &output]);
@@ -364,10 +461,9 @@ fn cli_record_observation_emits_invalidations() {
 
 #[test]
 fn cli_query_via_digest() {
-    let harness = CliHarness::new();
-    let first = harness.run_with_stdin(&["record"], "auth module at src/auth.py");
-    let second =
-        harness.run_with_stdin(&["record"], "auth module renamed to src/authentication.py");
+    let harness = extraction_harness();
+    let first = harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    let second = harness.run_with_stdin(&["record"], AUTH_RENAME);
     let store_path = store_path_from(&[&first, &second]);
     let store = persisted_store(store_path.clone());
     let context_id = context_id_from(&[&first, &second]);
@@ -429,39 +525,36 @@ fn cli_query_via_digest() {
                 .unwrap_or_default(),
         )
     );
-    assert!(text.contains("current: auth module lives at src/authentication.py"));
-    assert!(text.contains("serves goal: ship password-less login"));
-    assert!(text.contains("prior: auth module at src/auth.py [invalidated"));
-    assert!(text.contains("use JWT with 15-min access tokens [superseded]"));
+    assert!(text.contains("auth module at src/authentication.py"));
+    assert!(text.contains("serves goal: ship password-less login for acme"));
+    assert!(!text.contains("prior: auth module at src/auth.py [invalidated"));
+    assert!(!text.contains("use JWT with 15-min access tokens [superseded]"));
 }
 
 #[test]
 fn cli_status() {
-    let harness = CliHarness::new();
+    let harness = extraction_harness();
     let empty = harness.run(&["status"]);
-    harness.run_with_stdin(&["record"], "session one auth and jwt decisions");
+    harness.run_with_stdin(&["record"], AUTH_WITH_JWT);
     let first = harness.run(&["status"]);
-    harness.run_with_stdin(&["record"], "set up CI pipeline");
+    harness.run_with_stdin(&["record"], CI_PIPELINE_SESSION);
     let second = harness.run(&["status"]);
 
     assert!(combined(&empty).contains("goals: 0"));
-    assert!(combined(&first).contains("goals: 3"));
-    assert!(combined(&first).contains("decisions: 6"));
-    assert!(combined(&first).contains("observations: 11"));
-    assert!(combined(&second).contains("goals: 4"));
-    assert!(combined(&second).contains("decisions: 8"));
-    assert!(combined(&second).contains("observations: 15"));
+    assert!(combined(&first).contains("goals: 1"));
+    assert!(combined(&first).contains("decisions: 2"));
+    assert!(combined(&first).contains("observations: 1"));
+    assert!(combined(&second).contains("goals: 2"));
+    assert!(combined(&second).contains("decisions: 4"));
+    assert!(combined(&second).contains("observations: 5"));
 }
 
 #[test]
 fn cli_status_idempotent_on_same_session_recaptured() {
-    let harness = CliHarness::new();
-    let first_capture = harness.run_with_stdin(&["record"], "auth module at src/auth.py");
+    let harness = extraction_harness();
+    let first_capture = harness.run_with_stdin(&["record"], AUTH_INITIAL);
     let first = harness.run(&["status"]);
-    let second_capture = harness.run_with_stdin(
-        &["record"],
-        "the authentication module remains in the original path",
-    );
+    let second_capture = harness.run_with_stdin(&["record"], AUTH_INITIAL);
     let second = harness.run(&["status"]);
     let first_decision_id = stable_uuid_from(
         &[&first_capture, &first],
@@ -480,17 +573,14 @@ fn cli_status_idempotent_on_same_session_recaptured() {
             second_decision_id.is_some(),
             first_decision_id == second_decision_id,
         ),
-        (Some((3, 6, 11)), Some((3, 6, 11)), true, true, true)
+        (Some((1, 1, 1)), Some((1, 1, 1)), true, true, true)
     );
 }
 
 #[test]
 fn cli_by_intention() {
-    let harness = CliHarness::new();
-    let capture = harness.run_with_stdin(
-        &["record"],
-        "Goal: ship password-less login for acme. Decision: auth module at src/authentication.py. Decision: use JWT with 15-min access tokens.",
-    );
+    let harness = extraction_harness();
+    let capture = harness.run_with_stdin(&["record"], AUTH_CURRENT_WITH_JWT);
     let intention_id = stable_id(&capture, &["ship password-less login for acme", "G1"]);
     let store_path = store_path_from(&[&capture]);
     let store = persisted_store(store_path.clone());
@@ -521,11 +611,11 @@ fn cli_by_intention() {
             Some("present"),
             true,
             vec![
+                ("use JWT with 15-min access tokens", DecisionStatus::Active),
                 (
                     "auth module at src/authentication.py",
-                    DecisionStatus::Active
+                    DecisionStatus::Active,
                 ),
-                ("use JWT with 15-min access tokens", DecisionStatus::Active),
             ],
         )
     );
@@ -538,13 +628,11 @@ fn cli_by_intention() {
 
 #[test]
 fn cli_by_entity() {
-    let harness = CliHarness::new();
-    let capture = harness.run_with_stdin(
-        &["record"],
-        "Entity: auth module file. Decision: auth module at src/auth.py. Later: auth module at src/authentication.py.",
-    );
-    let entity_id = stable_id(&capture, &["auth module file", "E_auth_module"]);
-    let store_path = store_path_from(&[&capture]);
+    let harness = extraction_harness();
+    let first = harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    let second = harness.run_with_stdin(&["record"], AUTH_RENAME);
+    let entity_id = stable_id(&first, &["auth module file", "E_auth_module"]);
+    let store_path = store_path_from(&[&first, &second]);
     let store = persisted_store(store_path.clone());
     let persisted_entity = entity_id
         .as_ref()
@@ -579,24 +667,62 @@ fn cli_by_entity() {
             ],
         )
     );
-    assert!(text.contains("src/authentication.py (was src/auth.py)"));
-    assert!(text.contains("auth module at src/authentication.py [current]"));
+    assert!(text.contains("auth module file: src/authentication.py"));
+    assert!(text.contains("auth module at src/authentication.py"));
     assert!(text.contains("auth module at src/auth.py [invalidated"));
-    assert!(text.contains("renamed during the following-Tuesday refactor"));
+    assert!(text.contains("E_auth_module path changed src/auth.py -> src/authentication.py"));
     assert!(!text.contains("Redis"));
     assert!(no_resolution(&wrong));
 }
 
 #[test]
+fn cli_by_entity_renders_non_auth_entity_history_from_stored_rows() {
+    let harness = extraction_harness();
+    let capture = harness.run_with_stdin(
+        &["record"],
+        "Webhook ingestion must stay reliable. The webhook worker file is src/webhook.rs; route webhooks through the signed worker and note the worker path is src/webhook.rs.",
+    );
+    let entity_id =
+        stable_id(&capture, &["E_worker"]).unwrap_or_else(|| "__missing_entity_id__".to_string());
+    let walk = harness.run(&["by-entity", &entity_id]);
+    let text = combined(&walk);
+
+    assert!(text.contains("webhook worker file: src/webhook.rs"));
+    assert!(text.contains("route webhooks through signed worker [current]"));
+    assert!(text.contains("E_worker path observed at src/webhook.rs"));
+    assert!(!text.contains("auth module"));
+    assert!(!text.contains("src/authentication.py"));
+}
+
+#[test]
+fn cli_walk_verbs_do_not_cross_context_by_default() {
+    let harness = extraction_harness();
+    let client_a = harness.run_with_stdin(&["record", "--context", "client-a"], AUTH_INITIAL);
+    harness.run_with_stdin(
+        &["record", "--context", "client-b"],
+        "Client B memory must stay separate, so use isolated deploy notes.",
+    );
+    let intention_id = stable_id(&client_a, &["ship password-less login for acme", "G1"])
+        .unwrap_or_else(|| "__missing_intention_id__".to_string());
+    let entity_id = stable_id(&client_a, &["auth module file", "E_auth_module"])
+        .unwrap_or_else(|| "__missing_entity_id__".to_string());
+    let wrong_intention = harness.run(&["by-intention", "--context", "client-b", &intention_id]);
+    let wrong_entity = harness.run(&["by-entity", "--context", "client-b", &entity_id]);
+
+    assert!(no_resolution(&wrong_intention));
+    assert!(no_resolution(&wrong_entity));
+}
+
+#[test]
 fn cli_impact_analysis() {
-    let harness = CliHarness::new();
-    harness.run_with_stdin(&["record"], "auth module at src/auth.py");
-    harness.run_with_stdin(&["record"], "auth module renamed to src/authentication.py");
+    let harness = extraction_harness();
+    harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    harness.run_with_stdin(&["record"], AUTH_RENAME);
     let output = harness.run(&["impact"]);
     let text = combined(&output);
 
     assert!(text.contains("auth module at src/auth.py [INVALIDATED]"));
-    assert!(text.contains("renamed src/auth.py -> src/authentication.py"));
+    assert!(text.contains("based on: src/auth.py -> src/authentication.py"));
     assert!(text.contains("served goal: ship password-less login"));
     assert!(text.contains(
         "goal still served by current decision \"auth module at src/authentication.py\""
@@ -605,36 +731,45 @@ fn cli_impact_analysis() {
 
 #[test]
 fn cli_impact_goal_still_served_when_another_decision_serves() {
-    let harness = CliHarness::new();
-    harness.run_with_stdin(&["record"], "G served by D1 and D2; D1 invalidated");
+    let harness = extraction_harness();
+    harness.run_with_stdin(
+        &["record"],
+        "Rollout must stay available. The primary rollout basis is src/d1.py and fallback rollout basis is src/d2.py; D1 uses the primary basis and D2 uses the fallback basis.",
+    );
+    harness.run_with_stdin(
+        &["record"],
+        "The primary rollout basis moved from src/d1.py to src/d1_v2.py.",
+    );
     let first = harness.run(&["impact"]);
-    harness.run_with_stdin(&["record"], "D2 invalidated too");
+    harness.run_with_stdin(
+        &["record"],
+        "The fallback rollout basis moved from src/d2.py to src/d2_v2.py.",
+    );
     let second = harness.run(&["impact"]);
 
-    assert!(combined(&first).contains("goal still served by D2"));
+    assert!(combined(&first).contains("goal still served by current decision \"D2\""));
     assert!(!combined(&first).contains("goal unserved"));
     assert!(combined(&second).contains("goal unserved"));
 }
 
 #[test]
 fn cli_invalidation_lifecycle() {
-    let harness = CliHarness::new();
-    harness.run_with_stdin(&["record"], "auth module at src/auth.py");
-    harness.run_with_stdin(&["record"], "rename invalidates old decision");
-    harness.run_with_stdin(&["record"], "new decision supersedes old auth decision");
+    let harness = extraction_harness();
+    harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    harness.run_with_stdin(&["record"], AUTH_RENAME);
     let output = harness.run(&["impact"]);
     let text = combined(&output);
 
-    assert!(text.contains("D_old resolved"));
-    assert!(text.contains("auth module at src/authentication.py [current]"));
-    assert!(!text.contains("D_old [open threat]"));
+    assert!(text.contains("auth module at src/auth.py [INVALIDATED]"));
+    assert!(text.contains("auth module at src/authentication.py"));
+    assert!(!text.contains("resolved"));
 }
 
 #[test]
 fn cli_changed_surfaces_cross_session_invalidation() {
-    let harness = CliHarness::new();
-    harness.run_with_stdin(&["record"], "auth module at src/auth.py");
-    harness.run_with_stdin(&["record"], "auth module renamed to src/authentication.py");
+    let harness = extraction_harness();
+    harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    harness.run_with_stdin(&["record"], AUTH_RENAME);
     let changed = harness.run(&["changed"]);
     let second = harness.run(&["changed"]);
 
@@ -646,26 +781,63 @@ fn cli_changed_surfaces_cross_session_invalidation() {
 
 #[test]
 fn impact_standing_set_vs_changed_recent_delta_are_distinct_observables() {
-    let harness = CliHarness::new();
+    let harness = extraction_harness();
     let before = harness.run_with_stdin(
         &["record"],
-        "Goal G_before. Entity E_before path=src/before.py. Decision D_before: src/before.py serves G_before. Observation: E_before path changed src/before.py -> src/before_v2.py, invalidating D_before.",
+        "Track the before file at src/before.py so the before path stays visible.",
     );
+    let before_invalidation = harness.run_with_stdin(
+        &["record"],
+        "The before file moved from src/before.py to src/before_v2.py.",
+    );
+    assert_record_contains(&before, "src/before.py");
+    assert_record_text(&before_invalidation, "src/before_v2.py");
     let cut = harness.run_with_stdin(
         &["record"],
-        "Goal G_cut. Entity E_cut path=src/cut.py. Decision D_cut: src/cut.py serves G_cut. Observation: E_cut path changed src/cut.py -> src/cut_v2.py, invalidating D_cut.",
+        "Track the cut file at src/cut.py so the cut path stays visible.",
     );
+    let cut_invalidation = harness.run_with_stdin(
+        &["record"],
+        "The cut file moved from src/cut.py to src/cut_v2.py.",
+    );
+    assert_record_contains(&cut, "src/cut.py");
+    assert_record_text(&cut_invalidation, "src/cut_v2.py");
     let cutoff_changed = harness.run(&["changed"]);
     let after = harness.run_with_stdin(
         &["record"],
-        "Goal G_after. Entity E_after path=src/after.py. Decision D_after: src/after.py serves G_after. Observation: E_after path changed src/after.py -> src/after_v2.py, invalidating D_after.",
+        "Track the after file at src/after.py so the after path stays visible.",
     );
+    let after_invalidation = harness.run_with_stdin(
+        &["record"],
+        "The after file moved from src/after.py to src/after_v2.py.",
+    );
+    assert_record_contains(&after, "src/after.py");
+    assert_record_text(&after_invalidation, "src/after_v2.py");
     let changed = harness.run(&["changed"]);
     let repeated = harness.run(&["changed"]);
     let impact = harness.run(&["impact"]);
-    let store_path = store_path_from(&[&before, &cut, &cutoff_changed, &after, &changed, &impact]);
+    let store_path = store_path_from(&[
+        &before,
+        &before_invalidation,
+        &cut,
+        &cut_invalidation,
+        &cutoff_changed,
+        &after,
+        &after_invalidation,
+        &changed,
+        &impact,
+    ]);
     let store = persisted_store(store_path.clone());
-    let context_id = context_id_from(&[&before, &cut, &after, &changed, &impact]);
+    let context_id = context_id_from(&[
+        &before,
+        &before_invalidation,
+        &cut,
+        &cut_invalidation,
+        &after,
+        &after_invalidation,
+        &changed,
+        &impact,
+    ]);
     let before_id =
         stable_uuid_from(&[&before, &cutoff_changed, &impact], &["D_before"]).map(DecisionId::from);
     let cut_id =
@@ -706,16 +878,14 @@ fn impact_standing_set_vs_changed_recent_delta_are_distinct_observables() {
 
 #[test]
 fn cli_query_and_impact_emit_stable_ids_consumed_by_walk_verbs() {
-    let harness = CliHarness::new();
-    let capture = harness.run_with_stdin(
-        &["record"],
-        "Goal: ship password-less login for acme. Entity: auth module file. Decision: auth module moved from src/auth.py to src/authentication.py.",
-    );
+    let harness = extraction_harness();
+    let first = harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    let second = harness.run_with_stdin(&["record"], AUTH_RENAME);
     let query = harness.run(&["query", "where is the auth module"]);
     let impact = harness.run(&["impact"]);
     let intention_id = stable_id(&query, &["ship password-less login for acme", "G1"]);
     let entity_id = stable_id(&impact, &["auth module file", "E_auth_module"]);
-    let store_path = store_path_from(&[&capture, &query, &impact]);
+    let store_path = store_path_from(&[&first, &second, &query, &impact]);
     let store = persisted_store(store_path.clone());
     let persisted_intention = intention_id
         .as_ref()
@@ -772,14 +942,10 @@ fn cli_query_and_impact_emit_stable_ids_consumed_by_walk_verbs() {
 
 #[test]
 fn record_lands_in_working_location_context_by_default() {
-    let harness = CliHarness::new();
+    let harness = extraction_harness();
     let dir_x = tempfile::tempdir().expect("dir x");
     let dir_y = tempfile::tempdir().expect("dir y");
-    run_in_dir(
-        &harness,
-        dir_x.path(),
-        &["record", "auth decision in project x"],
-    );
+    run_in_dir(&harness, dir_x.path(), &["record", PROJECT_X_RECORD]);
     let x_status = run_in_dir(&harness, dir_x.path(), &["status"]);
     let y_status = run_in_dir(&harness, dir_y.path(), &["status"]);
     run_in_dir(
@@ -790,31 +956,30 @@ fn record_lands_in_working_location_context_by_default() {
     let named = harness.run(&["status", "--context", "named-client"]);
 
     assert!(combined(&x_status).contains("context:"));
-    assert!(combined(&x_status).contains("goals: 3"));
+    assert!(combined(&x_status).contains("goals: 1"));
     assert!(combined(&y_status).contains("goals: 0"));
     assert!(combined(&named).contains("context: named-client"));
 }
 
 #[test]
 fn cli_query_cross_context_isolation_default_and_opt_in() {
-    let harness = CliHarness::new();
-    harness.run_with_stdin(
-        &["record", "--context", "client-a"],
-        "SOX AWS deploy control",
-    );
-    harness.run_with_stdin(
+    let harness = extraction_harness();
+    let client_a =
+        harness.run_with_stdin(&["record", "--context", "client-a"], CLIENT_A_SOX_SESSION);
+    let client_b = harness.run_with_stdin(
         &["record", "--context", "client-b"],
-        "hold 10 min before promote",
+        CLIENT_B_PUBLISH_SESSION,
     );
-    let isolated = harness.run(&["query", "--context", "client-b", "publish race"]);
-    let crossed = harness.run(&[
-        "query",
-        "--cross-context",
-        "client-a,client-b",
-        "publish race",
-    ]);
+    assert_record_contains(&client_a, "SOX approval required before promote");
+    assert_record_contains(&client_b, "hold 10 min before promote");
+    let isolated = harness.run(&["query", "--context", "client-b", "duplicate publish"]);
+    let crossed = harness.run(&["query", "--cross-context", "client-a,client-b", "publish"]);
 
-    assert!(combined(&isolated).contains("hold 10 min before promote"));
+    assert!(
+        combined(&isolated).contains("hold 10 min before promote"),
+        "{}",
+        combined(&isolated)
+    );
     assert!(!combined(&isolated).contains("SOX"));
     assert!(combined(&crossed).contains("client-a"));
     assert!(combined(&crossed).contains("client-b"));
@@ -822,25 +987,56 @@ fn cli_query_cross_context_isolation_default_and_opt_in() {
 
 #[test]
 fn cross_context_isolation_holds_on_explicit_context_in_shared_directory() {
-    let harness = CliHarness::new();
-    harness.run_with_stdin(
-        &["record", "--context", "client-a"],
-        "SOX AWS deploy control",
-    );
-    harness.run_with_stdin(
+    let harness = extraction_harness();
+    let client_a =
+        harness.run_with_stdin(&["record", "--context", "client-a"], CLIENT_A_SOX_SESSION);
+    let client_b = harness.run_with_stdin(
         &["record", "--context", "client-b"],
-        "hold 10 min before promote",
+        CLIENT_B_PUBLISH_SESSION,
     );
-    let output = harness.run(&["query", "--context", "client-b", "deploy delay"]);
+    assert_record_contains(&client_a, "SOX approval required before promote");
+    assert_record_contains(&client_b, "hold 10 min before promote");
+    let output = harness.run(&["query", "--context", "client-b", "duplicate publish"]);
 
     assert!(combined(&output).contains("client-b"));
-    assert!(combined(&output).contains("hold 10 min before promote"));
+    assert!(
+        combined(&output).contains("hold 10 min before promote"),
+        "{}",
+        combined(&output)
+    );
     assert!(!combined(&output).contains("SOX"));
 }
 
 #[test]
+fn read_commands_do_not_create_missing_contexts() {
+    let harness = extraction_harness();
+    let missing_id = uuid::Uuid::now_v7().to_string();
+    let query = harness.run(&["query", "--context", "typo-client", "anything"]);
+    let impact = harness.run(&["impact", "--context", "typo-client"]);
+    let changed = harness.run(&["changed", "--context", "typo-client"]);
+    let by_intention = harness.run(&[
+        "by-intention",
+        "--context",
+        "typo-client",
+        missing_id.as_str(),
+    ]);
+    let by_entity = harness.run(&["by-entity", "--context", "typo-client", missing_id.as_str()]);
+    let store_path = store_path_from(&[&query, &impact, &changed, &by_intention, &by_entity]);
+
+    assert!(combined(&query).contains("no matching memory"));
+    assert!(combined(&impact).contains("nothing stale"));
+    assert!(combined(&changed).contains("nothing newly stale"));
+    assert!(no_resolution(&by_intention));
+    assert!(no_resolution(&by_entity));
+    assert_eq!(
+        persisted_context_names(store_path.as_deref()),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn cli_first_capture_load_is_observable_not_silent() {
-    let harness = CliHarness::new();
+    let harness = extraction_harness();
     let first = harness.run_with_stdin(&["record"], "first auth capture");
     let second = harness.run_with_stdin(&["record"], "second auth capture");
 

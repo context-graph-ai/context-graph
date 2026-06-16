@@ -30,6 +30,7 @@ use crate::{
 pub const DEGRADED_MARKER: &str = "running without a connected model";
 const HOSTED_TIMEOUT: Duration = Duration::from_secs(10);
 const HOSTED_BODY_LIMIT: u64 = 1024 * 1024;
+const HOSTED_CHAT_MAX_TOKENS: u32 = 4096;
 const CONNECTION_CATALOG_SCOPE: &str = "connection-substrate";
 const EMBEDDED_PROVIDER_SPECS: &str = include_str!("../providers.toml");
 const NEW_PROVIDER_REQUIRED_FIELDS: &[&str] = &[
@@ -5604,6 +5605,8 @@ fn understand_hosted(
     let agent: ureq::Agent = agent_config.into();
     let body = serde_json::json!({
         "model": provider_config.provider_model.as_str(),
+        "max_tokens": HOSTED_CHAT_MAX_TOKENS,
+        "temperature": 0,
         "messages": [{
             "role": "user",
             "content": invocation.request.input.as_str(),

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use chrono::Utc;
 use context_graph::ingest::{
-    CaptureRequest, DedupClassification, changed_since_last_record, record_conversation,
-    standing_impact,
+    CaptureRequest, DedupClassification, changed_since_last_record,
+    record_conversation_with_extractor, standing_impact,
 };
 use context_graph::schema::DIGEST_VECTOR_DIMENSION;
 use context_graph::{
@@ -17,14 +17,15 @@ use contextdb_core::{TxId, Value};
 use contextdb_engine::Database;
 use serde_json::json;
 
+use super::fake_extractor::{LabeledTranscriptExtractor, open_store_with_lexical_embedder};
+
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(StoreConfig {
+    let store = open_store_with_lexical_embedder(StoreConfig {
         db_path: dir.path().join("cg.db"),
         default_text_embedder: None,
         ..Default::default()
-    })
-    .expect("open store");
+    });
     (dir, store)
 }
 
@@ -332,22 +333,24 @@ fn decision_entity_edges(
 fn impact_fires_across_two_separately_captured_sessions() {
     let (_dir, store) = fresh_store();
     let db_path = store.db_path().to_path_buf();
-    let first = record_conversation(
+    let first = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
             transcript: "Goal G1: ship password-less login for acme. Goal G2: keep refresh token storage stable. Entity E_auth_module path=src/auth.py. Entity E_redis path=config/redis.toml. Decision D_old: auth module at src/auth.py serves G1. Decision D_other: store refresh tokens in Redis serves G2 based_on E_redis.".to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .ok();
-    let second = record_conversation(
+    let second = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
-            transcript: "Observation: E_auth_module path changed src/auth.py -> src/authentication.py. Decision D_new: auth module at src/authentication.py serves G1.".to_string(),
+            transcript: "Goal G1: ship password-less login for acme. Observation: E_auth_module path changed src/auth.py -> src/authentication.py. Decision D_new: auth module at src/authentication.py serves G1.".to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .ok();
     drop(store);
@@ -646,16 +649,17 @@ fn impact_fires_across_two_separately_captured_sessions() {
 fn impact_silent_when_changed_entity_has_no_serving_decision() {
     let (dir, store) = fresh_store();
     let db_path = dir.path().join("cg.db");
-    let first = record_conversation(
+    let first = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
             transcript: "Goal G1: ship password-less login for acme. Entity E_auth_module path=src/auth.py. Entity E_redis path=config/redis.toml. Decision D_old: auth module at src/auth.py serves G1.".to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .ok();
-    let unrelated = record_conversation(
+    let unrelated = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
@@ -664,15 +668,17 @@ fn impact_silent_when_changed_entity_has_no_serving_decision() {
                     .to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .ok();
-    let related = record_conversation(
+    let related = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
-            transcript: "Observation: E_auth_module path changed src/auth.py -> src/authentication.py. Decision D_new: auth module at src/authentication.py serves G1.".to_string(),
+            transcript: "Goal G1: ship password-less login for acme. Observation: E_auth_module path changed src/auth.py -> src/authentication.py. Decision D_new: auth module at src/authentication.py serves G1.".to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .ok();
     drop(store);
@@ -759,22 +765,24 @@ fn impact_silent_when_changed_entity_has_no_serving_decision() {
 fn dedup_cross_capture_contradiction_classified_conflicts_not_swallowed() {
     let (_dir, store) = fresh_store();
     let db_path = store.db_path().to_path_buf();
-    let first = record_conversation(
+    let first = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
             transcript: "Goal G1: ship password-less login for acme. Entity E_auth_module path=src/auth.py. Decision D_old: auth module at src/auth.py serves G1.".to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .ok();
-    let second = record_conversation(
+    let second = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
-            transcript: "Observation: E_auth_module path changed src/auth.py -> src/authentication.py. Decision D_new: auth module at src/authentication.py serves G1.".to_string(),
+            transcript: "Goal G1: ship password-less login for acme. Observation: E_auth_module path changed src/auth.py -> src/authentication.py. Decision D_new: auth module at src/authentication.py serves G1.".to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .ok();
     drop(store);

@@ -4,6 +4,8 @@ mod crud;
 mod digest_capture;
 mod discovery;
 mod evidence;
+#[path = "../common/fake_extractor.rs"]
+mod fake_extractor;
 mod find_via_digests;
 mod graph_context_isolation;
 mod graph_entity_neighborhood;
