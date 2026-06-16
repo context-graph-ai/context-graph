@@ -2,15 +2,15 @@ use chrono::Utc;
 use contextdb_core::Value as DbValue;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value as JsonValue, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::embedding_space::BuiltinSpaceRegistry;
 use crate::{
     AgentId, CgError, ContextId, CreateContext, CreateDecision, CreateDigest, CreateEntity,
-    CreateIntention, DecisionId, DigestId, Embedder, EmbeddingId, EmbeddingInput, EmbeddingOutput,
-    EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef,
-    IntentionId, IntentionOrigin, IntentionStatus, InvalidationStatus, ObservationId,
-    PrecomputedEmbedding, RecordObservation, Result, Store,
+    CreateIntention, Decision, DecisionId, DigestId, Embedder, EmbeddingId, EmbeddingInput,
+    EmbeddingOutput, EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind,
+    EvidenceProducer, EvidenceRef, IntentionId, IntentionOrigin, IntentionStatus,
+    InvalidationStatus, ObservationId, PrecomputedEmbedding, RecordObservation, Result, Store,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -221,6 +221,27 @@ pub struct DecisionSeed {
     pub goal_key: Option<String>,
     #[serde(default)]
     pub entity_key: Option<String>,
+    #[serde(default)]
+    pub relation: Option<DecisionRelationSeed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DecisionRelationSeed {
+    #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
+    pub prior_decision_id: String,
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    pub classification: DecisionRelationClassification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionRelationClassification {
+    #[default]
+    NewInsertion,
+    ExactDuplicate,
+    RefinesExisting,
+    ConflictsExisting,
+    SupersedesExisting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -238,10 +259,25 @@ pub struct ObservationSeed {
 pub struct ExtractionRequest<'a> {
     pub context_label: &'a str,
     pub transcript: &'a str,
+    pub prior_decisions: &'a [ExtractionPriorDecision],
 }
 
 pub trait ConversationExtractor {
     fn extract(&self, request: ExtractionRequest<'_>) -> Result<StructuredHarvest>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionPriorDecision {
+    pub id: DecisionId,
+    pub text: String,
+    pub goals: Vec<String>,
+    pub entities: Vec<ExtractionPriorEntity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionPriorEntity {
+    pub name: String,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,44 +286,6 @@ pub enum DedupClassification {
     ExactDuplicate,
     RefinesExisting,
     ConflictsExisting,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DedupCandidate {
-    pub entity: String,
-    pub same_entity: bool,
-    pub prior_value: String,
-    pub candidate_value: String,
-}
-
-pub fn classify_dedup_candidate(candidate: DedupCandidate) -> DedupClassification {
-    if !candidate.same_entity {
-        return DedupClassification::NewInsertion;
-    }
-    let prior = normalized_tracked_value(&candidate.prior_value);
-    let next = normalized_tracked_value(&candidate.candidate_value);
-
-    if prior.is_empty() {
-        return DedupClassification::NewInsertion;
-    }
-    if next.is_empty() {
-        return DedupClassification::NewInsertion;
-    }
-    if prior == next {
-        return DedupClassification::ExactDuplicate;
-    }
-    if is_strict_refinement(&prior, &next) {
-        return DedupClassification::RefinesExisting;
-    }
-    DedupClassification::ConflictsExisting
-}
-
-fn normalized_tracked_value(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn is_strict_refinement(prior: &str, next: &str) -> bool {
-    next.len() > prior.len() && next.contains(prior)
 }
 
 pub trait ImportParser: Send + Sync {
@@ -479,9 +477,11 @@ fn record_conversation_internal(
     if !request.model_available {
         return capture_raw(store, context.id, &request.context_label, text);
     }
+    let prior_decisions = extraction_prior_decisions(store, context.id)?;
     let harvest = extractor.extract(ExtractionRequest {
         context_label: &request.context_label,
         transcript: text,
+        prior_decisions: &prior_decisions,
     })?;
     capture_structured_harvest(store, context.id, &request.context_label, text, harvest)
 }
@@ -507,7 +507,7 @@ fn import_conversation_text_internal(
         .lines()
         .find_map(|line| line.strip_prefix("Context:").map(str::trim))
         .filter(|label| !label.is_empty())
-        .unwrap_or("acme-coding-assistant")
+        .unwrap_or("default")
         .to_string();
     let transcript = text
         .lines()
@@ -537,7 +537,7 @@ pub fn rolling_condense_into_store(
     transcript: &str,
     window_tokens: usize,
 ) -> Result<CondensationReport> {
-    let context = context_by_label(store, "rolling-ingest")?;
+    let context = context_by_label(store, "rolling-import")?;
     let digest = create_text_digest(
         store,
         context.id,
@@ -829,6 +829,7 @@ fn capture_structured_harvest(
 
     let mut entities = BTreeMap::<String, EntityId>::new();
     let mut entity_paths = BTreeMap::<String, String>::new();
+    let mut entity_prior_paths = BTreeMap::<String, Option<String>>::new();
     let mut entity_names = BTreeMap::<String, String>::new();
     for seed in &harvest.entities {
         if seed.key.trim().is_empty() || seed.name.trim().is_empty() {
@@ -839,19 +840,20 @@ fn capture_structured_harvest(
         } else {
             seed.path.clone()
         };
-        let entity = ensure_entity(
+        let entity = ensure_entity_with_prior_path(
             store,
             context_id,
             &seed.name,
             &path,
             seed.entity_type.into(),
         )?;
-        stable_id(&mut stable, &seed.key, entity);
-        stable_id_text(&mut stable, &seed.name, entity.as_uuid());
-        stable_id_text(&mut stable, &path, entity.as_uuid());
-        source_ids.push((seed.key.clone(), entity.as_uuid()));
-        entities.insert(seed.key.clone(), entity);
+        stable_id(&mut stable, &seed.key, entity.id);
+        stable_id_text(&mut stable, &seed.name, entity.id.as_uuid());
+        stable_id_text(&mut stable, &path, entity.id.as_uuid());
+        source_ids.push((seed.key.clone(), entity.id.as_uuid()));
+        entities.insert(seed.key.clone(), entity.id);
         entity_paths.insert(seed.key.clone(), path);
+        entity_prior_paths.insert(seed.key.clone(), entity.prior_path);
         entity_names.insert(seed.key.clone(), seed.name.clone());
     }
 
@@ -862,6 +864,65 @@ fn capture_structured_harvest(
     let mut dedup_events = Vec::new();
     let mut observation_items = Vec::new();
     let mut observation_source_ids = Vec::<(String, uuid::Uuid)>::new();
+    let explicit_path_change_entities = harvest
+        .observations
+        .iter()
+        .filter_map(|seed| seed.path_change.as_ref().and(seed.entity_key.as_ref()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let captured_entity_path_changes = entities
+        .iter()
+        .filter_map(|(entity_key, entity)| {
+            if explicit_path_change_entities.contains(entity_key) {
+                return None;
+            }
+            let prior = entity_prior_paths.get(entity_key)?.as_ref()?;
+            let candidate = entity_paths.get(entity_key)?;
+            (prior != candidate).then(|| {
+                (
+                    entity_key.clone(),
+                    *entity,
+                    prior.clone(),
+                    candidate.clone(),
+                    entity_names
+                        .get(entity_key)
+                        .cloned()
+                        .unwrap_or_else(|| entity_key.clone()),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for (entity_key, entity, prior_value, candidate_value, entity_name) in
+        captured_entity_path_changes
+    {
+        let observation_key = format!("{entity_key}_path");
+        let observation_text = format!("{entity_name} observed at {candidate_value}");
+        let write = ensure_observation_with_invalidations(
+            store,
+            context_id,
+            entity,
+            &observation_text,
+            Some(("path", candidate_value.as_str())),
+        )?;
+        stable_id(&mut stable, &observation_key, write.id);
+        stable_id_text(&mut stable, &observation_text, write.id.as_uuid());
+        observation_source_ids.push((observation_key.clone(), write.id.as_uuid()));
+        observation_items.push(derived(
+            &observation_key,
+            "observation",
+            &observation_text,
+            "current",
+            digest.id,
+            context_label,
+        ));
+        dedup_events.push(DedupEvent {
+            entity: entity_name.clone(),
+            prior_value: prior_value.clone(),
+            candidate_value: candidate_value.clone(),
+            classification: DedupClassification::ConflictsExisting,
+        });
+        invalidation_rows.extend(write.invalidations);
+    }
     for seed in &harvest.observations {
         if seed.key.trim().is_empty() || seed.text.trim().is_empty() {
             continue;
@@ -877,7 +938,8 @@ fn capture_structured_harvest(
         let prior_path = seed
             .entity_key
             .as_ref()
-            .and_then(|key| entity_paths.get(key))
+            .and_then(|key| entity_prior_paths.get(key))
+            .and_then(|path| path.as_ref())
             .cloned();
         let path_change = seed
             .path_change
@@ -909,35 +971,12 @@ fn capture_structured_harvest(
                 .get(entity_key)
                 .cloned()
                 .unwrap_or_else(|| entity_key.clone());
-            let classification = classify_dedup_candidate(DedupCandidate {
-                entity: entity_name.clone(),
-                same_entity: true,
-                prior_value: prior_value.clone(),
-                candidate_value: candidate_value.clone(),
-            });
             dedup_events.push(DedupEvent {
                 entity: entity_name.clone(),
                 prior_value: prior_value.clone(),
                 candidate_value: candidate_value.clone(),
-                classification,
+                classification: DedupClassification::ConflictsExisting,
             });
-            if classification == DedupClassification::ConflictsExisting {
-                for decision_id in active_decision_ids_for_entity_basis(store, context_id, entity)?
-                {
-                    store.invalidate_decision(
-                        decision_id,
-                        write.id,
-                        format!(
-                            "extracted observation conflicts with decision basis for {entity_name}: {prior_value} -> {candidate_value}"
-                        ),
-                    )?;
-                    invalidation_rows.extend(store.list_invalidations(
-                        context_id,
-                        Some(decision_id),
-                        None,
-                    )?);
-                }
-            }
         }
         invalidation_rows.extend(write.invalidations);
     }
@@ -958,7 +997,105 @@ fn capture_structured_harvest(
             .entity_key
             .as_ref()
             .and_then(|key| entities.get(key).copied());
-        let decision = ensure_decision(store, context_id, &seed.text, &[goal], entity)?;
+        let relation = resolved_decision_relation(store, context_id, seed.relation.as_ref())?;
+        let decision = match relation.as_ref().map(|(classification, _)| *classification) {
+            Some(DecisionRelationClassification::ExactDuplicate) => {
+                let prior = relation.as_ref().expect("relation is present").1.id;
+                dedup_events.push(DedupEvent {
+                    entity: relation_entity_label(seed, &entity_names),
+                    prior_value: relation
+                        .as_ref()
+                        .expect("relation is present")
+                        .1
+                        .description
+                        .clone(),
+                    candidate_value: seed.text.clone(),
+                    classification: DedupClassification::ExactDuplicate,
+                });
+                prior
+            }
+            Some(DecisionRelationClassification::RefinesExisting) => {
+                let prior = relation.as_ref().expect("relation is present").1.id;
+                dedup_events.push(DedupEvent {
+                    entity: relation_entity_label(seed, &entity_names),
+                    prior_value: relation
+                        .as_ref()
+                        .expect("relation is present")
+                        .1
+                        .description
+                        .clone(),
+                    candidate_value: seed.text.clone(),
+                    classification: DedupClassification::RefinesExisting,
+                });
+                store
+                    .create_decision(decision_input(
+                        context_id,
+                        &seed.text,
+                        &[goal],
+                        entity,
+                        vec![prior],
+                    ))?
+                    .id
+            }
+            Some(DecisionRelationClassification::ConflictsExisting) => {
+                let prior = relation.as_ref().expect("relation is present").1.id;
+                let prior_text = relation
+                    .as_ref()
+                    .expect("relation is present")
+                    .1
+                    .description
+                    .clone();
+                dedup_events.push(DedupEvent {
+                    entity: relation_entity_label(seed, &entity_names),
+                    prior_value: prior_text.clone(),
+                    candidate_value: seed.text.clone(),
+                    classification: DedupClassification::ConflictsExisting,
+                });
+                let decision = store
+                    .create_decision(decision_input(
+                        context_id,
+                        &seed.text,
+                        &[goal],
+                        entity,
+                        vec![prior],
+                    ))?
+                    .id;
+                let trigger = ensure_semantic_conflict_observation(
+                    store,
+                    context_id,
+                    entity,
+                    prior,
+                    &prior_text,
+                    &seed.text,
+                )?;
+                store.invalidate_decision(
+                    prior,
+                    trigger,
+                    format!(
+                        "model classified extracted decision as conflicting with prior decision: {} -> {}",
+                        prior_text, seed.text
+                    ),
+                )?;
+                invalidation_rows.extend(store.list_invalidations(
+                    context_id,
+                    Some(prior),
+                    None,
+                )?);
+                decision
+            }
+            Some(DecisionRelationClassification::SupersedesExisting) => {
+                let prior = relation.as_ref().expect("relation is present").1.id;
+                store
+                    .supersede_decision(
+                        prior,
+                        decision_input(context_id, &seed.text, &[goal], entity, Vec::new()),
+                    )?
+                    .id
+            }
+            Some(DecisionRelationClassification::NewInsertion) | None => {
+                ensure_decision(store, context_id, &seed.text, &[goal], entity)?
+            }
+        };
         stable_id(&mut stable, &seed.key, decision);
         stable_id_text(&mut stable, &seed.text, decision.as_uuid());
         source_ids.push((seed.key.clone(), decision.as_uuid()));
@@ -1204,6 +1341,152 @@ fn context_by_label(store: &Store, label: &str) -> Result<crate::Context> {
     })
 }
 
+fn extraction_prior_decisions(
+    store: &Store,
+    context_id: ContextId,
+) -> Result<Vec<ExtractionPriorDecision>> {
+    let result = store
+        .internal_db()
+        .execute(
+            "SELECT id, description FROM decisions WHERE context_id = $context_id AND status = $status ORDER BY created_at ASC",
+            &HashMap::from([
+                (
+                    "context_id".to_string(),
+                    DbValue::Uuid(context_id.as_uuid()),
+                ),
+                ("status".to_string(), DbValue::Text("active".to_string())),
+            ]),
+        )
+        .map_err(map_engine)?;
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let id = match row.first() {
+                Some(DbValue::Uuid(id)) => DecisionId::from(*id),
+                _ => {
+                    return Err(CgError::Engine(
+                        "prior decision recall returned non-uuid id".to_string(),
+                    ));
+                }
+            };
+            let text = match row.get(1) {
+                Some(DbValue::Text(text)) => text.clone(),
+                _ => {
+                    return Err(CgError::Engine(
+                        "prior decision recall returned non-text description".to_string(),
+                    ));
+                }
+            };
+            Ok(ExtractionPriorDecision {
+                id,
+                text,
+                goals: prior_decision_goals(store, context_id, id)?,
+                entities: prior_decision_entities(store, context_id, id)?,
+            })
+        })
+        .collect()
+}
+
+fn prior_decision_goals(
+    store: &Store,
+    context_id: ContextId,
+    decision_id: DecisionId,
+) -> Result<Vec<String>> {
+    let result = store
+        .internal_db()
+        .execute(
+            "SELECT intentions.description
+             FROM edges
+             INNER JOIN intentions ON intentions.id = edges.target_id
+             WHERE edges.context_id = $context_id
+               AND edges.source_id = $decision_id
+               AND edges.edge_type = $edge_type
+               AND intentions.context_id = $context_id
+             ORDER BY intentions.created_at ASC",
+            &HashMap::from([
+                (
+                    "context_id".to_string(),
+                    DbValue::Uuid(context_id.as_uuid()),
+                ),
+                (
+                    "decision_id".to_string(),
+                    DbValue::Uuid(decision_id.as_uuid()),
+                ),
+                ("edge_type".to_string(), DbValue::Text("SERVES".to_string())),
+            ]),
+        )
+        .map_err(map_engine)?;
+    Ok(result
+        .rows
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(DbValue::Text(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .collect())
+}
+
+fn prior_decision_entities(
+    store: &Store,
+    context_id: ContextId,
+    decision_id: DecisionId,
+) -> Result<Vec<ExtractionPriorEntity>> {
+    let result = store
+        .internal_db()
+        .execute(
+            "SELECT entities.id, entities.name
+             FROM edges
+             INNER JOIN entities ON entities.id = edges.target_id
+             WHERE edges.context_id = $context_id
+               AND edges.source_id = $decision_id
+               AND edges.edge_type = $edge_type
+               AND entities.context_id = $context_id
+             ORDER BY entities.created_at ASC",
+            &HashMap::from([
+                (
+                    "context_id".to_string(),
+                    DbValue::Uuid(context_id.as_uuid()),
+                ),
+                (
+                    "decision_id".to_string(),
+                    DbValue::Uuid(decision_id.as_uuid()),
+                ),
+                (
+                    "edge_type".to_string(),
+                    DbValue::Text("BASED_ON".to_string()),
+                ),
+            ]),
+        )
+        .map_err(map_engine)?;
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let id = match row.first() {
+                Some(DbValue::Uuid(id)) => EntityId::from(*id),
+                _ => {
+                    return Err(CgError::Engine(
+                        "prior entity recall returned non-uuid id".to_string(),
+                    ));
+                }
+            };
+            let name = match row.get(1) {
+                Some(DbValue::Text(name)) => name.clone(),
+                _ => {
+                    return Err(CgError::Engine(
+                        "prior entity recall returned non-text name".to_string(),
+                    ));
+                }
+            };
+            Ok(ExtractionPriorEntity {
+                name,
+                path: current_entity_path(store, id)?,
+            })
+        })
+        .collect()
+}
+
 fn create_text_digest(
     store: &Store,
     context_id: ContextId,
@@ -1315,6 +1598,11 @@ fn normalize_path_change_value(value: &str) -> String {
         .to_string()
 }
 
+struct EntityWrite {
+    id: EntityId,
+    prior_path: Option<String>,
+}
+
 fn ensure_entity(
     store: &Store,
     context_id: ContextId,
@@ -1322,6 +1610,16 @@ fn ensure_entity(
     path: &str,
     entity_type: EntityType,
 ) -> Result<EntityId> {
+    Ok(ensure_entity_with_prior_path(store, context_id, name, path, entity_type)?.id)
+}
+
+fn ensure_entity_with_prior_path(
+    store: &Store,
+    context_id: ContextId,
+    name: &str,
+    path: &str,
+    entity_type: EntityType,
+) -> Result<EntityWrite> {
     if let Some(entity) = store
         .list_entities(crate::ListEntityFilter {
             entity_type: Some(entity_type),
@@ -1333,17 +1631,75 @@ fn ensure_entity(
         .into_iter()
         .find(|entity| entity.name == name)
     {
-        return Ok(entity.id);
+        let prior_path = current_entity_path(store, entity.id)?
+            .or_else(|| entity_path_from_properties(&entity.properties));
+        return Ok(EntityWrite {
+            id: entity.id,
+            prior_path,
+        });
     }
+    let entity = store.create_entity(CreateEntity {
+        entity_type,
+        name: name.to_string(),
+        properties: BTreeMap::from([("path".to_string(), json!(path))]),
+        context_id,
+        ..Default::default()
+    })?;
+    Ok(EntityWrite {
+        id: entity.id,
+        prior_path: None,
+    })
+}
+
+fn current_entity_path(store: &Store, entity_id: EntityId) -> Result<Option<String>> {
     Ok(store
-        .create_entity(CreateEntity {
-            entity_type,
-            name: name.to_string(),
-            properties: BTreeMap::from([("path".to_string(), json!(path))]),
-            context_id,
-            ..Default::default()
-        })?
-        .id)
+        .current_entity_snapshot(entity_id)?
+        .and_then(|snapshot| entity_path_from_properties(&snapshot.properties)))
+}
+
+fn entity_path_from_properties(properties: &BTreeMap<String, JsonValue>) -> Option<String> {
+    properties
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolved_decision_relation(
+    store: &Store,
+    context_id: ContextId,
+    relation: Option<&DecisionRelationSeed>,
+) -> Result<Option<(DecisionRelationClassification, Decision)>> {
+    let Some(relation) = relation else {
+        return Ok(None);
+    };
+    let id = relation.prior_decision_id.trim();
+    if id.is_empty() || relation.classification == DecisionRelationClassification::NewInsertion {
+        return Ok(None);
+    }
+    let prior_id = uuid::Uuid::parse_str(id)
+        .map(DecisionId::from)
+        .map_err(|err| {
+            CgError::Engine(format!(
+                "extractor returned invalid prior_decision_id: {err}"
+            ))
+        })?;
+    let prior = store.get_decision(prior_id)?.ok_or_else(|| {
+        CgError::Engine("extractor returned unknown prior_decision_id".to_string())
+    })?;
+    if prior.context_id != context_id {
+        return Err(CgError::CrossContextViolation);
+    }
+    Ok(Some((relation.classification, prior)))
+}
+
+fn relation_entity_label(seed: &DecisionSeed, entity_names: &BTreeMap<String, String>) -> String {
+    seed.entity_key
+        .as_ref()
+        .and_then(|key| entity_names.get(key))
+        .cloned()
+        .unwrap_or_else(|| "decision".to_string())
 }
 
 fn ensure_decision(
@@ -1357,18 +1713,35 @@ fn ensure_decision(
         return Ok(DecisionId::from(id));
     }
     Ok(store
-        .create_decision(CreateDecision {
-            decision_type: "code_reference".to_string(),
-            description: description.to_string(),
-            confidence: Some(0.9),
-            intention_ids: intention_ids.to_vec(),
-            based_on_entity_ids: entity_id.into_iter().collect(),
-            basis_fields: entity_id.map(|id| HashMap::from([(id, vec!["path".to_string()])])),
+        .create_decision(decision_input(
             context_id,
-            agent_id: Some(AgentId::from("cg-ingest")),
-            ..Default::default()
-        })?
+            description,
+            intention_ids,
+            entity_id,
+            Vec::new(),
+        ))?
         .id)
+}
+
+fn decision_input(
+    context_id: ContextId,
+    description: &str,
+    intention_ids: &[IntentionId],
+    entity_id: Option<EntityId>,
+    precedent_ids: Vec<DecisionId>,
+) -> CreateDecision {
+    CreateDecision {
+        decision_type: "code_reference".to_string(),
+        description: description.to_string(),
+        confidence: Some(0.9),
+        intention_ids: intention_ids.to_vec(),
+        based_on_entity_ids: entity_id.into_iter().collect(),
+        basis_fields: entity_id.map(|id| HashMap::from([(id, vec!["path".to_string()])])),
+        context_id,
+        precedent_ids,
+        agent_id: Some(AgentId::from("cg-ingest")),
+        ..Default::default()
+    }
 }
 
 fn ensure_observation(
@@ -1420,6 +1793,28 @@ fn ensure_observation_with_invalidations(
         id: result.observation_id,
         invalidations: result.invalidations,
     })
+}
+
+fn ensure_semantic_conflict_observation(
+    store: &Store,
+    context_id: ContextId,
+    entity_id: Option<EntityId>,
+    prior_decision_id: DecisionId,
+    prior_text: &str,
+    candidate_text: &str,
+) -> Result<ObservationId> {
+    let entity = match entity_id {
+        Some(entity) => entity,
+        None => ensure_entity(
+            store,
+            context_id,
+            "decision conflict",
+            &format!("decision:{}", prior_decision_id.as_uuid()),
+            EntityType::Document,
+        )?,
+    };
+    let text = format!("model classified decision conflict: {prior_text} -> {candidate_text}");
+    ensure_observation(store, context_id, entity, &text, None)
 }
 
 fn text_evidence(observation_id: ObservationId, context_id: ContextId) -> EvidenceRef {
@@ -1481,48 +1876,6 @@ fn add_provenance_edges(
         });
     }
     Ok(out)
-}
-
-fn active_decision_ids_for_entity_basis(
-    store: &Store,
-    context_id: ContextId,
-    entity_id: EntityId,
-) -> Result<Vec<DecisionId>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT DISTINCT decisions.id
-             FROM decisions
-             INNER JOIN edges ON edges.source_id = decisions.id
-             WHERE edges.context_id = $context_id
-               AND edges.target_id = $entity_id
-               AND edges.edge_type = $edge_type
-               AND decisions.context_id = $context_id
-               AND decisions.status = $status",
-            &HashMap::from([
-                (
-                    "context_id".to_string(),
-                    DbValue::Uuid(context_id.as_uuid()),
-                ),
-                ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
-                (
-                    "edge_type".to_string(),
-                    DbValue::Text("BASED_ON".to_string()),
-                ),
-                ("status".to_string(), DbValue::Text("active".to_string())),
-            ]),
-        )
-        .map_err(map_engine)?;
-    result
-        .rows
-        .iter()
-        .map(|row| match row.first() {
-            Some(DbValue::Uuid(id)) => Ok(DecisionId::from(*id)),
-            _ => Err(CgError::Engine(
-                "active decision lookup returned non-uuid id".to_string(),
-            )),
-        })
-        .collect()
 }
 
 fn derived(
