@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use context_graph::ingest::{
-    CaptureImpactSignal, CaptureMode, CaptureRequest, DedupCandidate, DedupClassification,
-    HarvestCounts, classify_dedup_candidate, record_conversation,
-    record_conversation_with_extractor, standing_impact,
+    CaptureImpactSignal, CaptureMode, CaptureRequest, DedupClassification, HarvestCounts,
+    record_conversation, record_conversation_with_extractor, standing_impact,
 };
 use context_graph::schema::DIGEST_VECTOR_DIMENSION;
 use context_graph::{
@@ -17,8 +16,9 @@ use contextdb_engine::Database;
 use super::fake_extractor::LabeledTranscriptExtractor;
 use super::fake_extractor::open_store_with_lexical_embedder;
 use context_graph::ingest::{
-    ConversationExtractor, DecisionSeed, EntitySeed, ExtractedEntityType, ExtractionRequest,
-    GoalSeed, ObservationSeed, StructuredHarvest,
+    ConversationExtractor, DecisionRelationClassification, DecisionRelationSeed, DecisionSeed,
+    EntitySeed, ExtractedEntityType, ExtractionRequest, GoalSeed, ObservationSeed,
+    StructuredHarvest,
 };
 
 #[derive(Debug, Default)]
@@ -192,6 +192,44 @@ fn decision_row(
             .flatten()
             .map(|decision| (decision.id, decision.description, decision.status))
     })
+}
+
+fn harvest_contains_text(harvest: &StructuredHarvest, needle: &str) -> bool {
+    harvest
+        .summary
+        .as_deref()
+        .is_some_and(|text| text.contains(needle))
+        || harvest
+            .goals
+            .iter()
+            .any(|seed| seed.key.contains(needle) || seed.text.contains(needle))
+        || harvest.entities.iter().any(|seed| {
+            seed.key.contains(needle) || seed.name.contains(needle) || seed.path.contains(needle)
+        })
+        || harvest.decisions.iter().any(|seed| {
+            seed.key.contains(needle)
+                || seed.text.contains(needle)
+                || seed
+                    .goal_key
+                    .as_deref()
+                    .is_some_and(|key| key.contains(needle))
+                || seed
+                    .entity_key
+                    .as_deref()
+                    .is_some_and(|key| key.contains(needle))
+        })
+        || harvest.observations.iter().any(|seed| {
+            seed.key.contains(needle)
+                || seed.text.contains(needle)
+                || seed
+                    .entity_key
+                    .as_deref()
+                    .is_some_and(|key| key.contains(needle))
+                || seed
+                    .path_change
+                    .as_deref()
+                    .is_some_and(|path| path.contains(needle))
+        })
 }
 
 fn create_digest_input(context_id: ContextId, summary: &str, kind: EvidenceKind) -> CreateDigest {
@@ -376,130 +414,192 @@ fn digest_capture_uses_registered_embedder_for_write_and_query() {
 }
 
 #[test]
-fn digest_dedup_four_way_classification() {
-    let observed = [
-        (
-            DedupClassification::NewInsertion,
-            false,
-            "entity-a",
-            "",
-            "value-a",
-        ),
-        (
-            DedupClassification::NewInsertion,
-            false,
-            "entity-b",
-            "value-a",
-            "value-b",
-        ),
-        (
-            DedupClassification::ExactDuplicate,
-            true,
-            "entity-c",
-            "value-a",
-            "value-a",
-        ),
-        (
-            DedupClassification::ExactDuplicate,
-            true,
-            "entity-d",
-            "  value-a  ",
-            "value-a",
-        ),
-        (
-            DedupClassification::RefinesExisting,
-            true,
-            "entity-e",
-            "value-a",
-            "value-a plus extra constraint",
-        ),
-        (
-            DedupClassification::RefinesExisting,
-            true,
-            "entity-f",
-            "alpha beta",
-            "alpha beta gamma",
-        ),
-        (
-            DedupClassification::ConflictsExisting,
-            true,
-            "entity-g",
-            "value-a",
-            "value-b",
-        ),
-        (
-            DedupClassification::ConflictsExisting,
-            true,
-            "entity-h",
-            "one/two",
-            "one/three",
-        ),
-    ]
-    .into_iter()
-    .map(
-        |(expected, same_entity, entity, prior_value, candidate_value)| {
-            (
-                classify_dedup_candidate(DedupCandidate {
-                    entity: entity.to_string(),
-                    same_entity,
-                    prior_value: prior_value.to_string(),
-                    candidate_value: candidate_value.to_string(),
-                }),
-                expected,
-            )
+fn model_relation_conflict_routes_negation_to_invalidation() {
+    let (_dir, store) = fresh_store();
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "release-demo".to_string(),
+            transcript: "release target captured".to_string(),
+            model_available: true,
         },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("release target captured".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_release".to_string(),
+                text: "ship the release safely".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_target".to_string(),
+                name: "release target".to_string(),
+                path: "deployment target".to_string(),
+                entity_type: ExtractedEntityType::Service,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_aws".to_string(),
+                text: "deploy to AWS".to_string(),
+                goal_key: Some("G_release".to_string()),
+                entity_key: Some("E_target".to_string()),
+                relation: None,
+            }],
+            observations: vec![],
+        }),
     )
-    .collect::<Vec<_>>();
+    .expect("first relation capture");
+    let prior = stable_decision_id(&[&first], &["D_aws"]).expect("prior decision");
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "release-demo".to_string(),
+            transcript: "release target changed".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("release target changed".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_release".to_string(),
+                text: "ship the release safely".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_target".to_string(),
+                name: "release target".to_string(),
+                path: "deployment target".to_string(),
+                entity_type: ExtractedEntityType::Service,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_never_aws".to_string(),
+                text: "never deploy to AWS".to_string(),
+                goal_key: Some("G_release".to_string()),
+                entity_key: Some("E_target".to_string()),
+                relation: Some(DecisionRelationSeed {
+                    prior_decision_id: prior.as_uuid().to_string(),
+                    classification: DecisionRelationClassification::ConflictsExisting,
+                }),
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("second relation capture");
+    let invalidations = store
+        .list_invalidations(
+            context_id_by_name(&store, "release-demo").expect("context"),
+            Some(prior),
+            None,
+        )
+        .expect("prior invalidations");
 
     assert_eq!(
-        observed,
-        vec![
-            (
-                DedupClassification::NewInsertion,
-                DedupClassification::NewInsertion,
-            ),
-            (
-                DedupClassification::NewInsertion,
-                DedupClassification::NewInsertion,
-            ),
-            (
-                DedupClassification::ExactDuplicate,
-                DedupClassification::ExactDuplicate,
-            ),
-            (
-                DedupClassification::ExactDuplicate,
-                DedupClassification::ExactDuplicate,
-            ),
-            (
-                DedupClassification::RefinesExisting,
-                DedupClassification::RefinesExisting,
-            ),
-            (
-                DedupClassification::RefinesExisting,
-                DedupClassification::RefinesExisting,
-            ),
-            (
-                DedupClassification::ConflictsExisting,
-                DedupClassification::ConflictsExisting,
-            ),
-            (
-                DedupClassification::ConflictsExisting,
-                DedupClassification::ConflictsExisting,
-            ),
-        ]
+        (
+            decision_row(&store, Some(prior)),
+            second
+                .dedup_events
+                .iter()
+                .map(|event| event.classification)
+                .collect::<Vec<_>>(),
+            invalidations.len(),
+        ),
+        (
+            Some((
+                prior,
+                "deploy to AWS".to_string(),
+                DecisionStatus::Invalidated
+            )),
+            vec![DedupClassification::ConflictsExisting],
+            1,
+        )
     );
 }
 
 #[test]
-fn dedup_high_text_similarity_contradiction_not_folded_into_duplicate() {
-    let class = classify_dedup_candidate(DedupCandidate {
-        entity: "entity".to_string(),
-        same_entity: true,
-        prior_value: "alpha beta gamma".to_string(),
-        candidate_value: "alpha beta delta".to_string(),
-    });
+fn model_relation_duplicate_routes_byte_disjoint_paraphrase_to_prior_row() {
+    let (_dir, store) = fresh_store();
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "paraphrase-demo".to_string(),
+            transcript: "auth location captured".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("auth location captured".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_login".to_string(),
+                text: "ship login".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_auth".to_string(),
+                name: "authentication module".to_string(),
+                path: "src/auth.py".to_string(),
+                entity_type: ExtractedEntityType::File,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_auth".to_string(),
+                text: "auth lives at src/auth.py".to_string(),
+                goal_key: Some("G_login".to_string()),
+                entity_key: Some("E_auth".to_string()),
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("first paraphrase capture");
+    let prior = stable_decision_id(&[&first], &["D_auth"]).expect("prior decision");
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "paraphrase-demo".to_string(),
+            transcript: "same auth location paraphrased".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("same auth location paraphrased".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_login".to_string(),
+                text: "ship login".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_auth".to_string(),
+                name: "authentication module".to_string(),
+                path: "src/auth.py".to_string(),
+                entity_type: ExtractedEntityType::File,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_auth_paraphrase".to_string(),
+                text: "the authentication module is in the authentication source file".to_string(),
+                goal_key: Some("G_login".to_string()),
+                entity_key: Some("E_auth".to_string()),
+                relation: Some(DecisionRelationSeed {
+                    prior_decision_id: prior.as_uuid().to_string(),
+                    classification: DecisionRelationClassification::ExactDuplicate,
+                }),
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("second paraphrase capture");
 
-    assert_eq!(class, DedupClassification::ConflictsExisting);
+    assert_eq!(
+        (
+            second.total_harvest.decisions,
+            stable_decision_id(&[&second], &["D_auth_paraphrase"]),
+            decision_row(&store, Some(prior)),
+            second
+                .dedup_events
+                .iter()
+                .map(|event| event.classification)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            1,
+            Some(prior),
+            Some((
+                prior,
+                "auth lives at src/auth.py".to_string(),
+                DecisionStatus::Active,
+            )),
+            vec![DedupClassification::ExactDuplicate],
+        )
+    );
 }
 
 #[test]
@@ -897,6 +997,224 @@ fn goal_article_drift_keeps_replacement_decision_attached() {
 }
 
 #[test]
+fn stored_entity_path_change_invalidates_without_old_value_in_second_harvest() {
+    let (_dir, store) = fresh_store();
+    let first_harvest = StructuredHarvest {
+        summary: Some("provider config location captured".to_string()),
+        goals: vec![GoalSeed {
+            key: "I_byok".to_string(),
+            text: "ship cg's BYOK model-connection layer".to_string(),
+        }],
+        entities: vec![EntitySeed {
+            key: "E_cfg".to_string(),
+            name: "provider config".to_string(),
+            path: "crates/cg-catalog/providers.toml".to_string(),
+            entity_type: ExtractedEntityType::Configuration,
+        }],
+        decisions: vec![DecisionSeed {
+            key: "D_loc".to_string(),
+            text: "the loader reads provider config from crates/cg-catalog/providers.toml"
+                .to_string(),
+            goal_key: Some("I_byok".to_string()),
+            entity_key: Some("E_cfg".to_string()),
+            relation: None,
+        }],
+        observations: vec![],
+    };
+    let second_harvest = StructuredHarvest {
+        summary: Some("provider config now embedded".to_string()),
+        goals: vec![GoalSeed {
+            key: "I_byok".to_string(),
+            text: "ship cg's BYOK model-connection layer".to_string(),
+        }],
+        entities: vec![EntitySeed {
+            key: "E_cfg".to_string(),
+            name: "provider config".to_string(),
+            path: "crates/cg-catalog/src/providers.toml".to_string(),
+            entity_type: ExtractedEntityType::Configuration,
+        }],
+        decisions: vec![DecisionSeed {
+            key: "D_embed".to_string(),
+            text: "provider config ships embedded at crates/cg-catalog/src/providers.toml"
+                .to_string(),
+            goal_key: Some("I_byok".to_string()),
+            entity_key: Some("E_cfg".to_string()),
+            relation: None,
+        }],
+        observations: vec![],
+    };
+    assert!(!harvest_contains_text(
+        &second_harvest,
+        "crates/cg-catalog/providers.toml"
+    ));
+
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "acme-coding-assistant".to_string(),
+            transcript: "Shipping the BYOK provider layer.".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(first_harvest),
+    )
+    .expect("first static harvest capture");
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "acme-coding-assistant".to_string(),
+            transcript: "The provider config now ships embedded in the binary.".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(second_harvest),
+    )
+    .expect("second static harvest capture");
+
+    let context_id = context_id_by_name(&store, "acme-coding-assistant").expect("context");
+    let old_decision = stable_decision_id(&[&first], &["D_loc"]).expect("old decision");
+    let new_decision = stable_decision_id(&[&second], &["D_embed"]).expect("new decision");
+    let impact = standing_impact(&store, context_id).expect("standing impact");
+    let invalidations = store
+        .list_invalidations(context_id, Some(old_decision), None)
+        .expect("old decision invalidations");
+
+    assert_eq!(
+        second
+            .dedup_events
+            .iter()
+            .map(|event| (event.prior_value.as_str(), event.candidate_value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(
+            "crates/cg-catalog/providers.toml",
+            "crates/cg-catalog/src/providers.toml"
+        )]
+    );
+    assert_eq!(invalidations.len(), 1);
+    assert_eq!(
+        (
+            decision_row(&store, Some(old_decision)),
+            decision_row(&store, Some(new_decision)),
+            impact.len(),
+            impact[0].basis_line.as_str(),
+            impact[0].goal_now_unserved,
+            impact[0].current_decision_text.as_deref(),
+        ),
+        (
+            Some((
+                old_decision,
+                "the loader reads provider config from crates/cg-catalog/providers.toml"
+                    .to_string(),
+                DecisionStatus::Invalidated,
+            )),
+            Some((
+                new_decision,
+                "provider config ships embedded at crates/cg-catalog/src/providers.toml"
+                    .to_string(),
+                DecisionStatus::Active,
+            )),
+            1,
+            "crates/cg-catalog/providers.toml -> crates/cg-catalog/src/providers.toml",
+            false,
+            Some("provider config ships embedded at crates/cg-catalog/src/providers.toml"),
+        )
+    );
+}
+
+#[test]
+fn model_relation_value_replacement_supersedes_prior_decision() {
+    let (_dir, store) = fresh_store();
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "model-choice-demo".to_string(),
+            transcript: "For cg's session capture we'll use Opus 4.8.".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("capture model selected".to_string()),
+            goals: vec![GoalSeed {
+                key: "I_model".to_string(),
+                text: "choose cg's default capture model".to_string(),
+            }],
+            entities: vec![],
+            decisions: vec![DecisionSeed {
+                key: "D_opus".to_string(),
+                text: "use Opus 4.8 as the capture model".to_string(),
+                goal_key: Some("I_model".to_string()),
+                entity_key: None,
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("first model choice capture");
+    let old_decision = stable_decision_id(&[&first], &["D_opus"]).expect("old decision");
+    let first_goal = stable_intention_id(&[&first], &["I_model"]).expect("first goal");
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "model-choice-demo".to_string(),
+            transcript: "Switching the default to Haiku 4.5.".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("capture model changed".to_string()),
+            goals: vec![GoalSeed {
+                key: "I_model".to_string(),
+                text: "choose cg's default capture model".to_string(),
+            }],
+            entities: vec![],
+            decisions: vec![DecisionSeed {
+                key: "D_haiku".to_string(),
+                text: "use Haiku 4.5 as the capture model".to_string(),
+                goal_key: Some("I_model".to_string()),
+                entity_key: None,
+                relation: Some(DecisionRelationSeed {
+                    prior_decision_id: old_decision.as_uuid().to_string(),
+                    classification: DecisionRelationClassification::SupersedesExisting,
+                }),
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("second model choice capture");
+
+    let new_decision = stable_decision_id(&[&second], &["D_haiku"]).expect("new decision");
+    let second_goal = stable_intention_id(&[&second], &["I_model"]).expect("second goal");
+    let active = store
+        .by_intention(first_goal, DiscoveryFilter::default())
+        .expect("active decisions by intention");
+
+    assert_eq!(first_goal, second_goal);
+    assert_eq!(
+        (
+            decision_row(&store, Some(old_decision)),
+            decision_row(&store, Some(new_decision)),
+            active
+                .iter()
+                .map(|decision| (decision.id, decision.description.as_str(), decision.status))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            Some((
+                old_decision,
+                "use Opus 4.8 as the capture model".to_string(),
+                DecisionStatus::Superseded,
+            )),
+            Some((
+                new_decision,
+                "use Haiku 4.5 as the capture model".to_string(),
+                DecisionStatus::Active,
+            )),
+            vec![(
+                new_decision,
+                "use Haiku 4.5 as the capture model",
+                DecisionStatus::Active,
+            )],
+        )
+    );
+}
+
+#[test]
 fn arrow_path_change_value_renders_single_old_to_new_basis() {
     let (_dir, store) = fresh_store();
     capture(
@@ -928,6 +1246,7 @@ fn arrow_path_change_value_renders_single_old_to_new_basis() {
                 text: "quota config at config/quota-v2.toml".to_string(),
                 goal_key: Some("G1".to_string()),
                 entity_key: Some("E_quota".to_string()),
+                relation: None,
             }],
             observations: vec![ObservationSeed {
                 key: "O_quota_moved".to_string(),

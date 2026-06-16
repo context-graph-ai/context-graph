@@ -192,6 +192,7 @@ fn decision_seed(key: String, text: String, entities: &[EntitySeed]) -> Decision
         text: decision_text,
         goal_key,
         entity_key,
+        relation: None,
     }
 }
 
