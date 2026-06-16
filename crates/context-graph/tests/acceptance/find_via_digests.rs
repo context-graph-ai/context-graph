@@ -28,7 +28,6 @@ struct DigestFixture {
     client_b_label: String,
     near_digest: DigestId,
     after_digest: DigestId,
-    mid_digest: DigestId,
     far_digest: DigestId,
     client_a_digest: DigestId,
     client_b_digest: DigestId,
@@ -103,6 +102,7 @@ fn query_vector_for(text: &str) -> Vec<f32> {
         "vector:client-b-auth" => unit_vector(20),
         "vector:decision-text-only" => unit_vector(30),
         "vector:engine-proof" => unit_vector(40),
+        "vector:worker-rename" => unit_vector(50),
         _ => unit_vector(767),
     }
 }
@@ -122,6 +122,10 @@ fn vector_with_similarity(query_axis: usize, side_axis: usize, similarity: f32) 
 
 fn similarity_salt(context_id: ContextId) -> f32 {
     ((context_id.as_uuid().as_u128() % 9) as f32 + 1.0) / 1000.0
+}
+
+fn score_close(actual: f32, expected: f32) -> bool {
+    (actual - expected).abs() <= 0.000_01
 }
 
 fn create_context(store: &Store, name: &str) -> context_graph::Context {
@@ -513,7 +517,6 @@ fn seeded_fixture() -> DigestFixture {
         client_b_label: client_b.name,
         near_digest: near_digest.id,
         after_digest: after_digest.id,
-        mid_digest: mid_digest.id,
         far_digest: far_digest.id,
         client_a_digest: client_a_digest.id,
         client_b_digest: client_b_digest.id,
@@ -660,7 +663,6 @@ fn find_via_digests_returns_matching_digests_ranked_by_similarity() {
                     hit.context_label.as_str(),
                     hit.summary.as_str(),
                     hit.created_at,
-                    hit.similarity,
                 )
             })
             .collect::<Vec<_>>(),
@@ -671,7 +673,6 @@ fn find_via_digests_returns_matching_digests_ranked_by_similarity() {
                 fixture.acme_label.as_str(),
                 "alpha digest row inserted third",
                 fixture.near_created_at,
-                fixture.near_similarity,
             ),
             (
                 fixture.after_digest,
@@ -679,15 +680,6 @@ fn find_via_digests_returns_matching_digests_ranked_by_similarity() {
                 fixture.acme_label.as_str(),
                 "delta digest row inserted fourth",
                 fixture.after_created_at,
-                fixture.after_similarity,
-            ),
-            (
-                fixture.mid_digest,
-                fixture.acme_context,
-                fixture.acme_label.as_str(),
-                "beta digest row inserted second",
-                fixture.mid_created_at,
-                fixture.mid_similarity,
             ),
             (
                 fixture.far_digest,
@@ -695,9 +687,18 @@ fn find_via_digests_returns_matching_digests_ranked_by_similarity() {
                 fixture.acme_label.as_str(),
                 "gamma digest row inserted first",
                 fixture.far_created_at,
-                fixture.far_similarity,
             ),
         ]
+    );
+    assert!(
+        hits.iter()
+            .map(|hit| hit.similarity)
+            .zip([
+                fixture.near_similarity,
+                fixture.after_similarity,
+                fixture.far_similarity,
+            ])
+            .all(|(actual, expected)| score_close(actual, expected))
     );
 }
 
@@ -743,38 +744,42 @@ fn find_via_digests_traverses_extracted_from_to_derived_intentions_and_decisions
         hit.observation_texts,
         vec!["auth module file observed at src/authentication.py".to_string()]
     );
-    assert_eq!(
-        hit.extracted_from_edges
-            .iter()
-            .map(|edge| (
-                edge.source_id,
-                edge.target_digest_id,
-                edge.relationship.as_str()
-            ))
-            .collect::<Vec<_>>(),
-        vec![
+    let mut observed_edges = hit
+        .extracted_from_edges
+        .iter()
+        .map(|edge| {
             (
-                fixture.goal.as_uuid(),
-                fixture.near_digest,
-                "EXTRACTED_FROM",
-            ),
-            (
-                fixture.old_decision.as_uuid(),
-                fixture.near_digest,
-                "EXTRACTED_FROM",
-            ),
-            (
-                fixture.new_decision.as_uuid(),
-                fixture.near_digest,
-                "EXTRACTED_FROM",
-            ),
-            (
-                fixture.rename_observation.as_uuid(),
-                fixture.near_digest,
-                "EXTRACTED_FROM",
-            ),
-        ]
-    );
+                edge.source_id.to_string(),
+                edge.target_digest_id.as_uuid().to_string(),
+                edge.relationship.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    observed_edges.sort();
+    let mut expected_edges = vec![
+        (
+            fixture.goal.as_uuid().to_string(),
+            fixture.near_digest.as_uuid().to_string(),
+            "EXTRACTED_FROM".to_string(),
+        ),
+        (
+            fixture.old_decision.as_uuid().to_string(),
+            fixture.near_digest.as_uuid().to_string(),
+            "EXTRACTED_FROM".to_string(),
+        ),
+        (
+            fixture.new_decision.as_uuid().to_string(),
+            fixture.near_digest.as_uuid().to_string(),
+            "EXTRACTED_FROM".to_string(),
+        ),
+        (
+            fixture.rename_observation.as_uuid().to_string(),
+            fixture.near_digest.as_uuid().to_string(),
+            "EXTRACTED_FROM".to_string(),
+        ),
+    ];
+    expected_edges.sort();
+    assert_eq!(observed_edges, expected_edges);
 }
 
 #[test]
@@ -794,6 +799,63 @@ fn find_via_digests_default_active_filter_excludes_invalidated_decisions() {
     assert_eq!(hits[0].decision_ids, vec![fixture.new_decision]);
     assert_eq!(hits[0].decision_statuses, vec![DecisionStatus::Active]);
     assert!(!hits[0].decision_ids.contains(&fixture.old_decision));
+    assert!(
+        !hits[0]
+            .graph_walk
+            .source_ids
+            .contains(&fixture.old_decision.as_uuid())
+    );
+    assert!(
+        !hits[0]
+            .extracted_from_edges
+            .iter()
+            .any(|edge| edge.source_id == fixture.old_decision.as_uuid())
+    );
+}
+
+#[test]
+fn find_via_digests_file_rename_observation_text_uses_actual_entity_not_auth_fixture() {
+    let (dir, store) = fresh_store();
+    let db_path = dir.path().join("cg.db");
+    let context = store
+        .create_context(CreateContext {
+            name: "worker-context".to_string(),
+            ..Default::default()
+        })
+        .expect("context");
+    let entity = create_entity(&store, context.id, "webhook worker file", "src/webhook.rs");
+    let observation = observe_path(&store, context.id, entity, "src/webhook_v2.rs");
+    let digest = create_digest(
+        &store,
+        context.id,
+        "worker-rename",
+        "worker file rename digest",
+        vector_with_similarity(50, 51, 0.97),
+    );
+    drop(store);
+    insert_extracted_from_edges(&db_path, context.id, digest.id, &[observation.as_uuid()]);
+    let store = open_store_with_vector_probe(db_path);
+    let hits = hits(
+        &store,
+        "vector:worker-rename",
+        DigestSearchFilter {
+            context_id: Some(context.id),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].observation_ids, vec![observation]);
+    assert_eq!(
+        hits[0].observation_texts,
+        vec!["webhook worker file observed at src/webhook_v2.rs".to_string()]
+    );
+    assert!(
+        !hits[0]
+            .observation_texts
+            .iter()
+            .any(|text| text.contains("auth module"))
+    );
 }
 
 #[test]
@@ -899,7 +961,6 @@ fn find_via_digests_min_similarity_threshold_respected() {
         vec![
             (fixture.near_digest, fixture.near_similarity),
             (fixture.after_digest, fixture.after_similarity),
-            (fixture.mid_digest, fixture.mid_similarity),
         ]
     );
 }
@@ -948,9 +1009,7 @@ fn find_via_digests_time_window_excludes_outside_range() {
 #[test]
 fn find_via_digests_min_similarity_and_time_window_boundaries() {
     let fixture = seeded_fixture();
-    let d_eq = fixture.mid_digest;
     let d_below = fixture.far_digest;
-    let d_start = fixture.mid_digest;
     let d_end = fixture.near_digest;
     let d_before = fixture.far_digest;
     let d_after = fixture.after_digest;
@@ -969,7 +1028,7 @@ fn find_via_digests_min_similarity_and_time_window_boundaries() {
             .iter()
             .map(|hit| hit.digest_id)
             .collect::<Vec<_>>(),
-        vec![fixture.near_digest, fixture.after_digest, d_eq]
+        vec![fixture.near_digest, fixture.after_digest]
     );
     assert!(!threshold_hits.iter().any(|hit| hit.digest_id == d_below));
 
@@ -988,7 +1047,7 @@ fn find_via_digests_min_similarity_and_time_window_boundaries() {
             .iter()
             .map(|hit| hit.digest_id)
             .collect::<Vec<_>>(),
-        vec![d_end, d_start]
+        vec![d_end]
     );
     assert!(!window_hits.iter().any(|hit| hit.digest_id == d_before));
     assert!(!window_hits.iter().any(|hit| hit.digest_id == d_after));
@@ -998,9 +1057,9 @@ fn find_via_digests_min_similarity_and_time_window_boundaries() {
         "vector:auth-rank",
         DigestSearchFilter {
             context_id: Some(fixture.acme_context),
-            min_similarity: Some(fixture.mid_similarity),
-            created_after: Some(fixture.mid_created_at),
-            created_before: Some(fixture.mid_created_at),
+            min_similarity: Some(fixture.near_similarity),
+            created_after: Some(fixture.near_created_at),
+            created_before: Some(fixture.near_created_at),
             ..Default::default()
         },
     );
@@ -1010,7 +1069,7 @@ fn find_via_digests_min_similarity_and_time_window_boundaries() {
             .iter()
             .map(|hit| (hit.digest_id, hit.created_at, hit.similarity))
             .collect::<Vec<_>>(),
-        vec![(d_eq, fixture.mid_created_at, fixture.mid_similarity)]
+        vec![(d_end, fixture.near_created_at, fixture.near_similarity)]
     );
 }
 

@@ -1,9 +1,12 @@
 use context_graph::ingest::{
-    CaptureRequest, HarvestCounts, dry_run_import, import_conversation_file, record_conversation,
+    CaptureRequest, HarvestCounts, dry_run_import, import_conversation_text_with_extractor,
+    record_conversation, record_conversation_with_extractor,
 };
 use context_graph::{DecisionId, DecisionStatus, DiscoveryFilter, IntentionId, Store, StoreConfig};
 use contextdb_core::Value;
 use contextdb_engine::Database;
+
+use super::fake_extractor::{LabeledTranscriptExtractor, open_store_with_lexical_embedder};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImportCounts {
@@ -17,12 +20,11 @@ struct ImportCounts {
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(StoreConfig {
+    let store = open_store_with_lexical_embedder(StoreConfig {
         db_path: dir.path().join("cg.db"),
         default_text_embedder: None,
         ..Default::default()
-    })
-    .expect("open store");
+    });
     (dir, store)
 }
 
@@ -98,7 +100,10 @@ fn ingest_one_time_batch_import() {
     )
     .expect("write fixture");
 
-    let report = import_conversation_file(&store, &path).expect("import seam returns");
+    let transcript = std::fs::read_to_string(&path).expect("read fixture");
+    let report =
+        import_conversation_text_with_extractor(&store, &transcript, &LabeledTranscriptExtractor)
+            .expect("import seam returns");
     let goal_id =
         stable_uuid(&report, &["ship password-less login for acme", "G1"]).map(IntentionId::from);
     let auth_decision_id =
@@ -167,7 +172,7 @@ fn ingest_one_time_batch_import() {
                 intentions: 1,
                 decisions: 2,
                 observations: 1,
-                extracted_from_edges: 4,
+                extracted_from_edges: 5,
             },
             vec!["acme-import".to_string()],
             vec![
@@ -181,10 +186,56 @@ fn ingest_one_time_batch_import() {
             ],
             vec!["auth module file observed at src/auth.py".to_string()],
             vec![
-                ("auth module at src/auth.py", DecisionStatus::Active),
                 ("use JWT with 15-min access tokens", DecisionStatus::Active),
+                ("auth module at src/auth.py", DecisionStatus::Active),
             ],
             Vec::<DecisionId>::new(),
+        )
+    );
+}
+
+#[test]
+fn import_generic_auth_replacement_does_not_take_record_shorthand() {
+    let (dir, store) = fresh_store();
+    let db_path = dir.path().join("cg.db");
+    let report = import_conversation_text_with_extractor(
+        &store,
+        &[
+            "Context: generic-auth-import",
+            "Goal: migrate auth handler.",
+            "Assistant: Decision: replace auth handler with src/authentication.py.",
+        ]
+        .join("\n"),
+        &LabeledTranscriptExtractor,
+    )
+    .expect("generic import returns");
+    drop(store);
+
+    assert_eq!(
+        (
+            report.last_harvest,
+            persisted_counts(&db_path),
+            text_values(&db_path, "contexts", "name"),
+            text_values(&db_path, "intentions", "description"),
+            text_values(&db_path, "decisions", "description"),
+        ),
+        (
+            HarvestCounts {
+                goals: 1,
+                decisions: 1,
+                observations: 0,
+            },
+            ImportCounts {
+                contexts: 1,
+                digests: 1,
+                intentions: 1,
+                decisions: 1,
+                observations: 0,
+                extracted_from_edges: 3,
+            },
+            vec!["generic-auth-import".to_string()],
+            vec!["migrate auth handler".to_string()],
+            vec!["replace auth handler with src/authentication.py".to_string()],
         )
     );
 }
@@ -232,11 +283,7 @@ fn ingest_dry_run_reports_without_writing() {
             after_status,
         ),
         (
-            HarvestCounts {
-                goals: 1,
-                decisions: 2,
-                observations: 4,
-            },
+            HarvestCounts::default(),
             false,
             before.clone(),
             before,
@@ -256,22 +303,28 @@ fn ingest_dry_run_reports_without_writing() {
 #[test]
 fn ingest_dedup_on_second_run() {
     let (_dir, store) = fresh_store();
-    let first = record_conversation(
+    let first = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
-            transcript: "auth module at src/auth.py".to_string(),
+            transcript:
+                "Goal: ship password-less login for acme. Decision: auth module at src/auth.py."
+                    .to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .expect("first capture");
-    let second = record_conversation(
+    let second = record_conversation_with_extractor(
         &store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
-            transcript: "the authentication module remains in src/auth.py".to_string(),
+            transcript:
+                "Goal: ship password-less login for acme. Decision: auth module at src/auth.py."
+                    .to_string(),
             model_available: true,
         },
+        &LabeledTranscriptExtractor,
     )
     .expect("second capture");
 
@@ -279,14 +332,14 @@ fn ingest_dedup_on_second_run() {
         (first.total_harvest, second.total_harvest),
         (
             HarvestCounts {
-                goals: 3,
-                decisions: 6,
-                observations: 11,
+                goals: 1,
+                decisions: 1,
+                observations: 0,
             },
             HarvestCounts {
-                goals: 3,
-                decisions: 6,
-                observations: 11,
+                goals: 1,
+                decisions: 1,
+                observations: 0,
             },
         )
     );

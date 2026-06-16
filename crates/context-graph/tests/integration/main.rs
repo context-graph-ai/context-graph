@@ -1,3 +1,5 @@
+#[path = "../common/fake_extractor.rs"]
+mod fake_extractor;
 #[path = "../common/invalidation_fixtures.rs"]
 mod invalidation_fixtures;
 

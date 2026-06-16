@@ -12,7 +12,7 @@ use candle_transformers::models::nomic_bert::{
     Config as NomicBertConfig, NomicBertModel, l2_normalize as candle_l2_normalize, mean_pooling,
 };
 use safetensors::{Dtype as SafeTensorDType, SafeTensors};
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationDirection};
 
 use crate::embedder::load_observer::{EmbedderLoadEvent, EmbedderLoadObserver};
 use crate::embedder::{Embedder, EmbedderConfig, EmbeddingInput, EmbeddingOutput};
@@ -25,6 +25,7 @@ const NOMIC_TEXT_DEFAULT_ID: &str = "text_default_nomic_v1_5_768";
 const NOMIC_MODEL_ID: &str = "nomic-embed-text-v1.5";
 const NOMIC_DEFAULT_DIMENSION: usize = 768;
 const NOMIC_MODEL_DOWNLOAD_LIMIT_BYTES: u64 = 600 * 1024 * 1024;
+const NOMIC_MAX_SEQUENCE_TOKENS: usize = 8192;
 const CG_MODEL_CACHE_ROOT_ENV: &str = "CG_MODEL_CACHE_ROOT";
 const LEGACY_EMBEDDER_CACHE_COMPONENT: &str = "embedders";
 
@@ -259,13 +260,14 @@ impl NomicTextEmbedder {
     }
 
     fn forward(&self, loaded: &LoadedNomicModel, text: &str) -> Result<Vec<f32>> {
-        let encoding =
+        let mut encoding =
             loaded
                 .tokenizer
                 .encode(text, true)
                 .map_err(|_| CgError::EmbedderModelCorrupt {
                     path: loaded.tokenizer_path.clone(),
                 })?;
+        encoding.truncate(NOMIC_MAX_SEQUENCE_TOKENS, 0, TruncationDirection::Right);
         let input_ids = Tensor::new(encoding.get_ids(), &loaded.device)
             .map_err(candle_err)?
             .unsqueeze(0)

@@ -18,13 +18,13 @@ path = "src/main.rs"
 [dependencies]
 cg-catalog = { path = "../cg-catalog" }
 cg-cli-conventions.workspace = true
+context-graph = { path = "../context-graph" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 toml.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-context-graph = { path = "../context-graph" }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 tempfile.workspace = true
-uuid.workspace = true

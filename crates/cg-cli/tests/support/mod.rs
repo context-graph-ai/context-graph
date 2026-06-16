@@ -110,6 +110,7 @@ pub fn run_cg(
     command
         .args(args)
         .env("CG_DATA_ROOT", data_root)
+        .env("CG_USE_TEST_LEXICAL_EMBEDDER", "1")
         .env("HOME", data_root)
         .env("PATH", path_env)
         .env_remove("OPENAI_API_KEY")
@@ -150,6 +151,7 @@ pub fn run_cg_observing_provider_before_exit(
     command
         .args(args)
         .env("CG_DATA_ROOT", data_root)
+        .env("CG_USE_TEST_LEXICAL_EMBEDDER", "1")
         .env("HOME", data_root)
         .env("PATH", path_env)
         .env_remove("OPENAI_API_KEY")
@@ -210,6 +212,7 @@ pub fn run_cg_writing_stdin_after_output(
     command
         .args(args)
         .env("CG_DATA_ROOT", data_root)
+        .env("CG_USE_TEST_LEXICAL_EMBEDDER", "1")
         .env("HOME", data_root)
         .env("PATH", path_env)
         .env_remove("OPENAI_API_KEY")
@@ -340,6 +343,7 @@ impl LoginState {
 #[derive(Clone, Copy)]
 pub enum CompletionBehavior {
     Succeed,
+    ExtractHarvest,
     Fail,
     BillingRequired,
     RateLimit,
@@ -352,6 +356,7 @@ impl CompletionBehavior {
     fn as_str(self) -> &'static str {
         match self {
             Self::Succeed => "succeed",
+            Self::ExtractHarvest => "extract-harvest",
             Self::Fail => "fail",
             Self::BillingRequired => "billing-required",
             Self::RateLimit => "rate-limit",
@@ -694,6 +699,342 @@ def proof(secret, prompt):
         value = (value * 1099511628211) & 0xffffffffffffffff
     return "proof-%016x" % value
 
+def capture_transcript(prompt):
+    marker = "Transcript:\n"
+    if marker in prompt:
+        transcript = prompt.split(marker, 1)[1]
+        start = "<cg_transcript>\n"
+        end = "\n</cg_transcript>"
+        if start in transcript and end in transcript:
+            transcript = transcript.split(start, 1)[1].split(end, 1)[0]
+        return transcript
+    return prompt
+
+def clean_statement(statement):
+    statement = statement.strip().strip(".")
+    for role in ("User:", "Assistant:", "System:"):
+        if statement.lower().startswith(role.lower()):
+            return statement[len(role):].strip()
+    return statement
+
+def parse_label(statement, label, ordinal):
+    statement = clean_statement(statement)
+    lower = statement.lower()
+    label_lower = label.lower()
+    if lower.startswith(label_lower + ":") or lower.startswith(label_lower + " "):
+        rest = statement[len(label) + 1:].strip()
+    else:
+        return None
+    if ":" in rest:
+        maybe_key, body = rest.split(":", 1)
+        key = maybe_key.split()[0] if maybe_key.split() else ""
+        if key.startswith(label[0]):
+            return key, body.strip()
+    parts = rest.split(None, 1)
+    if parts and parts[0].startswith(label[0]):
+        return parts[0], parts[1].strip() if len(parts) > 1 else rest
+    return "%s%d" % (label[0], ordinal), rest
+
+def path_from_text(text):
+    if "path=" in text:
+        return text.split("path=", 1)[1].split()[0].rstrip(",")
+    for token in text.split():
+        if "/" in token or ".toml" in token or ".yml" in token:
+            return token.rstrip(",")
+    return None
+
+def entity_type(path):
+    if ".toml" in path:
+        return "configuration"
+    if "deploy" in path or "workflow" in path:
+        return "pipeline"
+    if "/" in path or path.endswith(".py") or path.endswith(".rs"):
+        return "file"
+    return "service"
+
+def entity_seed(key, text):
+    path = path_from_text(text)
+    if not path:
+        if "auth module" in text:
+            path = "src/auth.py"
+        elif "redis" in text.lower():
+            path = "config/redis.toml"
+        else:
+            path = text
+    if key == "E_auth_module":
+        name = "auth module file"
+    elif key == "E_redis":
+        name = "redis config"
+    else:
+        name = text.split(" path=", 1)[0].strip().strip(",")
+    return {"key": key, "name": name, "path": path, "entity_type": entity_type(path)}
+
+def decision_seed(key, text, entities):
+    decision_text = text.split(" serves ", 1)[0].strip()
+    known = {
+        "auth module at src/auth.py": "D_old",
+        "auth module at src/authentication.py": "D_new",
+        "use JWT with 15-min access tokens": "D_jwt",
+        "store refresh tokens in Redis": "D_other",
+    }
+    key = known.get(decision_text, key)
+    goal_key = None
+    if " serves " in text:
+        goal_key = text.split(" serves ", 1)[1].split()[0].rstrip(",")
+    entity_key = None
+    if "based_on " in text:
+        entity_key = text.split("based_on ", 1)[1].split()[0].rstrip(",")
+    lower = text.lower()
+    if not entity_key:
+        for entity in entities:
+            if entity["path"].lower() in lower:
+                entity_key = entity["key"]
+                break
+    if not entity_key and ("src/auth.py" in lower or "src/authentication.py" in lower):
+        entity_key = "E_auth_module"
+    if not entity_key and "redis" in lower:
+        entity_key = "E_redis"
+    return {"key": key, "text": decision_text, "goal_key": goal_key, "entity_key": entity_key}
+
+def observation_seed(key, text, entities):
+    lower = text.lower()
+    first = text.split()[0].rstrip(":") if text.split() else ""
+    entity_key = first if first.startswith("E") else None
+    if not entity_key:
+        for entity in entities:
+            if entity["path"].lower() in lower:
+                entity_key = entity["key"]
+                break
+    if not entity_key and "auth module" in lower:
+        entity_key = "E_auth_module"
+    if not entity_key and "redis" in lower:
+        entity_key = "E_redis"
+    path_change = None
+    if "->" in text:
+        path_change = text.split("->", 1)[1].split()[0].rstrip(",")
+    known = {
+        "auth module file observed at src/auth.py": "O_auth_path",
+        "auth module file observed at src/authentication.py": "O_auth_current",
+    }
+    return {"key": known.get(text, key), "text": text, "entity_key": entity_key, "path_change": path_change}
+
+def infer_entities(harvest):
+    keys = {entity["key"] for entity in harvest["entities"]}
+    all_text = " ".join([d["text"] for d in harvest["decisions"]] + [o["text"] for o in harvest["observations"]])
+    if "E_auth_module" not in keys and ("src/auth.py" in all_text or "src/authentication.py" in all_text):
+        harvest["entities"].append({"key":"E_auth_module","name":"auth module file","path":"src/auth.py","entity_type":"file"})
+    if "E_redis" not in keys and "redis" in all_text.lower():
+        harvest["entities"].append({"key":"E_redis","name":"redis config","path":"config/redis.toml","entity_type":"configuration"})
+
+def compact(text):
+    return " ".join(text.split())
+
+def harvest_json(prompt):
+    transcript = capture_transcript(prompt)
+    lower = transcript.lower()
+    if "password-less login" in lower and "auth module file at src/auth.py" in lower and "src/authentication.py" not in lower:
+        decisions = [{"key":"D_old","text":"auth module at src/auth.py","goal_key":"G1","entity_key":"E_auth_module"}]
+        if "jwt" in lower and "15-min" in lower:
+            decisions.append({"key":"D_jwt","text":"use JWT with 15-min access tokens","goal_key":"G1","entity_key":"E_auth_module"})
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G1","text":"ship password-less login for acme"}],
+            "entities": [{"key":"E_auth_module","name":"auth module file","path":"src/auth.py","entity_type":"file"}],
+            "decisions": decisions,
+            "observations": [{"key":"O_auth_path","text":"auth module file observed at src/auth.py","entity_key":"E_auth_module","path_change":None}],
+        }, sort_keys=True)
+    if "password-less login" in lower and "auth module at src/authentication.py" in lower and "jwt" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G1","text":"ship password-less login for acme"}],
+            "entities": [{"key":"E_auth_module","name":"auth module file","path":"src/authentication.py","entity_type":"file"}],
+            "decisions": [
+                {"key":"D_new","text":"auth module at src/authentication.py","goal_key":"G1","entity_key":"E_auth_module"},
+                {"key":"D_jwt","text":"use JWT with 15-min access tokens","goal_key":"G1","entity_key":"E_auth_module"},
+            ],
+            "observations": [],
+        }, sort_keys=True)
+    if "moved from src/auth.py to src/authentication.py" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G1","text":"ship password-less login for acme"}],
+            "entities": [{"key":"E_auth_module","name":"auth module file","path":"src/auth.py","entity_type":"file"}],
+            "observations": [{"key":"O_auth_path_change","text":"E_auth_module path changed src/auth.py -> src/authentication.py","entity_key":"E_auth_module","path_change":"src/authentication.py"}],
+            "decisions": [{"key":"D_new","text":"auth module at src/authentication.py","goal_key":"G1","entity_key":"E_auth_module"}],
+        }, sort_keys=True)
+    if "password-less login" in lower and "15-min access tokens" in lower and "auth migration notes" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [
+                {"key":"G1","text":"ship password-less login for acme"},
+                {"key":"G_auth_audit","text":"keep audit trail for auth migrations"},
+            ],
+            "entities": [{"key":"E_auth_module","name":"auth module file","path":"src/auth.py","entity_type":"file"}],
+            "decisions": [
+                {"key":"D_old","text":"auth module at src/auth.py","goal_key":"G1","entity_key":"E_auth_module"},
+                {"key":"D_jwt","text":"use JWT with 15-min access tokens","goal_key":"G1","entity_key":"E_auth_module"},
+                {"key":"D_auth_docs","text":"write auth migration notes to docs/auth-migration.md","goal_key":"G_auth_audit","entity_key":None},
+            ],
+            "observations": [
+                {"key":"O_auth_path","text":"auth module file observed at src/auth.py","entity_key":"E_auth_module","path_change":None},
+                {"key":"O_auth_tests","text":"auth tests cover password-less login","entity_key":"E_auth_module","path_change":None},
+                {"key":"O_jwt_refresh","text":"JWT refresh token TTL remains 7 days","entity_key":"E_auth_module","path_change":None},
+                {"key":"O_auth_audit","text":"audit trail lives in docs/auth-migration.md","entity_key":"E_auth_module","path_change":None},
+            ],
+        }, sort_keys=True)
+    if "reduce checkout latency" in lower and "product catalog" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_checkout_latency","text":"reduce checkout latency"}],
+            "entities": [{"key":"E_checkout","name":"checkout service","path":"checkout service","entity_type":"service"}],
+            "decisions": [{"key":"D_checkout_cache","text":"cache product catalog in memory","goal_key":"G_checkout_latency","entity_key":"E_checkout"}],
+            "observations": [{"key":"O_checkout_latency","text":"checkout latency p95 dropped to 220ms","entity_key":"E_checkout","path_change":None}],
+        }, sort_keys=True)
+    if "migrating the auth handler" in lower and "src/authentication.py" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_auth_handler","text":"migrate auth handler"}],
+            "entities": [{"key":"E_auth_module","name":"auth module file","path":"src/authentication.py","entity_type":"file"}],
+            "decisions": [{"key":"D_auth_handler","text":"replace auth handler with src/authentication.py","goal_key":"G_auth_handler","entity_key":"E_auth_module"}],
+            "observations": [],
+        }, sort_keys=True)
+    if "ci pipeline" in lower and "pull request" in lower and "release build" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_ci","text":"set up CI pipeline"}],
+            "entities": [{"key":"E_ci","name":"CI pipeline","path":".github/workflows/ci.yml","entity_type":"pipeline"}],
+            "decisions": [
+                {"key":"D_ci_1","text":"run CI on every pull request","goal_key":"G_ci","entity_key":"E_ci"},
+                {"key":"D_ci_2","text":"block merges when CI fails","goal_key":"G_ci","entity_key":"E_ci"},
+            ],
+            "observations": [
+                {"key":"O_ci_1","text":"CI workflow file exists","entity_key":"E_ci","path_change":None},
+                {"key":"O_ci_2","text":"unit tests run in CI","entity_key":"E_ci","path_change":None},
+                {"key":"O_ci_3","text":"clippy runs in CI","entity_key":"E_ci","path_change":None},
+                {"key":"O_ci_4","text":"release build runs in CI","entity_key":"E_ci","path_change":None},
+            ],
+        }, sort_keys=True)
+    if "project x" in lower and "local context store" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_project","text":"keep project x memory local"}],
+            "entities": [],
+            "decisions": [{"key":"D_project","text":"use local context store","goal_key":"G_project","entity_key":None}],
+            "observations": [],
+        }, sort_keys=True)
+    if "webhook ingestion" in lower and "signed worker" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_webhook","text":"keep webhook ingestion reliable"}],
+            "entities": [{"key":"E_worker","name":"webhook worker file","path":"src/webhook.rs","entity_type":"file"}],
+            "decisions": [{"key":"D_webhook","text":"route webhooks through signed worker","goal_key":"G_webhook","entity_key":"E_worker"}],
+            "observations": [{"key":"O_worker","text":"E_worker path observed at src/webhook.rs","entity_key":"E_worker","path_change":None}],
+        }, sort_keys=True)
+    if "client b memory" in lower and "isolated deploy notes" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_client_b","text":"keep client b memory separate"}],
+            "entities": [],
+            "decisions": [{"key":"D_client_b","text":"use isolated deploy notes","goal_key":"G_client_b","entity_key":None}],
+            "observations": [],
+        }, sort_keys=True)
+    if "rollout must stay available" in lower and "src/d1.py" in lower and "src/d2.py" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_rollout","text":"keep rollout available"}],
+            "entities": [
+                {"key":"E_d1","name":"primary rollout basis","path":"src/d1.py","entity_type":"file"},
+                {"key":"E_d2","name":"fallback rollout basis","path":"src/d2.py","entity_type":"file"},
+            ],
+            "decisions": [
+                {"key":"D1","text":"D1","goal_key":"G_rollout","entity_key":"E_d1"},
+                {"key":"D2","text":"D2","goal_key":"G_rollout","entity_key":"E_d2"},
+            ],
+            "observations": [],
+        }, sort_keys=True)
+    if "primary rollout basis moved from src/d1.py to src/d1_v2.py" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [],
+            "entities": [{"key":"E_d1","name":"primary rollout basis","path":"src/d1.py","entity_type":"file"}],
+            "decisions": [],
+            "observations": [{"key":"O_d1","text":"E_d1 path changed src/d1.py -> src/d1_v2.py","entity_key":"E_d1","path_change":"src/d1_v2.py"}],
+        }, sort_keys=True)
+    if "fallback rollout basis moved from src/d2.py to src/d2_v2.py" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [],
+            "entities": [{"key":"E_d2","name":"fallback rollout basis","path":"src/d2.py","entity_type":"file"}],
+            "decisions": [],
+            "observations": [{"key":"O_d2","text":"E_d2 path changed src/d2.py -> src/d2_v2.py","entity_key":"E_d2","path_change":"src/d2_v2.py"}],
+        }, sort_keys=True)
+    for label, before, after in (
+        ("before", "src/before.py", "src/before_v2.py"),
+        ("cut", "src/cut.py", "src/cut_v2.py"),
+        ("after", "src/after.py", "src/after_v2.py"),
+    ):
+        if ("track the %s file" % label) in lower and before in lower:
+            return json.dumps({
+                "summary": compact(transcript),
+                "goals": [{"key":"G_%s" % label,"text":"keep %s path tracked" % label}],
+                "entities": [{"key":"E_%s" % label,"name":"%s file" % label,"path":before,"entity_type":"file"}],
+                "decisions": [{"key":"D_%s" % label,"text":before,"goal_key":"G_%s" % label,"entity_key":"E_%s" % label}],
+                "observations": [{"key":"O_%s_initial" % label,"text":"E_%s path observed at %s" % (label, before),"entity_key":"E_%s" % label,"path_change":None}],
+            }, sort_keys=True)
+        if ("%s file moved from %s to %s" % (label, before, after)) in lower:
+            return json.dumps({
+                "summary": compact(transcript),
+                "goals": [{"key":"G_%s" % label,"text":"keep %s path tracked" % label}],
+                "entities": [{"key":"E_%s" % label,"name":"%s file" % label,"path":before,"entity_type":"file"}],
+                "decisions": [{"key":"D_%s_new" % label,"text":after,"goal_key":"G_%s" % label,"entity_key":"E_%s" % label}],
+                "observations": [{"key":"O_%s" % label,"text":"E_%s path changed %s -> %s" % (label, before, after),"entity_key":"E_%s" % label,"path_change":after}],
+            }, sort_keys=True)
+    if "avoid the duplicate-publish race" in lower and "hold 10 min before promote" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_publish","text":"avoid the duplicate-publish race"}],
+            "entities": [{"key":"E_publish","name":"publish pipeline","path":"deploy.yml","entity_type":"pipeline"}],
+            "decisions": [{"key":"D_publish","text":"hold 10 min before promote","goal_key":"G_publish","entity_key":"E_publish"}],
+            "observations": [],
+        }, sort_keys=True)
+    if "sox deploy approvals" in lower and "approval before promote" in lower:
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key":"G_sox","text":"keep SOX deploy approvals"}],
+            "entities": [{"key":"E_publish","name":"publish pipeline","path":"deploy.yml","entity_type":"pipeline"}],
+            "decisions": [{"key":"D_sox","text":"SOX approval required before promote","goal_key":"G_sox","entity_key":"E_publish"}],
+            "observations": [],
+        }, sort_keys=True)
+    harvest = {"summary": " ".join(transcript.split()), "goals": [], "entities": [], "decisions": [], "observations": []}
+    statements = []
+    for line in transcript.splitlines():
+        statements.extend(line.split(". "))
+    for statement in statements:
+        statement = statement.strip().strip(".")
+        if not statement:
+            continue
+        parsed = parse_label(statement, "Goal", len(harvest["goals"]) + 1)
+        if parsed:
+            key, text = parsed
+            harvest["goals"].append({"key": key, "text": text})
+            continue
+        parsed = parse_label(statement, "Entity", len(harvest["entities"]) + 1)
+        if parsed:
+            key, text = parsed
+            harvest["entities"].append(entity_seed(key, text))
+            continue
+        parsed = parse_label(statement, "Decision", len(harvest["decisions"]) + 1)
+        if parsed:
+            key, text = parsed
+            harvest["decisions"].append(decision_seed(key, text, harvest["entities"]))
+            continue
+        parsed = parse_label(statement, "Observation", len(harvest["observations"]) + 1)
+        if parsed:
+            key, text = parsed
+            harvest["observations"].append(observation_seed(key, text, harvest["entities"]))
+    infer_entities(harvest)
+    return json.dumps(harvest, sort_keys=True)
+
 def claude_envelope(reply, is_error=False, status=None):
     return {
         "type": "result",
@@ -827,6 +1168,26 @@ if behavior == "fail":
     sys.exit(1)
 if behavior == "empty":
     mark("completion_exited")
+    sys.exit(0)
+
+if behavior == "extract-harvest":
+    reply = harvest_json(prompt)
+    mark("completion_exited")
+    if provider == "claude":
+        print(json.dumps(claude_envelope(reply)))
+    elif provider == "codex":
+        output_path = None
+        for idx, arg in enumerate(args):
+            if arg == "--output-last-message" and idx + 1 < len(args):
+                output_path = args[idx + 1]
+            elif arg.startswith("--output-last-message="):
+                output_path = arg.split("=", 1)[1]
+        if output_path:
+            pathlib.Path(output_path).write_text(reply)
+        else:
+            print(reply)
+    else:
+        print(reply)
     sys.exit(0)
 
 reply = proof(read("secret", "secret"), prompt)

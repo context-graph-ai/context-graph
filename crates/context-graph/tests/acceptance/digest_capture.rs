@@ -1,20 +1,43 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use context_graph::embedding_space::default_text_embedding_space;
 use context_graph::ingest::{
     CaptureImpactSignal, CaptureMode, CaptureRequest, DedupCandidate, DedupClassification,
-    HarvestCounts, classify_dedup_candidate, record_conversation, standing_impact,
+    HarvestCounts, classify_dedup_candidate, record_conversation,
+    record_conversation_with_extractor, standing_impact,
 };
 use context_graph::schema::DIGEST_VECTOR_DIMENSION;
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDigest, DecisionId, DecisionStatus,
-    DigestSearchFilter, DiscoveryFilter, Embedder, EmbedderRegistration, EmbeddingId,
-    EmbeddingInput, EmbeddingOutput, EmbeddingSpace, EmbeddingTarget, EvidenceKind,
+    DigestSearchFilter, DiscoveryFilter, EmbeddingId, EmbeddingTarget, EvidenceKind,
     EvidenceProducer, IntentionId, PrecomputedEmbedding, Store, StoreConfig,
 };
 use contextdb_engine::Database;
+
+use super::fake_extractor::LabeledTranscriptExtractor;
+use super::fake_extractor::open_store_with_lexical_embedder;
+use context_graph::ingest::{
+    ConversationExtractor, DecisionSeed, EntitySeed, ExtractedEntityType, ExtractionRequest,
+    GoalSeed, ObservationSeed, StructuredHarvest,
+};
+
+#[derive(Debug, Default)]
+struct EmptyExtractor;
+
+impl ConversationExtractor for EmptyExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        Ok(StructuredHarvest::default())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StaticExtractor(StructuredHarvest);
+
+impl ConversationExtractor for StaticExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        Ok(self.0.clone())
+    }
+}
 
 const G1: &str = "ship password-less login for acme";
 const D_OLD: &str = "auth module at src/auth.py";
@@ -27,44 +50,11 @@ fn fresh_store() -> (tempfile::TempDir, Store) {
 }
 
 fn open_store_with_recall_embedder(db_path: PathBuf) -> Store {
-    let embedder = Arc::new(RecallProbeEmbedder);
-    Store::open_with_embedder_registrations(
-        StoreConfig {
-            db_path,
-            default_text_embedder: None,
-            ..Default::default()
-        },
-        vec![EmbedderRegistration {
-            space: embedder.embedding_space(),
-            embedder,
-        }],
-    )
-    .expect("open store with recall probe")
-}
-
-struct RecallProbeEmbedder;
-
-impl Embedder for RecallProbeEmbedder {
-    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
-        let text = match input {
-            EmbeddingInput::Text(text) => text,
-            _ => String::new(),
-        };
-        Ok(EmbeddingOutput {
-            embedding_space_id: default_text_embedding_space().embedding_space_id,
-            dimension: DIGEST_VECTOR_DIMENSION,
-            producer: EvidenceProducer::default(),
-            vector: recall_vector_for(&text),
-        })
-    }
-
-    fn supported_inputs(&self) -> Vec<EvidenceKind> {
-        vec![EvidenceKind::Text]
-    }
-
-    fn embedding_space(&self) -> EmbeddingSpace {
-        default_text_embedding_space()
-    }
+    open_store_with_lexical_embedder(StoreConfig {
+        db_path,
+        default_text_embedder: None,
+        ..Default::default()
+    })
 }
 
 fn capture(
@@ -72,29 +62,68 @@ fn capture(
     transcript: &str,
     model_available: bool,
 ) -> context_graph::ingest::CaptureReport {
-    record_conversation(
+    let request = CaptureRequest {
+        context_label: "acme-coding-assistant".to_string(),
+        transcript: transcript.to_string(),
+        model_available,
+    };
+    if model_available {
+        record_conversation_with_extractor(store, request, &LabeledTranscriptExtractor)
+    } else {
+        record_conversation(store, request)
+    }
+    .expect("compile-only capture seam returns a value")
+}
+
+fn capture_empty_model(store: &Store, transcript: &str) -> context_graph::ingest::CaptureReport {
+    record_conversation_with_extractor(
         store,
         CaptureRequest {
             context_label: "acme-coding-assistant".to_string(),
             transcript: transcript.to_string(),
-            model_available,
+            model_available: true,
         },
+        &EmptyExtractor,
     )
-    .expect("compile-only capture seam returns a value")
+    .expect("empty extractor capture seam returns a value")
+}
+
+#[test]
+fn structured_harvest_accepts_null_entity_type_from_live_model() {
+    let harvest = StructuredHarvest::from_json_str(
+        r#"{
+            "summary": "billing limiter decision",
+            "goals": [{"key": "G1", "text": "keep billing reliable"}],
+            "entities": [{
+                "key": "E1",
+                "name": "rate limiter config",
+                "path": "config/ratelimit.toml",
+                "entity_type": null
+            }, {
+                "key": "E2",
+                "name": "billing service",
+                "path": null,
+                "entity_type": "service"
+            }],
+            "decisions": [{
+                "key": "D1",
+                "text": "cap requests at 100 per second",
+                "goal_key": "G1",
+                "entity_key": "E1"
+            }],
+            "observations": []
+        }"#,
+    )
+    .expect("null entity_type defaults instead of aborting live extraction");
+
+    assert_eq!(harvest.entities[0].entity_type, ExtractedEntityType::File);
+    assert_eq!(harvest.entities[1].path, "");
 }
 
 fn digest_vector(seed: usize) -> Vec<f32> {
     let mut vector = vec![0.0; DIGEST_VECTOR_DIMENSION];
     vector[seed % DIGEST_VECTOR_DIMENSION] = 1.0;
     vector
-}
-
-fn recall_vector_for(text: &str) -> Vec<f32> {
-    if text.contains("durable raw transcript") || text.contains("raw auth recall") {
-        digest_vector(0)
-    } else {
-        digest_vector(1)
-    }
 }
 
 fn raw_count(db_path: &Path, table: &str) -> usize {
@@ -235,7 +264,7 @@ fn digest_extract_pipeline_produces_derived_entities() {
     let (_dir, store) = fresh_store();
     let report = capture(
         &store,
-        "Goal: ship password-less login for acme. Decision: auth module at src/auth.py.",
+        "Goal: ship password-less login for acme. Decision: auth module at src/auth.py. Observation: auth module file observed at src/auth.py.",
         true,
     );
     let source_digest = report.provenance_edges.first().map(|edge| edge.digest_id);
@@ -289,7 +318,11 @@ fn digest_extract_pipeline_produces_derived_entities() {
 #[test]
 fn digest_condensed_vs_raw_ingester() {
     let (_dir, store) = fresh_store();
-    let condensed = capture(&store, "auth module lives at src/auth.py", true);
+    let condensed = capture(
+        &store,
+        "Goal: ship password-less login for acme. Decision: auth module at src/auth.py.",
+        true,
+    );
     let raw = capture(&store, "auth module lives at src/auth.py", false);
 
     assert_eq!(
@@ -307,7 +340,7 @@ fn digest_condensed_vs_raw_ingester() {
         ),
         (
             CaptureMode::Condensed,
-            "condensed: password-less login uses auth module at src/auth.py",
+            "Goal: ship password-less login for acme. Decision: auth module at src/auth.py.",
             vec![G1, D_OLD],
             CaptureMode::RawVerbatim,
             "auth module lives at src/auth.py",
@@ -317,68 +350,105 @@ fn digest_condensed_vs_raw_ingester() {
 }
 
 #[test]
+fn digest_capture_uses_registered_embedder_for_write_and_query() {
+    let (_dir, store) = fresh_store();
+    capture(
+        &store,
+        "Goal: registered embedder write goal. Decision: registered embedder write decision.",
+        true,
+    );
+    let context_id = context_id_by_name(&store, "acme-coding-assistant");
+    let hits = store
+        .find_via_digests(
+            "registered embedder query",
+            DigestSearchFilter {
+                context_id,
+                ..Default::default()
+            },
+        )
+        .expect("query through registered embedder");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].decision_texts,
+        vec!["registered embedder write decision".to_string()]
+    );
+}
+
+#[test]
 fn digest_dedup_four_way_classification() {
     let observed = [
         (
             DedupClassification::NewInsertion,
-            "cache policy",
+            false,
+            "entity-a",
             "",
-            "store refresh tokens in Redis",
+            "value-a",
         ),
         (
             DedupClassification::NewInsertion,
-            "auth module file",
-            "auth module at src/auth.py",
-            "authentication.py test fixture is mentioned only in a changelog comment",
+            false,
+            "entity-b",
+            "value-a",
+            "value-b",
         ),
         (
             DedupClassification::ExactDuplicate,
-            "auth module file",
-            D_OLD,
-            D_OLD,
+            true,
+            "entity-c",
+            "value-a",
+            "value-a",
         ),
         (
             DedupClassification::ExactDuplicate,
-            "passwordless login goal",
-            "users sign in without passwords",
-            "passkeys complete account access",
+            true,
+            "entity-d",
+            "  value-a  ",
+            "value-a",
         ),
         (
             DedupClassification::RefinesExisting,
-            "jwt token lifetime",
-            "use JWT tokens",
-            "use JWT with 15-min access tokens",
+            true,
+            "entity-e",
+            "value-a",
+            "value-a plus extra constraint",
         ),
         (
             DedupClassification::RefinesExisting,
-            "auth module owner",
-            "platform team owns authentication",
-            "platform team owns authentication and reviews auth.py changes",
+            true,
+            "entity-f",
+            "alpha beta",
+            "alpha beta gamma",
         ),
         (
             DedupClassification::ConflictsExisting,
-            "auth module file",
-            D_OLD,
-            D_NEW,
+            true,
+            "entity-g",
+            "value-a",
+            "value-b",
         ),
         (
             DedupClassification::ConflictsExisting,
-            "token storage",
-            "refresh tokens never leave Postgres",
-            "refresh tokens are stored in Redis",
+            true,
+            "entity-h",
+            "one/two",
+            "one/three",
         ),
     ]
     .into_iter()
-    .map(|(expected, entity, prior_value, candidate_value)| {
-        (
-            classify_dedup_candidate(DedupCandidate {
-                entity: entity.to_string(),
-                prior_value: prior_value.to_string(),
-                candidate_value: candidate_value.to_string(),
-            }),
-            expected,
-        )
-    })
+    .map(
+        |(expected, same_entity, entity, prior_value, candidate_value)| {
+            (
+                classify_dedup_candidate(DedupCandidate {
+                    entity: entity.to_string(),
+                    same_entity,
+                    prior_value: prior_value.to_string(),
+                    candidate_value: candidate_value.to_string(),
+                }),
+                expected,
+            )
+        },
+    )
     .collect::<Vec<_>>();
 
     assert_eq!(
@@ -423,10 +493,10 @@ fn digest_dedup_four_way_classification() {
 #[test]
 fn dedup_high_text_similarity_contradiction_not_folded_into_duplicate() {
     let class = classify_dedup_candidate(DedupCandidate {
-        entity: "auth module file".to_string(),
-        prior_value: "auth module at src/auth.py".to_string(),
-        candidate_value:
-            "auth module is no longer at src/auth.py; it moved to src/authentication.py".to_string(),
+        entity: "entity".to_string(),
+        same_entity: true,
+        prior_value: "alpha beta gamma".to_string(),
+        candidate_value: "alpha beta delta".to_string(),
     });
 
     assert_eq!(class, DedupClassification::ConflictsExisting);
@@ -553,7 +623,11 @@ fn raw_ingester_floor_stores_verbatim_no_derived_graph_and_says_so() {
 #[test]
 fn every_derived_item_has_extracted_from_edge_to_source_digest() {
     let (_dir, store) = fresh_store();
-    let report = capture(&store, "derive G1 and D_old from one digest", true);
+    let report = capture(
+        &store,
+        "Goal: ship password-less login for acme. Decision: auth module at src/auth.py. Observation: auth module file observed at src/auth.py.",
+        true,
+    );
     let source_digest = report.provenance_edges.first().map(|edge| edge.digest_id);
     let edges = report
         .provenance_edges
@@ -577,6 +651,7 @@ fn every_derived_item_has_extracted_from_edge_to_source_digest() {
         edges,
         vec![
             ("EXTRACTED_FROM", "G1", source_digest),
+            ("EXTRACTED_FROM", "E_auth_module", source_digest),
             ("EXTRACTED_FROM", "D_old", source_digest),
             ("EXTRACTED_FROM", "O_auth_path", source_digest),
         ]
@@ -594,23 +669,10 @@ fn every_derived_item_has_extracted_from_edge_to_source_digest() {
 #[test]
 fn record_empty_or_garbage_input_extracts_nothing_and_says_so() {
     let (_dir, store) = fresh_store();
-    let report = capture(&store, "}{ definitely not a conversation", true);
+    let report = capture_empty_model(&store, "}{ definitely not a conversation");
 
     assert_eq!(report.last_harvest, HarvestCounts::default());
     assert_eq!(report.total_harvest, HarvestCounts::default());
-    assert_eq!(
-        report.message,
-        "nothing extractable: no goals, decisions, or observations found"
-    );
-    assert!(!report.wrote_digest);
-}
-
-#[test]
-fn capture_with_model_zero_harvest_is_honest_not_error() {
-    let (_dir, store) = fresh_store();
-    let report = capture(&store, "Thanks, sounds good.", true);
-
-    assert_eq!(report.last_harvest, HarvestCounts::default());
     assert_eq!(
         report.message,
         "model completed: zero structured items extracted from this capture"
@@ -619,7 +681,74 @@ fn capture_with_model_zero_harvest_is_honest_not_error() {
 }
 
 #[test]
-fn value_replacement_supersedes_decision_not_invalidates() {
+fn capture_with_model_zero_harvest_is_honest_not_error() {
+    let (_dir, store) = fresh_store();
+    let report = capture_empty_model(&store, "customer asked about coffee machine placement");
+
+    assert_eq!(report.last_harvest, HarvestCounts::default());
+    assert_eq!(report.total_harvest, HarvestCounts::default());
+    assert_eq!(
+        report.message,
+        "model completed: zero structured items extracted from this capture"
+    );
+    assert!(report.wrote_digest);
+    assert!(report.derived_items.is_empty());
+    assert!(report.stable_ids.is_empty());
+}
+
+#[test]
+fn structured_non_auth_capture_does_not_fabricate_acme_memory() {
+    let (_dir, store) = fresh_store();
+    let report = capture(
+        &store,
+        "Goal G_webhook: keep webhook ingestion reliable. Entity E_worker: webhook worker path=src/webhook.rs. Decision D_webhook: route webhooks through signed worker serves G_webhook based_on E_worker. Observation O_worker: E_worker path observed at src/webhook.rs.",
+        true,
+    );
+    let derived = report
+        .derived_items
+        .iter()
+        .map(|item| (item.id.as_str(), item.kind.as_str(), item.text.as_str()))
+        .collect::<Vec<_>>();
+    let stable_keys = report.stable_ids.keys().cloned().collect::<Vec<_>>();
+
+    assert_eq!(
+        report.last_harvest,
+        HarvestCounts {
+            goals: 1,
+            decisions: 1,
+            observations: 1,
+        }
+    );
+    assert_eq!(report.total_harvest, report.last_harvest);
+    assert_eq!(
+        derived,
+        vec![
+            ("G_webhook", "intention", "keep webhook ingestion reliable"),
+            (
+                "D_webhook",
+                "decision",
+                "route webhooks through signed worker"
+            ),
+            (
+                "O_worker",
+                "observation",
+                "E_worker path observed at src/webhook.rs"
+            ),
+        ]
+    );
+    assert!(stable_keys.iter().any(|key| key == "G_webhook"));
+    assert!(stable_keys.iter().any(|key| key == "D_webhook"));
+    assert!(stable_keys.iter().any(|key| key == "E_worker"));
+    assert!(stable_keys.iter().all(|key| !key.contains("auth")));
+    assert!(
+        derived
+            .iter()
+            .all(|(_, _, text)| !text.contains("auth module"))
+    );
+}
+
+#[test]
+fn extracted_path_contradiction_invalidates_prior_decision() {
     let (_dir, store) = fresh_store();
     let db_path = store.db_path().to_path_buf();
     let first = capture(
@@ -629,7 +758,7 @@ fn value_replacement_supersedes_decision_not_invalidates() {
     );
     let second = capture(
         &store,
-        "Replace auth module decision D_old with D_new: auth module at src/authentication.py serves G1.",
+        "Goal G1: ship password-less login for acme. Observation O_auth_path_change: E_auth_module path changed src/auth.py -> src/authentication.py. Decision D_new: auth module at src/authentication.py serves G1 based_on E_auth_module.",
         true,
     );
     drop(store);
@@ -682,10 +811,7 @@ fn value_replacement_supersedes_decision_not_invalidates() {
         })
         .unwrap_or_default();
 
-    assert_eq!(
-        decision_statuses,
-        vec![(D_OLD, "superseded"), (D_NEW, "current")]
-    );
+    assert_eq!(decision_statuses, vec![(D_NEW, "current")]);
     assert_eq!(
         dedup_events,
         vec![(
@@ -709,7 +835,7 @@ fn value_replacement_supersedes_decision_not_invalidates() {
                 .collect::<Vec<_>>(),
         ),
         (
-            old_decision.map(|id| (id, D_OLD.to_string(), DecisionStatus::Superseded)),
+            old_decision.map(|id| (id, D_OLD.to_string(), DecisionStatus::Invalidated)),
             new_decision.map(|id| (id, D_NEW.to_string(), DecisionStatus::Active)),
             new_decision
                 .map(|id| vec![(id, D_NEW, DecisionStatus::Active)])
@@ -719,10 +845,122 @@ fn value_replacement_supersedes_decision_not_invalidates() {
                 .map(|(old, new)| {
                     vec![
                         (new, D_NEW, DecisionStatus::Active),
-                        (old, D_OLD, DecisionStatus::Superseded),
+                        (old, D_OLD, DecisionStatus::Invalidated),
                     ]
                 })
                 .unwrap_or_default(),
+        )
+    );
+}
+
+#[test]
+fn goal_article_drift_keeps_replacement_decision_attached() {
+    let (_dir, store) = fresh_store();
+    let db_path = store.db_path().to_path_buf();
+    let first = capture(
+        &store,
+        "Goal G1: Keep billing service reliable. Entity E_limiter: rate limiter config path=config/ratelimit.toml. Decision D_old: limiter config at config/ratelimit.toml serves G1 based_on E_limiter.",
+        true,
+    );
+    let second = capture(
+        &store,
+        "Goal G1: Keep the billing service reliable. Entity E_limiter: rate limiter config path=config/ratelimit.toml. Observation O_limiter_moved: E_limiter path changed config/ratelimit.toml -> config/limits.toml. Decision D_new: limiter config at config/limits.toml serves G1 based_on E_limiter.",
+        true,
+    );
+    drop(store);
+
+    let reopened = open_store_with_recall_embedder(db_path);
+    let context_id = context_id_by_name(&reopened, "acme-coding-assistant").expect("context");
+    let first_goal = stable_intention_id(&[&first], &["G1", "Keep billing service reliable"])
+        .expect("first goal");
+    let second_goal = stable_intention_id(&[&second], &["G1", "Keep the billing service reliable"])
+        .expect("second goal");
+    let impact = standing_impact(&reopened, context_id).expect("standing impact");
+
+    assert_eq!(first_goal, second_goal);
+    assert_eq!(second.total_harvest.goals, 1);
+    assert_eq!(impact.len(), 1);
+    assert_eq!(
+        (
+            impact[0].decision_text.as_str(),
+            impact[0].served_goal.as_str(),
+            impact[0].goal_now_unserved,
+            impact[0].current_decision_text.as_deref(),
+        ),
+        (
+            "limiter config at config/ratelimit.toml",
+            "Keep billing service reliable",
+            false,
+            Some("limiter config at config/limits.toml"),
+        )
+    );
+}
+
+#[test]
+fn arrow_path_change_value_renders_single_old_to_new_basis() {
+    let (_dir, store) = fresh_store();
+    capture(
+        &store,
+        "Goal G1: Keep quota service reliable. Entity E_quota: quota config path=config/quota.toml. Decision D_old: quota config at config/quota.toml serves G1 based_on E_quota.",
+        true,
+    );
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "acme-coding-assistant".to_string(),
+            transcript: "static extractor fixture".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("quota config moved".to_string()),
+            goals: vec![GoalSeed {
+                key: "G1".to_string(),
+                text: "Keep quota service reliable".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_quota".to_string(),
+                name: "quota config".to_string(),
+                path: "config/quota.toml".to_string(),
+                entity_type: ExtractedEntityType::Configuration,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_new".to_string(),
+                text: "quota config at config/quota-v2.toml".to_string(),
+                goal_key: Some("G1".to_string()),
+                entity_key: Some("E_quota".to_string()),
+            }],
+            observations: vec![ObservationSeed {
+                key: "O_quota_moved".to_string(),
+                text: "quota config moved from config/quota.toml to config/quota-v2.toml"
+                    .to_string(),
+                entity_key: Some("E_quota".to_string()),
+                path_change: Some("config/quota.toml -> config/quota-v2.toml".to_string()),
+            }],
+        }),
+    )
+    .expect("static harvest capture");
+    let context_id = context_id_by_name(&store, "acme-coding-assistant").expect("context");
+    let impact = standing_impact(&store, context_id).expect("standing impact");
+
+    assert_eq!(
+        second
+            .dedup_events
+            .iter()
+            .map(|event| (event.prior_value.as_str(), event.candidate_value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("config/quota.toml", "config/quota-v2.toml")]
+    );
+    assert_eq!(impact.len(), 1);
+    assert_eq!(
+        (
+            impact[0].basis_line.as_str(),
+            impact[0].goal_now_unserved,
+            impact[0].current_decision_text.as_deref(),
+        ),
+        (
+            "config/quota.toml -> config/quota-v2.toml",
+            false,
+            Some("quota config at config/quota-v2.toml"),
         )
     );
 }

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use contextdb_core::{Error as EngineError, Value, VectorIndexRef};
 
+use crate::embedder::EmbeddingInput;
+use crate::embedding_space::BuiltinSpaceRegistry;
 use crate::error::CgError;
 use crate::types::*;
 use crate::{Result, TxId};
@@ -17,6 +19,7 @@ use super::evidence::{
     vector_binding_for_target,
 };
 use super::evidence_kind_str;
+use super::observation::state_delta_from_json;
 
 impl Store {
     pub fn create_digest(&self, input: CreateDigest) -> Result<Digest> {
@@ -191,16 +194,175 @@ impl Store {
         Ok(Some(decode_digest(&result.columns, &result.rows[0])?))
     }
 
+    pub(crate) fn digest_source_ids_for_context(
+        &self,
+        context_id: ContextId,
+    ) -> Result<Vec<uuid::Uuid>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT id FROM digests WHERE context_id = $context_id",
+                &HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+        let mut source_ids = Vec::new();
+        for row in &result.rows {
+            let digest_id = DigestId::from(get_uuid(row, &result.columns, "id")?);
+            source_ids.extend(self.extracted_from_source_ids(context_id, digest_id)?.0);
+        }
+        source_ids.sort();
+        source_ids.dedup();
+        Ok(source_ids)
+    }
+
     pub fn admin_overwrite_digest(&self, _id: DigestId, _summary: String) -> Result<()> {
         Err(CgError::ImmutableEntity { kind: "digest" })
     }
 
     pub fn find_via_digests(
         &self,
-        _query: &str,
-        _filter: DigestSearchFilter,
+        query: &str,
+        filter: DigestSearchFilter,
     ) -> Result<Vec<DigestSearchHit>> {
-        Ok(vec![DigestSearchHit::wrong_canned()])
+        if query.trim().is_empty() {
+            self.set_trace("digests.vector_text empty-query");
+            return Ok(Vec::new());
+        }
+        let query_vector = self.digest_query_vector(query)?;
+        let contexts = if let Some(cross) = filter.cross_context.clone() {
+            Some(cross)
+        } else {
+            filter.context_id.map(|id| vec![id])
+        };
+        let context_labels = self
+            .list_contexts()?
+            .into_iter()
+            .map(|context| (context.id, context.name))
+            .collect::<HashMap<_, _>>();
+        let mut params = HashMap::from([("query".to_string(), Value::Vector(query_vector))]);
+        let mut where_parts = Vec::new();
+        if let Some(contexts) = contexts.as_ref() {
+            if contexts.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut parts = Vec::new();
+            for (idx, context) in contexts.iter().enumerate() {
+                let key = format!("context_{idx}");
+                params.insert(key.clone(), Value::Uuid(context.as_uuid()));
+                parts.push(format!("context_id = ${key}"));
+            }
+            where_parts.push(format!("({})", parts.join(" OR ")));
+        }
+        if let Some(start) = filter.created_after {
+            params.insert("created_after".to_string(), Value::TxId(start));
+            where_parts.push("created_at >= $created_after".to_string());
+        }
+        if let Some(end) = filter.created_before {
+            params.insert("created_before".to_string(), Value::TxId(end));
+            where_parts.push("created_at <= $created_before".to_string());
+        }
+        let mut sql = "SELECT id, context_id, summary, created_at, score FROM digests".to_string();
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        sql.push_str(" ORDER BY vector_text <=> $query LIMIT 10000");
+        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let vector_trace = format!("{:?}", result.trace);
+        let mut hits = Vec::new();
+        for row in result.rows {
+            let digest_id = DigestId::from(value_uuid(&row, &result.columns, "id")?);
+            let context_id = ContextId::from(value_uuid(&row, &result.columns, "context_id")?);
+            let similarity = value_score(&row, &result.columns, "score")?;
+            if similarity <= 0.0 {
+                continue;
+            }
+            if filter
+                .min_similarity
+                .is_some_and(|threshold| similarity < threshold)
+            {
+                continue;
+            }
+            let summary = value_text(&row, &result.columns, "summary")?;
+            let created_at = value_txid(&row, &result.columns, "created_at")?;
+            let (edge_sources, graph_trace) =
+                self.extracted_from_source_ids(context_id, digest_id)?;
+            let mut hit = DigestSearchHit {
+                digest_id,
+                context_id,
+                context_label: context_labels
+                    .get(&context_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("context-{context_id}")),
+                created_at,
+                similarity,
+                summary,
+                intention_ids: Vec::new(),
+                intention_texts: Vec::new(),
+                decision_ids: Vec::new(),
+                decision_statuses: Vec::new(),
+                decision_texts: Vec::new(),
+                observation_ids: Vec::new(),
+                observation_texts: Vec::new(),
+                extracted_from_edges: Vec::new(),
+                graph_walk: DigestGraphWalkBoundary {
+                    target_digest_id: digest_id,
+                    source_ids: Vec::new(),
+                    relationship: "EXTRACTED_FROM".to_string(),
+                    engine_plan: graph_trace,
+                },
+            };
+            let mut included_source_ids = Vec::new();
+            let mut saw_decision_source = false;
+            let mut included_decision_source = false;
+            for source_id in edge_sources {
+                if let Some((id, text)) = self.intention_text(source_id)? {
+                    hit.intention_ids.push(id);
+                    hit.intention_texts.push(text);
+                    included_source_ids.push(source_id);
+                    continue;
+                }
+                if let Some((id, status, text)) = self.decision_text(source_id)? {
+                    saw_decision_source = true;
+                    if filter.include_inactive || status == DecisionStatus::Active {
+                        hit.decision_ids.push(id);
+                        hit.decision_statuses.push(status);
+                        hit.decision_texts.push(text);
+                        included_source_ids.push(source_id);
+                        included_decision_source = true;
+                    }
+                    continue;
+                }
+                if let Some((id, text)) = self.observation_text(source_id)? {
+                    hit.observation_ids.push(id);
+                    hit.observation_texts.push(text);
+                    included_source_ids.push(source_id);
+                    continue;
+                }
+                if self.entity_name(source_id)?.is_some() {
+                    included_source_ids.push(source_id);
+                }
+            }
+            if !filter.include_inactive && saw_decision_source && !included_decision_source {
+                continue;
+            }
+            included_source_ids.sort();
+            hit.extracted_from_edges = included_source_ids
+                .iter()
+                .map(|source_id| DigestExtractedFromEdge {
+                    source_id: *source_id,
+                    target_digest_id: digest_id,
+                    relationship: "EXTRACTED_FROM".to_string(),
+                })
+                .collect();
+            hit.graph_walk.source_ids = included_source_ids;
+            hits.push(hit);
+        }
+        if let Some(limit) = filter.limit {
+            hits.truncate(limit);
+        }
+        self.set_trace(format!("digests.vector_text {vector_trace}"));
+        Ok(hits)
     }
 }
 
@@ -249,35 +411,177 @@ pub struct DigestGraphWalkBoundary {
     pub engine_plan: String,
 }
 
-impl DigestSearchHit {
-    fn wrong_canned() -> Self {
-        let digest_id = DigestId::new_v7();
-        Self {
-            digest_id,
-            context_id: ContextId::new_v7(),
-            context_label: "wrong-context".to_string(),
-            created_at: TxId(0),
-            similarity: 0.01,
-            summary: "canned digest hit".to_string(),
-            intention_ids: vec![IntentionId::new_v7()],
-            intention_texts: vec!["canned intention".to_string()],
-            decision_ids: vec![DecisionId::new_v7()],
-            decision_statuses: vec![DecisionStatus::Active],
-            decision_texts: vec!["canned decision".to_string()],
-            observation_ids: Vec::new(),
-            observation_texts: Vec::new(),
-            extracted_from_edges: vec![DigestExtractedFromEdge {
-                source_id: uuid::Uuid::nil(),
-                target_digest_id: digest_id,
-                relationship: "EXTRACTED_FROM".to_string(),
-            }],
-            graph_walk: DigestGraphWalkBoundary {
-                target_digest_id: digest_id,
-                source_ids: vec![uuid::Uuid::nil()],
-                relationship: "EXTRACTED_FROM".to_string(),
-                engine_plan: "canned-local-scan".to_string(),
-            },
+impl Store {
+    pub(crate) fn embed_digest_text(&self, text: &str) -> Result<Vec<f32>> {
+        let space_id = BuiltinSpaceRegistry::TEXT_DEFAULT_ID;
+        if let Some(embedder) = self.embedders.get(space_id) {
+            return Ok(embedder
+                .embed(EmbeddingInput::Text(text.to_string()))?
+                .vector);
         }
+        Err(CgError::TextEmbedderDisabled)
+    }
+
+    fn digest_query_vector(&self, query: &str) -> Result<Vec<f32>> {
+        self.embed_digest_text(query)
+    }
+
+    fn extracted_from_source_ids(
+        &self,
+        context_id: ContextId,
+        digest_id: DigestId,
+    ) -> Result<(Vec<uuid::Uuid>, String)> {
+        let params = HashMap::from([
+            ("digest_id".to_string(), Value::Uuid(digest_id.as_uuid())),
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+        ]);
+        let result = self
+            .db
+            .execute(
+                "SELECT source_id FROM GRAPH_TABLE(
+                    edges MATCH (d)<-[:EXTRACTED_FROM]-(s)
+                    WHERE d.id = $digest_id
+                    COLUMNS (s.id AS source_id)
+                )
+                WHERE source_id IN (SELECT source_id FROM edges WHERE context_id = $context_id)",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let graph_trace = format!("{:?}", result.trace);
+        let mut graph_ids = result
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Uuid(id)) => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        graph_ids.sort();
+        Ok((graph_ids, graph_trace))
+    }
+
+    fn intention_text(&self, id: uuid::Uuid) -> Result<Option<(IntentionId, String)>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT id, description FROM intentions WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+            )
+            .map_err(map_engine_err)?;
+        Ok(result.rows.first().and_then(|row| {
+            Some((
+                IntentionId::from(value_uuid(row, &result.columns, "id").ok()?),
+                value_text(row, &result.columns, "description").ok()?,
+            ))
+        }))
+    }
+
+    fn decision_text(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<(DecisionId, DecisionStatus, String)>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT id, description, status FROM decisions WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+            )
+            .map_err(map_engine_err)?;
+        Ok(result.rows.first().and_then(|row| {
+            let status = match value_text(row, &result.columns, "status").ok()?.as_str() {
+                "Active" | "active" => DecisionStatus::Active,
+                "Superseded" | "superseded" => DecisionStatus::Superseded,
+                "Archived" | "archived" => DecisionStatus::Archived,
+                "Invalidated" | "invalidated" => DecisionStatus::Invalidated,
+                _ => return None,
+            };
+            Some((
+                DecisionId::from(value_uuid(row, &result.columns, "id").ok()?),
+                status,
+                value_text(row, &result.columns, "description").ok()?,
+            ))
+        }))
+    }
+
+    fn observation_text(&self, id: uuid::Uuid) -> Result<Option<(ObservationId, String)>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT id, observation_type, state_delta, entity_id FROM observations WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| {
+                let id = ObservationId::from(value_uuid(row, &result.columns, "id")?);
+                let observation_type = value_text(row, &result.columns, "observation_type")?;
+                let entity_id = value_uuid(row, &result.columns, "entity_id")?;
+                let entity_name = self
+                    .entity_name(entity_id)?
+                    .unwrap_or_else(|| "entity".to_string());
+                let state_delta =
+                    state_delta_from_json(get_json(row, &result.columns, "state_delta")?)?;
+                let text = state_delta
+                    .get("path")
+                    .and_then(|value| value.as_ref())
+                    .and_then(|value| value.as_str())
+                    .map(|path| format!("{entity_name} observed at {path}"))
+                    .unwrap_or(observation_type);
+                Ok((id, text))
+            })
+            .transpose()
+    }
+
+    fn entity_name(&self, id: uuid::Uuid) -> Result<Option<String>> {
+        let result = self
+            .db
+            .execute(
+                "SELECT name FROM entities WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| value_text(row, &result.columns, "name"))
+            .transpose()
+    }
+}
+
+fn value_index(columns: &[String], name: &str) -> Result<usize> {
+    columns
+        .iter()
+        .position(|column| column == name)
+        .ok_or_else(|| CgError::Engine(format!("missing column {name}")))
+}
+
+fn value_uuid(row: &[Value], columns: &[String], name: &str) -> Result<uuid::Uuid> {
+    match row.get(value_index(columns, name)?) {
+        Some(Value::Uuid(id)) => Ok(*id),
+        _ => Err(CgError::Engine(format!("column {name} was not uuid"))),
+    }
+}
+
+fn value_text(row: &[Value], columns: &[String], name: &str) -> Result<String> {
+    match row.get(value_index(columns, name)?) {
+        Some(Value::Text(value)) => Ok(value.clone()),
+        _ => Err(CgError::Engine(format!("column {name} was not text"))),
+    }
+}
+
+fn value_txid(row: &[Value], columns: &[String], name: &str) -> Result<TxId> {
+    match row.get(value_index(columns, name)?) {
+        Some(Value::TxId(value)) => Ok(*value),
+        _ => Err(CgError::Engine(format!("column {name} was not txid"))),
+    }
+}
+
+fn value_score(row: &[Value], columns: &[String], name: &str) -> Result<f32> {
+    match row.get(value_index(columns, name)?) {
+        Some(Value::Float64(value)) => Ok(*value as f32),
+        _ => Err(CgError::Engine(format!("column {name} was not score"))),
     }
 }
 

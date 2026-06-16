@@ -23,7 +23,7 @@ use support::{
     repo_root, run_cg, run_variadic_fake, unique_label, write_file,
 };
 
-const INGESTION_EXPECTATION: &str = "automatic capture switches on when ingestion ships";
+const INGESTION_EXPECTATION: &str = "automatic capture is ready for cg record and cg import";
 const CLAUDE_SUCCESS: &str = include_str!("fixtures/provider_envelopes/claude_success.json");
 const CLAUDE_401: &str = include_str!("fixtures/provider_envelopes/claude_401.json");
 const CLAUDE_402: &str = include_str!("fixtures/provider_envelopes/claude_402.json");

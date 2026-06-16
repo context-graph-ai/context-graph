@@ -869,6 +869,11 @@ fn cli_connect_then_status_then_selftest_success_state_exit_zero_and_json_stable
     );
     assert_eq!(ready_object.get("degraded"), Some(&json!(false)));
     assert_eq!(ready_object.get("last_error"), Some(&Value::Null));
+    assert_eq!(
+        ready_object.get("message").and_then(Value::as_str),
+        Some("live proof passed; automatic capture is ready"),
+        "ready status must not ask for selftest after proof_status pass"
+    );
     assert_no_secret_leak(&ready, harness.root(), &secret);
 
     let dead_endpoint = dead_base_url();
