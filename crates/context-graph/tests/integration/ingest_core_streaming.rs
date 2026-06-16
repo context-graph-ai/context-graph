@@ -31,29 +31,6 @@ fn persisted_digest_count(db_path: &std::path::Path) -> usize {
         .len()
 }
 
-fn persisted_extracted_from_edge_targets(db_path: &std::path::Path) -> Vec<uuid::Uuid> {
-    let db = Database::open(db_path).expect("raw db");
-    let mut targets = db
-        .scan("edges", db.snapshot())
-        .expect("scan edges")
-        .into_iter()
-        .filter_map(|row| {
-            let relationship = row.values.get("edge_type")?;
-            let target = row.values.get("target_id")?;
-            match (relationship, target) {
-                (Value::Text(edge_type), Value::Uuid(target_id))
-                    if edge_type == "EXTRACTED_FROM" =>
-                {
-                    Some(*target_id)
-                }
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>();
-    targets.sort();
-    targets
-}
-
 fn text_values(db_path: &std::path::Path, table: &str, column: &str) -> Vec<String> {
     let db = Database::open(db_path).expect("raw db");
     let mut values = db
@@ -272,12 +249,6 @@ fn long_session_rolling_condensation_covers_both_ends_no_overflow() {
     let report =
         rolling_condense_into_store(&store, &transcript, 1_024).expect("rolling seam returns");
     drop(store);
-    let source_digest = report.provenance_edges.first().map(|edge| edge.digest_id);
-    let expected_items = vec!["I_early", "D_old", "O_mid", "D_mid", "O_late", "D_new"];
-    let persisted_edge_targets = persisted_extracted_from_edge_targets(&db_path);
-    let expected_persisted_targets = source_digest
-        .map(|digest_id| vec![digest_id.as_uuid(); expected_items.len()])
-        .unwrap_or_default();
     let reopened = Store::open(StoreConfig {
         db_path: db_path.clone(),
         default_text_embedder: None,
@@ -292,49 +263,11 @@ fn long_session_rolling_condensation_covers_both_ends_no_overflow() {
     let decision_rows = uuid_text_rows(&db_path, "decisions", "description");
     let observation_types = text_values(&db_path, "observations", "observation_type");
     let persisted_edges = persisted_extracted_from_edges(&db_path);
-    let expected_persisted_edges = source_digest
-        .map(|digest_id| {
-            expected_items
-                .iter()
-                .filter_map(|item_id| {
-                    report.stable_item_ids.get(item_id).map(|source_id| {
-                        (
-                            *source_id,
-                            digest_id.as_uuid(),
-                            "EXTRACTED_FROM".to_string(),
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let digest_summaries = text_values(&db_path, "digests", "summary");
 
     assert_eq!(report.pass_count, transcript.len().div_ceil(1_024));
     assert!(report.max_prompt_tokens_seen <= 1_024);
     assert!(report.wrote_digest);
-    assert!(source_digest.is_some());
-    assert_eq!(report.discovered_item_ids, expected_items);
-    assert_eq!(
-        report
-            .provenance_edges
-            .iter()
-            .map(|edge| {
-                (
-                    edge.item_id.as_str(),
-                    edge.relationship.as_str(),
-                    Some(edge.digest_id),
-                )
-            })
-            .collect::<Vec<_>>(),
-        vec![
-            ("I_early", "EXTRACTED_FROM", source_digest),
-            ("D_old", "EXTRACTED_FROM", source_digest),
-            ("O_mid", "EXTRACTED_FROM", source_digest),
-            ("D_mid", "EXTRACTED_FROM", source_digest),
-            ("O_late", "EXTRACTED_FROM", source_digest),
-            ("D_new", "EXTRACTED_FROM", source_digest),
-        ]
-    );
     assert_eq!(
         (
             persisted_digest_count(&db_path),
@@ -353,34 +286,31 @@ fn long_session_rolling_condensation_covers_both_ends_no_overflow() {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            persisted_edge_targets.len(),
-            persisted_edge_targets,
             persisted_edges,
+            report.discovered_item_ids,
+            report.provenance_edges,
+            digest_summaries
+                .first()
+                .is_some_and(|summary| summary.contains("EARLY_ONLY_SENTINEL")
+                    && summary.contains("LATE_ONLY_SENTINEL")),
         ),
         (
             1,
             1,
-            vec!["Goal I_early: preserve password-less login for acme"],
-            vec![
-                "Decision D_mid: JWT access token lifetime is 15 minutes",
-                "Decision D_new: auth module at src/authentication.py",
-                "Decision D_old: auth module at src/auth.py",
-            ],
-            vec![
-                "Observation O_late: auth module renamed src/auth.py -> src/authentication.py"
-                    .to_string(),
-                "Observation O_mid: token lifetime policy reviewed".to_string(),
-            ],
-            expected_items.clone(),
-            report.discovered_item_ids.len(),
-            expected_persisted_targets,
-            expected_persisted_edges,
+            Vec::<&str>::new(),
+            Vec::<&str>::new(),
+            Vec::<String>::new(),
+            Vec::<&str>::new(),
+            Vec::<(uuid::Uuid, uuid::Uuid, String)>::new(),
+            Vec::<String>::new(),
+            Vec::<context_graph::ingest::ExtractionProvenance>::new(),
+            true,
         )
     );
 }
 
 #[test]
-fn rolling_condensation_pins_items_on_discovery_not_rederived() {
+fn rolling_condensation_preserves_early_and_late_text_without_rederived_items() {
     let (dir, store) = fresh_store();
     let db_path = dir.path().join("cg.db");
     let transcript = generated_final_summary_only_session();
@@ -392,48 +322,37 @@ fn rolling_condensation_pins_items_on_discovery_not_rederived() {
     let report =
         rolling_condense_into_store(&store, &transcript, 512).expect("store-backed rolling ingest");
     drop(store);
-    let source_digest = report.provenance_edges.first().map(|edge| edge.digest_id);
-    let intention_rows = uuid_text_rows(&db_path, "intentions", "description");
-    let persisted_edges = persisted_extracted_from_edges(&db_path);
-    let early_item_id = report.stable_item_ids.get("I_early").copied();
+    let digest_summaries = text_values(&db_path, "digests", "summary");
 
     assert_eq!(
         (
             final_summary_only.contains("EARLY_PIN_SENTINEL"),
-            report.discovered_item_ids.iter().any(|id| id == "I_early"),
+            report.discovered_item_ids,
             report
-                .provenance_edges
-                .iter()
-                .find(|edge| edge.item_id == "I_early")
-                .map(|edge| (edge.relationship.as_str(), edge.digest_id)),
-            source_digest.is_some(),
-            early_item_id.is_some(),
-            intention_rows,
-            persisted_edges,
+                .stable_item_ids
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            report.provenance_edges,
+            persisted_stream_snapshot(&db_path).1,
+            persisted_stream_snapshot(&db_path).2,
+            persisted_stream_snapshot(&db_path).3,
+            digest_summaries.len(),
+            digest_summaries
+                .first()
+                .is_some_and(|summary| summary.contains("EARLY_PIN_SENTINEL")
+                    && summary.contains("LATE_SUMMARY_SENTINEL")),
         ),
         (
             false,
+            Vec::<String>::new(),
+            Vec::<&str>::new(),
+            Vec::<context_graph::ingest::ExtractionProvenance>::new(),
+            0,
+            0,
+            0,
+            1,
             true,
-            source_digest.map(|digest_id| ("EXTRACTED_FROM", digest_id)),
-            true,
-            true,
-            report
-                .stable_item_ids
-                .get("I_early")
-                .map(|id| {
-                    vec![(
-                        *id,
-                        "Goal I_early: keep the original auth path decision discoverable"
-                            .to_string(),
-                    )]
-                })
-                .unwrap_or_default(),
-            early_item_id
-                .zip(source_digest)
-                .map(|(source_id, digest_id)| {
-                    vec![(source_id, digest_id.as_uuid(), "EXTRACTED_FROM".to_string())]
-                })
-                .unwrap_or_default(),
         )
     );
 }

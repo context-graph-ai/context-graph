@@ -16,9 +16,9 @@ use contextdb_engine::Database;
 use super::fake_extractor::LabeledTranscriptExtractor;
 use super::fake_extractor::open_store_with_lexical_embedder;
 use context_graph::ingest::{
-    ConversationExtractor, DecisionRelationClassification, DecisionRelationSeed, DecisionSeed,
-    EntitySeed, ExtractedEntityType, ExtractionRequest, GoalSeed, ObservationSeed,
-    StructuredHarvest,
+    ConversationExtractor, DecisionRelationClassification, DecisionRelationRequest,
+    DecisionRelationSeed, DecisionSeed, EntitySeed, ExtractedEntityType, ExtractionRequest,
+    GoalSeed, ObservationSeed, StructuredHarvest,
 };
 
 #[derive(Debug, Default)]
@@ -30,12 +30,42 @@ impl ConversationExtractor for EmptyExtractor {
     }
 }
 
+#[derive(Debug, Default)]
+struct FailingExtractor;
+
+impl ConversationExtractor for FailingExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        Err(CgError::Engine(
+            "model extraction failed: provider timeout".to_string(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StaticExtractor(StructuredHarvest);
 
 impl ConversationExtractor for StaticExtractor {
     fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
         Ok(self.0.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClassifyingExtractor {
+    harvest: StructuredHarvest,
+    relation: Option<DecisionRelationSeed>,
+}
+
+impl ConversationExtractor for ClassifyingExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        Ok(self.harvest.clone())
+    }
+
+    fn classify_decision_relation(
+        &self,
+        _request: DecisionRelationRequest<'_>,
+    ) -> context_graph::Result<Option<DecisionRelationSeed>> {
+        Ok(self.relation.clone())
     }
 }
 
@@ -118,6 +148,30 @@ fn structured_harvest_accepts_null_entity_type_from_live_model() {
 
     assert_eq!(harvest.entities[0].entity_type, ExtractedEntityType::File);
     assert_eq!(harvest.entities[1].path, "");
+}
+
+#[test]
+fn structured_harvest_accepts_duplicate_summary_from_live_model() {
+    let harvest = StructuredHarvest::from_json_str(
+        r#"{
+            "summary": "first summary",
+            "summary": "replacement summary",
+            "goals": [{"key": "G1", "text": "keep deploy policy safe"}],
+            "entities": [],
+            "decisions": [{
+                "key": "D1",
+                "text": "never deploy the worker to AWS",
+                "goal_key": "G1",
+                "entity_key": null,
+                "relation": null
+            }],
+            "observations": []
+        }"#,
+    )
+    .expect("duplicate summary keys should follow JSON object semantics instead of aborting");
+
+    assert_eq!(harvest.summary.as_deref(), Some("replacement summary"));
+    assert_eq!(harvest.decisions.len(), 1);
 }
 
 fn digest_vector(seed: usize) -> Vec<f32> {
@@ -598,6 +652,280 @@ fn model_relation_duplicate_routes_byte_disjoint_paraphrase_to_prior_row() {
                 DecisionStatus::Active,
             )),
             vec![DedupClassification::ExactDuplicate],
+        )
+    );
+}
+
+#[test]
+fn duplicate_relation_to_invalidated_prior_writes_current_replacement() {
+    let (_dir, store) = fresh_store();
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "billing-duplicate-replacement".to_string(),
+            transcript: "billing limiter captured".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("billing limiter decision".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_billing".to_string(),
+                text: "keep billing service reliable".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_limiter".to_string(),
+                name: "rate-limiter config".to_string(),
+                path: "config/ratelimit.toml".to_string(),
+                entity_type: ExtractedEntityType::Configuration,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_cap".to_string(),
+                text: "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                goal_key: Some("G_billing".to_string()),
+                entity_key: Some("E_limiter".to_string()),
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("first billing capture");
+    let prior = stable_decision_id(&[&first], &["D_cap"]).expect("prior decision");
+
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "billing-duplicate-replacement".to_string(),
+            transcript: "The billing rate-limiter config now lives at config/limits.toml."
+                .to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("billing limiter moved".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_billing".to_string(),
+                text: "keep billing service reliable".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_limiter".to_string(),
+                name: "rate-limiter configuration".to_string(),
+                path: "config/limits.toml".to_string(),
+                entity_type: ExtractedEntityType::Configuration,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_cap_current".to_string(),
+                text: "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                goal_key: Some("G_billing".to_string()),
+                entity_key: Some("E_limiter".to_string()),
+                relation: Some(DecisionRelationSeed {
+                    prior_decision_id: prior.as_uuid().to_string(),
+                    classification: DecisionRelationClassification::ExactDuplicate,
+                }),
+            }],
+            observations: vec![ObservationSeed {
+                key: "O_limiter_moved".to_string(),
+                text: "rate-limiter configuration observed at config/limits.toml".to_string(),
+                entity_key: Some("E_limiter".to_string()),
+                path_change: Some("config/limits.toml".to_string()),
+            }],
+        }),
+    )
+    .expect("second billing capture");
+
+    let context_id = context_id_by_name(&store, "billing-duplicate-replacement").expect("context");
+    let replacement =
+        stable_decision_id(&[&second], &["D_cap_current"]).expect("replacement decision");
+    let goal = stable_intention_id(&[&first, &second], &["G_billing"]).expect("goal");
+    let impact = standing_impact(&store, context_id).expect("standing impact");
+    let hits = store
+        .find_via_digests(
+            "where is the rate limiter config",
+            DigestSearchFilter {
+                context_id: Some(context_id),
+                limit: Some(20),
+                ..Default::default()
+            },
+        )
+        .expect("query digest hits");
+
+    assert_ne!(replacement, prior);
+    assert_eq!(
+        (
+            decision_row(&store, Some(prior)),
+            decision_row(&store, Some(replacement)),
+            store
+                .by_intention(goal, DiscoveryFilter::default())
+                .expect("active decisions for goal")
+                .into_iter()
+                .map(|decision| (decision.id, decision.description, decision.status))
+                .collect::<Vec<_>>(),
+            impact
+                .iter()
+                .map(|notice| {
+                    (
+                        notice.affected_decision_id,
+                        notice.basis_line.as_str(),
+                        notice.goal_now_unserved,
+                        notice.current_decision_text.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            hits.iter()
+                .flat_map(|hit| hit.observation_texts.iter())
+                .any(|text| text.contains("config/limits.toml")),
+        ),
+        (
+            Some((
+                prior,
+                "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                DecisionStatus::Invalidated,
+            )),
+            Some((
+                replacement,
+                "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                DecisionStatus::Active,
+            )),
+            vec![(
+                replacement,
+                "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                DecisionStatus::Active,
+            )],
+            vec![(
+                Some(prior),
+                "config/ratelimit.toml -> config/limits.toml",
+                false,
+                Some("cap requests at 100 per second in rate-limiter configuration"),
+            )],
+            true,
+        )
+    );
+}
+
+#[test]
+fn refines_relation_to_invalidated_prior_does_not_cascade_into_replacement() {
+    let (_dir, store) = fresh_store();
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "billing-refine-replacement".to_string(),
+            transcript: "billing limiter captured".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("billing limiter decision".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_billing".to_string(),
+                text: "keep billing service reliable".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_limiter".to_string(),
+                name: "rate-limiter config".to_string(),
+                path: "config/ratelimit.toml".to_string(),
+                entity_type: ExtractedEntityType::Configuration,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_cap".to_string(),
+                text: "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                goal_key: Some("G_billing".to_string()),
+                entity_key: Some("E_limiter".to_string()),
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("first billing capture");
+    let prior = stable_decision_id(&[&first], &["D_cap"]).expect("prior decision");
+
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "billing-refine-replacement".to_string(),
+            transcript: "The billing rate-limiter config now lives at config/limits.toml."
+                .to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("billing limiter moved".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_billing".to_string(),
+                text: "keep billing service reliable".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_limiter".to_string(),
+                name: "rate-limiter configuration".to_string(),
+                path: "config/limits.toml".to_string(),
+                entity_type: ExtractedEntityType::Configuration,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_cap_current".to_string(),
+                text: "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                goal_key: Some("G_billing".to_string()),
+                entity_key: Some("E_limiter".to_string()),
+                relation: Some(DecisionRelationSeed {
+                    prior_decision_id: prior.as_uuid().to_string(),
+                    classification: DecisionRelationClassification::RefinesExisting,
+                }),
+            }],
+            observations: vec![ObservationSeed {
+                key: "O_limiter_moved".to_string(),
+                text: "rate-limiter configuration observed at config/limits.toml".to_string(),
+                entity_key: Some("E_limiter".to_string()),
+                path_change: Some("config/limits.toml".to_string()),
+            }],
+        }),
+    )
+    .expect("second billing capture");
+
+    let context_id = context_id_by_name(&store, "billing-refine-replacement").expect("context");
+    let replacement =
+        stable_decision_id(&[&second], &["D_cap_current"]).expect("replacement decision");
+    let goal = stable_intention_id(&[&first, &second], &["G_billing"]).expect("goal");
+    let impact = standing_impact(&store, context_id).expect("standing impact");
+
+    assert_ne!(replacement, prior);
+    assert_eq!(
+        (
+            decision_row(&store, Some(prior)),
+            decision_row(&store, Some(replacement)),
+            store
+                .by_intention(goal, DiscoveryFilter::default())
+                .expect("active decisions for goal")
+                .into_iter()
+                .map(|decision| (decision.id, decision.description, decision.status))
+                .collect::<Vec<_>>(),
+            impact
+                .iter()
+                .map(|notice| {
+                    (
+                        notice.affected_decision_id,
+                        notice.basis_line.as_str(),
+                        notice.goal_now_unserved,
+                        notice.current_decision_text.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
+        (
+            Some((
+                prior,
+                "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                DecisionStatus::Invalidated,
+            )),
+            Some((
+                replacement,
+                "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                DecisionStatus::Active,
+            )),
+            vec![(
+                replacement,
+                "cap requests at 100 per second in rate-limiter configuration".to_string(),
+                DecisionStatus::Active,
+            )],
+            vec![(
+                Some(prior),
+                "config/ratelimit.toml -> config/limits.toml",
+                false,
+                Some("cap requests at 100 per second in rate-limiter configuration"),
+            )],
         )
     );
 }
@@ -1120,6 +1448,111 @@ fn stored_entity_path_change_invalidates_without_old_value_in_second_harvest() {
 }
 
 #[test]
+fn normalized_entity_name_path_change_invalidates_without_old_value_in_second_harvest() {
+    let (_dir, store) = fresh_store();
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "billing-demo".to_string(),
+            transcript: "billing limiter captured".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("billing limiter decision".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_billing".to_string(),
+                text: "keep billing service reliable".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E_limiter".to_string(),
+                name: "rate-limiter config".to_string(),
+                path: "config/ratelimit.toml".to_string(),
+                entity_type: ExtractedEntityType::Configuration,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D_cap".to_string(),
+                text: "cap billing requests at 100 per second in the rate-limiter config"
+                    .to_string(),
+                goal_key: Some("G_billing".to_string()),
+                entity_key: Some("E_limiter".to_string()),
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("first billing capture");
+    let second_harvest = StructuredHarvest {
+        summary: Some("billing limiter moved".to_string()),
+        goals: vec![],
+        entities: vec![EntitySeed {
+            key: "E_limiter_new".to_string(),
+            name: "rate-limiter configuration".to_string(),
+            path: "config/limits.toml".to_string(),
+            entity_type: ExtractedEntityType::Configuration,
+        }],
+        decisions: vec![DecisionSeed {
+            key: "D_limits".to_string(),
+            text: "billing rate-limiter configuration now lives at config/limits.toml".to_string(),
+            goal_key: None,
+            entity_key: Some("E_limiter_new".to_string()),
+            relation: None,
+        }],
+        observations: vec![],
+    };
+    assert!(!harvest_contains_text(
+        &second_harvest,
+        "config/ratelimit.toml"
+    ));
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "billing-demo".to_string(),
+            transcript: "The billing rate-limiter config now lives at config/limits.toml."
+                .to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(second_harvest),
+    )
+    .expect("second billing capture");
+
+    let context_id = context_id_by_name(&store, "billing-demo").expect("context");
+    let old_decision = stable_decision_id(&[&first], &["D_cap"]).expect("old decision");
+    let new_decision = stable_decision_id(&[&second], &["D_limits"]).expect("new decision");
+    let impact = standing_impact(&store, context_id).expect("standing impact");
+    let invalidations = store
+        .list_invalidations(context_id, Some(old_decision), None)
+        .expect("old decision invalidations");
+
+    assert_eq!(invalidations.len(), 1);
+    assert_eq!(
+        (
+            decision_row(&store, Some(old_decision)),
+            decision_row(&store, Some(new_decision)),
+            impact.len(),
+            impact[0].basis_line.as_str(),
+            impact[0].goal_now_unserved,
+            impact[0].current_decision_text.as_deref(),
+        ),
+        (
+            Some((
+                old_decision,
+                "cap billing requests at 100 per second in the rate-limiter config".to_string(),
+                DecisionStatus::Invalidated,
+            )),
+            Some((
+                new_decision,
+                "billing rate-limiter configuration now lives at config/limits.toml".to_string(),
+                DecisionStatus::Active,
+            )),
+            1,
+            "config/ratelimit.toml -> config/limits.toml",
+            false,
+            Some("billing rate-limiter configuration now lives at config/limits.toml"),
+        )
+    );
+}
+
+#[test]
 fn model_relation_value_replacement_supersedes_prior_decision() {
     let (_dir, store) = fresh_store();
     let first = record_conversation_with_extractor(
@@ -1211,6 +1644,292 @@ fn model_relation_value_replacement_supersedes_prior_decision() {
                 DecisionStatus::Active,
             )],
         )
+    );
+}
+
+#[test]
+fn focused_relation_classifier_supersedes_when_extraction_omits_relation() {
+    let (_dir, store) = fresh_store();
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "model-choice-live-shape".to_string(),
+            transcript: "For cg session capture we will use Opus 4.8 as default model.".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("capture model selected".to_string()),
+            goals: vec![],
+            entities: vec![],
+            decisions: vec![DecisionSeed {
+                key: "D_opus".to_string(),
+                text: "use Opus 4.8 as the default capture model".to_string(),
+                goal_key: None,
+                entity_key: None,
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("first live-shape model choice capture");
+    let old_decision = stable_decision_id(&[&first], &["D_opus"]).expect("old decision");
+    let first_goal = stable_intention_id(&[&first], &["G_context"]).expect("fallback goal");
+    let second_harvest = StructuredHarvest {
+        summary: Some("capture model changed".to_string()),
+        goals: vec![],
+        entities: vec![],
+        decisions: vec![DecisionSeed {
+            key: "D_haiku".to_string(),
+            text: "switch default capture model to Haiku 4.5".to_string(),
+            goal_key: None,
+            entity_key: None,
+            relation: None,
+        }],
+        observations: vec![],
+    };
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "model-choice-live-shape".to_string(),
+            transcript: "Switching the default capture model to Haiku 4.5.".to_string(),
+            model_available: true,
+        },
+        &ClassifyingExtractor {
+            harvest: second_harvest,
+            relation: Some(DecisionRelationSeed {
+                prior_decision_id: old_decision.as_uuid().to_string(),
+                classification: DecisionRelationClassification::SupersedesExisting,
+            }),
+        },
+    )
+    .expect("second live-shape model choice capture");
+    let new_decision = stable_decision_id(&[&second], &["D_haiku"]).expect("new decision");
+    let second_goal = stable_intention_id(&[&second], &["G_context"]).expect("fallback goal");
+    let active = store
+        .by_intention(first_goal, DiscoveryFilter::default())
+        .expect("active decisions by fallback intention");
+
+    assert_eq!(first_goal, second_goal);
+    assert_eq!(
+        (
+            decision_row(&store, Some(old_decision)),
+            decision_row(&store, Some(new_decision)),
+            active
+                .iter()
+                .map(|decision| (decision.id, decision.description.as_str(), decision.status))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            Some((
+                old_decision,
+                "use Opus 4.8 as the default capture model".to_string(),
+                DecisionStatus::Superseded,
+            )),
+            Some((
+                new_decision,
+                "switch default capture model to Haiku 4.5".to_string(),
+                DecisionStatus::Active,
+            )),
+            vec![(
+                new_decision,
+                "switch default capture model to Haiku 4.5",
+                DecisionStatus::Active,
+            )],
+        )
+    );
+}
+
+#[test]
+fn structural_choice_replacement_supersedes_when_goal_wording_drifts() {
+    let (_dir, store) = fresh_store();
+    let first = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "model-choice-drift".to_string(),
+            transcript: "For cg session capture we will use Opus 4.8 as default model.".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("capture model selected".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_initial".to_string(),
+                text: "track durable decisions for model-choice-drift".to_string(),
+            }],
+            entities: vec![],
+            decisions: vec![DecisionSeed {
+                key: "D_opus".to_string(),
+                text: "use Opus 4.8 as the default model for cg session capture".to_string(),
+                goal_key: Some("G_initial".to_string()),
+                entity_key: None,
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("first model choice drift capture");
+    let old_decision = stable_decision_id(&[&first], &["D_opus"]).expect("old decision");
+    let first_goal = stable_intention_id(&[&first], &["G_initial"]).expect("first goal");
+
+    let second = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "model-choice-drift".to_string(),
+            transcript: "Switching the default capture model to Haiku 4.5.".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("capture model changed".to_string()),
+            goals: vec![GoalSeed {
+                key: "G_changed".to_string(),
+                text: "evaluate capture model coverage and cost".to_string(),
+            }],
+            entities: vec![],
+            decisions: vec![DecisionSeed {
+                key: "D_haiku".to_string(),
+                text: "switch default capture model to Haiku 4.5".to_string(),
+                goal_key: Some("G_changed".to_string()),
+                entity_key: None,
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("second model choice drift capture");
+    let new_decision = stable_decision_id(&[&second], &["D_haiku"]).expect("new decision");
+    let active = store
+        .by_intention(first_goal, DiscoveryFilter::default())
+        .expect("active decisions by first intention");
+
+    assert_eq!(
+        (
+            decision_row(&store, Some(old_decision)),
+            decision_row(&store, Some(new_decision)),
+            active
+                .iter()
+                .map(|decision| decision.id)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            Some((
+                old_decision,
+                "use Opus 4.8 as the default model for cg session capture".to_string(),
+                DecisionStatus::Superseded,
+            )),
+            Some((
+                new_decision,
+                "switch default capture model to Haiku 4.5".to_string(),
+                DecisionStatus::Active,
+            )),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
+fn invalid_relation_id_fails_before_partial_graph_write() {
+    let (dir, store) = fresh_store();
+    let db_path = dir.path().join("cg.db");
+    record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "atomic-invalid-relation".to_string(),
+            transcript: "valid prior fixture".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("valid prior".to_string()),
+            goals: vec![GoalSeed {
+                key: "G1".to_string(),
+                text: "keep relation writes atomic".to_string(),
+            }],
+            entities: vec![],
+            decisions: vec![DecisionSeed {
+                key: "D_prior".to_string(),
+                text: "prior decision".to_string(),
+                goal_key: Some("G1".to_string()),
+                entity_key: None,
+                relation: None,
+            }],
+            observations: vec![],
+        }),
+    )
+    .expect("valid prior capture");
+    drop(store);
+    let before = (
+        raw_count(&db_path, "digests"),
+        raw_count(&db_path, "decisions"),
+        raw_count(&db_path, "edges"),
+    );
+    let store = open_store_with_recall_embedder(db_path.clone());
+    let result = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "atomic-invalid-relation".to_string(),
+            transcript: "invalid relation fixture".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("invalid relation".to_string()),
+            goals: vec![GoalSeed {
+                key: "G1".to_string(),
+                text: "keep relation writes atomic".to_string(),
+            }],
+            entities: vec![],
+            decisions: vec![DecisionSeed {
+                key: "D1".to_string(),
+                text: "candidate with bogus prior id".to_string(),
+                goal_key: Some("G1".to_string()),
+                entity_key: None,
+                relation: Some(DecisionRelationSeed {
+                    prior_decision_id: "d1".to_string(),
+                    classification: DecisionRelationClassification::ConflictsExisting,
+                }),
+            }],
+            observations: vec![],
+        }),
+    );
+
+    assert!(
+        matches!(result, Err(CgError::Engine(ref message)) if message.contains("invalid prior_decision_id")),
+        "invalid relation should fail before writes, got {result:?}"
+    );
+    drop(store);
+    assert_eq!(
+        (
+            raw_count(&db_path, "digests"),
+            raw_count(&db_path, "decisions"),
+            raw_count(&db_path, "edges"),
+        ),
+        before
+    );
+}
+
+#[test]
+fn model_extraction_failure_propagates_from_capture_entrypoint_without_zero_harvest() {
+    let (dir, store) = fresh_store();
+    let db_path = dir.path().join("cg.db");
+    let result = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "failing-model-demo".to_string(),
+            transcript: "The model provider times out before extraction.".to_string(),
+            model_available: true,
+        },
+        &FailingExtractor,
+    );
+
+    assert!(
+        matches!(result, Err(CgError::Engine(ref message)) if message == "model extraction failed: provider timeout"),
+        "model failure should propagate as a typed engine error, got {result:?}"
+    );
+    drop(store);
+    assert_eq!(
+        (
+            raw_count(&db_path, "digests"),
+            raw_count(&db_path, "decisions"),
+            raw_count(&db_path, "edges"),
+        ),
+        (0, 0, 0)
     );
 }
 

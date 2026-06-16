@@ -225,27 +225,6 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn insert_extracted_from_edge(
-        &self,
-        source_id: Uuid,
-        digest_id: crate::DigestId,
-        context_id: ContextId,
-    ) -> Result<()> {
-        let tx = self.begin_tx()?;
-        if let Err(err) = self.insert_edge_in_tx(
-            tx,
-            source_id,
-            digest_id.as_uuid(),
-            relationship_type_str(RelationshipType::ExtractedFrom),
-            context_id,
-            None,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(err);
-        }
-        self.db.commit(tx).map_err(map_engine_err)
-    }
-
     pub(super) fn edges_from_sources(
         &self,
         context_id: ContextId,

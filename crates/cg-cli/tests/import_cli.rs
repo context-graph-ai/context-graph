@@ -250,16 +250,20 @@ fn compact_expected_session(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn large_chunked_session(lines: usize) -> String {
-    let mut session = String::new();
-    for index in 0..lines {
-        let filler = format!(" background-{index}").repeat(500);
-        let text = format!(
-            "Goal G{index}: keep service-{index} reliable. \
+fn large_chunked_statement(index: usize) -> String {
+    let filler = format!(" background-{index}").repeat(500);
+    format!(
+        "Goal G{index}: keep service-{index} reliable. \
 Entity E{index}: service-{index} path=services/{index}. \
 Decision D{index}: route service-{index} through queue serves G{index} based_on E{index}. \
 Observation O{index}: E{index} queue verified. {filler}"
-        );
+    )
+}
+
+fn large_chunked_session(lines: usize) -> String {
+    let mut session = String::new();
+    for index in 0..lines {
+        let text = large_chunked_statement(index);
         let encoded = serde_json::to_string(&text).expect("json string");
         session.push_str(&format!(
             r#"{{"type":"user","message":{{"content":[{{"type":"text","text":{encoded}}}]}}}}"#
@@ -267,6 +271,83 @@ Observation O{index}: E{index} queue verified. {filler}"
         session.push('\n');
     }
     session
+}
+
+fn large_chunked_clean_session(lines: usize) -> String {
+    (0..lines)
+        .map(|index| format!("User: {}\n", large_chunked_statement(index)))
+        .collect()
+}
+
+fn plain_sentinel_session(lines: usize) -> (String, String) {
+    let mut session = String::new();
+    let mut clean = String::new();
+    for index in 0..lines {
+        let marker = match index {
+            0 => "SENTINEL_OPEN",
+            value if value + 1 == lines => "SENTINEL_CLOSE",
+            _ => "middle",
+        };
+        let text = format!(
+            "The operator discussed {marker} while evaluating long-session memory chunk {index}. {}",
+            "ordinary prose without ontology labels ".repeat(30)
+        );
+        let encoded = serde_json::to_string(&text).expect("json string");
+        session.push_str(&format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"text","text":{encoded}}}]}}}}"#
+        ));
+        session.push('\n');
+        clean.push_str("User: ");
+        clean.push_str(&text);
+        clean.push('\n');
+    }
+    (session, clean)
+}
+
+fn extraction_prompt_transcript(prompt: &str) -> Option<String> {
+    if !prompt.contains("Extract context-graph memory") {
+        return None;
+    }
+    let transcript = prompt
+        .split_once("Transcript:\n")
+        .map(|(_, tail)| tail)
+        .unwrap_or(prompt);
+    let start = "<cg_transcript>\n";
+    let end = "\n</cg_transcript>";
+    let transcript = transcript
+        .split_once(start)
+        .map(|(_, tail)| tail)
+        .unwrap_or(transcript)
+        .split_once(end)
+        .map(|(head, _)| head)
+        .unwrap_or(transcript);
+    Some(transcript.to_string())
+}
+
+fn source_chunk_from_prompt(prompt: &str) -> Option<String> {
+    let transcript = extraction_prompt_transcript(prompt)?;
+    let source = transcript
+        .rsplit_once("Next session chunk:\n")
+        .map(|(_, chunk)| chunk)
+        .unwrap_or(transcript.as_str())
+        .trim()
+        .to_string();
+    (!source.is_empty()).then_some(source)
+}
+
+fn source_chunks_after(harness: &CliHarness, before_calls: usize) -> Vec<String> {
+    harness
+        .providers
+        .completion_records()
+        .into_iter()
+        .skip(before_calls)
+        .filter_map(|record| {
+            record
+                .get("prompt")
+                .and_then(JsonValue::as_str)
+                .and_then(source_chunk_from_prompt)
+        })
+        .collect()
 }
 
 #[test]
@@ -410,25 +491,32 @@ fn cli_import_claude_session_becomes_memory() {
             ],
         )
     );
+    let mut persisted_decisions = persisted
+        .iter()
+        .map(|(_, description, status)| (description.as_str(), *status))
+        .collect::<Vec<_>>();
+    persisted_decisions.sort_by(|left, right| left.0.cmp(right.0));
+    let mut second_persisted_decisions = second_persisted
+        .iter()
+        .map(|(_, description, status)| (description.as_str(), *status))
+        .collect::<Vec<_>>();
+    second_persisted_decisions.sort_by(|left, right| left.0.cmp(right.0));
+    let mut audit_persisted_decisions = audit_persisted
+        .iter()
+        .map(|(_, description, status)| (description.as_str(), *status))
+        .collect::<Vec<_>>();
+    audit_persisted_decisions.sort_by(|left, right| left.0.cmp(right.0));
+
     assert_eq!(
         (
-            persisted
-                .iter()
-                .map(|(_, description, status)| (description.as_str(), *status))
-                .collect::<Vec<_>>(),
-            second_persisted
-                .iter()
-                .map(|(_, description, status)| (description.as_str(), *status))
-                .collect::<Vec<_>>(),
-            audit_persisted
-                .iter()
-                .map(|(_, description, status)| (description.as_str(), *status))
-                .collect::<Vec<_>>(),
+            persisted_decisions,
+            second_persisted_decisions,
+            audit_persisted_decisions,
         ),
         (
             vec![
-                ("use JWT with 15-min access tokens", DecisionStatus::Active),
                 ("auth module at src/auth.py", DecisionStatus::Active),
+                ("use JWT with 15-min access tokens", DecisionStatus::Active),
             ],
             vec![("cache product catalog in memory", DecisionStatus::Active)],
             vec![(
@@ -471,18 +559,42 @@ fn cli_import_claude_session_becomes_memory() {
 fn cli_import_streams_large_jsonl_in_bounded_chunks() {
     let harness = extraction_harness();
     let session = harness.data_root.path().join("large-session.jsonl");
-    write_file(&session, &large_chunked_session(18));
+    let line_count = 18;
+    write_file(&session, &large_chunked_session(line_count));
 
     let before_calls = harness.providers.completion_count();
-    let dry_run = harness.run(&["import", "--dry-run", session.to_str().expect("utf8 path")]);
-    let import = harness.run(&["import", session.to_str().expect("utf8 path")]);
+    let dry_run = harness.run(&[
+        "import",
+        "--dry-run",
+        "--chunk-tokens",
+        "10000",
+        session.to_str().expect("utf8 path"),
+    ]);
+    let import = harness.run(&[
+        "import",
+        "--chunk-tokens",
+        "10000",
+        session.to_str().expect("utf8 path"),
+    ]);
     let completion_calls = harness.providers.completion_count() - before_calls;
     let import_json = output_json(&import).expect("import json");
     let dry_run_json = output_json(&dry_run).expect("dry run json");
     let persisted = persisted_counts(store_path_from(&[&import]).as_deref());
+    let source_chunks = source_chunks_after(&harness, before_calls);
 
     assert_eq!(dry_run.code, 0, "dry run failed: {}", combined(&dry_run));
     assert_eq!(import.code, 0, "import failed: {}", combined(&import));
+    assert_eq!(
+        (
+            dry_run_json
+                .get("resolved_chunk_window")
+                .and_then(JsonValue::as_u64),
+            import_json
+                .get("resolved_chunk_window")
+                .and_then(JsonValue::as_u64),
+        ),
+        (Some(10_000), Some(10_000))
+    );
     assert!(
         dry_run_json
             .get("chunks")
@@ -491,17 +603,30 @@ fn cli_import_streams_large_jsonl_in_bounded_chunks() {
         "dry-run must stream the large JSONL into multiple bounded chunks: {}",
         dry_run.stdout
     );
-    assert!(
-        completion_calls > 1,
-        "large import must call the extractor once per bounded chunk, before={before_calls}, after={}",
-        harness.providers.completion_count()
+    assert_eq!(
+        (
+            completion_calls,
+            source_chunks.len(),
+            source_chunks
+                .iter()
+                .all(|chunk| chunk.len() <= 10_000 && !chunk.is_empty()),
+            compact_expected_session(&source_chunks.join("\n")),
+        ),
+        (
+            source_chunks.len(),
+            source_chunks.len(),
+            true,
+            compact_expected_session(&large_chunked_clean_session(line_count)),
+        ),
+        "large import must call the extractor once per bounded source chunk and reconstruct the imported transcript"
     );
     assert!(
         import_json
             .get("message")
             .and_then(JsonValue::as_str)
-            .is_some_and(|message| message.starts_with("captured import in ")),
-        "chunked import should report chunked capture: {}",
+            .is_some_and(|message| message.starts_with("captured import in ")
+                && message.contains("one condensed memory")),
+        "chunked import should report one condensed memory: {}",
         import.stdout
     );
     assert!(
@@ -510,11 +635,93 @@ fn cli_import_streams_large_jsonl_in_bounded_chunks() {
         import.stdout
     );
     assert!(
-        persisted.digests > 1
+        persisted.digests == 1
             && persisted.intentions >= 18
             && persisted.decisions >= 18
             && persisted.observations >= 18,
-        "chunked import must persist memory from multiple chunks: {persisted:?}"
+        "chunked import must persist one session memory with facts from multiple chunks: {persisted:?}"
+    );
+}
+
+#[test]
+fn cli_import_rolls_plain_long_session_into_one_digest_without_label_markers() {
+    let harness = extraction_harness();
+    let session = harness.data_root.path().join("plain-long-session.jsonl");
+    let (jsonl, _clean) = plain_sentinel_session(16);
+    write_file(&session, &jsonl);
+
+    let before_calls = harness.providers.completion_count();
+    let import = harness.run(&[
+        "import",
+        "--chunk-tokens=2500",
+        session.to_str().expect("utf8 path"),
+    ]);
+    let import_json = output_json(&import).expect("import json");
+    let source_chunks = source_chunks_after(&harness, before_calls);
+    let store_path = store_path_from(&[&import]);
+    let digest_summaries = persisted_text_values(store_path.as_deref(), "digests", "summary");
+
+    assert_eq!(import.code, 0, "import failed: {}", combined(&import));
+    assert_eq!(
+        (
+            import_json
+                .get("import_chunks")
+                .and_then(JsonValue::as_u64)
+                .is_some_and(|chunks| chunks > 1),
+            import_json
+                .get("resolved_chunk_window")
+                .and_then(JsonValue::as_u64),
+            source_chunks
+                .iter()
+                .all(|chunk| chunk.len() <= 2500 && !chunk.is_empty()),
+            persisted_counts(store_path.as_deref()).digests,
+            digest_summaries.len(),
+            digest_summaries
+                .first()
+                .is_some_and(|summary| summary.contains("SENTINEL_OPEN")
+                    && summary.contains("SENTINEL_CLOSE")),
+        ),
+        (true, Some(2500), true, 1, 1, true,)
+    );
+}
+
+#[test]
+fn cli_import_rejects_malformed_chunk_options_loudly() {
+    let harness = extraction_harness();
+    let session = harness.data_root.path().join("session.jsonl");
+    write_file(&session, SECOND_CLAUDE_SESSION);
+
+    let bad_tokens = harness.run(&[
+        "import",
+        "--chunk-tokens",
+        "abc",
+        session.to_str().expect("utf8 path"),
+    ]);
+    let bad_fraction = harness.run(&[
+        "import",
+        "--context-fraction=1.5",
+        session.to_str().expect("utf8 path"),
+    ]);
+
+    assert_eq!(
+        (
+            bad_tokens.code,
+            output_json(&bad_tokens).and_then(|json| json
+                .get("condition")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)),
+            bad_fraction.code,
+            output_json(&bad_fraction).and_then(|json| json
+                .get("condition")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)),
+        ),
+        (
+            2,
+            Some("InvalidImportChunking".to_string()),
+            2,
+            Some("InvalidImportChunking".to_string()),
+        )
     );
 }
 

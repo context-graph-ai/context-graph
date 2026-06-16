@@ -598,24 +598,27 @@ fn cli_by_intention() {
     let wrong = harness.run(&["by-intention", wrong_id.as_str()]);
     let text = combined(&walk);
 
+    let mut persisted_decisions = persisted
+        .iter()
+        .map(|(_, description, status)| (description.as_str(), *status))
+        .collect::<Vec<_>>();
+    persisted_decisions.sort_by(|left, right| left.0.cmp(right.0));
+
     assert_eq!(
         (
             intention_id.as_ref().map(|_| "present"),
             store_path.is_some(),
-            persisted
-                .iter()
-                .map(|(_, description, status)| (description.as_str(), *status))
-                .collect::<Vec<_>>(),
+            persisted_decisions,
         ),
         (
             Some("present"),
             true,
             vec![
-                ("use JWT with 15-min access tokens", DecisionStatus::Active),
                 (
                     "auth module at src/authentication.py",
                     DecisionStatus::Active,
                 ),
+                ("use JWT with 15-min access tokens", DecisionStatus::Active),
             ],
         )
     );
