@@ -134,6 +134,11 @@ fn ingest_one_time_batch_import() {
             .unwrap_or_default(),
         None => Vec::new(),
     };
+    let mut walk_statuses = walk_rows
+        .iter()
+        .map(|decision| (decision.description.as_str(), decision.status))
+        .collect::<Vec<_>>();
+    walk_statuses.sort_by_key(|(description, _)| *description);
     drop(reopened);
 
     assert_eq!(
@@ -148,10 +153,7 @@ fn ingest_one_time_batch_import() {
             text_values(&db_path, "intentions", "description"),
             text_values(&db_path, "decisions", "description"),
             text_values(&db_path, "observations", "observation_type"),
-            walk_rows
-                .iter()
-                .map(|decision| (decision.description.as_str(), decision.status))
-                .collect::<Vec<_>>(),
+            walk_statuses,
             impact_rows
                 .iter()
                 .map(|notice| notice.affected_decision_id)
@@ -186,8 +188,8 @@ fn ingest_one_time_batch_import() {
             ],
             vec!["auth module file observed at src/auth.py".to_string()],
             vec![
-                ("use JWT with 15-min access tokens", DecisionStatus::Active),
                 ("auth module at src/auth.py", DecisionStatus::Active),
+                ("use JWT with 15-min access tokens", DecisionStatus::Active),
             ],
             Vec::<DecisionId>::new(),
         )

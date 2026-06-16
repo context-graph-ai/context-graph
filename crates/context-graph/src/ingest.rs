@@ -1,16 +1,16 @@
 use chrono::Utc;
-use contextdb_core::Value as DbValue;
+use contextdb_core::{Value as DbValue, VectorIndexRef};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value as JsonValue, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::embedding_space::BuiltinSpaceRegistry;
 use crate::{
-    AgentId, CgError, ContextId, CreateContext, CreateDecision, CreateDigest, CreateEntity,
-    CreateIntention, Decision, DecisionId, DigestId, Embedder, EmbeddingId, EmbeddingInput,
-    EmbeddingOutput, EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind,
-    EvidenceProducer, EvidenceRef, IntentionId, IntentionOrigin, IntentionStatus,
-    InvalidationStatus, ObservationId, PrecomputedEmbedding, RecordObservation, Result, Store,
+    AgentId, AuditId, BasisDiffResult, CgError, ContextId, CreateContext, CreateDecision,
+    CreateDigest, Decision, DecisionId, DecisionStatus, DigestId, Embedder, EmbeddingId,
+    EmbeddingInput, EmbeddingOutput, EmbeddingTarget, EntityId, EntitySnapshotId, EntityType,
+    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionId, InvalidationId,
+    InvalidationSeverity, InvalidationStatus, ObservationId, PrecomputedEmbedding, Result, Store,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,6 +91,9 @@ pub struct CaptureReport {
     pub wrote_digest: bool,
     pub impact_signal: Option<CaptureImpactSignal>,
     pub dedup_events: Vec<DedupEvent>,
+    pub import_chunks: Option<usize>,
+    pub resolved_chunk_window: Option<usize>,
+    pub model_context_tokens: Option<usize>,
 }
 
 impl CaptureReport {
@@ -109,6 +112,9 @@ impl CaptureReport {
             wrote_digest: false,
             impact_signal: None,
             dedup_events: Vec::new(),
+            import_chunks: None,
+            resolved_chunk_window: None,
+            model_context_tokens: None,
         }
     }
 }
@@ -136,7 +142,12 @@ pub struct StructuredHarvest {
 
 impl StructuredHarvest {
     pub fn from_json_str(raw: &str) -> Result<Self> {
-        serde_json::from_str(raw).map_err(|err| {
+        let value = serde_json::from_str::<JsonValue>(raw).map_err(|err| {
+            CgError::Engine(format!(
+                "extractor returned invalid structured harvest JSON: {err}"
+            ))
+        })?;
+        serde_json::from_value(value).map_err(|err| {
             CgError::Engine(format!(
                 "extractor returned invalid structured harvest JSON: {err}"
             ))
@@ -262,8 +273,24 @@ pub struct ExtractionRequest<'a> {
     pub prior_decisions: &'a [ExtractionPriorDecision],
 }
 
+pub struct DecisionRelationRequest<'a> {
+    pub context_label: &'a str,
+    pub candidate_decision: &'a str,
+    pub candidate_goal: Option<&'a str>,
+    pub candidate_entity_name: Option<&'a str>,
+    pub candidate_entity_path: Option<&'a str>,
+    pub prior_decisions: &'a [ExtractionPriorDecision],
+}
+
 pub trait ConversationExtractor {
     fn extract(&self, request: ExtractionRequest<'_>) -> Result<StructuredHarvest>;
+
+    fn classify_decision_relation(
+        &self,
+        _request: DecisionRelationRequest<'_>,
+    ) -> Result<Option<DecisionRelationSeed>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,11 +505,19 @@ fn record_conversation_internal(
         return capture_raw(store, context.id, &request.context_label, text);
     }
     let prior_decisions = extraction_prior_decisions(store, context.id)?;
-    let harvest = extractor.extract(ExtractionRequest {
+    let mut harvest = extractor.extract(ExtractionRequest {
         context_label: &request.context_label,
         transcript: text,
         prior_decisions: &prior_decisions,
     })?;
+    prepare_harvest_for_capture(
+        store,
+        context.id,
+        &request.context_label,
+        &mut harvest,
+        &prior_decisions,
+        extractor,
+    )?;
     capture_structured_harvest(store, context.id, &request.context_label, text, harvest)
 }
 
@@ -538,140 +573,81 @@ pub fn rolling_condense_into_store(
     window_tokens: usize,
 ) -> Result<CondensationReport> {
     let context = context_by_label(store, "rolling-import")?;
-    let digest = create_text_digest(
-        store,
-        context.id,
-        "rolled long-session digest",
-        &transcript.chars().take(2048).collect::<String>(),
-    )?;
-    let mut stable = StableItemIds::default();
-    let mut discovered = Vec::new();
-    let mut provenance = Vec::new();
-    let labeled_items = extract_labeled_rolling_items(transcript);
-    let mut first_goal = None::<IntentionId>;
-    let mut observation_entity = None::<EntityId>;
-
-    for item in labeled_items {
-        let source_id = match item.kind {
-            RollingItemKind::Goal => {
-                let goal = ensure_intention(store, context.id, &item.text)?;
-                first_goal.get_or_insert(goal);
-                goal.as_uuid()
-            }
-            RollingItemKind::Decision => {
-                let goal_ids = first_goal.iter().copied().collect::<Vec<_>>();
-                ensure_decision(store, context.id, &item.text, &goal_ids, None)?.as_uuid()
-            }
-            RollingItemKind::Observation => {
-                let entity = match observation_entity {
-                    Some(entity) => entity,
-                    None => {
-                        let entity = ensure_entity(
-                            store,
-                            context.id,
-                            "rolling session",
-                            "rolling-session",
-                            EntityType::Document,
-                        )?;
-                        observation_entity = Some(entity);
-                        entity
-                    }
-                };
-                ensure_observation(store, context.id, entity, &item.text, None)?.as_uuid()
-            }
-        };
-        stable.insert(item.key.clone(), source_id);
-        discovered.push(item.key.clone());
-        store.insert_extracted_from_edge(source_id, digest.id, context.id)?;
-        provenance.push(ExtractionProvenance {
-            item_id: item.key,
-            digest_id: digest.id,
-            relationship: "EXTRACTED_FROM".to_string(),
-        });
-    }
+    let summary = bounded_rolling_digest_summary(transcript);
+    let _digest = create_text_digest(store, context.id, &summary, &summary)?;
     let chunk_window = window_tokens.max(1);
-    let pass_count = if transcript.len() > chunk_window {
-        transcript.len().div_ceil(chunk_window)
-    } else {
-        1
-    };
+    let (pass_count, max_seen) = rolling_pass_stats(transcript, chunk_window);
     Ok(CondensationReport {
         pass_count,
-        max_prompt_tokens_seen: chunk_window.min(transcript.len().max(1)),
-        discovered_item_ids: discovered,
-        stable_item_ids: stable,
-        provenance_edges: provenance,
+        max_prompt_tokens_seen: max_seen,
+        discovered_item_ids: Vec::new(),
+        stable_item_ids: StableItemIds::default(),
+        provenance_edges: Vec::new(),
         wrote_digest: true,
         resolved_chunk_window: Some(chunk_window),
         model_context_tokens: None,
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RollingItemKind {
-    Goal,
-    Decision,
-    Observation,
+fn rolling_pass_stats(transcript: &str, chunk_window: usize) -> (usize, usize) {
+    if transcript.is_empty() {
+        return (1, 0);
+    }
+    let mut rest = transcript;
+    let mut passes = 0;
+    let mut max_seen = 0;
+    while !rest.is_empty() {
+        let split = char_boundary_at_or_before(rest, chunk_window);
+        let split = split.max(
+            rest.char_indices()
+                .nth(1)
+                .map(|(idx, _)| idx)
+                .unwrap_or(rest.len()),
+        );
+        let chunk = &rest[..split];
+        passes += 1;
+        max_seen = max_seen.max(chunk.len());
+        rest = &rest[split..];
+    }
+    (passes, max_seen)
 }
 
-impl RollingItemKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Goal => "Goal",
-            Self::Decision => "Decision",
-            Self::Observation => "Observation",
+fn bounded_rolling_digest_summary(transcript: &str) -> String {
+    let compact = compact_summary(transcript);
+    const SUMMARY_LIMIT: usize = 8_192;
+    if compact.len() <= SUMMARY_LIMIT {
+        return compact;
+    }
+    let half = (SUMMARY_LIMIT - 5) / 2;
+    let head_end = char_boundary_at_or_before(&compact, half);
+    let tail_start = char_boundary_tail_start(&compact, half);
+    format!("{} ... {}", &compact[..head_end], &compact[tail_start..])
+}
+
+fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    let mut last = 0;
+    for (index, ch) in text.char_indices() {
+        let end = index + ch.len_utf8();
+        if end > max_bytes {
+            break;
         }
+        last = end;
     }
+    last
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RollingItemSeed {
-    kind: RollingItemKind,
-    key: String,
-    text: String,
-}
-
-fn extract_labeled_rolling_items(transcript: &str) -> Vec<RollingItemSeed> {
-    let mut markers = Vec::new();
-    for (needle, kind) in [
-        ("Goal ", RollingItemKind::Goal),
-        ("Decision ", RollingItemKind::Decision),
-        ("Observation ", RollingItemKind::Observation),
-    ] {
-        for (index, _) in transcript.match_indices(needle) {
-            markers.push((index, needle.len(), kind));
-        }
+fn char_boundary_tail_start(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return 0;
     }
-    markers.sort_by_key(|(index, _, _)| *index);
-
-    markers
-        .iter()
-        .enumerate()
-        .filter_map(|(position, (index, marker_len, kind))| {
-            let start = index + marker_len;
-            let end = markers
-                .get(position + 1)
-                .map(|(next, _, _)| *next)
-                .unwrap_or(transcript.len());
-            parse_rolling_item(*kind, &transcript[start..end])
-        })
-        .collect()
-}
-
-fn parse_rolling_item(kind: RollingItemKind, segment: &str) -> Option<RollingItemSeed> {
-    let first_line = segment.lines().next()?.trim();
-    let item = first_line.trim_end_matches(['.', ';']).trim();
-    let (key, body) = item.split_once(':')?;
-    let key = key.trim();
-    let body = body.trim();
-    if key.is_empty() || body.is_empty() || key.chars().any(char::is_whitespace) {
-        return None;
+    let mut start = text.len() - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
     }
-    Some(RollingItemSeed {
-        kind,
-        key: key.to_string(),
-        text: format!("{} {}: {}", kind.label(), key, body),
-    })
+    start
 }
 
 pub fn rolling_condense_for_connected_model(
@@ -782,7 +758,348 @@ fn capture_raw(
         wrote_digest: true,
         impact_signal: Some(CaptureImpactSignal::VerbatimOnlyNoGraph),
         dedup_events: Vec::new(),
+        import_chunks: None,
+        resolved_chunk_window: None,
+        model_context_tokens: None,
     })
+}
+
+fn prepare_harvest_for_capture(
+    store: &Store,
+    context_id: ContextId,
+    context_label: &str,
+    harvest: &mut StructuredHarvest,
+    prior_decisions: &[ExtractionPriorDecision],
+    extractor: &dyn ConversationExtractor,
+) -> Result<()> {
+    reuse_prior_goals_for_entity_decisions(harvest, prior_decisions);
+    ensure_goal_keys_for_decisions(harvest, context_label);
+    complete_decision_relations(
+        store,
+        context_id,
+        context_label,
+        harvest,
+        prior_decisions,
+        extractor,
+    )?;
+    validate_harvest_relations(store, context_id, harvest)
+}
+
+fn reuse_prior_goals_for_entity_decisions(
+    harvest: &mut StructuredHarvest,
+    prior_decisions: &[ExtractionPriorDecision],
+) {
+    if prior_decisions.is_empty() || harvest.decisions.is_empty() || harvest.entities.is_empty() {
+        return;
+    }
+    let entity_names = harvest
+        .entities
+        .iter()
+        .map(|entity| {
+            (
+                entity.key.clone(),
+                normalize_entity_identity_name(&entity.name),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let known_goal_keys = harvest
+        .goals
+        .iter()
+        .map(|goal| goal.key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut existing_goal_keys = harvest
+        .goals
+        .iter()
+        .map(|goal| {
+            (
+                normalize_intention_description(&goal.text),
+                goal.key.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut updates = Vec::new();
+    for (index, decision) in harvest.decisions.iter().enumerate() {
+        if decision
+            .goal_key
+            .as_ref()
+            .is_some_and(|key| known_goal_keys.contains(key))
+        {
+            continue;
+        }
+        let Some(entity_name) = decision
+            .entity_key
+            .as_ref()
+            .and_then(|key| entity_names.get(key))
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let Some(prior_goal) = prior_decisions
+            .iter()
+            .find(|prior| {
+                prior
+                    .entities
+                    .iter()
+                    .any(|entity| normalize_entity_identity_name(&entity.name) == *entity_name)
+            })
+            .and_then(|prior| prior.goals.first())
+            .filter(|goal| !goal.trim().is_empty())
+        else {
+            continue;
+        };
+        let normalized_goal = normalize_intention_description(prior_goal);
+        let key = if let Some(existing) = existing_goal_keys.get(&normalized_goal) {
+            existing.clone()
+        } else {
+            let key = format!("G_prior_{}", harvest.goals.len() + 1);
+            harvest.goals.push(GoalSeed {
+                key: key.clone(),
+                text: prior_goal.clone(),
+            });
+            existing_goal_keys.insert(normalized_goal, key.clone());
+            key
+        };
+        updates.push((index, key));
+    }
+    for (index, key) in updates {
+        if let Some(decision) = harvest.decisions.get_mut(index) {
+            decision.goal_key = Some(key);
+        }
+    }
+}
+
+fn ensure_goal_keys_for_decisions(harvest: &mut StructuredHarvest, context_label: &str) {
+    if harvest.decisions.is_empty() {
+        return;
+    }
+    if harvest.goals.is_empty() {
+        harvest.goals.push(GoalSeed {
+            key: "G_context".to_string(),
+            text: format!("track durable decisions for {context_label}"),
+        });
+    }
+    let goal_keys = harvest
+        .goals
+        .iter()
+        .map(|goal| goal.key.as_str())
+        .collect::<BTreeSet<_>>();
+    let fallback = harvest.goals.first().map(|goal| goal.key.clone());
+    for decision in &mut harvest.decisions {
+        let missing_or_unknown = decision
+            .goal_key
+            .as_deref()
+            .is_none_or(|key| !goal_keys.contains(key));
+        if missing_or_unknown {
+            decision.goal_key = fallback.clone();
+        }
+    }
+}
+
+fn complete_decision_relations(
+    store: &Store,
+    context_id: ContextId,
+    context_label: &str,
+    harvest: &mut StructuredHarvest,
+    prior_decisions: &[ExtractionPriorDecision],
+    extractor: &dyn ConversationExtractor,
+) -> Result<()> {
+    if prior_decisions.is_empty() {
+        for decision in &mut harvest.decisions {
+            decision.relation = None;
+        }
+        return Ok(());
+    }
+    let goal_text = harvest
+        .goals
+        .iter()
+        .map(|goal| (goal.key.as_str(), goal.text.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let entity_data = harvest
+        .entities
+        .iter()
+        .map(|entity| {
+            (
+                entity.key.as_str(),
+                (entity.name.as_str(), entity.path.as_str()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for decision in &mut harvest.decisions {
+        if decision.text.trim().is_empty() {
+            continue;
+        }
+        let relation_is_valid = match decision.relation.as_ref() {
+            Some(relation)
+                if relation.classification == DecisionRelationClassification::NewInsertion
+                    || relation.prior_decision_id.trim().is_empty() =>
+            {
+                false
+            }
+            Some(relation)
+                if relation.classification != DecisionRelationClassification::NewInsertion
+                    && !relation.prior_decision_id.trim().is_empty() =>
+            {
+                match resolved_decision_relation(store, context_id, Some(relation)) {
+                    Ok(_) => true,
+                    Err(CgError::CrossContextViolation) => {
+                        return Err(CgError::CrossContextViolation);
+                    }
+                    Err(_) => false,
+                }
+            }
+            Some(_) => false,
+            None => false,
+        };
+        if relation_is_valid {
+            continue;
+        }
+
+        let candidate_goal = decision
+            .goal_key
+            .as_deref()
+            .and_then(|key| goal_text.get(key).copied());
+        let (candidate_entity_name, candidate_entity_path) = decision
+            .entity_key
+            .as_deref()
+            .and_then(|key| entity_data.get(key).copied())
+            .map(|(name, path)| (Some(name), Some(path)))
+            .unwrap_or((None, None));
+        if let Some(relation) = extractor.classify_decision_relation(DecisionRelationRequest {
+            context_label,
+            candidate_decision: &decision.text,
+            candidate_goal,
+            candidate_entity_name,
+            candidate_entity_path,
+            prior_decisions,
+        })? {
+            if relation.classification == DecisionRelationClassification::NewInsertion
+                || relation.prior_decision_id.trim().is_empty()
+            {
+                decision.relation = None;
+            } else {
+                decision.relation = Some(relation);
+            }
+        }
+        if decision.relation.is_none()
+            && let Some(relation) =
+                structural_relation_for_decision(&decision.text, candidate_goal, prior_decisions)
+        {
+            decision.relation = Some(relation);
+        }
+    }
+    Ok(())
+}
+
+fn structural_relation_for_decision(
+    candidate_decision: &str,
+    candidate_goal: Option<&str>,
+    prior_decisions: &[ExtractionPriorDecision],
+) -> Option<DecisionRelationSeed> {
+    if !replacement_choice_language(candidate_decision) {
+        return None;
+    }
+    let candidate_goal = candidate_goal
+        .map(normalize_intention_description)
+        .unwrap_or_default();
+    prior_decisions
+        .iter()
+        .find(|prior| {
+            replacement_choice_language(&prior.text)
+                && ((!candidate_goal.is_empty()
+                    && prior
+                        .goals
+                        .iter()
+                        .any(|goal| normalize_intention_description(goal) == candidate_goal))
+                    || choice_subject_matches(candidate_decision, &prior.text))
+        })
+        .map(|prior| DecisionRelationSeed {
+            prior_decision_id: prior.id.as_uuid().to_string(),
+            classification: DecisionRelationClassification::SupersedesExisting,
+        })
+}
+
+fn choice_subject_matches(candidate: &str, prior: &str) -> bool {
+    let candidate = choice_subject_tokens(candidate);
+    let prior = choice_subject_tokens(prior);
+    if candidate.is_empty() || prior.is_empty() {
+        return false;
+    }
+    let shared = candidate.intersection(&prior).count();
+    shared >= 2 && shared * 2 >= candidate.len().min(prior.len())
+}
+
+fn choice_subject_tokens(text: &str) -> BTreeSet<String> {
+    normalize_intention_description(text)
+        .split_whitespace()
+        .filter(|word| {
+            !choice_subject_stopword(word) && !word.chars().any(|ch| ch.is_ascii_digit())
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn choice_subject_stopword(word: &str) -> bool {
+    matches!(
+        word,
+        "and"
+            | "as"
+            | "choose"
+            | "chosen"
+            | "decision"
+            | "decide"
+            | "decided"
+            | "default"
+            | "for"
+            | "from"
+            | "in"
+            | "make"
+            | "new"
+            | "now"
+            | "of"
+            | "old"
+            | "on"
+            | "or"
+            | "replace"
+            | "replaced"
+            | "replacing"
+            | "select"
+            | "selected"
+            | "set"
+            | "should"
+            | "switch"
+            | "switching"
+            | "to"
+            | "use"
+            | "uses"
+            | "using"
+            | "we"
+            | "will"
+            | "with"
+            | "without"
+    )
+}
+
+fn replacement_choice_language(text: &str) -> bool {
+    normalize_intention_description(text)
+        .split_whitespace()
+        .any(|word| {
+            matches!(
+                word,
+                "default" | "switch" | "switching" | "replace" | "replacing" | "replaced"
+            )
+        })
+}
+
+fn validate_harvest_relations(
+    store: &Store,
+    context_id: ContextId,
+    harvest: &StructuredHarvest,
+) -> Result<()> {
+    for decision in &harvest.decisions {
+        resolved_decision_relation(store, context_id, decision.relation.as_ref())?;
+    }
+    Ok(())
 }
 
 fn capture_structured_harvest(
@@ -796,6 +1113,7 @@ fn capture_structured_harvest(
         return capture_zero_harvest_digest(store, context_id, transcript);
     }
 
+    let mut tx = CaptureTxn::begin(store)?;
     let summary = harvest
         .summary
         .as_deref()
@@ -803,7 +1121,7 @@ fn capture_structured_harvest(
         .filter(|summary| !summary.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| compact_summary(transcript));
-    let digest = create_text_digest(store, context_id, &summary, &summary)?;
+    let digest = tx.create_text_digest(context_id, &summary, &summary)?;
     let mut stable = BTreeMap::new();
     let mut source_ids = Vec::<(String, uuid::Uuid)>::new();
     let mut derived_items = Vec::new();
@@ -812,7 +1130,7 @@ fn capture_structured_harvest(
         if seed.key.trim().is_empty() || seed.text.trim().is_empty() {
             continue;
         }
-        let goal = ensure_intention(store, context_id, &seed.text)?;
+        let goal = tx.ensure_intention(context_id, &seed.text)?;
         stable_id(&mut stable, &seed.key, goal);
         stable_id_text(&mut stable, &seed.text, goal.as_uuid());
         source_ids.push((seed.key.clone(), goal.as_uuid()));
@@ -840,8 +1158,7 @@ fn capture_structured_harvest(
         } else {
             seed.path.clone()
         };
-        let entity = ensure_entity_with_prior_path(
-            store,
+        let entity = tx.ensure_entity_with_prior_path(
             context_id,
             &seed.name,
             &path,
@@ -897,8 +1214,7 @@ fn capture_structured_harvest(
     {
         let observation_key = format!("{entity_key}_path");
         let observation_text = format!("{entity_name} observed at {candidate_value}");
-        let write = ensure_observation_with_invalidations(
-            store,
+        let write = tx.ensure_observation_with_invalidations(
             context_id,
             entity,
             &observation_text,
@@ -946,8 +1262,7 @@ fn capture_structured_harvest(
             .as_deref()
             .map(normalize_path_change_value)
             .filter(|path| !path.is_empty());
-        let write = ensure_observation_with_invalidations(
-            store,
+        let write = tx.ensure_observation_with_invalidations(
             context_id,
             entity,
             &seed.text,
@@ -1000,7 +1315,8 @@ fn capture_structured_harvest(
         let relation = resolved_decision_relation(store, context_id, seed.relation.as_ref())?;
         let decision = match relation.as_ref().map(|(classification, _)| *classification) {
             Some(DecisionRelationClassification::ExactDuplicate) => {
-                let prior = relation.as_ref().expect("relation is present").1.id;
+                let prior_row = &relation.as_ref().expect("relation is present").1;
+                let prior = prior_row.id;
                 dedup_events.push(DedupEvent {
                     entity: relation_entity_label(seed, &entity_names),
                     prior_value: relation
@@ -1012,10 +1328,23 @@ fn capture_structured_harvest(
                     candidate_value: seed.text.clone(),
                     classification: DedupClassification::ExactDuplicate,
                 });
-                prior
+                let prior_status = tx.decision_status(prior)?.unwrap_or(prior_row.status);
+                if prior_status == DecisionStatus::Active && !tx.will_invalidate_decision(prior) {
+                    prior
+                } else {
+                    tx.create_decision(decision_input(
+                        context_id,
+                        &seed.text,
+                        &[goal],
+                        entity,
+                        Vec::new(),
+                    ))?
+                    .id
+                }
             }
             Some(DecisionRelationClassification::RefinesExisting) => {
                 let prior = relation.as_ref().expect("relation is present").1.id;
+                let precedent_ids = tx.precedent_ids_if_prior_stays_current(prior)?;
                 dedup_events.push(DedupEvent {
                     entity: relation_entity_label(seed, &entity_names),
                     prior_value: relation
@@ -1027,18 +1356,18 @@ fn capture_structured_harvest(
                     candidate_value: seed.text.clone(),
                     classification: DedupClassification::RefinesExisting,
                 });
-                store
-                    .create_decision(decision_input(
-                        context_id,
-                        &seed.text,
-                        &[goal],
-                        entity,
-                        vec![prior],
-                    ))?
-                    .id
+                tx.create_decision(decision_input(
+                    context_id,
+                    &seed.text,
+                    &[goal],
+                    entity,
+                    precedent_ids,
+                ))?
+                .id
             }
             Some(DecisionRelationClassification::ConflictsExisting) => {
                 let prior = relation.as_ref().expect("relation is present").1.id;
+                let precedent_ids = tx.precedent_ids_if_prior_stays_current(prior)?;
                 let prior_text = relation
                     .as_ref()
                     .expect("relation is present")
@@ -1051,24 +1380,23 @@ fn capture_structured_harvest(
                     candidate_value: seed.text.clone(),
                     classification: DedupClassification::ConflictsExisting,
                 });
-                let decision = store
+                let decision = tx
                     .create_decision(decision_input(
                         context_id,
                         &seed.text,
                         &[goal],
                         entity,
-                        vec![prior],
+                        precedent_ids,
                     ))?
                     .id;
-                let trigger = ensure_semantic_conflict_observation(
-                    store,
+                let trigger = tx.ensure_semantic_conflict_observation(
                     context_id,
                     entity,
                     prior,
                     &prior_text,
                     &seed.text,
                 )?;
-                store.invalidate_decision(
+                tx.invalidate_decision(
                     prior,
                     trigger,
                     format!(
@@ -1076,24 +1404,19 @@ fn capture_structured_harvest(
                         prior_text, seed.text
                     ),
                 )?;
-                invalidation_rows.extend(store.list_invalidations(
-                    context_id,
-                    Some(prior),
-                    None,
-                )?);
+                invalidation_rows.extend(tx.list_invalidations(context_id, Some(prior))?);
                 decision
             }
             Some(DecisionRelationClassification::SupersedesExisting) => {
                 let prior = relation.as_ref().expect("relation is present").1.id;
-                store
-                    .supersede_decision(
-                        prior,
-                        decision_input(context_id, &seed.text, &[goal], entity, Vec::new()),
-                    )?
-                    .id
+                tx.supersede_decision(
+                    prior,
+                    decision_input(context_id, &seed.text, &[goal], entity, Vec::new()),
+                )?
+                .id
             }
             Some(DecisionRelationClassification::NewInsertion) | None => {
-                ensure_decision(store, context_id, &seed.text, &[goal], entity)?
+                tx.ensure_decision(context_id, &seed.text, &[goal], entity)?
             }
         };
         stable_id(&mut stable, &seed.key, decision);
@@ -1103,9 +1426,9 @@ fn capture_structured_harvest(
     }
 
     for (key, decision, text) in &decision_items {
-        let status = store
-            .get_decision(*decision)?
-            .map(|row| decision_status_label(row.status))
+        let status = tx
+            .decision_status(*decision)?
+            .map(decision_status_label)
             .unwrap_or("current");
         derived_items.push(derived(
             key,
@@ -1116,10 +1439,6 @@ fn capture_structured_harvest(
             context_label,
         ));
     }
-    let invalidations = invalidation_rows
-        .iter()
-        .map(|row| invalidation_notice(store, row))
-        .collect::<Result<Vec<_>>>()?;
     derived_items.extend(observation_items);
     source_ids.extend(observation_source_ids);
 
@@ -1127,16 +1446,39 @@ fn capture_structured_harvest(
         .iter()
         .map(|(key, id)| (key.as_str(), *id))
         .collect::<Vec<_>>();
-    let provenance = add_provenance_edges(store, context_id, digest.id, &source_refs)?;
+    let provenance = tx.add_provenance_edges(context_id, digest.id, &source_refs)?;
+    let mut invalidated_decision_ids = invalidation_rows
+        .iter()
+        .map(|row| row.affected_decision_id)
+        .chain(tx.pending_invalidated_decisions.iter().copied())
+        .collect::<Vec<_>>();
+    invalidated_decision_ids.sort();
+    invalidated_decision_ids.dedup();
     let last_harvest = HarvestCounts {
         goals: harvest.goals.len() as u32,
         decisions: harvest.decisions.len() as u32,
         observations: harvest.observations.len() as u32,
     };
-    Ok(report_with_counts(
+    let total_harvest = tx.total_counts(context_id)?;
+    tx.commit()?;
+    let mut committed_invalidation_rows = Vec::new();
+    for decision_id in invalidated_decision_ids {
+        committed_invalidation_rows.extend(store.list_invalidations(
+            context_id,
+            Some(decision_id),
+            None,
+        )?);
+    }
+    committed_invalidation_rows.sort_by_key(|row| row.id);
+    committed_invalidation_rows.dedup_by_key(|row| row.id);
+    let invalidations = committed_invalidation_rows
+        .iter()
+        .map(|row| invalidation_notice(store, row))
+        .collect::<Result<Vec<_>>>()?;
+    let report = report_with_counts(
         CaptureMode::Condensed,
         last_harvest,
-        total_counts(store, context_id)?,
+        total_harvest,
         "captured structured memory",
         summary,
         report_artifacts(
@@ -1146,7 +1488,1771 @@ fn capture_structured_harvest(
             dedup_events,
             invalidations,
         ),
-    ))
+    );
+    Ok(report)
+}
+
+struct CaptureTxn<'a> {
+    store: &'a Store,
+    tx: crate::TxId,
+    active: bool,
+    pending_invalidated_decisions: HashSet<DecisionId>,
+    current_snapshot_overrides: HashMap<EntityId, EntitySnapshotId>,
+}
+
+impl<'a> CaptureTxn<'a> {
+    fn begin(store: &'a Store) -> Result<Self> {
+        let tx = store.internal_db().begin().map_err(map_engine)?;
+        Ok(Self {
+            store,
+            tx,
+            active: true,
+            pending_invalidated_decisions: HashSet::new(),
+            current_snapshot_overrides: HashMap::new(),
+        })
+    }
+
+    fn commit(mut self) -> Result<()> {
+        self.store
+            .internal_db()
+            .commit(self.tx)
+            .map_err(map_engine)?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn create_text_digest(
+        &mut self,
+        context_id: ContextId,
+        summary: &str,
+        vector_text: &str,
+    ) -> Result<crate::Digest> {
+        let id = DigestId::new_v7();
+        let embedding_id = EmbeddingId::new_v7();
+        let vector = self.store.embed_digest_text(vector_text)?;
+        let row_id = self
+            .store
+            .internal_db()
+            .insert_row(
+                self.tx,
+                "digests",
+                HashMap::from([
+                    ("id".to_string(), DbValue::Uuid(id.as_uuid())),
+                    (
+                        "source".to_string(),
+                        DbValue::Text("claude-cli".to_string()),
+                    ),
+                    (
+                        "session_ref".to_string(),
+                        DbValue::Text("capture".to_string()),
+                    ),
+                    ("summary".to_string(), DbValue::Text(summary.to_string())),
+                    ("kind".to_string(), DbValue::Text("text".to_string())),
+                    ("vector_text".to_string(), DbValue::Vector(vector.clone())),
+                    (
+                        "dimension".to_string(),
+                        DbValue::Int64(crate::schema::DIGEST_VECTOR_DIMENSION as i64),
+                    ),
+                    (
+                        "context_id".to_string(),
+                        DbValue::Uuid(context_id.as_uuid()),
+                    ),
+                    ("properties".to_string(), DbValue::Json(json!({}))),
+                    ("created_at".to_string(), DbValue::TxId(self.tx)),
+                ]),
+            )
+            .map_err(map_engine)?;
+        self.execute(
+            "INSERT INTO digest_embedding_handles (id, context_id, embedding_space_id, target_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $embedding_space_id, $target_id, $produced_by, $producer_system, $created_at)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(embedding_id.as_uuid())),
+                (
+                    "context_id".to_string(),
+                    DbValue::Uuid(context_id.as_uuid()),
+                ),
+                (
+                    "embedding_space_id".to_string(),
+                    DbValue::Text(BuiltinSpaceRegistry::TEXT_DEFAULT_ID.to_string()),
+                ),
+                ("target_id".to_string(), DbValue::Uuid(id.as_uuid())),
+                (
+                    "produced_by".to_string(),
+                    DbValue::Json(serde_json::to_value(EvidenceProducer::default()).map_err(
+                        |err| CgError::Engine(format!("producer serialize: {err}")),
+                    )?),
+                ),
+                ("producer_system".to_string(), DbValue::Text(String::new())),
+                ("created_at".to_string(), DbValue::TxId(self.tx)),
+            ]),
+        )?;
+        self.store
+            .internal_db()
+            .insert_vector(
+                self.tx,
+                VectorIndexRef::new("digests", "vector_text"),
+                row_id,
+                vector.clone(),
+            )
+            .map_err(map_engine)?;
+        Ok(crate::Digest {
+            id,
+            source: "claude-cli".to_string(),
+            summary: summary.to_string(),
+            vector_text: Some(vector),
+            dimension: crate::schema::DIGEST_VECTOR_DIMENSION,
+            context_id,
+            session_ref: Some("capture".to_string()),
+            properties: BTreeMap::new(),
+            created_at: self.tx,
+        })
+    }
+
+    fn ensure_intention(
+        &mut self,
+        context_id: ContextId,
+        description: &str,
+    ) -> Result<IntentionId> {
+        if let Some(id) = find_id_by_text(
+            self.store,
+            "intentions",
+            "description",
+            description,
+            context_id,
+        )? {
+            return Ok(IntentionId::from(id));
+        }
+        if let Some(id) =
+            find_intention_by_normalized_description(self.store, context_id, description)?
+        {
+            return Ok(IntentionId::from(id));
+        }
+        let id = IntentionId::new_v7();
+        self.execute(
+            "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $properties, $tags, $created_at)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(id.as_uuid())),
+                ("description".to_string(), DbValue::Text(description.to_string())),
+                ("status".to_string(), DbValue::Text("active".to_string())),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("origin".to_string(), DbValue::Text("human".to_string())),
+                ("origin_ref".to_string(), DbValue::Null),
+                ("blueprint_id".to_string(), DbValue::Null),
+                ("bindings".to_string(), DbValue::Null),
+                ("blueprint_proposal".to_string(), DbValue::Null),
+                ("properties".to_string(), DbValue::Json(json!({}))),
+                ("tags".to_string(), DbValue::Json(json!([]))),
+                ("created_at".to_string(), DbValue::TxId(self.tx)),
+            ]),
+        )?;
+        self.execute(
+            "INSERT INTO intention_snapshots (id, context_id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $context_id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(uuid::Uuid::now_v7())),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("intention_id".to_string(), DbValue::Uuid(id.as_uuid())),
+                ("description".to_string(), DbValue::Text(description.to_string())),
+                ("status".to_string(), DbValue::Text("active".to_string())),
+                ("origin".to_string(), DbValue::Text("human".to_string())),
+                ("properties".to_string(), DbValue::Json(json!({}))),
+                ("tags".to_string(), DbValue::Json(json!([]))),
+                ("valid_from".to_string(), DbValue::TxId(self.tx)),
+                ("valid_to".to_string(), DbValue::Null),
+            ]),
+        )?;
+        self.insert_audit("create", "intention", id.as_uuid(), context_id)?;
+        Ok(id)
+    }
+
+    fn ensure_entity_with_prior_path(
+        &mut self,
+        context_id: ContextId,
+        name: &str,
+        path: &str,
+        entity_type: EntityType,
+    ) -> Result<EntityWrite> {
+        if let Some(entity) =
+            find_existing_entity_for_seed(self.store, context_id, name, entity_type)?
+        {
+            let prior_path = current_entity_path(self.store, entity.id)?
+                .or_else(|| entity_path_from_properties(&entity.properties));
+            return Ok(EntityWrite {
+                id: entity.id,
+                prior_path,
+            });
+        }
+        let id = EntityId::new_v7();
+        let properties = BTreeMap::from([("path".to_string(), json!(path))]);
+        let properties_json = properties_to_json_value(&properties);
+        self.execute(
+            "INSERT INTO entities (id, entity_type, name, status, context_id, properties, tags, created_at) VALUES ($id, $entity_type, $name, $status, $context_id, $properties, $tags, $created_at)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(id.as_uuid())),
+                ("entity_type".to_string(), DbValue::Text(entity_type_label(entity_type).to_string())),
+                ("name".to_string(), DbValue::Text(name.to_string())),
+                ("status".to_string(), DbValue::Text("active".to_string())),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("properties".to_string(), DbValue::Json(properties_json.clone())),
+                ("tags".to_string(), DbValue::Json(json!([]))),
+                ("created_at".to_string(), DbValue::TxId(self.tx)),
+            ]),
+        )?;
+        let snapshot_id = EntitySnapshotId::new_v7();
+        self.insert_entity_snapshot(EntitySnapshotInsert {
+            context_id,
+            entity_id: id,
+            snapshot_id,
+            name,
+            entity_type,
+            properties_json: &properties_json,
+            valid_to: None,
+        })?;
+        self.set_current_entity_snapshot(context_id, id, snapshot_id)?;
+        self.insert_audit("create", "entity", id.as_uuid(), context_id)?;
+        Ok(EntityWrite {
+            id,
+            prior_path: None,
+        })
+    }
+
+    fn create_decision(&mut self, input: CreateDecision) -> Result<Decision> {
+        let id = DecisionId::new_v7();
+        let based_on_snapshots = self.insert_decision_row(id, &input, DecisionStatus::Active)?;
+        let precedent_ids = input.precedent_ids.clone();
+        Ok(Decision {
+            id,
+            decision_type: input.decision_type,
+            description: input.description,
+            reasoning: input.reasoning,
+            confidence: input.confidence,
+            status: DecisionStatus::Active,
+            agent_id: input.agent_id,
+            context_id: input.context_id,
+            tags: input.tags,
+            properties: input.properties,
+            created_at: self.tx,
+            intention_ids: input.intention_ids,
+            based_on_snapshots,
+            outcome: None,
+            precedent_ids,
+        })
+    }
+
+    fn ensure_decision(
+        &mut self,
+        context_id: ContextId,
+        description: &str,
+        intention_ids: &[IntentionId],
+        entity_id: Option<EntityId>,
+    ) -> Result<DecisionId> {
+        if let Some(id) = find_id_by_text(
+            self.store,
+            "decisions",
+            "description",
+            description,
+            context_id,
+        )? {
+            return Ok(DecisionId::from(id));
+        }
+        Ok(self
+            .create_decision(decision_input(
+                context_id,
+                description,
+                intention_ids,
+                entity_id,
+                Vec::new(),
+            ))?
+            .id)
+    }
+
+    fn ensure_observation_with_invalidations(
+        &mut self,
+        context_id: ContextId,
+        entity_id: EntityId,
+        text: &str,
+        state_delta: Option<(&str, &str)>,
+    ) -> Result<ObservationWrite> {
+        if let Some(id) = find_id_by_text(
+            self.store,
+            "observations",
+            "observation_type",
+            text,
+            context_id,
+        )? {
+            return Ok(ObservationWrite {
+                id: ObservationId::from(id),
+                invalidations: Vec::new(),
+            });
+        }
+
+        let id = ObservationId::new_v7();
+        let state_delta = state_delta
+            .map(|(field, value)| BTreeMap::from([(field.to_string(), Some(json!(value)))]))
+            .unwrap_or_default();
+        self.execute(
+            "INSERT INTO observations (id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at) VALUES ($id, $observation_type, $observed_properties, $state_delta, $properties, $source, $entity_id, $context_id, $timestamp, $created_at)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(id.as_uuid())),
+                ("observation_type".to_string(), DbValue::Text(text.to_string())),
+                ("observed_properties".to_string(), DbValue::Json(json!({}))),
+                ("state_delta".to_string(), DbValue::Json(state_delta_to_json(&state_delta))),
+                ("properties".to_string(), DbValue::Json(json!({}))),
+                ("source".to_string(), DbValue::Text("agent-session".to_string())),
+                ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("timestamp".to_string(), DbValue::Timestamp(Utc::now().timestamp_millis())),
+                ("created_at".to_string(), DbValue::TxId(self.tx)),
+            ]),
+        )?;
+        let evidence = text_evidence(id, context_id);
+        self.insert_evidence(&evidence, 0)?;
+        self.mark_decisions_invalidated_by_delta(context_id, entity_id, &state_delta)?;
+        self.merge_state_delta(context_id, entity_id, id, &state_delta)?;
+        self.insert_audit(
+            "record_observation",
+            "observation",
+            id.as_uuid(),
+            context_id,
+        )?;
+        let invalidations = self.list_invalidations_for_observation(context_id, id)?;
+        Ok(ObservationWrite { id, invalidations })
+    }
+
+    fn mark_decisions_invalidated_by_delta(
+        &mut self,
+        context_id: ContextId,
+        entity_id: EntityId,
+        state_delta: &BTreeMap<String, Option<JsonValue>>,
+    ) -> Result<()> {
+        if state_delta.is_empty() {
+            return Ok(());
+        }
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT decision_id, snapshot_id FROM decision_basis_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
+                &HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        for row in &result.rows {
+            let decision_id =
+                DecisionId::from(required_uuid_column(row, &result.columns, "decision_id")?);
+            if self.decision_status(decision_id)? != Some(DecisionStatus::Active) {
+                continue;
+            }
+            let snapshot_id =
+                EntitySnapshotId::from(required_uuid_column(row, &result.columns, "snapshot_id")?);
+            let Some(snapshot_data) = self.entity_snapshot_data(context_id, snapshot_id)? else {
+                continue;
+            };
+            let edge_properties =
+                self.based_on_edge_properties(context_id, decision_id, entity_id)?;
+            if basis_snapshot_differs_from_delta(&snapshot_data, &edge_properties, state_delta) {
+                self.pending_invalidated_decisions.insert(decision_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn will_invalidate_decision(&self, decision_id: DecisionId) -> bool {
+        self.pending_invalidated_decisions.contains(&decision_id)
+    }
+
+    fn precedent_ids_if_prior_stays_current(&self, prior: DecisionId) -> Result<Vec<DecisionId>> {
+        if self.decision_status(prior)? == Some(DecisionStatus::Active)
+            && !self.will_invalidate_decision(prior)
+        {
+            Ok(vec![prior])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn ensure_semantic_conflict_observation(
+        &mut self,
+        context_id: ContextId,
+        entity_id: Option<EntityId>,
+        prior_decision_id: DecisionId,
+        prior_text: &str,
+        candidate_text: &str,
+    ) -> Result<ObservationId> {
+        let entity = match entity_id {
+            Some(entity) => entity,
+            None => {
+                self.ensure_entity_with_prior_path(
+                    context_id,
+                    "decision conflict",
+                    &format!("decision:{}", prior_decision_id.as_uuid()),
+                    EntityType::Document,
+                )?
+                .id
+            }
+        };
+        let text = format!("model classified decision conflict: {prior_text} -> {candidate_text}");
+        Ok(self
+            .ensure_observation_with_invalidations(context_id, entity, &text, None)?
+            .id)
+    }
+
+    fn invalidate_decision(
+        &mut self,
+        decision_id: DecisionId,
+        trigger_observation_id: ObservationId,
+        reason: String,
+    ) -> Result<()> {
+        let status = self
+            .decision_status(decision_id)?
+            .ok_or(CgError::DecisionNotFound { id: decision_id })?;
+        if status != DecisionStatus::Active {
+            return Ok(());
+        }
+        let context_id = self
+            .decision_context_id(decision_id)?
+            .ok_or(CgError::DecisionNotFound { id: decision_id })?;
+        let threatened_intention_ids = self.decision_intention_ids(context_id, decision_id)?;
+        let replacement_exists = threatened_intention_ids.iter().any(|intention_id| {
+            self.active_decision_for_intention(*intention_id, decision_id)
+                .is_ok_and(|row| row.is_some())
+        });
+        self.execute(
+            "UPDATE decisions SET status = $new_status WHERE id = $id AND status = $old_status",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(decision_id.as_uuid())),
+                (
+                    "new_status".to_string(),
+                    DbValue::Text("invalidated".to_string()),
+                ),
+                (
+                    "old_status".to_string(),
+                    DbValue::Text("active".to_string()),
+                ),
+            ]),
+        )?;
+        let diff = empty_basis_diff(self.tx);
+        self.insert_invalidation_row(InvalidationInsert {
+            context_id,
+            decision_id,
+            trigger_observation_id,
+            reason: Some(reason),
+            basis_diff: diff,
+            cascade_from: None,
+            severity: InvalidationSeverity::Warning,
+            threatened_intention_ids,
+            intention_now_un_served: !replacement_exists,
+        })?;
+        Ok(())
+    }
+
+    fn list_invalidations(
+        &self,
+        context_id: ContextId,
+        decision_id: Option<DecisionId>,
+    ) -> Result<Vec<crate::Invalidation>> {
+        let mut sql = "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE context_id = $context_id".to_string();
+        let mut params = HashMap::from([(
+            "context_id".to_string(),
+            DbValue::Uuid(context_id.as_uuid()),
+        )]);
+        if let Some(decision_id) = decision_id {
+            sql.push_str(" AND affected_decision_id = $affected_decision_id");
+            params.insert(
+                "affected_decision_id".to_string(),
+                DbValue::Uuid(decision_id.as_uuid()),
+            );
+        }
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(self.tx, &sql, &params)
+            .map_err(map_engine)?;
+        decode_invalidation_rows(&result.columns, &result.rows)
+    }
+
+    fn list_invalidations_for_observation(
+        &self,
+        context_id: ContextId,
+        observation_id: ObservationId,
+    ) -> Result<Vec<crate::Invalidation>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE context_id = $context_id AND trigger_observation_id = $trigger_observation_id",
+                &HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    (
+                        "trigger_observation_id".to_string(),
+                        DbValue::Uuid(observation_id.as_uuid()),
+                    ),
+                ]),
+            )
+            .map_err(map_engine)?;
+        decode_invalidation_rows(&result.columns, &result.rows)
+    }
+
+    fn supersede_decision(&mut self, old: DecisionId, mut new: CreateDecision) -> Result<Decision> {
+        let existing_status = self
+            .decision_status(old)?
+            .ok_or(CgError::DecisionNotFound { id: old })?;
+        if existing_status != DecisionStatus::Active {
+            return Err(CgError::IllegalTransition {
+                from: existing_status,
+                to: DecisionStatus::Superseded,
+            });
+        }
+        self.execute(
+            "UPDATE decisions SET status = $status WHERE id = $id",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(old.as_uuid())),
+                (
+                    "status".to_string(),
+                    DbValue::Text("superseded".to_string()),
+                ),
+            ]),
+        )?;
+        if !new.precedent_ids.contains(&old) {
+            new.precedent_ids.push(old);
+        }
+        let decision = self.create_decision(new)?;
+        self.insert_edge(
+            decision.id.as_uuid(),
+            old.as_uuid(),
+            "SUPERSEDES",
+            decision.context_id,
+            None,
+        )?;
+        self.insert_audit("supersede", "decision", old.as_uuid(), decision.context_id)?;
+        Ok(decision)
+    }
+
+    fn decision_status(&self, decision_id: DecisionId) -> Result<Option<DecisionStatus>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT status FROM decisions WHERE id = $id",
+                &HashMap::from([("id".to_string(), DbValue::Uuid(decision_id.as_uuid()))]),
+            )
+            .map_err(map_engine)?;
+        result
+            .rows
+            .first()
+            .map(|row| match row.first() {
+                Some(DbValue::Text(status)) => decision_status_from_label(status).map(Some),
+                other => Err(CgError::Engine(format!(
+                    "decision status query returned {other:?}"
+                ))),
+            })
+            .unwrap_or(Ok(None))
+    }
+
+    fn total_counts(&self, context_id: ContextId) -> Result<HarvestCounts> {
+        let count_table = |table: &str| -> Result<u32> {
+            Ok(self
+                .store
+                .internal_db()
+                .execute_in_tx(
+                    self.tx,
+                    &format!("SELECT id FROM {table} WHERE context_id = $context_id"),
+                    &HashMap::from([(
+                        "context_id".to_string(),
+                        DbValue::Uuid(context_id.as_uuid()),
+                    )]),
+                )
+                .map_err(map_engine)?
+                .rows
+                .len() as u32)
+        };
+        Ok(HarvestCounts {
+            goals: count_table("intentions")?,
+            decisions: count_table("decisions")?,
+            observations: count_table("observations")?,
+        })
+    }
+
+    fn add_provenance_edges(
+        &mut self,
+        context_id: ContextId,
+        digest_id: DigestId,
+        sources: &[(&str, uuid::Uuid)],
+    ) -> Result<Vec<ExtractionProvenance>> {
+        let mut out = Vec::new();
+        for (item_id, source_id) in sources {
+            self.insert_edge(
+                *source_id,
+                digest_id.as_uuid(),
+                "EXTRACTED_FROM",
+                context_id,
+                None,
+            )?;
+            out.push(ExtractionProvenance {
+                item_id: (*item_id).to_string(),
+                digest_id,
+                relationship: "EXTRACTED_FROM".to_string(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn insert_decision_row(
+        &mut self,
+        id: DecisionId,
+        input: &CreateDecision,
+        status: DecisionStatus,
+    ) -> Result<Vec<EntitySnapshotId>> {
+        if input.intention_ids.is_empty() {
+            return Err(CgError::MissingIntention);
+        }
+        let mut basis_snapshot_ids = input.based_on_snapshots.clone();
+        for entity_id in &input.based_on_entity_ids {
+            let snapshot_id = if let Some(snapshot_id) =
+                self.current_snapshot_overrides.get(entity_id).copied()
+            {
+                snapshot_id
+            } else {
+                self.current_entity_snapshot_id(input.context_id, *entity_id)?
+                    .ok_or(CgError::NotFound {
+                        id: Some(entity_id.as_uuid().to_string()),
+                        missing: Some("entity_snapshot"),
+                    })?
+            };
+            if !basis_snapshot_ids.contains(&snapshot_id) {
+                basis_snapshot_ids.push(snapshot_id);
+            }
+        }
+        let reasoning_json = serde_json::to_value(&input.reasoning)
+            .map_err(|err| CgError::Engine(format!("decision reasoning serialize: {err}")))?;
+        let tags_json = JsonValue::Array(
+            input
+                .tags
+                .iter()
+                .map(|tag| JsonValue::String(tag.clone()))
+                .collect(),
+        );
+        self.execute(
+            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(id.as_uuid())),
+                ("decision_type".to_string(), DbValue::Text(input.decision_type.clone())),
+                ("description".to_string(), DbValue::Text(input.description.clone())),
+                ("reasoning".to_string(), DbValue::Json(reasoning_json)),
+                (
+                    "confidence".to_string(),
+                    input
+                        .confidence
+                        .map(|value| DbValue::Float64(value as f64))
+                        .unwrap_or(DbValue::Null),
+                ),
+                (
+                    "status".to_string(),
+                    DbValue::Text(decision_status_to_label(status).to_string()),
+                ),
+                (
+                    "agent_id".to_string(),
+                    input
+                        .agent_id
+                        .clone()
+                        .map(DbValue::Text)
+                        .unwrap_or(DbValue::Null),
+                ),
+                ("context_id".to_string(), DbValue::Uuid(input.context_id.as_uuid())),
+                (
+                    "properties".to_string(),
+                    DbValue::Json(properties_to_json_value(&input.properties)),
+                ),
+                ("tags".to_string(), DbValue::Json(tags_json)),
+                ("created_at".to_string(), DbValue::TxId(self.tx)),
+            ]),
+        )?;
+        let mut basis_edge_entities = HashSet::new();
+        for (basis_order, snapshot_id) in basis_snapshot_ids.iter().enumerate() {
+            let snapshot = self.entity_snapshot_by_id(input.context_id, *snapshot_id)?;
+            self.execute(
+                "INSERT INTO decision_basis_snapshots (id, context_id, decision_id, entity_id, snapshot_id, basis_order, created_at) VALUES ($id, $context_id, $decision_id, $entity_id, $snapshot_id, $basis_order, $created_at)",
+                HashMap::from([
+                    ("id".to_string(), DbValue::Uuid(decision_basis_row_id(id, basis_order))),
+                    ("context_id".to_string(), DbValue::Uuid(input.context_id.as_uuid())),
+                    ("decision_id".to_string(), DbValue::Uuid(id.as_uuid())),
+                    ("entity_id".to_string(), DbValue::Uuid(snapshot.entity_id.as_uuid())),
+                    ("snapshot_id".to_string(), DbValue::Uuid(snapshot.id.as_uuid())),
+                    ("basis_order".to_string(), DbValue::Int64(basis_order as i64)),
+                    ("created_at".to_string(), DbValue::TxId(self.tx)),
+                ]),
+            )?;
+            if basis_edge_entities.insert(snapshot.entity_id) {
+                let basis_fields = input
+                    .basis_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get(&snapshot.entity_id))
+                    .map(Vec::as_slice);
+                self.insert_edge(
+                    id.as_uuid(),
+                    snapshot.entity_id.as_uuid(),
+                    "BASED_ON",
+                    input.context_id,
+                    Some(basis_snapshot_edge_properties(&snapshot, basis_fields)),
+                )?;
+            }
+        }
+        for intention_id in &input.intention_ids {
+            self.insert_edge(
+                id.as_uuid(),
+                intention_id.as_uuid(),
+                "SERVES",
+                input.context_id,
+                None,
+            )?;
+        }
+        for precedent_id in &input.precedent_ids {
+            self.insert_edge(
+                id.as_uuid(),
+                precedent_id.as_uuid(),
+                "CITES",
+                input.context_id,
+                None,
+            )?;
+        }
+        self.insert_audit("create", "decision", id.as_uuid(), input.context_id)?;
+        Ok(basis_snapshot_ids)
+    }
+
+    fn insert_evidence(&self, evidence: &EvidenceRef, supply_order: i64) -> Result<()> {
+        let captured_at = evidence.captured_at.unwrap_or_else(Utc::now);
+        self.execute(
+            "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, mime_type, content_hash, captured_at, captured_at_nanos, byte_range, time_range_ms, frame_index, region, producer, text_projection, derived_from, retention_status, media_retention_until, media_retention_until_nanos, properties, supply_order, vector_text, vector_vision) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $mime_type, $content_hash, $captured_at, $captured_at_nanos, $byte_range, $time_range_ms, $frame_index, $region, $producer, $text_projection, $derived_from, $retention_status, $media_retention_until, $media_retention_until_nanos, $properties, $supply_order, $vector_text, $vector_vision)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(evidence.id.as_uuid())),
+                (
+                    "observation_id".to_string(),
+                    DbValue::Uuid(evidence.observation_id.as_uuid()),
+                ),
+                ("context_id".to_string(), DbValue::Uuid(evidence.context_id.as_uuid())),
+                ("kind".to_string(), DbValue::Text(evidence_kind_label(evidence.kind).to_string())),
+                ("source_ref".to_string(), DbValue::Text(evidence.source_ref.clone())),
+                (
+                    "mime_type".to_string(),
+                    evidence.mime_type.clone().map(DbValue::Text).unwrap_or(DbValue::Null),
+                ),
+                (
+                    "content_hash".to_string(),
+                    evidence
+                        .content_hash
+                        .clone()
+                        .map(DbValue::Text)
+                        .unwrap_or(DbValue::Null),
+                ),
+                ("captured_at".to_string(), DbValue::Timestamp(captured_at.timestamp_millis())),
+                (
+                    "captured_at_nanos".to_string(),
+                    DbValue::Int64(captured_at.timestamp_subsec_nanos() as i64),
+                ),
+                ("byte_range".to_string(), optional_pair_json(&evidence.byte_range)),
+                (
+                    "time_range_ms".to_string(),
+                    optional_pair_json(&evidence.time_range_ms),
+                ),
+                (
+                    "frame_index".to_string(),
+                    evidence
+                        .frame_index
+                        .map(|value| DbValue::Int64(value as i64))
+                        .unwrap_or(DbValue::Null),
+                ),
+                (
+                    "region".to_string(),
+                    evidence
+                        .region
+                        .clone()
+                        .map(DbValue::Json)
+                        .unwrap_or(DbValue::Null),
+                ),
+                (
+                    "producer".to_string(),
+                    DbValue::Json(serde_json::to_value(&evidence.producer).map_err(|err| {
+                        CgError::Engine(format!("evidence producer serialize: {err}"))
+                    })?),
+                ),
+                (
+                    "text_projection".to_string(),
+                    evidence
+                        .text_projection
+                        .clone()
+                        .map(DbValue::Text)
+                        .unwrap_or(DbValue::Null),
+                ),
+                (
+                    "derived_from".to_string(),
+                    evidence
+                        .derived_from
+                        .map(|id| DbValue::Uuid(id.as_uuid()))
+                        .unwrap_or(DbValue::Null),
+                ),
+                (
+                    "retention_status".to_string(),
+                    DbValue::Text(retention_status_label(evidence.retention_status).to_string()),
+                ),
+                (
+                    "media_retention_until".to_string(),
+                    evidence
+                        .media_retention_until
+                        .map(|value| DbValue::Timestamp(value.timestamp_millis()))
+                        .unwrap_or(DbValue::Null),
+                ),
+                (
+                    "media_retention_until_nanos".to_string(),
+                    evidence
+                        .media_retention_until
+                        .map(|value| DbValue::Int64(value.timestamp_subsec_nanos() as i64))
+                        .unwrap_or(DbValue::Null),
+                ),
+                (
+                    "properties".to_string(),
+                    DbValue::Json(properties_to_json_value(&evidence.properties)),
+                ),
+                ("supply_order".to_string(), DbValue::Int64(supply_order)),
+                ("vector_text".to_string(), DbValue::Null),
+                ("vector_vision".to_string(), DbValue::Null),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn merge_state_delta(
+        &mut self,
+        context_id: ContextId,
+        entity_id: EntityId,
+        observation_id: ObservationId,
+        state_delta: &BTreeMap<String, Option<JsonValue>>,
+    ) -> Result<Option<EntitySnapshotId>> {
+        if state_delta.is_empty() {
+            return Ok(None);
+        }
+        let current = self.current_entity_snapshot(context_id, entity_id)?;
+        let mut new_properties = current
+            .as_ref()
+            .map(|snapshot| snapshot.properties.clone())
+            .unwrap_or_default();
+        for (field, value) in state_delta {
+            if let Some(value) = value {
+                new_properties.insert(field.clone(), value.clone());
+            } else {
+                new_properties.remove(field);
+            }
+        }
+        if current
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.properties == new_properties)
+        {
+            return Ok(None);
+        }
+        let (entity_type, entity_name) =
+            self.entity_identity(context_id, entity_id, current.as_ref())?;
+        if let Some(current) = &current {
+            self.execute(
+                "UPDATE entity_snapshots SET valid_to = $valid_to WHERE id = $id AND valid_to IS NULL",
+                HashMap::from([
+                    ("id".to_string(), DbValue::Uuid(current.id.as_uuid())),
+                    ("valid_to".to_string(), DbValue::TxId(self.tx)),
+                ]),
+            )?;
+        }
+        let snapshot_id = EntitySnapshotId::new_v7();
+        let properties_json = properties_to_json_value(&new_properties);
+        self.insert_entity_snapshot(EntitySnapshotInsert {
+            context_id,
+            entity_id,
+            snapshot_id,
+            name: &entity_name,
+            entity_type,
+            properties_json: &properties_json,
+            valid_to: None,
+        })?;
+        self.execute(
+            "INSERT INTO entity_snapshot_observations (id, context_id, entity_id, snapshot_id, observation_id, observation_order, created_at) VALUES ($id, $context_id, $entity_id, $snapshot_id, $observation_id, $observation_order, $created_at)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(uuid::Uuid::now_v7())),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                ("snapshot_id".to_string(), DbValue::Uuid(snapshot_id.as_uuid())),
+                (
+                    "observation_id".to_string(),
+                    DbValue::Uuid(observation_id.as_uuid()),
+                ),
+                ("observation_order".to_string(), DbValue::Int64(0)),
+                ("created_at".to_string(), DbValue::TxId(self.tx)),
+            ]),
+        )?;
+        if let Some(current) = current {
+            self.execute(
+                "INSERT INTO entity_snapshot_links (id, context_id, entity_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $context_id, $entity_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
+                HashMap::from([
+                    ("id".to_string(), DbValue::Uuid(uuid::Uuid::now_v7())),
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                    (
+                        "predecessor_snapshot_id".to_string(),
+                        DbValue::Uuid(current.id.as_uuid()),
+                    ),
+                    (
+                        "successor_snapshot_id".to_string(),
+                        DbValue::Uuid(snapshot_id.as_uuid()),
+                    ),
+                    ("created_at".to_string(), DbValue::TxId(self.tx)),
+                ]),
+            )?;
+        }
+        self.set_current_entity_snapshot(context_id, entity_id, snapshot_id)?;
+        self.current_snapshot_overrides
+            .insert(entity_id, snapshot_id);
+        Ok(Some(snapshot_id))
+    }
+
+    fn insert_entity_snapshot(&self, input: EntitySnapshotInsert<'_>) -> Result<()> {
+        let snapshot_data = json!({
+            "entity_id": input.entity_id.as_uuid().to_string(),
+            "entity_type": entity_type_label(input.entity_type),
+            "name": input.name,
+            "properties": input.properties_json,
+        });
+        self.execute(
+            "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(input.snapshot_id.as_uuid())),
+                ("context_id".to_string(), DbValue::Uuid(input.context_id.as_uuid())),
+                ("entity_id".to_string(), DbValue::Uuid(input.entity_id.as_uuid())),
+                ("data".to_string(), DbValue::Json(snapshot_data)),
+                ("valid_from".to_string(), DbValue::TxId(self.tx)),
+                (
+                    "valid_to".to_string(),
+                    input.valid_to.map(DbValue::TxId).unwrap_or(DbValue::Null),
+                ),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn set_current_entity_snapshot(
+        &self,
+        context_id: ContextId,
+        entity_id: EntityId,
+        snapshot_id: EntitySnapshotId,
+    ) -> Result<()> {
+        let updated = self.execute(
+            "UPDATE entity_current_snapshots SET snapshot_id = $snapshot_id, updated_at = $updated_at WHERE context_id = $context_id AND entity_id = $entity_id",
+            HashMap::from([
+                ("snapshot_id".to_string(), DbValue::Uuid(snapshot_id.as_uuid())),
+                ("updated_at".to_string(), DbValue::TxId(self.tx)),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+            ]),
+        )?;
+        if updated == 0 {
+            self.execute(
+                "INSERT INTO entity_current_snapshots (context_id, entity_id, snapshot_id, updated_at) VALUES ($context_id, $entity_id, $snapshot_id, $updated_at)",
+                HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                    ("snapshot_id".to_string(), DbValue::Uuid(snapshot_id.as_uuid())),
+                    ("updated_at".to_string(), DbValue::TxId(self.tx)),
+                ]),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn current_entity_snapshot_id(
+        &self,
+        context_id: ContextId,
+        entity_id: EntityId,
+    ) -> Result<Option<EntitySnapshotId>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT snapshot_id FROM entity_current_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
+                &HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        Ok(result.rows.first().and_then(|row| match row.first() {
+            Some(DbValue::Uuid(id)) => Some(EntitySnapshotId::from(*id)),
+            _ => None,
+        }))
+    }
+
+    fn current_entity_snapshot(
+        &self,
+        context_id: ContextId,
+        entity_id: EntityId,
+    ) -> Result<Option<TxEntitySnapshot>> {
+        let Some(snapshot_id) = self.current_entity_snapshot_id(context_id, entity_id)? else {
+            return Ok(None);
+        };
+        self.entity_snapshot_by_id_optional(context_id, snapshot_id)
+    }
+
+    fn entity_snapshot_by_id(
+        &self,
+        context_id: ContextId,
+        snapshot_id: EntitySnapshotId,
+    ) -> Result<TxEntitySnapshot> {
+        self.entity_snapshot_by_id_optional(context_id, snapshot_id)?
+            .ok_or(CgError::NotFound {
+                id: Some(snapshot_id.as_uuid().to_string()),
+                missing: Some("entity_snapshot"),
+            })
+    }
+
+    fn entity_snapshot_by_id_optional(
+        &self,
+        context_id: ContextId,
+        snapshot_id: EntitySnapshotId,
+    ) -> Result<Option<TxEntitySnapshot>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE context_id = $context_id AND id = $id",
+                &HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("id".to_string(), DbValue::Uuid(snapshot_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        result
+            .rows
+            .first()
+            .map(|row| decode_tx_entity_snapshot(&result.columns, row))
+            .transpose()
+    }
+
+    fn entity_identity(
+        &self,
+        context_id: ContextId,
+        entity_id: EntityId,
+        current: Option<&TxEntitySnapshot>,
+    ) -> Result<(EntityType, String)> {
+        if let Some(current) = current {
+            return Ok((current.entity_type, current.name.clone()));
+        }
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT entity_type, name FROM entities WHERE context_id = $context_id AND id = $id",
+                &HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        let row = result.rows.first().ok_or(CgError::NotFound {
+            id: Some(entity_id.as_uuid().to_string()),
+            missing: Some("entity"),
+        })?;
+        match row.as_slice() {
+            [DbValue::Text(entity_type), DbValue::Text(name)] => {
+                Ok((entity_type_from_label(entity_type)?, name.clone()))
+            }
+            other => Err(CgError::Engine(format!(
+                "entity identity query returned {other:?}"
+            ))),
+        }
+    }
+
+    fn entity_snapshot_data(
+        &self,
+        context_id: ContextId,
+        snapshot_id: EntitySnapshotId,
+    ) -> Result<Option<JsonValue>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT data FROM entity_snapshots WHERE context_id = $context_id AND id = $id",
+                &HashMap::from([
+                    (
+                        "context_id".to_string(),
+                        DbValue::Uuid(context_id.as_uuid()),
+                    ),
+                    ("id".to_string(), DbValue::Uuid(snapshot_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        result
+            .rows
+            .first()
+            .map(|row| required_json_column(row, &result.columns, "data").map(Some))
+            .unwrap_or(Ok(None))
+    }
+
+    fn based_on_edge_properties(
+        &self,
+        context_id: ContextId,
+        decision_id: DecisionId,
+        entity_id: EntityId,
+    ) -> Result<JsonValue> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT properties FROM edges WHERE context_id = $context_id AND source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type LIMIT 1",
+                &HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("source_id".to_string(), DbValue::Uuid(decision_id.as_uuid())),
+                    ("target_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                    ("edge_type".to_string(), DbValue::Text("BASED_ON".to_string())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        result
+            .rows
+            .first()
+            .map(|row| required_json_column(row, &result.columns, "properties"))
+            .unwrap_or_else(|| Ok(json!({})))
+    }
+
+    fn insert_invalidation_row(&self, input: InvalidationInsert) -> Result<()> {
+        self.execute(
+            "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $reason, $basis_diff, $cascade_from, $severity, $threatened_intention_ids, $intention_now_un_served, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(InvalidationId::from(input.decision_id.as_uuid()).as_uuid())),
+                ("status".to_string(), DbValue::Text("pending".to_string())),
+                ("context_id".to_string(), DbValue::Uuid(input.context_id.as_uuid())),
+                (
+                    "affected_decision_id".to_string(),
+                    DbValue::Uuid(input.decision_id.as_uuid()),
+                ),
+                (
+                    "trigger_observation_id".to_string(),
+                    DbValue::Uuid(input.trigger_observation_id.as_uuid()),
+                ),
+                (
+                    "reason".to_string(),
+                    input.reason.map(DbValue::Text).unwrap_or(DbValue::Null),
+                ),
+                (
+                    "basis_diff".to_string(),
+                    DbValue::Json(serde_json::to_value(input.basis_diff).map_err(|err| {
+                        CgError::Engine(format!("basis diff serialize: {err}"))
+                    })?),
+                ),
+                (
+                    "cascade_from".to_string(),
+                    input
+                        .cascade_from
+                        .map(|id| DbValue::Uuid(id.as_uuid()))
+                        .unwrap_or(DbValue::Null),
+                ),
+                (
+                    "severity".to_string(),
+                    DbValue::Text(invalidation_severity_label(input.severity).to_string()),
+                ),
+                (
+                    "threatened_intention_ids".to_string(),
+                    DbValue::Json(serde_json::to_value(input.threatened_intention_ids).map_err(
+                        |err| CgError::Engine(format!("threatened intentions serialize: {err}")),
+                    )?),
+                ),
+                (
+                    "intention_now_un_served".to_string(),
+                    DbValue::Bool(input.intention_now_un_served),
+                ),
+                ("detected_at".to_string(), DbValue::TxId(self.tx)),
+                ("resolved_at".to_string(), DbValue::Null),
+                ("resolution_action".to_string(), DbValue::Null),
+                ("resolution_decision_id".to_string(), DbValue::Null),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn decision_context_id(&self, decision_id: DecisionId) -> Result<Option<ContextId>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT context_id FROM decisions WHERE id = $id",
+                &HashMap::from([("id".to_string(), DbValue::Uuid(decision_id.as_uuid()))]),
+            )
+            .map_err(map_engine)?;
+        Ok(result.rows.first().and_then(|row| match row.first() {
+            Some(DbValue::Uuid(id)) => Some(ContextId::from(*id)),
+            _ => None,
+        }))
+    }
+
+    fn decision_intention_ids(
+        &self,
+        context_id: ContextId,
+        decision_id: DecisionId,
+    ) -> Result<Vec<IntentionId>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT target_id FROM edges WHERE context_id = $context_id AND source_id = $decision_id AND edge_type = $edge_type",
+                &HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("decision_id".to_string(), DbValue::Uuid(decision_id.as_uuid())),
+                    ("edge_type".to_string(), DbValue::Text("SERVES".to_string())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(DbValue::Uuid(id)) => Some(IntentionId::from(*id)),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn active_decision_for_intention(
+        &self,
+        intention_id: IntentionId,
+        excluded_decision_id: DecisionId,
+    ) -> Result<Option<String>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT decisions.description FROM edges INNER JOIN decisions ON decisions.id = edges.source_id WHERE edges.target_id = $intention_id AND edges.edge_type = $edge_type AND decisions.status = $status AND decisions.id <> $excluded_decision_id ORDER BY decisions.created_at DESC LIMIT 1",
+                &HashMap::from([
+                    ("intention_id".to_string(), DbValue::Uuid(intention_id.as_uuid())),
+                    ("edge_type".to_string(), DbValue::Text("SERVES".to_string())),
+                    ("status".to_string(), DbValue::Text("active".to_string())),
+                    (
+                        "excluded_decision_id".to_string(),
+                        DbValue::Uuid(excluded_decision_id.as_uuid()),
+                    ),
+                ]),
+            )
+            .map_err(map_engine)?;
+        Ok(result.rows.first().and_then(|row| match row.first() {
+            Some(DbValue::Text(text)) => Some(text.clone()),
+            _ => None,
+        }))
+    }
+
+    fn insert_audit(
+        &self,
+        operation: &str,
+        target_kind: &str,
+        target_id: uuid::Uuid,
+        context_id: ContextId,
+    ) -> Result<()> {
+        self.execute(
+            "INSERT INTO audit_log (id, txid, operation, actor, reason, target_kind, target_id, context_id, payload) VALUES ($id, $txid, $operation, $actor, $reason, $target_kind, $target_id, $context_id, $payload)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(AuditId::new_v7().as_uuid())),
+                ("txid".to_string(), DbValue::TxId(self.tx)),
+                ("operation".to_string(), DbValue::Text(operation.to_string())),
+                ("actor".to_string(), DbValue::Text("system".to_string())),
+                ("reason".to_string(), DbValue::Null),
+                ("target_kind".to_string(), DbValue::Text(target_kind.to_string())),
+                ("target_id".to_string(), DbValue::Uuid(target_id)),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("payload".to_string(), DbValue::Null),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn execute(&self, sql: &str, params: HashMap<String, DbValue>) -> Result<u64> {
+        Ok(self
+            .store
+            .internal_db()
+            .execute_in_tx(self.tx, sql, &params)
+            .map_err(map_engine)?
+            .rows_affected)
+    }
+
+    fn insert_edge(
+        &mut self,
+        source_id: uuid::Uuid,
+        target_id: uuid::Uuid,
+        edge_type: &str,
+        context_id: ContextId,
+        properties: Option<JsonValue>,
+    ) -> Result<()> {
+        self.execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(uuid::Uuid::now_v7())),
+                ("source_id".to_string(), DbValue::Uuid(source_id)),
+                ("target_id".to_string(), DbValue::Uuid(target_id)),
+                ("edge_type".to_string(), DbValue::Text(edge_type.to_string())),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("valid_from".to_string(), DbValue::TxId(self.tx)),
+                ("valid_to".to_string(), DbValue::Null),
+                (
+                    "properties".to_string(),
+                    DbValue::Json(properties.unwrap_or_else(|| json!({}))),
+                ),
+            ]),
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TxEntitySnapshot {
+    id: EntitySnapshotId,
+    entity_id: EntityId,
+    entity_type: EntityType,
+    name: String,
+    properties: BTreeMap<String, JsonValue>,
+    valid_from: crate::TxId,
+    valid_to: Option<crate::TxId>,
+}
+
+struct EntitySnapshotInsert<'a> {
+    context_id: ContextId,
+    entity_id: EntityId,
+    snapshot_id: EntitySnapshotId,
+    name: &'a str,
+    entity_type: EntityType,
+    properties_json: &'a JsonValue,
+    valid_to: Option<crate::TxId>,
+}
+
+struct InvalidationInsert {
+    context_id: ContextId,
+    decision_id: DecisionId,
+    trigger_observation_id: ObservationId,
+    reason: Option<String>,
+    basis_diff: BasisDiffResult,
+    cascade_from: Option<DecisionId>,
+    severity: InvalidationSeverity,
+    threatened_intention_ids: Vec<IntentionId>,
+    intention_now_un_served: bool,
+}
+
+fn properties_to_json_value(properties: &BTreeMap<String, JsonValue>) -> JsonValue {
+    JsonValue::Object(
+        properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+fn state_delta_to_json(delta: &BTreeMap<String, Option<JsonValue>>) -> JsonValue {
+    let mut ops = serde_json::Map::new();
+    for (key, value) in delta {
+        let mut op = serde_json::Map::new();
+        match value {
+            Some(value) => {
+                op.insert("op".to_string(), JsonValue::String("set".to_string()));
+                op.insert("value".to_string(), value.clone());
+            }
+            None => {
+                op.insert("op".to_string(), JsonValue::String("delete".to_string()));
+            }
+        }
+        ops.insert(key.clone(), JsonValue::Object(op));
+    }
+    json!({
+        "format": "cg_state_delta_v1",
+        "ops": ops,
+    })
+}
+
+fn optional_pair_json(pair: &Option<(u64, u64)>) -> DbValue {
+    pair.map(|(start, end)| json!([start, end]))
+        .map(DbValue::Json)
+        .unwrap_or(DbValue::Null)
+}
+
+fn decision_basis_row_id(decision_id: DecisionId, basis_order: usize) -> uuid::Uuid {
+    let mut bytes = *decision_id.as_uuid().as_bytes();
+    let order = (basis_order as u64).to_be_bytes();
+    for (idx, byte) in order.iter().enumerate() {
+        bytes[8 + idx] ^= byte;
+    }
+    uuid::Uuid::from_bytes(bytes)
+}
+
+fn basis_snapshot_edge_properties(
+    snapshot: &TxEntitySnapshot,
+    basis_fields: Option<&[String]>,
+) -> JsonValue {
+    let mut properties = json!({
+        "basis_snapshot": {
+            "id": snapshot.id.as_uuid().to_string(),
+            "entity_id": snapshot.entity_id.as_uuid().to_string(),
+            "entity_type": entity_type_label(snapshot.entity_type),
+            "name": snapshot.name,
+            "properties": properties_to_json_value(&snapshot.properties),
+            "evidenced_by": [],
+            "captured_at": snapshot.valid_from.0,
+            "valid_from": snapshot.valid_from.0,
+            "valid_to": snapshot.valid_to.map(|tx| tx.0),
+        }
+    });
+    if let Some(fields) = basis_fields
+        && let Some(object) = properties.as_object_mut()
+    {
+        object.insert("basis_fields".to_string(), json!(fields));
+    }
+    properties
+}
+
+fn basis_snapshot_differs_from_delta(
+    snapshot_data: &JsonValue,
+    edge_properties: &JsonValue,
+    state_delta: &BTreeMap<String, Option<JsonValue>>,
+) -> bool {
+    let Some(properties) = snapshot_data
+        .get("properties")
+        .and_then(JsonValue::as_object)
+    else {
+        return false;
+    };
+    let mut fields = edge_properties
+        .get("basis_fields")
+        .and_then(JsonValue::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| state_delta.keys().cloned().collect());
+    fields.sort();
+    fields.dedup();
+    fields.into_iter().any(|field| {
+        state_delta
+            .get(&field)
+            .is_some_and(|new_value| properties.get(&field) != new_value.as_ref())
+    })
+}
+
+fn empty_basis_diff(tx: crate::TxId) -> BasisDiffResult {
+    BasisDiffResult {
+        is_invalidated_candidate: false,
+        divergences: Vec::new(),
+        read_txid: tx,
+        current_snapshot_read_txid: tx,
+    }
+}
+
+fn decode_tx_entity_snapshot(columns: &[String], row: &[DbValue]) -> Result<TxEntitySnapshot> {
+    let id = EntitySnapshotId::from(required_uuid_column(row, columns, "id")?);
+    let entity_id = EntityId::from(required_uuid_column(row, columns, "entity_id")?);
+    let data = required_json_column(row, columns, "data")?;
+    let entity_type = data
+        .get("entity_type")
+        .and_then(JsonValue::as_str)
+        .map(entity_type_from_label)
+        .transpose()?
+        .unwrap_or(EntityType::Document);
+    let name = data
+        .get("name")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("entity")
+        .to_string();
+    let properties = data
+        .get("properties")
+        .and_then(JsonValue::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(TxEntitySnapshot {
+        id,
+        entity_id,
+        entity_type,
+        name,
+        properties,
+        valid_from: required_txid_column(row, columns, "valid_from")?,
+        valid_to: optional_txid_column(row, columns, "valid_to")?,
+    })
+}
+
+fn decode_invalidation_rows(
+    columns: &[String],
+    rows: &[Vec<DbValue>],
+) -> Result<Vec<crate::Invalidation>> {
+    let mut invalidations = rows
+        .iter()
+        .map(|row| decode_invalidation_row(columns, row))
+        .collect::<Result<Vec<_>>>()?;
+    invalidations.sort_by_key(|row| row.detected_at);
+    Ok(invalidations)
+}
+
+fn decode_invalidation_row(columns: &[String], row: &[DbValue]) -> Result<crate::Invalidation> {
+    Ok(crate::Invalidation {
+        id: InvalidationId::from(required_uuid_column(row, columns, "id")?),
+        status: invalidation_status_from_label(&required_text_column(row, columns, "status")?)?,
+        context_id: ContextId::from(required_uuid_column(row, columns, "context_id")?),
+        affected_decision_id: DecisionId::from(required_uuid_column(
+            row,
+            columns,
+            "affected_decision_id",
+        )?),
+        trigger_observation_id: ObservationId::from(required_uuid_column(
+            row,
+            columns,
+            "trigger_observation_id",
+        )?),
+        reason: optional_text_column(row, columns, "reason")?,
+        basis_diff: basis_diff_from_json(required_json_column(row, columns, "basis_diff")?)?,
+        cascade_from: optional_uuid_column(row, columns, "cascade_from")?.map(DecisionId::from),
+        severity: invalidation_severity_from_label(&required_text_column(
+            row, columns, "severity",
+        )?)?,
+        threatened_intention_ids: intention_ids_from_json(required_json_column(
+            row,
+            columns,
+            "threatened_intention_ids",
+        )?)?,
+        intention_now_un_served: required_bool_column(row, columns, "intention_now_un_served")?,
+        detected_at: required_txid_column(row, columns, "detected_at")?,
+        resolved_at: optional_txid_column(row, columns, "resolved_at")?,
+        resolution_action: optional_text_column(row, columns, "resolution_action")?,
+        resolution_decision_id: optional_uuid_column(row, columns, "resolution_decision_id")?
+            .map(DecisionId::from),
+    })
+}
+
+fn basis_diff_from_json(value: JsonValue) -> Result<BasisDiffResult> {
+    serde_json::from_value(value)
+        .map_err(|err| CgError::Engine(format!("invalid basis_diff JSON: {err}")))
+}
+
+fn intention_ids_from_json(value: JsonValue) -> Result<Vec<IntentionId>> {
+    serde_json::from_value(value)
+        .map_err(|err| CgError::Engine(format!("invalid threatened_intention_ids JSON: {err}")))
+}
+
+fn column_index(columns: &[String], name: &str) -> Result<usize> {
+    columns
+        .iter()
+        .position(|column| column == name)
+        .ok_or_else(|| CgError::Engine(format!("missing column {name}")))
+}
+
+fn required_uuid_column(row: &[DbValue], columns: &[String], name: &str) -> Result<uuid::Uuid> {
+    match row.get(column_index(columns, name)?) {
+        Some(DbValue::Uuid(id)) => Ok(*id),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected uuid, got {other:?}"
+        ))),
+    }
+}
+
+fn optional_uuid_column(
+    row: &[DbValue],
+    columns: &[String],
+    name: &str,
+) -> Result<Option<uuid::Uuid>> {
+    match row.get(column_index(columns, name)?) {
+        Some(DbValue::Uuid(id)) => Ok(Some(*id)),
+        Some(DbValue::Null) | None => Ok(None),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected uuid|null, got {other:?}"
+        ))),
+    }
+}
+
+fn required_text_column(row: &[DbValue], columns: &[String], name: &str) -> Result<String> {
+    match row.get(column_index(columns, name)?) {
+        Some(DbValue::Text(text)) => Ok(text.clone()),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected text, got {other:?}"
+        ))),
+    }
+}
+
+fn optional_text_column(row: &[DbValue], columns: &[String], name: &str) -> Result<Option<String>> {
+    match row.get(column_index(columns, name)?) {
+        Some(DbValue::Text(text)) => Ok(Some(text.clone())),
+        Some(DbValue::Null) | None => Ok(None),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected text|null, got {other:?}"
+        ))),
+    }
+}
+
+fn required_json_column(row: &[DbValue], columns: &[String], name: &str) -> Result<JsonValue> {
+    match row.get(column_index(columns, name)?) {
+        Some(DbValue::Json(value)) => Ok(value.clone()),
+        Some(DbValue::Text(text)) => serde_json::from_str(text)
+            .map_err(|err| CgError::Engine(format!("column {name}: invalid json: {err}"))),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected json, got {other:?}"
+        ))),
+    }
+}
+
+fn required_bool_column(row: &[DbValue], columns: &[String], name: &str) -> Result<bool> {
+    match row.get(column_index(columns, name)?) {
+        Some(DbValue::Bool(value)) => Ok(*value),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected bool, got {other:?}"
+        ))),
+    }
+}
+
+fn required_txid_column(row: &[DbValue], columns: &[String], name: &str) -> Result<crate::TxId> {
+    match row.get(column_index(columns, name)?) {
+        Some(DbValue::TxId(tx)) => Ok(*tx),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected txid, got {other:?}"
+        ))),
+    }
+}
+
+fn optional_txid_column(
+    row: &[DbValue],
+    columns: &[String],
+    name: &str,
+) -> Result<Option<crate::TxId>> {
+    match row.get(column_index(columns, name)?) {
+        Some(DbValue::TxId(tx)) => Ok(Some(*tx)),
+        Some(DbValue::Null) | None => Ok(None),
+        other => Err(CgError::Engine(format!(
+            "column {name}: expected txid|null, got {other:?}"
+        ))),
+    }
+}
+
+fn decision_status_to_label(status: DecisionStatus) -> &'static str {
+    match status {
+        DecisionStatus::Active => "active",
+        DecisionStatus::Superseded => "superseded",
+        DecisionStatus::Archived => "archived",
+        DecisionStatus::Invalidated => "invalidated",
+    }
+}
+
+fn decision_status_from_label(label: &str) -> Result<DecisionStatus> {
+    match label {
+        "active" => Ok(DecisionStatus::Active),
+        "superseded" => Ok(DecisionStatus::Superseded),
+        "archived" => Ok(DecisionStatus::Archived),
+        "invalidated" => Ok(DecisionStatus::Invalidated),
+        other => Err(CgError::Engine(format!("unknown decision status: {other}"))),
+    }
+}
+
+fn entity_type_label(entity_type: EntityType) -> &'static str {
+    match entity_type {
+        EntityType::Service => "SERVICE",
+        EntityType::Person => "PERSON",
+        EntityType::Device => "DEVICE",
+        EntityType::Module => "MODULE",
+        EntityType::Repository => "REPOSITORY",
+        EntityType::Configuration => "CONFIGURATION",
+        EntityType::Infrastructure => "INFRASTRUCTURE",
+        EntityType::Location => "LOCATION",
+        EntityType::File => "FILE",
+        EntityType::Pipeline => "PIPELINE",
+        EntityType::Database => "DATABASE",
+        EntityType::Team => "TEAM",
+        EntityType::Document => "DOCUMENT",
+    }
+}
+
+fn entity_type_from_label(label: &str) -> Result<EntityType> {
+    match label {
+        "SERVICE" => Ok(EntityType::Service),
+        "PERSON" => Ok(EntityType::Person),
+        "DEVICE" => Ok(EntityType::Device),
+        "MODULE" => Ok(EntityType::Module),
+        "REPOSITORY" => Ok(EntityType::Repository),
+        "CONFIGURATION" => Ok(EntityType::Configuration),
+        "INFRASTRUCTURE" => Ok(EntityType::Infrastructure),
+        "LOCATION" => Ok(EntityType::Location),
+        "FILE" => Ok(EntityType::File),
+        "PIPELINE" => Ok(EntityType::Pipeline),
+        "DATABASE" => Ok(EntityType::Database),
+        "TEAM" => Ok(EntityType::Team),
+        "DOCUMENT" => Ok(EntityType::Document),
+        other => Err(CgError::Engine(format!("unknown entity type: {other}"))),
+    }
+}
+
+fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Text => "text",
+        EvidenceKind::ImageFrame => "image_frame",
+        EvidenceKind::AudioSegment => "audio_segment",
+        EvidenceKind::VideoSegment => "video_segment",
+        EvidenceKind::StructuredSignal => "structured_signal",
+    }
+}
+
+fn retention_status_label(status: crate::RetentionStatus) -> &'static str {
+    match status {
+        crate::RetentionStatus::RetainedExternal => "retained_external",
+        crate::RetentionStatus::NotStored => "not_stored",
+        crate::RetentionStatus::Ephemeral => "ephemeral",
+        crate::RetentionStatus::Expired => "expired",
+        crate::RetentionStatus::Unavailable => "unavailable",
+    }
+}
+
+fn invalidation_status_from_label(label: &str) -> Result<InvalidationStatus> {
+    match label {
+        "pending" => Ok(InvalidationStatus::Pending),
+        "acknowledged" => Ok(InvalidationStatus::Acknowledged),
+        "resolved" => Ok(InvalidationStatus::Resolved),
+        "dismissed" => Ok(InvalidationStatus::Dismissed),
+        other => Err(CgError::Engine(format!(
+            "unknown invalidation status: {other}"
+        ))),
+    }
+}
+
+fn invalidation_severity_label(severity: InvalidationSeverity) -> &'static str {
+    match severity {
+        InvalidationSeverity::Info => "info",
+        InvalidationSeverity::Warning => "warning",
+        InvalidationSeverity::Critical => "critical",
+    }
+}
+
+fn invalidation_severity_from_label(label: &str) -> Result<InvalidationSeverity> {
+    match label {
+        "info" => Ok(InvalidationSeverity::Info),
+        "warning" => Ok(InvalidationSeverity::Warning),
+        "critical" => Ok(InvalidationSeverity::Critical),
+        other => Err(CgError::Engine(format!(
+            "unknown invalidation severity: {other}"
+        ))),
+    }
+}
+
+impl Drop for CaptureTxn<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.store.internal_db().rollback(self.tx);
+        }
+    }
 }
 
 fn decision_status_label(status: crate::DecisionStatus) -> &'static str {
@@ -1227,6 +3333,9 @@ fn report_with_counts(
         wrote_digest: true,
         impact_signal: Some(CaptureImpactSignal::DerivedGraph),
         dedup_events,
+        import_chunks: None,
+        resolved_chunk_window: None,
+        model_context_tokens: None,
     }
 }
 
@@ -1513,29 +3622,6 @@ fn create_text_digest(
     })
 }
 
-fn ensure_intention(
-    store: &Store,
-    context_id: ContextId,
-    description: &str,
-) -> Result<IntentionId> {
-    if let Some(id) = find_id_by_text(store, "intentions", "description", description, context_id)?
-    {
-        return Ok(IntentionId::from(id));
-    }
-    if let Some(id) = find_intention_by_normalized_description(store, context_id, description)? {
-        return Ok(IntentionId::from(id));
-    }
-    Ok(store
-        .create_intention(CreateIntention {
-            description: description.to_string(),
-            status: IntentionStatus::Active,
-            origin: IntentionOrigin::Human,
-            context_id,
-            ..Default::default()
-        })?
-        .id)
-}
-
 fn find_intention_by_normalized_description(
     store: &Store,
     context_id: ContextId,
@@ -1603,52 +3689,60 @@ struct EntityWrite {
     prior_path: Option<String>,
 }
 
-fn ensure_entity(
+fn find_existing_entity_for_seed(
     store: &Store,
     context_id: ContextId,
     name: &str,
-    path: &str,
     entity_type: EntityType,
-) -> Result<EntityId> {
-    Ok(ensure_entity_with_prior_path(store, context_id, name, path, entity_type)?.id)
-}
-
-fn ensure_entity_with_prior_path(
-    store: &Store,
-    context_id: ContextId,
-    name: &str,
-    path: &str,
-    entity_type: EntityType,
-) -> Result<EntityWrite> {
-    if let Some(entity) = store
-        .list_entities(crate::ListEntityFilter {
-            entity_type: Some(entity_type),
-            name_contains: Some(name.to_string()),
-            include_archived: false,
-            context_id: Some(context_id),
-            ..Default::default()
-        })?
-        .into_iter()
-        .find(|entity| entity.name == name)
-    {
-        let prior_path = current_entity_path(store, entity.id)?
-            .or_else(|| entity_path_from_properties(&entity.properties));
-        return Ok(EntityWrite {
-            id: entity.id,
-            prior_path,
-        });
-    }
-    let entity = store.create_entity(CreateEntity {
-        entity_type,
-        name: name.to_string(),
-        properties: BTreeMap::from([("path".to_string(), json!(path))]),
-        context_id,
+) -> Result<Option<crate::Entity>> {
+    let candidates = store.list_entities(crate::ListEntityFilter {
+        entity_type: Some(entity_type),
+        include_archived: false,
+        context_id: Some(context_id),
         ..Default::default()
     })?;
-    Ok(EntityWrite {
-        id: entity.id,
-        prior_path: None,
-    })
+    if let Some(exact) = candidates.iter().find(|entity| entity.name == name) {
+        return Ok(Some(exact.clone()));
+    }
+    let target = normalize_entity_identity_name(name);
+    if target.is_empty() {
+        return Ok(None);
+    }
+    Ok(candidates
+        .into_iter()
+        .find(|entity| normalize_entity_identity_name(&entity.name) == target))
+}
+
+fn normalize_entity_identity_name(name: &str) -> String {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            push_entity_identity_word(&mut words, &mut current);
+        }
+    }
+    if !current.is_empty() {
+        push_entity_identity_word(&mut words, &mut current);
+    }
+    words.join(" ")
+}
+
+fn push_entity_identity_word(words: &mut Vec<String>, current: &mut String) {
+    let word = match current.as_str() {
+        "a" | "an" | "the" => {
+            current.clear();
+            return;
+        }
+        "configuration" | "configurations" | "configs" => "config",
+        "services" => "service",
+        "modules" => "module",
+        "files" => "file",
+        other => other,
+    };
+    words.push(word.to_string());
+    current.clear();
 }
 
 fn current_entity_path(store: &Store, entity_id: EntityId) -> Result<Option<String>> {
@@ -1702,27 +3796,6 @@ fn relation_entity_label(seed: &DecisionSeed, entity_names: &BTreeMap<String, St
         .unwrap_or_else(|| "decision".to_string())
 }
 
-fn ensure_decision(
-    store: &Store,
-    context_id: ContextId,
-    description: &str,
-    intention_ids: &[IntentionId],
-    entity_id: Option<EntityId>,
-) -> Result<DecisionId> {
-    if let Some(id) = find_id_by_text(store, "decisions", "description", description, context_id)? {
-        return Ok(DecisionId::from(id));
-    }
-    Ok(store
-        .create_decision(decision_input(
-            context_id,
-            description,
-            intention_ids,
-            entity_id,
-            Vec::new(),
-        ))?
-        .id)
-}
-
 fn decision_input(
     context_id: ContextId,
     description: &str,
@@ -1744,77 +3817,9 @@ fn decision_input(
     }
 }
 
-fn ensure_observation(
-    store: &Store,
-    context_id: ContextId,
-    entity_id: EntityId,
-    text: &str,
-    state_delta: Option<(&str, &str)>,
-) -> Result<ObservationId> {
-    Ok(ensure_observation_with_invalidations(store, context_id, entity_id, text, state_delta)?.id)
-}
-
 struct ObservationWrite {
     id: ObservationId,
     invalidations: Vec<crate::Invalidation>,
-}
-
-fn ensure_observation_with_invalidations(
-    store: &Store,
-    context_id: ContextId,
-    entity_id: EntityId,
-    text: &str,
-    state_delta: Option<(&str, &str)>,
-) -> Result<ObservationWrite> {
-    if let Some(id) = find_id_by_text(store, "observations", "observation_type", text, context_id)?
-    {
-        return Ok(ObservationWrite {
-            id: ObservationId::from(id),
-            invalidations: Vec::new(),
-        });
-    }
-    let id = ObservationId::new_v7();
-    let result = store.record_observation(RecordObservation {
-        id,
-        entity_id,
-        context_id,
-        observation_type: text.to_string(),
-        source: "agent-session".to_string(),
-        observed_at: Utc::now(),
-        evidence: vec![text_evidence(id, context_id)],
-        observed_properties: BTreeMap::new(),
-        state_delta: state_delta
-            .map(|(field, value)| BTreeMap::from([(field.to_string(), Some(json!(value)))]))
-            .unwrap_or_default(),
-        properties: BTreeMap::new(),
-        embeddings: Vec::new(),
-    })?;
-    Ok(ObservationWrite {
-        id: result.observation_id,
-        invalidations: result.invalidations,
-    })
-}
-
-fn ensure_semantic_conflict_observation(
-    store: &Store,
-    context_id: ContextId,
-    entity_id: Option<EntityId>,
-    prior_decision_id: DecisionId,
-    prior_text: &str,
-    candidate_text: &str,
-) -> Result<ObservationId> {
-    let entity = match entity_id {
-        Some(entity) => entity,
-        None => ensure_entity(
-            store,
-            context_id,
-            "decision conflict",
-            &format!("decision:{}", prior_decision_id.as_uuid()),
-            EntityType::Document,
-        )?,
-    };
-    let text = format!("model classified decision conflict: {prior_text} -> {candidate_text}");
-    ensure_observation(store, context_id, entity, &text, None)
 }
 
 fn text_evidence(observation_id: ObservationId, context_id: ContextId) -> EvidenceRef {
@@ -1858,24 +3863,6 @@ fn find_id_by_text(
         Some(DbValue::Uuid(id)) => Some(*id),
         _ => None,
     }))
-}
-
-fn add_provenance_edges(
-    store: &Store,
-    context_id: ContextId,
-    digest_id: DigestId,
-    sources: &[(&str, uuid::Uuid)],
-) -> Result<Vec<ExtractionProvenance>> {
-    let mut out = Vec::new();
-    for (item_id, source_id) in sources {
-        store.insert_extracted_from_edge(*source_id, digest_id, context_id)?;
-        out.push(ExtractionProvenance {
-            item_id: (*item_id).to_string(),
-            digest_id,
-            relationship: "EXTRACTED_FROM".to_string(),
-        });
-    }
-    Ok(out)
 }
 
 fn derived(
@@ -2146,4 +4133,121 @@ fn derive_chunk_window(
     let additive = model_context - prompt_overhead_tokens - output_budget - running_state_cap;
     let ceiling = (model_context as f32 * context_fraction.unwrap_or(0.6)).floor() as usize;
     Ok(additive.min(ceiling))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::embedder::mock::LexicalMockEmbedder;
+    use crate::{EmbedderRegistration, StoreConfig};
+
+    #[derive(Debug)]
+    struct StaticExtractor(StructuredHarvest);
+
+    impl ConversationExtractor for StaticExtractor {
+        fn extract(&self, _request: ExtractionRequest<'_>) -> Result<StructuredHarvest> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn structured_capture_rolls_back_digest_row_when_embedding_handle_insert_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StoreConfig {
+            db_path: dir.path().join("cg.db"),
+            default_text_embedder: None,
+            ..Default::default()
+        };
+        let embedder = Arc::new(LexicalMockEmbedder::default());
+        let store = Store::open_with_embedder_registrations(
+            config,
+            vec![EmbedderRegistration {
+                space: embedder.embedding_space(),
+                embedder,
+            }],
+        )
+        .expect("open store");
+        store
+            .internal_db()
+            .execute(
+                "DELETE FROM embedding_space_bindings WHERE embedding_space_id = $embedding_space_id",
+                &HashMap::from([(
+                    "embedding_space_id".to_string(),
+                    DbValue::Text(BuiltinSpaceRegistry::TEXT_DEFAULT_ID.to_string()),
+                )]),
+            )
+            .expect("remove embedding space binding");
+        store
+            .internal_db()
+            .execute(
+                "DELETE FROM embedding_spaces WHERE embedding_space_id = $embedding_space_id",
+                &HashMap::from([(
+                    "embedding_space_id".to_string(),
+                    DbValue::Text(BuiltinSpaceRegistry::TEXT_DEFAULT_ID.to_string()),
+                )]),
+            )
+            .expect("remove embedding space to force handle FK failure");
+        let extractor = StaticExtractor(StructuredHarvest {
+            summary: Some("rollback capture".to_string()),
+            goals: vec![GoalSeed {
+                key: "G1".to_string(),
+                text: "keep rollback test reliable".to_string(),
+            }],
+            entities: vec![EntitySeed {
+                key: "E1".to_string(),
+                name: "rollback config".to_string(),
+                path: "config/rollback.toml".to_string(),
+                entity_type: ExtractedEntityType::Configuration,
+            }],
+            decisions: vec![DecisionSeed {
+                key: "D1".to_string(),
+                text: "use config/rollback.toml for rollback config".to_string(),
+                goal_key: Some("G1".to_string()),
+                entity_key: Some("E1".to_string()),
+                relation: None,
+            }],
+            observations: Vec::new(),
+        });
+
+        let result = record_conversation_with_extractor(
+            &store,
+            CaptureRequest {
+                context_label: "rollback-capture".to_string(),
+                transcript: "capture should roll back after a partial write".to_string(),
+                model_available: true,
+            },
+            &extractor,
+        );
+
+        assert!(result.is_err());
+        let context = context_by_label(&store, "rollback-capture").expect("context");
+        assert_eq!(
+            total_counts(&store, context.id).expect("counts"),
+            HarvestCounts::default()
+        );
+        for table in ["digests", "entities", "edges"] {
+            assert_eq!(
+                count_context_rows(&store, table, context.id),
+                0,
+                "{table} rows must roll back with the failed capture"
+            );
+        }
+    }
+
+    fn count_context_rows(store: &Store, table: &str, context_id: ContextId) -> usize {
+        store
+            .internal_db()
+            .execute(
+                &format!("SELECT id FROM {table} WHERE context_id = $context_id"),
+                &HashMap::from([(
+                    "context_id".to_string(),
+                    DbValue::Uuid(context_id.as_uuid()),
+                )]),
+            )
+            .expect("count query")
+            .rows
+            .len()
+    }
 }
