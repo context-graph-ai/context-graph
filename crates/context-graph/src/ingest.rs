@@ -395,47 +395,6 @@ pub struct RuntimeModelInfo {
     pub default_for_context: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CondensationReport {
-    pub pass_count: usize,
-    pub max_prompt_tokens_seen: usize,
-    pub discovered_item_ids: Vec<String>,
-    pub stable_item_ids: StableItemIds,
-    pub provenance_edges: Vec<ExtractionProvenance>,
-    pub wrote_digest: bool,
-    pub resolved_chunk_window: Option<usize>,
-    pub model_context_tokens: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StableItemIds {
-    entries: Vec<(String, uuid::Uuid)>,
-}
-
-impl StableItemIds {
-    pub fn insert(&mut self, key: String, value: uuid::Uuid) {
-        if let Some((_, existing)) = self
-            .entries
-            .iter_mut()
-            .find(|(existing, _)| existing == &key)
-        {
-            *existing = value;
-        } else {
-            self.entries.push((key, value));
-        }
-    }
-
-    pub fn get(&self, key: &str) -> Option<&uuid::Uuid> {
-        self.entries
-            .iter()
-            .find_map(|(existing, value)| (existing == key).then_some(value))
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.entries.iter().map(|(key, _)| key)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct RollingIngestRequest {
     pub context_label: String,
@@ -446,6 +405,15 @@ pub struct RollingIngestRequest {
     pub running_state_cap_tokens: usize,
     pub explicit_chunk_tokens: Option<usize>,
     pub context_fraction: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollingCaptureRequest {
+    pub context_label: String,
+    pub transcript: String,
+    pub chunk_window: usize,
+    pub running_state_cap_tokens: usize,
+    pub model_context_tokens: Option<usize>,
 }
 
 pub fn register_runtime_model_info(store: &Store, info: RuntimeModelInfo) -> Result<()> {
@@ -567,64 +535,330 @@ pub fn dry_run_import(_store: &Store, _transcript: &str) -> Result<CaptureReport
     ))
 }
 
-pub fn rolling_condense_into_store(
+pub fn capture_rolling_conversation_with_extractor(
     store: &Store,
-    transcript: &str,
-    window_tokens: usize,
-) -> Result<CondensationReport> {
-    let context = context_by_label(store, "rolling-import")?;
-    let summary = bounded_rolling_digest_summary(transcript);
-    let _digest = create_text_digest(store, context.id, &summary, &summary)?;
-    let chunk_window = window_tokens.max(1);
-    let (pass_count, max_seen) = rolling_pass_stats(transcript, chunk_window);
-    Ok(CondensationReport {
-        pass_count,
-        max_prompt_tokens_seen: max_seen,
-        discovered_item_ids: Vec::new(),
-        stable_item_ids: StableItemIds::default(),
-        provenance_edges: Vec::new(),
-        wrote_digest: true,
-        resolved_chunk_window: Some(chunk_window),
-        model_context_tokens: None,
-    })
+    request: RollingCaptureRequest,
+    extractor: &dyn ConversationExtractor,
+) -> Result<CaptureReport> {
+    let chunk_window = request.chunk_window.max(1);
+    let text = request.transcript.trim();
+    if text.is_empty() {
+        let mut report =
+            CaptureReport::empty(CaptureMode::Condensed, "nothing to capture: empty import");
+        report.import_chunks = Some(0);
+        report.resolved_chunk_window = Some(chunk_window);
+        report.model_context_tokens = request.model_context_tokens;
+        return Ok(report);
+    }
+    let context = context_by_label(store, &request.context_label)?;
+    let prior_decisions = extraction_prior_decisions(store, context.id)?;
+    let mut rolling = RollingCaptureAccumulator::new(request.running_state_cap_tokens);
+    let chunks = stream_text_chunks(text, chunk_window, |chunk| {
+        let transcript = rolling.chunk_prompt(chunk);
+        let harvest = extractor.extract(ExtractionRequest {
+            context_label: &request.context_label,
+            transcript: &transcript,
+            prior_decisions: &prior_decisions,
+        })?;
+        rolling.push_harvest(harvest);
+        Ok(())
+    })?;
+    let mut report = rolling.finish_capture(store, &request.context_label, chunks, extractor)?;
+    report.resolved_chunk_window = Some(chunk_window);
+    report.model_context_tokens = request.model_context_tokens;
+    Ok(report)
 }
 
-fn rolling_pass_stats(transcript: &str, chunk_window: usize) -> (usize, usize) {
-    if transcript.is_empty() {
-        return (1, 0);
+pub fn capture_rolling_conversation_for_model_with_extractor(
+    store: &Store,
+    request: RollingIngestRequest,
+    extractor: &dyn ConversationExtractor,
+) -> Result<CaptureReport> {
+    let model_context =
+        runtime_model_context(store, &request.context_label, request.model_key.as_deref())?;
+    let chunk_window = derive_chunk_window(
+        model_context,
+        request.prompt_overhead_tokens,
+        request.output_budget_tokens,
+        request.running_state_cap_tokens,
+        request.explicit_chunk_tokens,
+        request.context_fraction,
+    )?;
+    capture_rolling_conversation_with_extractor(
+        store,
+        RollingCaptureRequest {
+            context_label: request.context_label,
+            transcript: request.transcript,
+            chunk_window,
+            running_state_cap_tokens: request.running_state_cap_tokens,
+            model_context_tokens: Some(model_context),
+        },
+        extractor,
+    )
+}
+
+pub struct RollingCaptureAccumulator {
+    harvest: StructuredHarvest,
+    summary: String,
+    summary_cap_chars: usize,
+    goal_keys_by_text: BTreeMap<String, String>,
+    entity_keys_by_identity: BTreeMap<String, String>,
+    decision_texts: BTreeMap<String, String>,
+    observation_texts: BTreeMap<String, String>,
+}
+
+impl RollingCaptureAccumulator {
+    pub fn new(summary_cap_chars: usize) -> Self {
+        Self {
+            harvest: StructuredHarvest::default(),
+            summary: String::new(),
+            summary_cap_chars,
+            goal_keys_by_text: BTreeMap::new(),
+            entity_keys_by_identity: BTreeMap::new(),
+            decision_texts: BTreeMap::new(),
+            observation_texts: BTreeMap::new(),
+        }
     }
-    let mut rest = transcript;
-    let mut passes = 0;
-    let mut max_seen = 0;
-    while !rest.is_empty() {
-        let split = char_boundary_at_or_before(rest, chunk_window);
-        let split = split.max(
-            rest.char_indices()
-                .nth(1)
-                .map(|(idx, _)| idx)
-                .unwrap_or(rest.len()),
+
+    pub fn chunk_prompt(&self, chunk: &str) -> String {
+        if self.summary.trim().is_empty() {
+            return chunk.to_string();
+        }
+        format!(
+            "Earlier chunks condensed so far:\n{}\n\nNext session chunk:\n{}",
+            self.summary, chunk
+        )
+    }
+
+    pub fn push_harvest(&mut self, harvest: StructuredHarvest) {
+        self.push_summary(harvest.summary.as_deref());
+        let prefix = format!(
+            "c{}",
+            self.harvest.goals.len()
+                + self.harvest.entities.len()
+                + self.harvest.decisions.len()
+                + self.harvest.observations.len()
+                + 1
         );
-        let chunk = &rest[..split];
-        passes += 1;
-        max_seen = max_seen.max(chunk.len());
+        let mut goal_key_map = BTreeMap::new();
+        let mut entity_key_map = BTreeMap::new();
+
+        for goal in harvest.goals {
+            let normalized = normalize_rolling_text(&goal.text);
+            if normalized.is_empty() {
+                continue;
+            }
+            if let Some(existing) = self.goal_keys_by_text.get(&normalized) {
+                goal_key_map.insert(goal.key, existing.clone());
+                continue;
+            }
+            let key = unique_rolling_key(&prefix, &goal.key, self.harvest.goals.len() + 1);
+            self.goal_keys_by_text.insert(normalized, key.clone());
+            goal_key_map.insert(goal.key.clone(), key.clone());
+            self.harvest.goals.push(GoalSeed {
+                key,
+                text: goal.text,
+            });
+        }
+
+        for entity in harvest.entities {
+            let identity = normalize_rolling_entity_identity(&entity);
+            if identity.is_empty() {
+                continue;
+            }
+            if let Some(existing) = self.entity_keys_by_identity.get(&identity) {
+                entity_key_map.insert(entity.key, existing.clone());
+                continue;
+            }
+            let key = unique_rolling_key(&prefix, &entity.key, self.harvest.entities.len() + 1);
+            self.entity_keys_by_identity.insert(identity, key.clone());
+            entity_key_map.insert(entity.key.clone(), key.clone());
+            self.harvest.entities.push(EntitySeed {
+                key,
+                name: entity.name,
+                path: entity.path,
+                entity_type: entity.entity_type,
+            });
+        }
+
+        for mut decision in harvest.decisions {
+            let normalized = normalize_rolling_text(&decision.text);
+            if normalized.is_empty() || self.decision_texts.contains_key(&normalized) {
+                continue;
+            }
+            let key = unique_rolling_key(&prefix, &decision.key, self.harvest.decisions.len() + 1);
+            decision.goal_key = decision
+                .goal_key
+                .as_ref()
+                .and_then(|key| goal_key_map.get(key).cloned())
+                .or_else(|| self.harvest.goals.first().map(|goal| goal.key.clone()));
+            decision.entity_key = decision
+                .entity_key
+                .as_ref()
+                .and_then(|key| entity_key_map.get(key).cloned());
+            self.decision_texts.insert(normalized, key.clone());
+            self.harvest
+                .decisions
+                .push(DecisionSeed { key, ..decision });
+        }
+
+        for mut observation in harvest.observations {
+            let normalized = normalize_rolling_text(&observation.text);
+            if normalized.is_empty() || self.observation_texts.contains_key(&normalized) {
+                continue;
+            }
+            let key = unique_rolling_key(
+                &prefix,
+                &observation.key,
+                self.harvest.observations.len() + 1,
+            );
+            observation.entity_key = observation
+                .entity_key
+                .as_ref()
+                .and_then(|key| entity_key_map.get(key).cloned());
+            self.observation_texts.insert(normalized, key.clone());
+            self.harvest
+                .observations
+                .push(ObservationSeed { key, ..observation });
+        }
+    }
+
+    pub fn finish_capture(
+        self,
+        store: &Store,
+        context_label: &str,
+        chunks: usize,
+        relation_classifier: &dyn ConversationExtractor,
+    ) -> Result<CaptureReport> {
+        if chunks == 0 {
+            let mut report =
+                CaptureReport::empty(CaptureMode::Condensed, "nothing to capture: empty import");
+            report.import_chunks = Some(0);
+            return Ok(report);
+        }
+        let digest_text = self.digest_text(chunks);
+        let final_harvest = self.finish_harvest(chunks);
+        let one_shot = OneShotRollingExtractor {
+            harvest: final_harvest,
+            relation_classifier,
+        };
+        let mut report = record_conversation_with_extractor(
+            store,
+            CaptureRequest {
+                context_label: context_label.to_string(),
+                transcript: digest_text,
+                model_available: true,
+            },
+            &one_shot,
+        )?;
+        if chunks > 1 {
+            report.message = format!("captured import in {chunks} chunks as one condensed memory");
+            report.digest_summary = format!("rolling import: {chunks} chunks");
+        }
+        report.import_chunks = Some(chunks);
+        Ok(report)
+    }
+
+    fn push_summary(&mut self, summary: Option<&str>) {
+        let Some(summary) = summary.map(str::trim).filter(|summary| !summary.is_empty()) else {
+            return;
+        };
+        if !self.summary.is_empty() {
+            self.summary.push('\n');
+        }
+        self.summary.push_str(summary);
+        let summary_limit = self.summary_cap_chars.max(1);
+        if self.summary.len() > summary_limit {
+            self.summary = bounded_rolling_summary(&self.summary, summary_limit);
+        }
+    }
+
+    fn finish_harvest(mut self, chunks: usize) -> StructuredHarvest {
+        if self.harvest.summary.as_deref().is_none_or(str::is_empty) {
+            self.harvest.summary = Some(if self.summary.trim().is_empty() {
+                format!("condensed import from {chunks} streamed chunks")
+            } else {
+                self.summary
+            });
+        }
+        self.harvest
+    }
+
+    fn digest_text(&self, chunks: usize) -> String {
+        if self.summary.trim().is_empty() {
+            format!("condensed import from {chunks} streamed chunks")
+        } else {
+            self.summary.clone()
+        }
+    }
+}
+
+struct OneShotRollingExtractor<'a> {
+    harvest: StructuredHarvest,
+    relation_classifier: &'a dyn ConversationExtractor,
+}
+
+impl ConversationExtractor for OneShotRollingExtractor<'_> {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> Result<StructuredHarvest> {
+        Ok(self.harvest.clone())
+    }
+
+    fn classify_decision_relation(
+        &self,
+        request: DecisionRelationRequest<'_>,
+    ) -> Result<Option<DecisionRelationSeed>> {
+        self.relation_classifier.classify_decision_relation(request)
+    }
+}
+
+fn stream_text_chunks<F>(text: &str, chunk_window: usize, mut on_chunk: F) -> Result<usize>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let mut rest = text;
+    let mut chunks = 0;
+    let window = chunk_window.max(1);
+    while !rest.is_empty() {
+        let split = rolling_chunk_boundary(rest, window);
+        let chunk = rest[..split].trim();
+        if !chunk.is_empty() {
+            chunks += 1;
+            on_chunk(chunk)?;
+        }
         rest = &rest[split..];
     }
-    (passes, max_seen)
+    Ok(chunks)
 }
 
-fn bounded_rolling_digest_summary(transcript: &str) -> String {
-    let compact = compact_summary(transcript);
-    const SUMMARY_LIMIT: usize = 8_192;
-    if compact.len() <= SUMMARY_LIMIT {
-        return compact;
+fn rolling_chunk_boundary(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
     }
-    let half = (SUMMARY_LIMIT - 5) / 2;
-    let head_end = char_boundary_at_or_before(&compact, half);
-    let tail_start = char_boundary_tail_start(&compact, half);
-    format!("{} ... {}", &compact[..head_end], &compact[tail_start..])
+    let split = rolling_char_boundary_at_or_before(text, max_bytes);
+    if split > 0 {
+        split
+    } else {
+        text.char_indices()
+            .nth(1)
+            .map(|(idx, _)| idx)
+            .unwrap_or(text.len())
+    }
 }
 
-fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
+fn bounded_rolling_summary(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    if limit <= 5 {
+        return text.chars().take(limit).collect();
+    }
+    let half = (limit - 5) / 2;
+    let head_end = rolling_char_boundary_at_or_before(text, half);
+    let tail_start = rolling_char_boundary_tail_start(text, limit - 5 - head_end);
+    format!("{} ... {}", &text[..head_end], &text[tail_start..])
+}
+
+fn rolling_char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
     if max_bytes >= text.len() {
         return text.len();
     }
@@ -639,7 +873,7 @@ fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
     last
 }
 
-fn char_boundary_tail_start(text: &str, max_bytes: usize) -> usize {
+fn rolling_char_boundary_tail_start(text: &str, max_bytes: usize) -> usize {
     if max_bytes >= text.len() {
         return 0;
     }
@@ -650,24 +884,47 @@ fn char_boundary_tail_start(text: &str, max_bytes: usize) -> usize {
     start
 }
 
-pub fn rolling_condense_for_connected_model(
-    store: &Store,
-    request: RollingIngestRequest,
-) -> Result<CondensationReport> {
-    let model_context =
-        runtime_model_context(store, &request.context_label, request.model_key.as_deref())?;
-    let chunk_window = derive_chunk_window(
-        model_context,
-        request.prompt_overhead_tokens,
-        request.output_budget_tokens,
-        request.running_state_cap_tokens,
-        request.explicit_chunk_tokens,
-        request.context_fraction,
-    )?;
-    let mut report = rolling_condense_into_store(store, &request.transcript, chunk_window)?;
-    report.model_context_tokens = Some(model_context);
-    report.resolved_chunk_window = Some(chunk_window);
-    Ok(report)
+fn unique_rolling_key(prefix: &str, key: &str, ordinal: usize) -> String {
+    let clean = key
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let clean = clean.trim_matches('_');
+    if clean.is_empty() {
+        format!("{prefix}_{ordinal}")
+    } else {
+        format!("{prefix}_{clean}")
+    }
+}
+
+fn normalize_rolling_entity_identity(entity: &EntitySeed) -> String {
+    let text = if entity.path.trim().is_empty() {
+        entity.name.as_str()
+    } else {
+        entity.path.as_str()
+    };
+    normalize_rolling_text(text)
+}
+
+fn normalize_rolling_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
 }
 
 pub fn embed_digest_summary_for_connected_embedders(

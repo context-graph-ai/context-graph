@@ -20,9 +20,9 @@ use cg_cli_conventions::{
 };
 use context_graph::ingest::{
     CaptureImpactSignal, CaptureMode, CaptureReport, CaptureRequest, ConversationExtractor,
-    DecisionRelationClassification, DecisionRelationRequest, DecisionRelationSeed, DecisionSeed,
-    EntitySeed, ExtractionPriorDecision, ExtractionRequest, GoalSeed, HarvestCounts, ImportParser,
-    ObservationSeed, StructuredHarvest, changed_since_context_cursor,
+    DecisionRelationClassification, DecisionRelationRequest, DecisionRelationSeed,
+    ExtractionPriorDecision, ExtractionRequest, HarvestCounts, ImportParser,
+    RollingCaptureAccumulator, StructuredHarvest, changed_since_context_cursor,
     digest_source_ids_for_context, memory_counts, parser_for_format, record_conversation,
     record_conversation_with_extractor, standing_impact,
 };
@@ -552,7 +552,7 @@ fn import_with_connected_extractor(
     extractor: ConnectedModelExtractor,
     chunk_options: ImportChunkOptions,
 ) -> context_graph::Result<CaptureReport> {
-    let mut rolling = RollingImportAccumulator::new(IMPORT_RUNNING_STATE_CAP_TOKENS);
+    let mut rolling = RollingCaptureAccumulator::new(IMPORT_RUNNING_STATE_CAP_TOKENS);
     let chunks = stream_import_chunks(path, parser, chunk_options, |chunk| {
         let transcript = rolling.chunk_prompt(chunk);
         let prior_decisions = [];
@@ -564,21 +564,7 @@ fn import_with_connected_extractor(
         rolling.push_harvest(harvest);
         Ok(())
     })?;
-    let digest_text = rolling.digest_text(chunks);
-    let final_harvest = rolling.finish_harvest(chunks);
-    let one_shot = OneShotHarvestExtractor {
-        harvest: final_harvest,
-        relation_classifier: Some(extractor),
-    };
-    let mut report = record_conversation_with_extractor(
-        store,
-        CaptureRequest {
-            context_label: context_label.to_string(),
-            transcript: digest_text,
-            model_available: true,
-        },
-        &one_shot,
-    )?;
+    let mut report = rolling.finish_capture(store, context_label, chunks, &extractor)?;
     if chunks > 1 {
         report.message = format!(
             "captured import in {chunks} chunks as one condensed memory; resolved chunk window {} tokens",
@@ -590,266 +576,6 @@ fn import_with_connected_extractor(
     report.resolved_chunk_window = Some(chunk_options.resolved_chunk_window);
     report.model_context_tokens = Some(chunk_options.model_context_tokens);
     Ok(report)
-}
-
-#[derive(Clone)]
-struct OneShotHarvestExtractor {
-    harvest: StructuredHarvest,
-    relation_classifier: Option<ConnectedModelExtractor>,
-}
-
-impl ConversationExtractor for OneShotHarvestExtractor {
-    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
-        Ok(self.harvest.clone())
-    }
-
-    fn classify_decision_relation(
-        &self,
-        request: DecisionRelationRequest<'_>,
-    ) -> context_graph::Result<Option<DecisionRelationSeed>> {
-        match &self.relation_classifier {
-            Some(classifier) => classifier.classify_decision_relation(request),
-            None => Ok(None),
-        }
-    }
-}
-
-#[derive(Default)]
-struct RollingImportAccumulator {
-    harvest: StructuredHarvest,
-    summary: String,
-    summary_cap_chars: usize,
-    goal_keys_by_text: BTreeMap<String, String>,
-    entity_keys_by_identity: BTreeMap<String, String>,
-    decision_texts: BTreeMap<String, String>,
-    observation_texts: BTreeMap<String, String>,
-}
-
-impl RollingImportAccumulator {
-    fn new(summary_cap_chars: usize) -> Self {
-        Self {
-            summary_cap_chars,
-            ..Default::default()
-        }
-    }
-
-    fn chunk_prompt(&self, chunk: &str) -> String {
-        if self.summary.trim().is_empty() {
-            return chunk.to_string();
-        }
-        format!(
-            "Earlier chunks condensed so far:\n{}\n\nNext session chunk:\n{}",
-            self.summary, chunk
-        )
-    }
-
-    fn push_harvest(&mut self, harvest: StructuredHarvest) {
-        self.push_summary(harvest.summary.as_deref());
-        let prefix = format!(
-            "c{}",
-            self.harvest.goals.len()
-                + self.harvest.entities.len()
-                + self.harvest.decisions.len()
-                + self.harvest.observations.len()
-                + 1
-        );
-        let mut goal_key_map = BTreeMap::new();
-        let mut entity_key_map = BTreeMap::new();
-
-        for goal in harvest.goals {
-            let normalized = normalize_import_text(&goal.text);
-            if normalized.is_empty() {
-                continue;
-            }
-            if let Some(existing) = self.goal_keys_by_text.get(&normalized) {
-                goal_key_map.insert(goal.key, existing.clone());
-                continue;
-            }
-            let key = unique_import_key(&prefix, &goal.key, self.harvest.goals.len() + 1);
-            self.goal_keys_by_text.insert(normalized, key.clone());
-            goal_key_map.insert(goal.key.clone(), key.clone());
-            self.harvest.goals.push(GoalSeed {
-                key,
-                text: goal.text,
-            });
-        }
-
-        for entity in harvest.entities {
-            let identity = normalize_import_entity_identity(&entity);
-            if identity.is_empty() {
-                continue;
-            }
-            if let Some(existing) = self.entity_keys_by_identity.get(&identity) {
-                entity_key_map.insert(entity.key, existing.clone());
-                continue;
-            }
-            let key = unique_import_key(&prefix, &entity.key, self.harvest.entities.len() + 1);
-            self.entity_keys_by_identity.insert(identity, key.clone());
-            entity_key_map.insert(entity.key.clone(), key.clone());
-            self.harvest.entities.push(EntitySeed {
-                key,
-                name: entity.name,
-                path: entity.path,
-                entity_type: entity.entity_type,
-            });
-        }
-
-        for mut decision in harvest.decisions {
-            let normalized = normalize_import_text(&decision.text);
-            if normalized.is_empty() || self.decision_texts.contains_key(&normalized) {
-                continue;
-            }
-            let key = unique_import_key(&prefix, &decision.key, self.harvest.decisions.len() + 1);
-            decision.goal_key = decision
-                .goal_key
-                .as_ref()
-                .and_then(|key| goal_key_map.get(key).cloned())
-                .or_else(|| self.harvest.goals.first().map(|goal| goal.key.clone()));
-            decision.entity_key = decision
-                .entity_key
-                .as_ref()
-                .and_then(|key| entity_key_map.get(key).cloned());
-            self.decision_texts.insert(normalized, key.clone());
-            self.harvest
-                .decisions
-                .push(DecisionSeed { key, ..decision });
-        }
-
-        for mut observation in harvest.observations {
-            let normalized = normalize_import_text(&observation.text);
-            if normalized.is_empty() || self.observation_texts.contains_key(&normalized) {
-                continue;
-            }
-            let key = unique_import_key(
-                &prefix,
-                &observation.key,
-                self.harvest.observations.len() + 1,
-            );
-            observation.entity_key = observation
-                .entity_key
-                .as_ref()
-                .and_then(|key| entity_key_map.get(key).cloned());
-            self.observation_texts.insert(normalized, key.clone());
-            self.harvest
-                .observations
-                .push(ObservationSeed { key, ..observation });
-        }
-    }
-
-    fn push_summary(&mut self, summary: Option<&str>) {
-        let Some(summary) = summary.map(str::trim).filter(|summary| !summary.is_empty()) else {
-            return;
-        };
-        if !self.summary.is_empty() {
-            self.summary.push('\n');
-        }
-        self.summary.push_str(summary);
-        let summary_limit = self.summary_cap_chars.max(1);
-        if self.summary.len() > summary_limit {
-            self.summary = bounded_import_summary(&self.summary, summary_limit);
-        }
-    }
-
-    fn finish_harvest(mut self, chunks: usize) -> StructuredHarvest {
-        if self.harvest.summary.as_deref().is_none_or(str::is_empty) {
-            self.harvest.summary = Some(if self.summary.trim().is_empty() {
-                format!("condensed import from {chunks} streamed chunks")
-            } else {
-                self.summary
-            });
-        }
-        self.harvest
-    }
-
-    fn digest_text(&self, chunks: usize) -> String {
-        if self.summary.trim().is_empty() {
-            format!("condensed import from {chunks} streamed chunks")
-        } else {
-            self.summary.clone()
-        }
-    }
-}
-
-fn bounded_import_summary(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    if limit <= 5 {
-        return text.chars().take(limit).collect();
-    }
-    let half = (limit - 5) / 2;
-    let head_end = import_char_boundary_at_or_before(text, half);
-    let tail_start = import_char_boundary_tail_start(text, limit - 5 - head_end);
-    format!("{} ... {}", &text[..head_end], &text[tail_start..])
-}
-
-fn import_char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
-    if max_bytes >= text.len() {
-        return text.len();
-    }
-    let mut last = 0;
-    for (index, ch) in text.char_indices() {
-        let end = index + ch.len_utf8();
-        if end > max_bytes {
-            break;
-        }
-        last = end;
-    }
-    last
-}
-
-fn import_char_boundary_tail_start(text: &str, max_bytes: usize) -> usize {
-    if max_bytes >= text.len() {
-        return 0;
-    }
-    let mut start = text.len() - max_bytes;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    start
-}
-
-fn unique_import_key(prefix: &str, key: &str, ordinal: usize) -> String {
-    let clean = key
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let clean = clean.trim_matches('_');
-    if clean.is_empty() {
-        format!("{prefix}_{ordinal}")
-    } else {
-        format!("{prefix}_{clean}")
-    }
-}
-
-fn normalize_import_entity_identity(entity: &EntitySeed) -> String {
-    let text = if entity.path.trim().is_empty() {
-        entity.name.as_str()
-    } else {
-        entity.path.as_str()
-    };
-    normalize_import_text(text)
-}
-
-fn normalize_import_text(text: &str) -> String {
-    let mut out = String::new();
-    let mut last_space = false;
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_space = false;
-        } else if !last_space {
-            out.push(' ');
-            last_space = true;
-        }
-    }
-    out.trim().to_string()
 }
 
 fn stream_import_chunks<F>(
