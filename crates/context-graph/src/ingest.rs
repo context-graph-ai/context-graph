@@ -13,6 +13,8 @@ use crate::{
     InvalidationSeverity, InvalidationStatus, ObservationId, PrecomputedEmbedding, Result, Store,
 };
 
+const EXTRACTION_PRIOR_DECISION_LIMIT: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HarvestCounts {
     pub goals: u32,
@@ -487,10 +489,6 @@ fn record_conversation_internal(
         extractor,
     )?;
     capture_structured_harvest(store, context.id, &request.context_label, text, harvest)
-}
-
-pub fn import_conversation_text(store: &Store, text: &str) -> Result<CaptureReport> {
-    import_conversation_text_internal(store, text, None)
 }
 
 pub fn import_conversation_text_with_extractor(
@@ -1383,11 +1381,20 @@ fn capture_structured_harvest(
     let mut source_ids = Vec::<(String, uuid::Uuid)>::new();
     let mut derived_items = Vec::new();
     let mut goals = BTreeMap::<String, IntentionId>::new();
+    let mut goal_ids_by_normalized_text = BTreeMap::<String, IntentionId>::new();
     for seed in &harvest.goals {
         if seed.key.trim().is_empty() || seed.text.trim().is_empty() {
             continue;
         }
+        let normalized = normalize_intention_description(&seed.text);
+        if let Some(goal) = goal_ids_by_normalized_text.get(&normalized).copied() {
+            stable_id(&mut stable, &seed.key, goal);
+            stable_id_text(&mut stable, &seed.text, goal.as_uuid());
+            goals.insert(seed.key.clone(), goal);
+            continue;
+        }
         let goal = tx.ensure_intention(context_id, &seed.text)?;
+        goal_ids_by_normalized_text.insert(normalized, goal);
         stable_id(&mut stable, &seed.key, goal);
         stable_id_text(&mut stable, &seed.text, goal.as_uuid());
         source_ids.push((seed.key.clone(), goal.as_uuid()));
@@ -1406,6 +1413,7 @@ fn capture_structured_harvest(
     let mut entity_paths = BTreeMap::<String, String>::new();
     let mut entity_prior_paths = BTreeMap::<String, Option<String>>::new();
     let mut entity_names = BTreeMap::<String, String>::new();
+    let mut entity_writes_by_identity = BTreeMap::<String, EntityWrite>::new();
     for seed in &harvest.entities {
         if seed.key.trim().is_empty() || seed.name.trim().is_empty() {
             continue;
@@ -1415,12 +1423,26 @@ fn capture_structured_harvest(
         } else {
             seed.path.clone()
         };
-        let entity = tx.ensure_entity_with_prior_path(
-            context_id,
-            &seed.name,
-            &path,
-            seed.entity_type.into(),
-        )?;
+        let entity_type = seed.entity_type.into();
+        let entity_dedup_key = format!(
+            "{}:{}:{}",
+            entity_type_label(entity_type),
+            normalize_entity_identity_name(&seed.name),
+            path.trim().to_ascii_lowercase()
+        );
+        if let Some(entity) = entity_writes_by_identity.get(&entity_dedup_key).cloned() {
+            stable_id(&mut stable, &seed.key, entity.id);
+            stable_id_text(&mut stable, &seed.name, entity.id.as_uuid());
+            stable_id_text(&mut stable, &path, entity.id.as_uuid());
+            entities.insert(seed.key.clone(), entity.id);
+            entity_paths.insert(seed.key.clone(), path);
+            entity_prior_paths.insert(seed.key.clone(), entity.prior_path);
+            entity_names.insert(seed.key.clone(), seed.name.clone());
+            continue;
+        }
+        let entity =
+            tx.ensure_entity_with_prior_path(context_id, &seed.name, &path, entity_type)?;
+        entity_writes_by_identity.insert(entity_dedup_key, entity.clone());
         stable_id(&mut stable, &seed.key, entity.id);
         stable_id_text(&mut stable, &seed.name, entity.id.as_uuid());
         stable_id_text(&mut stable, &path, entity.id.as_uuid());
@@ -1438,6 +1460,7 @@ fn capture_structured_harvest(
     let mut dedup_events = Vec::new();
     let mut observation_items = Vec::new();
     let mut observation_source_ids = Vec::<(String, uuid::Uuid)>::new();
+    let mut observation_ids_by_normalized_text = BTreeMap::<String, ObservationId>::new();
     let explicit_path_change_entities = harvest
         .observations
         .iter()
@@ -1519,12 +1542,27 @@ fn capture_structured_harvest(
             .as_deref()
             .map(normalize_path_change_value)
             .filter(|path| !path.is_empty());
+        let observation_dedup_key = format!(
+            "{}:{}:{}",
+            entity.as_uuid(),
+            normalize_intention_description(&seed.text),
+            path_change.as_deref().unwrap_or_default()
+        );
+        if let Some(observation) = observation_ids_by_normalized_text
+            .get(&observation_dedup_key)
+            .copied()
+        {
+            stable_id(&mut stable, &seed.key, observation);
+            stable_id_text(&mut stable, &seed.text, observation.as_uuid());
+            continue;
+        }
         let write = tx.ensure_observation_with_invalidations(
             context_id,
             entity,
             &seed.text,
             path_change.as_deref().map(|path| ("path", path)),
         )?;
+        observation_ids_by_normalized_text.insert(observation_dedup_key, write.id);
         stable_id(&mut stable, &seed.key, write.id);
         stable_id_text(&mut stable, &seed.text, write.id.as_uuid());
         observation_source_ids.push((seed.key.clone(), write.id.as_uuid()));
@@ -1553,6 +1591,7 @@ fn capture_structured_harvest(
         invalidation_rows.extend(write.invalidations);
     }
 
+    let mut decision_ids_by_normalized_text = BTreeMap::<String, DecisionId>::new();
     for seed in &harvest.decisions {
         if seed.key.trim().is_empty() || seed.text.trim().is_empty() {
             continue;
@@ -1569,6 +1608,15 @@ fn capture_structured_harvest(
             .entity_key
             .as_ref()
             .and_then(|key| entities.get(key).copied());
+        let decision_dedup_key = normalize_intention_description(&seed.text);
+        if let Some(decision) = decision_ids_by_normalized_text
+            .get(&decision_dedup_key)
+            .copied()
+        {
+            stable_id(&mut stable, &seed.key, decision);
+            stable_id_text(&mut stable, &seed.text, decision.as_uuid());
+            continue;
+        }
         let relation = resolved_decision_relation(store, context_id, seed.relation.as_ref())?;
         let decision = match relation.as_ref().map(|(classification, _)| *classification) {
             Some(DecisionRelationClassification::ExactDuplicate) => {
@@ -1676,6 +1724,7 @@ fn capture_structured_harvest(
                 tx.ensure_decision(context_id, &seed.text, &[goal], entity)?
             }
         };
+        decision_ids_by_normalized_text.insert(decision_dedup_key, decision);
         stable_id(&mut stable, &seed.key, decision);
         stable_id_text(&mut stable, &seed.text, decision.as_uuid());
         source_ids.push((seed.key.clone(), decision.as_uuid()));
@@ -2095,20 +2144,38 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
+        let mut candidates = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             let decision_id =
                 DecisionId::from(required_uuid_column(row, &result.columns, "decision_id")?);
-            if self.decision_status(decision_id)? != Some(DecisionStatus::Active) {
-                continue;
-            }
             let snapshot_id =
                 EntitySnapshotId::from(required_uuid_column(row, &result.columns, "snapshot_id")?);
-            let Some(snapshot_data) = self.entity_snapshot_data(context_id, snapshot_id)? else {
+            candidates.push((decision_id, snapshot_id));
+        }
+        let decision_ids = candidates
+            .iter()
+            .map(|(decision_id, _)| *decision_id)
+            .collect::<Vec<_>>();
+        let snapshot_ids = candidates
+            .iter()
+            .map(|(_, snapshot_id)| *snapshot_id)
+            .collect::<Vec<_>>();
+        let statuses = self.decision_statuses(context_id, &decision_ids)?;
+        let snapshots = self.entity_snapshot_data_batch(context_id, &snapshot_ids)?;
+        let edge_properties =
+            self.based_on_edge_properties_batch(context_id, entity_id, &decision_ids)?;
+        for (decision_id, snapshot_id) in candidates {
+            if statuses.get(&decision_id) != Some(&DecisionStatus::Active) {
+                continue;
+            }
+            let Some(snapshot_data) = snapshots.get(&snapshot_id) else {
                 continue;
             };
-            let edge_properties =
-                self.based_on_edge_properties(context_id, decision_id, entity_id)?;
-            if basis_snapshot_differs_from_delta(&snapshot_data, &edge_properties, state_delta) {
+            let edge_properties = edge_properties
+                .get(&decision_id)
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if basis_snapshot_differs_from_delta(snapshot_data, &edge_properties, state_delta) {
                 self.pending_invalidated_decisions.insert(decision_id);
             }
         }
@@ -2309,22 +2376,133 @@ impl<'a> CaptureTxn<'a> {
             .unwrap_or(Ok(None))
     }
 
+    fn decision_statuses(
+        &self,
+        context_id: ContextId,
+        decision_ids: &[DecisionId],
+    ) -> Result<HashMap<DecisionId, DecisionStatus>> {
+        if decision_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut params = HashMap::from([(
+            "context_id".to_string(),
+            DbValue::Uuid(context_id.as_uuid()),
+        )]);
+        let id_list = decision_id_list("decision", decision_ids, &mut params);
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                &format!(
+                    "SELECT id, status FROM decisions WHERE context_id = $context_id AND id IN ({id_list})"
+                ),
+                &params,
+            )
+            .map_err(map_engine)?;
+        let mut out = HashMap::new();
+        for row in &result.rows {
+            out.insert(
+                DecisionId::from(required_uuid_column(row, &result.columns, "id")?),
+                decision_status_from_label(&required_text_column(row, &result.columns, "status")?)?,
+            );
+        }
+        Ok(out)
+    }
+
+    fn entity_snapshot_data_batch(
+        &self,
+        context_id: ContextId,
+        snapshot_ids: &[EntitySnapshotId],
+    ) -> Result<HashMap<EntitySnapshotId, JsonValue>> {
+        if snapshot_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut params = HashMap::from([(
+            "context_id".to_string(),
+            DbValue::Uuid(context_id.as_uuid()),
+        )]);
+        let id_list = snapshot_id_list("snapshot", snapshot_ids, &mut params);
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                &format!(
+                    "SELECT id, data FROM entity_snapshots WHERE context_id = $context_id AND id IN ({id_list})"
+                ),
+                &params,
+            )
+            .map_err(map_engine)?;
+        let mut out = HashMap::new();
+        for row in &result.rows {
+            out.insert(
+                EntitySnapshotId::from(required_uuid_column(row, &result.columns, "id")?),
+                required_json_column(row, &result.columns, "data")?,
+            );
+        }
+        Ok(out)
+    }
+
+    fn based_on_edge_properties_batch(
+        &self,
+        context_id: ContextId,
+        entity_id: EntityId,
+        decision_ids: &[DecisionId],
+    ) -> Result<HashMap<DecisionId, JsonValue>> {
+        if decision_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut params = HashMap::from([
+            (
+                "context_id".to_string(),
+                DbValue::Uuid(context_id.as_uuid()),
+            ),
+            ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+            (
+                "edge_type".to_string(),
+                DbValue::Text("BASED_ON".to_string()),
+            ),
+        ]);
+        let id_list = decision_id_list("decision", decision_ids, &mut params);
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                &format!(
+                    "SELECT source_id, properties FROM edges WHERE context_id = $context_id AND target_id = $entity_id AND edge_type = $edge_type AND source_id IN ({id_list})"
+                ),
+                &params,
+            )
+            .map_err(map_engine)?;
+        let mut out = HashMap::new();
+        for row in &result.rows {
+            out.entry(DecisionId::from(required_uuid_column(
+                row,
+                &result.columns,
+                "source_id",
+            )?))
+            .or_insert(required_json_column(row, &result.columns, "properties")?);
+        }
+        Ok(out)
+    }
+
     fn total_counts(&self, context_id: ContextId) -> Result<HarvestCounts> {
         let count_table = |table: &str| -> Result<u32> {
-            Ok(self
+            let result = self
                 .store
                 .internal_db()
                 .execute_in_tx(
                     self.tx,
-                    &format!("SELECT id FROM {table} WHERE context_id = $context_id"),
+                    &format!("SELECT COUNT(*) AS n FROM {table} WHERE context_id = $context_id"),
                     &HashMap::from([(
                         "context_id".to_string(),
                         DbValue::Uuid(context_id.as_uuid()),
                     )]),
                 )
-                .map_err(map_engine)?
-                .rows
-                .len() as u32)
+                .map_err(map_engine)?;
+            count_from_result(&result.columns, &result.rows)
         };
         Ok(HarvestCounts {
             goals: count_table("intentions")?,
@@ -2828,60 +3006,6 @@ impl<'a> CaptureTxn<'a> {
         }
     }
 
-    fn entity_snapshot_data(
-        &self,
-        context_id: ContextId,
-        snapshot_id: EntitySnapshotId,
-    ) -> Result<Option<JsonValue>> {
-        let result = self
-            .store
-            .internal_db()
-            .execute_in_tx(
-                self.tx,
-                "SELECT data FROM entity_snapshots WHERE context_id = $context_id AND id = $id",
-                &HashMap::from([
-                    (
-                        "context_id".to_string(),
-                        DbValue::Uuid(context_id.as_uuid()),
-                    ),
-                    ("id".to_string(), DbValue::Uuid(snapshot_id.as_uuid())),
-                ]),
-            )
-            .map_err(map_engine)?;
-        result
-            .rows
-            .first()
-            .map(|row| required_json_column(row, &result.columns, "data").map(Some))
-            .unwrap_or(Ok(None))
-    }
-
-    fn based_on_edge_properties(
-        &self,
-        context_id: ContextId,
-        decision_id: DecisionId,
-        entity_id: EntityId,
-    ) -> Result<JsonValue> {
-        let result = self
-            .store
-            .internal_db()
-            .execute_in_tx(
-                self.tx,
-                "SELECT properties FROM edges WHERE context_id = $context_id AND source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type LIMIT 1",
-                &HashMap::from([
-                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
-                    ("source_id".to_string(), DbValue::Uuid(decision_id.as_uuid())),
-                    ("target_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
-                    ("edge_type".to_string(), DbValue::Text("BASED_ON".to_string())),
-                ]),
-            )
-            .map_err(map_engine)?;
-        result
-            .rows
-            .first()
-            .map(|row| required_json_column(row, &result.columns, "properties"))
-            .unwrap_or_else(|| Ok(json!({})))
-    }
-
     fn insert_invalidation_row(&self, input: InvalidationInsert) -> Result<()> {
         self.execute(
             "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $reason, $basis_diff, $cascade_from, $severity, $threatened_intention_ids, $intention_now_un_served, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
@@ -3365,6 +3489,20 @@ fn required_json_column(row: &[DbValue], columns: &[String], name: &str) -> Resu
     }
 }
 
+fn count_from_result(columns: &[String], rows: &[Vec<DbValue>]) -> Result<u32> {
+    let row = rows
+        .first()
+        .ok_or_else(|| CgError::Engine("count query returned no rows".to_string()))?;
+    match row.get(column_index(columns, "n")?) {
+        Some(DbValue::Int64(value)) if *value >= 0 && *value <= u32::MAX as i64 => {
+            Ok(*value as u32)
+        }
+        other => Err(CgError::Engine(format!(
+            "count query returned invalid count {other:?}"
+        ))),
+    }
+}
+
 fn required_bool_column(row: &[DbValue], columns: &[String], name: &str) -> Result<bool> {
     match row.get(column_index(columns, name)?) {
         Some(DbValue::Bool(value)) => Ok(*value),
@@ -3714,7 +3852,14 @@ fn extraction_prior_decisions(
     let result = store
         .internal_db()
         .execute(
-            "SELECT id, description FROM decisions WHERE context_id = $context_id AND status = $status ORDER BY created_at ASC",
+            &format!(
+                "SELECT id, description
+             FROM decisions
+             WHERE context_id = $context_id
+               AND status = $status
+             ORDER BY created_at DESC, id ASC
+             LIMIT {EXTRACTION_PRIOR_DECISION_LIMIT}"
+            ),
             &HashMap::from([
                 (
                     "context_id".to_string(),
@@ -3724,7 +3869,7 @@ fn extraction_prior_decisions(
             ]),
         )
         .map_err(map_engine)?;
-    result
+    let mut rows = result
         .rows
         .iter()
         .map(|row| {
@@ -3744,113 +3889,155 @@ fn extraction_prior_decisions(
                     ));
                 }
             };
-            Ok(ExtractionPriorDecision {
-                id,
-                text,
-                goals: prior_decision_goals(store, context_id, id)?,
-                entities: prior_decision_entities(store, context_id, id)?,
-            })
+            Ok((id, text))
         })
-        .collect()
-}
-
-fn prior_decision_goals(
-    store: &Store,
-    context_id: ContextId,
-    decision_id: DecisionId,
-) -> Result<Vec<String>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT intentions.description
-             FROM edges
-             INNER JOIN intentions ON intentions.id = edges.target_id
-             WHERE edges.context_id = $context_id
-               AND edges.source_id = $decision_id
-               AND edges.edge_type = $edge_type
-               AND intentions.context_id = $context_id
-             ORDER BY intentions.created_at ASC",
-            &HashMap::from([
-                (
-                    "context_id".to_string(),
-                    DbValue::Uuid(context_id.as_uuid()),
-                ),
-                (
-                    "decision_id".to_string(),
-                    DbValue::Uuid(decision_id.as_uuid()),
-                ),
-                ("edge_type".to_string(), DbValue::Text("SERVES".to_string())),
-            ]),
-        )
-        .map_err(map_engine)?;
-    Ok(result
-        .rows
-        .iter()
-        .filter_map(|row| match row.first() {
-            Some(DbValue::Text(text)) => Some(text.clone()),
-            _ => None,
+        .collect::<Result<Vec<_>>>()?;
+    rows.reverse();
+    let ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let goals = prior_decision_goals_batch(store, context_id, &ids)?;
+    let entities = prior_decision_entities_batch(store, context_id, &ids)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, text)| ExtractionPriorDecision {
+            id,
+            text,
+            goals: goals.get(&id).cloned().unwrap_or_default(),
+            entities: entities.get(&id).cloned().unwrap_or_default(),
         })
         .collect())
 }
 
-fn prior_decision_entities(
+fn prior_decision_goals_batch(
     store: &Store,
     context_id: ContextId,
-    decision_id: DecisionId,
-) -> Result<Vec<ExtractionPriorEntity>> {
+    decision_ids: &[DecisionId],
+) -> Result<HashMap<DecisionId, Vec<String>>> {
+    if decision_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut params = HashMap::from([
+        (
+            "context_id".to_string(),
+            DbValue::Uuid(context_id.as_uuid()),
+        ),
+        ("edge_type".to_string(), DbValue::Text("SERVES".to_string())),
+    ]);
+    let id_list = decision_id_list("decision", decision_ids, &mut params);
     let result = store
         .internal_db()
         .execute(
-            "SELECT entities.id, entities.name
+            &format!(
+                "SELECT edges.source_id, intentions.description
+             FROM edges
+             INNER JOIN intentions ON intentions.id = edges.target_id
+             WHERE edges.context_id = $context_id
+               AND edges.source_id IN ({id_list})
+               AND edges.edge_type = $edge_type
+               AND intentions.context_id = $context_id
+             ORDER BY intentions.created_at ASC"
+            ),
+            &params,
+        )
+        .map_err(map_engine)?;
+    let mut out = decision_ids
+        .iter()
+        .map(|id| (*id, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for row in &result.rows {
+        let decision_id =
+            DecisionId::from(required_uuid_column(row, &result.columns, "source_id")?);
+        let text = required_text_column(row, &result.columns, "description")?;
+        out.entry(decision_id).or_default().push(text);
+    }
+    Ok(out)
+}
+
+fn prior_decision_entities_batch(
+    store: &Store,
+    context_id: ContextId,
+    decision_ids: &[DecisionId],
+) -> Result<HashMap<DecisionId, Vec<ExtractionPriorEntity>>> {
+    if decision_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut params = HashMap::from([
+        (
+            "context_id".to_string(),
+            DbValue::Uuid(context_id.as_uuid()),
+        ),
+        (
+            "edge_type".to_string(),
+            DbValue::Text("BASED_ON".to_string()),
+        ),
+    ]);
+    let id_list = decision_id_list("decision", decision_ids, &mut params);
+    let result = store
+        .internal_db()
+        .execute(
+            &format!(
+                "SELECT edges.source_id, entities.id, entities.name
              FROM edges
              INNER JOIN entities ON entities.id = edges.target_id
              WHERE edges.context_id = $context_id
-               AND edges.source_id = $decision_id
+               AND edges.source_id IN ({id_list})
                AND edges.edge_type = $edge_type
                AND entities.context_id = $context_id
-             ORDER BY entities.created_at ASC",
-            &HashMap::from([
-                (
-                    "context_id".to_string(),
-                    DbValue::Uuid(context_id.as_uuid()),
-                ),
-                (
-                    "decision_id".to_string(),
-                    DbValue::Uuid(decision_id.as_uuid()),
-                ),
-                (
-                    "edge_type".to_string(),
-                    DbValue::Text("BASED_ON".to_string()),
-                ),
-            ]),
+             ORDER BY entities.created_at ASC"
+            ),
+            &params,
         )
         .map_err(map_engine)?;
-    result
-        .rows
+    let mut out = decision_ids
         .iter()
-        .map(|row| {
-            let id = match row.first() {
-                Some(DbValue::Uuid(id)) => EntityId::from(*id),
-                _ => {
-                    return Err(CgError::Engine(
-                        "prior entity recall returned non-uuid id".to_string(),
-                    ));
-                }
-            };
-            let name = match row.get(1) {
-                Some(DbValue::Text(name)) => name.clone(),
-                _ => {
-                    return Err(CgError::Engine(
-                        "prior entity recall returned non-text name".to_string(),
-                    ));
-                }
-            };
-            Ok(ExtractionPriorEntity {
+        .map(|id| (*id, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for row in &result.rows {
+        let decision_id =
+            DecisionId::from(required_uuid_column(row, &result.columns, "source_id")?);
+        let entity_id = EntityId::from(required_uuid_column(row, &result.columns, "id")?);
+        let name = required_text_column(row, &result.columns, "name")?;
+        out.entry(decision_id)
+            .or_default()
+            .push(ExtractionPriorEntity {
                 name,
-                path: current_entity_path(store, id)?,
-            })
+                path: current_entity_path(store, entity_id)?,
+            });
+    }
+    Ok(out)
+}
+
+fn decision_id_list(
+    prefix: &str,
+    decision_ids: &[DecisionId],
+    params: &mut HashMap<String, DbValue>,
+) -> String {
+    decision_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, decision_id)| {
+            let key = format!("{prefix}_{idx}");
+            params.insert(key.clone(), DbValue::Uuid(decision_id.as_uuid()));
+            format!("${key}")
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn snapshot_id_list(
+    prefix: &str,
+    snapshot_ids: &[EntitySnapshotId],
+    params: &mut HashMap<String, DbValue>,
+) -> String {
+    snapshot_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, snapshot_id)| {
+            let key = format!("{prefix}_{idx}");
+            params.insert(key.clone(), DbValue::Uuid(snapshot_id.as_uuid()));
+            format!("${key}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn create_text_digest(
@@ -3941,6 +4128,7 @@ fn normalize_path_change_value(value: &str) -> String {
         .to_string()
 }
 
+#[derive(Clone)]
 struct EntityWrite {
     id: EntityId,
     prior_path: Option<String>,
@@ -4151,17 +4339,16 @@ fn stable_id_text(stable: &mut BTreeMap<String, String>, key: &str, id: uuid::Uu
 fn total_counts(store: &Store, context_id: ContextId) -> Result<HarvestCounts> {
     let db = store.internal_db();
     let count_table = |table: &str| -> Result<u32> {
-        Ok(db
+        let result = db
             .execute(
-                &format!("SELECT id FROM {table} WHERE context_id = $context_id"),
+                &format!("SELECT COUNT(*) AS n FROM {table} WHERE context_id = $context_id"),
                 &HashMap::from([(
                     "context_id".to_string(),
                     DbValue::Uuid(context_id.as_uuid()),
                 )]),
             )
-            .map_err(map_engine)?
-            .rows
-            .len() as u32)
+            .map_err(map_engine)?;
+        count_from_result(&result.columns, &result.rows)
     };
     Ok(HarvestCounts {
         goals: count_table("intentions")?,
@@ -4398,7 +4585,9 @@ mod tests {
 
     use super::*;
     use crate::embedder::mock::LexicalMockEmbedder;
-    use crate::{EmbedderRegistration, StoreConfig};
+    use crate::{
+        CreateIntention, EmbedderRegistration, IntentionOrigin, IntentionStatus, StoreConfig,
+    };
 
     #[derive(Debug)]
     struct StaticExtractor(StructuredHarvest);
@@ -4406,6 +4595,57 @@ mod tests {
     impl ConversationExtractor for StaticExtractor {
         fn extract(&self, _request: ExtractionRequest<'_>) -> Result<StructuredHarvest> {
             Ok(self.0.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PriorBoundExtractor {
+        prior: DecisionId,
+    }
+
+    impl ConversationExtractor for PriorBoundExtractor {
+        fn extract(&self, request: ExtractionRequest<'_>) -> Result<StructuredHarvest> {
+            assert!(
+                request.prior_decisions.len() <= EXTRACTION_PRIOR_DECISION_LIMIT,
+                "capture prompt prior recall must stay bounded"
+            );
+            assert!(
+                request
+                    .prior_decisions
+                    .iter()
+                    .any(|prior| prior.id == self.prior),
+                "bounded prior recall must keep the newest relevant prior"
+            );
+            Ok(StructuredHarvest {
+                summary: Some("bounded prior recall conflict".to_string()),
+                goals: vec![GoalSeed {
+                    key: "G1".to_string(),
+                    text: "keep bounded prior recall useful".to_string(),
+                }],
+                entities: Vec::new(),
+                decisions: vec![DecisionSeed {
+                    key: "D1".to_string(),
+                    text: "replace the newest bounded prior decision".to_string(),
+                    goal_key: Some("G1".to_string()),
+                    entity_key: None,
+                    relation: None,
+                }],
+                observations: Vec::new(),
+            })
+        }
+
+        fn classify_decision_relation(
+            &self,
+            request: DecisionRelationRequest<'_>,
+        ) -> Result<Option<DecisionRelationSeed>> {
+            assert!(
+                request.prior_decisions.len() <= EXTRACTION_PRIOR_DECISION_LIMIT,
+                "relation prompt prior recall must stay bounded"
+            );
+            Ok(Some(DecisionRelationSeed {
+                prior_decision_id: self.prior.as_uuid().to_string(),
+                classification: DecisionRelationClassification::ConflictsExisting,
+            }))
         }
     }
 
@@ -4491,6 +4731,67 @@ mod tests {
                 "{table} rows must roll back with the failed capture"
             );
         }
+    }
+
+    #[test]
+    fn extraction_prior_recall_is_bounded_and_still_invalidates_recalled_prior() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StoreConfig {
+            db_path: dir.path().join("cg.db"),
+            default_text_embedder: None,
+            ..Default::default()
+        };
+        let embedder = Arc::new(LexicalMockEmbedder::default());
+        let store = Store::open_with_embedder_registrations(
+            config,
+            vec![EmbedderRegistration {
+                space: embedder.embedding_space(),
+                embedder,
+            }],
+        )
+        .expect("open store");
+        let context = context_by_label(&store, "bounded-prior-recall").expect("context");
+        let goal = store
+            .create_intention(CreateIntention {
+                description: "keep bounded prior recall useful".to_string(),
+                status: IntentionStatus::Active,
+                origin: IntentionOrigin::Human,
+                context_id: context.id,
+                ..Default::default()
+            })
+            .expect("goal");
+        let mut latest = None;
+        for idx in 0..(EXTRACTION_PRIOR_DECISION_LIMIT + 12) {
+            let decision = store
+                .create_decision(CreateDecision {
+                    decision_type: "prior".to_string(),
+                    description: format!("prior decision {idx}"),
+                    intention_ids: vec![goal.id],
+                    context_id: context.id,
+                    ..Default::default()
+                })
+                .expect("prior decision");
+            latest = Some(decision.id);
+        }
+        let latest = latest.expect("latest prior");
+
+        let report = record_conversation_with_extractor(
+            &store,
+            CaptureRequest {
+                context_label: "bounded-prior-recall".to_string(),
+                transcript: "new decision conflicts with the newest bounded prior".to_string(),
+                model_available: true,
+            },
+            &PriorBoundExtractor { prior: latest },
+        )
+        .expect("bounded capture");
+        let latest_row = store
+            .get_decision(latest)
+            .expect("latest decision lookup")
+            .expect("latest decision row");
+
+        assert_eq!(latest_row.status, DecisionStatus::Invalidated);
+        assert_eq!(report.invalidations.len(), 1);
     }
 
     fn count_context_rows(store: &Store, table: &str, context_id: ContextId) -> usize {
