@@ -579,11 +579,11 @@ impl Store {
             });
         }
         let snapshot = self.db.snapshot();
-        let params = HashMap::from([(
+        let mut params = HashMap::from([(
             "intention_id".to_string(),
             Value::Uuid(intention_id.as_uuid()),
         )]);
-        let anchor_sql = "SELECT id FROM intentions WHERE id = $intention_id";
+        let anchor_sql = "SELECT id, context_id FROM intentions WHERE id = $intention_id";
         let anchor = self
             .db
             .execute_at_snapshot(anchor_sql, &params, snapshot)
@@ -591,6 +591,18 @@ impl Store {
         if anchor.rows.is_empty() {
             return Err(CgError::IntentionNotFound { id: intention_id });
         }
+        let anchor_context_id = match anchor.rows[0].as_slice() {
+            [_, Value::Uuid(context_id), ..] => ContextId::from(*context_id),
+            other => {
+                return Err(CgError::Engine(format!(
+                    "intention anchor lookup returned invalid row {other:?}"
+                )));
+            }
+        };
+        params.insert(
+            "context_id".to_string(),
+            Value::Uuid(anchor_context_id.as_uuid()),
+        );
 
         let decision_statuses = decision_statuses_for_discovery(&filter);
         if decision_statuses.is_empty() {
@@ -606,7 +618,9 @@ impl Store {
             )
             SELECT DISTINCT d.id, d.decision_type, d.description, d.reasoning, d.confidence, d.status, d.agent_id, d.context_id, d.properties, d.tags, d.created_at
             FROM decisions d
-            WHERE d.id IN (SELECT d_id FROM serving) AND d.status IN ({})
+            WHERE d.id IN (SELECT d_id FROM serving)
+                AND d.context_id = $context_id
+                AND d.status IN ({})
             ORDER BY d.created_at DESC, d.id ASC",
             sql_string_list(&decision_statuses),
         );
@@ -628,8 +642,9 @@ impl Store {
             });
         }
         let snapshot = self.db.snapshot();
-        let params = HashMap::from([("entity_id".to_string(), Value::Uuid(entity_id.as_uuid()))]);
-        let anchor_sql = "SELECT id FROM entities WHERE id = $entity_id";
+        let mut params =
+            HashMap::from([("entity_id".to_string(), Value::Uuid(entity_id.as_uuid()))]);
+        let anchor_sql = "SELECT id, context_id FROM entities WHERE id = $entity_id";
         let anchor = self
             .db
             .execute_at_snapshot(anchor_sql, &params, snapshot)
@@ -640,6 +655,18 @@ impl Store {
                 missing: Option::from("entity"),
             });
         }
+        let anchor_context_id = match anchor.rows[0].as_slice() {
+            [_, Value::Uuid(context_id), ..] => ContextId::from(*context_id),
+            other => {
+                return Err(CgError::Engine(format!(
+                    "entity anchor lookup returned invalid row {other:?}"
+                )));
+            }
+        };
+        params.insert(
+            "context_id".to_string(),
+            Value::Uuid(anchor_context_id.as_uuid()),
+        );
 
         let decision_statuses = decision_statuses_for_discovery(&filter);
         if decision_statuses.is_empty() {
@@ -663,6 +690,7 @@ impl Store {
             SELECT DISTINCT d.id, d.decision_type, d.description, d.reasoning, d.confidence, d.status, d.agent_id, d.context_id, d.properties, d.tags, d.created_at
             FROM decisions d
             WHERE (d.id IN (SELECT d_id FROM based) OR d.id IN (SELECT d_id FROM about))
+                AND d.context_id = $context_id
                 AND d.status IN ({})
             ORDER BY d.created_at DESC, d.id ASC",
             sql_string_list(&decision_statuses),

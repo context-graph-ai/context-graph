@@ -174,6 +174,78 @@ fn structured_harvest_accepts_duplicate_summary_from_live_model() {
     assert_eq!(harvest.decisions.len(), 1);
 }
 
+#[test]
+fn structured_capture_dedups_duplicate_text_seeds_inside_one_harvest() {
+    let (dir, store) = fresh_store();
+    let db_path = dir.path().join("cg.db");
+    let report = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "intra-harvest-duplicates".to_string(),
+            transcript: "duplicate seeds from one model response".to_string(),
+            model_available: true,
+        },
+        &StaticExtractor(StructuredHarvest {
+            summary: Some("dedup duplicate seeds".to_string()),
+            goals: vec![
+                GoalSeed {
+                    key: "G1".to_string(),
+                    text: "keep duplicate captures idempotent".to_string(),
+                },
+                GoalSeed {
+                    key: "G2".to_string(),
+                    text: "Keep duplicate captures idempotent.".to_string(),
+                },
+            ],
+            entities: vec![EntitySeed {
+                key: "E1".to_string(),
+                name: "duplicate config".to_string(),
+                path: "config/duplicate.toml".to_string(),
+                entity_type: ExtractedEntityType::Configuration,
+            }],
+            decisions: vec![
+                DecisionSeed {
+                    key: "D1".to_string(),
+                    text: "use config/duplicate.toml for duplicate config".to_string(),
+                    goal_key: Some("G1".to_string()),
+                    entity_key: Some("E1".to_string()),
+                    relation: None,
+                },
+                DecisionSeed {
+                    key: "D2".to_string(),
+                    text: "Use config/duplicate.toml for duplicate config.".to_string(),
+                    goal_key: Some("G2".to_string()),
+                    entity_key: Some("E1".to_string()),
+                    relation: None,
+                },
+            ],
+            observations: vec![
+                ObservationSeed {
+                    key: "O1".to_string(),
+                    text: "duplicate config observed at config/duplicate.toml".to_string(),
+                    entity_key: Some("E1".to_string()),
+                    path_change: None,
+                },
+                ObservationSeed {
+                    key: "O2".to_string(),
+                    text: "Duplicate config observed at config/duplicate.toml.".to_string(),
+                    entity_key: Some("E1".to_string()),
+                    path_change: None,
+                },
+            ],
+        }),
+    )
+    .expect("duplicate text capture should succeed");
+    drop(store);
+
+    assert_eq!(raw_count(&db_path, "intentions"), 1);
+    assert_eq!(raw_count(&db_path, "decisions"), 1);
+    assert_eq!(raw_count(&db_path, "observations"), 1);
+    assert_eq!(report.stable_ids.get("G1"), report.stable_ids.get("G2"));
+    assert_eq!(report.stable_ids.get("D1"), report.stable_ids.get("D2"));
+    assert_eq!(report.stable_ids.get("O1"), report.stable_ids.get("O2"));
+}
+
 fn digest_vector(seed: usize) -> Vec<f32> {
     let mut vector = vec![0.0; DIGEST_VECTOR_DIMENSION];
     vector[seed % DIGEST_VECTOR_DIMENSION] = 1.0;

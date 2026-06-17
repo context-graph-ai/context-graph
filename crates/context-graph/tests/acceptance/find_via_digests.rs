@@ -1,6 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(context_graph_internal_test_support)]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+#[cfg(context_graph_internal_test_support)]
+use std::time::Duration;
 
 use chrono::Utc;
 use context_graph::embedding_space::default_text_embedding_space;
@@ -15,6 +22,8 @@ use context_graph::{
 };
 use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::Database;
+#[cfg(context_graph_internal_test_support)]
+use contextdb_engine::plugin::{DatabasePlugin, QueryOutcome};
 use serde_json::json;
 
 struct DigestFixture {
@@ -70,6 +79,27 @@ fn open_store_with_vector_probe(db_path: PathBuf) -> Store {
     .expect("open store with vector probe embedder")
 }
 
+#[cfg(context_graph_internal_test_support)]
+fn open_store_with_vector_probe_and_query_plugin(
+    db_path: PathBuf,
+    plugin: Arc<dyn DatabasePlugin>,
+) -> Store {
+    let embedder = Arc::new(VectorProbeEmbedder);
+    Store::open_with_database_plugin_and_embedder_registrations(
+        StoreConfig {
+            db_path,
+            default_text_embedder: None,
+            ..Default::default()
+        },
+        plugin,
+        vec![EmbedderRegistration {
+            space: embedder.embedding_space(),
+            embedder,
+        }],
+    )
+    .expect("open store with vector probe embedder and query plugin")
+}
+
 struct VectorProbeEmbedder;
 
 impl Embedder for VectorProbeEmbedder {
@@ -93,6 +123,44 @@ impl Embedder for VectorProbeEmbedder {
     fn embedding_space(&self) -> EmbeddingSpace {
         default_text_embedding_space()
     }
+}
+
+#[cfg(context_graph_internal_test_support)]
+#[derive(Default)]
+struct QueryCountingPlugin {
+    enabled: AtomicBool,
+    count: AtomicUsize,
+    sql: Mutex<Vec<String>>,
+}
+
+#[cfg(context_graph_internal_test_support)]
+impl QueryCountingPlugin {
+    fn enable_for_next_call(&self) {
+        self.count.store(0, Ordering::SeqCst);
+        self.sql.lock().expect("query sql").clear();
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    fn disable(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+    }
+
+    fn sql(&self) -> Vec<String> {
+        self.sql.lock().expect("query sql").clone()
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
+impl DatabasePlugin for QueryCountingPlugin {
+    fn on_query(&self, sql: &str) -> contextdb_core::Result<()> {
+        if self.enabled.load(Ordering::SeqCst) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.sql.lock().expect("query sql").push(sql.to_string());
+        }
+        Ok(())
+    }
+
+    fn post_query(&self, _sql: &str, _duration: Duration, _outcome: &QueryOutcome) {}
 }
 
 fn query_vector_for(text: &str) -> Vec<f32> {
@@ -981,6 +1049,74 @@ fn find_via_digests_limit_caps_results() {
     assert_eq!(
         hits.iter().map(|hit| hit.digest_id).collect::<Vec<_>>(),
         vec![fixture.near_digest, fixture.after_digest]
+    );
+}
+
+#[cfg(context_graph_internal_test_support)]
+#[test]
+fn find_via_digests_enriches_only_limited_candidates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cg.db");
+    let seed_store = open_store_with_vector_probe(db_path.clone());
+    let context = create_context(&seed_store, "limited-enrichment");
+    let goal = create_intention(&seed_store, context.id, "keep digest query bounded");
+    let mut expected = Vec::new();
+    let mut digest_ids = Vec::new();
+    for idx in 0..8 {
+        let digest = create_digest(
+            &seed_store,
+            context.id,
+            &format!("limited-{idx}"),
+            &format!("limited candidate {idx}"),
+            vector_with_similarity(0, 100 + idx, 0.99 - (idx as f32 * 0.02)),
+        );
+        if idx < 2 {
+            expected.push(digest.id);
+        }
+        digest_ids.push(digest.id);
+    }
+    drop(seed_store);
+    for digest_id in &digest_ids {
+        insert_extracted_from_edges(&db_path, context.id, *digest_id, &[goal.as_uuid()]);
+    }
+    let counter = Arc::new(QueryCountingPlugin::default());
+    let store = open_store_with_vector_probe_and_query_plugin(db_path, counter.clone());
+
+    counter.enable_for_next_call();
+    let hits = hits(
+        &store,
+        "vector:auth-rank",
+        DigestSearchFilter {
+            context_id: Some(context.id),
+            limit: Some(2),
+            ..Default::default()
+        },
+    );
+    counter.disable();
+    let sql = counter.sql();
+    let graph_walks = sql
+        .iter()
+        .filter(|statement| {
+            statement.contains("GRAPH_TABLE") && statement.contains("EXTRACTED_FROM")
+        })
+        .count();
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.digest_id).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        graph_walks, 2,
+        "digest enrichment must graph-walk only the requested result count; sql={sql:?}"
+    );
+    assert!(
+        sql.iter().any(|statement| statement.contains("LIMIT 2")),
+        "digest vector search must bind the requested limit into SQL; sql={sql:?}"
+    );
+    assert!(
+        !sql.iter()
+            .any(|statement| statement.contains("LIMIT 10000")),
+        "digest vector search must not keep the old 10000 over-fetch cap; sql={sql:?}"
     );
 }
 

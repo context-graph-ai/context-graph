@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use contextdb_core::{Error as EngineError, Value, VectorIndexRef};
 
@@ -239,6 +239,7 @@ impl Store {
             .into_iter()
             .map(|context| (context.id, context.name))
             .collect::<HashMap<_, _>>();
+        let candidate_limit = filter.limit.unwrap_or(10_000).max(1);
         let mut params = HashMap::from([("query".to_string(), Value::Vector(query_vector))]);
         let mut where_parts = Vec::new();
         if let Some(contexts) = contexts.as_ref() {
@@ -266,10 +267,12 @@ impl Store {
             sql.push_str(" WHERE ");
             sql.push_str(&where_parts.join(" AND "));
         }
-        sql.push_str(" ORDER BY vector_text <=> $query LIMIT 10000");
+        sql.push_str(&format!(
+            " ORDER BY vector_text <=> $query LIMIT {candidate_limit}"
+        ));
         let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
         let vector_trace = format!("{:?}", result.trace);
-        let mut hits = Vec::new();
+        let mut candidates = Vec::new();
         for row in result.rows {
             let digest_id = DigestId::from(value_uuid(&row, &result.columns, "id")?);
             let context_id = ContextId::from(value_uuid(&row, &result.columns, "context_id")?);
@@ -285,8 +288,31 @@ impl Store {
             }
             let summary = value_text(&row, &result.columns, "summary")?;
             let created_at = value_txid(&row, &result.columns, "created_at")?;
+            candidates.push(DigestCandidate {
+                digest_id,
+                context_id,
+                created_at,
+                similarity,
+                summary,
+            });
+        }
+        if let Some(limit) = filter.limit {
+            candidates.truncate(limit);
+        }
+
+        let mut candidate_graphs = Vec::new();
+        let mut source_ids = BTreeSet::new();
+        for candidate in candidates {
             let (edge_sources, graph_trace) =
-                self.extracted_from_source_ids(context_id, digest_id)?;
+                self.extracted_from_source_ids(candidate.context_id, candidate.digest_id)?;
+            source_ids.extend(edge_sources.iter().copied());
+            candidate_graphs.push((candidate, edge_sources, graph_trace));
+        }
+        let source_details = self.digest_source_details(&source_ids)?;
+        let mut hits = Vec::new();
+        for (candidate, edge_sources, graph_trace) in candidate_graphs {
+            let digest_id = candidate.digest_id;
+            let context_id = candidate.context_id;
             let mut hit = DigestSearchHit {
                 digest_id,
                 context_id,
@@ -294,9 +320,9 @@ impl Store {
                     .get(&context_id)
                     .cloned()
                     .unwrap_or_else(|| format!("context-{context_id}")),
-                created_at,
-                similarity,
-                summary,
+                created_at: candidate.created_at,
+                similarity: candidate.similarity,
+                summary: candidate.summary,
                 intention_ids: Vec::new(),
                 intention_texts: Vec::new(),
                 decision_ids: Vec::new(),
@@ -316,31 +342,31 @@ impl Store {
             let mut saw_decision_source = false;
             let mut included_decision_source = false;
             for source_id in edge_sources {
-                if let Some((id, text)) = self.intention_text(source_id)? {
-                    hit.intention_ids.push(id);
-                    hit.intention_texts.push(text);
-                    included_source_ids.push(source_id);
-                    continue;
-                }
-                if let Some((id, status, text)) = self.decision_text(source_id)? {
-                    saw_decision_source = true;
-                    if filter.include_inactive || status == DecisionStatus::Active {
-                        hit.decision_ids.push(id);
-                        hit.decision_statuses.push(status);
-                        hit.decision_texts.push(text);
+                match source_details.get(&source_id) {
+                    Some(DigestSourceDetail::Intention { id, text }) => {
+                        hit.intention_ids.push(*id);
+                        hit.intention_texts.push(text.clone());
                         included_source_ids.push(source_id);
-                        included_decision_source = true;
                     }
-                    continue;
-                }
-                if let Some((id, text)) = self.observation_text(source_id)? {
-                    hit.observation_ids.push(id);
-                    hit.observation_texts.push(text);
-                    included_source_ids.push(source_id);
-                    continue;
-                }
-                if self.entity_name(source_id)?.is_some() {
-                    included_source_ids.push(source_id);
+                    Some(DigestSourceDetail::Decision { id, status, text }) => {
+                        saw_decision_source = true;
+                        if filter.include_inactive || *status == DecisionStatus::Active {
+                            hit.decision_ids.push(*id);
+                            hit.decision_statuses.push(*status);
+                            hit.decision_texts.push(text.clone());
+                            included_source_ids.push(source_id);
+                            included_decision_source = true;
+                        }
+                    }
+                    Some(DigestSourceDetail::Observation { id, text }) => {
+                        hit.observation_ids.push(*id);
+                        hit.observation_texts.push(text.clone());
+                        included_source_ids.push(source_id);
+                    }
+                    Some(DigestSourceDetail::Entity) => {
+                        included_source_ids.push(source_id);
+                    }
+                    None => {}
                 }
             }
             if !filter.include_inactive && saw_decision_source && !included_decision_source {
@@ -358,12 +384,38 @@ impl Store {
             hit.graph_walk.source_ids = included_source_ids;
             hits.push(hit);
         }
-        if let Some(limit) = filter.limit {
-            hits.truncate(limit);
-        }
-        self.set_trace(format!("digests.vector_text {vector_trace}"));
+        self.set_trace(format!(
+            "digests.vector_text limit={candidate_limit} {vector_trace}"
+        ));
         Ok(hits)
     }
+}
+
+#[derive(Debug, Clone)]
+struct DigestCandidate {
+    digest_id: DigestId,
+    context_id: ContextId,
+    created_at: TxId,
+    similarity: f32,
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+enum DigestSourceDetail {
+    Intention {
+        id: IntentionId,
+        text: String,
+    },
+    Decision {
+        id: DecisionId,
+        status: DecisionStatus,
+        text: String,
+    },
+    Observation {
+        id: ObservationId,
+        text: String,
+    },
+    Entity,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -460,93 +512,164 @@ impl Store {
         Ok((graph_ids, graph_trace))
     }
 
-    fn intention_text(&self, id: uuid::Uuid) -> Result<Option<(IntentionId, String)>> {
-        let result = self
-            .db
-            .execute(
-                "SELECT id, description FROM intentions WHERE id = $id",
-                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
-            )
-            .map_err(map_engine_err)?;
-        Ok(result.rows.first().and_then(|row| {
-            Some((
-                IntentionId::from(value_uuid(row, &result.columns, "id").ok()?),
-                value_text(row, &result.columns, "description").ok()?,
-            ))
-        }))
-    }
-
-    fn decision_text(
+    fn digest_source_details(
         &self,
-        id: uuid::Uuid,
-    ) -> Result<Option<(DecisionId, DecisionStatus, String)>> {
-        let result = self
+        source_ids: &BTreeSet<uuid::Uuid>,
+    ) -> Result<HashMap<uuid::Uuid, DigestSourceDetail>> {
+        if source_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::new();
+
+        let mut params = HashMap::new();
+        let id_list = uuid_param_list("source", source_ids.iter().copied(), &mut params);
+        let intentions = self
             .db
             .execute(
-                "SELECT id, description, status FROM decisions WHERE id = $id",
-                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+                &format!("SELECT id, description FROM intentions WHERE id IN ({id_list})"),
+                &params,
             )
             .map_err(map_engine_err)?;
-        Ok(result.rows.first().and_then(|row| {
-            let status = match value_text(row, &result.columns, "status").ok()?.as_str() {
-                "Active" | "active" => DecisionStatus::Active,
-                "Superseded" | "superseded" => DecisionStatus::Superseded,
-                "Archived" | "archived" => DecisionStatus::Archived,
-                "Invalidated" | "invalidated" => DecisionStatus::Invalidated,
-                _ => return None,
-            };
-            Some((
-                DecisionId::from(value_uuid(row, &result.columns, "id").ok()?),
-                status,
-                value_text(row, &result.columns, "description").ok()?,
-            ))
-        }))
+        for row in &intentions.rows {
+            let raw_id = value_uuid(row, &intentions.columns, "id")?;
+            out.insert(
+                raw_id,
+                DigestSourceDetail::Intention {
+                    id: IntentionId::from(raw_id),
+                    text: value_text(row, &intentions.columns, "description")?,
+                },
+            );
+        }
+
+        let mut params = HashMap::new();
+        let id_list = uuid_param_list("source", source_ids.iter().copied(), &mut params);
+        let decisions = self
+            .db
+            .execute(
+                &format!("SELECT id, description, status FROM decisions WHERE id IN ({id_list})"),
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        for row in &decisions.rows {
+            let raw_id = value_uuid(row, &decisions.columns, "id")?;
+            let status = decision_status_from_text(&value_text(row, &decisions.columns, "status")?)
+                .ok_or_else(|| {
+                    CgError::Engine("decision source returned invalid status".to_string())
+                })?;
+            out.insert(
+                raw_id,
+                DigestSourceDetail::Decision {
+                    id: DecisionId::from(raw_id),
+                    status,
+                    text: value_text(row, &decisions.columns, "description")?,
+                },
+            );
+        }
+
+        let mut params = HashMap::new();
+        let id_list = uuid_param_list("source", source_ids.iter().copied(), &mut params);
+        let observations = self
+            .db
+            .execute(
+                &format!(
+                    "SELECT id, observation_type, state_delta, entity_id FROM observations WHERE id IN ({id_list})"
+                ),
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut observation_rows = Vec::new();
+        let mut entity_ids = source_ids.clone();
+        for row in &observations.rows {
+            let raw_id = value_uuid(row, &observations.columns, "id")?;
+            let entity_id = value_uuid(row, &observations.columns, "entity_id")?;
+            entity_ids.insert(entity_id);
+            observation_rows.push((
+                raw_id,
+                value_text(row, &observations.columns, "observation_type")?,
+                get_json(row, &observations.columns, "state_delta")?,
+                entity_id,
+            ));
+        }
+        let entity_names = self.entity_names_for_ids(&entity_ids)?;
+        for (raw_id, observation_type, state_delta_json, entity_id) in observation_rows {
+            let entity_name = entity_names
+                .get(&entity_id)
+                .cloned()
+                .unwrap_or_else(|| "entity".to_string());
+            let state_delta = state_delta_from_json(state_delta_json)?;
+            let text = state_delta
+                .get("path")
+                .and_then(|value| value.as_ref())
+                .and_then(|value| value.as_str())
+                .map(|path| format!("{entity_name} observed at {path}"))
+                .unwrap_or(observation_type);
+            out.insert(
+                raw_id,
+                DigestSourceDetail::Observation {
+                    id: ObservationId::from(raw_id),
+                    text,
+                },
+            );
+        }
+
+        for source_id in source_ids {
+            if !out.contains_key(source_id) && entity_names.contains_key(source_id) {
+                out.insert(*source_id, DigestSourceDetail::Entity);
+            }
+        }
+        Ok(out)
     }
 
-    fn observation_text(&self, id: uuid::Uuid) -> Result<Option<(ObservationId, String)>> {
+    fn entity_names_for_ids(
+        &self,
+        ids: &BTreeSet<uuid::Uuid>,
+    ) -> Result<HashMap<uuid::Uuid, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut params = HashMap::new();
+        let id_list = uuid_param_list("entity", ids.iter().copied(), &mut params);
         let result = self
             .db
             .execute(
-                "SELECT id, observation_type, state_delta, entity_id FROM observations WHERE id = $id",
-                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
+                &format!("SELECT id, name FROM entities WHERE id IN ({id_list})"),
+                &params,
             )
             .map_err(map_engine_err)?;
-        result
-            .rows
-            .first()
-            .map(|row| {
-                let id = ObservationId::from(value_uuid(row, &result.columns, "id")?);
-                let observation_type = value_text(row, &result.columns, "observation_type")?;
-                let entity_id = value_uuid(row, &result.columns, "entity_id")?;
-                let entity_name = self
-                    .entity_name(entity_id)?
-                    .unwrap_or_else(|| "entity".to_string());
-                let state_delta =
-                    state_delta_from_json(get_json(row, &result.columns, "state_delta")?)?;
-                let text = state_delta
-                    .get("path")
-                    .and_then(|value| value.as_ref())
-                    .and_then(|value| value.as_str())
-                    .map(|path| format!("{entity_name} observed at {path}"))
-                    .unwrap_or(observation_type);
-                Ok((id, text))
-            })
-            .transpose()
+        let mut out = HashMap::new();
+        for row in &result.rows {
+            out.insert(
+                value_uuid(row, &result.columns, "id")?,
+                value_text(row, &result.columns, "name")?,
+            );
+        }
+        Ok(out)
     }
+}
 
-    fn entity_name(&self, id: uuid::Uuid) -> Result<Option<String>> {
-        let result = self
-            .db
-            .execute(
-                "SELECT name FROM entities WHERE id = $id",
-                &HashMap::from([("id".to_string(), Value::Uuid(id))]),
-            )
-            .map_err(map_engine_err)?;
-        result
-            .rows
-            .first()
-            .map(|row| value_text(row, &result.columns, "name"))
-            .transpose()
+fn uuid_param_list(
+    prefix: &str,
+    ids: impl IntoIterator<Item = uuid::Uuid>,
+    params: &mut HashMap<String, Value>,
+) -> String {
+    ids.into_iter()
+        .enumerate()
+        .map(|(idx, id)| {
+            let key = format!("{prefix}_{idx}");
+            params.insert(key.clone(), Value::Uuid(id));
+            format!("${key}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn decision_status_from_text(status: &str) -> Option<DecisionStatus> {
+    match status {
+        "Active" | "active" => Some(DecisionStatus::Active),
+        "Superseded" | "superseded" => Some(DecisionStatus::Superseded),
+        "Archived" | "archived" => Some(DecisionStatus::Archived),
+        "Invalidated" | "invalidated" => Some(DecisionStatus::Invalidated),
+        _ => None,
     }
 }
 

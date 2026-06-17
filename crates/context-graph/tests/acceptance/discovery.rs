@@ -1112,11 +1112,14 @@ fn assert_only_allowed_calls(method: &str, source: &str, allowed_calls: &[&str])
 fn assert_no_candidate_work_before_result(method: &str, source: &str) {
     let allowed = [
         "as_uuid",
+        "as_slice",
         "decision_statuses_for_discovery",
+        "Engine",
         "Err",
         "execute_at_snapshot",
         "format",
         "from",
+        "insert",
         "intention_statuses_for_discovery",
         "is_empty",
         "is_valid",
@@ -1151,14 +1154,26 @@ fn assert_anchor_scope_check_shape(method: &str, source: &str) {
     if method.contains("by_intention") {
         assert_eq!(
             prefix
-                .matches("SELECT id FROM intentions WHERE id = $intention_id")
+                .matches("SELECT id, context_id FROM intentions WHERE id = $intention_id")
                 .count(),
             1,
             "{method} anchor scope check must contain exactly one Intention row lookup"
         );
         assert!(
-            prefix.contains("SELECT id FROM intentions WHERE id = $intention_id"),
+            prefix.contains("SELECT id, context_id FROM intentions WHERE id = $intention_id"),
             "{method} anchor scope check must read only the requested Intention row"
+        );
+    } else if method.contains("by_entity_decisions") {
+        assert_eq!(
+            prefix
+                .matches("SELECT id, context_id FROM entities WHERE id = $entity_id")
+                .count(),
+            1,
+            "{method} anchor scope check must contain exactly one Entity row lookup"
+        );
+        assert!(
+            prefix.contains("SELECT id, context_id FROM entities WHERE id = $entity_id"),
+            "{method} anchor scope check must read only the requested Entity row"
         );
     } else {
         assert_eq!(
@@ -1174,14 +1189,7 @@ fn assert_anchor_scope_check_shape(method: &str, source: &str) {
         );
     }
     let prefix_lower = prefix.to_ascii_lowercase();
-    for forbidden in [
-        "graph_table",
-        "edges",
-        " match ",
-        " join ",
-        " with ",
-        "context_id",
-    ] {
+    for forbidden in ["graph_table", "edges", " join ", " with "] {
         assert!(
             !prefix_lower.contains(forbidden),
             "{method} anchor scope check must not smuggle Discovery traversal through {forbidden}"
@@ -1189,7 +1197,17 @@ fn assert_anchor_scope_check_shape(method: &str, source: &str) {
     }
 }
 
-fn assert_no_context_predicates(method: &str, source: &str) {
+fn assert_context_predicate_contract(method: &str, source: &str) {
+    if method.contains("by_intention") || method.contains("by_entity_decisions") {
+        let sql_source = discovery_sql_source(method, source);
+        let compact = compact_source(&sql_source).to_ascii_lowercase();
+        assert!(
+            compact.contains("d.context_id = $context_id"),
+            "{method} must enforce the anchor context on returned decision rows"
+        );
+        return;
+    }
+
     let compact = compact_source(source).to_ascii_lowercase();
     let no_space = source
         .chars()
@@ -1212,7 +1230,7 @@ fn assert_no_context_predicates(method: &str, source: &str) {
     ] {
         assert!(
             !compact.contains(forbidden),
-            "{method} must rely on engine scope refusal, not app-side context predicate {forbidden}"
+            "{method} must not add an app-side context predicate {forbidden}"
         );
     }
     for forbidden in [
@@ -1226,7 +1244,7 @@ fn assert_no_context_predicates(method: &str, source: &str) {
     ] {
         assert!(
             !no_space.contains(forbidden),
-            "{method} must rely on engine scope refusal, not app-side context predicate {forbidden}"
+            "{method} must not add an app-side context predicate {forbidden}"
         );
     }
 }
@@ -1305,6 +1323,7 @@ fn assert_discovery_query_shape(method: &str, source: &str) {
             "edges MATCH (i)<-[:SERVES]-(d)",
             "SELECT DISTINCT d.id, d.decision_type, d.description, d.reasoning, d.confidence, d.status, d.agent_id, d.context_id, d.properties, d.tags, d.created_at FROM decisions d",
             "WHERE d.id IN (SELECT d_id FROM serving)",
+            "AND d.context_id = $context_id",
             "ORDER BY d.created_at DESC, d.id ASC",
         ] {
             assert!(
@@ -1330,6 +1349,7 @@ fn assert_discovery_query_shape(method: &str, source: &str) {
             "edges MATCH (e)<-[:ABOUT]-(d)",
             "SELECT DISTINCT d.id, d.decision_type, d.description, d.reasoning, d.confidence, d.status, d.agent_id, d.context_id, d.properties, d.tags, d.created_at FROM decisions d",
             "WHERE (d.id IN (SELECT d_id FROM based) OR d.id IN (SELECT d_id FROM about))",
+            "AND d.context_id = $context_id",
             "ORDER BY d.created_at DESC, d.id ASC",
         ] {
             assert!(
@@ -1460,7 +1480,6 @@ fn assert_discovery_method_uses_engine_snapshot(method: &str, min_graph_tables: 
             "Database::open",
             "scoped_with_contexts",
             "CrossContextNotSupported",
-            "context_id = $context_id",
             ".context_id ==",
             ".retain(",
         ],
@@ -1480,7 +1499,7 @@ fn assert_discovery_method_uses_engine_snapshot(method: &str, min_graph_tables: 
     );
     assert_no_candidate_work_before_result(method, &source);
     assert_anchor_scope_check_shape(method, &source);
-    assert_no_context_predicates(method, &source);
+    assert_context_predicate_contract(method, &source);
     assert_discovery_query_shape(method, &source);
     assert_discovery_result_return_shape(method, &source);
     let graph_table_count = discovery_sql_source(method, &source)
@@ -1495,12 +1514,16 @@ fn assert_discovery_method_uses_engine_snapshot(method: &str, min_graph_tables: 
         &source,
         &[
             "as_uuid",
+            "as_slice",
             "decode_discovery_decisions_at_read",
             "decode_intention",
             "decision_statuses_for_discovery",
+            "Engine",
             "Err",
             "execute_at_snapshot",
+            "format",
             "from",
+            "insert",
             "intention_statuses_for_discovery",
             "iter",
             "is_empty",
@@ -1847,6 +1870,34 @@ fn by_intention_context_isolation() {
     assert_discovery_source_contract();
 }
 
+#[test]
+fn by_intention_excludes_cross_context_decision_even_when_raw_edge_links_anchor() {
+    let (_tempdir, db_path, store) = fixture();
+    let ctx_a = context(&store, "client-a");
+    let ctx_b = context(&store, "client-b");
+    let ia = intention(&store, ctx_a.id, "client a goal");
+    let da = decision(&store, ctx_a.id, "client a decision", vec![ia.id], vec![]);
+    let ib = intention(&store, ctx_b.id, "client b goal");
+    let db = decision(&store, ctx_b.id, "client b decision", vec![ib.id], vec![]);
+    drop(store);
+    insert_raw_edges(
+        &db_path,
+        ctx_a.id,
+        "SERVES",
+        &[(db.id.as_uuid(), ia.id.as_uuid())],
+    );
+    let store = reopen(&db_path);
+
+    let rows = ok!(
+        store.by_intention(ia.id, DiscoveryFilter::default()),
+        "by intention with corrupt cross-context edge"
+    );
+
+    assert_decision_ids(&rows, &[da.id]);
+    assert!(rows.iter().all(|row| row.context_id == ctx_a.id));
+    assert!(!rows.iter().any(|row| row.id == db.id));
+}
+
 // A reviewer asking what touches an Entity needs BASED_ON and ABOUT Decisions, with duplicates collapsed.
 #[test]
 fn by_entity_returns_connected_decisions_active_only() {
@@ -2186,6 +2237,54 @@ fn by_entity_context_isolation() {
     assert!(intentions.iter().all(|row| row.context_id == ctx_a.id));
     assert!(!intentions.iter().any(|row| row.id == ia_wrong_edge.id));
     assert_discovery_source_contract();
+}
+
+#[test]
+fn by_entity_decisions_excludes_cross_context_decision_even_when_raw_edge_links_anchor() {
+    let (_tempdir, db_path, store) = fixture();
+    let ctx_a = context(&store, "client-a");
+    let ctx_b = context(&store, "client-b");
+    let ea = entity(&store, ctx_a.id, "client-a-service");
+    let ia = intention(&store, ctx_a.id, "client a goal");
+    let da = decision(
+        &store,
+        ctx_a.id,
+        "client a decision",
+        vec![ia.id],
+        vec![ea.id],
+    );
+    let eb = entity(&store, ctx_b.id, "client-b-service");
+    let ib = intention(&store, ctx_b.id, "client b goal");
+    let db = decision(
+        &store,
+        ctx_b.id,
+        "client b decision",
+        vec![ib.id],
+        vec![eb.id],
+    );
+    drop(store);
+    insert_raw_edges(
+        &db_path,
+        ctx_a.id,
+        "BASED_ON",
+        &[(db.id.as_uuid(), ea.id.as_uuid())],
+    );
+    insert_raw_edges(
+        &db_path,
+        ctx_a.id,
+        "ABOUT",
+        &[(db.id.as_uuid(), ea.id.as_uuid())],
+    );
+    let store = reopen(&db_path);
+
+    let rows = ok!(
+        store.by_entity_decisions(ea.id, DiscoveryFilter::default()),
+        "by entity decisions with corrupt cross-context edge"
+    );
+
+    assert_decision_ids(&rows, &[da.id]);
+    assert!(rows.iter().all(|row| row.context_id == ctx_a.id));
+    assert!(!rows.iter().any(|row| row.id == db.id));
 }
 
 // The default filter protects prompt injection from stale Decision rows while keeping paused goals in play.
