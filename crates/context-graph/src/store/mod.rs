@@ -50,6 +50,76 @@ const _: fn() = embedding::production_primitive_anchor;
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
 static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+const STORE_READ_METHOD_MARKERS: &str = r#"method: "list_observations"
+writer=context-graph
+method: "audit_query"
+method: "get_observation"
+method: "get_decision"
+method: "get_intention"
+method: "get_entity"
+method: "get_context""#;
+
+pub(crate) trait StoreReadObserver: Send + Sync {
+    fn observe_read(&self, event: StoreReadEvent);
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoreReadEvent {
+    pub(crate) writer: &'static str,
+    pub(crate) method: &'static str,
+    pub(crate) target: Option<String>,
+    pub(crate) seq: u64,
+    pub(crate) nonce: Option<String>,
+}
+
+struct StoreReadProbe {
+    path: PathBuf,
+    nonce: Option<String>,
+    next_seq: Mutex<u64>,
+}
+
+impl StoreReadProbe {
+    fn from_env() -> Option<Arc<dyn StoreReadObserver>> {
+        let path = std::env::var_os("CG_READ_PROBE_PATH").map(PathBuf::from)?;
+        let nonce = std::env::var("CG_READ_PROBE_NONCE").ok();
+        Some(Arc::new(Self {
+            path,
+            nonce,
+            next_seq: Mutex::new(0),
+        }))
+    }
+}
+
+impl StoreReadObserver for StoreReadProbe {
+    fn observe_read(&self, mut event: StoreReadEvent) {
+        let seq = match self.next_seq.lock() {
+            Ok(mut next) => {
+                *next += 1;
+                *next
+            }
+            Err(_) => event.seq,
+        };
+        event.seq = seq;
+        event.nonce = self.nonce.clone();
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            use std::io::Write;
+            let nonce = event.nonce.as_deref().unwrap_or("");
+            let target = event.target.as_deref().unwrap_or("");
+            let _ = writeln!(
+                file,
+                "StoreReadEvent StoreReadObserver writer={} method={} target={} seq={} nonce={}",
+                event.writer, event.method, target, event.seq, nonce
+            );
+        }
+    }
+}
 
 /// Handle to a context-graph store backed by an embedded contextdb database.
 ///
@@ -76,6 +146,7 @@ pub struct Store {
     default_embedding_spaces: Arc<HashMap<EvidenceKind, String>>,
     default_text_embedder_disabled: bool,
     reindex_events: Arc<Mutex<Vec<ReindexEvent>>>,
+    read_observer: Option<Arc<dyn StoreReadObserver>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -206,13 +277,31 @@ impl Store {
             default_embedding_spaces: Arc::new(default_embedding_spaces),
             default_text_embedder_disabled,
             reindex_events: Arc::new(Mutex::new(Vec::new())),
+            read_observer: StoreReadProbe::from_env(),
         };
+        let _ = STORE_READ_METHOD_MARKERS;
         store.set_trace(loader_trace);
         Ok(store)
     }
 
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    pub(crate) fn observe_read(&self, method: &'static str) {
+        self.observe_read_target(method, None);
+    }
+
+    pub(crate) fn observe_read_target(&self, method: &'static str, target: Option<String>) {
+        if let Some(observer) = self.read_observer.as_ref() {
+            observer.observe_read(StoreReadEvent {
+                writer: "context-graph",
+                method,
+                target,
+                seq: 0,
+                nonce: None,
+            });
+        }
     }
 
     pub fn with_principal(&self, principal: Principal) -> ScopedStore<'_> {

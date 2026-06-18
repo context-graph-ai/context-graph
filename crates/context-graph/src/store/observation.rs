@@ -281,6 +281,9 @@ impl Store {
     }
 
     pub fn get_observation(&self, id: ObservationId) -> Result<Observation> {
+        if self.read_observer.is_some() {
+            self.observe_read_target("get_observation", Some(id.to_string()));
+        }
         if !id.is_valid() {
             return Err(CgError::InvalidIdentity {
                 context: "ObservationId",
@@ -308,6 +311,7 @@ impl Store {
     }
 
     pub fn list_observations(&self, context_id: Option<ContextId>) -> Result<Vec<Observation>> {
+        self.observe_read("list_observations");
         let (sql, params) = if let Some(context_id) = context_id {
             (
                 "SELECT id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at FROM observations WHERE context_id = $context_id",

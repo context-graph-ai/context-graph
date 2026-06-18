@@ -15,6 +15,7 @@ use super::encode::{get_json, get_optional_text, get_text, get_txid, get_uuid};
 
 impl Store {
     pub fn audit_query(&self, filter: AuditFilter) -> Result<Vec<AuditEntry>> {
+        self.observe_read("audit_query");
         let mut clauses: Vec<String> = Vec::new();
         let mut params: HashMap<String, Value> = HashMap::new();
         if let Some(ctx) = filter.context_id {
