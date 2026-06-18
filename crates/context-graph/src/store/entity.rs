@@ -126,6 +126,7 @@ impl Store {
     }
 
     pub fn get_entity(&self, id: EntityId) -> Result<Option<Entity>> {
+        self.observe_read("get_entity");
         if !id.is_valid() {
             return Err(CgError::InvalidIdentity {
                 context: "EntityId",

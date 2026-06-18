@@ -119,6 +119,7 @@ impl Store {
     }
 
     pub fn get_intention(&self, id: IntentionId) -> Result<Option<Intention>> {
+        self.observe_read("get_intention");
         if !id.is_valid() {
             return Err(CgError::InvalidIdentity {
                 context: "IntentionId",

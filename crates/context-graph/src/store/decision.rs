@@ -248,6 +248,7 @@ impl Store {
     }
 
     pub fn get_decision(&self, id: DecisionId) -> Result<Option<Decision>> {
+        self.observe_read("get_decision");
         if !id.is_valid() {
             return Err(CgError::InvalidIdentity {
                 context: "DecisionId",

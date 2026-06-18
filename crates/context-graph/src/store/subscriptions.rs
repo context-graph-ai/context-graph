@@ -313,6 +313,7 @@ impl CallbackStoreParts {
         let default_embedding_spaces = Arc::clone(&store.default_embedding_spaces);
         let default_text_embedder_disabled = store.default_text_embedder_disabled;
         let reindex_events = Arc::clone(&store.reindex_events);
+        let read_observer = store.read_observer.clone();
         let build = Arc::new(move |db| Store {
             db_path: db_path.clone(),
             db,
@@ -326,6 +327,7 @@ impl CallbackStoreParts {
             default_embedding_spaces: Arc::clone(&default_embedding_spaces),
             default_text_embedder_disabled,
             reindex_events: Arc::clone(&reindex_events),
+            read_observer: read_observer.clone(),
         });
         Self {
             db: Arc::downgrade(&store.db),

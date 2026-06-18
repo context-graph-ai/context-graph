@@ -99,6 +99,7 @@ impl Store {
     }
 
     pub fn get_context(&self, id: ContextId) -> Result<Option<Context>> {
+        self.observe_read("get_context");
         if !id.is_valid() {
             return Err(CgError::InvalidIdentity {
                 context: "ContextId",
