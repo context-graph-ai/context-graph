@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use crate::{ContextId, Result};
+use crate::{ContextId, ProviderUsage, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeploymentSurface {
@@ -94,6 +94,7 @@ pub struct ModelReply {
     pub phrasing: String,
     pub advisory_flag: bool,
     pub malformed: bool,
+    pub usage: Option<ProviderUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,7 @@ pub struct UnderstandingOutcome {
     pub resolved_connection: Option<String>,
     pub cache_path_consulted: Option<PathBuf>,
     pub stored_understanding: Option<String>,
+    pub usage: Option<ProviderUsage>,
 }
 
 pub trait LlmClient: Send + Sync {

@@ -142,6 +142,7 @@ impl LlmClient for RecordingClient {
             phrasing: format!("phrased:{}", invocation.request.input),
             advisory_flag: false,
             malformed: false,
+            usage: None,
         })
     }
 }
@@ -281,6 +282,7 @@ fn completed(
         resolved_connection: None,
         cache_path_consulted: None,
         stored_understanding: Some(input.to_string()),
+        usage: None,
     })
 }
 
@@ -936,6 +938,7 @@ fn connected_model_returning_error_or_malformed_response_degrades_without_fabric
         phrasing: "{not-valid-understanding".to_string(),
         advisory_flag: false,
         malformed: true,
+        usage: None,
     }));
     let (mut runtime, context_id) = connected_hosted_runtime(true, client.clone());
     let outcome = completed(
@@ -1083,6 +1086,7 @@ fn model_understanding_never_gates_whether_an_invalidation_flag_fires() {
         phrasing: "model-says-ignore: adversarial phrasing landed".to_string(),
         advisory_flag: false,
         malformed: false,
+        usage: None,
     }));
     let (fire_with_model, fire_outcome) = record_engine_case(
         "basis-change-with-model",
@@ -1095,6 +1099,7 @@ fn model_understanding_never_gates_whether_an_invalidation_flag_fires() {
         phrasing: "model-says-invalidate: adversarial phrasing landed".to_string(),
         advisory_flag: true,
         malformed: false,
+        usage: None,
     }));
     let (silent_with_model, silent_outcome) = record_engine_case(
         "non-basis-with-model",
@@ -1136,6 +1141,7 @@ fn model_understanding_never_gates_whether_an_invalidation_flag_fires() {
         phrasing: "model-says-invalidate: opposite verdict phrasing landed".to_string(),
         advisory_flag: true,
         malformed: false,
+        usage: None,
     }));
     let (fire_with_opposite_model, fire_opposite_outcome) = record_engine_case(
         "basis-change-with-opposite-model",
@@ -1147,6 +1153,7 @@ fn model_understanding_never_gates_whether_an_invalidation_flag_fires() {
         phrasing: "model-says-ignore: opposite verdict phrasing landed".to_string(),
         advisory_flag: false,
         malformed: false,
+        usage: None,
     }));
     let (silent_with_opposite_model, silent_opposite_outcome) = record_engine_case(
         "non-basis-with-opposite-model",
@@ -1343,6 +1350,7 @@ fn consent_chokepoint_and_determinism_boundary_hold_in_release_profile() {
         phrasing: "release model says ignore; deterministic flag must still fire".to_string(),
         advisory_flag: false,
         malformed: false,
+        usage: None,
     }));
     let (release_fire_with_model, release_outcome) = record_engine_case(
         "release-basis-change-with-adversarial-model",
@@ -1372,6 +1380,7 @@ fn consent_chokepoint_and_determinism_boundary_hold_in_release_profile() {
         phrasing: "release phrasing".to_string(),
         advisory_flag: true,
         malformed: false,
+        usage: None,
     }));
     let (mut runtime, context_id) = connected_hosted_runtime(false, client.clone());
     let outcome = completed(

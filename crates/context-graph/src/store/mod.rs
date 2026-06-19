@@ -369,6 +369,10 @@ impl Store {
         &self.db
     }
 
+    pub fn sync_database(&self) -> Arc<Database> {
+        Arc::clone(&self.db)
+    }
+
     pub fn register_embedding_space(&self, decl: EmbeddingSpaceDecl) -> Result<()> {
         validate_runtime_embedding_space_declaration(&decl)?;
         ensure_runtime_vector_columns(&self.db, &decl)?;

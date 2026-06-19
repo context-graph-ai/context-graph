@@ -1,24 +1,40 @@
 mod support;
 
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use context_graph::{
     ContextId, CreateDecision, CreateIntention, DecisionId, DecisionStatus, DiscoveryFilter,
     EntityId, IntentionId, IntentionOrigin, IntentionStatus, Store, StoreConfig,
+    context_graph_sync_table_contract, schema::TABLES,
 };
 use contextdb_core::Value as DbValue;
 use contextdb_engine::Database;
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
+use contextdb_server::{SyncClient, SyncServer};
 use serde_json::Value;
 use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider, cg_bin};
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::sync::OwnedSemaphorePermit;
 
 const AUTH_INITIAL: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py.";
 const AUTH_WITH_JWT: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py. Use JWT with 15-min access tokens.";
 const AUTH_RENAME: &str = "Following Tuesday, the auth module file moved from src/auth.py to src/authentication.py. Keep password-less login served by the auth module at src/authentication.py.";
 const AUTH_CURRENT_WITH_JWT: &str = "Acme password-less login is now served by the auth module at src/authentication.py. Use JWT with 15-min access tokens.";
 const CI_PIPELINE_SESSION: &str = "The delivery team needs a CI pipeline. Run CI on every pull request, block merges when CI fails, and include unit tests, clippy, and release build in .github/workflows/ci.yml.";
-const PROJECT_X_RECORD: &str = "Project X memory must stay local, so use the local context store.";
 const CLIENT_A_SOX_SESSION: &str = "Client A must keep SOX deploy approvals. The publish pipeline is deploy.yml; require SOX approval before promote.";
 const CLIENT_B_PUBLISH_SESSION: &str = "Client B must avoid the duplicate-publish race. The publish pipeline is deploy.yml; hold 10 min before promote.";
+
+static CLI_NATS_TEST_LOCK: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 fn combined(output: &CommandOutput) -> String {
     format!("{}\n{}", output.stdout, output.stderr)
@@ -103,8 +119,113 @@ fn run_in_dir(harness: &CliHarness, cwd: &std::path::Path, args: &[&str]) -> Com
     }
 }
 
+fn run_in_dir_with_stdin(
+    harness: &CliHarness,
+    cwd: &std::path::Path,
+    args: &[&str],
+    stdin: &str,
+) -> CommandOutput {
+    let mut child = Command::new(cg_bin())
+        .args(args)
+        .current_dir(cwd)
+        .env("CG_DATA_ROOT", harness.data_root.path())
+        .env("CG_USE_TEST_LEXICAL_EMBEDDER", "1")
+        .env("HOME", harness.data_root.path())
+        .env("PATH", harness.providers.path_env())
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run cg");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait for cg");
+    CommandOutput {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
 fn output_json(output: &CommandOutput) -> Option<Value> {
     serde_json::from_str(&output.stdout).ok()
+}
+
+fn spawn_one_shot_chat_completion_server(
+    assistant_content: Value,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hosted provider fixture");
+    let address = listener.local_addr().expect("hosted provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept hosted provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+        let mut first_line = String::new();
+        reader
+            .read_line(&mut first_line)
+            .expect("read provider request line");
+        let mut request = first_line;
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line).expect("read provider header");
+            if bytes == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().unwrap_or(0);
+            }
+            request.push_str(&line);
+        }
+        if content_length > 0 {
+            let mut request_body = vec![0; content_length];
+            reader
+                .read_exact(&mut request_body)
+                .expect("read provider request body");
+            request.push_str(&String::from_utf8_lossy(&request_body));
+        }
+        tx.send(request).expect("send provider request");
+        let body = serde_json::json!({
+            "id": "chatcmpl-cli-hosted-usage",
+            "object": "chat.completion",
+            "created": 1766019000,
+            "model": "local-vllm/test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": assistant_content.to_string(),
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write provider response");
+    });
+    (format!("http://{address}/v1"), rx)
 }
 
 fn stable_id(output: &CommandOutput, keys: &[&str]) -> Option<String> {
@@ -122,6 +243,261 @@ fn json_string_at<'a>(json: &'a Value, paths: &[&str]) -> Option<&'a str> {
     paths
         .iter()
         .find_map(|path| json.pointer(path).and_then(Value::as_str))
+}
+
+fn json_u64_at(json: &Value, paths: &[&str]) -> Option<u64> {
+    paths
+        .iter()
+        .find_map(|path| json.pointer(path).and_then(Value::as_u64))
+}
+
+fn json_bool_at(json: &Value, paths: &[&str]) -> Option<bool> {
+    paths
+        .iter()
+        .find_map(|path| json.pointer(path).and_then(Value::as_bool))
+}
+
+fn json_array_len_at(json: &Value, paths: &[&str]) -> Option<u64> {
+    paths.iter().find_map(|path| {
+        json.pointer(path)
+            .and_then(Value::as_array)
+            .map(|items| items.len() as u64)
+    })
+}
+
+fn completion_records_since(harness: &CliHarness, start: usize) -> Vec<Value> {
+    let records = harness.providers.completion_records();
+    assert!(
+        records.len() >= start,
+        "provider completion log shrank: start={start}, records={records:?}"
+    );
+    records[start..].to_vec()
+}
+
+fn provider_usage(record: &Value) -> (u64, u64, u64) {
+    let usage = record
+        .get("usage")
+        .and_then(Value::as_object)
+        .expect("fake provider completion log must include exact provider usage");
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .expect("provider usage input tokens");
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .expect("provider usage output tokens");
+    let total = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .expect("provider usage total tokens");
+    assert_eq!(
+        total,
+        input + output,
+        "fake provider usage fixture is invalid"
+    );
+    (input, output, total)
+}
+
+fn assert_cli_capture_usage_receipt(output: &CommandOutput, provider_records: &[Value]) {
+    assert!(
+        !provider_records.is_empty(),
+        "record fixture must drive the shipped provider path"
+    );
+    let json = output_json(output).expect("record output json");
+    let calls = json
+        .pointer("/usage/calls")
+        .and_then(Value::as_array)
+        .expect("record receipt must expose per-model-call usage from the shipped provider path");
+    assert_eq!(
+        calls.len(),
+        provider_records.len(),
+        "receipt must account for every provider call made by this record command"
+    );
+    let mut summed_total = 0;
+    for (call, provider_record) in calls.iter().zip(provider_records) {
+        let (expected_prompt, expected_completion, expected_total) =
+            provider_usage(provider_record);
+        let prompt_tokens = call
+            .pointer("/prompt_tokens")
+            .or_else(|| call.pointer("/input_tokens"))
+            .and_then(Value::as_u64)
+            .expect("provider call usage must include input/prompt tokens");
+        let completion_tokens = call
+            .pointer("/completion_tokens")
+            .or_else(|| call.pointer("/output_tokens"))
+            .and_then(Value::as_u64)
+            .expect("provider call usage must include output/completion tokens");
+        let total_tokens = call
+            .pointer("/total_tokens")
+            .and_then(Value::as_u64)
+            .expect("provider call usage must include total tokens");
+        assert_eq!(
+            (prompt_tokens, completion_tokens, total_tokens),
+            (expected_prompt, expected_completion, expected_total),
+            "record receipt must preserve the exact usage block returned by the fake provider"
+        );
+        assert_eq!(
+            total_tokens,
+            prompt_tokens + completion_tokens,
+            "per-call total must come from the provider usage block, not a fixture constant"
+        );
+        summed_total += total_tokens;
+    }
+    assert_eq!(
+        json.pointer("/usage/total_tokens").and_then(Value::as_u64),
+        Some(summed_total),
+        "record receipt must sum provider usage across calls"
+    );
+    assert!(
+        json.pointer("/usage/elapsed_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            > 0,
+        "record receipt must expose elapsed wall-clock time"
+    );
+}
+
+fn expected_cli_import_chunks(segments: &[String], max_chars: usize) -> u64 {
+    let mut buffer = String::new();
+    let mut chunks = 0;
+    for segment in segments {
+        append_expected_import_segment(&mut buffer, segment, max_chars, &mut chunks);
+    }
+    flush_expected_import_chunk(&mut buffer, &mut chunks);
+    chunks
+}
+
+fn append_expected_import_segment(
+    buffer: &mut String,
+    segment: &str,
+    max_chars: usize,
+    chunks: &mut u64,
+) {
+    let mut rest = segment;
+    while !rest.is_empty() {
+        if buffer.len() >= max_chars {
+            flush_expected_import_chunk(buffer, chunks);
+            continue;
+        }
+        let remaining = max_chars - buffer.len();
+        if rest.len() <= remaining {
+            buffer.push_str(rest);
+            break;
+        }
+        let split = expected_import_chunk_boundary(rest, remaining);
+        if split == 0 {
+            flush_expected_import_chunk(buffer, chunks);
+            continue;
+        }
+        buffer.push_str(&rest[..split]);
+        flush_expected_import_chunk(buffer, chunks);
+        rest = &rest[split..];
+    }
+}
+
+fn flush_expected_import_chunk(buffer: &mut String, chunks: &mut u64) {
+    if !buffer.trim().is_empty() {
+        *chunks += 1;
+    }
+    buffer.clear();
+}
+
+fn expected_import_chunk_boundary(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    let mut last_boundary = 0;
+    let mut last_whitespace = None;
+    for (index, ch) in text.char_indices() {
+        let end = index + ch.len_utf8();
+        if end > max_bytes {
+            break;
+        }
+        last_boundary = end;
+        if ch.is_whitespace() {
+            last_whitespace = Some(end);
+        }
+    }
+    if let Some(whitespace) = last_whitespace.filter(|index| *index >= max_bytes / 2) {
+        return whitespace;
+    }
+    if last_boundary > 0 {
+        return last_boundary;
+    }
+    text.char_indices()
+        .nth(1)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn assert_cli_import_estimate_makes_no_provider_calls(harness: &CliHarness, cwd: &std::path::Path) {
+    let session_path = cwd.join("session.jsonl");
+    let chunk_window = 64;
+    let user_text = "Goal G_est: estimate import. Entity E_est: estimator path=src/estimate.rs. Decision D_est: estimate before spending serves G_est based_on E_est.";
+    let assistant_text = "Observation O_est: E_est moved -> src/estimate_v2.rs";
+    let parsed_segments = vec![
+        format!("User: {user_text}\n"),
+        format!("Assistant: {assistant_text}\n"),
+    ];
+    let expected_chunks = expected_cli_import_chunks(&parsed_segments, chunk_window);
+    assert!(
+        expected_chunks > 1,
+        "estimate fixture must force real chunking"
+    );
+    std::fs::write(
+        &session_path,
+        [
+            format!(r#"{{"message":{{"role":"user","content":"{user_text}"}}}}"#),
+            format!(r#"{{"message":{{"role":"assistant","content":"{assistant_text}"}}}}"#),
+        ]
+        .join("\n"),
+    )
+    .expect("write estimate fixture");
+    let before = harness.providers.completion_count();
+    let estimate = run_in_dir(
+        harness,
+        cwd,
+        &[
+            "import",
+            session_path.to_str().expect("utf8 session path"),
+            "--tenant-id",
+            "owner-tenant",
+            "--estimate",
+            "--chunk-tokens",
+            &chunk_window.to_string(),
+        ],
+    );
+    assert_eq!(estimate.code, 0, "{}", combined(&estimate));
+    assert_eq!(
+        harness.providers.completion_count(),
+        before,
+        "`cg import --estimate` must not call the provider"
+    );
+    let json = output_json(&estimate).expect("estimate output json");
+    assert!(
+        json.pointer("/estimate/chunks").and_then(Value::as_u64) == Some(expected_chunks),
+        "estimate must report real chunk count"
+    );
+    assert_eq!(
+        json.pointer("/estimate/resolved_chunk_window")
+            .and_then(Value::as_u64),
+        Some(chunk_window as u64),
+        "estimate must use the explicit chunk window that determines the expected chunk count"
+    );
+    assert_eq!(
+        json.pointer("/estimate/provider_calls")
+            .and_then(Value::as_u64),
+        Some(0),
+        "estimate must explicitly report zero provider calls"
+    );
+    assert!(
+        json.pointer("/estimate/elapsed_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            > 0,
+        "estimate must project elapsed wall-clock time"
+    );
 }
 
 fn store_path_from(outputs: &[&CommandOutput]) -> Option<std::path::PathBuf> {
@@ -180,6 +556,201 @@ fn memory_counts(output: &CommandOutput) -> Option<(u64, u64, u64)> {
         count_after_label(&text, "decisions:")?,
         count_after_label(&text, "observations:")?,
     ))
+}
+
+struct CliNatsFixture {
+    _lock: OwnedSemaphorePermit,
+    _container: ContainerAsync<GenericImage>,
+    nats_url: String,
+}
+
+async fn start_cli_nats_or_environment_error() -> CliNatsFixture {
+    let lock = CLI_NATS_TEST_LOCK
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("NATS fixture lock should not close");
+    let conf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../context-graph/tests/common/nats.conf")
+        .to_string_lossy()
+        .into_owned();
+    let image = GenericImage::new("nats", "latest")
+        .with_exposed_port(4222.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
+    let request = image
+        .with_mount(Mount::bind_mount(conf, "/etc/nats/nats.conf"))
+        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
+    let container = request
+        .start()
+        .await
+        .expect("environment ERROR: Docker/NATS substrate is required for this CLI sync test");
+    let nats_port = container
+        .get_host_port_ipv4(4222.tcp())
+        .await
+        .expect("NATS port should be mapped");
+    CliNatsFixture {
+        _lock: lock,
+        _container: container,
+        nats_url: format!("nats://127.0.0.1:{nats_port}"),
+    }
+}
+
+struct CliSyncFixture {
+    _nats: CliNatsFixture,
+    _hub_dir: tempfile::TempDir,
+    hub_db: Arc<Database>,
+    shutdown: Arc<AtomicBool>,
+    server_task: tokio::task::JoinHandle<()>,
+    nats_url: String,
+    tenant_id: String,
+}
+
+impl Drop for CliSyncFixture {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.server_task.abort();
+    }
+}
+
+async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
+    let nats = start_cli_nats_or_environment_error().await;
+    let hub_dir = tempfile::tempdir().expect("hub tempdir");
+    let tenant_id = format!("tenant-{}", label.replace('_', "-"));
+    let hub_db = Arc::new(
+        Database::open(hub_dir.path().join("hub.db")).expect("open CLI sync hub database"),
+    );
+    let server = Arc::new(SyncServer::new(
+        Arc::clone(&hub_db),
+        &nats.nats_url,
+        &tenant_id,
+        cli_conflict_policies_from_contract(),
+    ));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_task = {
+        let server = Arc::clone(&server);
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move { server.run_until(shutdown).await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let nats_url = nats.nats_url.clone();
+    CliSyncFixture {
+        _nats: nats,
+        _hub_dir: hub_dir,
+        hub_db,
+        shutdown,
+        server_task,
+        nats_url,
+        tenant_id,
+    }
+}
+
+fn cli_expected_pending_push_change_count(store: &Store, nats_url: &str, tenant_id: &str) -> usize {
+    let client = SyncClient::new(store.sync_database(), nats_url, tenant_id);
+    let directions = cli_sync_directions_from_contract();
+    let changes = client
+        .db()
+        .changes_since(client.push_watermark())
+        .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
+    changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len()
+}
+
+fn cli_sync_directions_from_contract() -> HashMap<String, SyncDirection> {
+    let contract = context_graph_sync_table_contract();
+    assert_eq!(
+        contract.len(),
+        TABLES.len(),
+        "CLI sync tests must use the full production cg table policy contract"
+    );
+    let mut directions = HashMap::new();
+    for policy in contract {
+        assert!(
+            directions
+                .insert(policy.table.to_string(), policy.direction)
+                .is_none(),
+            "duplicate sync policy for {}",
+            policy.table
+        );
+    }
+    for table in TABLES {
+        assert!(
+            directions.contains_key(table.name),
+            "production sync table policy missing {}",
+            table.name
+        );
+    }
+    assert_eq!(
+        directions.get("audit_log"),
+        Some(&SyncDirection::None),
+        "audit_log is operational/local-only and must not sync through the shipped CLI path"
+    );
+    directions
+}
+
+fn cli_conflict_policies_from_contract() -> ConflictPolicies {
+    let contract = context_graph_sync_table_contract();
+    assert_eq!(
+        contract.len(),
+        TABLES.len(),
+        "CLI sync hub must use the full production cg table conflict-policy contract"
+    );
+    let mut per_table = HashMap::new();
+    for policy in contract {
+        assert!(
+            per_table
+                .insert(policy.table.to_string(), policy.conflict_policy)
+                .is_none(),
+            "duplicate sync conflict policy for {}",
+            policy.table
+        );
+    }
+    for table in TABLES {
+        assert!(
+            per_table.contains_key(table.name),
+            "production sync conflict policy missing {}",
+            table.name
+        );
+    }
+    assert_eq!(
+        per_table.get("audit_log"),
+        Some(&ConflictPolicy::InsertIfNotExists),
+        "audit_log must be registered in the production conflict-policy contract even though its direction is local-only"
+    );
+    ConflictPolicies {
+        per_table,
+        default: ConflictPolicy::LatestWins,
+    }
+}
+
+fn db_table_row_count(db: &Database, table: &str) -> usize {
+    db.scan(table, db.snapshot())
+        .unwrap_or_else(|err| panic!("scan {table}: {err}"))
+        .len()
+}
+
+fn force_write_once_schema_conflict(path: &std::path::Path) {
+    let store = persisted_store(Some(path.to_path_buf())).expect("open second CLI store");
+    let db = store.sync_database();
+    db.execute(
+        "UPDATE cg_schema_version SET version = $version WHERE id = $id",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Int64(1)),
+            ("version".to_string(), DbValue::Int64(999)),
+        ]),
+    )
+    .expect("create local write-once conflict fixture");
+    let versions = db
+        .scan("cg_schema_version", db.snapshot())
+        .expect("scan schema version")
+        .into_iter()
+        .filter_map(|row| match row.values.get("version") {
+            Some(DbValue::Int64(version)) => Some(*version),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        versions.contains(&999),
+        "fixture must create a local write-once schema conflict; versions={versions:?}"
+    );
 }
 
 fn count_after_label(text: &str, label: &str) -> Option<u64> {
@@ -944,24 +1515,420 @@ fn cli_query_and_impact_emit_stable_ids_consumed_by_walk_verbs() {
 }
 
 #[test]
-fn record_lands_in_working_location_context_by_default() {
+fn hosted_record_usage_receipt_flows_through_connected_extractor() {
+    let harness = CliHarness::new();
+    let cwd = tempfile::tempdir().expect("hosted record cwd");
+    let transcript = "Goal G_hosted: show hosted usage. Entity E_hosted: receipt file path=receipt.rs. Decision D_hosted: hosted usage flows through connected extractor serves G_hosted based_on E_hosted.";
+    let (endpoint, provider_requests) = spawn_one_shot_chat_completion_server(
+        serde_json::json!({
+            "summary": "hosted usage receipt",
+            "goals": [{
+                "key": "G_hosted",
+                "text": "show hosted usage"
+            }],
+            "entities": [{
+                "key": "E_hosted",
+                "name": "receipt file",
+                "path": "receipt.rs",
+                "entity_type": "file"
+            }],
+            "decisions": [{
+                "key": "D_hosted",
+                "text": "hosted usage flows through connected extractor",
+                "goal_key": "G_hosted",
+                "entity_key": "E_hosted",
+                "relation": null
+            }],
+            "observations": []
+        }),
+        3217,
+        233,
+    );
+    let connect = harness.run(&[
+        "model",
+        "connect",
+        "local-vllm",
+        "--endpoint",
+        &endpoint,
+        "--model",
+        "test-model",
+        "--no-auth",
+        "--consent",
+    ]);
+    assert_eq!(connect.code, 0, "{}", combined(&connect));
+
+    let record = run_in_dir_with_stdin(&harness, cwd.path(), &["record"], transcript);
+    let request = provider_requests
+        .recv_timeout(Duration::from_secs(5))
+        .expect("record must call the configured hosted provider through ConnectedModelExtractor");
+    assert!(
+        request.contains("hosted usage flows through connected extractor"),
+        "provider request must be the production record prompt, not a test-only usage helper: {request}"
+    );
+    assert_eq!(record.code, 0, "{}", combined(&record));
+    let json = output_json(&record).expect("record output json");
+    assert_eq!(
+        json.pointer("/captured/decisions").and_then(Value::as_u64),
+        Some(1),
+        "the hosted provider reply must still drive normal capture"
+    );
+    let calls = json
+        .pointer("/usage/calls")
+        .and_then(Value::as_array)
+        .expect(
+            "record receipt must expose usage from the shipped hosted ConnectedModelExtractor path",
+        );
+    assert_eq!(
+        calls.len(),
+        1,
+        "single-chunk record must report exactly the hosted model call it made"
+    );
+    let call = &calls[0];
+    assert_eq!(
+        (
+            call.pointer("/prompt_tokens").and_then(Value::as_u64),
+            call.pointer("/completion_tokens").and_then(Value::as_u64),
+            call.pointer("/total_tokens").and_then(Value::as_u64),
+            json.pointer("/usage/total_tokens").and_then(Value::as_u64),
+        ),
+        (Some(3217), Some(233), Some(3450), Some(3450)),
+        "the receipt must preserve the provider usage block carried by UnderstandingRuntime through ConnectedModelExtractor"
+    );
+}
+
+#[test]
+fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
     let harness = extraction_harness();
+    let second_machine = extraction_harness();
     let dir_x = tempfile::tempdir().expect("dir x");
     let dir_y = tempfile::tempdir().expect("dir y");
-    run_in_dir(&harness, dir_x.path(), &["record", PROJECT_X_RECORD]);
-    let x_status = run_in_dir(&harness, dir_x.path(), &["status"]);
-    let y_status = run_in_dir(&harness, dir_y.path(), &["status"]);
-    run_in_dir(
+    let dir_z = tempfile::tempdir().expect("dir z");
+    assert_cli_import_estimate_makes_no_provider_calls(&harness, dir_x.path());
+    harness.providers.set_behavior(
+        Provider::Claude,
+        CompletionBehavior::SleepThenExtractHarvest,
+    );
+    let progress = harness.run_with_stdin_observing_provider_before_exit(
+        &["record", "--tenant-id", "progress-tenant"],
+        "Goal G_progress: report shipped CLI progress. Entity E_progress: progress file path=progress.rs. Decision D_progress: CLI capture progress is visible serves G_progress based_on E_progress.",
+        "capture progress: chunk 1/",
+        Provider::Claude,
+    );
+    assert_eq!(progress.output.code, 0, "{}", combined(&progress.output));
+    assert!(
+        progress.observed_before_exit,
+        "record/import progress must be observable before the shipped cg command exits; output={}",
+        combined(&progress.output)
+    );
+    assert!(
+        progress.observed_while_provider_running,
+        "record/import progress must be emitted while the provider call is still running, not reconstructed after capture; output={}",
+        combined(&progress.output)
+    );
+    assert!(
+        combined(&progress.output).contains("CLI capture progress is visible"),
+        "the progress-observed capture must still persist the memory it was recording"
+    );
+    harness
+        .providers
+        .set_behavior(Provider::Claude, CompletionBehavior::ExtractHarvest);
+    let completions_before_first = harness.providers.completion_records().len();
+    let first = run_in_dir_with_stdin(
         &harness,
         dir_x.path(),
-        &["record", "--context", "named-client", "override"],
+        &["record", "--tenant-id", "owner-tenant"],
+        "Goal G1: converge by tenant. Entity E1: auth module path=src/auth.py. Decision D1: tenant memory lands together serves G1 based_on E1.",
     );
-    let named = harness.run(&["status", "--context", "named-client"]);
+    let first_provider_records = completion_records_since(&harness, completions_before_first);
+    let completions_before_second = harness.providers.completion_records().len();
+    let second = run_in_dir_with_stdin(
+        &harness,
+        dir_y.path(),
+        &["record", "--tenant-id", "owner-tenant"],
+        "Goal G2: converge by tenant again. Entity E2: config file path=config/app.toml. Decision D2: second tenant capture lands together serves G2 based_on E2.",
+    );
+    let second_provider_records = completion_records_since(&harness, completions_before_second);
+    let owner_status_x = run_in_dir(
+        &harness,
+        dir_x.path(),
+        &["status", "--tenant-id", "owner-tenant"],
+    );
+    let owner_status_y = run_in_dir(
+        &harness,
+        dir_y.path(),
+        &["status", "--tenant-id", "owner-tenant"],
+    );
+    let other_tenant = run_in_dir_with_stdin(
+        &harness,
+        dir_x.path(),
+        &["record", "--tenant-id", "other-owner-tenant"],
+        "Goal G3: isolate other tenant. Entity E3: billing file path=billing.toml. Decision D3: other tenant stays separate serves G3 based_on E3.",
+    );
+    let explicit = run_in_dir_with_stdin(
+        &harness,
+        dir_x.path(),
+        &[
+            "record",
+            "--tenant-id",
+            "owner-tenant",
+            "--context",
+            "named-client",
+        ],
+        "Goal G4: explicit context. Entity E4: override file path=override.toml. Decision D4: explicit context stays isolated serves G4 based_on E4.",
+    );
+    let completions_before_second_machine = second_machine.providers.completion_records().len();
+    let same_tenant_second_machine = run_in_dir_with_stdin(
+        &second_machine,
+        dir_z.path(),
+        &["record", "--tenant-id", "owner-tenant"],
+        "Goal G7: converge from another machine. Entity E7: other machine path=machine.rs. Decision D7: tenant CLI memory from a second machine lands in the same context serves G7 based_on E7.",
+    );
+    let second_machine_provider_records =
+        completion_records_since(&second_machine, completions_before_second_machine);
 
-    assert!(combined(&x_status).contains("context:"));
-    assert!(combined(&x_status).contains("goals: 1"));
-    assert!(combined(&y_status).contains("goals: 0"));
-    assert!(combined(&named).contains("context: named-client"));
+    for output in [
+        &first,
+        &second,
+        &other_tenant,
+        &explicit,
+        &same_tenant_second_machine,
+    ] {
+        assert_eq!(output.code, 0, "{}", combined(output));
+    }
+    assert_cli_capture_usage_receipt(&first, &first_provider_records);
+    assert_cli_capture_usage_receipt(&second, &second_provider_records);
+    assert_cli_capture_usage_receipt(
+        &same_tenant_second_machine,
+        &second_machine_provider_records,
+    );
+
+    let first_context = context_id_from(&[&first]).expect("first record context id");
+    let second_context = context_id_from(&[&second]).expect("second record context id");
+    let other_context = context_id_from(&[&other_tenant]).expect("other tenant context id");
+    let explicit_context = context_id_from(&[&explicit]).expect("explicit context id");
+    let second_machine_context =
+        context_id_from(&[&same_tenant_second_machine]).expect("second machine context id");
+
+    assert_eq!(
+        first_context, second_context,
+        "same tenant must resolve to the same context across working directories"
+    );
+    assert_eq!(
+        first_context, second_machine_context,
+        "same tenant must resolve to the same context across independent CLI data roots"
+    );
+    for output in [&owner_status_x, &owner_status_y] {
+        assert_eq!(output.code, 0, "{}", combined(output));
+    }
+    assert_eq!(context_id_from(&[&owner_status_x]), Some(first_context));
+    assert_eq!(context_id_from(&[&owner_status_y]), Some(first_context));
+    let owner_counts = memory_counts(&owner_status_x).expect("owner status counts");
+    assert_eq!(
+        (owner_counts.0, owner_counts.1),
+        (2, 2),
+        "tenant status must see both captures from both working directories"
+    );
+    assert_ne!(first_context, other_context);
+    assert_ne!(first_context, explicit_context);
+
+    let context_names = persisted_context_names(store_path_from(&[&first]).as_deref());
+    assert!(
+        context_names.iter().any(|name| name == "owner-tenant"),
+        "tenant id itself must be the persisted default context name; contexts={context_names:?}"
+    );
+    assert!(
+        !context_names
+            .iter()
+            .any(|name| name.starts_with("context:")),
+        "default context must not be the working-directory hash; contexts={context_names:?}"
+    );
+    let second_machine_context_names =
+        persisted_context_names(store_path_from(&[&same_tenant_second_machine]).as_deref());
+    assert!(
+        second_machine_context_names
+            .iter()
+            .any(|name| name == "owner-tenant"),
+        "second machine must persist the tenant id itself as the default context name; contexts={second_machine_context_names:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending() {
+    let offline_harness = extraction_harness();
+    let offline_record = offline_harness.run_with_stdin(
+        &[
+            "record",
+            "--remote-server",
+            "nats://127.0.0.1:1",
+            "--tenant-id",
+            "offline-cli-tenant",
+        ],
+        "Goal G0: offline sync must not block capture. Entity E0: offline file path=offline.rs. Decision D0: offline CLI capture survives serves G0 based_on E0.",
+    );
+    assert_record_contains(&offline_record, "offline CLI capture survives");
+    let offline_query = offline_harness.run(&[
+        "query",
+        "--tenant-id",
+        "offline-cli-tenant",
+        "offline capture survives",
+    ]);
+    assert_eq!(offline_query.code, 0, "{}", combined(&offline_query));
+    let offline_query_text = combined(&offline_query);
+    assert!(
+        offline_query_text.contains("offline CLI capture survives")
+            && offline_query_text.contains("offline.rs"),
+        "remote-configured capture must persist locally when the hub is unreachable: {offline_query_text}"
+    );
+
+    let fixture =
+        cli_sync_fixture("sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending")
+            .await;
+    let harness = extraction_harness();
+    let record = harness.run_with_stdin(
+        &[
+            "record",
+            "--remote-server",
+            fixture.nats_url.as_str(),
+            "--tenant-id",
+            fixture.tenant_id.as_str(),
+        ],
+        "Goal G1: sync from the CLI. Entity E1: laptop path=src/sync.rs. Decision D1: operator sync commands carry memory serves G1 based_on E1.",
+    );
+    assert_eq!(record.code, 0, "{}", combined(&record));
+    let store_path = store_path_from(&[&record]).expect("record output should include store path");
+    let expected_pending = {
+        let store = persisted_store(Some(store_path.clone())).expect("open CLI store after record");
+        let local_audit_rows = db_table_row_count(store.sync_database().as_ref(), "audit_log");
+        assert!(
+            local_audit_rows > 0,
+            "fixture must produce local audit rows so the CLI sync path proves audit_log stays local"
+        );
+        let count = cli_expected_pending_push_change_count(
+            &store,
+            fixture.nats_url.as_str(),
+            fixture.tenant_id.as_str(),
+        ) as u64;
+        assert!(
+            count > 1,
+            "fixture must create a real non-boolean pending count"
+        );
+        count
+    };
+
+    let pending_status = harness.run(&[
+        "sync",
+        "status",
+        "--remote-server",
+        fixture.nats_url.as_str(),
+        "--tenant-id",
+        fixture.tenant_id.as_str(),
+    ]);
+    assert_eq!(pending_status.code, 0, "{}", combined(&pending_status));
+    let pending_json = output_json(&pending_status).expect("pending sync status JSON");
+    assert_eq!(
+        json_string_at(&pending_json, &["/sync/remote_url", "/remote_url"]),
+        Some(fixture.nats_url.as_str())
+    );
+    assert_eq!(
+        json_string_at(&pending_json, &["/sync/tenant_id", "/tenant_id"]),
+        Some(fixture.tenant_id.as_str())
+    );
+    let pending_count = json_u64_at(
+        &pending_json,
+        &["/sync/pending_push_count", "/pending_push_count"],
+    )
+    .expect("pending push count");
+    assert_eq!(
+        pending_count, expected_pending,
+        "pending status must report the exact live pending count, not a boolean sentinel: {pending_json}"
+    );
+    assert_eq!(
+        json_bool_at(
+            &pending_json,
+            &["/sync/sync_client_constructed", "/sync_client_constructed"]
+        ),
+        Some(true)
+    );
+
+    let push = harness.run(&[
+        "sync",
+        "push",
+        "--remote-server",
+        fixture.nats_url.as_str(),
+        "--tenant-id",
+        fixture.tenant_id.as_str(),
+    ]);
+    assert_eq!(push.code, 0, "{}", combined(&push));
+    assert_eq!(
+        db_table_row_count(fixture.hub_db.as_ref(), "audit_log"),
+        0,
+        "shipped CLI sync push must register the production table contract and keep audit_log out of the hub"
+    );
+    let expected_drained = {
+        let store = persisted_store(Some(store_path)).expect("open CLI store after push");
+        cli_expected_pending_push_change_count(
+            &store,
+            fixture.nats_url.as_str(),
+            fixture.tenant_id.as_str(),
+        ) as u64
+    };
+    let pushed_status = harness.run(&[
+        "sync",
+        "status",
+        "--remote-server",
+        fixture.nats_url.as_str(),
+        "--tenant-id",
+        fixture.tenant_id.as_str(),
+    ]);
+    assert_eq!(pushed_status.code, 0, "{}", combined(&pushed_status));
+    let pushed_json = output_json(&pushed_status).expect("pushed sync status JSON");
+    assert!(
+        json_u64_at(&pushed_json, &["/sync/push_watermark", "/push_watermark"]).unwrap_or(0) > 0,
+        "push watermark must advance after CLI push: {pushed_json}"
+    );
+    assert_eq!(
+        json_u64_at(
+            &pushed_json,
+            &["/sync/pending_push_count", "/pending_push_count"]
+        ),
+        Some(expected_drained)
+    );
+    assert_eq!(expected_drained, 0);
+
+    let second_edge = CliHarness::new();
+    let second_edge_store_path = second_edge.data_root.path().join("context-graph.db");
+    force_write_once_schema_conflict(&second_edge_store_path);
+    let pull = second_edge.run(&[
+        "sync",
+        "pull",
+        "--remote-server",
+        fixture.nats_url.as_str(),
+        "--tenant-id",
+        fixture.tenant_id.as_str(),
+    ]);
+    assert_eq!(pull.code, 0, "{}", combined(&pull));
+    let pull_json = output_json(&pull).expect("pull sync JSON");
+    assert_eq!(
+        json_array_len_at(
+            &pull_json,
+            &["/sync/apply_result/conflicts", "/apply_result/conflicts"]
+        ),
+        Some(0),
+        "cg sync pull must report the real ApplyResult from the production per-table policy contract; a default ServerWins pull records a conflict for the write-once schema row: {pull_json}"
+    );
+    let pulled_query = second_edge.run(&[
+        "query",
+        "--tenant-id",
+        fixture.tenant_id.as_str(),
+        "operator sync commands",
+    ]);
+    assert_eq!(pulled_query.code, 0, "{}", combined(&pulled_query));
+    let pulled_text = combined(&pulled_query);
+    assert!(
+        pulled_text.contains("operator sync commands carry memory")
+            && pulled_text.contains("src/sync.rs"),
+        "cg sync pull must materialize pushed memory on a second CLI edge, not just return success: {pulled_text}"
+    );
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use cg_catalog::{
@@ -60,6 +61,7 @@ impl LlmClient for RecordingClient {
             phrasing: format!("phrased:{}", invocation.request.input),
             advisory_flag: false,
             malformed: false,
+            usage: None,
         })
     }
 }
@@ -74,6 +76,7 @@ fn degraded(input: &str, failure_bucket: FailureBucket) -> UnderstandingOutcome 
         resolved_connection: None,
         cache_path_consulted: None,
         stored_understanding: Some(input.to_string()),
+        usage: None,
     }
 }
 
@@ -100,6 +103,22 @@ fn locked_package_names(lockfile: &str) -> Vec<String> {
         }
     }
     names
+}
+
+fn default_build_tree(package: &str) -> String {
+    let output = Command::new("cargo")
+        .args(["tree", "-p", package, "--edges", "normal,build"])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run cargo tree for default build dependency audit");
+    assert!(
+        output.status.success(),
+        "cargo tree for {package} default build failed: status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("cargo tree output utf8")
 }
 
 #[test]
@@ -242,10 +261,13 @@ fn workspace_default_build_remains_tokio_free_and_sdk_free() {
     let lockfile = std::fs::read_to_string(workspace_root().join("Cargo.lock"))
         .expect("workspace lockfile readable");
     let names = locked_package_names(&lockfile);
-    assert!(
-        !names.iter().any(|name| name == "tokio"),
-        "default workspace lockfile must remain tokio-free"
-    );
+    for package in ["context-graph", "cg-catalog"] {
+        let tree = default_build_tree(package);
+        assert!(
+            !tree.lines().any(|line| line.contains("tokio v")),
+            "{package} default-build dependency tree must remain tokio-free:\n{tree}"
+        );
+    }
     let sdk_names = names
         .iter()
         .filter(|name| {

@@ -1,8 +1,17 @@
+mod capture_cost_estimate;
+mod capture_cost_visibility;
+mod capture_progress;
+#[path = "../common/capture_sync_common.rs"]
+mod capture_sync_common;
 mod cg_main_dep_audit;
+mod context_default_is_tenant;
 mod context_isolation;
+mod cross_machine_invalidation;
 mod crud;
 mod digest_capture;
 mod discovery;
+mod edge_sync_convergence;
+mod edge_sync_offline_and_merge;
 mod evidence;
 #[path = "../common/fake_extractor.rs"]
 mod fake_extractor;
@@ -30,4 +39,6 @@ mod screenshot_memory_distinguishability;
 #[cfg(context_graph_internal_test_support)]
 mod screenshot_memory_review;
 mod subscriptions;
+mod sync_status_reporting;
 mod temporal;
+mod usage_is_non_basis;

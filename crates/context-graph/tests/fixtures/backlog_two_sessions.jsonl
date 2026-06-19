@@ -1,0 +1,4 @@
+{"type":"user","message":{"role":"user","content":"Goal G1: resume work across machines. Entity E_auth_module: auth module file path=src/auth.py. Decision D1: auth module at src/auth.py serves G1 based_on E_auth_module."}}
+{"type":"assistant","message":{"role":"assistant","content":"Captured the decision and basis for session one."}}
+{"type":"user","message":{"role":"user","content":"Observation O1: auth module file observed at src/authentication.py"}}
+{"type":"assistant","message":{"role":"assistant","content":"Session two states only the new value; it does not restate the old src/auth.py value."}}
