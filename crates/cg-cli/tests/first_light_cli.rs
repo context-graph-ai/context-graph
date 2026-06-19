@@ -648,7 +648,11 @@ fn cli_expected_pending_push_change_count(store: &Store, nats_url: &str, tenant_
     let client = SyncClient::new(store.sync_database(), nats_url, tenant_id);
     let directions = cli_sync_directions_from_contract();
     let raw_changes = client.db().changes_since(client.push_watermark());
-    let changes = cli_expected_push_changes_without_trigger_ddl(&raw_changes, &directions);
+    let mut changes = cli_expected_push_changes_without_trigger_ddl(&raw_changes, &directions);
+    let schema_changes = store
+        .sync_schema_database()
+        .changes_since(client.push_watermark());
+    restore_expected_non_trigger_schema_ddl(&mut changes, &schema_changes);
     changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len()
 }
 
