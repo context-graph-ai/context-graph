@@ -6,7 +6,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
-use context_graph::ingest::CaptureRequest;
+use context_graph::ingest::{
+    CaptureRequest, ConversationExtractor, ExtractionRequest, StructuredHarvest,
+};
 use context_graph::schema::{DIGEST_VECTOR_DIMENSION, TABLES};
 use context_graph::{
     CapturePricing, ContextGraphSyncTablePolicy, ContextId, CreateContext, CreateDecision,
@@ -16,6 +18,7 @@ use context_graph::{
     IntentionOrigin, IntentionPatch, IntentionStatus, ModelCallUsage, ObservationId, Outcome,
     PrecomputedEmbedding, ProgressKind, ProviderUsage, RecordObservation, Store, StoreConfig,
     SyncStatusBoundary, TxId, UsageReportState, context_graph_sync_table_contract,
+    provider_usage_from_str,
 };
 use contextdb_core::{Lsn, Value as DbValue};
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
@@ -304,6 +307,64 @@ pub fn capture_request(context_label: &str, transcript: &str) -> CaptureRequest 
 
 pub fn extractor() -> LabeledTranscriptExtractor {
     LabeledTranscriptExtractor
+}
+
+pub struct ProviderBackedExtractor<'a> {
+    inner: LabeledTranscriptExtractor,
+    provider: &'a dyn HostedProviderBoundary,
+    calls: Mutex<Vec<ModelCallUsage>>,
+}
+
+impl<'a> ProviderBackedExtractor<'a> {
+    pub fn new(provider: &'a dyn HostedProviderBoundary) -> Self {
+        Self {
+            inner: LabeledTranscriptExtractor,
+            provider,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record_usage(&self, reply: HostedProviderReply) {
+        let usage = match provider_usage_from_str(&reply.body) {
+            Some(usage)
+                if usage.prompt_tokens == 0
+                    && usage.completion_tokens == 0
+                    && usage.total_tokens == 0 =>
+            {
+                UsageReportState::Zero
+            }
+            Some(usage) => UsageReportState::Tokens(usage),
+            None => UsageReportState::Unavailable,
+        };
+        let mut calls = self.calls.lock().expect("usage calls lock");
+        let chunk_index = calls.len() + 1;
+        calls.push(ModelCallUsage {
+            chunk_index,
+            usage,
+            elapsed: reply.elapsed,
+        });
+    }
+}
+
+impl ConversationExtractor for ProviderBackedExtractor<'_> {
+    fn extract(&self, request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        let reply = self.provider.call_model(request.transcript)?;
+        self.record_usage(reply);
+        self.inner.extract(request)
+    }
+
+    fn drain_model_usage(&self) -> Vec<ModelCallUsage> {
+        self.calls
+            .lock()
+            .map(|mut calls| std::mem::take(&mut *calls))
+            .unwrap_or_default()
+    }
+}
+
+pub fn provider_backed_extractor(
+    provider: &dyn HostedProviderBoundary,
+) -> ProviderBackedExtractor<'_> {
+    ProviderBackedExtractor::new(provider)
 }
 
 pub struct SeededGraph {
@@ -988,7 +1049,7 @@ pub async fn bidirectional_sync(edge1: &SyncClient, edge2: &SyncClient) {
     drain_pull(edge2).await;
 }
 
-async fn drain_push(client: &SyncClient) {
+pub async fn drain_push(client: &SyncClient) {
     for _ in 0..32 {
         if !client
             .has_pending_push_changes()
@@ -1012,7 +1073,7 @@ async fn drain_push(client: &SyncClient) {
     panic!("push did not drain pending changes");
 }
 
-async fn drain_pull(client: &SyncClient) {
+pub async fn drain_pull(client: &SyncClient) {
     for _ in 0..32 {
         let before = client.pull_watermark();
         client

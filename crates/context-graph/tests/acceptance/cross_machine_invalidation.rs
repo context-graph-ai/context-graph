@@ -6,7 +6,8 @@ use context_graph::{DecisionStatus, Invalidation, ObservationId, Store};
 
 use crate::capture_sync_common::{
     SeededGraph, assert_real_observation_content, assert_sync_contract_has_real_table_policies,
-    capture_request, extractor, push_pull, real_sync_fixture, seed_decision_graph,
+    capture_request, drain_pull, drain_push, extractor, push_pull, real_sync_fixture,
+    seed_decision_graph,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -49,16 +50,8 @@ async fn basis_change_captured_on_converged_edge_two_invalidates_edge_one_decisi
         "edge2 before push",
     );
     let trigger_id = edge2_invalidation.trigger_observation_id;
-    fixture
-        .edge2_client
-        .push()
-        .await
-        .expect("edge2 push trigger");
-    fixture
-        .edge1_client
-        .pull(&crate::capture_sync_common::cg_conflict_policies())
-        .await
-        .expect("edge1 pulls invalidation");
+    drain_push(&fixture.edge2_client).await;
+    drain_pull(&fixture.edge1_client).await;
 
     assert_basis_invalidation(
         &fixture.edge1.store,
