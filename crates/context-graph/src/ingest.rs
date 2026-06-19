@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value as JsonValue, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::capture_sync_status::ModelCallUsage;
 use crate::embedding_space::BuiltinSpaceRegistry;
 use crate::{
     AgentId, AuditId, BasisDiffResult, CgError, ContextId, CreateContext, CreateDecision,
@@ -96,6 +97,7 @@ pub struct CaptureReport {
     pub import_chunks: Option<usize>,
     pub resolved_chunk_window: Option<usize>,
     pub model_context_tokens: Option<usize>,
+    pub model_usage: Vec<ModelCallUsage>,
 }
 
 impl CaptureReport {
@@ -117,6 +119,7 @@ impl CaptureReport {
             import_chunks: None,
             resolved_chunk_window: None,
             model_context_tokens: None,
+            model_usage: Vec::new(),
         }
     }
 }
@@ -292,6 +295,10 @@ pub trait ConversationExtractor {
         _request: DecisionRelationRequest<'_>,
     ) -> Result<Option<DecisionRelationSeed>> {
         Ok(None)
+    }
+
+    fn drain_model_usage(&self) -> Vec<ModelCallUsage> {
+        Vec::new()
     }
 }
 
@@ -488,7 +495,10 @@ fn record_conversation_internal(
         &prior_decisions,
         extractor,
     )?;
-    capture_structured_harvest(store, context.id, &request.context_label, text, harvest)
+    let mut report =
+        capture_structured_harvest(store, context.id, &request.context_label, text, harvest)?;
+    report.model_usage = extractor.drain_model_usage();
+    Ok(report)
 }
 
 pub fn import_conversation_text_with_extractor(
@@ -807,6 +817,10 @@ impl ConversationExtractor for OneShotRollingExtractor<'_> {
     ) -> Result<Option<DecisionRelationSeed>> {
         self.relation_classifier.classify_decision_relation(request)
     }
+
+    fn drain_model_usage(&self) -> Vec<ModelCallUsage> {
+        self.relation_classifier.drain_model_usage()
+    }
 }
 
 fn stream_text_chunks<F>(text: &str, chunk_window: usize, mut on_chunk: F) -> Result<usize>
@@ -1016,6 +1030,7 @@ fn capture_raw(
         import_chunks: None,
         resolved_chunk_window: None,
         model_context_tokens: None,
+        model_usage: Vec::new(),
     })
 }
 
@@ -1977,7 +1992,7 @@ impl<'a> CaptureTxn<'a> {
         entity_type: EntityType,
     ) -> Result<EntityWrite> {
         if let Some(entity) =
-            find_existing_entity_for_seed(self.store, context_id, name, entity_type)?
+            find_existing_entity_for_seed(self.store, context_id, name, path, entity_type)?
         {
             let prior_path = current_entity_path(self.store, entity.id)?
                 .or_else(|| entity_path_from_properties(&entity.properties));
@@ -3731,6 +3746,7 @@ fn report_with_counts(
         import_chunks: None,
         resolved_chunk_window: None,
         model_context_tokens: None,
+        model_usage: Vec::new(),
     }
 }
 
@@ -4138,6 +4154,7 @@ fn find_existing_entity_for_seed(
     store: &Store,
     context_id: ContextId,
     name: &str,
+    path: &str,
     entity_type: EntityType,
 ) -> Result<Option<crate::Entity>> {
     let candidates = store.list_entities(crate::ListEntityFilter {
@@ -4150,12 +4167,27 @@ fn find_existing_entity_for_seed(
         return Ok(Some(exact.clone()));
     }
     let target = normalize_entity_identity_name(name);
-    if target.is_empty() {
+    if !target.is_empty()
+        && let Some(named) = candidates
+            .iter()
+            .find(|entity| normalize_entity_identity_name(&entity.name) == target)
+    {
+        return Ok(Some(named.clone()));
+    }
+    let path = normalize_entity_identity_path(path);
+    if path.is_empty() {
         return Ok(None);
     }
-    Ok(candidates
-        .into_iter()
-        .find(|entity| normalize_entity_identity_name(&entity.name) == target))
+    for entity in candidates {
+        let candidate_path = current_entity_path(store, entity.id)?
+            .or_else(|| entity_path_from_properties(&entity.properties))
+            .map(|path| normalize_entity_identity_path(&path))
+            .unwrap_or_default();
+        if candidate_path == path {
+            return Ok(Some(entity));
+        }
+    }
+    Ok(None)
 }
 
 fn normalize_entity_identity_name(name: &str) -> String {
@@ -4188,6 +4220,10 @@ fn push_entity_identity_word(words: &mut Vec<String>, current: &mut String) {
     };
     words.push(word.to_string());
     current.clear();
+}
+
+fn normalize_entity_identity_path(path: &str) -> String {
+    path.trim().replace('\\', "/")
 }
 
 fn current_entity_path(store: &Store, entity_id: EntityId) -> Result<Option<String>> {

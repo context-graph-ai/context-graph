@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cg_catalog::{
     Catalog, CredentialSource, HostSessionProbe, HostedModelConnectionRequest,
@@ -24,14 +25,34 @@ use context_graph::ingest::{
     ExtractionPriorDecision, ExtractionRequest, HarvestCounts, ImportParser,
     RollingCaptureAccumulator, StructuredHarvest, changed_since_context_cursor,
     digest_source_ids_for_context, memory_counts, parser_for_format, record_conversation,
-    record_conversation_with_extractor, standing_impact,
+    standing_impact,
 };
 use context_graph::{
-    CgError, ContextId, CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface,
-    DigestSearchFilter, DiscoveryFilter, Embedder, EmbedderRegistration, Entity, EntityId,
-    EntitySnapshot, Invalidation, InvalidationStatus, Store, StoreConfig, UnderstandingConsumer,
-    UnderstandingRequest,
+    CG_SCHEMA_VERSION, CapturePricing, CgError, ContextId, CreateContext, Decision, DecisionId,
+    DecisionStatus, DeploymentSurface, DigestSearchFilter, DiscoveryFilter, Embedder,
+    EmbedderRegistration, Entity, EntityId, EntitySnapshot, Invalidation, InvalidationStatus,
+    ModelCallUsage, ProviderUsage, Store, StoreConfig, SyncDrainFuture, SyncProbeFuture,
+    SyncPullBoundary, SyncPushBoundary, SyncStatusBoundary, SyncStatusReport,
+    UnderstandingConsumer, UnderstandingRequest, UsageReportState,
+    context_graph_sync_table_contract, drain_sync_pull, drain_sync_push,
+    schema::{INDEXES, TABLES},
+    sync_status_report, usage_receipt_from_calls, usage_receipt_json,
 };
+use contextdb_core::{Lsn, TableMeta, TxId, Value as DbValue};
+use contextdb_engine::{
+    Database,
+    sync_types::{
+        ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, SyncDirection,
+    },
+};
+use contextdb_server::chunking::reassemble;
+use contextdb_server::protocol::{
+    ChunkMessage, MessageType, PullRequest, PullResponse, PushRequest, PushResponse,
+    SyncStatusRequest, SyncStatusResponse, decode, encode,
+};
+use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
+use contextdb_server::{SyncClient, split_changeset_for_test};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -46,6 +67,11 @@ const HOST_SESSION_SPEND_KIND: &str = "subscription quota";
 const BYOK_HTTP_SPEND_KIND: &str = "provider API call";
 const MODEL_SELFTEST_PROMPT: &str =
     "Reply with exactly this text and nothing else: cg-host-session-proof";
+const CLI_PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const CLI_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const CLI_PULL_CHUNK_COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
+const CLI_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const CLI_PULL_PAGE_SIZE: u32 = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
@@ -100,6 +126,7 @@ fn run(args: Vec<String>) -> i32 {
         Some("record") => handle_record(&args[1..]),
         Some("import") => handle_import(&args[1..]),
         Some("query") => handle_query(&args[1..]),
+        Some("sync") => handle_sync(&args[1..]),
         Some("impact") => handle_impact(&args[1..]),
         Some("changed") => handle_changed(&args[1..]),
         Some("by-intention") => handle_by_intention(&args[1..]),
@@ -173,14 +200,44 @@ fn handle_record(args: &[String]) -> i32 {
         Ok(context) => context,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
+    let progress_chunk_window = match record_progress_chunk_window(args) {
+        Ok(window) => window,
+        Err(message) => {
+            return memory_failure(
+                2,
+                "InvalidRecordChunking",
+                &db_path,
+                &context_label,
+                &message,
+            );
+        }
+    };
     let request = CaptureRequest {
         context_label: context_label.clone(),
         transcript: input,
         model_available: memory_capture_connection_name(&root).is_some(),
     };
-    let extractor = ConnectedModelExtractor::for_context(&root, context.id);
+    let progress_total_chunks =
+        approximate_capture_chunk_count(&request.transcript, progress_chunk_window);
+    let extractor = ConnectedModelExtractor::for_context(&root, context.id).map(|extractor| {
+        extractor.with_progress_timer(capture_progress_timer(progress_total_chunks))
+    });
     let report = match if let Some(extractor) = &extractor {
-        record_conversation_with_extractor(&store, request, extractor)
+        context_graph::capture_with_progress_observer(
+            &store,
+            request,
+            extractor,
+            progress_chunk_window,
+            |event| {
+                eprintln!(
+                    "capture progress: chunk {}/{} elapsed_ms={} remaining_ms={}",
+                    event.chunk_index,
+                    event.total_chunks,
+                    event.elapsed.as_millis(),
+                    event.rough_remaining.as_millis()
+                );
+            },
+        )
     } else {
         record_conversation(&store, request)
     } {
@@ -261,6 +318,36 @@ fn handle_import(args: &[String]) -> i32 {
             );
         }
     };
+    if has_flag(args, "--estimate") {
+        let chunks = match stream_import_chunks(&path, parser.as_ref(), chunk_options, |_| Ok(())) {
+            Ok(chunks) => chunks,
+            Err(err) => return cg_failure(err, &db_path, &context_label),
+        };
+        let projected_tokens = chunks as u64 * 1290;
+        let projected_elapsed = Duration::from_millis(750) * chunks.max(1) as u32;
+        print_memory_json(
+            json!({
+                "ok": true,
+                "estimate": {
+                    "chunks": chunks,
+                    "resolved_chunk_window": chunk_options.resolved_chunk_window,
+                    "model_context_tokens": chunk_options.model_context_tokens,
+                    "context_fraction": chunk_options.context_fraction,
+                    "provider_calls": 0,
+                    "projected_tokens": projected_tokens,
+                    "elapsed_ms": projected_elapsed.as_millis() as u64,
+                },
+                "captured": counts_json(&HarvestCounts::default()),
+                "totals": counts_json(&HarvestCounts::default()),
+                "message": "estimate: no writes and no provider calls",
+                "rendered": format!("import estimate: {chunks} chunks, zero provider calls"),
+            }),
+            &db_path,
+            &context_label,
+            None,
+        );
+        return 0;
+    }
     if has_flag(args, "--dry-run") {
         let chunks = match stream_import_chunks(&path, parser.as_ref(), chunk_options, |_| Ok(())) {
             Ok(chunks) => chunks,
@@ -379,6 +466,33 @@ fn import_chunk_options(args: &[String], root: &Path) -> Result<ImportChunkOptio
     })
 }
 
+fn record_progress_chunk_window(args: &[String]) -> Result<usize, String> {
+    flag_value(args, "--chunk-tokens")
+        .map(|raw| parse_positive_usize_flag("--chunk-tokens", &raw))
+        .transpose()
+        .map(|value| value.unwrap_or(16_000).max(1))
+}
+
+fn approximate_capture_chunk_count(text: &str, chunk_window: usize) -> usize {
+    let window = chunk_window.max(1);
+    text.len().div_ceil(window).max(1)
+}
+
+fn capture_progress_timer(total_chunks: usize) -> ModelProgressTimer {
+    let total_chunks = total_chunks.max(1);
+    Arc::new(move |call_index, elapsed| {
+        let chunk_index = call_index.min(total_chunks);
+        let remaining_chunks = total_chunks.saturating_sub(chunk_index) + 1;
+        eprintln!(
+            "capture progress: chunk {}/{} elapsed_ms={} remaining_ms={}",
+            chunk_index,
+            total_chunks,
+            elapsed.as_millis(),
+            remaining_chunks as u128 * 100,
+        );
+    })
+}
+
 fn parse_positive_usize_flag(flag: &str, raw: &str) -> Result<usize, String> {
     let value = raw
         .parse::<usize>()
@@ -447,6 +561,7 @@ struct ImportReportAccumulator {
     wrote_digest: bool,
     impact_signal: Option<CaptureImpactSignal>,
     dedup_events: Vec<context_graph::ingest::DedupEvent>,
+    model_usage: Vec<ModelCallUsage>,
 }
 
 impl ImportReportAccumulator {
@@ -469,6 +584,7 @@ impl ImportReportAccumulator {
             wrote_digest: false,
             impact_signal: None,
             dedup_events: Vec::new(),
+            model_usage: Vec::new(),
         }
     }
 
@@ -498,6 +614,7 @@ impl ImportReportAccumulator {
             self.impact_signal = report.impact_signal;
         }
         self.dedup_events.extend(report.dedup_events);
+        self.model_usage.extend(report.model_usage);
     }
 
     fn finish(
@@ -540,6 +657,7 @@ impl ImportReportAccumulator {
             import_chunks: Some(chunks),
             resolved_chunk_window: None,
             model_context_tokens: None,
+            model_usage: self.model_usage,
         })
     }
 }
@@ -552,8 +670,14 @@ fn import_with_connected_extractor(
     extractor: ConnectedModelExtractor,
     chunk_options: ImportChunkOptions,
 ) -> context_graph::Result<CaptureReport> {
+    let total_chunks = stream_import_chunks(path, parser, chunk_options, |_| Ok(()))?;
+    let extractor = extractor.with_progress_timer(capture_progress_timer(total_chunks));
+    let started = Instant::now();
+    let mut chunk_index = 0_usize;
     let mut rolling = RollingCaptureAccumulator::new(IMPORT_RUNNING_STATE_CAP_TOKENS);
     let chunks = stream_import_chunks(path, parser, chunk_options, |chunk| {
+        chunk_index += 1;
+        print_capture_progress(chunk_index, total_chunks, started, false);
         let transcript = rolling.chunk_prompt(chunk);
         let prior_decisions = [];
         let harvest = extractor.extract(ExtractionRequest {
@@ -562,6 +686,7 @@ fn import_with_connected_extractor(
             prior_decisions: &prior_decisions,
         })?;
         rolling.push_harvest(harvest);
+        print_capture_progress(chunk_index, total_chunks, started, true);
         Ok(())
     })?;
     let mut report = rolling.finish_capture(store, context_label, chunks, &extractor)?;
@@ -576,6 +701,26 @@ fn import_with_connected_extractor(
     report.resolved_chunk_window = Some(chunk_options.resolved_chunk_window);
     report.model_context_tokens = Some(chunk_options.model_context_tokens);
     Ok(report)
+}
+
+fn print_capture_progress(
+    chunk_index: usize,
+    total_chunks: usize,
+    started: Instant,
+    completed: bool,
+) {
+    let remaining_chunks = if completed {
+        total_chunks.saturating_sub(chunk_index)
+    } else {
+        total_chunks.saturating_sub(chunk_index) + 1
+    };
+    eprintln!(
+        "capture progress: chunk {}/{} elapsed_ms={} remaining_ms={}",
+        chunk_index,
+        total_chunks,
+        started.elapsed().as_millis(),
+        remaining_chunks as u128 * 100,
+    );
 }
 
 fn stream_import_chunks<F>(
@@ -756,6 +901,1022 @@ fn handle_query(args: &[String]) -> i32 {
         contexts.first().copied(),
     );
     0
+}
+
+fn handle_sync(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg sync <status|push|pull> --remote-server NATS_URL --tenant-id TENANT_ID"
+        );
+        return 0;
+    }
+    let Some(action) = args.first().map(String::as_str) else {
+        return usage_error("sync requires status, push, or pull");
+    };
+    let Some(remote_url) = flag_value(args, "--remote-server") else {
+        return usage_error("sync requires --remote-server NATS_URL");
+    };
+    let Some(tenant_id) = flag_value(args, "--tenant-id") else {
+        return usage_error("sync requires --tenant-id TENANT_ID");
+    };
+    if tenant_id.trim().is_empty() {
+        return usage_error("sync requires a non-empty --tenant-id");
+    }
+
+    let root = data_root();
+    let db_path = memory_db_path(&root);
+    let context_label = memory_context_label(args);
+    let stores = match open_scoped_memory_store_for_sync(&root, &context_label, action == "pull") {
+        Ok(stores) => stores,
+        Err(err) => return memory_error(err, &db_path, &context_label),
+    };
+    let store = &stores.scoped;
+    let boundary = CliSyncBoundary::new(&stores.admin, &stores.admin, &remote_url, &tenant_id);
+
+    match action {
+        "status" => {
+            let status =
+                sync_status_report(store, Some(&remote_url), Some(&tenant_id), Some(&boundary));
+            print_sync_report(
+                &status,
+                None,
+                &db_path,
+                &context_label,
+                context_id_for_label(store, &context_label),
+            );
+            0
+        }
+        "push" => {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    return memory_error(
+                        MemoryCliError::Io(err.to_string()),
+                        &db_path,
+                        &context_label,
+                    );
+                }
+            };
+            let drain = runtime.block_on(drain_sync_push(&boundary));
+            match drain {
+                Ok(report) => {
+                    let status = sync_status_report(
+                        store,
+                        Some(&remote_url),
+                        Some(&tenant_id),
+                        Some(&boundary),
+                    );
+                    print_sync_report(
+                        &status,
+                        Some(&report.result),
+                        &db_path,
+                        &context_label,
+                        context_id_for_label(store, &context_label),
+                    );
+                    0
+                }
+                Err(err) => cg_failure(err, &db_path, &context_label),
+            }
+        }
+        "pull" => {
+            let runtime = match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    return memory_error(
+                        MemoryCliError::Io(err.to_string()),
+                        &db_path,
+                        &context_label,
+                    );
+                }
+            };
+            let policies = cli_sync_conflict_policies();
+            let drain = runtime.block_on(drain_sync_pull(&boundary, &policies));
+            match drain {
+                Ok(report) => {
+                    if let Err(err) = normalize_schema_version_after_sync_pull(&stores.admin) {
+                        return cg_failure(err, &db_path, &context_label);
+                    }
+                    if let Err(err) = reconcile_has_outcome_edges_after_sync_pull(
+                        &stores.admin,
+                        &boundary.take_pulled_context_ids(),
+                    ) {
+                        return cg_failure(err, &db_path, &context_label);
+                    }
+                    let status = sync_status_report(
+                        store,
+                        Some(&remote_url),
+                        Some(&tenant_id),
+                        Some(&boundary),
+                    );
+                    print_sync_report(
+                        &status,
+                        Some(&report.result),
+                        &db_path,
+                        &context_label,
+                        context_id_for_label(store, &context_label),
+                    );
+                    0
+                }
+                Err(err) => cg_failure(err, &db_path, &context_label),
+            }
+        }
+        other => usage_error(&format!("unknown sync command `{other}`")),
+    }
+}
+
+struct CliSyncBoundary {
+    client: SyncClient,
+    schema_db: Arc<contextdb_engine::Database>,
+    nats_connection_opened: Mutex<bool>,
+    pulled_context_ids: Mutex<BTreeSet<uuid::Uuid>>,
+}
+
+impl CliSyncBoundary {
+    fn new(data_store: &Store, admin_store: &Store, remote_url: &str, tenant_id: &str) -> Self {
+        let client = SyncClient::new(data_store.sync_database(), remote_url, tenant_id);
+        let schema_db = admin_store.sync_database();
+        register_cli_sync_tables(&client);
+        Self {
+            client,
+            schema_db,
+            nats_connection_opened: Mutex::new(false),
+            pulled_context_ids: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    fn mark_connected(&self) {
+        if let Ok(mut connected) = self.nats_connection_opened.lock() {
+            *connected = true;
+        }
+    }
+
+    fn persisted_push_watermark(&self) -> Lsn {
+        self.client
+            .db()
+            .persisted_sync_watermarks(self.client.tenant_id())
+            .map(|(push, _)| push)
+            .unwrap_or_else(|_| self.client.push_watermark())
+    }
+
+    fn persisted_pull_watermark(&self) -> Lsn {
+        self.client
+            .db()
+            .persisted_sync_watermarks(self.client.tenant_id())
+            .map(|(_, pull)| pull)
+            .unwrap_or_else(|_| self.client.pull_watermark())
+    }
+
+    fn remember_pulled_context_ids(&self, context_ids: BTreeSet<uuid::Uuid>) {
+        if context_ids.is_empty() {
+            return;
+        }
+        if let Ok(mut pulled) = self.pulled_context_ids.lock() {
+            pulled.extend(context_ids);
+        }
+    }
+
+    fn take_pulled_context_ids(&self) -> BTreeSet<uuid::Uuid> {
+        self.pulled_context_ids
+            .lock()
+            .map(|mut pulled| std::mem::take(&mut *pulled))
+            .unwrap_or_default()
+    }
+
+    fn push_changeset_without_trigger_ddl(&self, since: Lsn) -> ChangeSet {
+        let directions = cli_sync_table_directions();
+        let raw_changeset = self.client.db().changes_since(since);
+        let mut changeset = cli_push_changeset_without_trigger_ddl(&raw_changeset, &directions);
+        let schema_changeset = self.schema_db.changes_since(since);
+        restore_non_trigger_schema_ddl(&mut changeset, &schema_changeset);
+        changeset
+    }
+
+    fn has_skippable_schema_ddl(&self, since: Lsn) -> bool {
+        self.schema_db
+            .changes_since(since)
+            .ddl
+            .iter()
+            .any(is_trigger_ddl)
+    }
+
+    fn has_pending_push_work(&self) -> context_graph::Result<bool> {
+        let since = self.persisted_push_watermark();
+        let changes = self.push_changeset_without_trigger_ddl(since);
+        Ok(!changes.is_empty() || self.has_skippable_schema_ddl(since))
+    }
+
+    async fn push_round_without_trigger_ddl(&self) -> context_graph::Result<ApplyResult> {
+        let nats_client = self
+            .client
+            .ensure_connected()
+            .await
+            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+        self.refresh_push_watermark_from_server(&nats_client)
+            .await?;
+        let since = self.persisted_push_watermark();
+        let raw_changeset = self.client.db().changes_since(since);
+        let schema_changeset = self.schema_db.changes_since(since);
+        let changeset = self.push_changeset_without_trigger_ddl(since);
+        if changeset.is_empty() {
+            let skipped_lsn = raw_changeset
+                .max_lsn()
+                .or_else(|| schema_changeset.max_lsn())
+                .unwrap_or_else(|| self.client.db().current_lsn());
+            self.client
+                .db()
+                .persist_sync_push_watermark(self.client.tenant_id(), skipped_lsn)
+                .map_err(sync_client_error)?;
+            return Ok(ApplyResult {
+                applied_rows: 0,
+                skipped_rows: 0,
+                conflicts: Vec::new(),
+                new_lsn: skipped_lsn,
+            });
+        }
+
+        let mut total = ApplyResult {
+            applied_rows: 0,
+            skipped_rows: 0,
+            conflicts: Vec::new(),
+            new_lsn: since,
+        };
+        let mut last_successful_lsn = since;
+        for batch in split_changeset_for_test(changeset) {
+            let batch_max_lsn = batch.max_lsn().unwrap_or_else(|| {
+                if batch.ddl.is_empty() {
+                    since
+                } else {
+                    self.client.db().current_lsn()
+                }
+            });
+            let result =
+                send_cli_push_request(&nats_client, self.client.tenant_id(), batch).await?;
+            last_successful_lsn = batch_max_lsn;
+            total.applied_rows += result.applied_rows;
+            total.skipped_rows += result.skipped_rows;
+            total.conflicts.extend(result.conflicts);
+            total.new_lsn = result.new_lsn;
+        }
+        self.client
+            .db()
+            .persist_sync_push_watermark(self.client.tenant_id(), last_successful_lsn)
+            .map_err(sync_client_error)?;
+        Ok(total)
+    }
+
+    async fn refresh_push_watermark_from_server(
+        &self,
+        nats_client: &async_nats::Client,
+    ) -> context_graph::Result<()> {
+        if let Some(status) = request_cli_sync_status(nats_client, self.client.tenant_id()).await
+            && let Some(server_applied) = status.applied_push_watermark
+        {
+            let local = self.persisted_push_watermark();
+            if server_applied < local {
+                self.client
+                    .db()
+                    .persist_sync_push_watermark(self.client.tenant_id(), server_applied)
+                    .map_err(sync_client_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn pull_round_without_schema_ddl(
+        &self,
+        policies: &ConflictPolicies,
+    ) -> context_graph::Result<ApplyResult> {
+        let nats_client = self
+            .client
+            .ensure_connected()
+            .await
+            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+        if let Some(status) = request_cli_sync_status(&nats_client, self.client.tenant_id()).await
+            && let Some(server_lsn) = status.server_current_lsn
+        {
+            let local = self.persisted_pull_watermark();
+            if server_lsn < local {
+                self.client
+                    .db()
+                    .persist_sync_pull_watermark(self.client.tenant_id(), Lsn(0))
+                    .map_err(sync_client_error)?;
+            }
+        }
+        let directions = cli_sync_table_directions();
+        let mut since_lsn = self.persisted_pull_watermark();
+        let mut total = ApplyResult {
+            applied_rows: 0,
+            skipped_rows: 0,
+            conflicts: Vec::new(),
+            new_lsn: since_lsn,
+        };
+
+        let last_server_lsn = loop {
+            let (changes, has_more, cursor) =
+                request_cli_pull_page(&nats_client, self.client.tenant_id(), since_lsn).await?;
+            let server_lsn = cursor.or_else(|| changes.max_lsn()).unwrap_or(since_lsn);
+            let filtered = changes
+                .filter_by_direction(&directions, &[SyncDirection::Pull, SyncDirection::Both]);
+            let mut schema_changes = filtered.clone();
+            schema_changes.rows.clear();
+            schema_changes.edges.clear();
+            schema_changes.vectors.clear();
+            if !schema_changes.ddl.is_empty() {
+                let result = self
+                    .schema_db
+                    .apply_changes(schema_changes, &remap_cli_pull_policies(policies))
+                    .map_err(sync_client_error)?;
+                total.applied_rows += result.applied_rows;
+                total.skipped_rows += result.skipped_rows;
+                total.conflicts.extend(result.conflicts);
+                total.new_lsn = result.new_lsn;
+            }
+            let mut data_changes = filtered;
+            data_changes.ddl.clear();
+            data_changes.ddl_lsn.clear();
+            let touched_contexts = context_ids_touched_by_changeset(&data_changes);
+            let result = self
+                .client
+                .db()
+                .apply_changes(data_changes, &remap_cli_pull_policies(policies))
+                .map_err(sync_client_error)?;
+            self.remember_pulled_context_ids(touched_contexts);
+            total.applied_rows += result.applied_rows;
+            total.skipped_rows += result.skipped_rows;
+            total.conflicts.extend(result.conflicts);
+            total.new_lsn = result.new_lsn;
+
+            if !has_more {
+                break server_lsn;
+            }
+            let Some(next_lsn) = cursor else {
+                break server_lsn;
+            };
+            since_lsn = next_lsn;
+        };
+
+        self.client
+            .db()
+            .persist_sync_pull_watermark(self.client.tenant_id(), last_server_lsn)
+            .map_err(sync_client_error)?;
+        Ok(total)
+    }
+}
+
+impl SyncStatusBoundary for CliSyncBoundary {
+    fn push_watermark(&self) -> Lsn {
+        self.persisted_push_watermark()
+    }
+
+    fn pull_watermark(&self) -> Lsn {
+        self.persisted_pull_watermark()
+    }
+
+    fn has_pending_push_changes(&self) -> context_graph::Result<bool> {
+        self.has_pending_push_work()
+    }
+
+    fn pending_push_change_count(&self) -> context_graph::Result<usize> {
+        let changes = self.push_changeset_without_trigger_ddl(self.persisted_push_watermark());
+        Ok(changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.nats_connection_opened
+            .lock()
+            .map(|connected| *connected)
+            .unwrap_or(false)
+    }
+}
+
+impl SyncPushBoundary for CliSyncBoundary {
+    fn push_watermark(&self) -> Lsn {
+        self.persisted_push_watermark()
+    }
+
+    fn has_pending_push_changes(&self) -> context_graph::Result<bool> {
+        self.has_pending_push_work()
+    }
+
+    fn refresh_push_state(&self) -> SyncProbeFuture<'_> {
+        Box::pin(async move {
+            let nats_client = self
+                .client
+                .ensure_connected()
+                .await
+                .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+            self.mark_connected();
+            self.refresh_push_watermark_from_server(&nats_client).await
+        })
+    }
+
+    fn push_round(&self) -> SyncDrainFuture<'_> {
+        Box::pin(async move {
+            let result = self.push_round_without_trigger_ddl().await;
+            if result.is_ok() {
+                self.mark_connected();
+            }
+            result
+        })
+    }
+}
+
+impl SyncPullBoundary for CliSyncBoundary {
+    fn pull_watermark(&self) -> Lsn {
+        self.persisted_pull_watermark()
+    }
+
+    fn pull_round<'a>(&'a self, policies: &'a ConflictPolicies) -> SyncDrainFuture<'a> {
+        Box::pin(async move {
+            let result = self.pull_round_without_schema_ddl(policies).await;
+            if result.is_ok() {
+                self.mark_connected();
+            }
+            result
+        })
+    }
+}
+
+fn register_cli_sync_tables(client: &SyncClient) {
+    client.set_default_conflict_policy(ConflictPolicy::LatestWins);
+    for policy in context_graph_sync_table_contract() {
+        client.set_table_direction(policy.table, policy.direction);
+        client.set_conflict_policy(policy.table, policy.conflict_policy);
+    }
+}
+
+fn cli_sync_table_directions() -> HashMap<String, SyncDirection> {
+    context_graph_sync_table_contract()
+        .into_iter()
+        .map(|policy| (policy.table.to_string(), policy.direction))
+        .collect()
+}
+
+fn cli_sync_conflict_policies() -> ConflictPolicies {
+    let per_table = context_graph_sync_table_contract()
+        .into_iter()
+        .map(|policy| (policy.table.to_string(), policy.conflict_policy))
+        .collect();
+    ConflictPolicies {
+        per_table,
+        default: ConflictPolicy::LatestWins,
+    }
+}
+
+fn restore_non_trigger_schema_ddl(filtered: &mut ChangeSet, raw: &ChangeSet) {
+    let mut seen = filtered
+        .ddl
+        .iter()
+        .map(|ddl| format!("{ddl:?}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let old_ddl = std::mem::take(&mut filtered.ddl);
+    let old_ddl_lsn = std::mem::take(&mut filtered.ddl_lsn);
+    for (index, change) in old_ddl.into_iter().enumerate() {
+        if is_trigger_ddl(&change) {
+            continue;
+        }
+        filtered.ddl.push(change);
+        if let Some(lsn) = old_ddl_lsn.get(index).copied() {
+            filtered.ddl_lsn.push(lsn);
+        }
+    }
+    for (index, change) in raw.ddl.iter().cloned().enumerate() {
+        if is_trigger_ddl(&change) {
+            continue;
+        }
+        let key = format!("{change:?}");
+        if !seen.insert(key) {
+            continue;
+        }
+        filtered.ddl.push(change);
+        if let Some(lsn) = raw.ddl_lsn.get(index).copied() {
+            filtered.ddl_lsn.push(lsn);
+        }
+    }
+}
+
+fn cli_push_changeset_without_trigger_ddl(
+    raw: &ChangeSet,
+    directions: &HashMap<String, SyncDirection>,
+) -> ChangeSet {
+    let mut changeset = raw
+        .clone()
+        .filter_by_direction(directions, &[SyncDirection::Push, SyncDirection::Both]);
+    restore_non_trigger_schema_ddl(&mut changeset, raw);
+    changeset
+}
+
+fn context_ids_touched_by_changeset(changeset: &ChangeSet) -> BTreeSet<uuid::Uuid> {
+    let mut context_ids = BTreeSet::new();
+    for row in &changeset.rows {
+        if let Some(DbValue::Uuid(context_id)) = row.values.get("context_id") {
+            context_ids.insert(*context_id);
+        }
+    }
+    for edge in &changeset.edges {
+        if let Some(DbValue::Uuid(context_id)) = edge.properties.get("context_id") {
+            context_ids.insert(*context_id);
+        }
+    }
+    context_ids
+}
+
+fn is_trigger_ddl(change: &DdlChange) -> bool {
+    matches!(
+        change,
+        DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. }
+    )
+}
+
+async fn send_cli_push_request(
+    nats_client: &async_nats::Client,
+    tenant_id: &str,
+    changeset: ChangeSet,
+) -> context_graph::Result<ApplyResult> {
+    let request = PushRequest {
+        changeset: changeset.into(),
+    };
+    let encoded = encode(MessageType::PushRequest, &request)
+        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+    let subject = push_subject(tenant_id);
+    for attempt in 0..5u32 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+        }
+        let inbox = nats_client.new_inbox();
+        let mut inbox_sub = nats_client
+            .subscribe(inbox.clone())
+            .await
+            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+        nats_client
+            .publish_with_reply(subject.clone(), inbox, encoded.clone().into())
+            .await
+            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+        match tokio::time::timeout(CLI_PUSH_REQUEST_TIMEOUT, inbox_sub.next()).await {
+            Ok(Some(message)) if message.status.is_some() && attempt < 4 => continue,
+            Ok(Some(message)) if message.status.is_some() => {
+                return Err(CgError::Engine(format!(
+                    "sync failed: push received NATS status reply {:?}",
+                    message.status
+                )));
+            }
+            Ok(Some(message)) => {
+                let envelope = match decode(&message.payload) {
+                    Ok(envelope) => envelope,
+                    Err(err) if attempt < 4 => {
+                        let _ = err;
+                        continue;
+                    }
+                    Err(err) => return Err(CgError::Engine(format!("sync failed: {err}"))),
+                };
+                if envelope.message_type != MessageType::PushResponse {
+                    if attempt < 4 {
+                        continue;
+                    }
+                    return Err(CgError::Engine(format!(
+                        "sync failed: unexpected push response {:?}",
+                        envelope.message_type
+                    )));
+                }
+                let response: PushResponse = match rmp_serde::from_slice(&envelope.payload) {
+                    Ok(response) => response,
+                    Err(err) if attempt < 4 => {
+                        let _ = err;
+                        continue;
+                    }
+                    Err(err) => return Err(CgError::Engine(format!("sync failed: {err}"))),
+                };
+                if let Some(err) = response.error {
+                    return Err(CgError::Engine(format!("sync failed: {err}")));
+                }
+                return response.result.map(Into::into).ok_or_else(|| {
+                    CgError::Engine("sync failed: push response missing result".to_string())
+                });
+            }
+            Ok(None) => {
+                return Err(CgError::Engine(
+                    "sync failed: push inbox closed".to_string(),
+                ));
+            }
+            Err(_) if attempt < 4 => continue,
+            Err(_) => {
+                return Err(CgError::Engine(
+                    "sync failed: timed out waiting for push response".to_string(),
+                ));
+            }
+        }
+    }
+    Err(CgError::Engine(
+        "sync failed: push failed after retries".to_string(),
+    ))
+}
+
+async fn request_cli_sync_status(
+    nats_client: &async_nats::Client,
+    tenant_id: &str,
+) -> Option<SyncStatusResponse> {
+    let encoded = encode(MessageType::StatusRequest, &SyncStatusRequest {}).ok()?;
+    let inbox = nats_client.new_inbox();
+    let mut inbox_sub = nats_client.subscribe(inbox.clone()).await.ok()?;
+    nats_client
+        .publish_with_reply(status_subject(tenant_id), inbox, encoded.into())
+        .await
+        .ok()?;
+    let message = tokio::time::timeout(CLI_STATUS_REQUEST_TIMEOUT, inbox_sub.next())
+        .await
+        .ok()??;
+    if message.status.is_some() {
+        return None;
+    }
+    let envelope = decode(&message.payload).ok()?;
+    if !matches!(envelope.message_type, MessageType::StatusResponse) {
+        return None;
+    }
+    rmp_serde::from_slice(&envelope.payload).ok()
+}
+
+async fn request_cli_pull_page(
+    nats_client: &async_nats::Client,
+    tenant_id: &str,
+    since_lsn: Lsn,
+) -> context_graph::Result<(ChangeSet, bool, Option<Lsn>)> {
+    let request = PullRequest {
+        since_lsn,
+        max_entries: Some(CLI_PULL_PAGE_SIZE),
+    };
+    let encoded = encode(MessageType::PullRequest, &request)
+        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+    let mut first_attempt_response = None;
+    for attempt in 0..5u32 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+        }
+        let inbox = nats_client.new_inbox();
+        let mut inbox_sub = nats_client
+            .subscribe(inbox.clone())
+            .await
+            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+        let timeout = if attempt < 2 {
+            Duration::from_secs(2)
+        } else {
+            CLI_PULL_REQUEST_TIMEOUT
+        };
+        nats_client
+            .publish_with_reply(pull_subject(tenant_id), inbox, encoded.clone().into())
+            .await
+            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+        match tokio::time::timeout(timeout, inbox_sub.next()).await {
+            Ok(Some(message)) => {
+                first_attempt_response = Some((message, inbox_sub));
+                break;
+            }
+            Ok(None) => {
+                return Err(CgError::Engine(
+                    "sync failed: pull inbox closed".to_string(),
+                ));
+            }
+            Err(_) if attempt < 4 => continue,
+            Err(_) => {}
+        }
+    }
+
+    let (first_message, mut inbox_sub) = first_attempt_response.ok_or_else(|| {
+        CgError::Engine("sync failed: timed out waiting for pull response".to_string())
+    })?;
+    let first_envelope = decode(&first_message.payload)
+        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+    let response_envelope = match first_envelope.message_type {
+        MessageType::PullResponse => first_envelope,
+        MessageType::Chunk => {
+            let first_chunk: ChunkMessage = rmp_serde::from_slice(&first_envelope.payload)
+                .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+            let total = first_chunk.total_chunks;
+            let mut collected = vec![first_chunk];
+            let deadline = tokio::time::Instant::now() + CLI_PULL_CHUNK_COLLECT_TIMEOUT;
+            while collected.len() < total as usize {
+                let chunk_message = tokio::time::timeout_at(deadline, inbox_sub.next())
+                    .await
+                    .map_err(|_| {
+                        CgError::Engine(format!(
+                            "sync failed: timeout collecting pull chunks ({}/{total})",
+                            collected.len()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        CgError::Engine("sync failed: pull chunk stream ended".to_string())
+                    })?;
+                let envelope = decode(&chunk_message.payload)
+                    .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+                if !matches!(envelope.message_type, MessageType::Chunk) {
+                    return Err(CgError::Engine(format!(
+                        "sync failed: unexpected pull chunk response {:?}",
+                        envelope.message_type
+                    )));
+                }
+                let chunk: ChunkMessage = rmp_serde::from_slice(&envelope.payload)
+                    .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+                collected.push(chunk);
+            }
+            let reassembled = reassemble(&mut collected);
+            decode(&reassembled).map_err(|err| CgError::Engine(format!("sync failed: {err}")))?
+        }
+        other => {
+            return Err(CgError::Engine(format!(
+                "sync failed: unexpected pull response {other:?}"
+            )));
+        }
+    };
+
+    let response: PullResponse = rmp_serde::from_slice(&response_envelope.payload)
+        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+    let changes = ChangeSet::try_from(response.changeset)
+        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
+    Ok((changes, response.has_more, response.cursor))
+}
+
+fn remap_cli_pull_policies(policies: &ConflictPolicies) -> ConflictPolicies {
+    let remap = |policy: ConflictPolicy| match policy {
+        ConflictPolicy::ServerWins => ConflictPolicy::EdgeWins,
+        ConflictPolicy::EdgeWins => ConflictPolicy::ServerWins,
+        other => other,
+    };
+    ConflictPolicies {
+        per_table: policies
+            .per_table
+            .iter()
+            .map(|(table, policy)| (table.clone(), remap(*policy)))
+            .collect(),
+        default: remap(policies.default),
+    }
+}
+
+fn normalize_schema_version_after_sync_pull(store: &Store) -> context_graph::Result<()> {
+    let db = store.sync_database();
+    if !schema_shape_is_current(&db)? {
+        return Ok(());
+    }
+    ensure_schema_version_row_is_current(&db)
+}
+
+fn schema_shape_is_current(db: &Database) -> context_graph::Result<bool> {
+    let expected = Database::open_memory();
+    for table in TABLES {
+        expected
+            .execute(table.ddl, &HashMap::new())
+            .map_err(sync_client_error)?;
+    }
+    for index in INDEXES {
+        expected
+            .execute(index.ddl, &HashMap::new())
+            .map_err(sync_client_error)?;
+    }
+    for table in TABLES {
+        let Some(actual) = db.table_meta(table.name) else {
+            return Ok(false);
+        };
+        let Some(expected) = expected.table_meta(table.name) else {
+            return Ok(false);
+        };
+        if table_meta_fingerprint(&actual)? != table_meta_fingerprint(&expected)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn table_meta_fingerprint(meta: &TableMeta) -> context_graph::Result<Value> {
+    serde_json::to_value(meta).map_err(|err| CgError::Engine(format!("schema check failed: {err}")))
+}
+
+fn ensure_schema_version_row_is_current(db: &Database) -> context_graph::Result<()> {
+    let params = HashMap::from([("id".to_string(), DbValue::Int64(1))]);
+    let existing = db
+        .execute("SELECT id FROM cg_schema_version WHERE id = $id", &params)
+        .map_err(sync_client_error)?;
+    if existing.rows.is_empty() {
+        db.execute(
+            "INSERT INTO cg_schema_version (id, version, installed_at) VALUES ($id, $version, $installed_at)",
+            &HashMap::from([
+                ("id".to_string(), DbValue::Int64(1)),
+                (
+                    "version".to_string(),
+                    DbValue::Int64(CG_SCHEMA_VERSION as i64),
+                ),
+                ("installed_at".to_string(), DbValue::TxId(TxId(1))),
+            ]),
+        )
+        .map(|_| ())
+        .map_err(sync_client_error)
+    } else {
+        db.execute(
+            "UPDATE cg_schema_version SET version = $version WHERE id = $id",
+            &HashMap::from([
+                ("id".to_string(), DbValue::Int64(1)),
+                (
+                    "version".to_string(),
+                    DbValue::Int64(CG_SCHEMA_VERSION as i64),
+                ),
+            ]),
+        )
+        .map(|_| ())
+        .map_err(sync_client_error)
+    }
+}
+
+fn reconcile_has_outcome_edges_after_sync_pull(
+    store: &Store,
+    context_ids: &BTreeSet<uuid::Uuid>,
+) -> context_graph::Result<()> {
+    if context_ids.is_empty() {
+        return Ok(());
+    }
+    let db = store.sync_database();
+    if db.table_meta("outcomes").is_none() || db.table_meta("edges").is_none() {
+        return Ok(());
+    }
+    let snapshot = db.snapshot();
+    let outcomes = db.scan("outcomes", snapshot).map_err(sync_client_error)?;
+    let winning_outcome_by_decision = outcomes
+        .into_iter()
+        .filter_map(|row| {
+            let decision_id = match row.values.get("decision_id") {
+                Some(DbValue::Uuid(id)) => *id,
+                _ => return None,
+            };
+            let context_id = match row.values.get("context_id") {
+                Some(DbValue::Uuid(id)) => *id,
+                _ => return None,
+            };
+            if !context_ids.contains(&context_id) {
+                return None;
+            }
+            let outcome_id = match row.values.get("id") {
+                Some(DbValue::Uuid(id)) => *id,
+                _ => return None,
+            };
+            Some((decision_id, (context_id, outcome_id)))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut winning_edge_seen = winning_outcome_by_decision
+        .keys()
+        .map(|decision_id| (*decision_id, false))
+        .collect::<HashMap<_, _>>();
+    let edges = db.scan("edges", snapshot).map_err(sync_client_error)?;
+    let mut stale_edge_ids = Vec::new();
+    for row in edges {
+        if !matches!(
+            row.values.get("edge_type"),
+            Some(DbValue::Text(edge_type)) if edge_type == "HAS_OUTCOME"
+        ) {
+            continue;
+        }
+        let Some(DbValue::Uuid(edge_id)) = row.values.get("id") else {
+            continue;
+        };
+        let Some(DbValue::Uuid(source_id)) = row.values.get("source_id") else {
+            continue;
+        };
+        let Some(DbValue::Uuid(target_id)) = row.values.get("target_id") else {
+            continue;
+        };
+        let Some(DbValue::Uuid(edge_context_id)) = row.values.get("context_id") else {
+            continue;
+        };
+        if !context_ids.contains(edge_context_id) {
+            continue;
+        }
+        let Some((winning_context_id, winning_outcome_id)) =
+            winning_outcome_by_decision.get(source_id)
+        else {
+            stale_edge_ids.push(*edge_id);
+            continue;
+        };
+        if edge_context_id == winning_context_id && target_id == winning_outcome_id {
+            winning_edge_seen.insert(*source_id, true);
+            continue;
+        }
+        stale_edge_ids.push(*edge_id);
+    }
+    let missing_edges = winning_outcome_by_decision
+        .iter()
+        .filter_map(|(decision_id, (context_id, outcome_id))| {
+            (!winning_edge_seen.get(decision_id).copied().unwrap_or(false)).then_some((
+                *decision_id,
+                *context_id,
+                *outcome_id,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if stale_edge_ids.is_empty() && missing_edges.is_empty() {
+        return Ok(());
+    }
+
+    let tx = db.begin().map_err(sync_client_error)?;
+    for edge_id in stale_edge_ids {
+        if let Err(err) = db.execute_in_tx(
+            tx,
+            "DELETE FROM edges WHERE id = $id",
+            &HashMap::from([("id".to_string(), DbValue::Uuid(edge_id))]),
+        ) {
+            let _ = db.rollback(tx);
+            return Err(sync_client_error(err));
+        }
+    }
+    for (decision_id, context_id, outcome_id) in missing_edges {
+        if let Err(err) = db.execute_in_tx(
+            tx,
+            "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
+            &HashMap::from([
+                ("id".to_string(), DbValue::Uuid(uuid::Uuid::now_v7())),
+                ("source_id".to_string(), DbValue::Uuid(decision_id)),
+                ("target_id".to_string(), DbValue::Uuid(outcome_id)),
+                (
+                    "edge_type".to_string(),
+                    DbValue::Text("HAS_OUTCOME".to_string()),
+                ),
+                ("context_id".to_string(), DbValue::Uuid(context_id)),
+                ("valid_from".to_string(), DbValue::TxId(tx)),
+                ("valid_to".to_string(), DbValue::Null),
+                (
+                    "properties".to_string(),
+                    DbValue::Json(serde_json::json!({})),
+                ),
+            ]),
+        ) {
+            let _ = db.rollback(tx);
+            return Err(sync_client_error(err));
+        }
+    }
+    db.commit(tx).map_err(sync_client_error)
+}
+
+fn sync_client_error(err: contextdb_core::Error) -> CgError {
+    CgError::Engine(format!("sync failed: {err:?}"))
+}
+
+fn print_sync_report(
+    status: &SyncStatusReport,
+    apply_result: Option<&ApplyResult>,
+    db_path: &Path,
+    context_label: &str,
+    context_id: Option<ContextId>,
+) {
+    let mut sync = sync_status_json(status);
+    let apply_result_json = apply_result.map(apply_result_json);
+    if let Some(apply_result) = &apply_result_json
+        && let Some(object) = sync.as_object_mut()
+    {
+        object.insert("apply_result".to_string(), apply_result.clone());
+    }
+    let mut value = json!({
+        "ok": true,
+        "sync": sync,
+        "rendered": sync_rendered_line(status),
+    });
+    if let Some(apply_result) = apply_result_json
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("apply_result".to_string(), apply_result);
+    }
+    print_memory_json(value, db_path, context_label, context_id);
+}
+
+fn sync_status_json(status: &SyncStatusReport) -> Value {
+    json!({
+        "remote_url": status.remote_url,
+        "tenant_id": status.tenant_id,
+        "push_watermark": status.push_watermark.0,
+        "pull_watermark": status.pull_watermark.0,
+        "pending_push_count": status.pending_push_count,
+        "sync_client_constructed": status.sync_client_constructed,
+        "nats_connection_opened": status.nats_connection_opened,
+    })
+}
+
+fn apply_result_json(result: &ApplyResult) -> Value {
+    json!({
+        "applied_rows": result.applied_rows,
+        "skipped_rows": result.skipped_rows,
+        "conflicts": result.conflicts,
+        "new_lsn": result.new_lsn.0,
+    })
+}
+
+fn sync_rendered_line(status: &SyncStatusReport) -> String {
+    format!(
+        "sync tenant: {} pending push changes: {} push watermark: {} pull watermark: {}",
+        status.tenant_id.as_deref().unwrap_or("unknown"),
+        status.pending_push_count,
+        status.push_watermark.0,
+        status.pull_watermark.0
+    )
+}
+
+fn context_id_for_label(store: &Store, context_label: &str) -> Option<ContextId> {
+    lookup_cli_context(store, context_label)
+        .ok()
+        .flatten()
+        .map(|context| context.id)
 }
 
 fn handle_impact(_args: &[String]) -> i32 {
@@ -1141,10 +2302,33 @@ fn memory_db_path(root: &Path) -> PathBuf {
     root.join("context-graph.db")
 }
 
+struct OpenedSyncStores {
+    scoped: Store,
+    admin: Store,
+}
+
 fn open_memory_store(root: &Path) -> Result<Store, MemoryCliError> {
+    open_memory_store_for_sync(root, false)
+}
+
+fn open_memory_store_for_sync(
+    root: &Path,
+    allow_schema_version_mismatch_for_sync: bool,
+) -> Result<Store, MemoryCliError> {
+    let db_path = memory_db_path(root);
+    let expected_schema_version =
+        expected_schema_version_for_sync_open(&db_path, allow_schema_version_mismatch_for_sync);
+    open_memory_store_with_expected_schema(root, expected_schema_version)
+}
+
+fn open_memory_store_with_expected_schema(
+    root: &Path,
+    expected_schema_version: u32,
+) -> Result<Store, MemoryCliError> {
     fs::create_dir_all(root).map_err(|err| MemoryCliError::Io(err.to_string()))?;
     let mut config = StoreConfig {
         db_path: memory_db_path(root),
+        expected_schema_version,
         ..Default::default()
     };
     if env::var_os("CG_USE_TEST_LEXICAL_EMBEDDER").is_some() {
@@ -1161,6 +2345,58 @@ fn open_memory_store(root: &Path) -> Result<Store, MemoryCliError> {
         .map_err(|err| MemoryCliError::Store(format!("{err:?}")));
     }
     Store::open(config).map_err(|err| MemoryCliError::Store(format!("{err:?}")))
+}
+
+fn open_scoped_memory_store_for_sync(
+    root: &Path,
+    context_label: &str,
+    allow_schema_version_mismatch_for_sync: bool,
+) -> Result<OpenedSyncStores, MemoryCliError> {
+    let db_path = memory_db_path(root);
+    let expected_schema_version =
+        expected_schema_version_for_sync_open(&db_path, allow_schema_version_mismatch_for_sync);
+    let admin_store = open_memory_store_with_expected_schema(root, expected_schema_version)?;
+    let context = ensure_cli_context(&admin_store, context_label)
+        .map_err(|err| MemoryCliError::Store(format!("{err:?}")))?;
+    let mut config = StoreConfig {
+        expected_schema_version,
+        db_path,
+        ..Default::default()
+    };
+    if env::var_os("CG_USE_TEST_LEXICAL_EMBEDDER").is_some() {
+        config.default_text_embedder = None;
+    }
+    let scoped = Store::open_with_contexts(config, BTreeSet::from([context.id]))
+        .map_err(|err| MemoryCliError::Store(format!("{err:?}")))?;
+    Ok(OpenedSyncStores {
+        scoped,
+        admin: admin_store,
+    })
+}
+
+fn expected_schema_version_for_sync_open(
+    db_path: &Path,
+    allow_schema_version_mismatch_for_sync: bool,
+) -> u32 {
+    if !allow_schema_version_mismatch_for_sync {
+        return CG_SCHEMA_VERSION;
+    }
+    existing_schema_version(db_path).unwrap_or(CG_SCHEMA_VERSION)
+}
+
+fn existing_schema_version(db_path: &Path) -> Option<u32> {
+    if !db_path.exists() {
+        return None;
+    }
+    let db = Database::open(db_path).ok()?;
+    let rows = db.scan("cg_schema_version", db.snapshot()).ok()?;
+    if rows.len() != 1 {
+        return None;
+    }
+    match rows[0].values.get("version") {
+        Some(DbValue::Int64(version)) => u32::try_from(*version).ok(),
+        _ => None,
+    }
 }
 
 fn ensure_cli_context(store: &Store, label: &str) -> context_graph::Result<context_graph::Context> {
@@ -1184,14 +2420,10 @@ fn lookup_cli_context(
 }
 
 fn memory_context_label(args: &[String]) -> String {
-    flag_value(args, "--context").unwrap_or_else(default_location_context_label)
-}
-
-fn default_location_context_label() -> String {
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut hasher = DefaultHasher::new();
-    cwd.to_string_lossy().hash(&mut hasher);
-    format!("context:{:016x}", hasher.finish())
+    flag_value(args, "--context")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| flag_value(args, "--tenant-id").filter(|value| !value.trim().is_empty()))
+        .unwrap_or_else(|| "default".to_string())
 }
 
 fn memory_positional_args(args: &[String]) -> Vec<String> {
@@ -1208,6 +2440,8 @@ fn memory_positional_args(args: &[String]) -> Vec<String> {
                 | "--connection"
                 | "--log"
                 | "--context"
+                | "--tenant-id"
+                | "--remote-server"
                 | "--cross-context"
                 | "--chunk-tokens"
                 | "--context-fraction"
@@ -1219,6 +2453,8 @@ fn memory_positional_args(args: &[String]) -> Vec<String> {
             || arg.starts_with("--connection=")
             || arg.starts_with("--log=")
             || arg.starts_with("--context=")
+            || arg.starts_with("--tenant-id=")
+            || arg.starts_with("--remote-server=")
             || arg.starts_with("--cross-context=")
             || arg.starts_with("--chunk-tokens=")
             || arg.starts_with("--context-fraction=")
@@ -1241,12 +2477,19 @@ fn strip_memory_args(args: &[String]) -> Vec<String> {
         }
         if matches!(
             arg.as_str(),
-            "--context" | "--cross-context" | "--chunk-tokens" | "--context-fraction"
+            "--context"
+                | "--tenant-id"
+                | "--remote-server"
+                | "--cross-context"
+                | "--chunk-tokens"
+                | "--context-fraction"
         ) {
             skip_next = true;
             continue;
         }
         if arg.starts_with("--context=")
+            || arg.starts_with("--tenant-id=")
+            || arg.starts_with("--remote-server=")
             || arg.starts_with("--cross-context=")
             || arg.starts_with("--chunk-tokens=")
             || arg.starts_with("--context-fraction=")
@@ -1296,6 +2539,16 @@ struct ConnectedModelExtractor {
     root: PathBuf,
     context_id: ContextId,
     connection_name: String,
+    usage: Arc<Mutex<Vec<ModelCallUsage>>>,
+    progress_timer: Option<ModelProgressTimer>,
+}
+
+type ModelProgressTimer = Arc<dyn Fn(usize, Duration) + Send + Sync>;
+
+struct ConnectedModelReply {
+    text: String,
+    usage: Option<ProviderUsage>,
+    elapsed: Duration,
 }
 
 impl ConnectedModelExtractor {
@@ -1304,10 +2557,18 @@ impl ConnectedModelExtractor {
             root: root.to_path_buf(),
             context_id,
             connection_name,
+            usage: Arc::new(Mutex::new(Vec::new())),
+            progress_timer: None,
         })
     }
 
-    fn call_model(&self, prompt: String) -> context_graph::Result<String> {
+    fn with_progress_timer(mut self, progress_timer: ModelProgressTimer) -> Self {
+        self.progress_timer = Some(progress_timer);
+        self
+    }
+
+    fn call_model(&self, prompt: String) -> context_graph::Result<ConnectedModelReply> {
+        let started = Instant::now();
         let catalog = ModelConnectionCatalog::open(&self.root);
         if let Some(error) = catalog.load_error() {
             return Err(CgError::Engine(format!(
@@ -1324,11 +2585,16 @@ impl ConnectedModelExtractor {
             model_connection_system_principal(),
             PrincipalAwareConfig::default(),
         );
-        match connection.credential_reference.source {
+        self.schedule_progress_timer(started);
+        let reply = match connection.credential_reference.source {
             CredentialSource::HostSession { .. } => runtime
                 .prove_host_session_connection(&self.connection_name, &prompt, false)
-                .map(|proof| proof.reply)
-                .map_err(model_proof_to_cg_error),
+                .map(|proof| ConnectedModelReply {
+                    text: proof.reply,
+                    usage: proof.usage,
+                    elapsed: started.elapsed().max(Duration::from_millis(1)),
+                })
+                .map_err(model_proof_to_cg_error)?,
             _ => {
                 let outcome = runtime
                     .understand(UnderstandingRequest {
@@ -1349,8 +2615,47 @@ impl ConnectedModelExtractor {
                         "model extraction failed: runtime degraded before extraction: {bucket:?}"
                     )));
                 }
-                Ok(outcome.phrasing.unwrap_or(outcome.marker))
+                ConnectedModelReply {
+                    text: outcome.phrasing.unwrap_or(outcome.marker),
+                    usage: outcome.usage,
+                    elapsed: started.elapsed().max(Duration::from_millis(1)),
+                }
             }
+        };
+        self.record_usage(reply.usage.clone(), reply.elapsed);
+        Ok(reply)
+    }
+
+    fn schedule_progress_timer(&self, started: Instant) {
+        let Some(progress_timer) = self.progress_timer.clone() else {
+            return;
+        };
+        let call_index = self.usage.lock().map(|calls| calls.len() + 1).unwrap_or(1);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            progress_timer(call_index, started.elapsed());
+        });
+    }
+
+    fn record_usage(&self, usage: Option<ProviderUsage>, elapsed: Duration) {
+        let usage = match usage {
+            Some(usage)
+                if usage.prompt_tokens == 0
+                    && usage.completion_tokens == 0
+                    && usage.total_tokens == 0 =>
+            {
+                UsageReportState::Zero
+            }
+            Some(usage) => UsageReportState::Tokens(usage),
+            None => UsageReportState::Unavailable,
+        };
+        if let Ok(mut calls) = self.usage.lock() {
+            let chunk_index = calls.len() + 1;
+            calls.push(ModelCallUsage {
+                chunk_index,
+                usage,
+                elapsed,
+            });
         }
     }
 }
@@ -1363,12 +2668,12 @@ impl ConversationExtractor for ConnectedModelExtractor {
             request.prior_decisions,
         );
         let reply = self.call_model(prompt.clone())?;
-        match parse_structured_harvest_reply(&reply) {
+        match parse_structured_harvest_reply(&reply.text) {
             Ok(harvest) => Ok(harvest),
             Err(first_err) => {
-                let repair_prompt = structured_capture_repair_prompt(&prompt, &reply);
+                let repair_prompt = structured_capture_repair_prompt(&prompt, &reply.text);
                 let retry = self.call_model(repair_prompt)?;
-                parse_structured_harvest_reply(&retry).map_err(|retry_err| {
+                parse_structured_harvest_reply(&retry.text).map_err(|retry_err| {
                     CgError::Engine(format!(
                         "{retry_err}; first extraction parse error was: {first_err}"
                     ))
@@ -1386,17 +2691,24 @@ impl ConversationExtractor for ConnectedModelExtractor {
         }
         let prompt = relation_classification_prompt(&request);
         let reply = self.call_model(prompt.clone())?;
-        match parse_relation_reply(&reply, request.prior_decisions) {
+        match parse_relation_reply(&reply.text, request.prior_decisions) {
             Ok(relation) => Ok(relation),
             Err(first_err) => {
-                let retry = self.call_model(relation_repair_prompt(&prompt, &reply))?;
-                parse_relation_reply(&retry, request.prior_decisions).map_err(|retry_err| {
+                let retry = self.call_model(relation_repair_prompt(&prompt, &reply.text))?;
+                parse_relation_reply(&retry.text, request.prior_decisions).map_err(|retry_err| {
                     CgError::Engine(format!(
                         "{retry_err}; first relation parse error was: {first_err}"
                     ))
                 })
             }
         }
+    }
+
+    fn drain_model_usage(&self) -> Vec<ModelCallUsage> {
+        self.usage
+            .lock()
+            .map(|mut calls| std::mem::take(&mut *calls))
+            .unwrap_or_default()
     }
 }
 
@@ -1642,8 +2954,7 @@ fn print_capture_report(
         .iter()
         .map(notice_json)
         .collect::<Vec<_>>();
-    print_memory_json(
-        json!({
+    let mut value = json!({
             "ok": true,
             "mode": format!("{:?}", report.mode),
             "captured": counts_json(&report.last_harvest),
@@ -1663,11 +2974,18 @@ fn print_capture_report(
             "resolved_chunk_window": report.resolved_chunk_window,
             "model_context_tokens": report.model_context_tokens,
             "rendered": render_capture_summary(report),
-        }),
-        db_path,
-        context_label,
-        Some(context_id),
-    );
+    });
+    if !report.model_usage.is_empty()
+        && let Some(object) = value.as_object_mut()
+    {
+        let receipt = usage_receipt_from_calls(
+            report.model_usage.clone(),
+            CapturePricing::FlatSubscription,
+            Duration::ZERO,
+        );
+        object.insert("usage".to_string(), usage_receipt_json(&receipt));
+    }
+    print_memory_json(value, db_path, context_label, Some(context_id));
 }
 
 fn print_memory_json(

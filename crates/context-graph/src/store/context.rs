@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use contextdb_core::Value;
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::Result;
 use crate::error::CgError;
@@ -16,7 +18,7 @@ use super::encode::{
 
 impl Store {
     pub fn create_context(&self, input: CreateContext) -> Result<Context> {
-        let id = ContextId::new_v7();
+        let id = deterministic_context_id(&input.name);
         let labels_json = JsonValue::Array(
             input
                 .labels
@@ -120,6 +122,18 @@ impl Store {
         }
         Ok(Some(decode_context(&result.columns, &result.rows[0])?))
     }
+}
+
+fn deterministic_context_id(name: &str) -> ContextId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"context-graph/context/");
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ContextId::from(Uuid::from_bytes(bytes))
 }
 
 fn decode_context(columns: &[String], row: &[Value]) -> Result<Context> {

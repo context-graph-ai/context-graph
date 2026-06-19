@@ -92,7 +92,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "outcomes",
-        ddl: "CREATE TABLE outcomes (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), decision_id UUID NOT NULL REFERENCES decisions(id), success BOOLEAN NOT NULL, notes TEXT, recorded_at TXID NOT NULL, UNIQUE (context_id, id), FOREIGN KEY (context_id, decision_id) REFERENCES decisions(context_id, id))",
+        ddl: "CREATE TABLE outcomes (id UUID PRIMARY KEY, decision_id UUID NOT NULL REFERENCES decisions(id), context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), success BOOLEAN NOT NULL, notes TEXT, recorded_at TXID NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, decision_id), FOREIGN KEY (context_id, decision_id) REFERENCES decisions(context_id, id))",
     },
     TableSpec {
         name: "invalidations",

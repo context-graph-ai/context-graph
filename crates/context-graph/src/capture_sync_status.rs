@@ -1,14 +1,26 @@
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
-use std::time::Duration;
+use std::pin::Pin;
+use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use contextdb_core::Lsn;
-use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
+use contextdb_engine::sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection};
 use serde_json::Value;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::ingest::{
-    CaptureReport, CaptureRequest, ConversationExtractor, record_conversation_with_extractor,
+    CaptureReport, CaptureRequest, ConversationExtractor, ExtractionRequest,
+    RollingCaptureAccumulator, record_conversation_with_extractor,
 };
-use crate::{ContextId, Result, Store};
+use crate::schema::TABLES;
+use crate::{
+    CgError, ContextId, CreateEntity, EntityId, EntityType, EvidenceId, EvidenceKind,
+    EvidenceProducer, EvidenceRef, ListEntityFilter, ObservationId, RecordObservation, Result,
+    RetentionStatus, Store,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderUsage {
@@ -24,7 +36,7 @@ pub enum UsageReportState {
     Zero,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCallUsage {
     pub chunk_index: usize,
     pub usage: UsageReportState,
@@ -135,6 +147,12 @@ pub struct CapturedUsage {
     pub total_tokens: u64,
 }
 
+impl CapturedUsage {
+    pub fn to_properties_value(&self) -> Value {
+        Value::from(self.total_tokens)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultContextCaptureResult {
     pub context_id: ContextId,
@@ -155,74 +173,525 @@ pub trait SyncStatusBoundary {
     fn is_connected(&self) -> bool;
 }
 
-impl From<CapturedUsage> for Value {
-    fn from(value: CapturedUsage) -> Self {
-        Value::from(value.total_tokens)
+pub type SyncDrainFuture<'a> = Pin<Box<dyn Future<Output = Result<ApplyResult>> + 'a>>;
+pub type SyncProbeFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+
+pub trait SyncPushBoundary {
+    fn push_watermark(&self) -> Lsn;
+    fn has_pending_push_changes(&self) -> Result<bool>;
+    fn refresh_push_state(&self) -> SyncProbeFuture<'_> {
+        Box::pin(async { Ok(()) })
     }
+    fn push_round(&self) -> SyncDrainFuture<'_>;
+}
+
+pub trait SyncPullBoundary {
+    fn pull_watermark(&self) -> Lsn;
+    fn pull_round<'a>(&'a self, policies: &'a ConflictPolicies) -> SyncDrainFuture<'a>;
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncDrainReport {
+    pub rounds: usize,
+    pub result: ApplyResult,
 }
 
 pub fn capture_with_usage_visibility(
     store: &Store,
     request: CaptureRequest,
-    _max_chars_per_chunk: usize,
+    max_chars_per_chunk: usize,
     extractor: &dyn ConversationExtractor,
     _provider: &dyn HostedProviderBoundary,
-    _pricing: CapturePricing,
+    pricing: CapturePricing,
 ) -> Result<CaptureUsageReceipt> {
-    let _ = record_conversation_with_extractor(store, request, extractor)?;
-    Ok(CaptureUsageReceipt::default())
+    let started = Instant::now();
+    let context_label = request.context_label.clone();
+    let report =
+        capture_with_progress_observer(store, request, extractor, max_chars_per_chunk, |_| {})?;
+    let calls = report.model_usage;
+    let receipt = usage_receipt(calls, pricing, started.elapsed());
+    persist_usage_receipt(store, &context_label, &receipt)?;
+    Ok(receipt)
 }
 
 pub fn estimate_capture(
-    _transcript: &str,
-    _max_chars_per_chunk: usize,
-    _per_chunk_time: Duration,
-    _pricing: CapturePricing,
+    transcript: &str,
+    max_chars_per_chunk: usize,
+    per_chunk_time: Duration,
+    pricing: CapturePricing,
     _provider: &dyn HostedProviderBoundary,
 ) -> CaptureEstimate {
-    CaptureEstimate::default()
+    let projected_chunks = transcript_chunks(transcript, max_chars_per_chunk).len();
+    let projected_token_count = projected_chunks as u64 * 1290;
+    let projected_tokens = Some(projected_token_count);
+    let projected_dollars = match pricing {
+        CapturePricing::FlatSubscription => None,
+        CapturePricing::PayPerToken { usd_per_token } => {
+            Some(projected_token_count as f64 * usd_per_token)
+        }
+    };
+    CaptureEstimate {
+        provider_calls: 0,
+        projected_chunks,
+        projected_tokens,
+        projected_time: per_chunk_time * projected_chunks as u32,
+        projected_dollars,
+    }
 }
 
 pub fn capture_with_progress_observer(
     store: &Store,
     request: CaptureRequest,
     extractor: &dyn ConversationExtractor,
-    _chunk_window: usize,
-    _observer: impl FnMut(CaptureProgressEvent),
+    chunk_window: usize,
+    mut observer: impl FnMut(CaptureProgressEvent),
 ) -> Result<CaptureReport> {
-    record_conversation_with_extractor(store, request, extractor)
+    let text = request.transcript.as_str();
+    if text.trim().is_empty() {
+        return record_conversation_with_extractor(store, request, extractor);
+    }
+    let chunks = transcript_chunks(text, chunk_window);
+    let total_chunks = chunks.len();
+    let started = Instant::now();
+    if total_chunks == 1 {
+        observer(progress_event(
+            1,
+            total_chunks,
+            started.elapsed(),
+            ProgressKind::InFlight,
+        ));
+        let mut report = record_conversation_with_extractor(store, request, extractor)?;
+        observer(progress_event(
+            1,
+            total_chunks,
+            started.elapsed(),
+            ProgressKind::Completed,
+        ));
+        report.resolved_chunk_window = Some(chunk_window.max(1));
+        return Ok(report);
+    }
+    let mut rolling = RollingCaptureAccumulator::new(16_000);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let chunk_index = index + 1;
+        observer(progress_event(
+            chunk_index,
+            total_chunks,
+            started.elapsed(),
+            ProgressKind::InFlight,
+        ));
+        let harvest = extractor.extract(ExtractionRequest {
+            context_label: &request.context_label,
+            transcript: chunk,
+            prior_decisions: &[],
+        })?;
+        rolling.push_harvest(harvest);
+        observer(progress_event(
+            chunk_index,
+            total_chunks,
+            started.elapsed(),
+            ProgressKind::Completed,
+        ));
+    }
+    let mut report =
+        rolling.finish_capture(store, &request.context_label, total_chunks, extractor)?;
+    report.resolved_chunk_window = Some(chunk_window.max(1));
+    Ok(report)
 }
 
-fn default_capture_context_id(
-    _tenant_id: Option<&str>,
-    _explicit_context: Option<&str>,
+fn default_capture_context_label(
+    tenant_id: Option<&str>,
+    explicit_context: Option<&str>,
     _cwd: &Path,
-) -> ContextId {
-    ContextId::new_v7()
+) -> String {
+    explicit_context
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            tenant_id
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "default".to_string())
 }
 
 pub fn capture_with_default_context(
-    _store: &Store,
+    store: &Store,
     tenant_id: Option<&str>,
     explicit_context: Option<&str>,
     cwd: &Path,
-    _transcript: &str,
-    _extractor: &dyn ConversationExtractor,
+    transcript: &str,
+    extractor: &dyn ConversationExtractor,
 ) -> Result<DefaultContextCaptureResult> {
-    Ok(DefaultContextCaptureResult {
-        context_id: default_capture_context_id(tenant_id, explicit_context, cwd),
-    })
+    let context_label = default_capture_context_label(tenant_id, explicit_context, cwd);
+    let _ = record_conversation_with_extractor(
+        store,
+        CaptureRequest {
+            context_label: context_label.clone(),
+            transcript: transcript.to_string(),
+            model_available: true,
+        },
+        extractor,
+    )?;
+    let context_id = store
+        .list_contexts()?
+        .into_iter()
+        .find(|context| context.name == context_label)
+        .map(|context| context.id)
+        .ok_or_else(|| CgError::Engine(format!("capture context not found: {context_label}")))?;
+    Ok(DefaultContextCaptureResult { context_id })
 }
 
 pub fn sync_status_report(
     _store: &Store,
-    _remote_url: Option<&str>,
-    _tenant_id: Option<&str>,
-    _boundary: Option<&dyn SyncStatusBoundary>,
+    remote_url: Option<&str>,
+    tenant_id: Option<&str>,
+    boundary: Option<&dyn SyncStatusBoundary>,
 ) -> SyncStatusReport {
-    SyncStatusReport::default()
+    let Some(boundary) = boundary else {
+        return SyncStatusReport {
+            remote_url: remote_url.map(str::to_string),
+            tenant_id: tenant_id.map(str::to_string),
+            ..SyncStatusReport::default()
+        };
+    };
+    SyncStatusReport {
+        remote_url: remote_url.map(str::to_string),
+        tenant_id: tenant_id.map(str::to_string),
+        push_watermark: boundary.push_watermark(),
+        pull_watermark: boundary.pull_watermark(),
+        pending_push_count: boundary
+            .pending_push_change_count()
+            .unwrap_or_else(|_| usize::from(boundary.has_pending_push_changes().unwrap_or(false))),
+        sync_client_constructed: true,
+        nats_connection_opened: boundary.is_connected(),
+    }
+}
+
+pub async fn drain_sync_push(boundary: &dyn SyncPushBoundary) -> Result<SyncDrainReport> {
+    let mut report = empty_sync_drain_report(boundary.push_watermark());
+    for _ in 0..MAX_SYNC_DRAIN_ROUNDS {
+        boundary.refresh_push_state().await?;
+        if !boundary.has_pending_push_changes()? {
+            return Ok(report);
+        }
+        let before = boundary.push_watermark();
+        let round = boundary.push_round().await?;
+        merge_sync_round(&mut report, round, boundary.push_watermark());
+        if !boundary.has_pending_push_changes()? {
+            return Ok(report);
+        }
+        if boundary.push_watermark() == before {
+            return Err(CgError::Engine(
+                "cg sync push made no progress while pending changes remained".to_string(),
+            ));
+        }
+    }
+    Err(CgError::Engine(format!(
+        "cg sync push did not drain pending changes after {MAX_SYNC_DRAIN_ROUNDS} rounds"
+    )))
+}
+
+pub async fn drain_sync_pull(
+    boundary: &dyn SyncPullBoundary,
+    policies: &ConflictPolicies,
+) -> Result<SyncDrainReport> {
+    let mut report = empty_sync_drain_report(boundary.pull_watermark());
+    for _ in 0..MAX_SYNC_DRAIN_ROUNDS {
+        let before = boundary.pull_watermark();
+        let round = boundary.pull_round(policies).await?;
+        let after = boundary.pull_watermark();
+        merge_sync_round(&mut report, round, after);
+        if after == before {
+            return Ok(report);
+        }
+    }
+    Err(CgError::Engine(format!(
+        "cg sync pull did not drain remote changes after {MAX_SYNC_DRAIN_ROUNDS} rounds"
+    )))
 }
 
 pub fn context_graph_sync_table_contract() -> Vec<ContextGraphSyncTablePolicy> {
-    Vec::new()
+    TABLES
+        .iter()
+        .map(|table| {
+            let (direction, conflict_policy) = sync_policy_for_table(table.name);
+            ContextGraphSyncTablePolicy {
+                table: table.name,
+                direction,
+                conflict_policy,
+            }
+        })
+        .collect()
+}
+
+const MAX_SYNC_DRAIN_ROUNDS: usize = 32;
+
+fn empty_sync_drain_report(lsn: Lsn) -> SyncDrainReport {
+    SyncDrainReport {
+        rounds: 0,
+        result: ApplyResult {
+            applied_rows: 0,
+            skipped_rows: 0,
+            conflicts: Vec::new(),
+            new_lsn: lsn,
+        },
+    }
+}
+
+fn merge_sync_round(report: &mut SyncDrainReport, round: ApplyResult, watermark: Lsn) {
+    report.rounds += 1;
+    report.result.applied_rows += round.applied_rows;
+    report.result.skipped_rows += round.skipped_rows;
+    report.result.conflicts.extend(round.conflicts);
+    report.result.new_lsn = watermark;
+}
+
+pub fn provider_usage_from_str(body: &str) -> Option<ProviderUsage> {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| provider_usage_from_value(&value))
+}
+
+pub fn provider_usage_from_value(value: &Value) -> Option<ProviderUsage> {
+    let usage = value.get("usage")?;
+    let prompt_tokens = token_field(usage, &["prompt_tokens", "input_tokens"])?;
+    let completion_tokens = token_field(usage, &["completion_tokens", "output_tokens"])?;
+    let total_tokens = token_field(usage, &["total_tokens"])
+        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+    Some(ProviderUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    })
+}
+
+fn token_field(value: &Value, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_u64))
+}
+
+fn usage_receipt(
+    calls: Vec<ModelCallUsage>,
+    pricing: CapturePricing,
+    measured_elapsed: Duration,
+) -> CaptureUsageReceipt {
+    let chunk_elapsed = calls.iter().map(|call| call.elapsed).collect::<Vec<_>>();
+    let summed_elapsed = chunk_elapsed.iter().copied().sum::<Duration>();
+    let total_tokens = if calls.is_empty()
+        || calls
+            .iter()
+            .any(|call| matches!(call.usage, UsageReportState::Unavailable))
+    {
+        None
+    } else {
+        Some(
+            calls
+                .iter()
+                .map(|call| match &call.usage {
+                    UsageReportState::Tokens(usage) => usage.total_tokens,
+                    UsageReportState::Zero => 0,
+                    UsageReportState::Unavailable => 0,
+                })
+                .sum::<u64>(),
+        )
+    };
+    let dollars = match (pricing, total_tokens) {
+        (CapturePricing::PayPerToken { usd_per_token }, Some(tokens)) => {
+            Some(tokens as f64 * usd_per_token)
+        }
+        _ => None,
+    };
+    CaptureUsageReceipt {
+        calls,
+        total_tokens,
+        elapsed: measured_elapsed.max(summed_elapsed),
+        chunk_elapsed,
+        dollars,
+    }
+}
+
+pub fn usage_receipt_from_calls(
+    calls: Vec<ModelCallUsage>,
+    pricing: CapturePricing,
+    measured_elapsed: Duration,
+) -> CaptureUsageReceipt {
+    usage_receipt(calls, pricing, measured_elapsed)
+}
+
+pub fn usage_receipt_json(receipt: &CaptureUsageReceipt) -> Value {
+    json!({
+        "calls": receipt.calls.iter().map(model_call_usage_json).collect::<Vec<_>>(),
+        "total_tokens": receipt.total_tokens,
+        "elapsed_ms": receipt.elapsed.as_millis() as u64,
+        "dollars": receipt.dollars,
+    })
+}
+
+fn persist_usage_receipt(
+    store: &Store,
+    context_label: &str,
+    receipt: &CaptureUsageReceipt,
+) -> Result<()> {
+    if receipt.calls.is_empty() {
+        return Ok(());
+    }
+    let context_id = store
+        .list_contexts()?
+        .into_iter()
+        .find(|context| context.name == context_label)
+        .map(|context| context.id)
+        .ok_or_else(|| CgError::Engine(format!("capture context not found: {context_label}")))?;
+    let usage = usage_receipt_json(receipt);
+    let observed_at = Utc::now();
+    let observation_id = ObservationId::new_v7();
+    let evidence_id = EvidenceId::new_v7();
+    let hash = hex_sha256(&usage.to_string());
+    store.record_observation(RecordObservation {
+        id: observation_id,
+        entity_id: provider_usage_entity_id(store, context_id)?,
+        context_id,
+        observation_type: "provider_usage".to_string(),
+        source: "context-graph:capture-usage".to_string(),
+        observed_at,
+        evidence: vec![EvidenceRef {
+            id: evidence_id,
+            observation_id,
+            context_id,
+            kind: EvidenceKind::StructuredSignal,
+            source_ref: format!("cas://sha256:{hash}"),
+            content_hash: Some(format!("sha256:{hash}")),
+            captured_at: Some(observed_at),
+            producer: EvidenceProducer {
+                system: "context-graph".to_string(),
+                pipeline_version: "capture-usage-v1".to_string(),
+                ..Default::default()
+            },
+            retention_status: RetentionStatus::RetainedExternal,
+            properties: BTreeMap::from([("usage".to_string(), usage.clone())]),
+            ..Default::default()
+        }],
+        observed_properties: BTreeMap::new(),
+        state_delta: BTreeMap::new(),
+        properties: BTreeMap::from([("usage".to_string(), usage)]),
+        embeddings: Vec::new(),
+    })?;
+    Ok(())
+}
+
+fn model_call_usage_json(call: &ModelCallUsage) -> Value {
+    match &call.usage {
+        UsageReportState::Tokens(usage) => json!({
+            "chunk_index": call.chunk_index,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+            "elapsed_ms": call.elapsed.as_millis() as u64,
+        }),
+        UsageReportState::Zero => json!({
+            "chunk_index": call.chunk_index,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "elapsed_ms": call.elapsed.as_millis() as u64,
+        }),
+        UsageReportState::Unavailable => json!({
+            "chunk_index": call.chunk_index,
+            "usage": null,
+            "elapsed_ms": call.elapsed.as_millis() as u64,
+        }),
+    }
+}
+
+fn progress_event(
+    chunk_index: usize,
+    total_chunks: usize,
+    elapsed: Duration,
+    kind: ProgressKind,
+) -> CaptureProgressEvent {
+    let remaining_chunks = match kind {
+        ProgressKind::InFlight => total_chunks.saturating_sub(chunk_index) + 1,
+        ProgressKind::Completed => total_chunks.saturating_sub(chunk_index),
+    };
+    CaptureProgressEvent {
+        chunk_index,
+        total_chunks,
+        elapsed,
+        rough_remaining: Duration::from_millis(remaining_chunks as u64 * 100),
+        kind,
+    }
+}
+
+fn transcript_chunks(text: &str, max_chars_per_chunk: usize) -> Vec<&str> {
+    let chunk_window = max_chars_per_chunk.max(1);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + chunk_window).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = text[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(text.len());
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
+}
+
+fn hex_sha256(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn provider_usage_entity_id(store: &Store, context_id: ContextId) -> Result<EntityId> {
+    const NAME: &str = "provider usage model";
+    if let Some(entity) = store
+        .list_entities(ListEntityFilter {
+            entity_type: Some(EntityType::Service),
+            name_contains: Some(NAME.to_string()),
+            context_id: Some(context_id),
+            ..Default::default()
+        })?
+        .into_iter()
+        .find(|entity| entity.name == NAME)
+    {
+        return Ok(entity.id);
+    }
+    let entity = store.create_entity(CreateEntity {
+        entity_type: EntityType::Service,
+        name: NAME.to_string(),
+        properties: BTreeMap::from([(
+            "usage_role".to_string(),
+            Value::String("provider_usage".to_string()),
+        )]),
+        tags: vec!["provider_usage".to_string()],
+        context_id,
+    })?;
+    Ok(entity.id)
+}
+
+fn sync_policy_for_table(table: &str) -> (SyncDirection, ConflictPolicy) {
+    let write_once = (SyncDirection::Both, ConflictPolicy::InsertIfNotExists);
+    let hub_arbitrated = (SyncDirection::Both, ConflictPolicy::ServerWins);
+    match table {
+        "audit_log" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
+        "intentions"
+        | "decisions"
+        | "entities"
+        | "reindex_cursors"
+        | "outcomes"
+        | "invalidations"
+        | "entity_current_snapshots" => hub_arbitrated,
+        _ => write_once,
+    }
 }
