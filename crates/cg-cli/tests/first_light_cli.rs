@@ -1,6 +1,6 @@
 mod support;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
@@ -16,7 +16,7 @@ use context_graph::{
 };
 use contextdb_core::Value as DbValue;
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
+use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, DdlChange, SyncDirection};
 use contextdb_server::{SyncClient, SyncServer};
 use serde_json::Value;
 use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider, cg_bin};
@@ -647,11 +647,62 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
 fn cli_expected_pending_push_change_count(store: &Store, nats_url: &str, tenant_id: &str) -> usize {
     let client = SyncClient::new(store.sync_database(), nats_url, tenant_id);
     let directions = cli_sync_directions_from_contract();
-    let changes = client
-        .db()
-        .changes_since(client.push_watermark())
-        .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
+    let raw_changes = client.db().changes_since(client.push_watermark());
+    let changes = cli_expected_push_changes_without_trigger_ddl(&raw_changes, &directions);
     changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len()
+}
+
+fn cli_expected_push_changes_without_trigger_ddl(
+    raw: &contextdb_engine::sync_types::ChangeSet,
+    directions: &HashMap<String, SyncDirection>,
+) -> contextdb_engine::sync_types::ChangeSet {
+    let mut filtered = raw
+        .clone()
+        .filter_by_direction(directions, &[SyncDirection::Push, SyncDirection::Both]);
+    restore_expected_non_trigger_schema_ddl(&mut filtered, raw);
+    filtered
+}
+
+fn restore_expected_non_trigger_schema_ddl(
+    filtered: &mut contextdb_engine::sync_types::ChangeSet,
+    raw: &contextdb_engine::sync_types::ChangeSet,
+) {
+    let mut seen = filtered
+        .ddl
+        .iter()
+        .map(|ddl| format!("{ddl:?}"))
+        .collect::<BTreeSet<_>>();
+    let old_ddl = std::mem::take(&mut filtered.ddl);
+    let old_ddl_lsn = std::mem::take(&mut filtered.ddl_lsn);
+    for (index, change) in old_ddl.into_iter().enumerate() {
+        if is_trigger_ddl(&change) {
+            continue;
+        }
+        filtered.ddl.push(change);
+        if let Some(lsn) = old_ddl_lsn.get(index).copied() {
+            filtered.ddl_lsn.push(lsn);
+        }
+    }
+    for (index, change) in raw.ddl.iter().cloned().enumerate() {
+        if is_trigger_ddl(&change) {
+            continue;
+        }
+        let key = format!("{change:?}");
+        if !seen.insert(key) {
+            continue;
+        }
+        filtered.ddl.push(change);
+        if let Some(lsn) = raw.ddl_lsn.get(index).copied() {
+            filtered.ddl_lsn.push(lsn);
+        }
+    }
+}
+
+fn is_trigger_ddl(change: &DdlChange) -> bool {
+    matches!(
+        change,
+        DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. }
+    )
 }
 
 fn cli_sync_directions_from_contract() -> HashMap<String, SyncDirection> {
@@ -776,6 +827,26 @@ fn persisted_store(path: Option<std::path::PathBuf>) -> Option<Store> {
         })
         .ok()
     })
+}
+
+fn scoped_persisted_store(path: Option<std::path::PathBuf>, context_label: &str) -> Option<Store> {
+    let db_path = path?;
+    let admin = persisted_store(Some(db_path.clone()))?;
+    let context_id = admin
+        .list_contexts()
+        .ok()?
+        .into_iter()
+        .find(|context| context.name == context_label)?
+        .id;
+    Store::open_with_contexts(
+        StoreConfig {
+            db_path,
+            default_text_embedder: None,
+            ..Default::default()
+        },
+        BTreeSet::from([context_id]),
+    )
+    .ok()
 }
 
 fn persisted_decisions_for_intention(
@@ -1803,8 +1874,10 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
             local_audit_rows > 0,
             "fixture must produce local audit rows so the CLI sync path proves audit_log stays local"
         );
+        let scoped_store = scoped_persisted_store(Some(store_path.clone()), &fixture.tenant_id)
+            .expect("open scoped CLI store after record");
         let count = cli_expected_pending_push_change_count(
-            &store,
+            &scoped_store,
             fixture.nats_url.as_str(),
             fixture.tenant_id.as_str(),
         ) as u64;
@@ -1865,7 +1938,8 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         "shipped CLI sync push must register the production table contract and keep audit_log out of the hub"
     );
     let expected_drained = {
-        let store = persisted_store(Some(store_path)).expect("open CLI store after push");
+        let store = scoped_persisted_store(Some(store_path), &fixture.tenant_id)
+            .expect("open scoped CLI store after push");
         cli_expected_pending_push_change_count(
             &store,
             fixture.nats_url.as_str(),
