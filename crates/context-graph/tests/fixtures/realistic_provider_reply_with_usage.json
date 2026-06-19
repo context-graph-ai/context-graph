@@ -1,0 +1,44 @@
+[
+  {
+    "id": "chatcmpl-9XkF2nY7qP8mR1sT4uV6w",
+    "object": "chat.completion",
+    "created": 1766016000,
+    "model": "anthropic/claude-3-haiku",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "{\"summary\":\"chunk one\",\"goals\":[{\"key\":\"G1\",\"text\":\"share memory\"}],\"entities\":[{\"key\":\"E1\",\"name\":\"context graph\",\"path\":\"context-graph\"}],\"decisions\":[{\"key\":\"D1\",\"text\":\"use contextdb sync\",\"goal_key\":\"G1\",\"entity_key\":\"E1\"}],\"observations\":[]}"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1200,
+      "completion_tokens": 180,
+      "total_tokens": 1380
+    }
+  },
+  {
+    "id": "chatcmpl-3LqN8rB5vC2zH9aM6dE1f",
+    "object": "chat.completion",
+    "created": 1766016060,
+    "model": "anthropic/claude-3-haiku",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "{\"summary\":\"chunk two\",\"goals\":[],\"entities\":[{\"key\":\"E2\",\"name\":\"laptop edge\",\"path\":\"laptop\"}],\"decisions\":[],\"observations\":[{\"key\":\"O1\",\"text\":\"laptop captured while offline\",\"entity_key\":\"E2\"}]}"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 980,
+      "completion_tokens": 220,
+      "total_tokens": 1200
+    }
+  }
+]

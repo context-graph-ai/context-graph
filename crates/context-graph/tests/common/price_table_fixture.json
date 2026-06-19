@@ -1,0 +1,5 @@
+{
+  "anthropic/claude-3-haiku": {
+    "usd_per_token": 0.00000025
+  }
+}

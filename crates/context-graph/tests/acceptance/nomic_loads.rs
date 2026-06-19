@@ -1333,6 +1333,7 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "state_at",
     "supersede_decision",
     "supersede_history",
+    "sync_database",
     "traverse",
     "update_decision",
     "update_decision_basis",

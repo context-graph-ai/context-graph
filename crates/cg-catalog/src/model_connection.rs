@@ -2004,6 +2004,7 @@ impl HostSessionLlmClient {
             phrasing: reply,
             advisory_flag: false,
             malformed: false,
+            usage: None,
         })
     }
 }
@@ -5410,6 +5411,7 @@ fn success_outcome(
         resolved_connection: invocation.resolved_connection.clone(),
         cache_path_consulted: invocation.cache_path.clone(),
         stored_understanding: None,
+        usage: reply.usage,
     }
 }
 
@@ -5441,6 +5443,7 @@ fn understand_local_single_file(
         ),
         advisory_flag: false,
         malformed: false,
+        usage: None,
     })
 }
 
@@ -5677,6 +5680,7 @@ fn understand_hosted(
                 phrasing: String::new(),
                 advisory_flag: false,
                 malformed: true,
+                usage: None,
             });
         }
     };
@@ -5685,6 +5689,7 @@ fn understand_hosted(
         phrasing,
         advisory_flag: false,
         malformed: false,
+        usage: None,
     })
 }
 
@@ -6230,5 +6235,6 @@ fn degraded_outcome(
         resolved_connection: None,
         cache_path_consulted: None,
         stored_understanding: Some(request.input.clone()),
+        usage: None,
     }
 }

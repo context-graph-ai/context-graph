@@ -1,14 +1,18 @@
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use cg_catalog::{
-    CacheStatus, Capability, Catalog, CatalogEntry, CredentialResolution, DEGRADED_MARKER, License,
-    MigrationRecord, MissingConnectionOutcome, ModelConnectionCatalog, ModelKind,
-    PrincipalAwareConfig, Source, UnderstandingRuntime, UnderstandingRuntimeError,
+    CacheStatus, Capability, Catalog, CatalogEntry, CredentialResolution, DEGRADED_MARKER,
+    HostedModelConnectionRequest, License, MigrationRecord, MissingConnectionOutcome,
+    ModelConnectionCatalog, ModelKind, PrincipalAwareConfig, Source, UnderstandingRuntime,
+    UnderstandingRuntimeError,
 };
 use context_graph::{
-    ContextId, DeploymentSurface, LlmClient, ModelInvocation, ModelReply, Principal,
+    ContextId, DeploymentSurface, LlmClient, ModelInvocation, ModelReply, Principal, ProviderUsage,
     UnderstandingConsumer, UnderstandingRequest,
 };
 use tempfile::TempDir;
@@ -43,6 +47,102 @@ fn request(context_id: ContextId, input: &str) -> UnderstandingRequest {
     }
 }
 
+fn spawn_chat_completion_server(body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback provider");
+    let address = listener.local_addr().expect("loopback provider address");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line).expect("read provider header");
+            if bytes == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse::<usize>().unwrap_or(0);
+            }
+        }
+        if content_length > 0 {
+            let mut request_body = vec![0; content_length];
+            reader
+                .read_exact(&mut request_body)
+                .expect("read provider request body");
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write provider response");
+    });
+    format!("http://{address}/v1")
+}
+
+#[test]
+fn hosted_chat_completion_runtime_carries_provider_usage() {
+    let dir = TempDir::new().expect("catalog dir");
+    let context_id = ContextId::new_v7();
+    let base_url = spawn_chat_completion_server(
+        r#"{
+  "id": "chatcmpl-loopback-usage",
+  "object": "chat.completion",
+  "created": 1766018000,
+  "model": "local-vllm/test-model",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "hosted usage survived"
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": {
+    "prompt_tokens": 37,
+    "completion_tokens": 11,
+    "total_tokens": 48
+  }
+}"#,
+    );
+    let mut catalog = open_catalog(&dir);
+    catalog
+        .connect_hosted_no_auth_result(HostedModelConnectionRequest {
+            connection_name: "loopback-usage".to_string(),
+            model_id: "loopback-usage-model".to_string(),
+            base_url,
+            provider: "local-vllm".to_string(),
+            provider_model: "test-model".to_string(),
+            consent_owner: Some("test quota".to_string()),
+        })
+        .expect("connect loopback provider");
+    catalog.bind_context_model(context_id, "loopback-usage-model");
+    let mut runtime = UnderstandingRuntime::<cg_catalog::NoopLlmClient>::new(
+        catalog,
+        developer(),
+        PrincipalAwareConfig::default(),
+    );
+
+    let outcome = runtime
+        .understand(request(context_id, "return a usage-bearing reply"))
+        .expect("hosted understanding succeeds");
+
+    assert_eq!(outcome.phrasing.as_deref(), Some("hosted usage survived"));
+    assert_eq!(
+        outcome.usage,
+        Some(ProviderUsage {
+            prompt_tokens: 37,
+            completion_tokens: 11,
+            total_tokens: 48
+        }),
+        "the shipped HTTP chat-completions runtime must carry the provider usage block, not only the test capture helper"
+    );
+}
+
 #[derive(Debug, Default)]
 struct ConnectionRecordingClient {
     observed: Mutex<Vec<(Option<String>, Option<String>)>>,
@@ -70,6 +170,7 @@ impl LlmClient for ConnectionRecordingClient {
             phrasing: format!("phrased:{}", invocation.request.input),
             advisory_flag: false,
             malformed: false,
+            usage: None,
         })
     }
 }

@@ -9,6 +9,7 @@ fn main() {
         phrasing: "model text must not become basis".to_string(),
         advisory_flag: true,
         malformed: false,
+        usage: None,
     };
 
     let _observation = RecordObservation {

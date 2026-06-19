@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use context_graph::embedder::mock::MockEmbedder;
 use context_graph::embedder::nomic::NomicTextEmbedder;
@@ -119,32 +120,20 @@ fn default_build_dependency_names(manifest_path: &str) -> Vec<String> {
     dependencies
 }
 
-fn locked_package_names() -> Vec<String> {
-    let lockfile = read_workspace_file("Cargo.lock");
-    let mut names = Vec::new();
-    let mut in_package = false;
-    let mut multiline = None;
-    for raw_line in lockfile.lines() {
-        let line = strip_unquoted_toml_comment(raw_line, &mut multiline);
-        let line = line.trim();
-        if line == "[[package]]" {
-            in_package = true;
-            continue;
-        }
-        if line.starts_with('[') {
-            in_package = false;
-            continue;
-        }
-        if in_package
-            && let Some((raw_key, raw_value)) = line.split_once('=')
-            && toml_key_parts(raw_key).as_slice() == ["name"]
-        {
-            let value = raw_value.trim().trim_matches('"').trim_matches('\'');
-            names.push(decode_toml_key_escapes(value));
-            in_package = false;
-        }
-    }
-    names
+fn default_build_tree(package: &str) -> String {
+    let output = Command::new("cargo")
+        .args(["tree", "-p", package, "--edges", "normal,build"])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run cargo tree for default build dependency audit");
+    assert!(
+        output.status.success(),
+        "cargo tree for {package} default build failed: status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("cargo tree output utf8")
 }
 
 fn assert_no_cargo_audit_aliases() {
@@ -1563,11 +1552,13 @@ fn default_build_dep_tree_for_context_graph_and_cg_catalog_has_no_tokio_runtime(
         !direct_default_build_deps.iter().any(|name| name == "tokio"),
         "context-graph + cg-catalog default-build manifests must not directly depend on tokio: {direct_default_build_deps:?}"
     );
-    let locked_packages = locked_package_names();
-    assert!(
-        !locked_packages.iter().any(|name| name == "tokio"),
-        "context-graph + cg-catalog default-build dependency tree must not pull tokio; Cargo.lock contains package `tokio`"
-    );
+    for package in ["context-graph", "cg-catalog"] {
+        let tree = default_build_tree(package);
+        assert!(
+            !tree.lines().any(|line| line.contains("tokio v")),
+            "{package} default-build dependency tree must not pull tokio:\n{tree}"
+        );
+    }
 }
 
 #[test]

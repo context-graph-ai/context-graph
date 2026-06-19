@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `serde_json::Value: From<CapturedUsage>` is not satisfied
+  --> tests/ui/usage_is_not_a_basis_input.rs:11:65
+   |
+11 |     state_delta.insert("usage.total_tokens".to_string(), Some(usage.into()));
+   |                                                                 ^^^^ the trait `From<CapturedUsage>` is not implemented for `serde_json::Value`
+   |
+   = note: required for `CapturedUsage` to implement `Into<serde_json::Value>`

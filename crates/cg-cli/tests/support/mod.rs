@@ -56,6 +56,24 @@ impl CliHarness {
         )
     }
 
+    pub fn run_with_stdin_observing_provider_before_exit(
+        &self,
+        args: &[&str],
+        stdin: &str,
+        needle: &str,
+        provider: Provider,
+    ) -> ObservedCommandOutput {
+        run_cg_observing_provider_before_exit_inner(
+            args,
+            self.data_root.path(),
+            &self.providers.path_env(),
+            Some(stdin),
+            needle,
+            &self.providers.completion_started_marker(provider),
+            &self.providers.completion_exited_marker(provider),
+        )
+    }
+
     pub fn run_observing_provider_before_exit(
         &self,
         args: &[&str],
@@ -147,6 +165,33 @@ pub fn run_cg_observing_provider_before_exit(
     provider_started_marker: &Path,
     provider_exited_marker: &Path,
 ) -> ObservedCommandOutput {
+    run_cg_observing_provider_before_exit_inner(
+        args,
+        data_root,
+        path_env,
+        None,
+        needle,
+        provider_started_marker,
+        provider_exited_marker,
+    )
+}
+
+fn run_cg_observing_provider_before_exit_inner(
+    args: &[&str],
+    data_root: &Path,
+    path_env: &str,
+    stdin: Option<&str>,
+    needle: &str,
+    provider_started_marker: &Path,
+    provider_exited_marker: &Path,
+) -> ObservedCommandOutput {
+    for marker in [provider_started_marker, provider_exited_marker] {
+        match fs::remove_file(marker) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => panic!("remove stale provider marker {}: {err}", marker.display()),
+        }
+    }
     let mut command = Command::new(cg_bin());
     command
         .args(args)
@@ -157,11 +202,21 @@ pub fn run_cg_observing_provider_before_exit(
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
         .env_remove("ANTHROPIC_API_KEY")
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     let mut child = command.spawn().expect("spawn compiled cg binary");
+    if let Some(stdin) = stdin
+        && let Some(mut child_stdin) = child.stdin.take()
+        && let Err(err) = child_stdin.write_all(stdin.as_bytes())
+    {
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe, "write cg stdin: {err}");
+    }
     let stdout = child.stdout.take().expect("take cg stdout");
     let stderr = child.stderr.take().expect("take cg stderr");
     let (tx, rx) = mpsc::channel();
@@ -344,6 +399,7 @@ impl LoginState {
 pub enum CompletionBehavior {
     Succeed,
     ExtractHarvest,
+    SleepThenExtractHarvest,
     Fail,
     BillingRequired,
     RateLimit,
@@ -357,6 +413,7 @@ impl CompletionBehavior {
         match self {
             Self::Succeed => "succeed",
             Self::ExtractHarvest => "extract-harvest",
+            Self::SleepThenExtractHarvest => "sleep-then-extract-harvest",
             Self::Fail => "fail",
             Self::BillingRequired => "billing-required",
             Self::RateLimit => "rate-limit",
@@ -678,6 +735,22 @@ TRACKED_ENV = [
     "CODEX_API_KEY",
 ]
 
+def completion_usage(reply):
+    output_tokens = len(reply.split())
+    return {
+        "input_tokens": 13,
+        "output_tokens": output_tokens,
+        "total_tokens": 13 + output_tokens,
+    }
+
+def expected_completion_usage(prompt):
+    behavior = read("completion_behavior", "succeed")
+    if behavior in ("extract-harvest", "sleep-then-extract-harvest"):
+        return completion_usage(harvest_json(prompt))
+    if behavior in ("succeed", "sleep-then-succeed"):
+        return completion_usage(proof(read("secret", "secret"), prompt))
+    return None
+
 def write_log(mode, prompt=""):
     record = {
         "provider": provider,
@@ -686,6 +759,10 @@ def write_log(mode, prompt=""):
         "prompt": prompt,
         "env": {name: os.environ[name] for name in TRACKED_ENV if name in os.environ},
     }
+    if mode == "completion":
+        usage = expected_completion_usage(prompt)
+        if usage is not None:
+            record["usage"] = usage
     with log_path.open("a") as out:
         out.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -1036,14 +1113,15 @@ def harvest_json(prompt):
     return json.dumps(harvest, sort_keys=True)
 
 def claude_envelope(reply, is_error=False, status=None):
+    usage = completion_usage(reply)
     return {
         "type": "result",
         "subtype": "success",
         "is_error": is_error,
         "api_error_status": status,
         "result": reply,
-        "usage": {"input_tokens": 13, "output_tokens": len(reply.split())},
-        "modelUsage": {"claude-sonnet-4-20250514": {"inputTokens": 13, "outputTokens": len(reply.split())}},
+        "usage": usage,
+        "modelUsage": {"claude-sonnet-4-20250514": {"inputTokens": usage["input_tokens"], "outputTokens": usage["output_tokens"]}},
     }
 
 if "--help" in args:
@@ -1146,7 +1224,7 @@ if read("login_state", "valid") == "expired":
 behavior = read("completion_behavior", "succeed")
 if behavior == "hang":
     time.sleep(120)
-if behavior == "sleep-then-succeed":
+if behavior in ("sleep-then-succeed", "sleep-then-extract-harvest"):
     time.sleep(1)
 if behavior == "billing-required":
     mark("completion_exited")
@@ -1170,7 +1248,7 @@ if behavior == "empty":
     mark("completion_exited")
     sys.exit(0)
 
-if behavior == "extract-harvest":
+if behavior in ("extract-harvest", "sleep-then-extract-harvest"):
     reply = harvest_json(prompt)
     mark("completion_exited")
     if provider == "claude":

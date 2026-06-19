@@ -1,0 +1,39 @@
+[
+  {
+    "id": "chatcmpl-7QaT2uL9xN4pS6dV1eR8y",
+    "object": "chat.completion",
+    "created": 1766016120,
+    "model": "anthropic/claude-3-haiku",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "{\"summary\":\"usage omitted\",\"goals\":[],\"entities\":[],\"decisions\":[],\"observations\":[]}"
+        },
+        "finish_reason": "stop"
+      }
+    ]
+  },
+  {
+    "id": "chatcmpl-2MbK5wP8nQ1zT7rC4hY9s",
+    "object": "chat.completion",
+    "created": 1766016180,
+    "model": "anthropic/claude-3-haiku",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "{\"summary\":\"usage zero\",\"goals\":[],\"entities\":[],\"decisions\":[],\"observations\":[]}"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "total_tokens": 0
+    }
+  }
+]
