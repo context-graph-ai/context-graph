@@ -954,11 +954,8 @@ pub fn expected_pending_push_change_count(client: &SyncClient) -> usize {
 }
 
 pub async fn push_pull(edge1: &SyncClient, edge2: &SyncClient) {
-    edge1.push().await.expect("push edge1 to hub");
-    edge2
-        .pull(&cg_conflict_policies())
-        .await
-        .expect("pull edge2 from hub");
+    drain_push(edge1).await;
+    drain_pull(edge2).await;
 }
 
 pub async fn bootstrap_sync_schema_without_rows(fixture: &RealSyncFixture) {
@@ -985,16 +982,48 @@ pub async fn bootstrap_sync_schema_without_rows(fixture: &RealSyncFixture) {
 }
 
 pub async fn bidirectional_sync(edge1: &SyncClient, edge2: &SyncClient) {
-    edge1.push().await.expect("push edge1 to hub");
-    edge2.push().await.expect("push edge2 to hub");
-    edge1
-        .pull(&cg_conflict_policies())
-        .await
-        .expect("pull edge1 from hub");
-    edge2
-        .pull(&cg_conflict_policies())
-        .await
-        .expect("pull edge2 from hub");
+    drain_push(edge1).await;
+    drain_push(edge2).await;
+    drain_pull(edge1).await;
+    drain_pull(edge2).await;
+}
+
+async fn drain_push(client: &SyncClient) {
+    for _ in 0..32 {
+        if !client
+            .has_pending_push_changes()
+            .expect("pending push check")
+        {
+            return;
+        }
+        let before = client.push_watermark();
+        client.push().await.expect("push sync round");
+        if !client
+            .has_pending_push_changes()
+            .expect("pending push check")
+        {
+            return;
+        }
+        assert!(
+            client.push_watermark() > before,
+            "push drain must advance while pending changes remain"
+        );
+    }
+    panic!("push did not drain pending changes");
+}
+
+async fn drain_pull(client: &SyncClient) {
+    for _ in 0..32 {
+        let before = client.pull_watermark();
+        client
+            .pull(&cg_conflict_policies())
+            .await
+            .expect("pull sync round");
+        if client.pull_watermark() == before {
+            return;
+        }
+    }
+    panic!("pull did not drain remote changes");
 }
 
 pub fn assert_lsn_advanced(before: Lsn, after: Lsn) {
