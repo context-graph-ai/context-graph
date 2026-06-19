@@ -272,6 +272,7 @@ impl Store {
         decision.based_on_snapshots = self.basis_snapshots_for_decision(id)?;
         decision.outcome = self.outcome_for_decision(id)?;
         decision.precedent_ids = self.precedents_for_decision(id, decision.context_id)?;
+        self.apply_pending_invalidation_status(&mut decision)?;
         Ok(Some(decision))
     }
 
@@ -788,6 +789,7 @@ impl Store {
             decision.outcome = self.outcome_for_decision_at_read(decision.id, snapshot)?;
             decision.precedent_ids =
                 self.precedents_for_decision_at_read(decision.id, decision.context_id, snapshot)?;
+            self.apply_pending_invalidation_status_at_read(&mut decision, snapshot)?;
             decisions.push(decision);
         }
         Ok(decisions)
@@ -1713,6 +1715,76 @@ impl Store {
         }
         rows.sort_by_key(|row| row.detected_at);
         Ok(rows)
+    }
+
+    fn apply_pending_invalidation_status(&self, decision: &mut Decision) -> Result<()> {
+        if decision.status != DecisionStatus::Active {
+            return Ok(());
+        }
+        if self.has_pending_invalidation(decision.id, decision.context_id)? {
+            decision.status = DecisionStatus::Invalidated;
+        }
+        Ok(())
+    }
+
+    fn apply_pending_invalidation_status_at_read(
+        &self,
+        decision: &mut Decision,
+        snapshot: SnapshotId,
+    ) -> Result<()> {
+        if decision.status != DecisionStatus::Active {
+            return Ok(());
+        }
+        if self.has_pending_invalidation_at_read(decision.id, decision.context_id, snapshot)? {
+            decision.status = DecisionStatus::Invalidated;
+        }
+        Ok(())
+    }
+
+    fn has_pending_invalidation(
+        &self,
+        decision_id: DecisionId,
+        context_id: ContextId,
+    ) -> Result<bool> {
+        let result = self
+            .db
+            .execute(
+                "SELECT id FROM invalidations WHERE context_id = $context_id AND affected_decision_id = $affected_decision_id AND status = $status",
+                &HashMap::from([
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    (
+                        "affected_decision_id".to_string(),
+                        Value::Uuid(decision_id.as_uuid()),
+                    ),
+                    ("status".to_string(), Value::Text("pending".to_string())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        Ok(!result.rows.is_empty())
+    }
+
+    fn has_pending_invalidation_at_read(
+        &self,
+        decision_id: DecisionId,
+        context_id: ContextId,
+        snapshot: SnapshotId,
+    ) -> Result<bool> {
+        let result = self
+            .db
+            .execute_at_snapshot(
+                "SELECT id FROM invalidations WHERE context_id = $context_id AND affected_decision_id = $affected_decision_id AND status = $status",
+                &HashMap::from([
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    (
+                        "affected_decision_id".to_string(),
+                        Value::Uuid(decision_id.as_uuid()),
+                    ),
+                    ("status".to_string(), Value::Text("pending".to_string())),
+                ]),
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        Ok(!result.rows.is_empty())
     }
 }
 

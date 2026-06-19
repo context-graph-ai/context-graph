@@ -12,8 +12,8 @@ use candle_core::{Device, Tensor};
 use cg_cli_conventions::{CheckRegistrar, DiagnosticCheck, Finding};
 use context_graph::{
     AuthorizedModelInvocationParts, CgError, ContextId, DeploymentSurface, FailureBucket,
-    LlmClient, ModelInvocation, ModelReply, Principal, ProviderInvocationConfig,
-    UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
+    LlmClient, ModelInvocation, ModelReply, Principal, ProviderInvocationConfig, ProviderUsage,
+    UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest, provider_usage_from_str,
 };
 use fs4::fs_std::FileExt;
 use safetensors::SafeTensors;
@@ -282,6 +282,7 @@ pub struct ModelProof {
     pub connection_name: String,
     pub provider: String,
     pub reply: String,
+    pub usage: Option<ProviderUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2004,7 +2005,7 @@ impl HostSessionLlmClient {
             phrasing: reply,
             advisory_flag: false,
             malformed: false,
-            usage: None,
+            usage: provider_usage_from_str(&run.stdout),
         })
     }
 }
@@ -5077,6 +5078,7 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                 connection_name: resolution.connection_name,
                 provider,
                 reply: reply.phrasing,
+                usage: reply.usage,
             });
         }
         let Some(model) = self.catalog.model_for_connection(connection_name) else {
@@ -5118,6 +5120,7 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
             connection_name: resolution.connection_name,
             provider: provider_config.provider,
             reply: reply.phrasing,
+            usage: reply.usage,
         })
     }
 
@@ -5689,7 +5692,7 @@ fn understand_hosted(
         phrasing,
         advisory_flag: false,
         malformed: false,
-        usage: None,
+        usage: provider_usage_from_str(&payload),
     })
 }
 

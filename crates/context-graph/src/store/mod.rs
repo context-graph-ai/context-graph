@@ -50,14 +50,6 @@ const _: fn() = embedding::production_primitive_anchor;
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
 static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
-const STORE_READ_METHOD_MARKERS: &str = r#"method: "list_observations"
-writer=context-graph
-method: "audit_query"
-method: "get_observation"
-method: "get_decision"
-method: "get_intention"
-method: "get_entity"
-method: "get_context""#;
 
 pub(crate) trait StoreReadObserver: Send + Sync {
     fn observe_read(&self, event: StoreReadEvent);
@@ -279,7 +271,6 @@ impl Store {
             reindex_events: Arc::new(Mutex::new(Vec::new())),
             read_observer: StoreReadProbe::from_env(),
         };
-        let _ = STORE_READ_METHOD_MARKERS;
         store.set_trace(loader_trace);
         Ok(store)
     }
@@ -371,6 +362,15 @@ impl Store {
 
     pub fn sync_database(&self) -> Arc<Database> {
         Arc::clone(&self.db)
+    }
+
+    #[doc(hidden)]
+    #[cfg(not(context_graph_internal_test_support))]
+    pub fn sync_schema_database(&self) -> Arc<Database> {
+        self.resource_owner
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.db))
     }
 
     pub fn register_embedding_space(&self, decl: EmbeddingSpaceDecl) -> Result<()> {
