@@ -3,7 +3,8 @@ use contextdb_core::Lsn;
 
 use crate::capture_sync_common::{
     TestStore, TestSyncStatusBoundary, assert_lsn_advanced, assert_real_decision_content,
-    expected_pending_push_change_count, push_pull, real_sync_fixture, seed_decision_graph,
+    drain_push, expected_pending_push_change_count, push_pull, real_sync_fixture,
+    seed_decision_graph,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -59,11 +60,7 @@ async fn status_reports_pending_push_count() {
         Some(&fixture.tenant_id),
         Some(&TestSyncStatusBoundary(&fixture.edge1_client)),
     );
-    fixture
-        .edge1_client
-        .push()
-        .await
-        .expect("push pending rows");
+    drain_push(&fixture.edge1_client).await;
     let expected_drained = expected_pending_push_change_count(&fixture.edge1_client);
     let drained = sync_status_report(
         &fixture.edge1.store,

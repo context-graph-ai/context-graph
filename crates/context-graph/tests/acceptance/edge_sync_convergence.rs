@@ -2,8 +2,8 @@ use crate::capture_sync_common::{
     assert_exact_extracted_from_edge, assert_no_raw_row_by_uuid, assert_real_decision_content,
     assert_real_digest_content, assert_real_entity_snapshot, assert_real_evidence_content,
     assert_real_intention_content, assert_real_observation_content, assert_real_outcome_state,
-    assert_sync_contract_has_real_table_policies, bootstrap_sync_schema_without_rows,
-    pre_client_sync_fixture, push_pull, real_sync_fixture, register_cg_sync_tables,
+    assert_sync_contract_has_real_table_policies, bootstrap_sync_schema_without_rows, drain_pull,
+    drain_push, pre_client_sync_fixture, push_pull, real_sync_fixture, register_cg_sync_tables,
     seed_decision_graph,
 };
 
@@ -157,18 +157,8 @@ async fn cross_context_isolation_survives_sync() {
         &fixture.tenant_id,
     );
     register_cg_sync_tables(&edge2_scoped_client);
-    fixture
-        .edge1_client
-        .push()
-        .await
-        .expect("push context rows to hub");
-    let pull = edge2_scoped_client
-        .pull(&crate::capture_sync_common::cg_conflict_policies())
-        .await;
-    assert!(
-        pull.is_ok(),
-        "context-B scoped data pull should succeed after admin DDL bootstrap: {pull:?}"
-    );
+    drain_push(&fixture.edge1_client).await;
+    drain_pull(&edge2_scoped_client).await;
 
     assert_real_decision_content(
         &edge2_context_b,

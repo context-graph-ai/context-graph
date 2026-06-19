@@ -80,26 +80,7 @@ async fn concurrent_mutable_status_row_converges_deterministically() {
         &seeded.decision.description,
     );
     let contended = record_contended_outcomes_concurrently(&fixture, &seeded).await;
-    fixture
-        .edge1_client
-        .push()
-        .await
-        .expect("edge1 outcome push");
-    fixture
-        .edge2_client
-        .push()
-        .await
-        .expect("edge2 outcome push");
-    fixture
-        .edge1_client
-        .pull(&crate::capture_sync_common::cg_conflict_policies())
-        .await
-        .expect("edge1 outcome pull");
-    fixture
-        .edge2_client
-        .pull(&crate::capture_sync_common::cg_conflict_policies())
-        .await
-        .expect("edge2 outcome pull");
+    bidirectional_sync(&fixture.edge1_client, &fixture.edge2_client).await;
 
     assert_real_outcome_state(
         &fixture.edge2.store,

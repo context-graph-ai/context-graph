@@ -4,9 +4,9 @@ use context_graph::{CapturePricing, HostedProviderBoundary, capture_with_usage_v
 
 use crate::capture_sync_common::{
     TestStore, assert_context_has_decision_and_digest, capture_request, expected_chunk_count,
-    expected_total_tokens, expected_zero_absent_and_real_usage, extractor, flat_pricing,
-    haiku_pricing, provider_absent_and_zero_usage, provider_with_unique_usage_for_chunks,
-    provider_with_usage,
+    expected_total_tokens, expected_zero_absent_and_real_usage, flat_pricing, haiku_pricing,
+    provider_absent_and_zero_usage, provider_backed_extractor,
+    provider_with_unique_usage_for_chunks, provider_with_usage,
 };
 
 #[test]
@@ -16,11 +16,12 @@ fn usage_recorded_per_model_call_and_summed_per_run() {
         "Goal G1: share memory. Entity E1: laptop. Decision D1: sync through contextdb serves G1 based_on E1.",
     );
     let (provider, expected_calls) = provider_with_unique_usage_for_chunks(expected_chunks);
+    let extractor = provider_backed_extractor(&provider);
     let report = capture_with_usage_visibility(
         &store.store,
         capture_request("tenant-alpha", &transcript),
         max_chars_per_chunk,
-        &extractor(),
+        &extractor,
         &provider,
         flat_pricing(),
     )
@@ -42,11 +43,12 @@ fn missing_provider_usage_reports_unavailable_without_crash() {
     let real_transcript = "Goal G1: keep the receipt. Entity E1: capture run. Decision D1: preserve missing usage serves G1 based_on E1.";
     let real_chunk_window = real_transcript.len() + 1;
     assert_eq!(expected_chunk_count(real_transcript, real_chunk_window), 1);
+    let real_extractor = provider_backed_extractor(&real_provider);
     let real_report = capture_with_usage_visibility(
         &store.store,
         capture_request("tenant-alpha", real_transcript),
         real_chunk_window,
-        &extractor(),
+        &real_extractor,
         &real_provider,
         flat_pricing(),
     )
@@ -55,11 +57,12 @@ fn missing_provider_usage_reports_unavailable_without_crash() {
     let (absent_transcript, absent_chunk_window) = two_chunk_transcript(
         "Goal G2: keep zero distinct. Entity E2: capture run. Decision D2: zero is not missing serves G2 based_on E2.",
     );
+    let absent_extractor = provider_backed_extractor(&absent_provider);
     let absent_report = capture_with_usage_visibility(
         &store.store,
         capture_request("tenant-alpha", &absent_transcript),
         absent_chunk_window,
-        &extractor(),
+        &absent_extractor,
         &absent_provider,
         flat_pricing(),
     )
@@ -84,11 +87,12 @@ fn run_receipt_reports_wall_clock_time() {
         "Goal G1: see elapsed time. Entity E1: import job. Decision D1: show receipt serves G1 based_on E1.",
     );
     let (provider, expected_calls) = provider_with_unique_usage_for_chunks(expected_chunks);
+    let extractor = provider_backed_extractor(&provider);
     let report = capture_with_usage_visibility(
         &store.store,
         capture_request("tenant-alpha", &transcript),
         max_chars_per_chunk,
-        &extractor(),
+        &extractor,
         &provider,
         flat_pricing(),
     )
@@ -121,11 +125,12 @@ fn dollars_dark_on_flat_path_lit_on_pay_per_token_path() {
         "Goal G1: price the run. Entity E1: haiku path. Decision D1: show dollars serves G1 based_on E1.",
     );
     let (pay_provider, expected_pay_calls) = provider_with_unique_usage_for_chunks(pay_chunks);
+    let pay_extractor = provider_backed_extractor(&pay_provider);
     let pay_report = capture_with_usage_visibility(
         &store.store,
         capture_request("tenant-alpha", &pay_transcript),
         pay_chunk_window,
-        &extractor(),
+        &pay_extractor,
         &pay_provider,
         haiku_pricing(),
     )
@@ -134,11 +139,12 @@ fn dollars_dark_on_flat_path_lit_on_pay_per_token_path() {
         "Goal G2: hide flat dollars. Entity E2: codex path. Decision D2: time is the meter serves G2 based_on E2.",
     );
     let flat_provider = provider_with_usage();
+    let flat_extractor = provider_backed_extractor(&flat_provider);
     let flat_report = capture_with_usage_visibility(
         &store.store,
         capture_request("tenant-alpha", &flat_transcript),
         flat_chunk_window,
-        &extractor(),
+        &flat_extractor,
         &flat_provider,
         CapturePricing::FlatSubscription,
     )
