@@ -830,6 +830,12 @@ impl Drop for SelfEchoSyncFixture {
     }
 }
 
+impl RealSyncFixture {
+    pub fn hub_store(&self) -> &Store {
+        &self._hub.store
+    }
+}
+
 pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
     let nats = start_nats_or_environment_error().await;
     let tenant_id = format!("tenant_{test_name}");
