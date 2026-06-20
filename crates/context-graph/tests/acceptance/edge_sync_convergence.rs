@@ -6,7 +6,7 @@ use crate::capture_sync_common::{
     bootstrap_sync_schema_without_rows, drain_pull, drain_push, pre_client_sync_fixture, push_pull,
     real_sync_fixture, register_cg_sync_tables, seed_decision_graph,
 };
-use context_graph::{DecisionStatus, InvalidationStatus, Store};
+use context_graph::{DecisionId, DecisionStatus, InvalidationId, InvalidationStatus, Store, TxId};
 use contextdb_core::Value as DbValue;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -160,27 +160,30 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
         seeded.digest_id.as_uuid(),
         "EXTRACTED_FROM",
     );
-    let based_on_edge_id = exact_edge_id(
+    let invalidated = insert_committed_invalidated_decision_fixture(
         &fixture.edge1.store,
         seeded.context_id,
-        seeded.decision.id.as_uuid(),
-        seeded.entity_id.as_uuid(),
-        "BASED_ON",
+        seeded.intention.id,
+        seeded.entity_id,
+        seeded.observation_id,
     );
-    let invalidation = fixture
-        .edge1
-        .store
-        .invalidate_decision(
-            seeded.decision.id,
-            seeded.observation_id,
-            "local edge invalidated stale auth decision",
-        )
-        .expect("invalidate decision on source edge");
+    let status_only = insert_committed_status_only_decision_fixture(
+        &fixture.edge1.store,
+        seeded.context_id,
+        DecisionStatus::Invalidated,
+        "status-only invalidated decision restore sentinel",
+    );
+    let active_control = insert_committed_status_only_decision_fixture(
+        &fixture.edge1.store,
+        seeded.context_id,
+        DecisionStatus::Active,
+        "status-only active decision restore control",
+    );
     let outcome = fixture
         .edge1
         .store
         .record_outcome(
-            seeded.decision.id,
+            invalidated.decision_id,
             false,
             Some("restored failed auth outcome".to_string()),
         )
@@ -190,16 +193,30 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
     assert_text_column_by_id(
         fixture.hub_store(),
         "decisions",
-        seeded.decision.id.as_uuid(),
+        invalidated.decision_id.as_uuid(),
         "status",
         "invalidated",
     );
     assert_text_column_by_id(
         fixture.hub_store(),
         "invalidations",
-        invalidation.invalidation_id.as_uuid(),
+        invalidated.invalidation_id.as_uuid(),
         "status",
         "pending",
+    );
+    assert_text_column_by_id(
+        fixture.hub_store(),
+        "decisions",
+        status_only.decision_id.as_uuid(),
+        "status",
+        "invalidated",
+    );
+    assert_text_column_by_id(
+        fixture.hub_store(),
+        "decisions",
+        active_control.decision_id.as_uuid(),
+        "status",
+        "active",
     );
 
     let restored_edge = TestStore::new("wiped_restore_reopened_edge");
@@ -212,7 +229,7 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
     assert_eq!(
         restored_edge
             .store
-            .get_decision(seeded.decision.id)
+            .get_decision(invalidated.decision_id)
             .expect("read pre-restore decision"),
         None,
         "replacement edge must begin empty before pulling from the hub"
@@ -241,8 +258,43 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
     );
     assert_decision_status_from_committed_column(
         &restored_edge.store,
-        seeded.decision.id,
+        invalidated.decision_id,
         DecisionStatus::Invalidated,
+    );
+    assert_decision_status_from_committed_column(
+        &restored_edge.store,
+        status_only.decision_id,
+        DecisionStatus::Invalidated,
+    );
+    assert_decision_status_from_committed_column(
+        &restored_edge.store,
+        active_control.decision_id,
+        DecisionStatus::Active,
+    );
+    assert_real_decision_content(
+        &restored_edge.store,
+        invalidated.decision_id,
+        &invalidated.description,
+    );
+    assert_real_decision_content(
+        &restored_edge.store,
+        status_only.decision_id,
+        &status_only.description,
+    );
+    assert_real_decision_content(
+        &restored_edge.store,
+        active_control.decision_id,
+        &active_control.description,
+    );
+    assert_no_invalidation_for_decision(
+        &restored_edge.store,
+        seeded.context_id,
+        status_only.decision_id,
+    );
+    assert_no_invalidation_for_decision(
+        &restored_edge.store,
+        seeded.context_id,
+        active_control.decision_id,
     );
     assert_real_decision_content(
         &restored_edge.store,
@@ -275,13 +327,13 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
         seeded.digest_id,
         &seeded.digest_summary,
     );
-    assert_real_outcome_state(&restored_edge.store, seeded.decision.id, &outcome, 1);
+    assert_real_outcome_state(&restored_edge.store, invalidated.decision_id, &outcome, 1);
     assert_restored_invalidation(
         &restored_edge.store,
         seeded.context_id,
-        seeded.decision.id,
+        invalidated.decision_id,
         seeded.observation_id,
-        invalidation.invalidation_id,
+        invalidated.invalidation_id,
     );
     assert_exact_extracted_from_edge(
         &restored_edge.store,
@@ -299,13 +351,205 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
     );
     assert_exact_edge_by_id(
         &restored_edge.store,
-        based_on_edge_id,
+        invalidated.based_on_edge_id,
         seeded.context_id,
-        seeded.decision.id.as_uuid(),
+        invalidated.decision_id.as_uuid(),
         seeded.entity_id.as_uuid(),
         "BASED_ON",
     );
+    assert_exact_edge_by_id(
+        &restored_edge.store,
+        invalidated.serves_edge_id,
+        seeded.context_id,
+        invalidated.decision_id.as_uuid(),
+        seeded.intention.id.as_uuid(),
+        "SERVES",
+    );
     assert_sync_contract_has_real_table_policies();
+}
+
+struct InvalidatedDecisionFixture {
+    decision_id: DecisionId,
+    invalidation_id: InvalidationId,
+    serves_edge_id: uuid::Uuid,
+    based_on_edge_id: uuid::Uuid,
+    description: String,
+}
+
+struct StatusOnlyDecisionFixture {
+    decision_id: DecisionId,
+    description: String,
+}
+
+fn insert_committed_invalidated_decision_fixture(
+    store: &Store,
+    context_id: context_graph::ContextId,
+    intention_id: context_graph::IntentionId,
+    entity_id: context_graph::EntityId,
+    observation_id: context_graph::ObservationId,
+) -> InvalidatedDecisionFixture {
+    let decision_id = DecisionId::new_v7();
+    let invalidation_id = InvalidationId::new_v7();
+    let serves_edge_id = uuid::Uuid::now_v7();
+    let based_on_edge_id = uuid::Uuid::now_v7();
+    let description = "auth module was invalidated before restore".to_string();
+    let db = store.sync_database();
+    db.execute(
+        "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+        &std::collections::HashMap::from([
+            ("id".to_string(), DbValue::Uuid(decision_id.as_uuid())),
+            (
+                "decision_type".to_string(),
+                DbValue::Text("technical".to_string()),
+            ),
+            ("description".to_string(), DbValue::Text(description.clone())),
+            ("reasoning".to_string(), DbValue::Json(serde_json::json!({}))),
+            ("confidence".to_string(), DbValue::Float64(0.9)),
+            (
+                "status".to_string(),
+                DbValue::Text("invalidated".to_string()),
+            ),
+            ("agent_id".to_string(), DbValue::Null),
+            ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+            ("properties".to_string(), DbValue::Json(serde_json::json!({}))),
+            ("tags".to_string(), DbValue::Json(serde_json::json!([]))),
+            ("created_at".to_string(), DbValue::TxId(TxId(1))),
+        ]),
+    )
+    .expect("insert committed invalidated decision fixture");
+    insert_edge_row(
+        store,
+        serves_edge_id,
+        context_id,
+        decision_id.as_uuid(),
+        intention_id.as_uuid(),
+        "SERVES",
+    );
+    insert_edge_row(
+        store,
+        based_on_edge_id,
+        context_id,
+        decision_id.as_uuid(),
+        entity_id.as_uuid(),
+        "BASED_ON",
+    );
+    let basis_diff = context_graph::BasisDiffResult {
+        is_invalidated_candidate: true,
+        divergences: Vec::new(),
+        read_txid: TxId(1),
+        current_snapshot_read_txid: TxId(1),
+    };
+    db.execute(
+        "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $reason, $basis_diff, $cascade_from, $severity, $threatened_intention_ids, $intention_now_un_served, $detected_at, $resolved_at, $resolution_action, $resolution_decision_id)",
+        &std::collections::HashMap::from([
+            ("id".to_string(), DbValue::Uuid(invalidation_id.as_uuid())),
+            ("status".to_string(), DbValue::Text("pending".to_string())),
+            ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+            (
+                "affected_decision_id".to_string(),
+                DbValue::Uuid(decision_id.as_uuid()),
+            ),
+            (
+                "trigger_observation_id".to_string(),
+                DbValue::Uuid(observation_id.as_uuid()),
+            ),
+            (
+                "reason".to_string(),
+                DbValue::Text("committed invalidated restore fixture".to_string()),
+            ),
+            (
+                "basis_diff".to_string(),
+                DbValue::Json(serde_json::to_value(basis_diff).expect("basis diff JSON")),
+            ),
+            ("cascade_from".to_string(), DbValue::Null),
+            ("severity".to_string(), DbValue::Text("warning".to_string())),
+            (
+                "threatened_intention_ids".to_string(),
+                DbValue::Json(
+                    serde_json::to_value(vec![intention_id])
+                        .expect("threatened intention ids JSON"),
+                ),
+            ),
+            ("intention_now_un_served".to_string(), DbValue::Bool(true)),
+            ("detected_at".to_string(), DbValue::TxId(TxId(1))),
+            ("resolved_at".to_string(), DbValue::Null),
+            ("resolution_action".to_string(), DbValue::Null),
+            ("resolution_decision_id".to_string(), DbValue::Null),
+        ]),
+    )
+    .expect("insert committed invalidation fixture");
+    InvalidatedDecisionFixture {
+        decision_id,
+        invalidation_id,
+        serves_edge_id,
+        based_on_edge_id,
+        description,
+    }
+}
+
+fn insert_committed_status_only_decision_fixture(
+    store: &Store,
+    context_id: context_graph::ContextId,
+    status: DecisionStatus,
+    description: &str,
+) -> StatusOnlyDecisionFixture {
+    let decision_id = DecisionId::new_v7();
+    let description = description.to_string();
+    store
+        .sync_database()
+        .execute(
+            "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
+            &std::collections::HashMap::from([
+                ("id".to_string(), DbValue::Uuid(decision_id.as_uuid())),
+                (
+                    "decision_type".to_string(),
+                    DbValue::Text("technical".to_string()),
+                ),
+                ("description".to_string(), DbValue::Text(description.clone())),
+                ("reasoning".to_string(), DbValue::Json(serde_json::json!({}))),
+                ("confidence".to_string(), DbValue::Float64(0.5)),
+                (
+                    "status".to_string(),
+                    DbValue::Text(decision_status_str(status).to_string()),
+                ),
+                ("agent_id".to_string(), DbValue::Null),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("properties".to_string(), DbValue::Json(serde_json::json!({}))),
+                ("tags".to_string(), DbValue::Json(serde_json::json!([]))),
+                ("created_at".to_string(), DbValue::TxId(TxId(1))),
+            ]),
+        )
+        .expect("insert committed status-only invalidated decision fixture");
+    StatusOnlyDecisionFixture {
+        decision_id,
+        description,
+    }
+}
+
+fn insert_edge_row(
+    store: &Store,
+    edge_id: uuid::Uuid,
+    context_id: context_graph::ContextId,
+    source_id: uuid::Uuid,
+    target_id: uuid::Uuid,
+    edge_type: &str,
+) {
+    store
+        .sync_database()
+        .execute(
+            "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
+            &std::collections::HashMap::from([
+                ("id".to_string(), DbValue::Uuid(edge_id)),
+                ("source_id".to_string(), DbValue::Uuid(source_id)),
+                ("target_id".to_string(), DbValue::Uuid(target_id)),
+                ("edge_type".to_string(), DbValue::Text(edge_type.to_string())),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("valid_from".to_string(), DbValue::TxId(TxId(1))),
+                ("valid_to".to_string(), DbValue::Null),
+                ("properties".to_string(), DbValue::Json(serde_json::json!({}))),
+            ]),
+        )
+        .unwrap_or_else(|err| panic!("insert {edge_type} edge fixture: {err:?}"));
 }
 
 fn assert_decision_status_from_committed_column(
@@ -354,6 +598,20 @@ fn assert_restored_invalidation(
         invalidation_id.as_uuid(),
         "status",
         "pending",
+    );
+}
+
+fn assert_no_invalidation_for_decision(
+    store: &Store,
+    context_id: context_graph::ContextId,
+    decision_id: DecisionId,
+) {
+    let invalidations = store
+        .list_invalidations(context_id, Some(decision_id), None)
+        .expect("read invalidations for status-only sentinel");
+    assert!(
+        invalidations.is_empty(),
+        "status-only decision {decision_id} must not be supported by an invalidation row: {invalidations:?}"
     );
 }
 
@@ -442,7 +700,7 @@ fn assert_text_column_by_id(
     assert_eq!(
         row.get(column),
         Some(&DbValue::Text(expected.to_string())),
-        "{table}.{column} for restored row {id}"
+        "{table}.{column} for row {id}"
     );
 }
 
