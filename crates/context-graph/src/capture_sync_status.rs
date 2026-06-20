@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use contextdb_core::Lsn;
+use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection};
 use serde_json::Value;
 use serde_json::json;
@@ -371,9 +372,6 @@ pub async fn drain_sync_push(boundary: &dyn SyncPushBoundary) -> Result<SyncDrai
     let mut report = empty_sync_drain_report(boundary.push_watermark());
     for _ in 0..MAX_SYNC_DRAIN_ROUNDS {
         boundary.refresh_push_state().await?;
-        if !boundary.has_pending_push_changes()? {
-            return Ok(report);
-        }
         let before = boundary.push_watermark();
         let round = boundary.push_round().await?;
         merge_sync_round(&mut report, round, boundary.push_watermark());
@@ -424,6 +422,53 @@ pub fn context_graph_sync_table_contract() -> Vec<ContextGraphSyncTablePolicy> {
         .collect()
 }
 
+pub fn context_graph_sync_conflict_policies() -> ConflictPolicies {
+    let mut per_table = context_graph_sync_table_contract()
+        .into_iter()
+        .map(|policy| (policy.table.to_string(), policy.conflict_policy))
+        .collect::<std::collections::HashMap<_, _>>();
+    for table in LOCAL_ONLY_RUNTIME_SYNC_TABLES {
+        per_table.insert(table.to_string(), ConflictPolicy::InsertIfNotExists);
+    }
+    ConflictPolicies {
+        per_table,
+        default: ConflictPolicy::ServerWins,
+    }
+}
+
+pub trait ContextGraphSyncRegistration {
+    fn set_default_conflict_policy(&self, policy: ConflictPolicy);
+    fn set_table_direction(&self, table: &str, direction: SyncDirection);
+    fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy);
+}
+
+pub fn register_context_graph_sync_client(client: &impl ContextGraphSyncRegistration) {
+    client.set_default_conflict_policy(ConflictPolicy::ServerWins);
+    for policy in context_graph_sync_table_contract() {
+        client.set_table_direction(policy.table, policy.direction);
+        client.set_conflict_policy(policy.table, policy.conflict_policy);
+    }
+    for table in LOCAL_ONLY_RUNTIME_SYNC_TABLES {
+        client.set_table_direction(table, SyncDirection::None);
+        client.set_conflict_policy(table, ConflictPolicy::InsertIfNotExists);
+    }
+}
+
+pub fn context_graph_pending_push_change_count(db: &Database, since: Lsn) -> usize {
+    let mut directions = context_graph_sync_table_contract()
+        .into_iter()
+        .map(|policy| (policy.table.to_string(), policy.direction))
+        .collect::<std::collections::HashMap<_, _>>();
+    for table in LOCAL_ONLY_RUNTIME_SYNC_TABLES {
+        directions.insert(table.to_string(), SyncDirection::None);
+    }
+    let changes = db
+        .changes_since(since)
+        .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
+    changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len()
+}
+
+const LOCAL_ONLY_RUNTIME_SYNC_TABLES: &[&str] = &["cg_changed_cursors", "cg_runtime_models"];
 const MAX_SYNC_DRAIN_ROUNDS: usize = 32;
 
 fn empty_sync_drain_report(lsn: Lsn) -> SyncDrainReport {

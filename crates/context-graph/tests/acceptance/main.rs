@@ -6,7 +6,6 @@ mod capture_sync_common;
 mod cg_main_dep_audit;
 mod context_default_is_tenant;
 mod context_isolation;
-mod cross_machine_invalidation;
 mod crud;
 mod digest_capture;
 mod discovery;

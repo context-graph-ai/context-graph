@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{BufRead, Read, Write};
@@ -28,31 +28,22 @@ use context_graph::ingest::{
     standing_impact,
 };
 use context_graph::{
-    CG_SCHEMA_VERSION, CapturePricing, CgError, ContextId, CreateContext, Decision, DecisionId,
-    DecisionStatus, DeploymentSurface, DigestSearchFilter, DiscoveryFilter, Embedder,
-    EmbedderRegistration, Entity, EntityId, EntitySnapshot, Invalidation, InvalidationStatus,
-    ModelCallUsage, ProviderUsage, Store, StoreConfig, SyncDrainFuture, SyncProbeFuture,
-    SyncPullBoundary, SyncPushBoundary, SyncStatusBoundary, SyncStatusReport,
-    UnderstandingConsumer, UnderstandingRequest, UsageReportState,
-    context_graph_sync_table_contract, drain_sync_pull, drain_sync_push,
-    schema::{INDEXES, TABLES},
-    sync_status_report, usage_receipt_from_calls, usage_receipt_json,
+    CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
+    CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestSearchFilter,
+    DiscoveryFilter, Embedder, EmbedderRegistration, Entity, EntityId, EntitySnapshot,
+    Invalidation, InvalidationStatus, ModelCallUsage, ProviderUsage, Store, StoreConfig,
+    SyncDrainFuture, SyncProbeFuture, SyncPullBoundary, SyncPushBoundary, SyncStatusBoundary,
+    SyncStatusReport, UnderstandingConsumer, UnderstandingRequest, UsageReportState,
+    context_graph_pending_push_change_count, context_graph_sync_conflict_policies, drain_sync_pull,
+    drain_sync_push, register_context_graph_sync_client, sync_status_report,
+    usage_receipt_from_calls, usage_receipt_json,
 };
-use contextdb_core::{Lsn, TableMeta, TxId, Value as DbValue};
+use contextdb_core::{Lsn, Value as DbValue};
 use contextdb_engine::{
     Database,
-    sync_types::{
-        ApplyResult, ChangeSet, ConflictPolicies, ConflictPolicy, DdlChange, SyncDirection,
-    },
+    sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection},
 };
-use contextdb_server::chunking::reassemble;
-use contextdb_server::protocol::{
-    ChunkMessage, MessageType, PullRequest, PullResponse, PushRequest, PushResponse,
-    SyncStatusRequest, SyncStatusResponse, decode, encode,
-};
-use contextdb_server::subjects::{pull_subject, push_subject, status_subject};
-use contextdb_server::{SyncClient, split_changeset_for_test};
-use futures_util::StreamExt;
+use contextdb_server::SyncClient;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -67,11 +58,6 @@ const HOST_SESSION_SPEND_KIND: &str = "subscription quota";
 const BYOK_HTTP_SPEND_KIND: &str = "provider API call";
 const MODEL_SELFTEST_PROMPT: &str =
     "Reply with exactly this text and nothing else: cg-host-session-proof";
-const CLI_PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
-const CLI_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const CLI_PULL_CHUNK_COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
-const CLI_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-const CLI_PULL_PAGE_SIZE: u32 = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
@@ -989,19 +975,10 @@ fn handle_sync(args: &[String]) -> i32 {
                     );
                 }
             };
-            let policies = cli_sync_conflict_policies();
+            let policies = context_graph_sync_conflict_policies();
             let drain = runtime.block_on(drain_sync_pull(&boundary, &policies));
             match drain {
                 Ok(report) => {
-                    if let Err(err) = normalize_schema_version_after_sync_pull(&stores.admin) {
-                        return cg_failure(err, &db_path, &context_label);
-                    }
-                    if let Err(err) = reconcile_has_outcome_edges_after_sync_pull(
-                        &stores.admin,
-                        &boundary.take_pulled_context_ids(),
-                    ) {
-                        return cg_failure(err, &db_path, &context_label);
-                    }
                     let status = sync_status_report(
                         store,
                         Some(&remote_url),
@@ -1026,21 +1003,32 @@ fn handle_sync(args: &[String]) -> i32 {
 
 struct CliSyncBoundary {
     client: SyncClient,
-    schema_db: Arc<contextdb_engine::Database>,
     nats_connection_opened: Mutex<bool>,
-    pulled_context_ids: Mutex<BTreeSet<uuid::Uuid>>,
+}
+
+struct CliSyncClientRegistration<'a>(&'a SyncClient);
+
+impl ContextGraphSyncRegistration for CliSyncClientRegistration<'_> {
+    fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
+        self.0.set_default_conflict_policy(policy);
+    }
+
+    fn set_table_direction(&self, table: &str, direction: SyncDirection) {
+        self.0.set_table_direction(table, direction);
+    }
+
+    fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
+        self.0.set_conflict_policy(table, policy);
+    }
 }
 
 impl CliSyncBoundary {
-    fn new(data_store: &Store, admin_store: &Store, remote_url: &str, tenant_id: &str) -> Self {
+    fn new(data_store: &Store, _admin_store: &Store, remote_url: &str, tenant_id: &str) -> Self {
         let client = SyncClient::new(data_store.sync_database(), remote_url, tenant_id);
-        let schema_db = admin_store.sync_database();
-        register_cli_sync_tables(&client);
+        register_context_graph_sync_client(&CliSyncClientRegistration(&client));
         Self {
             client,
-            schema_db,
             nats_connection_opened: Mutex::new(false),
-            pulled_context_ids: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -1066,200 +1054,21 @@ impl CliSyncBoundary {
             .unwrap_or_else(|_| self.client.pull_watermark())
     }
 
-    fn remember_pulled_context_ids(&self, context_ids: BTreeSet<uuid::Uuid>) {
-        if context_ids.is_empty() {
-            return;
-        }
-        if let Ok(mut pulled) = self.pulled_context_ids.lock() {
-            pulled.extend(context_ids);
-        }
-    }
-
-    fn take_pulled_context_ids(&self) -> BTreeSet<uuid::Uuid> {
-        self.pulled_context_ids
-            .lock()
-            .map(|mut pulled| std::mem::take(&mut *pulled))
-            .unwrap_or_default()
-    }
-
-    fn push_changeset_without_trigger_ddl(&self, since: Lsn) -> ChangeSet {
-        let directions = cli_sync_table_directions();
-        let raw_changeset = self.client.db().changes_since(since);
-        let mut changeset = cli_push_changeset_without_trigger_ddl(&raw_changeset, &directions);
-        let schema_changeset = self.schema_db.changes_since(since);
-        restore_non_trigger_schema_ddl(&mut changeset, &schema_changeset);
-        changeset
-    }
-
-    fn has_skippable_schema_ddl(&self, since: Lsn) -> bool {
-        self.schema_db
-            .changes_since(since)
-            .ddl
-            .iter()
-            .any(is_trigger_ddl)
-    }
-
     fn has_pending_push_work(&self) -> context_graph::Result<bool> {
-        let since = self.persisted_push_watermark();
-        let changes = self.push_changeset_without_trigger_ddl(since);
-        Ok(!changes.is_empty() || self.has_skippable_schema_ddl(since))
-    }
-
-    async fn push_round_without_trigger_ddl(&self) -> context_graph::Result<ApplyResult> {
-        let nats_client = self
-            .client
-            .ensure_connected()
-            .await
-            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-        self.refresh_push_watermark_from_server(&nats_client)
-            .await?;
-        let since = self.persisted_push_watermark();
-        let raw_changeset = self.client.db().changes_since(since);
-        let schema_changeset = self.schema_db.changes_since(since);
-        let changeset = self.push_changeset_without_trigger_ddl(since);
-        if changeset.is_empty() {
-            let skipped_lsn = raw_changeset
-                .max_lsn()
-                .or_else(|| schema_changeset.max_lsn())
-                .unwrap_or_else(|| self.client.db().current_lsn());
-            self.client
-                .db()
-                .persist_sync_push_watermark(self.client.tenant_id(), skipped_lsn)
-                .map_err(sync_client_error)?;
-            return Ok(ApplyResult {
-                applied_rows: 0,
-                skipped_rows: 0,
-                conflicts: Vec::new(),
-                new_lsn: skipped_lsn,
-            });
-        }
-
-        let mut total = ApplyResult {
-            applied_rows: 0,
-            skipped_rows: 0,
-            conflicts: Vec::new(),
-            new_lsn: since,
-        };
-        let mut last_successful_lsn = since;
-        for batch in split_changeset_for_test(changeset) {
-            let batch_max_lsn = batch.max_lsn().unwrap_or_else(|| {
-                if batch.ddl.is_empty() {
-                    since
-                } else {
-                    self.client.db().current_lsn()
-                }
-            });
-            let result =
-                send_cli_push_request(&nats_client, self.client.tenant_id(), batch).await?;
-            last_successful_lsn = batch_max_lsn;
-            total.applied_rows += result.applied_rows;
-            total.skipped_rows += result.skipped_rows;
-            total.conflicts.extend(result.conflicts);
-            total.new_lsn = result.new_lsn;
-        }
         self.client
-            .db()
-            .persist_sync_push_watermark(self.client.tenant_id(), last_successful_lsn)
-            .map_err(sync_client_error)?;
-        Ok(total)
+            .has_pending_push_changes()
+            .map_err(sync_client_error)
     }
 
-    async fn refresh_push_watermark_from_server(
-        &self,
-        nats_client: &async_nats::Client,
-    ) -> context_graph::Result<()> {
-        if let Some(status) = request_cli_sync_status(nats_client, self.client.tenant_id()).await
-            && let Some(server_applied) = status.applied_push_watermark
-        {
-            let local = self.persisted_push_watermark();
-            if server_applied < local {
-                self.client
-                    .db()
-                    .persist_sync_push_watermark(self.client.tenant_id(), server_applied)
-                    .map_err(sync_client_error)?;
-            }
-        }
-        Ok(())
+    async fn run_push_round(&self) -> context_graph::Result<ApplyResult> {
+        self.client.push().await.map_err(sync_client_error)
     }
 
-    async fn pull_round_without_schema_ddl(
+    async fn run_pull_round(
         &self,
         policies: &ConflictPolicies,
     ) -> context_graph::Result<ApplyResult> {
-        let nats_client = self
-            .client
-            .ensure_connected()
-            .await
-            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-        if let Some(status) = request_cli_sync_status(&nats_client, self.client.tenant_id()).await
-            && let Some(server_lsn) = status.server_current_lsn
-        {
-            let local = self.persisted_pull_watermark();
-            if server_lsn < local {
-                self.client
-                    .db()
-                    .persist_sync_pull_watermark(self.client.tenant_id(), Lsn(0))
-                    .map_err(sync_client_error)?;
-            }
-        }
-        let directions = cli_sync_table_directions();
-        let mut since_lsn = self.persisted_pull_watermark();
-        let mut total = ApplyResult {
-            applied_rows: 0,
-            skipped_rows: 0,
-            conflicts: Vec::new(),
-            new_lsn: since_lsn,
-        };
-
-        let last_server_lsn = loop {
-            let (changes, has_more, cursor) =
-                request_cli_pull_page(&nats_client, self.client.tenant_id(), since_lsn).await?;
-            let server_lsn = cursor.or_else(|| changes.max_lsn()).unwrap_or(since_lsn);
-            let filtered = changes
-                .filter_by_direction(&directions, &[SyncDirection::Pull, SyncDirection::Both]);
-            let mut schema_changes = filtered.clone();
-            schema_changes.rows.clear();
-            schema_changes.edges.clear();
-            schema_changes.vectors.clear();
-            if !schema_changes.ddl.is_empty() {
-                let result = self
-                    .schema_db
-                    .apply_changes(schema_changes, &remap_cli_pull_policies(policies))
-                    .map_err(sync_client_error)?;
-                total.applied_rows += result.applied_rows;
-                total.skipped_rows += result.skipped_rows;
-                total.conflicts.extend(result.conflicts);
-                total.new_lsn = result.new_lsn;
-            }
-            let mut data_changes = filtered;
-            data_changes.ddl.clear();
-            data_changes.ddl_lsn.clear();
-            let touched_contexts = context_ids_touched_by_changeset(&data_changes);
-            let result = self
-                .client
-                .db()
-                .apply_changes(data_changes, &remap_cli_pull_policies(policies))
-                .map_err(sync_client_error)?;
-            self.remember_pulled_context_ids(touched_contexts);
-            total.applied_rows += result.applied_rows;
-            total.skipped_rows += result.skipped_rows;
-            total.conflicts.extend(result.conflicts);
-            total.new_lsn = result.new_lsn;
-
-            if !has_more {
-                break server_lsn;
-            }
-            let Some(next_lsn) = cursor else {
-                break server_lsn;
-            };
-            since_lsn = next_lsn;
-        };
-
-        self.client
-            .db()
-            .persist_sync_pull_watermark(self.client.tenant_id(), last_server_lsn)
-            .map_err(sync_client_error)?;
-        Ok(total)
+        self.client.pull(policies).await.map_err(sync_client_error)
     }
 }
 
@@ -1277,8 +1086,10 @@ impl SyncStatusBoundary for CliSyncBoundary {
     }
 
     fn pending_push_change_count(&self) -> context_graph::Result<usize> {
-        let changes = self.push_changeset_without_trigger_ddl(self.persisted_push_watermark());
-        Ok(changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len())
+        Ok(context_graph_pending_push_change_count(
+            self.client.db(),
+            self.persisted_push_watermark(),
+        ))
     }
 
     fn is_connected(&self) -> bool {
@@ -1300,19 +1111,18 @@ impl SyncPushBoundary for CliSyncBoundary {
 
     fn refresh_push_state(&self) -> SyncProbeFuture<'_> {
         Box::pin(async move {
-            let nats_client = self
-                .client
+            self.client
                 .ensure_connected()
                 .await
                 .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
             self.mark_connected();
-            self.refresh_push_watermark_from_server(&nats_client).await
+            Ok(())
         })
     }
 
     fn push_round(&self) -> SyncDrainFuture<'_> {
         Box::pin(async move {
-            let result = self.push_round_without_trigger_ddl().await;
+            let result = self.run_push_round().await;
             if result.is_ok() {
                 self.mark_connected();
             }
@@ -1328,526 +1138,13 @@ impl SyncPullBoundary for CliSyncBoundary {
 
     fn pull_round<'a>(&'a self, policies: &'a ConflictPolicies) -> SyncDrainFuture<'a> {
         Box::pin(async move {
-            let result = self.pull_round_without_schema_ddl(policies).await;
+            let result = self.run_pull_round(policies).await;
             if result.is_ok() {
                 self.mark_connected();
             }
             result
         })
     }
-}
-
-fn register_cli_sync_tables(client: &SyncClient) {
-    client.set_default_conflict_policy(ConflictPolicy::LatestWins);
-    for policy in context_graph_sync_table_contract() {
-        client.set_table_direction(policy.table, policy.direction);
-        client.set_conflict_policy(policy.table, policy.conflict_policy);
-    }
-}
-
-fn cli_sync_table_directions() -> HashMap<String, SyncDirection> {
-    context_graph_sync_table_contract()
-        .into_iter()
-        .map(|policy| (policy.table.to_string(), policy.direction))
-        .collect()
-}
-
-fn cli_sync_conflict_policies() -> ConflictPolicies {
-    let per_table = context_graph_sync_table_contract()
-        .into_iter()
-        .map(|policy| (policy.table.to_string(), policy.conflict_policy))
-        .collect();
-    ConflictPolicies {
-        per_table,
-        default: ConflictPolicy::LatestWins,
-    }
-}
-
-fn restore_non_trigger_schema_ddl(filtered: &mut ChangeSet, raw: &ChangeSet) {
-    let mut seen = filtered
-        .ddl
-        .iter()
-        .map(|ddl| format!("{ddl:?}"))
-        .collect::<std::collections::BTreeSet<_>>();
-    let old_ddl = std::mem::take(&mut filtered.ddl);
-    let old_ddl_lsn = std::mem::take(&mut filtered.ddl_lsn);
-    for (index, change) in old_ddl.into_iter().enumerate() {
-        if is_trigger_ddl(&change) {
-            continue;
-        }
-        filtered.ddl.push(change);
-        if let Some(lsn) = old_ddl_lsn.get(index).copied() {
-            filtered.ddl_lsn.push(lsn);
-        }
-    }
-    for (index, change) in raw.ddl.iter().cloned().enumerate() {
-        if is_trigger_ddl(&change) {
-            continue;
-        }
-        let key = format!("{change:?}");
-        if !seen.insert(key) {
-            continue;
-        }
-        filtered.ddl.push(change);
-        if let Some(lsn) = raw.ddl_lsn.get(index).copied() {
-            filtered.ddl_lsn.push(lsn);
-        }
-    }
-}
-
-fn cli_push_changeset_without_trigger_ddl(
-    raw: &ChangeSet,
-    directions: &HashMap<String, SyncDirection>,
-) -> ChangeSet {
-    let mut changeset = raw
-        .clone()
-        .filter_by_direction(directions, &[SyncDirection::Push, SyncDirection::Both]);
-    restore_non_trigger_schema_ddl(&mut changeset, raw);
-    changeset
-}
-
-fn context_ids_touched_by_changeset(changeset: &ChangeSet) -> BTreeSet<uuid::Uuid> {
-    let mut context_ids = BTreeSet::new();
-    for row in &changeset.rows {
-        if let Some(DbValue::Uuid(context_id)) = row.values.get("context_id") {
-            context_ids.insert(*context_id);
-        }
-    }
-    for edge in &changeset.edges {
-        if let Some(DbValue::Uuid(context_id)) = edge.properties.get("context_id") {
-            context_ids.insert(*context_id);
-        }
-    }
-    context_ids
-}
-
-fn is_trigger_ddl(change: &DdlChange) -> bool {
-    matches!(
-        change,
-        DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. }
-    )
-}
-
-async fn send_cli_push_request(
-    nats_client: &async_nats::Client,
-    tenant_id: &str,
-    changeset: ChangeSet,
-) -> context_graph::Result<ApplyResult> {
-    let request = PushRequest {
-        changeset: changeset.into(),
-    };
-    let encoded = encode(MessageType::PushRequest, &request)
-        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-    let subject = push_subject(tenant_id);
-    for attempt in 0..5u32 {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
-        }
-        let inbox = nats_client.new_inbox();
-        let mut inbox_sub = nats_client
-            .subscribe(inbox.clone())
-            .await
-            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-        nats_client
-            .publish_with_reply(subject.clone(), inbox, encoded.clone().into())
-            .await
-            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-        match tokio::time::timeout(CLI_PUSH_REQUEST_TIMEOUT, inbox_sub.next()).await {
-            Ok(Some(message)) if message.status.is_some() && attempt < 4 => continue,
-            Ok(Some(message)) if message.status.is_some() => {
-                return Err(CgError::Engine(format!(
-                    "sync failed: push received NATS status reply {:?}",
-                    message.status
-                )));
-            }
-            Ok(Some(message)) => {
-                let envelope = match decode(&message.payload) {
-                    Ok(envelope) => envelope,
-                    Err(err) if attempt < 4 => {
-                        let _ = err;
-                        continue;
-                    }
-                    Err(err) => return Err(CgError::Engine(format!("sync failed: {err}"))),
-                };
-                if envelope.message_type != MessageType::PushResponse {
-                    if attempt < 4 {
-                        continue;
-                    }
-                    return Err(CgError::Engine(format!(
-                        "sync failed: unexpected push response {:?}",
-                        envelope.message_type
-                    )));
-                }
-                let response: PushResponse = match rmp_serde::from_slice(&envelope.payload) {
-                    Ok(response) => response,
-                    Err(err) if attempt < 4 => {
-                        let _ = err;
-                        continue;
-                    }
-                    Err(err) => return Err(CgError::Engine(format!("sync failed: {err}"))),
-                };
-                if let Some(err) = response.error {
-                    return Err(CgError::Engine(format!("sync failed: {err}")));
-                }
-                return response.result.map(Into::into).ok_or_else(|| {
-                    CgError::Engine("sync failed: push response missing result".to_string())
-                });
-            }
-            Ok(None) => {
-                return Err(CgError::Engine(
-                    "sync failed: push inbox closed".to_string(),
-                ));
-            }
-            Err(_) if attempt < 4 => continue,
-            Err(_) => {
-                return Err(CgError::Engine(
-                    "sync failed: timed out waiting for push response".to_string(),
-                ));
-            }
-        }
-    }
-    Err(CgError::Engine(
-        "sync failed: push failed after retries".to_string(),
-    ))
-}
-
-async fn request_cli_sync_status(
-    nats_client: &async_nats::Client,
-    tenant_id: &str,
-) -> Option<SyncStatusResponse> {
-    let encoded = encode(MessageType::StatusRequest, &SyncStatusRequest {}).ok()?;
-    let inbox = nats_client.new_inbox();
-    let mut inbox_sub = nats_client.subscribe(inbox.clone()).await.ok()?;
-    nats_client
-        .publish_with_reply(status_subject(tenant_id), inbox, encoded.into())
-        .await
-        .ok()?;
-    let message = tokio::time::timeout(CLI_STATUS_REQUEST_TIMEOUT, inbox_sub.next())
-        .await
-        .ok()??;
-    if message.status.is_some() {
-        return None;
-    }
-    let envelope = decode(&message.payload).ok()?;
-    if !matches!(envelope.message_type, MessageType::StatusResponse) {
-        return None;
-    }
-    rmp_serde::from_slice(&envelope.payload).ok()
-}
-
-async fn request_cli_pull_page(
-    nats_client: &async_nats::Client,
-    tenant_id: &str,
-    since_lsn: Lsn,
-) -> context_graph::Result<(ChangeSet, bool, Option<Lsn>)> {
-    let request = PullRequest {
-        since_lsn,
-        max_entries: Some(CLI_PULL_PAGE_SIZE),
-    };
-    let encoded = encode(MessageType::PullRequest, &request)
-        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-    let mut first_attempt_response = None;
-    for attempt in 0..5u32 {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
-        }
-        let inbox = nats_client.new_inbox();
-        let mut inbox_sub = nats_client
-            .subscribe(inbox.clone())
-            .await
-            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-        let timeout = if attempt < 2 {
-            Duration::from_secs(2)
-        } else {
-            CLI_PULL_REQUEST_TIMEOUT
-        };
-        nats_client
-            .publish_with_reply(pull_subject(tenant_id), inbox, encoded.clone().into())
-            .await
-            .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-        match tokio::time::timeout(timeout, inbox_sub.next()).await {
-            Ok(Some(message)) => {
-                first_attempt_response = Some((message, inbox_sub));
-                break;
-            }
-            Ok(None) => {
-                return Err(CgError::Engine(
-                    "sync failed: pull inbox closed".to_string(),
-                ));
-            }
-            Err(_) if attempt < 4 => continue,
-            Err(_) => {}
-        }
-    }
-
-    let (first_message, mut inbox_sub) = first_attempt_response.ok_or_else(|| {
-        CgError::Engine("sync failed: timed out waiting for pull response".to_string())
-    })?;
-    let first_envelope = decode(&first_message.payload)
-        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-    let response_envelope = match first_envelope.message_type {
-        MessageType::PullResponse => first_envelope,
-        MessageType::Chunk => {
-            let first_chunk: ChunkMessage = rmp_serde::from_slice(&first_envelope.payload)
-                .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-            let total = first_chunk.total_chunks;
-            let mut collected = vec![first_chunk];
-            let deadline = tokio::time::Instant::now() + CLI_PULL_CHUNK_COLLECT_TIMEOUT;
-            while collected.len() < total as usize {
-                let chunk_message = tokio::time::timeout_at(deadline, inbox_sub.next())
-                    .await
-                    .map_err(|_| {
-                        CgError::Engine(format!(
-                            "sync failed: timeout collecting pull chunks ({}/{total})",
-                            collected.len()
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        CgError::Engine("sync failed: pull chunk stream ended".to_string())
-                    })?;
-                let envelope = decode(&chunk_message.payload)
-                    .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-                if !matches!(envelope.message_type, MessageType::Chunk) {
-                    return Err(CgError::Engine(format!(
-                        "sync failed: unexpected pull chunk response {:?}",
-                        envelope.message_type
-                    )));
-                }
-                let chunk: ChunkMessage = rmp_serde::from_slice(&envelope.payload)
-                    .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-                collected.push(chunk);
-            }
-            let reassembled = reassemble(&mut collected);
-            decode(&reassembled).map_err(|err| CgError::Engine(format!("sync failed: {err}")))?
-        }
-        other => {
-            return Err(CgError::Engine(format!(
-                "sync failed: unexpected pull response {other:?}"
-            )));
-        }
-    };
-
-    let response: PullResponse = rmp_serde::from_slice(&response_envelope.payload)
-        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-    let changes = ChangeSet::try_from(response.changeset)
-        .map_err(|err| CgError::Engine(format!("sync failed: {err}")))?;
-    Ok((changes, response.has_more, response.cursor))
-}
-
-fn remap_cli_pull_policies(policies: &ConflictPolicies) -> ConflictPolicies {
-    let remap = |policy: ConflictPolicy| match policy {
-        ConflictPolicy::ServerWins => ConflictPolicy::EdgeWins,
-        ConflictPolicy::EdgeWins => ConflictPolicy::ServerWins,
-        other => other,
-    };
-    ConflictPolicies {
-        per_table: policies
-            .per_table
-            .iter()
-            .map(|(table, policy)| (table.clone(), remap(*policy)))
-            .collect(),
-        default: remap(policies.default),
-    }
-}
-
-fn normalize_schema_version_after_sync_pull(store: &Store) -> context_graph::Result<()> {
-    let db = store.sync_database();
-    if !schema_shape_is_current(&db)? {
-        return Ok(());
-    }
-    ensure_schema_version_row_is_current(&db)
-}
-
-fn schema_shape_is_current(db: &Database) -> context_graph::Result<bool> {
-    let expected = Database::open_memory();
-    for table in TABLES {
-        expected
-            .execute(table.ddl, &HashMap::new())
-            .map_err(sync_client_error)?;
-    }
-    for index in INDEXES {
-        expected
-            .execute(index.ddl, &HashMap::new())
-            .map_err(sync_client_error)?;
-    }
-    for table in TABLES {
-        let Some(actual) = db.table_meta(table.name) else {
-            return Ok(false);
-        };
-        let Some(expected) = expected.table_meta(table.name) else {
-            return Ok(false);
-        };
-        if table_meta_fingerprint(&actual)? != table_meta_fingerprint(&expected)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn table_meta_fingerprint(meta: &TableMeta) -> context_graph::Result<Value> {
-    serde_json::to_value(meta).map_err(|err| CgError::Engine(format!("schema check failed: {err}")))
-}
-
-fn ensure_schema_version_row_is_current(db: &Database) -> context_graph::Result<()> {
-    let params = HashMap::from([("id".to_string(), DbValue::Int64(1))]);
-    let existing = db
-        .execute("SELECT id FROM cg_schema_version WHERE id = $id", &params)
-        .map_err(sync_client_error)?;
-    if existing.rows.is_empty() {
-        db.execute(
-            "INSERT INTO cg_schema_version (id, version, installed_at) VALUES ($id, $version, $installed_at)",
-            &HashMap::from([
-                ("id".to_string(), DbValue::Int64(1)),
-                (
-                    "version".to_string(),
-                    DbValue::Int64(CG_SCHEMA_VERSION as i64),
-                ),
-                ("installed_at".to_string(), DbValue::TxId(TxId(1))),
-            ]),
-        )
-        .map(|_| ())
-        .map_err(sync_client_error)
-    } else {
-        db.execute(
-            "UPDATE cg_schema_version SET version = $version WHERE id = $id",
-            &HashMap::from([
-                ("id".to_string(), DbValue::Int64(1)),
-                (
-                    "version".to_string(),
-                    DbValue::Int64(CG_SCHEMA_VERSION as i64),
-                ),
-            ]),
-        )
-        .map(|_| ())
-        .map_err(sync_client_error)
-    }
-}
-
-fn reconcile_has_outcome_edges_after_sync_pull(
-    store: &Store,
-    context_ids: &BTreeSet<uuid::Uuid>,
-) -> context_graph::Result<()> {
-    if context_ids.is_empty() {
-        return Ok(());
-    }
-    let db = store.sync_database();
-    if db.table_meta("outcomes").is_none() || db.table_meta("edges").is_none() {
-        return Ok(());
-    }
-    let snapshot = db.snapshot();
-    let outcomes = db.scan("outcomes", snapshot).map_err(sync_client_error)?;
-    let winning_outcome_by_decision = outcomes
-        .into_iter()
-        .filter_map(|row| {
-            let decision_id = match row.values.get("decision_id") {
-                Some(DbValue::Uuid(id)) => *id,
-                _ => return None,
-            };
-            let context_id = match row.values.get("context_id") {
-                Some(DbValue::Uuid(id)) => *id,
-                _ => return None,
-            };
-            if !context_ids.contains(&context_id) {
-                return None;
-            }
-            let outcome_id = match row.values.get("id") {
-                Some(DbValue::Uuid(id)) => *id,
-                _ => return None,
-            };
-            Some((decision_id, (context_id, outcome_id)))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut winning_edge_seen = winning_outcome_by_decision
-        .keys()
-        .map(|decision_id| (*decision_id, false))
-        .collect::<HashMap<_, _>>();
-    let edges = db.scan("edges", snapshot).map_err(sync_client_error)?;
-    let mut stale_edge_ids = Vec::new();
-    for row in edges {
-        if !matches!(
-            row.values.get("edge_type"),
-            Some(DbValue::Text(edge_type)) if edge_type == "HAS_OUTCOME"
-        ) {
-            continue;
-        }
-        let Some(DbValue::Uuid(edge_id)) = row.values.get("id") else {
-            continue;
-        };
-        let Some(DbValue::Uuid(source_id)) = row.values.get("source_id") else {
-            continue;
-        };
-        let Some(DbValue::Uuid(target_id)) = row.values.get("target_id") else {
-            continue;
-        };
-        let Some(DbValue::Uuid(edge_context_id)) = row.values.get("context_id") else {
-            continue;
-        };
-        if !context_ids.contains(edge_context_id) {
-            continue;
-        }
-        let Some((winning_context_id, winning_outcome_id)) =
-            winning_outcome_by_decision.get(source_id)
-        else {
-            stale_edge_ids.push(*edge_id);
-            continue;
-        };
-        if edge_context_id == winning_context_id && target_id == winning_outcome_id {
-            winning_edge_seen.insert(*source_id, true);
-            continue;
-        }
-        stale_edge_ids.push(*edge_id);
-    }
-    let missing_edges = winning_outcome_by_decision
-        .iter()
-        .filter_map(|(decision_id, (context_id, outcome_id))| {
-            (!winning_edge_seen.get(decision_id).copied().unwrap_or(false)).then_some((
-                *decision_id,
-                *context_id,
-                *outcome_id,
-            ))
-        })
-        .collect::<Vec<_>>();
-    if stale_edge_ids.is_empty() && missing_edges.is_empty() {
-        return Ok(());
-    }
-
-    let tx = db.begin().map_err(sync_client_error)?;
-    for edge_id in stale_edge_ids {
-        if let Err(err) = db.execute_in_tx(
-            tx,
-            "DELETE FROM edges WHERE id = $id",
-            &HashMap::from([("id".to_string(), DbValue::Uuid(edge_id))]),
-        ) {
-            let _ = db.rollback(tx);
-            return Err(sync_client_error(err));
-        }
-    }
-    for (decision_id, context_id, outcome_id) in missing_edges {
-        if let Err(err) = db.execute_in_tx(
-            tx,
-            "INSERT INTO edges (id, source_id, target_id, edge_type, context_id, valid_from, valid_to, properties) VALUES ($id, $source_id, $target_id, $edge_type, $context_id, $valid_from, $valid_to, $properties)",
-            &HashMap::from([
-                ("id".to_string(), DbValue::Uuid(uuid::Uuid::now_v7())),
-                ("source_id".to_string(), DbValue::Uuid(decision_id)),
-                ("target_id".to_string(), DbValue::Uuid(outcome_id)),
-                (
-                    "edge_type".to_string(),
-                    DbValue::Text("HAS_OUTCOME".to_string()),
-                ),
-                ("context_id".to_string(), DbValue::Uuid(context_id)),
-                ("valid_from".to_string(), DbValue::TxId(tx)),
-                ("valid_to".to_string(), DbValue::Null),
-                (
-                    "properties".to_string(),
-                    DbValue::Json(serde_json::json!({})),
-                ),
-            ]),
-        ) {
-            let _ = db.rollback(tx);
-            return Err(sync_client_error(err));
-        }
-    }
-    db.commit(tx).map_err(sync_client_error)
 }
 
 fn sync_client_error(err: contextdb_core::Error) -> CgError {

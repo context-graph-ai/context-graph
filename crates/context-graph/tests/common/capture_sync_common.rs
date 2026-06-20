@@ -11,14 +11,15 @@ use context_graph::ingest::{
 };
 use context_graph::schema::{DIGEST_VECTOR_DIMENSION, TABLES};
 use context_graph::{
-    CapturePricing, ContextGraphSyncTablePolicy, ContextId, CreateContext, CreateDecision,
-    CreateDigest, CreateEntity, CreateIntention, Decision, DecisionId, DecisionStatus, DigestId,
-    EmbeddingId, EmbeddingTarget, EntityId, EntitySnapshotId, EntityType, EvidenceId, EvidenceKind,
-    EvidenceProducer, EvidenceRef, HostedProviderBoundary, HostedProviderReply, Intention,
-    IntentionOrigin, IntentionPatch, IntentionStatus, ModelCallUsage, ObservationId, Outcome,
-    PrecomputedEmbedding, ProgressKind, ProviderUsage, RecordObservation, Store, StoreConfig,
-    SyncStatusBoundary, TxId, UsageReportState, context_graph_sync_table_contract,
-    provider_usage_from_str,
+    CapturePricing, ContextGraphSyncRegistration, ContextGraphSyncTablePolicy, ContextId,
+    CreateContext, CreateDecision, CreateDigest, CreateEntity, CreateIntention, Decision,
+    DecisionId, DecisionStatus, DigestId, EmbeddingId, EmbeddingTarget, EntityId, EntitySnapshotId,
+    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, HostedProviderBoundary,
+    HostedProviderReply, Intention, IntentionOrigin, IntentionPatch, IntentionStatus,
+    ModelCallUsage, ObservationId, Outcome, PrecomputedEmbedding, ProgressKind, ProviderUsage,
+    RecordObservation, Store, StoreConfig, SyncStatusBoundary, TxId, UsageReportState,
+    context_graph_pending_push_change_count, context_graph_sync_conflict_policies,
+    context_graph_sync_table_contract, provider_usage_from_str, register_context_graph_sync_client,
 };
 use contextdb_core::{Lsn, Value as DbValue};
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
@@ -971,53 +972,31 @@ fn nats_socket_addr(nats_url: &str) -> SocketAddr {
 }
 
 pub fn cg_conflict_policies() -> ConflictPolicies {
-    let mut per_table = HashMap::new();
-    for policy in context_graph_sync_table_contract() {
-        per_table.insert(policy.table.to_string(), policy.conflict_policy);
+    context_graph_sync_conflict_policies()
+}
+
+struct TestSyncClientRegistration<'a>(&'a SyncClient);
+
+impl ContextGraphSyncRegistration for TestSyncClientRegistration<'_> {
+    fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
+        self.0.set_default_conflict_policy(policy);
     }
-    ConflictPolicies {
-        per_table,
-        default: ConflictPolicy::LatestWins,
+
+    fn set_table_direction(&self, table: &str, direction: SyncDirection) {
+        self.0.set_table_direction(table, direction);
+    }
+
+    fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
+        self.0.set_conflict_policy(table, policy);
     }
 }
 
 pub fn register_cg_sync_tables(client: &SyncClient) {
-    client.set_default_conflict_policy(ConflictPolicy::LatestWins);
-    let contract = context_graph_sync_table_contract();
-    if contract.is_empty() {
-        for table in TABLES {
-            client.set_table_direction(table.name, SyncDirection::Both);
-            client.set_conflict_policy(table.name, ConflictPolicy::LatestWins);
-        }
-        return;
-    }
-    for policy in contract {
-        client.set_table_direction(policy.table, policy.direction);
-        client.set_conflict_policy(policy.table, policy.conflict_policy);
-    }
-}
-
-fn cg_table_directions() -> HashMap<String, SyncDirection> {
-    let contract = context_graph_sync_table_contract();
-    if contract.is_empty() {
-        return TABLES
-            .iter()
-            .map(|table| (table.name.to_string(), SyncDirection::Both))
-            .collect();
-    }
-    contract
-        .into_iter()
-        .map(|policy| (policy.table.to_string(), policy.direction))
-        .collect()
+    register_context_graph_sync_client(&TestSyncClientRegistration(client));
 }
 
 pub fn expected_pending_push_change_count(client: &SyncClient) -> usize {
-    let directions = cg_table_directions();
-    let changes = client
-        .db()
-        .changes_since(client.push_watermark())
-        .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
-    changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len()
+    context_graph_pending_push_change_count(client.db(), client.push_watermark())
 }
 
 pub async fn push_pull(edge1: &SyncClient, edge2: &SyncClient) {
@@ -1159,6 +1138,14 @@ pub fn assert_sync_contract_has_real_table_policies() {
             .copied()
             .unwrap_or_else(|| panic!("test expectation missing policy for {table}"));
         assert_policy(&contract, table, direction, conflict_policy);
+    }
+    let runtime_policies = context_graph_sync_conflict_policies();
+    for table in ["cg_changed_cursors", "cg_runtime_models"] {
+        assert_eq!(
+            runtime_policies.per_table.get(table),
+            Some(&ConflictPolicy::InsertIfNotExists),
+            "{table} must be registered as local-only runtime state"
+        );
     }
 }
 
