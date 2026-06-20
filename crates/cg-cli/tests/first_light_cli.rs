@@ -12,11 +12,10 @@ use std::time::Duration;
 use context_graph::{
     ContextId, CreateDecision, CreateIntention, DecisionId, DecisionStatus, DiscoveryFilter,
     EntityId, IntentionId, IntentionOrigin, IntentionStatus, Store, StoreConfig,
-    context_graph_sync_table_contract, schema::TABLES,
+    context_graph_pending_push_change_count, context_graph_sync_conflict_policies,
 };
 use contextdb_core::Value as DbValue;
 use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, DdlChange, SyncDirection};
 use contextdb_server::{SyncClient, SyncServer};
 use serde_json::Value;
 use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider, cg_bin};
@@ -598,6 +597,7 @@ async fn start_cli_nats_or_environment_error() -> CliNatsFixture {
 struct CliSyncFixture {
     _nats: CliNatsFixture,
     _hub_dir: tempfile::TempDir,
+    _hub_store: Store,
     hub_db: Arc<Database>,
     shutdown: Arc<AtomicBool>,
     server_task: tokio::task::JoinHandle<()>,
@@ -616,14 +616,18 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
     let nats = start_cli_nats_or_environment_error().await;
     let hub_dir = tempfile::tempdir().expect("hub tempdir");
     let tenant_id = format!("tenant-{}", label.replace('_', "-"));
-    let hub_db = Arc::new(
-        Database::open(hub_dir.path().join("hub.db")).expect("open CLI sync hub database"),
-    );
+    let hub_store = Store::open(StoreConfig {
+        db_path: hub_dir.path().join("hub.db"),
+        default_text_embedder: None,
+        ..Default::default()
+    })
+    .expect("open CLI sync hub store");
+    let hub_db = hub_store.sync_database();
     let server = Arc::new(SyncServer::new(
         Arc::clone(&hub_db),
         &nats.nats_url,
         &tenant_id,
-        cli_conflict_policies_from_contract(),
+        context_graph_sync_conflict_policies(),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
@@ -636,6 +640,7 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
     CliSyncFixture {
         _nats: nats,
         _hub_dir: hub_dir,
+        _hub_store: hub_store,
         hub_db,
         shutdown,
         server_task,
@@ -646,134 +651,7 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
 
 fn cli_expected_pending_push_change_count(store: &Store, nats_url: &str, tenant_id: &str) -> usize {
     let client = SyncClient::new(store.sync_database(), nats_url, tenant_id);
-    let directions = cli_sync_directions_from_contract();
-    let raw_changes = client.db().changes_since(client.push_watermark());
-    let mut changes = cli_expected_push_changes_without_trigger_ddl(&raw_changes, &directions);
-    let schema_changes = store
-        .sync_schema_database()
-        .changes_since(client.push_watermark());
-    restore_expected_non_trigger_schema_ddl(&mut changes, &schema_changes);
-    changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len()
-}
-
-fn cli_expected_push_changes_without_trigger_ddl(
-    raw: &contextdb_engine::sync_types::ChangeSet,
-    directions: &HashMap<String, SyncDirection>,
-) -> contextdb_engine::sync_types::ChangeSet {
-    let mut filtered = raw
-        .clone()
-        .filter_by_direction(directions, &[SyncDirection::Push, SyncDirection::Both]);
-    restore_expected_non_trigger_schema_ddl(&mut filtered, raw);
-    filtered
-}
-
-fn restore_expected_non_trigger_schema_ddl(
-    filtered: &mut contextdb_engine::sync_types::ChangeSet,
-    raw: &contextdb_engine::sync_types::ChangeSet,
-) {
-    let mut seen = filtered
-        .ddl
-        .iter()
-        .map(|ddl| format!("{ddl:?}"))
-        .collect::<BTreeSet<_>>();
-    let old_ddl = std::mem::take(&mut filtered.ddl);
-    let old_ddl_lsn = std::mem::take(&mut filtered.ddl_lsn);
-    for (index, change) in old_ddl.into_iter().enumerate() {
-        if is_trigger_ddl(&change) {
-            continue;
-        }
-        filtered.ddl.push(change);
-        if let Some(lsn) = old_ddl_lsn.get(index).copied() {
-            filtered.ddl_lsn.push(lsn);
-        }
-    }
-    for (index, change) in raw.ddl.iter().cloned().enumerate() {
-        if is_trigger_ddl(&change) {
-            continue;
-        }
-        let key = format!("{change:?}");
-        if !seen.insert(key) {
-            continue;
-        }
-        filtered.ddl.push(change);
-        if let Some(lsn) = raw.ddl_lsn.get(index).copied() {
-            filtered.ddl_lsn.push(lsn);
-        }
-    }
-}
-
-fn is_trigger_ddl(change: &DdlChange) -> bool {
-    matches!(
-        change,
-        DdlChange::CreateTrigger { .. } | DdlChange::DropTrigger { .. }
-    )
-}
-
-fn cli_sync_directions_from_contract() -> HashMap<String, SyncDirection> {
-    let contract = context_graph_sync_table_contract();
-    assert_eq!(
-        contract.len(),
-        TABLES.len(),
-        "CLI sync tests must use the full production cg table policy contract"
-    );
-    let mut directions = HashMap::new();
-    for policy in contract {
-        assert!(
-            directions
-                .insert(policy.table.to_string(), policy.direction)
-                .is_none(),
-            "duplicate sync policy for {}",
-            policy.table
-        );
-    }
-    for table in TABLES {
-        assert!(
-            directions.contains_key(table.name),
-            "production sync table policy missing {}",
-            table.name
-        );
-    }
-    assert_eq!(
-        directions.get("audit_log"),
-        Some(&SyncDirection::None),
-        "audit_log is operational/local-only and must not sync through the shipped CLI path"
-    );
-    directions
-}
-
-fn cli_conflict_policies_from_contract() -> ConflictPolicies {
-    let contract = context_graph_sync_table_contract();
-    assert_eq!(
-        contract.len(),
-        TABLES.len(),
-        "CLI sync hub must use the full production cg table conflict-policy contract"
-    );
-    let mut per_table = HashMap::new();
-    for policy in contract {
-        assert!(
-            per_table
-                .insert(policy.table.to_string(), policy.conflict_policy)
-                .is_none(),
-            "duplicate sync conflict policy for {}",
-            policy.table
-        );
-    }
-    for table in TABLES {
-        assert!(
-            per_table.contains_key(table.name),
-            "production sync conflict policy missing {}",
-            table.name
-        );
-    }
-    assert_eq!(
-        per_table.get("audit_log"),
-        Some(&ConflictPolicy::InsertIfNotExists),
-        "audit_log must be registered in the production conflict-policy contract even though its direction is local-only"
-    );
-    ConflictPolicies {
-        per_table,
-        default: ConflictPolicy::LatestWins,
-    }
+    context_graph_pending_push_change_count(client.db(), client.push_watermark())
 }
 
 fn db_table_row_count(db: &Database, table: &str) -> usize {
@@ -782,30 +660,59 @@ fn db_table_row_count(db: &Database, table: &str) -> usize {
         .len()
 }
 
-fn force_write_once_schema_conflict(path: &std::path::Path) {
-    let store = persisted_store(Some(path.to_path_buf())).expect("open second CLI store");
-    let db = store.sync_database();
-    db.execute(
-        "UPDATE cg_schema_version SET version = $version WHERE id = $id",
-        &HashMap::from([
-            ("id".to_string(), DbValue::Int64(1)),
-            ("version".to_string(), DbValue::Int64(999)),
-        ]),
-    )
-    .expect("create local write-once conflict fixture");
-    let versions = db
+fn schema_version_installed_at(db: &Database) -> contextdb_core::TxId {
+    let installed_at = db
         .scan("cg_schema_version", db.snapshot())
         .expect("scan schema version")
         .into_iter()
-        .filter_map(|row| match row.values.get("version") {
-            Some(DbValue::Int64(version)) => Some(*version),
+        .filter_map(|row| match row.values.get("installed_at") {
+            Some(DbValue::TxId(tx)) => Some(*tx),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(
-        versions.contains(&999),
-        "fixture must create a local write-once schema conflict; versions={versions:?}"
+    assert_eq!(
+        installed_at.len(),
+        1,
+        "schema version fixture must have exactly one installed_at value; installed_at={installed_at:?}"
     );
+    installed_at[0]
+}
+
+fn force_write_once_schema_conflict(path: &std::path::Path) -> contextdb_core::TxId {
+    let store = persisted_store(Some(path.to_path_buf())).expect("open second CLI store");
+    let db = store.sync_database();
+    let original_installed_at = schema_version_installed_at(db.as_ref());
+    let committed = db.committed_watermark();
+    let conflict_installed_at = if original_installed_at != committed {
+        committed
+    } else {
+        assert!(
+            committed.0 > 0,
+            "schema version fixture needs a prior valid txid to create a divergent write-once row"
+        );
+        contextdb_core::TxId(committed.0 - 1)
+    };
+    assert_ne!(
+        original_installed_at, conflict_installed_at,
+        "schema version fixture must create a divergent local write-once row"
+    );
+    db.execute(
+        "UPDATE cg_schema_version SET installed_at = $installed_at WHERE id = $id",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Int64(1)),
+            (
+                "installed_at".to_string(),
+                DbValue::TxId(conflict_installed_at),
+            ),
+        ]),
+    )
+    .expect("create local write-once conflict fixture");
+    assert_eq!(
+        schema_version_installed_at(db.as_ref()),
+        conflict_installed_at,
+        "fixture must create a local write-once schema conflict"
+    );
+    conflict_installed_at
 }
 
 fn count_after_label(text: &str, label: &str) -> Option<u64> {
@@ -1878,10 +1785,8 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
             local_audit_rows > 0,
             "fixture must produce local audit rows so the CLI sync path proves audit_log stays local"
         );
-        let scoped_store = scoped_persisted_store(Some(store_path.clone()), &fixture.tenant_id)
-            .expect("open scoped CLI store after record");
         let count = cli_expected_pending_push_change_count(
-            &scoped_store,
+            &store,
             fixture.nats_url.as_str(),
             fixture.tenant_id.as_str(),
         ) as u64;
@@ -1975,7 +1880,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
 
     let second_edge = CliHarness::new();
     let second_edge_store_path = second_edge.data_root.path().join("context-graph.db");
-    force_write_once_schema_conflict(&second_edge_store_path);
+    let local_schema_installed_at = force_write_once_schema_conflict(&second_edge_store_path);
     let pull = second_edge.run(&[
         "sync",
         "pull",
@@ -1994,6 +1899,27 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         Some(0),
         "cg sync pull must report the real ApplyResult from the production per-table policy contract; a default ServerWins pull records a conflict for the write-once schema row: {pull_json}"
     );
+    assert!(
+        json_u64_at(
+            &pull_json,
+            &[
+                "/sync/apply_result/skipped_rows",
+                "/apply_result/skipped_rows"
+            ]
+        )
+        .unwrap_or(0)
+            > 0,
+        "write-once schema conflict fixture must exercise the InsertIfNotExists skip path: {pull_json}"
+    );
+    {
+        let post_pull_db =
+            Database::open(&second_edge_store_path).expect("open second edge after pull");
+        assert_eq!(
+            schema_version_installed_at(&post_pull_db),
+            local_schema_installed_at,
+            "cg sync pull must preserve the local divergent write-once schema row while reporting zero conflicts"
+        );
+    }
     let pulled_query = second_edge.run(&[
         "query",
         "--tenant-id",

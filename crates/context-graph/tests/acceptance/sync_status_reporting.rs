@@ -1,3 +1,4 @@
+use context_graph::ingest::{RuntimeModelInfo, register_runtime_model_info};
 use context_graph::sync_status_report;
 use contextdb_core::Lsn;
 
@@ -79,6 +80,37 @@ async fn status_reports_pending_push_count() {
     );
     assert_eq!(expected_drained, 0);
     assert_eq!(drained.pending_push_count, expected_drained);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_excludes_runtime_model_metadata_from_pending_push_count() {
+    let fixture =
+        real_sync_fixture("status_excludes_runtime_model_metadata_from_pending_push_count").await;
+    drain_push(&fixture.edge1_client).await;
+
+    register_runtime_model_info(
+        &fixture.edge1.store,
+        RuntimeModelInfo {
+            context_label: "tenant-alpha".to_string(),
+            model_key: "local-runtime-window".to_string(),
+            advertised_context_tokens: 8_192,
+            default_for_context: true,
+        },
+    )
+    .expect("register runtime model metadata");
+
+    assert_eq!(
+        expected_pending_push_change_count(&fixture.edge1_client),
+        0,
+        "runtime model metadata is local operational state and must not count as syncable graph transport"
+    );
+    assert!(
+        !fixture
+            .edge1_client
+            .has_pending_push_changes()
+            .expect("pending push check after runtime metadata"),
+        "runtime model metadata must not make a registered cg sync client think a push is pending"
+    );
 }
 
 #[test]

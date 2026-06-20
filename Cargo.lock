@@ -808,15 +808,12 @@ dependencies = [
 name = "context-graph-cli"
 version = "0.1.0"
 dependencies = [
- "async-nats",
  "cg-catalog",
  "cg-cli-conventions",
  "context-graph",
  "contextdb-core",
  "contextdb-engine",
  "contextdb-server",
- "futures-util",
- "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
