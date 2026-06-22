@@ -1,4 +1,5 @@
 pub mod capture_sync_status;
+pub mod control_transport;
 pub mod embedder;
 pub mod embedding_space;
 pub mod embedding_target;
@@ -13,6 +14,7 @@ pub mod types;
 
 pub use capture_sync_status::*;
 pub use contextdb_core::TxId;
+pub use control_transport::{ControlHandler, request_control, start_control_listener};
 pub use embedder::{
     Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput, ModelSource,
     load_observer::{EmbedderLoadEvent, EmbedderLoadObserver},
