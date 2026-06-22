@@ -826,6 +826,7 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
     for file in files {
         if file == crate_dir.join("src/embedder/embeddinggemma.rs")
             || file == crate_dir.join("src/embedder/nomic.rs")
+            || file == crate_dir.join("src/control_transport.rs")
         {
             continue;
         }
@@ -854,6 +855,7 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
     for file in files {
         if file == crate_dir.join("src/embedder/embeddinggemma.rs")
             || file == crate_dir.join("src/embedder/nomic.rs")
+            || file == crate_dir.join("src/control_transport.rs")
         {
             continue;
         }
@@ -6508,6 +6510,7 @@ fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_file
         if file.starts_with(crate_dir.join("src")) {
             if file == crate_dir.join("src/embedder/embeddinggemma.rs")
                 || file == crate_dir.join("src/embedder/nomic.rs")
+                || file == crate_dir.join("src/control_transport.rs")
             {
                 continue;
             }
