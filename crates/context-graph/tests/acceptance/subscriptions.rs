@@ -1987,7 +1987,7 @@ fn subscription_resume_replays_queued_events_after_reopen_for_invalidation_confl
     );
 }
 
-// Use case: registering a subscriber does not mutate Plan 7's Invalidation row shape.
+// Use case: registering a subscriber does not mutate the Invalidation row shape.
 #[test]
 fn plan_7_invalidation_row_15_field_shape_unchanged_after_plan_10_subscriber_wraps_payload() {
     let (_dir, _path, store, ctx, ent, _intent, _dec, payloads) = collect_invalidation();

@@ -596,6 +596,7 @@ fn create_rendered_decision_for_snapshot(
             context_id,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .ok()?;
     let decision = store

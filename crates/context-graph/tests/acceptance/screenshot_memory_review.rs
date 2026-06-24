@@ -2826,6 +2826,7 @@ fn screenshot_review_replay_returns_original_image_frame_evidence_ref_not_captio
             context_id,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let decision = store

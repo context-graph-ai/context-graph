@@ -554,6 +554,10 @@ pub struct Intention {
     pub properties: BTreeMap<String, Value>,
     pub tags: Vec<String>,
     pub created_at: TxId,
+    /// Which catalog group this intention belongs to. None means unassigned (no grouping
+    /// resolution has run). The correct impl sets this during Stage-3 grouping; the wrong
+    /// stub never sets it, so captures always store None here.
+    pub blueprint_catalog_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -706,6 +710,8 @@ pub struct CreateIntention {
     pub context_id: ContextId,
     pub properties: BTreeMap<String, Value>,
     pub tags: Vec<String>,
+    /// Catalog group to assign at creation. None means unassigned.
+    pub blueprint_catalog_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

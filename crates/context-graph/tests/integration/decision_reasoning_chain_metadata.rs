@@ -164,6 +164,7 @@ fn create_decision_with_seeded_embedding(store: &Store, version: &str) -> Decisi
             context_id: context.id,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let decision = store

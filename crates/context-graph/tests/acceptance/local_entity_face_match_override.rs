@@ -90,6 +90,7 @@ fn scenario(name: &str) -> Scenario {
             context_id: context.id,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store

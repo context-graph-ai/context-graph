@@ -79,7 +79,48 @@ pub struct DedupEvent {
     pub classification: DedupClassification,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedEntityInfo {
+    pub id: String,
+    pub entity_type: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedDecisionInfo {
+    pub id: String,
+    pub decision_type: Option<String>,
+    pub agent_id: Option<String>,
+    pub confidence: Option<f32>,
+    pub reasoning: Vec<String>,
+    pub tags: Vec<String>,
+    pub properties: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedObservationInfo {
+    pub id: String,
+    pub observation_type: String,
+    pub source: String,
+    pub observed_properties: serde_json::Value,
+    pub state_delta: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedOutcomeInfo {
+    pub id: String,
+    pub of_decision_key: String,
+    pub success: bool,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlaggedItem {
+    pub key: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CaptureReport {
     pub mode: CaptureMode,
     pub last_harvest: HarvestCounts,
@@ -98,6 +139,16 @@ pub struct CaptureReport {
     pub resolved_chunk_window: Option<usize>,
     pub model_context_tokens: Option<usize>,
     pub model_usage: Vec<ModelCallUsage>,
+    /// Placeholder: always empty. The real implementation lists entities captured from the harvest.
+    pub captured_entities: Vec<CapturedEntityInfo>,
+    /// Placeholder: always empty. The real implementation lists decisions captured from the harvest.
+    pub captured_decisions: Vec<CapturedDecisionInfo>,
+    /// Placeholder: always empty. The real implementation lists observations captured from the harvest.
+    pub captured_observations: Vec<CapturedObservationInfo>,
+    /// Placeholder: always empty. The real implementation lists outcomes captured from the harvest.
+    pub captured_outcomes: Vec<CapturedOutcomeInfo>,
+    /// Placeholder: always empty. The real implementation lists items the grounding check flagged.
+    pub flagged_items: Vec<FlaggedItem>,
 }
 
 impl CaptureReport {
@@ -120,6 +171,11 @@ impl CaptureReport {
             resolved_chunk_window: None,
             model_context_tokens: None,
             model_usage: Vec::new(),
+            captured_entities: Vec::new(),
+            captured_decisions: Vec::new(),
+            captured_observations: Vec::new(),
+            captured_outcomes: Vec::new(),
+            flagged_items: Vec::new(),
         }
     }
 }
@@ -131,7 +187,7 @@ pub struct CaptureRequest {
     pub model_available: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct StructuredHarvest {
     #[serde(default)]
     pub summary: Option<String>,
@@ -143,6 +199,9 @@ pub struct StructuredHarvest {
     pub decisions: Vec<DecisionSeed>,
     #[serde(default)]
     pub observations: Vec<ObservationSeed>,
+    /// Outcomes extracted from the model — currently ignored by the capture harness.
+    #[serde(default)]
+    pub outcomes: Vec<OutcomeSeed>,
 }
 
 impl StructuredHarvest {
@@ -167,15 +226,20 @@ impl StructuredHarvest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct GoalSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub text: String,
+    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
+    /// under the emitted context instead of the capture context (cross-tenant leak). The
+    /// correct impl ignores this field and always uses the capture context.
+    #[serde(default)]
+    pub context_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct EntitySeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
@@ -185,16 +249,29 @@ pub struct EntitySeed {
     pub path: String,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub entity_type: ExtractedEntityType,
+    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
+    /// under the emitted context instead of the capture context (cross-tenant leak). The
+    /// correct impl ignores this field and always uses the capture context.
+    #[serde(default)]
+    pub context_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractedEntityType {
     Service,
+    Person,
+    Device,
+    Module,
+    Repository,
     Configuration,
+    Infrastructure,
+    Location,
     #[default]
     File,
     Pipeline,
+    Database,
+    Team,
     Document,
 }
 
@@ -217,17 +294,33 @@ where
 
 impl From<ExtractedEntityType> for EntityType {
     fn from(value: ExtractedEntityType) -> Self {
+        // Placeholder mapping: collapses Repository, Module, and others to File or Service.
+        // The correct implementation maps every variant to its matching EntityType variant.
         match value {
             ExtractedEntityType::Service => EntityType::Service,
+            ExtractedEntityType::Person => EntityType::Person,
+            ExtractedEntityType::Device => EntityType::Device,
+            // Placeholder: collapses Module to File; correct is Module.
+            ExtractedEntityType::Module => EntityType::File,
+            // Placeholder: collapses Repository to File; correct is Repository.
+            ExtractedEntityType::Repository => EntityType::File,
             ExtractedEntityType::Configuration => EntityType::Configuration,
+            // Placeholder: collapses Infrastructure to Service; correct is Infrastructure.
+            ExtractedEntityType::Infrastructure => EntityType::Service,
+            // Placeholder: collapses Location to Service; correct is Location.
+            ExtractedEntityType::Location => EntityType::Service,
             ExtractedEntityType::File => EntityType::File,
             ExtractedEntityType::Pipeline => EntityType::Pipeline,
+            // Placeholder: collapses Database to Service; correct is Database.
+            ExtractedEntityType::Database => EntityType::Service,
+            // Placeholder: collapses Team to Service; correct is Team.
+            ExtractedEntityType::Team => EntityType::Service,
             ExtractedEntityType::Document => EntityType::Document,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct DecisionSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
@@ -239,6 +332,29 @@ pub struct DecisionSeed {
     pub entity_key: Option<String>,
     #[serde(default)]
     pub relation: Option<DecisionRelationSeed>,
+    /// From model extraction — decision type (e.g. "technology_choice"). Currently ignored by harness.
+    #[serde(default)]
+    pub decision_type: Option<String>,
+    /// From model extraction — agent responsible for the decision. Currently ignored by harness.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// From model extraction — confidence (null at capture per Decision §2). Currently ignored by harness.
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// From model extraction — reasoning steps. Currently ignored by harness.
+    #[serde(default)]
+    pub reasoning: Vec<String>,
+    /// From model extraction — tags. Currently ignored by harness.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// From model extraction — properties. Currently ignored by harness.
+    #[serde(default)]
+    pub properties: serde_json::Value,
+    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
+    /// under the emitted context instead of the capture context (cross-tenant leak). The
+    /// correct impl ignores this field and always uses the capture context.
+    #[serde(default)]
+    pub context_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -260,7 +376,7 @@ pub enum DecisionRelationClassification {
     SupersedesExisting,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct ObservationSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
@@ -270,6 +386,53 @@ pub struct ObservationSeed {
     pub entity_key: Option<String>,
     #[serde(default)]
     pub path_change: Option<String>,
+    /// From model extraction — observation type (e.g. "benchmark"). Currently ignored by harness.
+    #[serde(default)]
+    pub observation_type: Option<String>,
+    /// From model extraction — source (e.g. "agent-session"). Currently ignored by harness.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// From model extraction — observed_properties (e.g. {latency_ms: 42}). Currently ignored.
+    #[serde(default)]
+    pub observed_properties: serde_json::Value,
+    /// From model extraction — state_delta. Currently ignored by harness.
+    #[serde(default)]
+    pub state_delta: serde_json::Value,
+    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
+    /// under the emitted context instead of the capture context (cross-tenant leak). The
+    /// correct impl ignores this field and always uses the capture context.
+    #[serde(default)]
+    pub context_id: Option<String>,
+}
+
+/// An outcome extracted from the model — maps to Outcome §5.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct OutcomeSeed {
+    #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
+    pub key: String,
+    /// Key of the decision this outcome belongs to.
+    #[serde(default)]
+    pub of_decision_key: Option<String>,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub notes: String,
+    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
+    /// under the emitted context instead of the capture context (cross-tenant leak). The
+    /// correct impl ignores this field and always uses the capture context.
+    #[serde(default)]
+    pub context_id: Option<String>,
+}
+
+/// A verbatim supporting span emitted by the model alongside an extracted value.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct ExtractedSpan {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub start: Option<usize>,
+    #[serde(default)]
+    pub end: Option<usize>,
 }
 
 pub struct ExtractionRequest<'a> {
@@ -666,6 +829,7 @@ impl RollingCaptureAccumulator {
             self.harvest.goals.push(GoalSeed {
                 key,
                 text: goal.text,
+                context_id: None,
             });
         }
 
@@ -686,6 +850,7 @@ impl RollingCaptureAccumulator {
                 name: entity.name,
                 path: entity.path,
                 entity_type: entity.entity_type,
+                context_id: None,
             });
         }
 
@@ -1031,6 +1196,11 @@ fn capture_raw(
         resolved_chunk_window: None,
         model_context_tokens: None,
         model_usage: Vec::new(),
+        captured_entities: Vec::new(),
+        captured_decisions: Vec::new(),
+        captured_observations: Vec::new(),
+        captured_outcomes: Vec::new(),
+        flagged_items: Vec::new(),
     })
 }
 
@@ -1125,6 +1295,7 @@ fn reuse_prior_goals_for_entity_decisions(
             harvest.goals.push(GoalSeed {
                 key: key.clone(),
                 text: prior_goal.clone(),
+                context_id: None,
             });
             existing_goal_keys.insert(normalized_goal, key.clone());
             key
@@ -1146,6 +1317,7 @@ fn ensure_goal_keys_for_decisions(harvest: &mut StructuredHarvest, context_label
         harvest.goals.push(GoalSeed {
             key: "G_context".to_string(),
             text: format!("track durable decisions for {context_label}"),
+            context_id: None,
         });
     }
     let goal_keys = harvest
@@ -3747,6 +3919,11 @@ fn report_with_counts(
         resolved_chunk_window: None,
         model_context_tokens: None,
         model_usage: Vec::new(),
+        captured_entities: Vec::new(),
+        captured_decisions: Vec::new(),
+        captured_observations: Vec::new(),
+        captured_outcomes: Vec::new(),
+        flagged_items: Vec::new(),
     }
 }
 
@@ -3861,7 +4038,7 @@ fn context_by_label(store: &Store, label: &str) -> Result<crate::Context> {
     })
 }
 
-fn extraction_prior_decisions(
+pub(crate) fn extraction_prior_decisions(
     store: &Store,
     context_id: ContextId,
 ) -> Result<Vec<ExtractionPriorDecision>> {
@@ -4657,6 +4834,7 @@ mod tests {
                 goals: vec![GoalSeed {
                     key: "G1".to_string(),
                     text: "keep bounded prior recall useful".to_string(),
+                    context_id: None,
                 }],
                 entities: Vec::new(),
                 decisions: vec![DecisionSeed {
@@ -4665,8 +4843,10 @@ mod tests {
                     goal_key: Some("G1".to_string()),
                     entity_key: None,
                     relation: None,
+                    ..Default::default()
                 }],
                 observations: Vec::new(),
+                outcomes: Vec::new(),
             })
         }
 
@@ -4727,12 +4907,14 @@ mod tests {
             goals: vec![GoalSeed {
                 key: "G1".to_string(),
                 text: "keep rollback test reliable".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E1".to_string(),
                 name: "rollback config".to_string(),
                 path: "config/rollback.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D1".to_string(),
@@ -4740,8 +4922,10 @@ mod tests {
                 goal_key: Some("G1".to_string()),
                 entity_key: Some("E1".to_string()),
                 relation: None,
+                ..Default::default()
             }],
             observations: Vec::new(),
+            outcomes: Vec::new(),
         });
 
         let result = record_conversation_with_extractor(

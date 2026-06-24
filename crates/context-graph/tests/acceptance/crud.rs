@@ -109,6 +109,7 @@ fn create_intention_input(context_id: ContextId, description: &str) -> CreateInt
         context_id,
         properties: BTreeMap::new(),
         tags: vec![],
+        blueprint_catalog_id: None,
     }
 }
 
@@ -205,6 +206,7 @@ fn intention_create_persists_across_reopen() {
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         }),
         "tx1: create intention"
     );
@@ -217,6 +219,7 @@ fn intention_create_persists_across_reopen() {
         context_id: ctx,
         properties: BTreeMap::new(),
         tags: vec![],
+        blueprint_catalog_id: None,
     });
     assert!(
         matches!(invalid, Err(CgError::InvalidIdentity { .. })),
@@ -255,6 +258,7 @@ fn intention_identity_collision_rejected() {
         properties: BTreeMap::new(),
         tags: vec![],
         created_at: original.created_at,
+        blueprint_catalog_id: None,
     };
     let result = store.admin_raw_insert_intention(forged);
     assert!(

@@ -2,6 +2,8 @@
 mod fake_extractor;
 #[path = "../common/invalidation_fixtures.rs"]
 mod invalidation_fixtures;
+#[path = "../common/refactor_extractor.rs"]
+mod refactor_extractor;
 
 mod cluster_aggregate_substrate;
 #[cfg(context_graph_internal_test_support)]
@@ -15,6 +17,8 @@ mod decision_reasoning_chain_metadata;
 mod embedder_metadata;
 mod entity_reference_edge_cases;
 mod entity_reference_embeddings;
+mod four_stages_three_sources;
+mod harness_contract_single_source;
 #[cfg(context_graph_internal_test_support)]
 mod engine_probes {
     pub mod embedder_concurrency;

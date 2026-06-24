@@ -164,12 +164,14 @@ impl ConversationExtractor for SpyRollingExtractor {
             harvest.goals.push(GoalSeed {
                 key: "G_sentinel".to_string(),
                 text: "preserve sentinel memory across a long session".to_string(),
+                context_id: None,
             });
             harvest.entities.push(EntitySeed {
                 key: "E_sentinel".to_string(),
                 name: "sentinel session memory".to_string(),
                 path: "memory://sentinel-session".to_string(),
                 entity_type: ExtractedEntityType::Document,
+                context_id: None,
             });
         }
         if source.contains("SENTINEL_OPEN") {
@@ -178,6 +180,7 @@ impl ConversationExtractor for SpyRollingExtractor {
                 text: "SENTINEL_OPEN appeared near the start of the long session".to_string(),
                 entity_key: Some("E_sentinel".to_string()),
                 path_change: None,
+                ..Default::default()
             });
         }
         if source.contains("SENTINEL_CLOSE") {
@@ -186,6 +189,7 @@ impl ConversationExtractor for SpyRollingExtractor {
                 text: "SENTINEL_CLOSE appeared near the end of the long session".to_string(),
                 entity_key: Some("E_sentinel".to_string()),
                 path_change: None,
+                ..Default::default()
             });
         }
         Ok(harvest)

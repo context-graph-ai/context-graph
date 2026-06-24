@@ -147,6 +147,8 @@ pub fn provider_with_unique_usage_for_chunks(
             elapsed: dynamic_provider_elapsed(index),
             reliability_level: EnforcementLevel::Native,
             outcome: ModelCallOutcome::Captured,
+            flow_tag: None,
+            model_id: None,
         })
         .collect::<Vec<_>>();
     (
@@ -348,6 +350,8 @@ impl<'a> ProviderBackedExtractor<'a> {
             elapsed: reply.elapsed,
             reliability_level: EnforcementLevel::Native,
             outcome: ModelCallOutcome::Captured,
+            flow_tag: None,
+            model_id: None,
         });
     }
 }
@@ -1195,6 +1199,20 @@ fn expected_sync_table_policies() -> BTreeMap<&'static str, (SyncDirection, Conf
         ("audit_log", local_only),
         ("conflicts", write_once),
         ("precedent_matches", write_once),
+        // Placeholder policies for the 4 new skill-loop tables (all write_once).
+        // Correct policies (what the impl must set) are noted below:
+        //   cg_learned_skills:    CORRECT = (Both, ServerWins);  placeholder = write_once
+        //   cg_teaching_events:   CORRECT = (Both, InsertIfNotExists); placeholder = write_once
+        //   cg_skill_firing_trace: CORRECT = (None, InsertIfNotExists); placeholder = write_once (Both)
+        //   cg_review_cursor:     CORRECT = (None, InsertIfNotExists); placeholder = write_once (Both)
+        ("cg_learned_skills", write_once),
+        ("cg_teaching_events", write_once),
+        ("cg_skill_firing_trace", write_once),
+        ("cg_review_cursor", write_once),
+        // Two-layer overlay corrections + compensation/reversal events are append-only rows that
+        // propagate tenant-wide so a reversal reaches every machine: (Both, InsertIfNotExists).
+        ("cg_overlay_entries", write_once),
+        ("cg_compensation_events", write_once),
     ])
 }
 
