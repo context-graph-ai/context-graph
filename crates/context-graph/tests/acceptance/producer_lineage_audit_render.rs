@@ -333,6 +333,7 @@ fn create_audit_lineage_decision(
             context_id: context.id,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let decision = store
@@ -407,6 +408,7 @@ fn executive_pdf_paragraph_includes_human_readable_producer_string() {
             context_id: context.id,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let decision = store
@@ -619,6 +621,7 @@ fn architect_departure_end_to_end_procurement_demo() {
             context_id: context.id,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let decision = store

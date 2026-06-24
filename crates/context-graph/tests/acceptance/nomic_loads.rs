@@ -1316,6 +1316,7 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "list_entities",
     "list_entity_reference_embeddings_for_entity",
     "list_evidence_for_observation",
+    "list_intentions_in_context",
     "list_invalidations",
     "list_observations",
     "open",

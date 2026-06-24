@@ -24,6 +24,15 @@ fn enforced_output_cannot_become_decision_basis_barrier_holds() {
 }
 
 #[test]
+fn extracted_field_is_not_a_basis() {
+    // The .stderr declares the compile error that the ModelExtractedField barrier will produce.
+    // Until the impl adds the barrier type to src/, the .rs file compiles (no error) and
+    // trybuild reports a mismatch.
+    let trybuild = trybuild::TestCases::new();
+    trybuild.compile_fail("tests/ui/extracted_field_is_not_a_basis.rs");
+}
+
+#[test]
 fn usage_is_not_a_basis_input_compile_fail() {
     let trybuild = trybuild::TestCases::new();
     trybuild.compile_fail("tests/ui/usage_is_not_a_basis_input.rs");

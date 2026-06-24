@@ -103,6 +103,7 @@ fn intention_with_status(
                 json!(format!("intention-{description}")),
             )]),
             tags: vec![format!("intent-{}", description.replace(' ', "-"))],
+            blueprint_catalog_id: None,
         }),
         "create intention"
     )
@@ -121,6 +122,7 @@ fn untagged_intention(store: &Store, context_id: ContextId, description: &str) -
                 json!(format!("intention-{description}")),
             )]),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         }),
         "create untagged intention"
     )

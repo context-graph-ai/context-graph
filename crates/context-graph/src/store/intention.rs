@@ -39,6 +39,11 @@ impl Store {
         );
 
         let tx = self.begin_tx()?;
+        let blueprint_catalog_id_value = input
+            .blueprint_catalog_id
+            .as_deref()
+            .map(|s| Value::Text(s.to_string()))
+            .unwrap_or(Value::Null);
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             (
@@ -62,6 +67,10 @@ impl Store {
             ("bindings".to_string(), Value::Null),
             ("blueprint_proposal".to_string(), Value::Null),
             (
+                "blueprint_catalog_id".to_string(),
+                blueprint_catalog_id_value,
+            ),
+            (
                 "properties".to_string(),
                 Value::Json(properties_json.clone()),
             ),
@@ -72,7 +81,7 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $properties, $tags, $created_at)",
+            "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, blueprint_catalog_id, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $blueprint_catalog_id, $properties, $tags, $created_at)",
             &params,
         ) {
             let _ = self.db.rollback(tx);
@@ -115,6 +124,7 @@ impl Store {
             properties: input.properties,
             tags: input.tags,
             created_at: tx,
+            blueprint_catalog_id: input.blueprint_catalog_id,
         })
     }
 
@@ -131,7 +141,7 @@ impl Store {
         let result = self
             .db
             .execute(
-                "SELECT id, description, status, origin, context_id, properties, tags, created_at FROM intentions WHERE id = $id",
+                "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE id = $id",
                 &params,
             )
             .map_err(map_engine_err)?;
@@ -717,6 +727,14 @@ impl Store {
             ("bindings".to_string(), Value::Null),
             ("blueprint_proposal".to_string(), Value::Null),
             (
+                "blueprint_catalog_id".to_string(),
+                input
+                    .blueprint_catalog_id
+                    .as_deref()
+                    .map(|s| Value::Text(s.to_string()))
+                    .unwrap_or(Value::Null),
+            ),
+            (
                 "properties".to_string(),
                 Value::Json(properties_to_json(&input.properties)),
             ),
@@ -727,7 +745,7 @@ impl Store {
         .collect();
         if let Err(e) = self.db.execute_in_tx(
             tx,
-            "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $properties, $tags, $created_at)",
+            "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, blueprint_catalog_id, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $blueprint_catalog_id, $properties, $tags, $created_at)",
             &params,
         ) {
             let _ = self.db.rollback(tx);
@@ -735,6 +753,27 @@ impl Store {
         }
         self.db.commit(tx).map_err(map_engine_err)?;
         Ok(())
+    }
+
+    /// Returns all intentions stored under the given context, ordered by creation time.
+    /// A read-only helper for verifying context-scoped capture output in tests.
+    pub fn list_intentions_in_context(&self, context_id: ContextId) -> Result<Vec<Intention>> {
+        let params: HashMap<String, Value> =
+            [("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]
+                .into_iter()
+                .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE context_id = $context_id ORDER BY created_at ASC",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            out.push(decode_intention(&result.columns, row)?);
+        }
+        Ok(out)
     }
 
     pub fn admin_raw_scan_intention_rows(&self, id: IntentionId) -> Result<Vec<Intention>> {
@@ -749,7 +788,7 @@ impl Store {
         let result = self
             .db
             .execute(
-                "SELECT id, description, status, origin, context_id, properties, tags, created_at FROM intentions WHERE id = $id",
+                "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE id = $id",
                 &params,
             )
             .map_err(map_engine_err)?;
@@ -847,6 +886,13 @@ pub(super) fn decode_intention(columns: &[String], row: &[Value]) -> Result<Inte
         status: intention_status_from_str(&get_text(row, columns, "status")?)?,
         origin: intention_origin_from_str(&get_text(row, columns, "origin")?)?,
         context_id: ContextId::from(get_uuid(row, columns, "context_id")?),
+        // Summary-projection queries (e.g. discovery's by_entity_intentions) intentionally omit
+        // this column; absence means the row carries no catalog grouping in this projection.
+        blueprint_catalog_id: if columns.iter().any(|c| c == "blueprint_catalog_id") {
+            get_optional_text(row, columns, "blueprint_catalog_id")?
+        } else {
+            None
+        },
         properties: properties_from_json(&get_json(row, columns, "properties")?),
         tags: tags_from_json(&get_json(row, columns, "tags")?),
         created_at: get_txid(row, columns, "created_at")?,

@@ -191,10 +191,12 @@ fn structured_capture_dedups_duplicate_text_seeds_inside_one_harvest() {
                 GoalSeed {
                     key: "G1".to_string(),
                     text: "keep duplicate captures idempotent".to_string(),
+                    context_id: None,
                 },
                 GoalSeed {
                     key: "G2".to_string(),
                     text: "Keep duplicate captures idempotent.".to_string(),
+                    context_id: None,
                 },
             ],
             entities: vec![EntitySeed {
@@ -202,6 +204,7 @@ fn structured_capture_dedups_duplicate_text_seeds_inside_one_harvest() {
                 name: "duplicate config".to_string(),
                 path: "config/duplicate.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                context_id: None,
             }],
             decisions: vec![
                 DecisionSeed {
@@ -210,6 +213,7 @@ fn structured_capture_dedups_duplicate_text_seeds_inside_one_harvest() {
                     goal_key: Some("G1".to_string()),
                     entity_key: Some("E1".to_string()),
                     relation: None,
+                    ..Default::default()
                 },
                 DecisionSeed {
                     key: "D2".to_string(),
@@ -217,6 +221,7 @@ fn structured_capture_dedups_duplicate_text_seeds_inside_one_harvest() {
                     goal_key: Some("G2".to_string()),
                     entity_key: Some("E1".to_string()),
                     relation: None,
+                    ..Default::default()
                 },
             ],
             observations: vec![
@@ -225,14 +230,17 @@ fn structured_capture_dedups_duplicate_text_seeds_inside_one_harvest() {
                     text: "duplicate config observed at config/duplicate.toml".to_string(),
                     entity_key: Some("E1".to_string()),
                     path_change: None,
+                    ..Default::default()
                 },
                 ObservationSeed {
                     key: "O2".to_string(),
                     text: "Duplicate config observed at config/duplicate.toml.".to_string(),
                     entity_key: Some("E1".to_string()),
                     path_change: None,
+                    ..Default::default()
                 },
             ],
+            outcomes: Vec::new(),
         }),
     )
     .expect("duplicate text capture should succeed");
@@ -554,12 +562,14 @@ fn model_relation_conflict_routes_negation_to_invalidation() {
             goals: vec![GoalSeed {
                 key: "G_release".to_string(),
                 text: "ship the release safely".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_target".to_string(),
                 name: "release target".to_string(),
                 path: "deployment target".to_string(),
                 entity_type: ExtractedEntityType::Service,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_aws".to_string(),
@@ -567,8 +577,10 @@ fn model_relation_conflict_routes_negation_to_invalidation() {
                 goal_key: Some("G_release".to_string()),
                 entity_key: Some("E_target".to_string()),
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("first relation capture");
@@ -585,12 +597,14 @@ fn model_relation_conflict_routes_negation_to_invalidation() {
             goals: vec![GoalSeed {
                 key: "G_release".to_string(),
                 text: "ship the release safely".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_target".to_string(),
                 name: "release target".to_string(),
                 path: "deployment target".to_string(),
                 entity_type: ExtractedEntityType::Service,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_never_aws".to_string(),
@@ -601,8 +615,10 @@ fn model_relation_conflict_routes_negation_to_invalidation() {
                     prior_decision_id: prior.as_uuid().to_string(),
                     classification: DecisionRelationClassification::ConflictsExisting,
                 }),
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("second relation capture");
@@ -651,12 +667,14 @@ fn model_relation_duplicate_routes_byte_disjoint_paraphrase_to_prior_row() {
             goals: vec![GoalSeed {
                 key: "G_login".to_string(),
                 text: "ship login".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_auth".to_string(),
                 name: "authentication module".to_string(),
                 path: "src/auth.py".to_string(),
                 entity_type: ExtractedEntityType::File,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_auth".to_string(),
@@ -664,8 +682,10 @@ fn model_relation_duplicate_routes_byte_disjoint_paraphrase_to_prior_row() {
                 goal_key: Some("G_login".to_string()),
                 entity_key: Some("E_auth".to_string()),
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("first paraphrase capture");
@@ -682,12 +702,14 @@ fn model_relation_duplicate_routes_byte_disjoint_paraphrase_to_prior_row() {
             goals: vec![GoalSeed {
                 key: "G_login".to_string(),
                 text: "ship login".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_auth".to_string(),
                 name: "authentication module".to_string(),
                 path: "src/auth.py".to_string(),
                 entity_type: ExtractedEntityType::File,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_auth_paraphrase".to_string(),
@@ -698,8 +720,10 @@ fn model_relation_duplicate_routes_byte_disjoint_paraphrase_to_prior_row() {
                     prior_decision_id: prior.as_uuid().to_string(),
                     classification: DecisionRelationClassification::ExactDuplicate,
                 }),
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("second paraphrase capture");
@@ -743,12 +767,14 @@ fn duplicate_relation_to_invalidated_prior_writes_current_replacement() {
             goals: vec![GoalSeed {
                 key: "G_billing".to_string(),
                 text: "keep billing service reliable".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_limiter".to_string(),
                 name: "rate-limiter config".to_string(),
                 path: "config/ratelimit.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_cap".to_string(),
@@ -756,8 +782,10 @@ fn duplicate_relation_to_invalidated_prior_writes_current_replacement() {
                 goal_key: Some("G_billing".to_string()),
                 entity_key: Some("E_limiter".to_string()),
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("first billing capture");
@@ -776,12 +804,14 @@ fn duplicate_relation_to_invalidated_prior_writes_current_replacement() {
             goals: vec![GoalSeed {
                 key: "G_billing".to_string(),
                 text: "keep billing service reliable".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_limiter".to_string(),
                 name: "rate-limiter configuration".to_string(),
                 path: "config/limits.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_cap_current".to_string(),
@@ -792,13 +822,16 @@ fn duplicate_relation_to_invalidated_prior_writes_current_replacement() {
                     prior_decision_id: prior.as_uuid().to_string(),
                     classification: DecisionRelationClassification::ExactDuplicate,
                 }),
+                ..Default::default()
             }],
             observations: vec![ObservationSeed {
                 key: "O_limiter_moved".to_string(),
                 text: "rate-limiter configuration observed at config/limits.toml".to_string(),
                 entity_key: Some("E_limiter".to_string()),
                 path_change: Some("config/limits.toml".to_string()),
+                ..Default::default()
             }],
+            outcomes: Vec::new(),
         }),
     )
     .expect("second billing capture");
@@ -887,12 +920,14 @@ fn refines_relation_to_invalidated_prior_does_not_cascade_into_replacement() {
             goals: vec![GoalSeed {
                 key: "G_billing".to_string(),
                 text: "keep billing service reliable".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_limiter".to_string(),
                 name: "rate-limiter config".to_string(),
                 path: "config/ratelimit.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_cap".to_string(),
@@ -900,8 +935,10 @@ fn refines_relation_to_invalidated_prior_does_not_cascade_into_replacement() {
                 goal_key: Some("G_billing".to_string()),
                 entity_key: Some("E_limiter".to_string()),
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("first billing capture");
@@ -920,12 +957,14 @@ fn refines_relation_to_invalidated_prior_does_not_cascade_into_replacement() {
             goals: vec![GoalSeed {
                 key: "G_billing".to_string(),
                 text: "keep billing service reliable".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_limiter".to_string(),
                 name: "rate-limiter configuration".to_string(),
                 path: "config/limits.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_cap_current".to_string(),
@@ -936,13 +975,16 @@ fn refines_relation_to_invalidated_prior_does_not_cascade_into_replacement() {
                     prior_decision_id: prior.as_uuid().to_string(),
                     classification: DecisionRelationClassification::RefinesExisting,
                 }),
+                ..Default::default()
             }],
             observations: vec![ObservationSeed {
                 key: "O_limiter_moved".to_string(),
                 text: "rate-limiter configuration observed at config/limits.toml".to_string(),
                 entity_key: Some("E_limiter".to_string()),
                 path_change: Some("config/limits.toml".to_string()),
+                ..Default::default()
             }],
+            outcomes: Vec::new(),
         }),
     )
     .expect("second billing capture");
@@ -1404,12 +1446,14 @@ fn stored_entity_path_change_invalidates_without_old_value_in_second_harvest() {
         goals: vec![GoalSeed {
             key: "I_byok".to_string(),
             text: "ship cg's BYOK model-connection layer".to_string(),
+            context_id: None,
         }],
         entities: vec![EntitySeed {
             key: "E_cfg".to_string(),
             name: "provider config".to_string(),
             path: "crates/cg-catalog/providers.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            context_id: None,
         }],
         decisions: vec![DecisionSeed {
             key: "D_loc".to_string(),
@@ -1418,20 +1462,24 @@ fn stored_entity_path_change_invalidates_without_old_value_in_second_harvest() {
             goal_key: Some("I_byok".to_string()),
             entity_key: Some("E_cfg".to_string()),
             relation: None,
+            ..Default::default()
         }],
         observations: vec![],
+        outcomes: Vec::new(),
     };
     let second_harvest = StructuredHarvest {
         summary: Some("provider config now embedded".to_string()),
         goals: vec![GoalSeed {
             key: "I_byok".to_string(),
             text: "ship cg's BYOK model-connection layer".to_string(),
+            context_id: None,
         }],
         entities: vec![EntitySeed {
             key: "E_cfg".to_string(),
             name: "provider config".to_string(),
             path: "crates/cg-catalog/src/providers.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            context_id: None,
         }],
         decisions: vec![DecisionSeed {
             key: "D_embed".to_string(),
@@ -1440,8 +1488,10 @@ fn stored_entity_path_change_invalidates_without_old_value_in_second_harvest() {
             goal_key: Some("I_byok".to_string()),
             entity_key: Some("E_cfg".to_string()),
             relation: None,
+            ..Default::default()
         }],
         observations: vec![],
+        outcomes: Vec::new(),
     };
     assert!(!harvest_contains_text(
         &second_harvest,
@@ -1534,12 +1584,14 @@ fn normalized_entity_name_path_change_invalidates_without_old_value_in_second_ha
             goals: vec![GoalSeed {
                 key: "G_billing".to_string(),
                 text: "keep billing service reliable".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_limiter".to_string(),
                 name: "rate-limiter config".to_string(),
                 path: "config/ratelimit.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_cap".to_string(),
@@ -1548,8 +1600,10 @@ fn normalized_entity_name_path_change_invalidates_without_old_value_in_second_ha
                 goal_key: Some("G_billing".to_string()),
                 entity_key: Some("E_limiter".to_string()),
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("first billing capture");
@@ -1561,6 +1615,7 @@ fn normalized_entity_name_path_change_invalidates_without_old_value_in_second_ha
             name: "rate-limiter configuration".to_string(),
             path: "config/limits.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            context_id: None,
         }],
         decisions: vec![DecisionSeed {
             key: "D_limits".to_string(),
@@ -1568,8 +1623,10 @@ fn normalized_entity_name_path_change_invalidates_without_old_value_in_second_ha
             goal_key: None,
             entity_key: Some("E_limiter_new".to_string()),
             relation: None,
+            ..Default::default()
         }],
         observations: vec![],
+        outcomes: Vec::new(),
     };
     assert!(!harvest_contains_text(
         &second_harvest,
@@ -1639,6 +1696,7 @@ fn model_relation_value_replacement_supersedes_prior_decision() {
             goals: vec![GoalSeed {
                 key: "I_model".to_string(),
                 text: "choose cg's default capture model".to_string(),
+                context_id: None,
             }],
             entities: vec![],
             decisions: vec![DecisionSeed {
@@ -1647,8 +1705,10 @@ fn model_relation_value_replacement_supersedes_prior_decision() {
                 goal_key: Some("I_model".to_string()),
                 entity_key: None,
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("first model choice capture");
@@ -1666,6 +1726,7 @@ fn model_relation_value_replacement_supersedes_prior_decision() {
             goals: vec![GoalSeed {
                 key: "I_model".to_string(),
                 text: "choose cg's default capture model".to_string(),
+                context_id: None,
             }],
             entities: vec![],
             decisions: vec![DecisionSeed {
@@ -1677,8 +1738,10 @@ fn model_relation_value_replacement_supersedes_prior_decision() {
                     prior_decision_id: old_decision.as_uuid().to_string(),
                     classification: DecisionRelationClassification::SupersedesExisting,
                 }),
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("second model choice capture");
@@ -1739,8 +1802,10 @@ fn focused_relation_classifier_supersedes_when_extraction_omits_relation() {
                 goal_key: None,
                 entity_key: None,
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("first live-shape model choice capture");
@@ -1756,8 +1821,10 @@ fn focused_relation_classifier_supersedes_when_extraction_omits_relation() {
             goal_key: None,
             entity_key: None,
             relation: None,
+            ..Default::default()
         }],
         observations: vec![],
+        outcomes: Vec::new(),
     };
     let second = record_conversation_with_extractor(
         &store,
@@ -1826,6 +1893,7 @@ fn structural_choice_replacement_supersedes_when_goal_wording_drifts() {
             goals: vec![GoalSeed {
                 key: "G_initial".to_string(),
                 text: "track durable decisions for model-choice-drift".to_string(),
+                context_id: None,
             }],
             entities: vec![],
             decisions: vec![DecisionSeed {
@@ -1834,8 +1902,10 @@ fn structural_choice_replacement_supersedes_when_goal_wording_drifts() {
                 goal_key: Some("G_initial".to_string()),
                 entity_key: None,
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("first model choice drift capture");
@@ -1854,6 +1924,7 @@ fn structural_choice_replacement_supersedes_when_goal_wording_drifts() {
             goals: vec![GoalSeed {
                 key: "G_changed".to_string(),
                 text: "evaluate capture model coverage and cost".to_string(),
+                context_id: None,
             }],
             entities: vec![],
             decisions: vec![DecisionSeed {
@@ -1862,8 +1933,10 @@ fn structural_choice_replacement_supersedes_when_goal_wording_drifts() {
                 goal_key: Some("G_changed".to_string()),
                 entity_key: None,
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("second model choice drift capture");
@@ -1913,6 +1986,7 @@ fn invalid_relation_id_fails_before_partial_graph_write() {
             goals: vec![GoalSeed {
                 key: "G1".to_string(),
                 text: "keep relation writes atomic".to_string(),
+                context_id: None,
             }],
             entities: vec![],
             decisions: vec![DecisionSeed {
@@ -1921,8 +1995,10 @@ fn invalid_relation_id_fails_before_partial_graph_write() {
                 goal_key: Some("G1".to_string()),
                 entity_key: None,
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     )
     .expect("valid prior capture");
@@ -1945,6 +2021,7 @@ fn invalid_relation_id_fails_before_partial_graph_write() {
             goals: vec![GoalSeed {
                 key: "G1".to_string(),
                 text: "keep relation writes atomic".to_string(),
+                context_id: None,
             }],
             entities: vec![],
             decisions: vec![DecisionSeed {
@@ -1956,8 +2033,10 @@ fn invalid_relation_id_fails_before_partial_graph_write() {
                     prior_decision_id: "d1".to_string(),
                     classification: DecisionRelationClassification::ConflictsExisting,
                 }),
+                ..Default::default()
             }],
             observations: vec![],
+            outcomes: Vec::new(),
         }),
     );
 
@@ -2025,12 +2104,14 @@ fn arrow_path_change_value_renders_single_old_to_new_basis() {
             goals: vec![GoalSeed {
                 key: "G1".to_string(),
                 text: "Keep quota service reliable".to_string(),
+                context_id: None,
             }],
             entities: vec![EntitySeed {
                 key: "E_quota".to_string(),
                 name: "quota config".to_string(),
                 path: "config/quota.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                context_id: None,
             }],
             decisions: vec![DecisionSeed {
                 key: "D_new".to_string(),
@@ -2038,6 +2119,7 @@ fn arrow_path_change_value_renders_single_old_to_new_basis() {
                 goal_key: Some("G1".to_string()),
                 entity_key: Some("E_quota".to_string()),
                 relation: None,
+                ..Default::default()
             }],
             observations: vec![ObservationSeed {
                 key: "O_quota_moved".to_string(),
@@ -2045,7 +2127,9 @@ fn arrow_path_change_value_renders_single_old_to_new_basis() {
                     .to_string(),
                 entity_key: Some("E_quota".to_string()),
                 path_change: Some("config/quota.toml -> config/quota-v2.toml".to_string()),
+                ..Default::default()
             }],
+            outcomes: Vec::new(),
         }),
     )
     .expect("static harvest capture");

@@ -380,6 +380,7 @@ fn seed_decision_with_source(
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -449,6 +450,7 @@ fn seed_decision_with_evidence(
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -2571,6 +2573,7 @@ fn replay_preserves_multiple_basis_snapshots_for_same_entity_without_map_collaps
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -2655,6 +2658,7 @@ fn snapshot_only_decision_basis_persists_based_on_graph_edges_for_create_and_sup
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -3020,6 +3024,7 @@ fn replay_when_entity_snapshot_evidenced_by_is_empty_returns_snapshot_state_with
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -3804,6 +3809,7 @@ fn decisions_based_on_snapshots_round_trip_from_normalized_db_table() {
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -3891,6 +3897,7 @@ fn replay_uses_entity_snapshot_observations_table_not_nested_data_copy() {
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -4003,6 +4010,7 @@ fn replay_ignores_nested_data_evidenced_by_when_normalized_table_has_no_lineage(
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -4185,6 +4193,7 @@ fn update_decision_basis_preserves_decision_created_at_for_intention_replay_hori
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -4271,6 +4280,7 @@ fn update_decision_basis_reorders_existing_snapshots_without_unique_conflict() {
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let first_entity = store
@@ -4357,6 +4367,7 @@ fn update_decision_basis_rejects_missing_and_cross_context_snapshots() {
             context_id: ctx_a,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention a");
     let entity_a = store
@@ -4505,6 +4516,7 @@ fn replay_ignores_raw_cross_context_serves_edge_for_same_decision_source() {
             context_id: ctx_a,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention a");
     let intention_b = store
@@ -4516,6 +4528,7 @@ fn replay_ignores_raw_cross_context_serves_edge_for_same_decision_source() {
             context_id: ctx_b,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention b");
     let entity = store
@@ -5495,6 +5508,7 @@ fn basis_diff_returns_divergence_for_enterprise_constraint_change_with_multi_mod
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store
@@ -5699,6 +5713,7 @@ fn basis_diff_for_nested_property_divergence_returns_full_nested_value_diff_byte
             context_id: ctx,
             properties: BTreeMap::new(),
             tags: vec![],
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let entity = store

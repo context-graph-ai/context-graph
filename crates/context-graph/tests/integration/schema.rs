@@ -155,6 +155,7 @@ fn seed_store_decision(
             context_id,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let observation_id = context_graph::ObservationId::new_v7();

@@ -792,6 +792,11 @@ impl ImportReportAccumulator {
             resolved_chunk_window: None,
             model_context_tokens: None,
             model_usage: self.model_usage,
+            captured_entities: Vec::new(),
+            captured_decisions: Vec::new(),
+            captured_observations: Vec::new(),
+            captured_outcomes: Vec::new(),
+            flagged_items: Vec::new(),
         })
     }
 }
@@ -2147,6 +2152,8 @@ impl ConnectedModelExtractor {
                 elapsed,
                 reliability_level: receipt.reliability_level,
                 outcome: receipt.outcome,
+                flow_tag: None,
+                model_id: None,
             });
         }
     }

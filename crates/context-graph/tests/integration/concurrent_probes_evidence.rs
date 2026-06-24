@@ -194,6 +194,7 @@ fn seed_decision(store: &Store) -> (DecisionId, ObservationId) {
             context_id: context,
             properties: BTreeMap::new(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("intention");
     let observation_id = ObservationId::new_v7();

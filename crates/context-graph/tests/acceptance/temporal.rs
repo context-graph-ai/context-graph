@@ -61,6 +61,7 @@ fn intention_input(context_id: ContextId, description: &str) -> CreateIntention 
         context_id,
         properties: BTreeMap::new(),
         tags: vec![],
+        blueprint_catalog_id: None,
     }
 }
 

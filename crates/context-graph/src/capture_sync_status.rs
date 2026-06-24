@@ -44,6 +44,10 @@ pub struct ModelCallUsage {
     pub elapsed: Duration,
     pub reliability_level: EnforcementLevel,
     pub outcome: ModelCallOutcome,
+    /// Placeholder: always None. The real implementation tags each call with "extraction" | "identity-judge" | "repair".
+    pub flow_tag: Option<String>,
+    /// Placeholder: always None. The real implementation carries the model id used for this call.
+    pub model_id: Option<String>,
 }
 
 impl ModelCallUsage {
@@ -759,6 +763,19 @@ fn sync_policy_for_table(table: &str) -> (SyncDirection, ConflictPolicy) {
         | "outcomes"
         | "invalidations"
         | "entity_current_snapshots" => hub_arbitrated,
+        // Placeholder policies for the 4 skill-loop tables (all return write_once).
+        // Correct policies:
+        //   cg_learned_skills:    (Both, ServerWins)
+        //   cg_teaching_events:   (Both, InsertIfNotExists)
+        //   cg_skill_firing_trace: (None, InsertIfNotExists)
+        //   cg_review_cursor:     (None, InsertIfNotExists)
+        "cg_learned_skills" => write_once,
+        "cg_teaching_events" => write_once,
+        "cg_skill_firing_trace" => write_once,
+        "cg_review_cursor" => write_once,
+        // Overlay corrections + compensation/reversal events: append-only, propagate tenant-wide.
+        "cg_overlay_entries" => write_once,
+        "cg_compensation_events" => write_once,
         _ => write_once,
     }
 }

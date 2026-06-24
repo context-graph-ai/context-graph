@@ -32,7 +32,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "intentions",
-        ddl: "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), origin TEXT NOT NULL, origin_ref UUID, blueprint_id UUID, bindings JSON, blueprint_proposal TEXT, properties JSON, tags JSON, created_at TXID NOT NULL, UNIQUE (context_id, id)) STATE MACHINE (status: active -> [paused, superseded, archived], paused -> [active, superseded, archived])",
+        ddl: "CREATE TABLE intentions (id UUID PRIMARY KEY, description TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), origin TEXT NOT NULL, origin_ref UUID, blueprint_id UUID, bindings JSON, blueprint_proposal TEXT, blueprint_catalog_id TEXT, properties JSON, tags JSON, created_at TXID NOT NULL, UNIQUE (context_id, id)) STATE MACHINE (status: active -> [paused, superseded, archived], paused -> [active, superseded, archived])",
     },
     TableSpec {
         name: "decisions",
@@ -165,6 +165,33 @@ pub const TABLES: &[TableSpec] = &[
     TableSpec {
         name: "precedent_matches",
         ddl: "CREATE TABLE precedent_matches (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), new_decision_id UUID NOT NULL REFERENCES decisions(id), precedent_decision_id UUID NOT NULL REFERENCES decisions(id), served_intention_ids JSON NOT NULL DEFAULT '[]', matched_precedent_outcome_success BOOLEAN NOT NULL, detected_at TXID NOT NULL, UNIQUE (context_id, new_decision_id, precedent_decision_id), FOREIGN KEY (context_id, new_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, precedent_decision_id) REFERENCES decisions(context_id, id)) IMMUTABLE",
+    },
+    // Skill-loop tables (stubs — DDL present so sync round-trip tests can persist/sync rows).
+    TableSpec {
+        name: "cg_learned_skills",
+        ddl: "CREATE TABLE cg_learned_skills (id TEXT PRIMARY KEY, description TEXT NOT NULL, rule TEXT NOT NULL, provenance TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true, held_for_review BOOLEAN NOT NULL DEFAULT false, fire_right INTEGER NOT NULL DEFAULT 0, fire_wrong INTEGER NOT NULL DEFAULT 0, created_at TXID NOT NULL)",
+    },
+    TableSpec {
+        name: "cg_teaching_events",
+        ddl: "CREATE TABLE cg_teaching_events (id TEXT PRIMARY KEY, skill_id TEXT, corrected_item_id TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, created_at TXID NOT NULL)",
+    },
+    TableSpec {
+        name: "cg_skill_firing_trace",
+        ddl: "CREATE TABLE cg_skill_firing_trace (id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, capture_id TEXT NOT NULL, correct INTEGER, created_at TXID NOT NULL)",
+    },
+    TableSpec {
+        name: "cg_review_cursor",
+        ddl: "CREATE TABLE cg_review_cursor (id TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0, is_local BOOLEAN NOT NULL DEFAULT true, updated_at TXID NOT NULL)",
+    },
+    // Overlay tables — additive layers over immutable captures. DDL present so
+    // two-layer reversibility tests can persist and read back overlay/compensation rows.
+    TableSpec {
+        name: "cg_overlay_entries",
+        ddl: "CREATE TABLE cg_overlay_entries (id TEXT PRIMARY KEY, item_id TEXT NOT NULL, kind TEXT NOT NULL, value TEXT, reversed BOOLEAN NOT NULL DEFAULT false, created_at TXID NOT NULL)",
+    },
+    TableSpec {
+        name: "cg_compensation_events",
+        ddl: "CREATE TABLE cg_compensation_events (id TEXT PRIMARY KEY, reversed_overlay_id TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, created_at TXID NOT NULL)",
     },
 ];
 

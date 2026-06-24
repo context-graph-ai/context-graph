@@ -4,11 +4,16 @@ pub mod embedder;
 pub mod embedding_space;
 pub mod embedding_target;
 pub mod error;
+pub mod grounding;
+pub mod harness;
 pub mod ingest;
 pub mod llm;
 pub mod messaging;
+pub mod overlay;
 pub mod producer;
+pub mod review_surface;
 pub mod schema;
+pub mod skill_store;
 pub mod store;
 pub mod types;
 

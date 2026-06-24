@@ -41,7 +41,11 @@ pub fn labeled_harvest(transcript: &str) -> StructuredHarvest {
 
     for statement in &statements {
         if let Some((key, text)) = parse_labeled(statement, "Goal", harvest.goals.len() + 1) {
-            harvest.goals.push(GoalSeed { key, text });
+            harvest.goals.push(GoalSeed {
+                key,
+                text,
+                context_id: None,
+            });
             continue;
         }
         if let Some((key, text)) = parse_labeled(statement, "Entity", harvest.entities.len() + 1) {
@@ -148,6 +152,7 @@ fn entity_seed(key: String, text: String) -> EntitySeed {
         name,
         path: path.clone(),
         entity_type: extracted_type_for_path(&path),
+        context_id: None,
     }
 }
 
@@ -193,6 +198,7 @@ fn decision_seed(key: String, text: String, entities: &[EntitySeed]) -> Decision
         goal_key,
         entity_key,
         relation: None,
+        ..Default::default()
     }
 }
 
@@ -229,6 +235,7 @@ fn observation_seed(key: String, text: String, entities: &[EntitySeed]) -> Obser
         text,
         entity_key,
         path_change,
+        ..Default::default()
     }
 }
 
@@ -252,6 +259,7 @@ fn infer_auth_entity(harvest: &mut StructuredHarvest) {
             name: "auth module file".to_string(),
             path: "src/auth.py".to_string(),
             entity_type: ExtractedEntityType::File,
+            context_id: None,
         });
     }
 }
@@ -277,6 +285,7 @@ fn infer_redis_entity(harvest: &mut StructuredHarvest) {
             name: "redis config".to_string(),
             path: "config/redis.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            context_id: None,
         });
     }
 }
