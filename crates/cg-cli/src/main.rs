@@ -1134,6 +1134,11 @@ fn handle_sync(args: &[String]) -> i32 {
             let drain = runtime.block_on(drain_sync_pull(&boundary, &policies));
             match drain {
                 Ok(report) => {
+                    // A pulled reversal teaching event takes effect locally: re-derive each
+                    // skill's on/off state from the now-synced teaching-events log.
+                    context_graph::skill_store::reconcile_skills_from_teaching_events(
+                        stores.admin.sync_database().as_ref(),
+                    );
                     let status = sync_status_report(
                         store,
                         Some(&remote_url),

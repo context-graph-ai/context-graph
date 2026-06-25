@@ -1,7 +1,17 @@
-error[E0277]: the trait bound `ModelExtractedField: Into<String>` is not satisfied
-  --> tests/ui/extracted_field_is_not_a_basis.rs:26:24
+error[E0277]: the trait bound `String: From<ModelExtractedField>` is not satisfied
+  --> tests/ui/extracted_field_is_not_a_basis.rs:19:40
    |
-26 |         source_ref: decision_type_text.into(),
-   |                                        ^^^^ the trait `Into<String>` is not implemented for `ModelExtractedField`
+19 |         source_ref: decision_type_text.into(),
+   |                                        ^^^^ the trait `From<ModelExtractedField>` is not implemented for `String`
    |
-   = note: model-extracted fields cannot be used directly as basis inputs
+   = help: the following other types implement trait `From<T>`:
+             `String` implements `From<&String>`
+             `String` implements `From<&mut str>`
+             `String` implements `From<&str>`
+             `String` implements `From<Box<str>>`
+             `String` implements `From<Cow<'_, str>>`
+             `String` implements `From<char>`
+             `String` implements `From<compact_str::CompactString>`
+             `String` implements `From<typed_path::common::utf8::pathbuf::Utf8PathBuf<T>>`
+             `String` implements `From<uuid::Uuid>`
+   = note: required for `ModelExtractedField` to implement `Into<String>`

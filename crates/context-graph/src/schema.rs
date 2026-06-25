@@ -193,6 +193,12 @@ pub const TABLES: &[TableSpec] = &[
         name: "cg_compensation_events",
         ddl: "CREATE TABLE cg_compensation_events (id TEXT PRIMARY KEY, reversed_overlay_id TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, created_at TXID NOT NULL)",
     },
+    // Pending review items table — tracks items surfaced for review that have not yet
+    // been acted on. Items persist here until explicitly resolved via act_on_item.
+    TableSpec {
+        name: "cg_pending_review_items",
+        ddl: "CREATE TABLE cg_pending_review_items (id TEXT PRIMARY KEY, acted_on BOOLEAN NOT NULL DEFAULT false, created_at TXID NOT NULL)",
+    },
 ];
 
 pub const SUBSCRIPTION_EVENT_TYPE_DDL: &[&str] = &[

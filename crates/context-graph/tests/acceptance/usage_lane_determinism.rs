@@ -139,7 +139,7 @@ impl ConversationExtractor for FlowTaggedUsageExtractor {
             key: "D1".to_string(),
             text: "use contextdb for storage".to_string(),
             goal_key: Some("G1".to_string()),
-            decision_type: Some("technology_choice".to_string()),
+            decision_type: Some("technology_choice".to_string().into()),
             confidence: Some(0.95),
             ..Default::default()
         });
@@ -192,7 +192,7 @@ impl ConversationExtractor for HighConfidenceExtractor {
             key: "D1".to_string(),
             text: "deploy on bare metal for latency".to_string(),
             goal_key: Some("G1".to_string()),
-            decision_type: Some("infrastructure".to_string()),
+            decision_type: Some("infrastructure".to_string().into()),
             confidence: Some(0.95), // must be blocked by the harness
             ..Default::default()
         });
