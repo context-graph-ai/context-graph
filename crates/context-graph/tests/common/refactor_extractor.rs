@@ -87,7 +87,7 @@ pub fn span_faithful_harvest(transcript: &str) -> StructuredHarvest {
                     key: key.trim().to_string(),
                     text: decision_text,
                     goal_key,
-                    decision_type: Some("technology_choice".to_string()),
+                    decision_type: Some("technology_choice".to_string().into()),
                     agent_id: Some("agent-session".to_string()),
                     confidence: None, // null at capture per Decision §2
                     reasoning: vec!["span-faithful reasoning".to_string()],
@@ -267,7 +267,7 @@ impl ConversationExtractor for DecisionTypeExtractor {
             key: "D1".to_string(),
             text: "use PostgreSQL for primary storage".to_string(),
             goal_key: Some("G1".to_string()),
-            decision_type: Some("technology_choice".to_string()),
+            decision_type: Some("technology_choice".to_string().into()),
             agent_id: Some("eng-agent".to_string()),
             confidence: None,
             reasoning: vec![
@@ -303,7 +303,7 @@ impl ConversationExtractor for AgentIdExtractor {
             text: "adopt Rust for new services".to_string(),
             goal_key: Some("G1".to_string()),
             agent_id: Some("senior-eng-alice".to_string()),
-            decision_type: Some("technology_choice".to_string()),
+            decision_type: Some("technology_choice".to_string().into()),
             confidence: None,
             ..Default::default()
         });
@@ -332,7 +332,7 @@ impl ConversationExtractor for NullConfidenceExtractor {
             text: "choose Rust for embedded components".to_string(),
             goal_key: Some("G1".to_string()),
             confidence: None, // explicitly null
-            decision_type: Some("technology_choice".to_string()),
+            decision_type: Some("technology_choice".to_string().into()),
             ..Default::default()
         });
         harvest.summary = Some("null confidence capture".to_string());
@@ -363,7 +363,7 @@ impl ConversationExtractor for WithConfidenceExtractor {
             goal_key: Some("G1".to_string()),
             // Emits a non-null confidence — harness must NOT store this.
             confidence: Some(self.emitted_confidence),
-            decision_type: Some("api_design".to_string()),
+            decision_type: Some("api_design".to_string().into()),
             ..Default::default()
         });
         harvest.summary = Some("decision with emitted confidence".to_string());
@@ -390,7 +390,7 @@ impl ConversationExtractor for OutcomeExtractor {
             key: "D1".to_string(),
             text: "deploy on Kubernetes".to_string(),
             goal_key: Some("G1".to_string()),
-            decision_type: Some("infrastructure".to_string()),
+            decision_type: Some("infrastructure".to_string().into()),
             ..Default::default()
         });
         harvest.outcomes.push(OutcomeSeed {
@@ -461,7 +461,7 @@ impl ConversationExtractor for DecisionWithMetadataExtractor {
             key: "D1".to_string(),
             text: "use NATS for async messaging".to_string(),
             goal_key: Some("G1".to_string()),
-            decision_type: Some("architecture".to_string()),
+            decision_type: Some("architecture".to_string().into()),
             reasoning: vec![
                 "low latency".to_string(),
                 "built-in persistence with JetStream".to_string(),
@@ -621,7 +621,7 @@ impl ConversationExtractor for MixedModelConfidenceSpanFaithfulExtractor {
             text: "use SQLite for local storage".to_string(),
             goal_key: harvest.goals.first().map(|g| g.key.clone()),
             confidence: None, // null; in real model a "low" confidence would be the field value
-            decision_type: Some("storage_choice".to_string()),
+            decision_type: Some("storage_choice".to_string().into()),
             ..Default::default()
         });
         Ok(harvest)
@@ -658,7 +658,7 @@ impl ConversationExtractor for OtherTenantContextExtractor {
             key: "D1".to_string(),
             text: "use tenant-B credential store".to_string(),
             goal_key: Some("G1".to_string()),
-            decision_type: Some("security".to_string()),
+            decision_type: Some("security".to_string().into()),
             // Emit the real other-tenant context_id on the decision seed too.
             context_id: Some(self.other_context_id.clone()),
             ..Default::default()

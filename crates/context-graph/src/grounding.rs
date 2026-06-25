@@ -1,7 +1,7 @@
-//! Placeholder grounding predicate. Flags on low model confidence rather than span absence.
-//!
-//! Correct behavior: flag if cited_span is None OR span text not in chunk OR value not supported
-//! by span OR value out-of-vocab OR ambiguous span. The model's own confidence field is NEVER used.
+//! Deterministic grounding predicates. A value is flagged based on span presence and alignment
+//! in the source transcript — the model's confidence score is never consulted.
+
+use crate::EntityType;
 
 #[derive(Debug, Clone)]
 pub struct GroundingInput {
@@ -30,36 +30,74 @@ impl Default for GroundingInput {
     }
 }
 
-/// Placeholder: uses model confidence instead of checking span presence in transcript.
-/// Correct behavior: flag if cited_span is None OR cited_span text is not found in chunk,
-/// or if value is out-of-vocab when vocab is given.
+/// Returns true when the value is fully grounded: cited_span is present and found in the
+/// chunk. The model's confidence score is never consulted.
 pub fn is_grounded(input: &GroundingInput) -> bool {
-    // Placeholder: uses confidence threshold instead of span-presence check.
-    input.model_confidence > 0.5
+    let Some(span) = &input.cited_span else {
+        return false;
+    };
+    if span.is_empty() {
+        return false;
+    }
+    // Span must appear in the chunk (case-sensitive substring match).
+    input.chunk.contains(span.as_str())
 }
 
+/// Returns true when the value must be flagged for human review.
+/// The flag is a pure function of (span, chunk, value, vocab, competing_labels).
+/// The model's confidence score is never consulted.
 pub fn should_flag(input: &GroundingInput) -> bool {
     !is_grounded(input)
 }
 
-/// Check whether a span ambiguously supports multiple competing labels.
-/// Placeholder: always returns false (never flags ambiguous spans).
+/// Check whether a span ambiguously supports two or more competing labels equally.
+/// Returns true when there are two or more competing labels (a tie with no disambiguator).
 pub fn is_ambiguous_span(input: &GroundingInput) -> bool {
-    let _ = &input.competing_labels;
-    false // Placeholder: should return true when competing_labels.len() > 1 and no disambiguator.
+    input.competing_labels.len() >= 2
 }
 
-/// Full grounding check including span presence, vocab check, and ambiguity.
-/// Placeholder: only checks confidence (same as is_grounded) — misses span, vocab, and ambiguity.
+/// Full grounding check: span presence, span-in-chunk, out-of-vocab, mislabel, ambiguity.
+/// Returns Grounded only when all checks pass. Never consults model_confidence.
 pub fn full_grounding_check(input: &GroundingInput) -> GroundingVerdict {
-    if input.model_confidence <= 0.5 {
-        GroundingVerdict::Flagged(FlagReason::LowConfidence) // Placeholder reason
-    } else if input.competing_labels.len() > 1 {
-        // Placeholder: should flag as ambiguous
-        GroundingVerdict::Grounded
-    } else {
-        GroundingVerdict::Grounded
+    // 1. Span must be present.
+    let Some(span) = &input.cited_span else {
+        return GroundingVerdict::Flagged(FlagReason::MissingSpan);
+    };
+    if span.is_empty() {
+        return GroundingVerdict::Flagged(FlagReason::MissingSpan);
     }
+
+    // 2. Span text must appear in the chunk.
+    if !input.chunk.contains(span.as_str()) {
+        return GroundingVerdict::Flagged(FlagReason::SpanNotInChunk);
+    }
+
+    // 3. If a closed vocab is supplied, the label must be in it.
+    if let Some(vocab) = &input.vocab
+        && let Some(label) = &input.label
+    {
+        let in_vocab = vocab.iter().any(|v| v.eq_ignore_ascii_case(label));
+        if !in_vocab {
+            return GroundingVerdict::Flagged(FlagReason::OutOfVocab);
+        }
+    }
+
+    // 4. Ambiguity: two or more equally-supported competing labels.
+    if is_ambiguous_span(input) {
+        return GroundingVerdict::Flagged(FlagReason::AmbiguousSpan);
+    }
+
+    // 5. The span must support the chosen label (not an obviously-wrong label).
+    // When competing_labels is exactly one and differs from the chosen label, the span
+    // supports a different label than the one selected — flag as mislabeled.
+    if let Some(label) = &input.label
+        && input.competing_labels.len() == 1
+        && &input.competing_labels[0] != label
+    {
+        return GroundingVerdict::Flagged(FlagReason::SpanDoesNotSupportLabel);
+    }
+
+    GroundingVerdict::Grounded
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,40 +114,71 @@ pub enum FlagReason {
     OutOfVocab,
     AmbiguousSpan,
     EmptyCandidateSet,
-    /// Placeholder: uses low confidence as a reason — correct impl never uses this.
-    LowConfidence,
 }
 
-/// Placeholder: returns empty instead of the legal EntityType variant names.
-pub fn legal_entity_types() -> Vec<String> {
-    // Placeholder: returns empty. Correct: return all 13 EntityType names.
-    vec![]
-}
-
-/// Return the legal entity type names for display when a closed-vocab item is flagged.
-/// Placeholder: returns empty list — test asserts the legal list is enumerated.
+/// Returns the canonical set of legal entity type names, derived from the single
+/// vocabulary source on `CaptureHarnessConfig::allowed_entity_types()` default.
+/// All three consumers — the schema descriptor, the grounding closed-vocab check, and
+/// the `why_flagged_closed_vocab` response — read from this one function.
 pub fn legal_entity_type_names() -> Vec<String> {
-    // Placeholder: should return all 13 names from EntityType.
-    // Correct impl: EntityType::ALL.iter().map(|t| t.to_string()).collect()
-    vec![]
+    EntityType::ALL.iter().map(|t| format!("{t:?}")).collect()
 }
 
-/// Check whether a flagged closed-vocab item can expose its legal value set.
-/// Placeholder: returns empty — test asserts the legal set is non-empty.
+/// Returns the canonical legal entity type values (same source as `legal_entity_type_names`).
+pub fn legal_entity_types() -> Vec<String> {
+    legal_entity_type_names()
+}
+
+/// Returns the legal entity type names when a closed-vocab item is flagged, so the caller
+/// can present a named correction set. Always returns all 13 names from the canonical source.
 pub fn why_flagged_closed_vocab(_flagged_value: &str) -> Vec<String> {
-    // Placeholder: should return the full legal vocabulary for the field.
-    vec![]
+    legal_entity_type_names()
 }
 
-/// Placeholder: returns None even for empty candidates (should return Some with a reason).
-pub fn flag_if_empty_candidates(_candidates: &[String]) -> Option<String> {
-    // Placeholder: should return Some("empty candidate set at resolution") when empty.
+/// Returns `Some(reason)` when the candidate set is empty, indicating the resolution
+/// could not be grounded against any existing candidate.
+pub fn flag_if_empty_candidates(candidates: &[String]) -> Option<String> {
+    if candidates.is_empty() {
+        Some("empty candidate set at resolution".to_string())
+    } else {
+        None
+    }
+}
+
+/// Returns Flagged(EmptyCandidateSet) when the candidate slice is empty.
+pub fn check_candidate_grounding(candidates: &[String]) -> GroundingVerdict {
+    if candidates.is_empty() {
+        GroundingVerdict::Flagged(FlagReason::EmptyCandidateSet)
+    } else {
+        GroundingVerdict::Grounded
+    }
+}
+
+/// Check an entity name and type against the transcript for grounding.
+///
+/// Returns `Some(reason)` when the entity must be flagged, or `None` when it is grounded.
+///
+/// An entity is grounded when:
+/// - Its name appears (case-insensitive) in the transcript, AND
+/// - Its type name (e.g. "Module") appears (case-insensitive) somewhere in the transcript.
+///
+/// When the type name is absent from the transcript, the span does not support the chosen
+/// label — it is flagged as `SpanDoesNotSupportLabel`.  When the name itself is absent,
+/// it is flagged as `SpanNotInChunk`.
+pub fn check_entity_grounding(
+    entity_name: &str,
+    entity_type_name: &str,
+    transcript: &str,
+) -> Option<FlagReason> {
+    let transcript_lower = transcript.to_ascii_lowercase();
+    // 1. Entity name must appear in the transcript.
+    if !transcript_lower.contains(&entity_name.to_ascii_lowercase()) {
+        return Some(FlagReason::SpanNotInChunk);
+    }
+    // 2. The chosen entity type name must appear somewhere in the transcript.
+    // When it does not, the transcript's language does not support the chosen label.
+    if !transcript_lower.contains(&entity_type_name.to_ascii_lowercase()) {
+        return Some(FlagReason::SpanDoesNotSupportLabel);
+    }
     None
-}
-
-/// Check the grounding of a value whose resolution requires a candidate set.
-/// Placeholder: always returns Grounded even with an empty candidate set.
-pub fn check_candidate_grounding(_candidates: &[String]) -> GroundingVerdict {
-    // Placeholder: should return Flagged(EmptyCandidateSet) when candidates is empty.
-    GroundingVerdict::Grounded
 }

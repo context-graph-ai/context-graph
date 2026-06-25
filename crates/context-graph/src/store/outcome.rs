@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use contextdb_core::Value;
 
 use crate::Result;
+use crate::TxId;
 use crate::error::CgError;
 use crate::types::*;
 
@@ -24,6 +25,34 @@ impl Store {
                 missing: Some("decision"),
             })?;
         let _outcome_guard = self.outcome_mutex.lock().expect("outcome mutex poisoned");
+        let tx = self.begin_tx()?;
+        match self.record_outcome_in_tx(tx, context_id, decision_id, success, notes) {
+            Ok(outcome) => {
+                self.db.commit(tx).map_err(map_engine_err)?;
+                Ok(outcome)
+            }
+            Err(e) => {
+                let _ = self.db.rollback(tx);
+                Err(e)
+            }
+        }
+    }
+
+    /// Write an Outcome inside an already-open transaction, replacing any active
+    /// Outcome on the decision so the survivor is the most recent (single active —
+    /// Invariant 9). The caller owns the transaction: on error this returns without
+    /// committing or rolling back, so an enclosing capture transaction rolls back as
+    /// one unit and nothing is stranded. `context_id` is supplied by the caller
+    /// rather than looked up, because the decision may have been created in this same
+    /// not-yet-committed transaction, where a committed-state lookup would not find it.
+    pub(crate) fn record_outcome_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        decision_id: DecisionId,
+        success: bool,
+        notes: Option<String>,
+    ) -> Result<Outcome> {
         let previous = self.outcome_for_decision(decision_id)?;
         let id = OutcomeId::new_v7();
         let notes_value = match &notes {
@@ -31,7 +60,6 @@ impl Store {
             None => Value::Null,
         };
 
-        let tx = self.begin_tx()?;
         if previous.is_some() {
             let delete_params: HashMap<String, Value> = [(
                 "decision_id".to_string(),
@@ -39,20 +67,14 @@ impl Store {
             )]
             .into_iter()
             .collect();
-            if let Err(e) = self.db.execute_in_tx(
-                tx,
-                "DELETE FROM outcomes WHERE decision_id = $decision_id",
-                &delete_params,
-            ) {
-                let _ = self.db.rollback(tx);
-                return Err(map_engine_err(e));
-            }
-            if let Err(e) =
-                self.delete_edges_in_tx(tx, Some(decision_id.as_uuid()), None, Some("HAS_OUTCOME"))
-            {
-                let _ = self.db.rollback(tx);
-                return Err(e);
-            }
+            self.db
+                .execute_in_tx(
+                    tx,
+                    "DELETE FROM outcomes WHERE decision_id = $decision_id",
+                    &delete_params,
+                )
+                .map_err(map_engine_err)?;
+            self.delete_edges_in_tx(tx, Some(decision_id.as_uuid()), None, Some("HAS_OUTCOME"))?;
         }
         let insert_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
@@ -67,25 +89,21 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        if let Err(e) = self.db.execute_in_tx(
-            tx,
-            "INSERT INTO outcomes (id, context_id, decision_id, success, notes, recorded_at) VALUES ($id, $context_id, $decision_id, $success, $notes, $recorded_at)",
-            &insert_params,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(e));
-        }
-        if let Err(e) = self.insert_edge_in_tx(
+        self.db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO outcomes (id, context_id, decision_id, success, notes, recorded_at) VALUES ($id, $context_id, $decision_id, $success, $notes, $recorded_at)",
+                &insert_params,
+            )
+            .map_err(map_engine_err)?;
+        self.insert_edge_in_tx(
             tx,
             decision_id.as_uuid(),
             id.as_uuid(),
             "HAS_OUTCOME",
             context_id,
             None,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(e);
-        }
+        )?;
 
         let outcome = Outcome {
             id,
@@ -100,7 +118,7 @@ impl Store {
         if let Some(prev) = previous.as_ref() {
             let prev_payload = serde_json::to_value(prev)
                 .map_err(|e| CgError::Engine(format!("prev outcome serialize: {e}")))?;
-            if let Err(e) = self.record_audit_in_tx(
+            self.record_audit_in_tx(
                 tx,
                 AuditOperation::RecordOutcome,
                 Principal::System,
@@ -108,12 +126,9 @@ impl Store {
                 AuditTarget::Outcome(decision_id),
                 context_id,
                 Some(prev_payload),
-            ) {
-                let _ = self.db.rollback(tx);
-                return Err(e);
-            }
+            )?;
         }
-        if let Err(e) = self.record_audit_in_tx(
+        self.record_audit_in_tx(
             tx,
             AuditOperation::RecordOutcome,
             Principal::System,
@@ -121,12 +136,8 @@ impl Store {
             AuditTarget::Outcome(decision_id),
             context_id,
             Some(new_payload),
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(e);
-        }
+        )?;
 
-        self.db.commit(tx).map_err(map_engine_err)?;
         Ok(outcome)
     }
 

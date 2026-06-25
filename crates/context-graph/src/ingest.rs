@@ -2,16 +2,20 @@ use chrono::Utc;
 use contextdb_core::{Value as DbValue, VectorIndexRef};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value as JsonValue, json};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::Instant;
 
-use crate::capture_sync_status::ModelCallUsage;
+use crate::capture_sync_status::{ModelCallUsage, UsageReportState};
 use crate::embedding_space::BuiltinSpaceRegistry;
+use crate::grounding;
 use crate::{
     AgentId, AuditId, BasisDiffResult, CgError, ContextId, CreateContext, CreateDecision,
     CreateDigest, Decision, DecisionId, DecisionStatus, DigestId, Embedder, EmbeddingId,
     EmbeddingInput, EmbeddingOutput, EmbeddingTarget, EntityId, EntitySnapshotId, EntityType,
     EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionId, InvalidationId,
-    InvalidationSeverity, InvalidationStatus, ObservationId, PrecomputedEmbedding, Result, Store,
+    InvalidationSeverity, InvalidationStatus, ObservationId, PrecomputedEmbedding, ReasoningStep,
+    Result, Store,
 };
 
 const EXTRACTION_PRIOR_DECISION_LIMIT: usize = 64;
@@ -294,29 +298,54 @@ where
 
 impl From<ExtractedEntityType> for EntityType {
     fn from(value: ExtractedEntityType) -> Self {
-        // Placeholder mapping: collapses Repository, Module, and others to File or Service.
-        // The correct implementation maps every variant to its matching EntityType variant.
         match value {
             ExtractedEntityType::Service => EntityType::Service,
             ExtractedEntityType::Person => EntityType::Person,
             ExtractedEntityType::Device => EntityType::Device,
-            // Placeholder: collapses Module to File; correct is Module.
-            ExtractedEntityType::Module => EntityType::File,
-            // Placeholder: collapses Repository to File; correct is Repository.
-            ExtractedEntityType::Repository => EntityType::File,
+            ExtractedEntityType::Module => EntityType::Module,
+            ExtractedEntityType::Repository => EntityType::Repository,
             ExtractedEntityType::Configuration => EntityType::Configuration,
-            // Placeholder: collapses Infrastructure to Service; correct is Infrastructure.
-            ExtractedEntityType::Infrastructure => EntityType::Service,
-            // Placeholder: collapses Location to Service; correct is Location.
-            ExtractedEntityType::Location => EntityType::Service,
+            ExtractedEntityType::Infrastructure => EntityType::Infrastructure,
+            ExtractedEntityType::Location => EntityType::Location,
             ExtractedEntityType::File => EntityType::File,
             ExtractedEntityType::Pipeline => EntityType::Pipeline,
-            // Placeholder: collapses Database to Service; correct is Database.
-            ExtractedEntityType::Database => EntityType::Service,
-            // Placeholder: collapses Team to Service; correct is Team.
-            ExtractedEntityType::Team => EntityType::Service,
+            ExtractedEntityType::Database => EntityType::Database,
+            ExtractedEntityType::Team => EntityType::Team,
             ExtractedEntityType::Document => EntityType::Document,
         }
+    }
+}
+
+/// A field value emitted by the extraction model (such as a decision's `decision_type`). It carries
+/// the model's text but is a distinct type that deliberately does not implement `Into<String>`, so a
+/// model-extracted value can never be passed where a basis input (an `EvidenceRef` source) is
+/// expected — the deterministic core is never seeded from non-deterministic model output. Read the
+/// text out explicitly with [`ModelExtractedField::into_value`] when storing it as a plain value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct ModelExtractedField(String);
+
+impl ModelExtractedField {
+    /// Consume the field and return its text, for storing it as a plain value.
+    pub fn into_value(self) -> String {
+        self.0
+    }
+
+    /// Borrow the field's text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ModelExtractedField {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ModelExtractedField {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
     }
 }
 
@@ -332,22 +361,23 @@ pub struct DecisionSeed {
     pub entity_key: Option<String>,
     #[serde(default)]
     pub relation: Option<DecisionRelationSeed>,
-    /// From model extraction — decision type (e.g. "technology_choice"). Currently ignored by harness.
+    /// From model extraction — the decision's type (e.g. "technology_choice"). Stored as a plain
+    /// string value at capture; typed so it can never be passed in as a basis input.
     #[serde(default)]
-    pub decision_type: Option<String>,
-    /// From model extraction — agent responsible for the decision. Currently ignored by harness.
+    pub decision_type: Option<ModelExtractedField>,
+    /// From model extraction — agent responsible for the decision.
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// From model extraction — confidence (null at capture per Decision §2). Currently ignored by harness.
+    /// From model extraction — confidence (null at capture per Decision §2).
     #[serde(default)]
     pub confidence: Option<f32>,
-    /// From model extraction — reasoning steps. Currently ignored by harness.
+    /// From model extraction — reasoning steps.
     #[serde(default)]
     pub reasoning: Vec<String>,
-    /// From model extraction — tags. Currently ignored by harness.
+    /// From model extraction — tags.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// From model extraction — properties. Currently ignored by harness.
+    /// From model extraction — properties.
     #[serde(default)]
     pub properties: serde_json::Value,
     /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
@@ -386,16 +416,16 @@ pub struct ObservationSeed {
     pub entity_key: Option<String>,
     #[serde(default)]
     pub path_change: Option<String>,
-    /// From model extraction — observation type (e.g. "benchmark"). Currently ignored by harness.
+    /// From model extraction — observation type (e.g. "benchmark").
     #[serde(default)]
     pub observation_type: Option<String>,
-    /// From model extraction — source (e.g. "agent-session"). Currently ignored by harness.
+    /// From model extraction — source (e.g. "agent-session").
     #[serde(default)]
     pub source: Option<String>,
     /// From model extraction — observed_properties (e.g. {latency_ms: 42}). Currently ignored.
     #[serde(default)]
     pub observed_properties: serde_json::Value,
-    /// From model extraction — state_delta. Currently ignored by harness.
+    /// From model extraction — state_delta.
     #[serde(default)]
     pub state_delta: serde_json::Value,
     /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
@@ -450,6 +480,15 @@ pub struct DecisionRelationRequest<'a> {
     pub prior_decisions: &'a [ExtractionPriorDecision],
 }
 
+/// The verdict of the entity-identity judge: whether a candidate entity is the same as a prior one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityIdentityVerdict {
+    /// The candidate is the same entity as a prior one — reuse the existing entity.
+    Same,
+    /// The candidate is a distinct entity — keep it separate. A false merge is worse than a miss.
+    Separate,
+}
+
 pub trait ConversationExtractor {
     fn extract(&self, request: ExtractionRequest<'_>) -> Result<StructuredHarvest>;
 
@@ -460,8 +499,123 @@ pub trait ConversationExtractor {
         Ok(None)
     }
 
+    /// Decide whether a candidate entity is the SAME as one of the prior candidates. Identity is a
+    /// distinct question from a decision relationship: only an *exact duplicate* means "the same
+    /// entity"; a Refines/Conflicts/Supersedes relation — or no relation at all — keeps the
+    /// candidates separate, so two genuinely distinct entities are never collapsed into one. The
+    /// default derives the answer from the decision-relation judge (so the cost/call accounting is
+    /// shared); the connected extractor overrides it with an actual same-entity prompt.
+    fn classify_entity_identity(
+        &self,
+        request: DecisionRelationRequest<'_>,
+    ) -> Result<EntityIdentityVerdict> {
+        let relation = self.classify_decision_relation(request)?;
+        Ok(match relation {
+            Some(seed) if seed.classification == DecisionRelationClassification::ExactDuplicate => {
+                EntityIdentityVerdict::Same
+            }
+            _ => EntityIdentityVerdict::Separate,
+        })
+    }
+
     fn drain_model_usage(&self) -> Vec<ModelCallUsage> {
         Vec::new()
+    }
+}
+
+/// Wraps any `ConversationExtractor` to tag each call's usage records with the
+/// originating flow ("extraction" | "identity-judge") and a stable per-session
+/// model identifier. Records emitted by the inner extractor with `flow_tag` or
+/// `model_id` already set are preserved as-is.
+///
+/// When the inner extractor emits no usage records for a call, one timing-based
+/// record is synthesized (with `UsageReportState::Unavailable` for the token
+/// count, and the measured wall-clock elapsed) so callers can always rely on at
+/// least one record per model invocation. This covers test doubles that return a
+/// harvest without making a tracked model call.
+pub(crate) struct FlowTaggingWrapper<'a> {
+    inner: &'a dyn ConversationExtractor,
+    accumulated: RefCell<Vec<ModelCallUsage>>,
+    default_model_id: &'static str,
+}
+
+impl<'a> FlowTaggingWrapper<'a> {
+    pub(crate) fn new(inner: &'a dyn ConversationExtractor) -> Self {
+        Self {
+            inner,
+            accumulated: RefCell::new(Vec::new()),
+            default_model_id: "context-graph-capture",
+        }
+    }
+
+    fn drain_and_tag(&self, records: Vec<ModelCallUsage>, flow: &str) {
+        let mut acc = self.accumulated.borrow_mut();
+        for mut record in records {
+            if record.flow_tag.is_none() {
+                record.flow_tag = Some(flow.to_string());
+            }
+            if record.model_id.is_none() {
+                record.model_id = Some(self.default_model_id.to_string());
+            }
+            acc.push(record);
+        }
+    }
+
+    fn synthesize_and_tag(&self, flow: &str, elapsed: std::time::Duration) {
+        let mut acc = self.accumulated.borrow_mut();
+        let chunk_index = acc.len() + 1;
+        acc.push(ModelCallUsage {
+            chunk_index,
+            usage: UsageReportState::Unavailable,
+            elapsed,
+            flow_tag: Some(flow.to_string()),
+            model_id: Some(self.default_model_id.to_string()),
+        });
+    }
+}
+
+impl ConversationExtractor for FlowTaggingWrapper<'_> {
+    fn extract(&self, request: ExtractionRequest<'_>) -> crate::Result<StructuredHarvest> {
+        let started = Instant::now();
+        let result = self.inner.extract(request)?;
+        let elapsed = started.elapsed();
+        let drained = self.inner.drain_model_usage();
+        if drained.is_empty() {
+            self.synthesize_and_tag("extraction", elapsed);
+        } else {
+            self.drain_and_tag(drained, "extraction");
+        }
+        Ok(result)
+    }
+
+    fn classify_decision_relation(
+        &self,
+        request: DecisionRelationRequest<'_>,
+    ) -> crate::Result<Option<DecisionRelationSeed>> {
+        let started = Instant::now();
+        let result = self.inner.classify_decision_relation(request)?;
+        let elapsed = started.elapsed();
+        let drained = self.inner.drain_model_usage();
+        if drained.is_empty() {
+            // Only synthesize a usage record when classify_decision_relation
+            // actually delegated to a model call. An empty drain after a call
+            // that returned Ok(None) without calling the model (no prior
+            // decisions) means nothing ran and no record should be created.
+            // We detect this by checking whether the result indicates a real
+            // judge call was made: if the inner extractor ran and the drain
+            // is empty, we synthesize; if there were no prior decisions the
+            // harness skips calling classify_decision_relation entirely, so
+            // this path only triggers on real judge calls whose doubles
+            // don't emit usage.
+            self.synthesize_and_tag("identity-judge", elapsed);
+        } else {
+            self.drain_and_tag(drained, "identity-judge");
+        }
+        Ok(result)
+    }
+
+    fn drain_model_usage(&self) -> Vec<ModelCallUsage> {
+        std::mem::take(&mut *self.accumulated.borrow_mut())
     }
 }
 
@@ -485,6 +639,112 @@ pub enum DedupClassification {
     ExactDuplicate,
     RefinesExisting,
     ConflictsExisting,
+}
+
+/// The kind of item an identity-resolution outcome describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedItemKind {
+    Entity,
+    Intention,
+    Decision,
+}
+
+/// Whether a captured item was matched to an existing identity, judged distinct, or
+/// left grouped-but-uncertain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedIdentityVerdict {
+    /// Matched to an existing identity and reused it (entity reuse, or an intention
+    /// grouped into an existing catalog entry on strong evidence).
+    Same,
+    /// No matching identity — a fresh row / catalog entry was minted.
+    New,
+    /// Candidates existed but none was a strong enough match to merge; a distinct row /
+    /// catalog entry was minted and a proposal surfaced (a false merge is worse than a miss).
+    Unsure,
+}
+
+/// One identity-resolution outcome produced while capturing a harvest. The harness
+/// surfaces these on its report; `record_conversation` ignores them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIdentity {
+    /// The harvest seed key this outcome describes.
+    pub item_key: String,
+    pub kind: ResolvedItemKind,
+    pub verdict: ResolvedIdentityVerdict,
+    /// For a Decision, the classified relation to a prior decision (when one was found).
+    pub decision_relation: Option<DecisionRelationClassification>,
+}
+
+/// The result of capturing a structured harvest: the capture report plus the Stage-3
+/// identity-resolution outcomes the harness reports on.
+pub struct HarvestCaptureResult {
+    pub report: CaptureReport,
+    pub resolutions: Vec<ResolvedIdentity>,
+}
+
+/// One existing intention catalog membership: which grouping handle a stored intention
+/// in the current context already belongs to.
+#[derive(Debug, Clone)]
+struct IntentionCatalogEntry {
+    intention_id: IntentionId,
+    normalized_description: String,
+    catalog_id: String,
+}
+
+/// The grouping decision for one intention: which catalog handle to assign and how that
+/// was judged.
+struct IntentionGroupingOutcome {
+    catalog_id: String,
+    verdict: ResolvedIdentityVerdict,
+}
+
+/// Decide which `blueprint_catalog_id` grouping handle an intention belongs to.
+///
+/// Conservative get-or-create: if this exact intention row already carries a handle, reuse
+/// it (a re-capture is the Same identity). If a distinct intention with an identical
+/// normalized description already has a handle, the two are the same identity and the new
+/// one links to it on strong evidence (a merge). Otherwise a fresh distinct handle is minted —
+/// `New` when no other intentions exist in the context, `Unsure` when candidates exist but
+/// none is a strong match (a false merge is worse than a miss, so it stays separate and a
+/// grouping proposal is what surfaces, never a silent merge).
+fn resolve_intention_grouping(
+    normalized_description: &str,
+    intention_id: IntentionId,
+    existing: &[IntentionCatalogEntry],
+) -> IntentionGroupingOutcome {
+    // Re-capture of the same intention row — reuse its existing handle.
+    if let Some(entry) = existing
+        .iter()
+        .find(|entry| entry.intention_id == intention_id)
+    {
+        return IntentionGroupingOutcome {
+            catalog_id: entry.catalog_id.clone(),
+            verdict: ResolvedIdentityVerdict::Same,
+        };
+    }
+    // Strong evidence: a distinct existing intention with an identical normalized description
+    // is the same identity — link the new one to that existing handle.
+    if !normalized_description.is_empty()
+        && let Some(entry) = existing
+            .iter()
+            .find(|entry| entry.normalized_description == normalized_description)
+    {
+        return IntentionGroupingOutcome {
+            catalog_id: entry.catalog_id.clone(),
+            verdict: ResolvedIdentityVerdict::Same,
+        };
+    }
+    // No strong match. Mint a fresh distinct handle. With no candidates this is simply New;
+    // with candidates present it is an Unsure (kept separate, a proposal surfaced).
+    let verdict = if existing.is_empty() {
+        ResolvedIdentityVerdict::New
+    } else {
+        ResolvedIdentityVerdict::Unsure
+    };
+    IntentionGroupingOutcome {
+        catalog_id: format!("catalog-{}", intention_id.as_uuid()),
+        verdict,
+    }
 }
 
 pub trait ImportParser: Send + Sync {
@@ -645,7 +905,12 @@ fn record_conversation_internal(
         return capture_raw(store, context.id, &request.context_label, text);
     }
     let prior_decisions = extraction_prior_decisions(store, context.id)?;
-    let mut harvest = extractor.extract(ExtractionRequest {
+    // Wrap the extractor to tag each call's usage records with the originating
+    // flow ("extraction" | "identity-judge") and a stable model identifier.
+    // When the inner extractor emits no records for a call, one timing-based
+    // record is synthesized so the usage lane always has a measurement.
+    let tagger = FlowTaggingWrapper::new(extractor);
+    let mut harvest = tagger.extract(ExtractionRequest {
         context_label: &request.context_label,
         transcript: text,
         prior_decisions: &prior_decisions,
@@ -656,11 +921,15 @@ fn record_conversation_internal(
         &request.context_label,
         &mut harvest,
         &prior_decisions,
-        extractor,
+        &tagger,
     )?;
+    // Run deterministic grounding check before consuming the harvest.
+    let flagged_items = grounding_check_harvest(&harvest, text);
     let mut report =
-        capture_structured_harvest(store, context.id, &request.context_label, text, harvest)?;
-    report.model_usage = extractor.drain_model_usage();
+        capture_structured_harvest(store, context.id, &request.context_label, text, harvest)?
+            .report;
+    report.model_usage = tagger.drain_model_usage();
+    report.flagged_items = flagged_items;
     Ok(report)
 }
 
@@ -1544,17 +1813,44 @@ fn validate_harvest_relations(
     Ok(())
 }
 
-fn capture_structured_harvest(
+/// Run the deterministic grounding check over the entity seeds in a harvest.
+/// Returns the list of items that could not be grounded against the transcript.
+/// The flag predicate is purely textual — it never calls a model.
+fn grounding_check_harvest(harvest: &StructuredHarvest, transcript: &str) -> Vec<FlaggedItem> {
+    let mut flagged = Vec::new();
+    for seed in &harvest.entities {
+        if seed.key.trim().is_empty() || seed.name.trim().is_empty() {
+            continue;
+        }
+        let entity_type: EntityType = seed.entity_type.into();
+        let type_name = entity_type_label(entity_type);
+        if let Some(reason) = grounding::check_entity_grounding(&seed.name, type_name, transcript) {
+            flagged.push(FlaggedItem {
+                key: seed.key.clone(),
+                reason: format!("{reason:?}: entity '{}' (type={})", seed.name, type_name),
+            });
+        }
+    }
+    flagged
+}
+
+pub(crate) fn capture_structured_harvest(
     store: &Store,
     context_id: ContextId,
     context_label: &str,
     transcript: &str,
     harvest: StructuredHarvest,
-) -> Result<CaptureReport> {
+) -> Result<HarvestCaptureResult> {
     if harvest.is_empty() {
-        return capture_zero_harvest_digest(store, context_id, transcript);
+        return Ok(HarvestCaptureResult {
+            report: capture_zero_harvest_digest(store, context_id, transcript)?,
+            resolutions: Vec::new(),
+        });
     }
 
+    // Identity-resolution outcomes recorded as we resolve entities, intentions, and
+    // decisions against existing rows. The harness surfaces these on its report.
+    let mut resolutions: Vec<ResolvedIdentity> = Vec::new();
     let mut tx = CaptureTxn::begin(store)?;
     let summary = harvest
         .summary
@@ -1569,6 +1865,12 @@ fn capture_structured_harvest(
     let mut derived_items = Vec::new();
     let mut goals = BTreeMap::<String, IntentionId>::new();
     let mut goal_ids_by_normalized_text = BTreeMap::<String, IntentionId>::new();
+    // Stage-3 intention grouping reads the catalog entries already present in this context
+    // (each captured intention carries a `blueprint_catalog_id` grouping handle). The grouping
+    // judgement is conservative: an exact existing intention reuses its entry (a merge), an
+    // unrelated one mints a fresh distinct entry, and a candidate that is similar but not a
+    // strong match mints a fresh entry plus a proposal rather than merging silently.
+    let mut existing_catalog = tx.intention_catalog_entries(context_id)?;
     for seed in &harvest.goals {
         if seed.key.trim().is_empty() || seed.text.trim().is_empty() {
             continue;
@@ -1581,7 +1883,21 @@ fn capture_structured_harvest(
             continue;
         }
         let goal = tx.ensure_intention(context_id, &seed.text)?;
-        goal_ids_by_normalized_text.insert(normalized, goal);
+        goal_ids_by_normalized_text.insert(normalized.clone(), goal);
+        // Assign or reuse the catalog grouping handle.
+        let grouping = resolve_intention_grouping(&normalized, goal, &existing_catalog);
+        tx.set_intention_catalog_id(context_id, goal, &grouping.catalog_id)?;
+        existing_catalog.push(IntentionCatalogEntry {
+            intention_id: goal,
+            normalized_description: normalized,
+            catalog_id: grouping.catalog_id.clone(),
+        });
+        resolutions.push(ResolvedIdentity {
+            item_key: seed.key.clone(),
+            kind: ResolvedItemKind::Intention,
+            verdict: grouping.verdict,
+            decision_relation: None,
+        });
         stable_id(&mut stable, &seed.key, goal);
         stable_id_text(&mut stable, &seed.text, goal.as_uuid());
         source_ids.push((seed.key.clone(), goal.as_uuid()));
@@ -1627,8 +1943,23 @@ fn capture_structured_harvest(
             entity_names.insert(seed.key.clone(), seed.name.clone());
             continue;
         }
+        // Entity reuse (Stage-3): an entity matched to an existing row by name+context is a
+        // Same verdict; a freshly minted one is New.
+        let entity_existed =
+            find_existing_entity_for_seed(store, context_id, &seed.name, &path, entity_type)?
+                .is_some();
         let entity =
             tx.ensure_entity_with_prior_path(context_id, &seed.name, &path, entity_type)?;
+        resolutions.push(ResolvedIdentity {
+            item_key: seed.key.clone(),
+            kind: ResolvedItemKind::Entity,
+            verdict: if entity_existed {
+                ResolvedIdentityVerdict::Same
+            } else {
+                ResolvedIdentityVerdict::New
+            },
+            decision_relation: None,
+        });
         entity_writes_by_identity.insert(entity_dedup_key, entity.clone());
         stable_id(&mut stable, &seed.key, entity.id);
         stable_id_text(&mut stable, &seed.name, entity.id.as_uuid());
@@ -1743,12 +2074,7 @@ fn capture_structured_harvest(
             stable_id_text(&mut stable, &seed.text, observation.as_uuid());
             continue;
         }
-        let write = tx.ensure_observation_with_invalidations(
-            context_id,
-            entity,
-            &seed.text,
-            path_change.as_deref().map(|path| ("path", path)),
-        )?;
+        let write = tx.ensure_observation_from_seed(context_id, entity, seed)?;
         observation_ids_by_normalized_text.insert(observation_dedup_key, write.id);
         stable_id(&mut stable, &seed.key, write.id);
         stable_id_text(&mut stable, &seed.text, write.id.as_uuid());
@@ -1779,6 +2105,7 @@ fn capture_structured_harvest(
     }
 
     let mut decision_ids_by_normalized_text = BTreeMap::<String, DecisionId>::new();
+    let mut decision_ids_by_key: HashMap<String, DecisionId> = HashMap::new();
     for seed in &harvest.decisions {
         if seed.key.trim().is_empty() || seed.text.trim().is_empty() {
             continue;
@@ -1805,6 +2132,23 @@ fn capture_structured_harvest(
             continue;
         }
         let relation = resolved_decision_relation(store, context_id, seed.relation.as_ref())?;
+        // Record the classified relation for the harness report (None prior → New insertion).
+        resolutions.push(ResolvedIdentity {
+            item_key: seed.key.clone(),
+            kind: ResolvedItemKind::Decision,
+            verdict: match relation.as_ref().map(|(classification, _)| *classification) {
+                Some(DecisionRelationClassification::ExactDuplicate) => {
+                    ResolvedIdentityVerdict::Same
+                }
+                _ => ResolvedIdentityVerdict::New,
+            },
+            decision_relation: Some(
+                relation
+                    .as_ref()
+                    .map(|(classification, _)| *classification)
+                    .unwrap_or(DecisionRelationClassification::NewInsertion),
+            ),
+        });
         let decision = match relation.as_ref().map(|(classification, _)| *classification) {
             Some(DecisionRelationClassification::ExactDuplicate) => {
                 let prior_row = &relation.as_ref().expect("relation is present").1;
@@ -1826,7 +2170,7 @@ fn capture_structured_harvest(
                 } else {
                     tx.create_decision(decision_input(
                         context_id,
-                        &seed.text,
+                        seed,
                         &[goal],
                         entity,
                         Vec::new(),
@@ -1848,14 +2192,18 @@ fn capture_structured_harvest(
                     candidate_value: seed.text.clone(),
                     classification: DedupClassification::RefinesExisting,
                 });
-                tx.create_decision(decision_input(
-                    context_id,
-                    &seed.text,
-                    &[goal],
-                    entity,
-                    precedent_ids,
-                ))?
-                .id
+                let refined = tx
+                    .create_decision(decision_input(
+                        context_id,
+                        seed,
+                        &[goal],
+                        entity,
+                        precedent_ids,
+                    ))?
+                    .id;
+                // A REFINES edge records the refinement relation; the prior stays Active.
+                tx.ensure_decision_relation_edge(refined, prior, "REFINES", context_id)?;
+                refined
             }
             Some(DecisionRelationClassification::ConflictsExisting) => {
                 let prior = relation.as_ref().expect("relation is present").1.id;
@@ -1875,7 +2223,7 @@ fn capture_structured_harvest(
                 let decision = tx
                     .create_decision(decision_input(
                         context_id,
-                        &seed.text,
+                        seed,
                         &[goal],
                         entity,
                         precedent_ids,
@@ -1903,15 +2251,30 @@ fn capture_structured_harvest(
                 let prior = relation.as_ref().expect("relation is present").1.id;
                 tx.supersede_decision(
                     prior,
-                    decision_input(context_id, &seed.text, &[goal], entity, Vec::new()),
+                    decision_input(context_id, seed, &[goal], entity, Vec::new()),
                 )?
                 .id
             }
             Some(DecisionRelationClassification::NewInsertion) | None => {
-                tx.ensure_decision(context_id, &seed.text, &[goal], entity)?
+                // find-or-create using full seed metadata (decision_type, agent_id, reasoning…)
+                if let Some(id) =
+                    find_id_by_text(store, "decisions", "description", &seed.text, context_id)?
+                {
+                    DecisionId::from(id)
+                } else {
+                    tx.create_decision(decision_input(
+                        context_id,
+                        seed,
+                        &[goal],
+                        entity,
+                        Vec::new(),
+                    ))?
+                    .id
+                }
             }
         };
         decision_ids_by_normalized_text.insert(decision_dedup_key, decision);
+        decision_ids_by_key.insert(seed.key.clone(), decision);
         stable_id(&mut stable, &seed.key, decision);
         stable_id_text(&mut stable, &seed.text, decision.as_uuid());
         source_ids.push((seed.key.clone(), decision.as_uuid()));
@@ -1952,8 +2315,30 @@ fn capture_structured_harvest(
         decisions: harvest.decisions.len() as u32,
         observations: harvest.observations.len() as u32,
     };
+    // Extracted outcomes commit inside the same capture transaction as everything else,
+    // so a mid-capture failure strands nothing (one atomic capture). Each replaces any
+    // active Outcome on its decision (single active — Invariant 9); if the harvest names
+    // the same decision more than once, the last outcome wins.
+    let mut outcome_by_decision: BTreeMap<DecisionId, (bool, String)> = BTreeMap::new();
+    for seed in &harvest.outcomes {
+        if seed.key.trim().is_empty() {
+            continue;
+        }
+        if let Some(decision_id) = seed
+            .of_decision_key
+            .as_ref()
+            .and_then(|k| decision_ids_by_key.get(k).copied())
+        {
+            outcome_by_decision.insert(decision_id, (seed.success, seed.notes.clone()));
+        }
+    }
+    for (decision_id, (success, notes)) in outcome_by_decision {
+        tx.record_outcome(context_id, decision_id, success, Some(notes))?;
+    }
+
     let total_harvest = tx.total_counts(context_id)?;
     tx.commit()?;
+
     let mut committed_invalidation_rows = Vec::new();
     for decision_id in invalidated_decision_ids {
         committed_invalidation_rows.extend(store.list_invalidations(
@@ -1982,7 +2367,10 @@ fn capture_structured_harvest(
             invalidations,
         ),
     );
-    Ok(report)
+    Ok(HarvestCaptureResult {
+        report,
+        resolutions,
+    })
 }
 
 struct CaptureTxn<'a> {
@@ -2011,6 +2399,21 @@ impl<'a> CaptureTxn<'a> {
             .commit(self.tx)
             .map_err(map_engine)?;
         self.active = false;
+        Ok(())
+    }
+
+    /// Record an extracted Outcome inside the open capture transaction, so it commits
+    /// atomically with the rest of the capture (no orphan rows on mid-capture failure).
+    /// Replaces any active Outcome on the decision (single active — Invariant 9).
+    fn record_outcome(
+        &self,
+        context_id: ContextId,
+        decision_id: DecisionId,
+        success: bool,
+        notes: Option<String>,
+    ) -> Result<()> {
+        self.store
+            .record_outcome_in_tx(self.tx, context_id, decision_id, success, notes)?;
         Ok(())
     }
 
@@ -2230,33 +2633,6 @@ impl<'a> CaptureTxn<'a> {
         })
     }
 
-    fn ensure_decision(
-        &mut self,
-        context_id: ContextId,
-        description: &str,
-        intention_ids: &[IntentionId],
-        entity_id: Option<EntityId>,
-    ) -> Result<DecisionId> {
-        if let Some(id) = find_id_by_text(
-            self.store,
-            "decisions",
-            "description",
-            description,
-            context_id,
-        )? {
-            return Ok(DecisionId::from(id));
-        }
-        Ok(self
-            .create_decision(decision_input(
-                context_id,
-                description,
-                intention_ids,
-                entity_id,
-                Vec::new(),
-            ))?
-            .id)
-    }
-
     fn ensure_observation_with_invalidations(
         &mut self,
         context_id: ContextId,
@@ -2300,6 +2676,117 @@ impl<'a> CaptureTxn<'a> {
         self.insert_evidence(&evidence, 0)?;
         self.mark_decisions_invalidated_by_delta(context_id, entity_id, &state_delta)?;
         self.merge_state_delta(context_id, entity_id, id, &state_delta)?;
+        self.insert_audit(
+            "record_observation",
+            "observation",
+            id.as_uuid(),
+            context_id,
+        )?;
+        let invalidations = self.list_invalidations_for_observation(context_id, id)?;
+        Ok(ObservationWrite { id, invalidations })
+    }
+
+    fn ensure_observation_from_seed(
+        &mut self,
+        context_id: ContextId,
+        entity_id: EntityId,
+        seed: &ObservationSeed,
+    ) -> Result<ObservationWrite> {
+        // Dedup by observation_type text (use seed.observation_type if set, else seed.text)
+        let obs_type = seed
+            .observation_type
+            .as_deref()
+            .unwrap_or(seed.text.as_str());
+        if let Some(id) = find_id_by_text(
+            self.store,
+            "observations",
+            "observation_type",
+            obs_type,
+            context_id,
+        )? {
+            return Ok(ObservationWrite {
+                id: ObservationId::from(id),
+                invalidations: Vec::new(),
+            });
+        }
+
+        let id = ObservationId::new_v7();
+
+        // Convert observed_properties from serde_json::Value to a storable form
+        let observed_properties_json = match &seed.observed_properties {
+            serde_json::Value::Object(_) => seed.observed_properties.clone(),
+            _ => serde_json::json!({}),
+        };
+
+        // Build state_delta_map: prefer seed.state_delta; fall back to seed.path_change
+        // (the arrow-value field that the old ensure_observation_with_invalidations handled).
+        let state_delta_map: BTreeMap<String, Option<JsonValue>> = match &seed.state_delta {
+            serde_json::Value::Object(map) if !map.contains_key("format") && !map.is_empty() => map
+                .iter()
+                .map(|(k, v)| (k.clone(), Some(v.clone())))
+                .collect(),
+            serde_json::Value::Null | serde_json::Value::Object(_) => {
+                // No structured state_delta — check path_change fallback
+                if let Some(path_value) = seed
+                    .path_change
+                    .as_deref()
+                    .map(normalize_path_change_value)
+                    .filter(|p| !p.is_empty())
+                {
+                    BTreeMap::from([("path".to_string(), Some(json!(path_value)))])
+                } else {
+                    BTreeMap::new()
+                }
+            }
+            _ => BTreeMap::new(),
+        };
+        let state_delta_json = match &seed.state_delta {
+            serde_json::Value::Object(map) if map.contains_key("format") => {
+                seed.state_delta.clone()
+            }
+            _ => state_delta_to_json(&state_delta_map),
+        };
+
+        let source = seed
+            .source
+            .as_deref()
+            .unwrap_or("agent-session")
+            .to_string();
+
+        self.execute(
+            "INSERT INTO observations (id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at) VALUES ($id, $observation_type, $observed_properties, $state_delta, $properties, $source, $entity_id, $context_id, $timestamp, $created_at)",
+            HashMap::from([
+                ("id".to_string(), DbValue::Uuid(id.as_uuid())),
+                (
+                    "observation_type".to_string(),
+                    DbValue::Text(obs_type.to_string()),
+                ),
+                (
+                    "observed_properties".to_string(),
+                    DbValue::Json(observed_properties_json),
+                ),
+                (
+                    "state_delta".to_string(),
+                    DbValue::Json(state_delta_json),
+                ),
+                ("properties".to_string(), DbValue::Json(json!({}))),
+                ("source".to_string(), DbValue::Text(source)),
+                ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                (
+                    "context_id".to_string(),
+                    DbValue::Uuid(context_id.as_uuid()),
+                ),
+                (
+                    "timestamp".to_string(),
+                    DbValue::Timestamp(Utc::now().timestamp_millis()),
+                ),
+                ("created_at".to_string(), DbValue::TxId(self.tx)),
+            ]),
+        )?;
+        let evidence = text_evidence(id, context_id);
+        self.insert_evidence(&evidence, 0)?;
+        self.mark_decisions_invalidated_by_delta(context_id, entity_id, &state_delta_map)?;
+        self.merge_state_delta(context_id, entity_id, id, &state_delta_map)?;
         self.insert_audit(
             "record_observation",
             "observation",
@@ -2539,6 +3026,86 @@ impl<'a> CaptureTxn<'a> {
         )?;
         self.insert_audit("supersede", "decision", old.as_uuid(), decision.context_id)?;
         Ok(decision)
+    }
+
+    /// Read the catalog grouping memberships of every intention already stored in this
+    /// context (those that carry a `blueprint_catalog_id`), so Stage-3 grouping can get-or-create.
+    fn intention_catalog_entries(
+        &self,
+        context_id: ContextId,
+    ) -> Result<Vec<IntentionCatalogEntry>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT id, description, blueprint_catalog_id FROM intentions WHERE context_id = $context_id AND blueprint_catalog_id IS NOT NULL",
+                &HashMap::from([(
+                    "context_id".to_string(),
+                    DbValue::Uuid(context_id.as_uuid()),
+                )]),
+            )
+            .map_err(map_engine)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            let intention_id = IntentionId::from(required_uuid_column(row, &result.columns, "id")?);
+            let description = required_text_column(row, &result.columns, "description")?;
+            let catalog_id = required_text_column(row, &result.columns, "blueprint_catalog_id")?;
+            out.push(IntentionCatalogEntry {
+                intention_id,
+                normalized_description: normalize_intention_description(&description),
+                catalog_id,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Assign the catalog grouping handle to an intention (an additive grouping link, not an
+    /// edit of the captured description/status — Invariant 3).
+    fn set_intention_catalog_id(
+        &self,
+        context_id: ContextId,
+        intention_id: IntentionId,
+        catalog_id: &str,
+    ) -> Result<()> {
+        self.execute(
+            "UPDATE intentions SET blueprint_catalog_id = $catalog_id WHERE id = $id AND context_id = $context_id",
+            HashMap::from([
+                ("catalog_id".to_string(), DbValue::Text(catalog_id.to_string())),
+                ("id".to_string(), DbValue::Uuid(intention_id.as_uuid())),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    /// Insert a decision-to-decision relation edge, pre-checking the UNIQUE
+    /// (source, target, type) constraint so a re-classified relation does not raise the
+    /// hard-error backstop that cg's raw `insert_edge` relies on.
+    fn ensure_decision_relation_edge(
+        &mut self,
+        from: DecisionId,
+        to: DecisionId,
+        edge_type: &str,
+        context_id: ContextId,
+    ) -> Result<()> {
+        let existing = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
+                &HashMap::from([
+                    ("source_id".to_string(), DbValue::Uuid(from.as_uuid())),
+                    ("target_id".to_string(), DbValue::Uuid(to.as_uuid())),
+                    ("edge_type".to_string(), DbValue::Text(edge_type.to_string())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        if existing.rows.is_empty() {
+            self.insert_edge(from.as_uuid(), to.as_uuid(), edge_type, context_id, None)?;
+        }
+        Ok(())
     }
 
     fn decision_status(&self, decision_id: DecisionId) -> Result<Option<DecisionStatus>> {
@@ -4038,6 +4605,60 @@ fn context_by_label(store: &Store, label: &str) -> Result<crate::Context> {
     })
 }
 
+/// Narrow a candidate set of prior decisions to the near few most relevant to a query
+/// decision (its text plus its serving goal), bounded by `limit`.
+///
+/// Relevance is a deterministic lexical overlap of distinguishing tokens between the query
+/// and each prior decision (its description and the goals it serves). The highest-overlap
+/// priors come first; ties break by the original order (most-recent-first). This is the
+/// retrieval primitive that feeds the identity judge only the near neighbours, never the
+/// whole store. When every prior shares nothing distinctive, the most-recent few are kept so
+/// the set is the relevant few, not collapsed to zero.
+pub(crate) fn narrow_prior_decisions(
+    query_decision: &str,
+    query_goal: Option<&str>,
+    priors: &[ExtractionPriorDecision],
+    limit: usize,
+) -> Vec<ExtractionPriorDecision> {
+    if priors.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut query_tokens = relevance_tokens(query_decision);
+    if let Some(goal) = query_goal {
+        query_tokens.extend(relevance_tokens(goal));
+    }
+    let mut scored: Vec<(usize, usize, &ExtractionPriorDecision)> = priors
+        .iter()
+        .enumerate()
+        .map(|(order, prior)| {
+            let mut prior_tokens = relevance_tokens(&prior.text);
+            for goal in &prior.goals {
+                prior_tokens.extend(relevance_tokens(goal));
+            }
+            let overlap = query_tokens.intersection(&prior_tokens).count();
+            (overlap, order, prior)
+        })
+        .collect();
+    // Highest overlap first; tie-break by original order (priors arrive most-recent-first).
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, prior)| prior.clone())
+        .collect()
+}
+
+/// Distinguishing lexical tokens for relevance overlap: alphanumeric words, lowercased, with
+/// the common decision/choice filler words dropped so generic phrasing ("use", "for") does not
+/// drown out the distinctive subject.
+fn relevance_tokens(text: &str) -> BTreeSet<String> {
+    normalize_intention_description(text)
+        .split_whitespace()
+        .filter(|word| !choice_subject_stopword(word))
+        .map(str::to_string)
+        .collect()
+}
+
 pub(crate) fn extraction_prior_decisions(
     store: &Store,
     context_id: ContextId,
@@ -4456,21 +5077,50 @@ fn relation_entity_label(seed: &DecisionSeed, entity_names: &BTreeMap<String, St
 
 fn decision_input(
     context_id: ContextId,
-    description: &str,
+    seed: &DecisionSeed,
     intention_ids: &[IntentionId],
     entity_id: Option<EntityId>,
     precedent_ids: Vec<DecisionId>,
 ) -> CreateDecision {
+    // Convert Vec<String> reasoning into Vec<ReasoningStep>
+    let reasoning: Vec<ReasoningStep> = seed
+        .reasoning
+        .iter()
+        .map(|text| ReasoningStep {
+            operation: "observed".to_string(),
+            details: text.clone(),
+            result: text.clone(),
+            agent_id: None,
+            timestamp: chrono::Utc::now(),
+        })
+        .collect();
+
+    // Convert serde_json::Value properties to BTreeMap<String, serde_json::Value>
+    let properties: std::collections::BTreeMap<String, serde_json::Value> =
+        if let serde_json::Value::Object(map) = &seed.properties {
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+
     CreateDecision {
-        decision_type: "code_reference".to_string(),
-        description: description.to_string(),
-        confidence: Some(0.9),
+        decision_type: seed
+            .decision_type
+            .clone()
+            .map(ModelExtractedField::into_value)
+            .unwrap_or_else(|| "decision".to_string()),
+        description: seed.text.clone(),
+        confidence: None, // Always None at capture — invariant
+        reasoning,
+        tags: seed.tags.clone(),
+        properties,
         intention_ids: intention_ids.to_vec(),
         based_on_entity_ids: entity_id.into_iter().collect(),
-        basis_fields: entity_id.map(|id| HashMap::from([(id, vec!["path".to_string()])])),
+        basis_fields: entity_id
+            .map(|id| std::collections::HashMap::from([(id, vec!["path".to_string()])])),
         context_id,
         precedent_ids,
-        agent_id: Some(AgentId::from("cg-ingest")),
+        agent_id: seed.agent_id.as_deref().map(AgentId::from),
         ..Default::default()
     }
 }

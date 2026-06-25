@@ -1075,6 +1075,9 @@ pub async fn drain_pull(client: &SyncClient) {
             .await
             .expect("pull sync round");
         if client.pull_watermark() == before {
+            // Mirror the production pull path: re-derive skill on/off state from the
+            // now-synced teaching-events log so a reversal recorded on a peer takes effect.
+            context_graph::skill_store::reconcile_skills_from_teaching_events(client.db());
             return;
         }
     }
@@ -1199,20 +1202,21 @@ fn expected_sync_table_policies() -> BTreeMap<&'static str, (SyncDirection, Conf
         ("audit_log", local_only),
         ("conflicts", write_once),
         ("precedent_matches", write_once),
-        // Placeholder policies for the 4 new skill-loop tables (all write_once).
-        // Correct policies (what the impl must set) are noted below:
-        //   cg_learned_skills:    CORRECT = (Both, ServerWins);  placeholder = write_once
-        //   cg_teaching_events:   CORRECT = (Both, InsertIfNotExists); placeholder = write_once
-        //   cg_skill_firing_trace: CORRECT = (None, InsertIfNotExists); placeholder = write_once (Both)
-        //   cg_review_cursor:     CORRECT = (None, InsertIfNotExists); placeholder = write_once (Both)
-        ("cg_learned_skills", write_once),
+        // Skill-loop sync policies (implemented):
+        //   cg_learned_skills:    (Both, ServerWins)     — hub-arbitrated, syncs tenant-wide
+        //   cg_teaching_events:   (Both, InsertIfNotExists) — order-free set union, syncs tenant-wide
+        //   cg_skill_firing_trace: (None, InsertIfNotExists) — local-only per device
+        //   cg_review_cursor:     (None, InsertIfNotExists) — local-only per owner
+        ("cg_learned_skills", hub_arbitrated),
         ("cg_teaching_events", write_once),
-        ("cg_skill_firing_trace", write_once),
-        ("cg_review_cursor", write_once),
+        ("cg_skill_firing_trace", local_only),
+        ("cg_review_cursor", local_only),
         // Two-layer overlay corrections + compensation/reversal events are append-only rows that
         // propagate tenant-wide so a reversal reaches every machine: (Both, InsertIfNotExists).
         ("cg_overlay_entries", write_once),
         ("cg_compensation_events", write_once),
+        // Pending review items are local-only per owner (never synced).
+        ("cg_pending_review_items", local_only),
     ])
 }
 

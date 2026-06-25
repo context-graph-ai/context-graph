@@ -44,9 +44,10 @@ pub struct ModelCallUsage {
     pub elapsed: Duration,
     pub reliability_level: EnforcementLevel,
     pub outcome: ModelCallOutcome,
-    /// Placeholder: always None. The real implementation tags each call with "extraction" | "identity-judge" | "repair".
+    /// The originating flow when the record is flow-tagged ("extraction" | "identity-judge" |
+    /// "repair"); `None` on the raw cost-receipt path, which carries usage untagged.
     pub flow_tag: Option<String>,
-    /// Placeholder: always None. The real implementation carries the model id used for this call.
+    /// The model id when the record is flow-tagged; `None` on the raw cost-receipt path.
     pub model_id: Option<String>,
 }
 
@@ -224,6 +225,12 @@ pub fn capture_with_usage_visibility(
 ) -> Result<CaptureUsageReceipt> {
     let started = Instant::now();
     let context_label = request.context_label.clone();
+    // Pass the extractor directly so the per-chunk usage records (chunk_index,
+    // flow_tag, model_id) are captured as emitted by the extractor, without
+    // additional tagging. Flow-tagging for the model-usage lane is applied by
+    // record_conversation_internal for the J-facing single-capture path; the
+    // cost-visibility path reads the raw per-chunk records that
+    // capture_with_progress_observer collects in its loop.
     let report =
         capture_with_progress_observer(store, request, extractor, max_chars_per_chunk, |_| {})?;
     let calls = report.model_usage;
@@ -289,8 +296,10 @@ pub fn capture_with_progress_observer(
         return Ok(report);
     }
     let mut rolling = RollingCaptureAccumulator::new(16_000);
+    let mut per_chunk_usage: Vec<ModelCallUsage> = Vec::new();
     for (index, chunk) in chunks.iter().enumerate() {
         let chunk_index = index + 1;
+        let chunk_started = Instant::now();
         observer(progress_event(
             chunk_index,
             total_chunks,
@@ -302,6 +311,29 @@ pub fn capture_with_progress_observer(
             transcript: chunk,
             prior_decisions: &[],
         })?;
+        let chunk_elapsed = chunk_started.elapsed();
+        // Drain the extractor's usage records immediately after each chunk.
+        // The extractor's internal chunk_index counter resets on each drain,
+        // so we assign the authoritative chunk_index from the loop variable.
+        // When the extractor emits no records for a chunk (e.g. a verbatim
+        // or deterministic double that never calls a model), synthesize one
+        // timing-only record so callers can always rely on at least one entry
+        // per chunk for timing and cost accounting.
+        let mut drained = extractor.drain_model_usage();
+        if drained.is_empty() {
+            per_chunk_usage.push(ModelCallUsage {
+                chunk_index,
+                usage: UsageReportState::Unavailable,
+                elapsed: chunk_elapsed,
+                flow_tag: None,
+                model_id: None,
+            });
+        } else {
+            for record in &mut drained {
+                record.chunk_index = chunk_index;
+            }
+            per_chunk_usage.extend(drained);
+        }
         rolling.push_harvest(harvest);
         observer(progress_event(
             chunk_index,
@@ -312,6 +344,12 @@ pub fn capture_with_progress_observer(
     }
     let mut report =
         rolling.finish_capture(store, &request.context_label, total_chunks, extractor)?;
+    // Replace the model_usage that finish_capture produced (from its inner
+    // record_conversation call) with the per-chunk records collected above.
+    // Those records carry the loop-authoritative chunk_index and the raw
+    // flow_tag / model_id values the extractor emitted — no additional
+    // tagging is applied here. Cost-visibility callers depend on this shape.
+    report.model_usage = per_chunk_usage;
     report.resolved_chunk_window = Some(chunk_window.max(1));
     Ok(report)
 }
@@ -763,16 +801,17 @@ fn sync_policy_for_table(table: &str) -> (SyncDirection, ConflictPolicy) {
         | "outcomes"
         | "invalidations"
         | "entity_current_snapshots" => hub_arbitrated,
-        // Placeholder policies for the 4 skill-loop tables (all return write_once).
-        // Correct policies:
-        //   cg_learned_skills:    (Both, ServerWins)
-        //   cg_teaching_events:   (Both, InsertIfNotExists)
-        //   cg_skill_firing_trace: (None, InsertIfNotExists)
-        //   cg_review_cursor:     (None, InsertIfNotExists)
-        "cg_learned_skills" => write_once,
+        // Skill-loop tables: explicit per-table sync policies.
+        //   cg_learned_skills syncs tenant-wide, hub-arbitrated (ServerWins).
+        //   cg_teaching_events syncs tenant-wide as an order-free set union (InsertIfNotExists).
+        //   cg_skill_firing_trace is local-only per device (None).
+        //   cg_review_cursor is local-only per owner (None).
+        "cg_learned_skills" => hub_arbitrated,
         "cg_teaching_events" => write_once,
-        "cg_skill_firing_trace" => write_once,
-        "cg_review_cursor" => write_once,
+        "cg_skill_firing_trace" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
+        "cg_review_cursor" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
+        // Pending review items: local-only (like the review cursor, never synced).
+        "cg_pending_review_items" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
         // Overlay corrections + compensation/reversal events: append-only, propagate tenant-wide.
         "cg_overlay_entries" => write_once,
         "cg_compensation_events" => write_once,
