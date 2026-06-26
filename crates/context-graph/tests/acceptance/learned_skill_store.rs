@@ -11,13 +11,16 @@ use std::collections::HashMap;
 use context_graph::skill_store::{
     SkillProvenance, TeachingEventKind, acknowledge_skill, apply_correction, export_skill,
     list_skills_in_store, parse_human_authored_skill, set_review_hold, set_skills_enabled,
-    try_promote_skill, try_promote_skill_with_result,
+    try_promote_skill, try_promote_skill_with_gate_counter, try_promote_skill_with_result,
 };
 use context_graph::{Store, StoreConfig, TxId};
 use contextdb_core::Value as DbValue;
 
 use super::fake_extractor::open_store_with_lexical_embedder;
-use super::skill_fixtures::{gate_failing_labels, gate_passing_labels, llm_authored_skill};
+use super::skill_fixtures::{
+    gate_failing_labels, gate_passing_labels, general_candidate_labels, llm_authored_skill,
+    overfit_candidate_labels,
+};
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -187,14 +190,19 @@ fn multiple_aligned_labels_promote_a_skill_single_correction_does_not() {
     );
 
     let skill = promoted.unwrap();
-    // The promoted skill's description and rule must derive from the labels (not a placeholder).
+    // The promoted skill's IDENTITY must DERIVE from the aligned labels' content — value equality
+    // against the labels, not merely non-empty. The gate_passing_labels all correct to
+    // "technology_choice", so the derived rule/description must reference that target.
     assert!(
-        !skill.description.is_empty(),
-        "promoted skill description must not be empty"
+        skill.rule.contains("technology_choice"),
+        "promoted skill rule must derive from the aligned labels' content (\"technology_choice\"); \
+         a placeholder rule that does not reference the labels fails; got: {:?}",
+        skill.rule
     );
     assert!(
-        !skill.rule.is_empty(),
-        "promoted skill rule must not be empty"
+        skill.description.contains("technology_choice"),
+        "promoted skill description must derive from the aligned labels' content; got: {:?}",
+        skill.description
     );
     // Provenance must reflect correction-origin.
     assert!(
@@ -204,6 +212,60 @@ fn multiple_aligned_labels_promote_a_skill_single_correction_does_not() {
         ),
         "promoted skill provenance must be HumanCorrection or LlmAuthored, got {:?}",
         skill.provenance
+    );
+}
+
+// The held-out gate (Surface F) must catch OVERFITTING: a candidate that fits its training labels
+// but FAILS a disjoint held-out slice must NOT be promoted, while a GENERAL rule that holds on the
+// held-out slice must — the gate discriminates generalization, not training fit. A gate-invocation
+// counter proves the verdict came from the held-out slice.
+//
+// SCAFFOLD STUB the test fails on: try_promote_skill_with_gate_counter judges on TRAINING fit and
+// never runs the held-out gate (counter stays 0), so the overfit candidate IS promoted and the
+// "gate was invoked" assertion fails.
+#[test]
+fn overfit_rule_is_not_promoted_while_a_general_rule_is() {
+    let (general_training, general_heldout) = general_candidate_labels("sk-general");
+    let (overfit_training, overfit_heldout) = overfit_candidate_labels("sk-overfit");
+
+    // The general candidate must be promoted (its rule holds on the held-out slice).
+    let general = try_promote_skill_with_gate_counter(&general_training, &general_heldout);
+    assert!(
+        general.promoted,
+        "a GENERAL rule that holds on the held-out slice must be promoted; wrong stub may promote \
+         it but the overfit/gate assertions below still fail"
+    );
+
+    // The overfit candidate must NOT be promoted (its rule fails the disjoint held-out slice).
+    let overfit = try_promote_skill_with_gate_counter(&overfit_training, &overfit_heldout);
+    assert!(
+        !overfit.promoted,
+        "an OVERFIT rule (fits training, fails the held-out slice) must NOT be promoted; \
+         wrong stub judges on training fit and promotes it"
+    );
+
+    // The held-out gate must have been EVALUATED on the learned path — proving the verdict came from
+    // the held-out slice, not training fit. The count rides the PromotionResult as a plain usize
+    // (no app-side global/atomic in src/); the wrong stub never runs the gate → it stays 0.
+    assert!(
+        general.heldout_gate_invocations > 0,
+        "the held-out gate must be evaluated on the general candidate (heldout_gate_invocations > 0), \
+         proving generalization was measured on the held-out slice; wrong stub never runs it (0)"
+    );
+    assert!(
+        overfit.heldout_gate_invocations > 0,
+        "the held-out gate must be evaluated on the overfit candidate too (heldout_gate_invocations \
+         > 0); wrong stub never runs it (0)"
+    );
+
+    // The promoted general rule's CONTENT must derive from the general labels (value equality).
+    let general_skill = general
+        .skill
+        .expect("general candidate must yield a skill when promoted");
+    assert!(
+        general_skill.rule.contains("technology_choice"),
+        "the promoted general rule must derive from the general labels' content; got: {:?}",
+        general_skill.rule
     );
 }
 
@@ -377,35 +439,87 @@ fn exported_edited_skill_pushed_back_becomes_human_authored() {
     );
 }
 
-// Test 8 (store-state): the placeholder list_skills_in_store returns empty.
+// Test 8 (store-state): a promoted skill must auto-apply on a REAL matching capture, changing the
+// captured result, with no approval step. The proof is a DIFF against a no-skill baseline capture
+// of the same transcript: the two results must differ exactly by the skill's effect.
+//
+// SCAFFOLD STUB the test fails on: run_capture does not read skills at all (applied_skill_ids is
+// hardcoded empty and no skill ever changes a captured value), so the with-skill and no-skill
+// captures are identical and applied_skill_ids stays empty → both assertions fail (RED).
 #[test]
 fn promoted_skill_auto_applies_when_description_matches_no_approval_click() {
-    let (_dir, store) = fresh_store();
+    use context_graph::harness::{CaptureHarnessConfig, run_capture};
+    use context_graph::ingest::CaptureRequest;
 
-    // Insert a promoted (active, not held) skill.
+    // The transcript names an entity whose type the skill is meant to correct (File → Repository).
+    let transcript = "Goal G1: remember the project\nEntity E1: context-graph type=file\nDecision D1: keep one repo serves G1";
+    let req = |label: &str| CaptureRequest {
+        context_label: label.to_string(),
+        transcript: transcript.to_string(),
+        model_available: true,
+    };
+
+    // Baseline: a fresh store with NO learned skill. Capture and read the entity type.
+    let (_bdir, baseline_store) = fresh_store();
+    let (_br, baseline_hr) = run_capture(
+        &baseline_store,
+        req("baseline-ctx"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("baseline capture");
+    let baseline_type = entity_type_named(&baseline_store, "context-graph");
+
+    // With a promoted, active, matching skill in the store. Its effect: retype the File entity to
+    // Repository when its description matches the chunk.
+    let (_sdir, skill_store) = fresh_store();
     insert_skill_row(
-        &store,
+        &skill_store,
         "sk-auto",
-        "detect technology_choice decisions",
-        "when decision mentions library → technology_choice",
+        "retype a context-graph file entity to a repository",
+        "when an entity named context-graph is typed File → Repository",
         "human-correction",
         true,
         false,
     );
+    let (_sr, skill_hr) = run_capture(
+        &skill_store,
+        req("skill-ctx"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("with-skill capture");
+    let with_skill_type = entity_type_named(&skill_store, "context-graph");
 
-    let skills = list_skills_in_store(&store);
-    // The placeholder returns empty.
-    assert_eq!(
-        skills.len(),
-        1,
-        "promoted active skill must be visible in the listing without an approval click"
-    );
-    let skill = &skills[0];
-    assert!(skill.active, "auto-applying skill must be active");
+    // The promoted skill must be reported as applied (no approval click required).
     assert!(
-        !skill.held_for_review,
-        "auto-applying skill must NOT be held for review"
+        skill_hr.applied_skill_ids.iter().any(|id| id == "sk-auto"),
+        "the promoted matching skill must auto-apply (appear in applied_skill_ids) with no approval \
+         step; wrong stub leaves applied_skill_ids empty, got {:?}",
+        skill_hr.applied_skill_ids
     );
+    // The captured RESULT must differ from the no-skill baseline by exactly the skill's effect.
+    assert_ne!(
+        with_skill_type, baseline_type,
+        "a promoted matching skill must change the captured result vs a no-skill baseline; \
+         wrong stub ignores skills on the capture path so both captures are identical \
+         (baseline={baseline_type:?}, with_skill={with_skill_type:?})"
+    );
+    // The no-skill baseline must NOT have applied any skill.
+    assert!(
+        baseline_hr.applied_skill_ids.is_empty(),
+        "the no-skill baseline must apply nothing"
+    );
+}
+
+/// Read the stored entity type for the entity whose name contains `name_fragment`, in any context.
+fn entity_type_named(store: &Store, name_fragment: &str) -> Option<context_graph::EntityType> {
+    store
+        .list_entities(context_graph::ListEntityFilter::default())
+        .expect("list entities")
+        .into_iter()
+        .find(|e| e.name.contains(name_fragment))
+        .map(|e| e.entity_type)
 }
 
 // Test 9 (store-state): the placeholder list_skills_in_store returns empty.
@@ -442,98 +556,268 @@ fn learned_skill_is_visible_via_skills_listing() {
     }
 }
 
-// Test 10 (store-state): the placeholder set_skills_enabled does nothing.
+// Test 10 (store-state): a skill that WAS applying must STOP applying after `cg skills off`, while
+// capture still succeeds — established by a real capture diff, not merely toggling a flag. With
+// skills ON the skill's effect must be present; with skills OFF the same matching capture must NOT
+// show the effect; ON again restores it.
+//
+// SCAFFOLD STUB the test fails on: run_capture never applies skills (no skill-application seam), so
+// the effect is absent even with skills ON → the "effect present with skills ON" assertion fails.
 #[test]
 fn skills_off_master_switch_stops_application_capture_still_works() {
-    let (_dir, store) = fresh_store();
+    use context_graph::harness::{CaptureHarnessConfig, run_capture};
+    use context_graph::ingest::CaptureRequest;
 
-    // Insert one active skill.
+    let transcript = "Goal G1: remember the project\nEntity E1: context-graph type=file\nDecision D1: keep one repo serves G1";
+    let req = |label: &str| CaptureRequest {
+        context_label: label.to_string(),
+        transcript: transcript.to_string(),
+        model_available: true,
+    };
+
+    // A store holding a promoted, active, matching skill whose effect retypes the entity.
+    let (_dir, store) = fresh_store();
     insert_skill_row(
         &store,
         "sk-switch",
-        "switch test skill",
-        "any rule",
+        "retype a context-graph file entity to a repository",
+        "when an entity named context-graph is typed File → Repository",
         "human-correction",
         true,
         false,
     );
 
-    // Skills are on: listing must show active skill.
-    let skills_on = list_skills_in_store(&store);
-    // The placeholder returns empty.
-    assert_eq!(
-        skills_on.len(),
-        1,
-        "before switch-off, listing must surface the active skill"
-    );
+    // The no-skill baseline type (capture in a fresh, skill-free store).
+    let (_bdir, baseline_store) = fresh_store();
+    run_capture(
+        &baseline_store,
+        req("switch-baseline"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("baseline capture");
+    let baseline_type = entity_type_named(&baseline_store, "context-graph");
 
-    // Turn off skills master switch.
-    let _ = set_skills_enabled(&store, false);
-
-    // After switch-off: apply_correction must still work (capture still works).
-    let correction_result = apply_correction(&store, "item-x", "corrected", None);
-    assert!(
-        correction_result.applied,
-        "capture/correction must still work after skills switch-off"
-    );
-
-    // Turn skills back on.
+    // Skills ON: the effect must be present (differs from the no-skill baseline).
     let _ = set_skills_enabled(&store, true);
+    let (_on_r, on_hr) = run_capture(
+        &store,
+        req("switch-on-ctx"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig {
+            skills_enabled: true,
+            ..Default::default()
+        },
+    )
+    .expect("skills-on capture");
+    let on_type = entity_type_named(&store, "context-graph");
+    assert_ne!(
+        on_type, baseline_type,
+        "with skills ON, the matching skill must apply and change the captured result vs baseline; \
+         wrong stub never applies skills (on={on_type:?}, baseline={baseline_type:?})"
+    );
+    assert!(
+        on_hr.applied_skill_ids.iter().any(|id| id == "sk-switch"),
+        "with skills ON, the matching skill must appear in applied_skill_ids"
+    );
+
+    // Skills OFF: the SAME matching capture must NOT show the effect, and capture still succeeds.
+    let _ = set_skills_enabled(&store, false);
+    let (off_report, off_hr) = run_capture(
+        &store,
+        req("switch-off-ctx"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig {
+            skills_enabled: false,
+            ..Default::default()
+        },
+    )
+    .expect("skills-off capture must still succeed");
+    let off_type = entity_type_named_in(&store, "context-graph", "switch-off-ctx");
+    assert_eq!(
+        off_type, baseline_type,
+        "with skills OFF, a skill that WAS applying must STOP — the captured result must match the \
+         no-skill baseline (off={off_type:?}, baseline={baseline_type:?})"
+    );
+    assert!(
+        off_hr.applied_skill_ids.is_empty(),
+        "with skills OFF, applied_skill_ids must be empty"
+    );
+    assert!(
+        off_report.wrote_digest || !off_report.stable_ids.is_empty(),
+        "capture must still produce a full receipt with skills OFF"
+    );
+
+    // ON again: applies again.
+    let _ = set_skills_enabled(&store, true);
+    let (_on2_r, on2_hr) = run_capture(
+        &store,
+        req("switch-on-again-ctx"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig {
+            skills_enabled: true,
+            ..Default::default()
+        },
+    )
+    .expect("skills-on-again capture");
+    assert!(
+        on2_hr.applied_skill_ids.iter().any(|id| id == "sk-switch"),
+        "turning skills back ON must re-apply the skill"
+    );
 }
 
-// Test 11 (store-state): the placeholder set_review_hold and acknowledge_skill do nothing.
+/// Read the stored entity type for an entity by name within a specific context label.
+fn entity_type_named_in(
+    store: &Store,
+    name_fragment: &str,
+    context_label: &str,
+) -> Option<context_graph::EntityType> {
+    let context_id = store
+        .list_contexts()
+        .ok()?
+        .into_iter()
+        .find(|c| c.name == context_label)
+        .map(|c| c.id);
+    store
+        .list_entities(context_graph::ListEntityFilter {
+            context_id,
+            ..Default::default()
+        })
+        .expect("list entities")
+        .into_iter()
+        .find(|e| e.name.contains(name_fragment))
+        .map(|e| e.entity_type)
+}
+
+// LIVE PATH: the review-hold gate must gate the actual capture path. With `cg skills review` OFF
+// (default), a freshly promoted matching skill auto-applies on a REAL capture; with it ON, a newly
+// promoted skill is HELD (does NOT apply on the live capture) until acknowledged, while the
+// promotion is still recorded. HEAD's run_capture applies no skills at all → the baseline and
+// post-acknowledge "effect present" arms fail (honest RED).
 #[test]
 fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
-    let (_dir, store) = fresh_store();
+    use context_graph::harness::{CaptureHarnessConfig, run_capture};
+    use context_graph::ingest::CaptureRequest;
 
-    // Insert a skill held for review (active=false, held_for_review=true).
+    // A transcript whose entity the matching skill retypes (File → Repository) when applied.
+    let transcript = "Goal G1: remember the project\nEntity E1: context-graph type=file\nDecision D1: keep one repo serves G1";
+    let req = |label: &str| CaptureRequest {
+        context_label: label.to_string(),
+        transcript: transcript.to_string(),
+        model_available: true,
+    };
+
+    // The no-skill baseline entity type (a fresh, skill-free store).
+    let (_bdir, baseline_store) = fresh_store();
+    run_capture(
+        &baseline_store,
+        req("review-baseline"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("baseline capture");
+    let baseline_type = entity_type_named(&baseline_store, "context-graph");
+
+    // --- review OFF (default): a promoted matching skill auto-applies on a REAL capture. ---
+    let (_dir_off, store_off) = fresh_store();
+    set_review_hold(&store_off, false);
     insert_skill_row(
-        &store,
-        "sk-held",
-        "held skill",
-        "candidate rule",
+        &store_off,
+        "sk-review-off",
+        "retype a context-graph file entity to a repository",
+        "when an entity named context-graph is typed File → Repository",
         "human-correction",
-        false,
-        true,
+        true,  // active
+        false, // not held
+    );
+    let (_ro, off_hr) = run_capture(
+        &store_off,
+        req("review-off-ctx"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig {
+            review_mode: false,
+            ..Default::default()
+        },
+    )
+    .expect("review-off capture");
+    let off_type = entity_type_named_in(&store_off, "context-graph", "review-off-ctx");
+    assert_ne!(
+        off_type, baseline_type,
+        "with `cg skills review` OFF, a promoted matching skill must auto-apply on the live capture \
+         (effect differs from the no-skill baseline); HEAD applies no skills (off={off_type:?}, \
+         baseline={baseline_type:?})"
+    );
+    assert!(
+        off_hr
+            .applied_skill_ids
+            .iter()
+            .any(|id| id == "sk-review-off"),
+        "review-off: the matching skill must appear in applied_skill_ids"
     );
 
-    // With review-hold on: the skill must be in the listing but held.
-    set_review_hold(&store, true);
-    let skills_before_ack = list_skills_in_store(&store);
-    // The placeholder returns empty.
+    // --- review ON: a newly promoted skill is HELD on the live capture path until acknowledged. ---
+    let (_dir_on, store_on) = fresh_store();
+    set_review_hold(&store_on, true);
+    // Freshly promoted under review-on → recorded held_for_review, must NOT apply on the live path.
+    insert_skill_row(
+        &store_on,
+        "sk-review-held",
+        "retype a context-graph file entity to a repository",
+        "when an entity named context-graph is typed File → Repository",
+        "human-correction",
+        false, // not active yet (held)
+        true,  // held_for_review
+    );
+    // Promotion is still recorded (the skill is listed even while held).
     assert_eq!(
-        skills_before_ack.len(),
+        list_skills_in_store(&store_on).len(),
         1,
-        "held skill must still be recorded in the listing even when held"
+        "review-on: the freshly promoted skill must still be recorded/listed even while held"
     );
-    let held = &skills_before_ack[0];
-    assert!(
-        held.held_for_review,
-        "skill must be held_for_review before acknowledgement"
-    );
-    assert!(
-        !held.active,
-        "held skill must not be active (auto-apply blocked) before acknowledgement"
-    );
-
-    // Acknowledge the skill — the placeholder does nothing.
-    acknowledge_skill(&store, "sk-held");
-
-    // After acknowledge: the skill must no longer be held.
-    let skills_after_ack = list_skills_in_store(&store);
-    // The placeholder still returns empty.
+    let (_rh, held_hr) = run_capture(
+        &store_on,
+        req("review-held-ctx"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig {
+            review_mode: true,
+            ..Default::default()
+        },
+    )
+    .expect("review-held capture");
+    let held_type = entity_type_named_in(&store_on, "context-graph", "review-held-ctx");
     assert_eq!(
-        skills_after_ack.len(),
-        1,
-        "acknowledged skill must still appear in listing"
-    );
-    let acknowledged = &skills_after_ack[0];
-    assert!(
-        !acknowledged.held_for_review,
-        "skill must not be held_for_review after acknowledgement"
+        held_type, baseline_type,
+        "with `cg skills review` ON, a held skill must NOT apply on the live capture (effect equals \
+         the no-skill baseline); held={held_type:?}, baseline={baseline_type:?}"
     );
     assert!(
-        acknowledged.active,
-        "skill must become active after acknowledgement"
+        held_hr.applied_skill_ids.is_empty(),
+        "review-on held: applied_skill_ids must be empty (the held skill did not apply)"
+    );
+
+    // --- acknowledge → the skill now applies on a subsequent live capture. ---
+    acknowledge_skill(&store_on, "sk-review-held");
+    let (_ra, ack_hr) = run_capture(
+        &store_on,
+        req("review-ack-ctx"),
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig {
+            review_mode: true,
+            ..Default::default()
+        },
+    )
+    .expect("post-acknowledge capture");
+    let ack_type = entity_type_named_in(&store_on, "context-graph", "review-ack-ctx");
+    assert_ne!(
+        ack_type, baseline_type,
+        "after acknowledgement, the skill must apply on a subsequent live capture (effect differs \
+         from baseline); HEAD applies no skills (ack={ack_type:?}, baseline={baseline_type:?})"
+    );
+    assert!(
+        ack_hr
+            .applied_skill_ids
+            .iter()
+            .any(|id| id == "sk-review-held"),
+        "post-acknowledge: the skill must appear in applied_skill_ids"
     );
 }

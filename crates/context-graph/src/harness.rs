@@ -346,10 +346,12 @@ pub fn run_capture(
     let context = resolve_capture_context(store, &request.context_label)?;
     let context_id = context.id;
 
-    // Stage 1: extract with NO prior store memory (not a RAG pipeline). The running summary
-    // and any applied learned skills are the only carried context; this plan applies no
-    // skills, so the applied set is empty.
-    let applied_skill_ids: Vec<String> = Vec::new();
+    // Select and apply the learned skills whose description matches this capture, recording a
+    // firing trace for each applied skill (the real input to drift). A stable capture id ties the
+    // firings to this capture.
+    let capture_id = crate::DigestId::new_v7().as_uuid().to_string();
+    let applied_skill_ids: Vec<String> =
+        select_and_apply_learned_skills(store, config, &request, &capture_id);
     let mut harvest = extractor.extract(ExtractionRequest {
         context_label: &request.context_label,
         transcript: &request.transcript,
@@ -366,6 +368,7 @@ pub fn run_capture(
             name: request.context_label.clone(),
             path: request.context_label.clone(),
             entity_type: ExtractedEntityType::Document,
+            entity_type_raw: None,
             context_id: None,
         });
     }
@@ -649,6 +652,25 @@ fn grounding_check_entities(harvest: &StructuredHarvest, transcript: &str) -> Ve
         }
     }
     flagged
+}
+
+/// Select the learned skills whose description matches this capture and apply them, recording a
+/// `cg_skill_firing_trace` row for each applied skill (the real input to drift detection). Skills
+/// held for review (when `cg skills review` is on) must NOT apply on the live path until
+/// acknowledged; with the master switch off, none apply.
+///
+/// SCAFFOLD STUB (deliberately wrong): this does NOTHING — it never reads `cg_learned_skills`, never
+/// matches descriptions, never applies an effect, and never records a firing trace. So a capture
+/// where a matching promoted skill SHOULD apply leaves `applied_skill_ids` empty, the captured value
+/// unchanged, and `cg_skill_firing_trace` empty — the Surface E/F/H tests fail on assertion.
+fn select_and_apply_learned_skills(
+    _store: &Store,
+    _config: &CaptureHarnessConfig,
+    _request: &CaptureRequest,
+    _capture_id: &str,
+) -> Vec<String> {
+    // Wrong: no skill is ever selected, applied, or recorded as fired.
+    Vec::new()
 }
 
 /// Render the config knobs honored on this capture, for the report's introspection field.

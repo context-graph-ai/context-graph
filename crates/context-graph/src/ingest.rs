@@ -253,6 +253,16 @@ pub struct EntitySeed {
     pub path: String,
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub entity_type: ExtractedEntityType,
+    /// The RAW model-emitted entity-type STRING, when the model reports the type as free text
+    /// (the Stage-1 JSON shape: `"entity_type": "Repository"`). When present, capture must resolve
+    /// it to the right `EntityType` variant through the live `entity_type_from_str` conversion and
+    /// flag it as out-of-vocab when the string is not recognized — never silently coerce it to a
+    /// default. SCAFFOLD STUB: the current capture path ignores this field (it uses the typed
+    /// `entity_type` only), so a raw `"module"` lands as the default `File` and a raw `"wormhole"`
+    /// is silently dropped rather than flagged — the deliberately-wrong behavior the Surface-A
+    /// from_str test fails on by assertion.
+    #[serde(default)]
+    pub entity_type_raw: Option<String>,
     /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
     /// under the emitted context instead of the capture context (cross-tenant leak). The
     /// correct impl ignores this field and always uses the capture context.
@@ -1119,6 +1129,7 @@ impl RollingCaptureAccumulator {
                 name: entity.name,
                 path: entity.path,
                 entity_type: entity.entity_type,
+                entity_type_raw: None,
                 context_id: None,
             });
         }
@@ -5564,6 +5575,7 @@ mod tests {
                 name: "rollback config".to_string(),
                 path: "config/rollback.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {

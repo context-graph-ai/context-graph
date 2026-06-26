@@ -67,6 +67,7 @@ pub fn span_faithful_harvest(transcript: &str) -> StructuredHarvest {
                     name: name.clone(),
                     path: name,
                     entity_type,
+                    entity_type_raw: None,
                     context_id: None,
                 });
             }
@@ -218,6 +219,7 @@ fn entity(key: &str, name: &str, entity_type: ExtractedEntityType) -> EntitySeed
         name: name.to_string(),
         path: name.to_string(),
         entity_type,
+        entity_type_raw: None,
         context_id: None,
     }
 }
@@ -425,6 +427,7 @@ impl ConversationExtractor for ObservationLanesExtractor {
             name: "benchmark service".to_string(),
             path: "benchmark".to_string(),
             entity_type: ExtractedEntityType::Service,
+            entity_type_raw: None,
             context_id: None,
         });
         harvest.observations.push(ObservationSeed {
@@ -501,10 +504,138 @@ impl ConversationExtractor for HighConfidenceFabricatedSpanExtractor {
             name: "kubernetes cluster".to_string(),
             path: "infra/k8s".to_string(),
             entity_type: ExtractedEntityType::Infrastructure,
+            entity_type_raw: None,
             context_id: None,
         });
         harvest.summary = Some("fabricated span test".to_string());
         Ok(harvest)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FiveFabricatedValuesExtractor
+// ---------------------------------------------------------------------------
+/// Emits, in ONE harvest, one fabricated value for EACH of the five extracted value classes —
+/// an entity, a decision_type, an agent_id, an observation value, and an outcome value — where
+/// every value's supporting text is ABSENT from the transcript the test feeds in. A real model
+/// can produce a harvest where several fields are ungrounded at once; this double drives the
+/// grounding silence rule across ALL value classes, not entities alone. None of these are an
+/// answer-key: each value is simply a phrase the model "wrote" that the transcript does not
+/// contain, so the deterministic grounding check must flag each by class.
+#[derive(Debug, Default)]
+pub struct FiveFabricatedValuesExtractor;
+
+impl FiveFabricatedValuesExtractor {
+    /// The five fabricated value phrases, none of which appear in the test transcript. Exposed so
+    /// the test can assert each phrase is flagged by class.
+    pub const FAB_ENTITY: &'static str = "phantom-orchestrator-service";
+    pub const FAB_DECISION_TYPE: &'static str = "quantum_routing_policy";
+    pub const FAB_AGENT_ID: &'static str = "ghost-agent-zeta";
+    pub const FAB_OBSERVATION: &'static str = "telemetry spike never witnessed here";
+    pub const FAB_OUTCOME: &'static str = "rollout that was never attempted";
+}
+
+impl ConversationExtractor for FiveFabricatedValuesExtractor {
+    fn extract(&self, request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        // Deliberately ignore the transcript content: every emitted value is absent from it.
+        let _ = request.transcript;
+        let mut harvest = StructuredHarvest::default();
+        harvest.goals.push(GoalSeed {
+            key: "G1".to_string(),
+            text: "ground every class against the transcript".to_string(),
+            context_id: None,
+        });
+        // Class 1: an ENTITY whose name is not in the transcript.
+        harvest.entities.push(EntitySeed {
+            key: "E_fab".to_string(),
+            name: Self::FAB_ENTITY.to_string(),
+            path: Self::FAB_ENTITY.to_string(),
+            entity_type: ExtractedEntityType::Service,
+            entity_type_raw: None,
+            context_id: None,
+        });
+        // Classes 2 + 3: a DECISION carrying a fabricated decision_type AND a fabricated agent_id.
+        harvest.decisions.push(DecisionSeed {
+            key: "D_fab".to_string(),
+            text: Self::FAB_DECISION_TYPE.to_string(),
+            goal_key: Some("G1".to_string()),
+            decision_type: Some(Self::FAB_DECISION_TYPE.to_string().into()),
+            agent_id: Some(Self::FAB_AGENT_ID.to_string()),
+            confidence: None,
+            ..Default::default()
+        });
+        // Class 4: an OBSERVATION value not in the transcript.
+        harvest.observations.push(ObservationSeed {
+            key: "Obs_fab".to_string(),
+            text: Self::FAB_OBSERVATION.to_string(),
+            entity_key: Some("E_fab".to_string()),
+            observation_type: Some("metric_anomaly".to_string()),
+            source: Some("agent-session".to_string()),
+            ..Default::default()
+        });
+        // Class 5: an OUTCOME value not in the transcript.
+        harvest.outcomes.push(OutcomeSeed {
+            key: "O_fab".to_string(),
+            of_decision_key: Some("D_fab".to_string()),
+            success: true,
+            notes: Self::FAB_OUTCOME.to_string(),
+            context_id: None,
+        });
+        harvest.summary = Some("five fabricated values across all classes".to_string());
+        Ok(harvest)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RawEntityTypeStringExtractor
+// ---------------------------------------------------------------------------
+/// Emits entities whose entity_type is the RAW MODEL STRING ("module", "repository") rather than
+/// a pre-typed `ExtractedEntityType` variant, so capture must resolve the string to the right
+/// `EntityType` variant through the live `entity_type_from_str` conversion. A real model emits
+/// strings, not Rust enum variants — this double exercises that path. It also emits one entity
+/// whose raw type string is NOT in the closed vocabulary, which capture must flag (out-of-vocab),
+/// never silently coerce. The raw strings ride a dedicated seed field (`entity_type_raw`); the
+/// values are faithful to what a model would emit, never a rigged answer-key.
+#[derive(Debug, Default)]
+pub struct RawEntityTypeStringExtractor;
+
+impl RawEntityTypeStringExtractor {
+    pub const MODULE_NAME: &'static str = "ingest-module";
+    pub const REPOSITORY_NAME: &'static str = "context-graph-repo";
+    pub const OUT_OF_VOCAB_NAME: &'static str = "mystery-thing";
+    pub const OUT_OF_VOCAB_TYPE: &'static str = "wormhole";
+}
+
+impl ConversationExtractor for RawEntityTypeStringExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        let mut harvest = StructuredHarvest::default();
+        harvest.goals.push(GoalSeed {
+            key: "G1".to_string(),
+            text: "resolve raw model entity-type strings".to_string(),
+            context_id: None,
+        });
+        harvest.entities = vec![
+            raw_type_entity("E_mod", Self::MODULE_NAME, "module"),
+            raw_type_entity("E_repo", Self::REPOSITORY_NAME, "repository"),
+            raw_type_entity("E_oov", Self::OUT_OF_VOCAB_NAME, Self::OUT_OF_VOCAB_TYPE),
+        ];
+        harvest.summary = Some("raw entity-type strings".to_string());
+        Ok(harvest)
+    }
+}
+
+/// Build an entity seed whose entity_type is carried as a RAW MODEL STRING (via `entity_type_raw`),
+/// not a pre-typed variant. The typed `entity_type` is left at its default; the raw string is the
+/// load-bearing field the capture path must route through `entity_type_from_str`.
+fn raw_type_entity(key: &str, name: &str, raw_type: &str) -> EntitySeed {
+    EntitySeed {
+        key: key.to_string(),
+        name: name.to_string(),
+        path: name.to_string(),
+        // Default typed variant; the RAW string is the source of truth for this double.
+        entity_type: ExtractedEntityType::default(),
+        entity_type_raw: Some(raw_type.to_string()),
+        context_id: None,
     }
 }
 
@@ -529,6 +660,7 @@ impl ConversationExtractor for MislabeledSpanExtractor {
             name: "the context-graph repo".to_string(),
             path: "context-graph".to_string(),
             entity_type: ExtractedEntityType::File, // Intentional mislabel for grounding test
+            entity_type_raw: None,
             context_id: None,
         });
         harvest.summary = Some("mislabeled span test".to_string());
@@ -560,6 +692,7 @@ impl ConversationExtractor for OutOfVocabExtractor {
             name: "mystery component".to_string(),
             path: "mystery".to_string(),
             entity_type: ExtractedEntityType::File, // placeholder for OOV type
+            entity_type_raw: None,
             context_id: None,
         });
         harvest.summary = Some("out-of-vocab test".to_string());
@@ -588,9 +721,102 @@ impl ConversationExtractor for AmbiguousSpanExtractor {
             name: "auth component".to_string(), // "component" is ambiguous: service or module?
             path: "auth".to_string(),
             entity_type: ExtractedEntityType::Service,
+            entity_type_raw: None,
             context_id: None,
         });
         harvest.summary = Some("ambiguous span test".to_string());
+        Ok(harvest)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capture-path closed-vocab DECISION_TYPE grounding doubles
+// ---------------------------------------------------------------------------
+// HEAD's capture grounding inspects entity name/type ONLY — it never grounds a decision's closed
+// `decision_type` value. These doubles emit a decision whose decision_type is mislabeled / out of
+// vocabulary / ambiguous (span present in the transcript, so the flag is driven by the label/vocab/
+// ambiguity check, not a missing span). A capture that grounds decision_type would flag them with
+// the specific reason; HEAD lets them through, so the capture-path arm fails (honest RED).
+
+/// Emits a decision whose `decision_type` span is present but does NOT support the chosen label.
+#[derive(Debug, Default)]
+pub struct MislabeledDecisionTypeExtractor;
+
+impl ConversationExtractor for MislabeledDecisionTypeExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        let mut harvest = StructuredHarvest::default();
+        harvest.goals.push(GoalSeed {
+            key: "G1".to_string(),
+            text: "ship the auth rewrite".to_string(),
+            context_id: None,
+        });
+        harvest.decisions.push(DecisionSeed {
+            key: "D1".to_string(),
+            text: "rewrite the authentication module".to_string(),
+            goal_key: Some("G1".to_string()),
+            // Span "rewrite the authentication module" supports an architecture/refactor decision,
+            // NOT the chosen closed label "security_policy" — a mislabeled closed-vocab value.
+            decision_type: Some("security_policy".to_string().into()),
+            agent_id: Some("eng".to_string()),
+            confidence: None,
+            ..Default::default()
+        });
+        harvest.summary = Some("mislabeled decision_type".to_string());
+        Ok(harvest)
+    }
+}
+
+/// Emits a decision whose `decision_type` is the reserved/out-of-vocab token.
+#[derive(Debug, Default)]
+pub struct OutOfVocabDecisionTypeExtractor;
+
+impl ConversationExtractor for OutOfVocabDecisionTypeExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        let mut harvest = StructuredHarvest::default();
+        harvest.goals.push(GoalSeed {
+            key: "G1".to_string(),
+            text: "decide the storage engine".to_string(),
+            context_id: None,
+        });
+        harvest.decisions.push(DecisionSeed {
+            key: "D1".to_string(),
+            text: "use the wibblefangle approach".to_string(),
+            goal_key: Some("G1".to_string()),
+            // Out-of-vocabulary closed decision_type token (the reserved "unknown" surrogate).
+            decision_type: Some("wibblefangle".to_string().into()),
+            agent_id: Some("eng".to_string()),
+            confidence: None,
+            ..Default::default()
+        });
+        harvest.summary = Some("out-of-vocab decision_type".to_string());
+        Ok(harvest)
+    }
+}
+
+/// Emits a decision whose `decision_type` span supports two closed labels equally (ambiguous).
+#[derive(Debug, Default)]
+pub struct AmbiguousDecisionTypeExtractor;
+
+impl ConversationExtractor for AmbiguousDecisionTypeExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        let mut harvest = StructuredHarvest::default();
+        harvest.goals.push(GoalSeed {
+            key: "G1".to_string(),
+            text: "tune the gateway".to_string(),
+            context_id: None,
+        });
+        harvest.decisions.push(DecisionSeed {
+            key: "D1".to_string(),
+            // "adjust the policy" is equally a security_policy and a monitoring_threshold change —
+            // ambiguous closed-vocab decision_type with no disambiguator in the chunk.
+            text: "adjust the policy".to_string(),
+            goal_key: Some("G1".to_string()),
+            decision_type: Some("policy".to_string().into()),
+            agent_id: Some("eng".to_string()),
+            confidence: None,
+            ..Default::default()
+        });
+        harvest.summary = Some("ambiguous decision_type".to_string());
         Ok(harvest)
     }
 }
@@ -677,10 +903,17 @@ pub struct CountingExtractor {
     inner: Box<dyn ConversationExtractor + Send + Sync>,
     /// Counts calls to `extract()` (Stage-1 model calls).
     extraction_call_count: Mutex<usize>,
-    /// Counts calls to `classify_decision_relation()` (Stage-3 judge calls).
+    /// Counts calls to `classify_decision_relation()` (Stage-3 decision-relation judge calls).
     judge_call_count: Mutex<usize>,
-    /// Records the candidate decision texts passed to each judge call, in call order.
-    /// Each inner Vec is the prior_decisions texts from one classify_decision_relation call.
+    /// Counts calls to the DEDICATED entity-identity judge seam (`classify_entity_identity`),
+    /// which is a distinct question from the decision-relation classifier. The strengthened
+    /// relevance-retrieval test asserts the entity-identity judge — NOT
+    /// `classify_decision_relation` — is the one consulted for a resolved entity, so this
+    /// counter must move while `judge_call_count` (decision-relation) stays 0.
+    entity_identity_call_count: Mutex<usize>,
+    /// Records the candidate texts passed to each judge call, in call order. Records candidate
+    /// sets from BOTH the decision-relation judge and the entity-identity judge, so a test can
+    /// assert the set contents (by identity) that the consulted judge actually received.
     received_candidate_sets: Mutex<Vec<Vec<String>>>,
 }
 
@@ -690,6 +923,7 @@ impl CountingExtractor {
             inner: Box::new(inner),
             extraction_call_count: Mutex::new(0),
             judge_call_count: Mutex::new(0),
+            entity_identity_call_count: Mutex::new(0),
             received_candidate_sets: Mutex::new(Vec::new()),
         }
     }
@@ -706,8 +940,13 @@ impl CountingExtractor {
         *self.judge_call_count.lock().unwrap()
     }
 
+    /// The number of calls to the dedicated entity-identity judge seam.
+    pub fn entity_identity_call_count(&self) -> usize {
+        *self.entity_identity_call_count.lock().unwrap()
+    }
+
     pub fn total_call_count(&self) -> usize {
-        self.extraction_call_count() + self.judge_call_count()
+        self.extraction_call_count() + self.judge_call_count() + self.entity_identity_call_count()
     }
 
     /// Returns the candidate decision texts passed to the judge across all calls, in order.
@@ -744,6 +983,30 @@ impl ConversationExtractor for CountingExtractor {
             .unwrap()
             .push(candidates);
         self.inner.classify_decision_relation(request)
+    }
+
+    fn classify_entity_identity(
+        &self,
+        request: context_graph::ingest::DecisionRelationRequest<'_>,
+    ) -> context_graph::Result<context_graph::ingest::EntityIdentityVerdict> {
+        // The dedicated entity-identity judge — counted separately from the decision-relation
+        // classifier. We record the candidate set this judge received and delegate to the inner
+        // double WITHOUT routing through `classify_decision_relation` (so the decision-relation
+        // counter stays 0 when only entity identity is asked).
+        *self.entity_identity_call_count.lock().unwrap() += 1;
+        let candidates: Vec<String> = request
+            .prior_decisions
+            .iter()
+            .map(|d| d.text.clone())
+            .collect();
+        self.received_candidate_sets
+            .lock()
+            .unwrap()
+            .push(candidates);
+        // Delegate to the inner extractor's entity-identity seam. SpanFaithfulExtractor's default
+        // returns Separate (an "unsure" entity-identity result), which is what a real model emits
+        // for two same-named entities with no disambiguator — never a rigged Same.
+        self.inner.classify_entity_identity(request)
     }
 }
 

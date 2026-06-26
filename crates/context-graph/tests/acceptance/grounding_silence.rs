@@ -1,13 +1,16 @@
 use context_graph::grounding::{
-    GroundingInput, GroundingVerdict, check_candidate_grounding, full_grounding_check,
+    FlagReason, GroundingInput, GroundingVerdict, check_candidate_grounding, full_grounding_check,
     legal_entity_type_names, should_flag, why_flagged_closed_vocab,
 };
+use std::collections::BTreeMap;
+
 use context_graph::ingest::CaptureRequest;
-use context_graph::{EntityType, Store, StoreConfig};
+use context_graph::{CreateEntity, EntityType, Store, StoreConfig};
 
 use super::fake_extractor::open_store_with_lexical_embedder;
 use super::refactor_extractor::{
-    AmbiguousSpanExtractor, HighConfidenceFabricatedSpanExtractor, MislabeledSpanExtractor,
+    AmbiguousDecisionTypeExtractor, AmbiguousSpanExtractor, FiveFabricatedValuesExtractor,
+    MislabeledDecisionTypeExtractor, MislabeledSpanExtractor, OutOfVocabDecisionTypeExtractor,
     OutOfVocabExtractor, SpanFaithfulExtractor,
 };
 
@@ -92,34 +95,73 @@ fn every_extracted_value_with_a_supporting_span_present_and_aligned_is_not_flagg
     );
 }
 
-// A value whose cited span is absent from the chunk is flagged.
-// The placeholder uses a confidence threshold — this value with missing span and high
-// confidence incorrectly passes through.
+// A value whose supporting span is absent from the chunk is flagged — across EVERY extracted
+// value class (entity, decision_type, agent_id, observation value, outcome value), not entities
+// only. Today grounding is entity-only (`grounding_check_entities` iterates harvest.entities and
+// nothing else), so a grounding check that inspects only entity spans flags the entity but lets
+// the decision_type / agent_id / observation / outcome through.
+//
+// The double emits, in ONE harvest, five fabricated values — one per class — none of which appear
+// in the transcript. The strengthened contract: ALL FIVE must be flagged. The current entity-only
+// grounding flags only the entity → the four non-entity assertions fail (RED on assertion).
 #[test]
 fn value_with_missing_span_is_flagged() {
     let (_dir, store) = fresh_store();
 
-    // Transcript that does NOT contain "kubernetes cluster".
-    let transcript = "Goal G1: test fabricated span detection.";
+    // A transcript that contains NONE of the five fabricated phrases.
+    let transcript = "the team discussed routine maintenance and nothing else of note today";
 
     let report = capture_with(
         &store,
-        "missing-span-context",
+        "missing-span-all-classes-context",
         transcript,
-        &HighConfidenceFabricatedSpanExtractor,
+        &FiveFabricatedValuesExtractor,
     );
 
-    // Assert via the report's flagged_items.
+    // Each of the five fabricated values must appear in the unsure (flagged) block, identified by
+    // its own value text. The entity arm passes on the current impl; the other four are RED.
+    let flagged = |needle: &str| {
+        report
+            .flagged_items
+            .iter()
+            .any(|f| f.reason.contains(needle))
+    };
+
     assert!(
-        !report.flagged_items.is_empty(),
-        "flagged_items must be non-empty when span is absent from transcript"
+        flagged(FiveFabricatedValuesExtractor::FAB_ENTITY),
+        "the fabricated ENTITY must be flagged (span absent); flagged_items: {:?}",
+        report.flagged_items
+    );
+    assert!(
+        flagged(FiveFabricatedValuesExtractor::FAB_DECISION_TYPE),
+        "the fabricated DECISION_TYPE must be flagged (span absent); grounding must reach the \
+         decision_type class, not entities only; flagged_items: {:?}",
+        report.flagged_items
+    );
+    assert!(
+        flagged(FiveFabricatedValuesExtractor::FAB_AGENT_ID),
+        "the fabricated AGENT_ID must be flagged (span absent); grounding must reach the agent_id \
+         class; flagged_items: {:?}",
+        report.flagged_items
+    );
+    assert!(
+        flagged(FiveFabricatedValuesExtractor::FAB_OBSERVATION),
+        "the fabricated OBSERVATION value must be flagged (span absent); grounding must reach the \
+         observation class; flagged_items: {:?}",
+        report.flagged_items
+    );
+    assert!(
+        flagged(FiveFabricatedValuesExtractor::FAB_OUTCOME),
+        "the fabricated OUTCOME value must be flagged (span absent); grounding must reach the \
+         outcome class; flagged_items: {:?}",
+        report.flagged_items
     );
 
-    // Also assert directly via the grounding predicate.
+    // Direct predicate check stays: missing cited_span flags regardless of confidence.
     let missing_span = GroundingInput {
         value: "kubernetes cluster".to_string(),
         cited_span: None, // absent
-        chunk: "Goal G1: test fabricated span detection.".to_string(),
+        chunk: transcript.to_string(),
         model_confidence: 0.99,
         vocab: None,
         label: None,
@@ -183,15 +225,17 @@ fn span_present_but_not_supporting_chosen_label_is_flagged() {
         competing_labels: vec!["Repository".to_string()], // span actually supports Repository
     };
 
-    // full_grounding_check must flag this as SpanDoesNotSupportLabel.
+    // full_grounding_check must flag this with the SPECIFIC mislabel reason — not merely "not
+    // Grounded". A stub that flags for the wrong reason (e.g. MissingSpan) fails this.
     let verdict = full_grounding_check(&mislabeled);
-    assert_ne!(
+    assert_eq!(
         verdict,
-        GroundingVerdict::Grounded,
-        "mislabeled span (span supports Repository, chosen label File) must be flagged"
+        GroundingVerdict::Flagged(FlagReason::SpanDoesNotSupportLabel),
+        "a present span that supports Repository but is labeled File must flag specifically as \
+         SpanDoesNotSupportLabel; got {verdict:?}"
     );
 
-    // Also test via the capture path with MislabeledSpanExtractor.
+    // Also test via the capture path with MislabeledSpanExtractor (entity arm).
     let (_dir, store) = fresh_store();
     let report = capture_with(
         &store,
@@ -202,6 +246,28 @@ fn span_present_but_not_supporting_chosen_label_is_flagged() {
     assert!(
         !report.flagged_items.is_empty(),
         "mislabeled entity span must appear in flagged_items"
+    );
+
+    // CAPTURE-PATH arm (RED): grounding must reach the closed-vocab DECISION_TYPE, not entities
+    // only. A decision whose decision_type span is present but does not support the chosen label
+    // must be flagged with the SPECIFIC SpanDoesNotSupportLabel reason. HEAD's capture grounding is
+    // entity-only, so the decision_type flag is absent → this fails.
+    let (_dir2, store2) = fresh_store();
+    let report2 = capture_with(
+        &store2,
+        "mislabel-decision-context",
+        "we will rewrite the authentication module to ship the auth rewrite",
+        &MislabeledDecisionTypeExtractor,
+    );
+    assert!(
+        report2.flagged_items.iter().any(|f| {
+            f.reason.contains("SpanDoesNotSupportLabel")
+                && (f.reason.contains("security_policy")
+                    || f.reason.contains("authentication module"))
+        }),
+        "the mislabeled DECISION_TYPE must be flagged with the SpanDoesNotSupportLabel reason via \
+         capture; HEAD's entity-only grounding lets it through. flagged_items: {:?}",
+        report2.flagged_items
     );
 }
 
@@ -226,10 +292,31 @@ fn out_of_vocab_or_unknown_closed_field_is_flagged() {
     };
 
     let verdict = full_grounding_check(&out_of_vocab);
-    assert_ne!(
+    assert_eq!(
         verdict,
-        GroundingVerdict::Grounded,
-        "out-of-vocab entity_type='unknown' must be flagged even at high confidence; placeholder returns Grounded"
+        GroundingVerdict::Flagged(FlagReason::OutOfVocab),
+        "an out-of-vocab closed field ('unknown') must flag specifically as OutOfVocab even at high \
+         confidence; got {verdict:?}"
+    );
+
+    // CAPTURE-PATH arm (RED): an out-of-vocab closed-vocab DECISION_TYPE with a present span must be
+    // flagged with the SPECIFIC OutOfVocab reason via capture. HEAD's entity-only grounding lets the
+    // decision_type through → this fails.
+    let (_dir, store) = fresh_store();
+    let report = capture_with(
+        &store,
+        "oov-decision-context",
+        "we use the wibblefangle approach to decide the storage engine",
+        &OutOfVocabDecisionTypeExtractor,
+    );
+    assert!(
+        report.flagged_items.iter().any(|f| {
+            f.reason.contains("OutOfVocab")
+                && (f.reason.contains("wibblefangle") || f.reason.contains("storage engine"))
+        }),
+        "the out-of-vocab DECISION_TYPE must be flagged with the OutOfVocab reason via capture; \
+         HEAD's entity-only grounding lets it through. flagged_items: {:?}",
+        report.flagged_items
     );
 }
 
@@ -249,13 +336,14 @@ fn ambiguous_span_supporting_two_labels_equally_is_flagged() {
     };
 
     let verdict = full_grounding_check(&ambiguous);
-    assert_ne!(
+    assert_eq!(
         verdict,
-        GroundingVerdict::Grounded,
-        "ambiguous span must be flagged when two competing labels score equally"
+        GroundingVerdict::Flagged(FlagReason::AmbiguousSpan),
+        "a span supporting two competing labels equally must flag specifically as AmbiguousSpan; \
+         got {verdict:?}"
     );
 
-    // Also via capture path.
+    // Also via capture path (entity arm).
     let (_dir, store) = fresh_store();
     let report = capture_with(
         &store,
@@ -267,72 +355,162 @@ fn ambiguous_span_supporting_two_labels_equally_is_flagged() {
         !report.flagged_items.is_empty(),
         "ambiguous entity span must appear in flagged_items"
     );
+
+    // CAPTURE-PATH arm (RED): an ambiguous closed-vocab DECISION_TYPE (span supports two labels
+    // equally) must be flagged with the SPECIFIC AmbiguousSpan reason via capture. HEAD's entity-only
+    // grounding lets the decision_type through → this fails.
+    let (_dir2, store2) = fresh_store();
+    let report2 = capture_with(
+        &store2,
+        "ambiguous-decision-context",
+        "we will adjust the policy to tune the gateway",
+        &AmbiguousDecisionTypeExtractor,
+    );
+    assert!(
+        report2.flagged_items.iter().any(|f| {
+            f.reason.contains("AmbiguousSpan")
+                && (f.reason.contains("policy") || f.reason.contains("adjust the policy"))
+        }),
+        "the ambiguous DECISION_TYPE must be flagged with the AmbiguousSpan reason via capture; \
+         HEAD's entity-only grounding lets it through. flagged_items: {:?}",
+        report2.flagged_items
+    );
 }
 
-// A flagged closed-vocab item exposes the legal type list via legal_entity_type_names().
-// The placeholder returns empty — the real implementation returns all 13 names.
+// A flagged closed-vocab item surfaces its LEGAL value set THROUGH the flagged item — the path
+// resolves the item, finds its closed field, and reads the legal set from the single vocabulary
+// source — NOT a direct constant lookup that returns EntityType::ALL regardless of any item. The
+// load-bearing arm: `cg why` on a NON-flagged / fully-grounded item must NOT return a closed-vocab
+// legal list, so a stub that always returns the constant list fails.
+//
+// SCAFFOLD STUB the test fails on: legal_types_for_flagged_item ignores the item and returns the
+// constant list for ANY id (even a non-flagged one), so the non-flagged arm (expecting None) fails.
 #[test]
 fn flagged_closed_vocab_item_exposes_legal_type_list_via_cg_why() {
-    // why_flagged_closed_vocab must return the full legal vocab for a flagged entity_type.
-    let legal_types = why_flagged_closed_vocab("unknown");
-
-    assert!(
-        !legal_types.is_empty(),
-        "why_flagged_closed_vocab must return the legal entity type list, not empty"
+    // Capture so a real out-of-vocab entity_type is FLAGGED in the store (a real unsure item).
+    let (_dir, store) = fresh_store();
+    let report = capture_with(
+        &store,
+        "why-flagged-context",
+        "mystery component handles routing",
+        &OutOfVocabExtractor,
     );
+    assert!(
+        !report.flagged_items.is_empty(),
+        "the OutOfVocabExtractor capture must produce a flagged item to reach `cg why` against"
+    );
+    let flagged_item_id = &report.flagged_items[0].key;
+
+    // `cg why` on the FLAGGED closed-vocab item must enumerate the legal EntityType vocabulary. The
+    // path takes only the store + item id and must DERIVE flagged-ness + the closed field from the
+    // resolved item (a stub that never reads the store cannot tell flagged from non-flagged).
+    let legal = context_graph::grounding::legal_types_for_flagged_item(&store, flagged_item_id);
+    let legal_types = legal.expect("a flagged closed-vocab item must expose its legal vocabulary");
     assert_eq!(
         legal_types.len(),
         13,
-        "legal entity type list must contain all 13 variants, got: {:?}",
+        "the legal entity type list reached through the flagged item must contain all 13 variants, got: {:?}",
         legal_types
     );
-
-    // Also directly via legal_entity_type_names().
-    let names = legal_entity_type_names();
-    assert_eq!(
-        names.len(),
-        13,
-        "legal_entity_type_names must return 13 names, got: {:?}",
-        names
-    );
-
-    // Each EntityType variant must appear in the list.
     for variant in EntityType::ALL.iter() {
         let variant_name = format!("{:?}", variant);
         assert!(
-            names.iter().any(|n| n.eq_ignore_ascii_case(&variant_name)),
-            "EntityType::{} must appear in legal_entity_type_names()",
+            legal_types
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&variant_name)),
+            "EntityType::{} must appear in the legal list reached through the flagged item",
             variant_name
         );
     }
+
+    // BY-ID, NOT TOKEN-OVERLAP. Seed a stored entity whose NAME shares a ≥3-char token with a
+    // NON-flagged probe id: a stored entity named "store" shares the "store" token with the probe id
+    // "no-such-item-in-store". A correct lookup resolves the item BY ID (the probe id is not a real
+    // flagged closed-vocab item) and returns None; a token-overlap heuristic resolves it because the
+    // stored entity name shares a token and wrongly returns the legal list → RED today.
+    let why_ctx = store
+        .list_contexts()
+        .expect("list contexts")
+        .into_iter()
+        .find(|c| c.name == "why-flagged-context")
+        .map(|c| c.id)
+        .expect("why-flagged-context exists");
+    store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::Repository,
+            name: "store".to_string(),
+            properties: BTreeMap::new(),
+            tags: Vec::new(),
+            context_id: why_ctx,
+        })
+        .expect("seed a stored entity named 'store'");
+    let token_overlap_probe = "no-such-item-in-store";
+    let non_flagged =
+        context_graph::grounding::legal_types_for_flagged_item(&store, token_overlap_probe);
+    assert_eq!(
+        non_flagged, None,
+        "`cg why` on a NON-flagged item ('{token_overlap_probe}') must return None even when a stored \
+         entity name ('store') shares a token with the id — resolution must be BY ID, not token \
+         overlap; the token-overlap heuristic wrongly returns the legal list and FAILS here"
+    );
+
+    // A genuinely-flagged closed-vocab item still resolves (by its own id) — the flagged arm above
+    // already exercised this; re-confirm it is not the all-None failure mode.
+    assert!(
+        context_graph::grounding::legal_types_for_flagged_item(&store, flagged_item_id).is_some(),
+        "a genuinely-flagged closed-vocab item must still resolve to its legal list by id"
+    );
+
+    // The single vocabulary source must itself enumerate 13 (kept as a sanity check on the source).
+    assert_eq!(legal_entity_type_names().len(), 13);
+    let _ = why_flagged_closed_vocab; // retained import; the item-keyed path is the contract now
 }
 
-// When Stage-3 resolution has an empty candidate set, the item is flagged.
-// The placeholder check_candidate_grounding returns Grounded even on empty candidates.
+// When Stage-3 resolution has an empty candidate set for a value that needed one, it is flagged
+// with the SPECIFIC empty-candidate reason — distinct from a span/vocab failure. The placeholder
+// check_candidate_grounding returns Grounded even on empty candidates.
 #[test]
 fn empty_candidate_set_at_resolution_is_flagged() {
-    // Direct predicate check: empty candidates → must be flagged.
-    let verdict = check_candidate_grounding(&[]);
-    assert_ne!(
-        verdict,
-        GroundingVerdict::Grounded,
-        "check_candidate_grounding([]) must return Flagged, not Grounded"
+    // The empty-candidate path specifically: an empty candidate set must flag as EmptyCandidateSet,
+    // not merely "not Grounded" and not some unrelated span reason.
+    let empty_verdict = check_candidate_grounding(&[]);
+    assert_eq!(
+        empty_verdict,
+        GroundingVerdict::Flagged(FlagReason::EmptyCandidateSet),
+        "an empty candidate set at resolution must flag specifically as EmptyCandidateSet; \
+         got {empty_verdict:?}"
     );
 
-    // Also via capture path with a fresh store so resolution candidates are empty.
+    // Contrast (proves the predicate exercises the candidate-set path, not a constant): a NON-empty
+    // candidate set is Grounded. A stub that ignores the candidates (always Grounded, or always
+    // Flagged) fails one of these two arms.
+    let non_empty_verdict = check_candidate_grounding(&["context-graph".to_string()]);
+    assert_eq!(
+        non_empty_verdict,
+        GroundingVerdict::Grounded,
+        "a non-empty candidate set must be Grounded (the empty-set flag is specific to no candidates); \
+         got {non_empty_verdict:?}"
+    );
+
+    // CAPTURE-PATH arm (RED): the LIVE capture path must drive Stage-3 resolution for a value that
+    // needs a candidate and, finding ZERO in the store, flag it with the empty-candidate reason —
+    // never silently mint-as-resolved. HEAD's Stage-3 silently treats a zero-candidate decision as a
+    // new insertion and flags nothing → this fails.
     let (_dir, store) = fresh_store();
-    let transcript = "Goal G1: test empty candidate resolution. \
-        Entity E1: mystery component type=unknown.";
     let report = capture_with(
         &store,
-        "empty-candidates-context",
-        transcript,
-        &OutOfVocabExtractor,
+        "empty-candidate-context",
+        "Goal G1: choose the cache layer\nDecision D1: adopt the redis cache serves G1",
+        &SpanFaithfulExtractor,
     );
-    // With an empty/unresolvable value, the item must appear in flagged_items.
     assert!(
-        !report.flagged_items.is_empty(),
-        "empty candidate set at resolution must produce a flagged item"
+        report
+            .flagged_items
+            .iter()
+            .any(|f| f.reason.contains("EmptyCandidateSet")),
+        "a Stage-3 resolution with ZERO candidates must land in report.flagged_items with the \
+         EmptyCandidateSet reason; HEAD silently mints-as-resolved and flags nothing. flagged_items: {:?}",
+        report.flagged_items
     );
 }
 

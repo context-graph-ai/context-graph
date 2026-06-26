@@ -96,7 +96,7 @@ pub struct HeldOutResult {
 }
 
 /// Result of a skill promotion attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PromotionResult {
     /// Whether the promotion succeeded (held-out gate was beaten, not just tied).
     pub promoted: bool,
@@ -104,6 +104,11 @@ pub struct PromotionResult {
     pub skill: Option<LearnedSkill>,
     /// The score achieved on the held-out set (for testing tie detection).
     pub heldout_score: f64,
+    /// How many times the held-out gate was evaluated to reach this verdict. A correct promotion
+    /// path measures generalization on the held-out slice, so this is > 0 on the learned path; a
+    /// stub that judges on training fit (never touching the held-out slice) leaves it 0. Plain
+    /// count on the result — no app-side global/atomic in `src/`.
+    pub heldout_gate_invocations: usize,
 }
 
 /// A parse-only result for a human-authored skill file.
@@ -810,6 +815,7 @@ pub fn try_promote_skill_with_result(
             promoted: false,
             skill: None,
             heldout_score: 0.0,
+            heldout_gate_invocations: 0,
         };
     }
 
@@ -836,6 +842,8 @@ pub fn try_promote_skill_with_result(
     // but fails on unseen events scores LOWER than a general rule that captures the
     // real pattern.
     let candidate_score = evaluate_on_heldout(&candidate, heldout).score;
+    // This path evaluated the held-out gate exactly once to reach its verdict.
+    let heldout_gate_invocations = 1;
 
     // The minimum promotion threshold when no incumbent exists.
     // Derives from the data: the rule must correctly predict more than half of
@@ -850,6 +858,7 @@ pub fn try_promote_skill_with_result(
             promoted: false,
             skill: None,
             heldout_score: candidate_score,
+            heldout_gate_invocations,
         };
     }
 
@@ -857,6 +866,54 @@ pub fn try_promote_skill_with_result(
         promoted: true,
         skill: Some(candidate),
         heldout_score: candidate_score,
+        heldout_gate_invocations,
+    }
+}
+
+/// Promote a candidate while counting held-out gate invocations, so a test can prove the verdict
+/// came from the HELD-OUT slice (the gate ran) rather than training fit. The held-out gate is the
+/// generalization discriminator: an overfit rule that fits its training labels but fails a disjoint
+/// held-out slice must NOT promote, while a general rule that holds on the held-out slice must.
+///
+/// `gate_invocations` is incremented once per held-out evaluation.
+///
+/// SCAFFOLD STUB (deliberately wrong): this judges on TRAINING fit and NEVER runs the held-out gate
+/// (the counter stays 0), so an overfit candidate is promoted and a general candidate is treated no
+/// differently — the Surface-F overfit test fails on both the "overfit not promoted" and the
+/// "gate was invoked" assertions.
+pub fn try_promote_skill_with_gate_counter(
+    training: &[TeachingEvent],
+    _heldout: &[TeachingEvent],
+) -> PromotionResult {
+    // Wrong: never touches the held-out slice (so `heldout_gate_invocations` stays 0) and "promotes"
+    // on the bare presence of more than one training label — i.e. on training fit, not
+    // generalization. The count rides the returned PromotionResult as a plain `usize`; there is no
+    // app-side global/atomic in `src/`.
+    if training.len() <= 1 {
+        return PromotionResult {
+            promoted: false,
+            skill: None,
+            heldout_score: 0.0,
+            heldout_gate_invocations: 0,
+        };
+    }
+    let description = derive_description_from_labels(training);
+    let rule = derive_rule_from_labels(training);
+    let provenance = provenance_from_labels(training);
+    PromotionResult {
+        promoted: true, // wrong: promotes regardless of held-out generalization
+        skill: Some(LearnedSkill {
+            id: uuid::Uuid::new_v4().to_string(),
+            description,
+            rule,
+            provenance,
+            active: true,
+            held_for_review: false,
+            fire_right: 0,
+            fire_wrong: 0,
+        }),
+        heldout_score: 1.0,          // wrong: not measured on held-out
+        heldout_gate_invocations: 0, // wrong: the held-out gate was never evaluated
     }
 }
 

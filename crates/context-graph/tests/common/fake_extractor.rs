@@ -152,6 +152,7 @@ fn entity_seed(key: String, text: String) -> EntitySeed {
         name,
         path: path.clone(),
         entity_type: extracted_type_for_path(&path),
+        entity_type_raw: None,
         context_id: None,
     }
 }
@@ -259,6 +260,7 @@ fn infer_auth_entity(harvest: &mut StructuredHarvest) {
             name: "auth module file".to_string(),
             path: "src/auth.py".to_string(),
             entity_type: ExtractedEntityType::File,
+            entity_type_raw: None,
             context_id: None,
         });
     }
@@ -285,6 +287,7 @@ fn infer_redis_entity(harvest: &mut StructuredHarvest) {
             name: "redis config".to_string(),
             path: "config/redis.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            entity_type_raw: None,
             context_id: None,
         });
     }

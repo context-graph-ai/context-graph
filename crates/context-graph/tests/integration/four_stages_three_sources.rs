@@ -138,6 +138,39 @@ fn stage2_structural_fill_uses_no_model_and_mints_id_status_created_at_embedding
          wrong stub always returns stage2_model_calls=1"
     );
 
+    // CROSS-CHECK the self-reported field against the ACTUAL spy counters (an impl that calls the
+    // model during stage 2 but reports 0 must still fail). In a fresh store with a single-chunk
+    // transcript, the only legitimate model call is the ONE Stage-1 extraction: there are no prior
+    // candidates, so no Stage-3 decision-relation or entity-identity judge fires. Therefore the spy's
+    // total model calls must equal its extraction calls, and that must be exactly 1 — leaving zero
+    // for stage 2.
+    assert_eq!(
+        counter.extraction_call_count(),
+        1,
+        "exactly one Stage-1 extraction call for a single-chunk capture; got {}",
+        counter.extraction_call_count()
+    );
+    assert_eq!(
+        counter.judge_call_count(),
+        0,
+        "no decision-relation judge call in a fresh store; got {}",
+        counter.judge_call_count()
+    );
+    assert_eq!(
+        counter.entity_identity_call_count(),
+        0,
+        "no entity-identity judge call in a fresh store; got {}",
+        counter.entity_identity_call_count()
+    );
+    assert_eq!(
+        counter.total_call_count(),
+        counter.extraction_call_count(),
+        "the actual observed model-call total ({}) must equal the extraction calls ({}) — stage 2 \
+         must add ZERO real model calls regardless of what stage2_model_calls self-reports",
+        counter.total_call_count(),
+        counter.extraction_call_count()
+    );
+
     // The stored entity must carry a valid (non-nil) context_id (structural fill populated it).
     let context_id = context_id_by_name(&store, "stage2-context");
     let entities = store
@@ -1012,5 +1045,91 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
         d4_stored.status,
         DecisionStatus::Active,
         "conflicting decision must be Active (no auto-resolution); wrong stub"
+    );
+
+    // --- Duplicate: an exact-duplicate decision reuses/links the prior — NO second decision row. ---
+    // Count the decisions before the duplicate capture, then capture an exact-duplicate of an
+    // existing decision text and assert the decision-row count did NOT grow (the duplicate is
+    // linked to the prior, not stored as a new row).
+    let decisions_before_dup = store
+        .by_intention(
+            intention_id,
+            DiscoveryFilter {
+                include_decision_statuses: Some(DecisionStatus::ALL.to_vec()),
+                ..Default::default()
+            },
+        )
+        .expect("all decisions before duplicate")
+        .len();
+
+    let ext_duplicate = DecisionRelationExtractor {
+        relation: DecisionRelationClassification::ExactDuplicate,
+        ..Default::default()
+    };
+    let (dup_rep, dup_harness) = run_capture(
+        &store,
+        request(
+            "relation-context",
+            // Re-state d4's decision text verbatim — an exact duplicate of an existing decision.
+            "Goal G1: decision relation test\nDecision D5: use SQLite instead serves G1",
+        ),
+        &ext_duplicate,
+        &default_config(),
+    )
+    .expect("duplicate capture");
+
+    let decisions_after_dup = store
+        .by_intention(
+            intention_id,
+            DiscoveryFilter {
+                include_decision_statuses: Some(DecisionStatus::ALL.to_vec()),
+                ..Default::default()
+            },
+        )
+        .expect("all decisions after duplicate")
+        .len();
+    assert_eq!(
+        decisions_after_dup, decisions_before_dup,
+        "an exact-duplicate decision must NOT add a second decision row — it reuses/links the prior; \
+         a stub that collapses all relations to `new` (or stores a fresh row) grows the count"
+    );
+
+    // LINK assertion (like the supersedes/refines arms): the duplicate must reuse the SPECIFIC prior
+    // decision — the captured D5 must resolve to d4's id, not a fresh decision. The stable_ids map
+    // carries the id the duplicate's key (D5) resolved to; it must equal d4 (the conflicting prior
+    // whose text "use SQLite instead" the duplicate restated). A stub that mints a fresh row gives a
+    // different id and fails.
+    let d5_resolved_id = dup_rep
+        .stable_ids
+        .get("D5")
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .map(context_graph::DecisionId::from)
+        .expect("D5 must appear in stable_ids after the duplicate capture");
+    assert_eq!(
+        d5_resolved_id, d4_id,
+        "an exact-duplicate decision must reuse the SPECIFIC prior decision's id (d4), not mint a new \
+         one; D5 resolved to {d5_resolved_id:?} but the matched prior is d4 {d4_id:?}"
+    );
+    // And no new row was added under that id (the reused decision still exists, unchanged status).
+    let reused = store
+        .get_decision(d5_resolved_id)
+        .expect("get reused decision")
+        .expect("the reused prior decision must still exist");
+    assert_eq!(
+        reused.status,
+        DecisionStatus::Active,
+        "the reused prior decision must remain Active after an exact-duplicate capture"
+    );
+
+    // The harness must report the duplicate relation for the duplicate capture.
+    let dup_relations: Vec<_> = dup_harness
+        .stage3_resolution_verdicts
+        .iter()
+        .filter(|v| v.kind == ResolutionKind::Decision)
+        .filter_map(|v| v.decision_relation.clone())
+        .collect();
+    assert!(
+        dup_relations.contains(&DecisionRelation::Duplicate),
+        "duplicate capture must report DecisionRelation::Duplicate; got {dup_relations:?}"
     );
 }

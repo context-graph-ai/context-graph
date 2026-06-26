@@ -282,6 +282,58 @@ fn skill_fires_on_two_captures_with_opposite_correct_labels_attributes_one_right
         wrong_after_swap, 1,
         "after swap, P (now wrong) must be the only wrong trace; got {wrong_after_swap}"
     );
+
+    // ORDER-INDEPENDENCE: the per-firing attribution must be by FIRING IDENTITY, not insertion
+    // position. Run the SAME ground truth (P correct, Q wrong) but record the labels in the OTHER
+    // order (Q-then-P) on a fresh store; the attribution must be identical, so a stub that infers
+    // right/wrong from insertion position (e.g. "first labeled is right") fails this ordering.
+    let (_dir2, store2) = fresh_store();
+    insert_skill(&store2, "sk-attr", "human-correction");
+    insert_firing_trace(&store2, firing_p_id, "sk-attr", "cap-p", None);
+    insert_firing_trace(&store2, firing_q_id, "sk-attr", "cap-q", None);
+    // Label Q FIRST (wrong), then P (correct) — opposite recording order, same ground truth.
+    record_firing_label(&store2, firing_q_id, false);
+    record_firing_label(&store2, firing_p_id, true);
+
+    // P must still be the right firing and Q the wrong one — by identity, regardless of order.
+    let p_correct = matches!(count_trace_correct_value(&store2, firing_p_id), Some(true));
+    let q_wrong = matches!(count_trace_correct_value(&store2, firing_q_id), Some(false));
+    assert!(
+        p_correct,
+        "P must be attributed RIGHT by firing identity regardless of recording order (Q-then-P)"
+    );
+    assert!(
+        q_wrong,
+        "Q must be attributed WRONG by firing identity regardless of recording order (Q-then-P)"
+    );
+    assert_eq!(
+        count_trace_with_correct(&store2, "sk-attr", Some(true)),
+        1,
+        "exactly one right trace in the reversed-order run"
+    );
+    assert_eq!(
+        count_trace_with_correct(&store2, "sk-attr", Some(false)),
+        1,
+        "exactly one wrong trace in the reversed-order run"
+    );
+}
+
+/// Read the `correct` value of a specific firing trace row by its id.
+fn count_trace_correct_value(store: &Store, firing_id: &str) -> Option<bool> {
+    let db = store.sync_database();
+    let snapshot = db.snapshot();
+    db.point_lookup(
+        "cg_skill_firing_trace",
+        "id",
+        &DbValue::Text(firing_id.to_string()),
+        snapshot,
+    )
+    .expect("trace point lookup")
+    .and_then(|row| match row.values.get("correct") {
+        Some(DbValue::Int64(1)) => Some(true),
+        Some(DbValue::Int64(0)) => Some(false),
+        _ => None,
+    })
 }
 
 // Test 3 (store-state): placeholder check_drift returns None, list_drift_alerts returns
@@ -466,5 +518,90 @@ fn drift_alert_never_auto_disables_the_skill() {
     assert!(
         !is_active_after,
         "only an explicit undo must disable the skill"
+    );
+}
+
+/// Insert an active, matching learned skill with a controllable description (test seeding).
+fn insert_matching_skill(store: &Store, id: &str, description: &str) {
+    let db = store.sync_database();
+    db.execute(
+        "INSERT INTO cg_learned_skills (id, description, rule, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Text(id.to_string())),
+            ("description".to_string(), DbValue::Text(description.to_string())),
+            ("rule".to_string(), DbValue::Text(format!("rule {id}"))),
+            ("provenance".to_string(), DbValue::Text("human-correction".to_string())),
+            ("active".to_string(), DbValue::Bool(true)),
+            ("held_for_review".to_string(), DbValue::Bool(false)),
+            ("fire_right".to_string(), DbValue::Int64(0)),
+            ("fire_wrong".to_string(), DbValue::Int64(0)),
+            ("created_at".to_string(), DbValue::TxId(TxId(1))),
+        ]),
+    )
+    .expect("insert matching skill");
+}
+
+// NEW (Surface H): drift's real input is capture-recorded firings. When a promoted skill applies
+// during a REAL capture, a `cg_skill_firing_trace` row must be recorded for that skill+capture (on
+// the capture path, not hand-inserted); a later wrong-label correction then makes `list_drift_alerts`
+// — reading the CAPTURE-produced traces — surface it. HEAD's run_capture applies no skills and
+// records no firing → both arms fail (honest RED).
+#[test]
+fn skill_application_records_a_firing_trace_on_the_capture_path() {
+    use context_graph::harness::{CaptureHarnessConfig, run_capture};
+    use context_graph::ingest::CaptureRequest;
+    use context_graph::skill_store::record_firing_label;
+
+    let (_dir, store) = fresh_store();
+
+    // Promote a matching skill (its description matches the captured chunk).
+    insert_matching_skill(
+        &store,
+        "sk-fires",
+        "retype a context-graph file entity to a repository",
+    );
+
+    // Run a REAL capture in which the skill applies.
+    let (_report, harness_report) = run_capture(
+        &store,
+        CaptureRequest {
+            context_label: "drift-firing-ctx".to_string(),
+            transcript:
+                "Goal G1: remember the project\nEntity E1: context-graph type=file\nDecision D1: keep one repo serves G1"
+                    .to_string(),
+            model_available: true,
+        },
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("capture where the skill applies");
+
+    // The skill must be reported applied AND a firing trace recorded ON THE CAPTURE PATH for it.
+    assert!(
+        harness_report
+            .applied_skill_ids
+            .iter()
+            .any(|id| id == "sk-fires"),
+        "the matching skill must apply on the live capture; HEAD applies no skills (applied={:?})",
+        harness_report.applied_skill_ids
+    );
+    let traces = load_traces_for_skill(&store, "sk-fires");
+    assert!(
+        !traces.is_empty(),
+        "a cg_skill_firing_trace row must be recorded on the capture path for the applied skill; \
+         HEAD's run_capture records none (it sets applied_skill_ids but never records a firing)"
+    );
+
+    // A wrong-label correction against that capture-produced firing must let drift surface it.
+    let firing = &traces[0];
+    record_firing_label(&store, &firing.id, false);
+    record_firing_label(&store, &firing.id, false);
+    record_firing_label(&store, &firing.id, false);
+    let alerts = list_drift_alerts(&store);
+    assert!(
+        alerts.iter().any(|a| a.skill_id == "sk-fires"),
+        "after wrong-label corrections on the CAPTURE-produced firing, list_drift_alerts must \
+         surface the skill — drift's real input is capture-recorded firings; got {:?}",
+        alerts.iter().map(|a| &a.skill_id).collect::<Vec<_>>()
     );
 }
