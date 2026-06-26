@@ -204,6 +204,7 @@ fn structured_capture_dedups_duplicate_text_seeds_inside_one_harvest() {
                 name: "duplicate config".to_string(),
                 path: "config/duplicate.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![
@@ -569,6 +570,7 @@ fn model_relation_conflict_routes_negation_to_invalidation() {
                 name: "release target".to_string(),
                 path: "deployment target".to_string(),
                 entity_type: ExtractedEntityType::Service,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -604,6 +606,7 @@ fn model_relation_conflict_routes_negation_to_invalidation() {
                 name: "release target".to_string(),
                 path: "deployment target".to_string(),
                 entity_type: ExtractedEntityType::Service,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -674,6 +677,7 @@ fn model_relation_duplicate_routes_byte_disjoint_paraphrase_to_prior_row() {
                 name: "authentication module".to_string(),
                 path: "src/auth.py".to_string(),
                 entity_type: ExtractedEntityType::File,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -709,6 +713,7 @@ fn model_relation_duplicate_routes_byte_disjoint_paraphrase_to_prior_row() {
                 name: "authentication module".to_string(),
                 path: "src/auth.py".to_string(),
                 entity_type: ExtractedEntityType::File,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -774,6 +779,7 @@ fn duplicate_relation_to_invalidated_prior_writes_current_replacement() {
                 name: "rate-limiter config".to_string(),
                 path: "config/ratelimit.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -811,6 +817,7 @@ fn duplicate_relation_to_invalidated_prior_writes_current_replacement() {
                 name: "rate-limiter configuration".to_string(),
                 path: "config/limits.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -927,6 +934,7 @@ fn refines_relation_to_invalidated_prior_does_not_cascade_into_replacement() {
                 name: "rate-limiter config".to_string(),
                 path: "config/ratelimit.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -964,6 +972,7 @@ fn refines_relation_to_invalidated_prior_does_not_cascade_into_replacement() {
                 name: "rate-limiter configuration".to_string(),
                 path: "config/limits.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -1453,6 +1462,7 @@ fn stored_entity_path_change_invalidates_without_old_value_in_second_harvest() {
             name: "provider config".to_string(),
             path: "crates/cg-catalog/providers.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            entity_type_raw: None,
             context_id: None,
         }],
         decisions: vec![DecisionSeed {
@@ -1479,6 +1489,7 @@ fn stored_entity_path_change_invalidates_without_old_value_in_second_harvest() {
             name: "provider config".to_string(),
             path: "crates/cg-catalog/src/providers.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            entity_type_raw: None,
             context_id: None,
         }],
         decisions: vec![DecisionSeed {
@@ -1591,6 +1602,7 @@ fn normalized_entity_name_path_change_invalidates_without_old_value_in_second_ha
                 name: "rate-limiter config".to_string(),
                 path: "config/ratelimit.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {
@@ -1615,6 +1627,7 @@ fn normalized_entity_name_path_change_invalidates_without_old_value_in_second_ha
             name: "rate-limiter configuration".to_string(),
             path: "config/limits.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            entity_type_raw: None,
             context_id: None,
         }],
         decisions: vec![DecisionSeed {
@@ -2111,6 +2124,7 @@ fn arrow_path_change_value_renders_single_old_to_new_basis() {
                 name: "quota config".to_string(),
                 path: "config/quota.toml".to_string(),
                 entity_type: ExtractedEntityType::Configuration,
+                entity_type_raw: None,
                 context_id: None,
             }],
             decisions: vec![DecisionSeed {

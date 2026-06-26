@@ -14,15 +14,73 @@
 //   - list_compensation_events always returns empty
 //   - apply_teaching_events_in_order always returns the original
 
+use context_graph::ingest::{CaptureRequest, record_conversation_with_extractor};
 use context_graph::overlay::{
     CompensationEventKind, OverlayKind, apply_teaching_events_in_order, is_dropped,
     list_compensation_events, list_overlay_entries_for_item, read_with_overlay, record_correction,
     record_drop, record_grouping_link, record_wrong_type_correction, reverse_overlay,
 };
 use context_graph::skill_store::{TeachingEventKind, apply_correction};
-use context_graph::{Store, StoreConfig};
+use context_graph::{
+    DecisionId, DigestSearchFilter, DiscoveryFilter, IntentionId, Store, StoreConfig,
+};
 
-use super::fake_extractor::open_store_with_lexical_embedder;
+use super::fake_extractor::{LabeledTranscriptExtractor, open_store_with_lexical_embedder};
+
+/// A captured decision reachable through its Intention anchor, so the production read path
+/// (`by_intention`) can return it.
+struct CapturedDecision {
+    intention_id: IntentionId,
+    decision_id: DecisionId,
+    raw_text: String,
+}
+
+/// Capture a labeled `Goal G1 … / Decision D1 … serves G1` transcript so the decision serves an
+/// Intention and is reachable via the `by_intention` anchor (decisions are never read via a flat
+/// list). Returns the context, the serving Intention id, the decision id, and the raw decision text.
+fn capture_one_decision(store: &Store, context_label: &str, transcript: &str) -> CapturedDecision {
+    let report = record_conversation_with_extractor(
+        store,
+        CaptureRequest {
+            context_label: context_label.to_string(),
+            transcript: transcript.to_string(),
+            model_available: true,
+        },
+        &LabeledTranscriptExtractor,
+    )
+    .expect("capture succeeds");
+    let context_id = store
+        .list_contexts()
+        .expect("list contexts")
+        .into_iter()
+        .find(|c| c.name == context_label)
+        .map(|c| c.id)
+        .expect("capture context exists");
+    let decision_id = report
+        .stable_ids
+        .get("D1")
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .map(DecisionId::from)
+        .expect("captured decision D1 in stable_ids");
+    // The Intention the decision serves — the anchor the production read path uses.
+    let intention_id = store
+        .list_intentions_in_context(context_id)
+        .expect("list intentions")
+        .into_iter()
+        .next()
+        .map(|i| i.id)
+        .expect("capture creates a serving intention");
+    let raw_text = store
+        .get_decision(decision_id)
+        .expect("get decision")
+        .expect("decision exists")
+        .description;
+    CapturedDecision {
+        intention_id,
+        decision_id,
+        raw_text,
+    }
+}
 
 fn fresh_store(name: &str) -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -34,36 +92,68 @@ fn fresh_store(name: &str) -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
-// Test 1 (store-state): record_correction returns an entry but does NOT persist it;
-// read_with_overlay always returns the original value.
+// LIVE PATH: after a correction via the library action seam, the PRODUCTION read path — the
+// Intention anchor `by_intention` (decisions are read through anchors, never a flat list) — returns
+// the corrected value while the raw stored row is byte-unchanged. The overlay read-merge has zero
+// production callers in HEAD, so `by_intention` returns the RAW row → the corrected-view assertion
+// fails (honest RED).
 #[test]
 fn correction_overrides_on_read_without_editing_the_original_capture() {
-    let (_dir, _store) = fresh_store("i_correction_overrides");
-    let item_id = "item-original-001";
-    let original_value = "code_reference";
-    let corrected_value = "technology_choice";
+    let (_dir, store) = fresh_store("i_correction_overrides");
 
-    // Record a correction for this item (placeholder: not persisted).
-    let _entry = record_correction(&_store, item_id, corrected_value);
-
-    // The correct implementation persists the overlay entry. Read it back.
-    let entries = list_overlay_entries_for_item(&_store, item_id);
-    assert!(
-        !entries.is_empty(),
-        "overlay entry for item must be persisted; placeholder returns empty"
+    // Capture a REAL decision serving an Intention, and snapshot the raw stored row.
+    let captured = capture_one_decision(
+        &store,
+        "i-correction-ctx",
+        "Goal G1: keep the database choice\nDecision D1: use code_reference db serves G1",
     );
+    let raw_snapshot = store
+        .get_decision(captured.decision_id)
+        .expect("get raw")
+        .expect("raw exists");
 
-    // The read view must show the corrected value, not the original.
-    let read_value = read_with_overlay(original_value, item_id, &entries);
+    // Apply the correction through the library action seam, keyed by the captured decision id.
+    let corrected_value = "use technology_choice db";
+    let entry = record_correction(
+        &store,
+        &captured.decision_id.as_uuid().to_string(),
+        corrected_value,
+    );
     assert_eq!(
-        read_value, corrected_value,
-        "read view must show corrected value; placeholder returns original"
+        entry.kind,
+        OverlayKind::Correction,
+        "the action seam must record a Correction overlay"
     );
 
-    // The entry kind must be Correction.
-    assert!(
-        entries.iter().any(|e| e.kind == OverlayKind::Correction),
-        "persisted entry must have Correction kind"
+    // PRODUCTION read path (the Intention anchor) must return the CORRECTED value. HEAD's
+    // `by_intention` returns the raw, un-merged row → RED.
+    let view = store
+        .by_intention(captured.intention_id, DiscoveryFilter::default())
+        .expect("by_intention read view");
+    let viewed = view
+        .iter()
+        .find(|d| d.id == captured.decision_id)
+        .expect("decision present via its Intention anchor");
+    assert_eq!(
+        viewed.description, corrected_value,
+        "the PRODUCTION read path (by_intention) must show the corrected value; HEAD returns the RAW \
+         row (the overlay read-merge has no production caller) — got {:?}",
+        viewed.description
+    );
+
+    // The raw stored row is byte-unchanged (never mutated, never deleted).
+    let raw_after = store
+        .get_decision(captured.decision_id)
+        .expect("get raw after")
+        .expect("raw still exists");
+    assert_eq!(
+        raw_after, raw_snapshot,
+        "the raw captured decision row must be byte-identical after a correction (overlay is a \
+         separate layer); it must NOT be edited in place"
+    );
+    assert_eq!(
+        raw_after.description, captured.raw_text,
+        "raw description unchanged"
     );
 }
 
@@ -118,72 +208,177 @@ fn reversal_un_applies_everywhere_and_never_rewrites_stored_history() {
     );
 }
 
-// Test 3 (store-state): record_grouping_link does not persist any link.
+// LIVE PATH: confirming a grouping via the library action seam adds links over three REAL captured
+// Intentions and the PRODUCTION read path — the EXISTING `list_intentions_in_context` — returns the
+// grouped view (each Intention carries the canonical catalog link), while each raw Intention row
+// (read via the `admin_raw_*` layer) is byte-unchanged and the link is reversible. HEAD's
+// `list_intentions_in_context` returns the ungrouped rows (no overlay merge) → RED.
 #[test]
 fn grouping_links_intentions_without_changing_or_deleting_any_row() {
-    let (_dir, _store) = fresh_store("i_grouping_links");
-    let intention_a = "intention-a-001";
-    let intention_b = "intention-b-001";
-    let intention_c = "intention-c-001";
-    let catalog_id = "catalog-canonical-001";
+    let (_dir, store) = fresh_store("i_grouping_links");
 
-    // Insert three grouping links — one per intention.
-    let entry_a = record_grouping_link(&_store, intention_a, catalog_id);
-    let entry_b = record_grouping_link(&_store, intention_b, catalog_id);
-    let entry_c = record_grouping_link(&_store, intention_c, catalog_id);
+    // Capture three REAL Intentions (three goals) in one context.
+    record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "i-grouping-ctx".to_string(),
+            transcript: "Goal G1: make retrieval fast\nGoal G2: keep query under 200ms\nGoal G3: retrieval latency budget".to_string(),
+            model_available: true,
+        },
+        &LabeledTranscriptExtractor,
+    )
+    .expect("capture three intentions");
+    let context_id = store
+        .list_contexts()
+        .expect("list contexts")
+        .into_iter()
+        .find(|c| c.name == "i-grouping-ctx")
+        .map(|c| c.id)
+        .expect("grouping context exists");
 
-    // Each link must be persisted. Placeholder: not persisted.
-    for (id, entry) in [
-        (intention_a, &entry_a),
-        (intention_b, &entry_b),
-        (intention_c, &entry_c),
-    ] {
-        let entries = list_overlay_entries_for_item(&_store, id);
-        assert!(
-            !entries.is_empty(),
-            "grouping link for {id} must be persisted; placeholder returns empty"
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|e| e.kind == OverlayKind::GroupingLink
-                    && e.value.as_deref() == Some(catalog_id)),
-            "grouping link entry must carry catalog_id {catalog_id}"
-        );
-        // The link is additive: item_id equals the intention id.
+    let intentions = store
+        .list_intentions_in_context(context_id)
+        .expect("list intentions");
+    assert!(
+        intentions.len() >= 3,
+        "three intentions must be captured; got {}",
+        intentions.len()
+    );
+    // Snapshot the RAW layer per intention via the admin_raw read (independent of the read-view).
+    let raw_snapshot: Vec<_> = intentions
+        .iter()
+        .map(|i| {
+            store
+                .admin_raw_scan_intention_rows(i.id)
+                .expect("admin raw scan")
+        })
+        .collect();
+
+    // Confirm the grouping through the library action seam: link each Intention to one canonical
+    // catalog entry, keyed by the Intention id.
+    let catalog_id = "catalog-canonical-retrieval-budget";
+    for intention in &intentions {
+        let entry = record_grouping_link(&store, &intention.id.as_uuid().to_string(), catalog_id);
         assert_eq!(
-            entry.item_id, id,
-            "grouping link item_id must match intention id"
+            entry.kind,
+            OverlayKind::GroupingLink,
+            "the seam records a GroupingLink overlay"
         );
     }
+
+    // PRODUCTION read path must return the GROUPED view: every intention carries the canonical link.
+    // HEAD's list_intentions_in_context returns the ungrouped rows (blueprint_catalog_id is the
+    // capture's auto-group id / None, never the overlay's canonical id) → RED.
+    let grouped_view = store
+        .list_intentions_in_context(context_id)
+        .expect("grouped read view");
+    for intention in &grouped_view {
+        assert_eq!(
+            intention.blueprint_catalog_id.as_deref(),
+            Some(catalog_id),
+            "the PRODUCTION read path (list_intentions_in_context) must show intention '{}' grouped \
+             under the canonical catalog entry; HEAD returns the ungrouped row \
+             (blueprint_catalog_id={:?})",
+            intention.description,
+            intention.blueprint_catalog_id
+        );
+    }
+
+    // Each raw Intention row is byte-unchanged (overlay is additive, never an in-place edit).
+    for (i, intention) in intentions.iter().enumerate() {
+        let raw_after = store
+            .admin_raw_scan_intention_rows(intention.id)
+            .expect("admin raw scan after");
+        assert_eq!(
+            raw_after, raw_snapshot[i],
+            "raw Intention row '{}' must be byte-identical after grouping (additive link, no edit)",
+            intention.description
+        );
+    }
+
+    // Reverse the grouping: the read-view links must be gone and the raw rows still unchanged.
+    for intention in &intentions {
+        let mut entry =
+            record_grouping_link(&store, &intention.id.as_uuid().to_string(), catalog_id);
+        let _ = reverse_overlay(&store, &mut entry);
+    }
+    let ungrouped_view = store
+        .list_intentions_in_context(context_id)
+        .expect("read view after reverse");
+    assert!(
+        ungrouped_view
+            .iter()
+            .all(|i| i.blueprint_catalog_id.as_deref() != Some(catalog_id)),
+        "after reversing the grouping, the read view must no longer show the canonical link"
+    );
+    for (i, intention) in intentions.iter().enumerate() {
+        let raw_final = store
+            .admin_raw_scan_intention_rows(intention.id)
+            .expect("admin raw scan final");
+        assert_eq!(
+            raw_final, raw_snapshot[i],
+            "raw Intention rows remain byte-identical through grouping and its reversal"
+        );
+    }
+    let _ = DiscoveryFilter::default();
 }
 
-// Test 4 (store-state): record_drop does not persist the entry; is_dropped always returns false.
+// LIVE PATH: a drop via the library action seam removes the item from the PRODUCTION read path —
+// the Intention anchor `by_intention` — as an overlay exclusion, while the raw row is byte-unchanged.
+// HEAD's `by_intention` returns the raw (un-excluded) row → the exclusion assertion fails (RED).
 #[test]
 fn drop_excludes_from_read_view_but_preserves_provenance() {
-    let (_dir, _store) = fresh_store("i_drop_preserves");
-    let item_id = "item-to-drop-004";
+    let (_dir, store) = fresh_store("i_drop_preserves");
 
-    // Record a drop overlay for this item.
-    let _entry = record_drop(&_store, item_id);
+    // Capture a REAL decision serving an Intention; snapshot the raw row.
+    let captured = capture_one_decision(
+        &store,
+        "i-drop-ctx",
+        "Goal G1: capture then drop\nDecision D1: this should be dropped serves G1",
+    );
+    let raw_snapshot = store
+        .get_decision(captured.decision_id)
+        .expect("get raw")
+        .expect("raw exists");
 
-    // is_dropped must return true after a persisted drop. Placeholder: always false.
-    let entries = list_overlay_entries_for_item(&_store, item_id);
-    assert!(
-        !entries.is_empty(),
-        "drop entry must be persisted; wrong stub returns empty"
+    // Apply the drop through the library action seam, keyed by the captured decision id.
+    let item_key = captured.decision_id.as_uuid().to_string();
+    let entry = record_drop(&store, &item_key);
+    assert_eq!(
+        entry.kind,
+        OverlayKind::Drop,
+        "the seam records a Drop overlay"
     );
 
-    let dropped = is_dropped(item_id, &entries);
+    // PRODUCTION read path (the Intention anchor) must EXCLUDE the dropped decision. HEAD returns it → RED.
+    let view = store
+        .by_intention(captured.intention_id, DiscoveryFilter::default())
+        .expect("by_intention read view");
     assert!(
-        dropped,
-        "is_dropped must return true after a drop entry is persisted; wrong stub returns false"
+        !view.iter().any(|d| d.id == captured.decision_id),
+        "the PRODUCTION read path (by_intention) must EXCLUDE a dropped item; HEAD still returns the \
+         raw (un-excluded) row — view ids: {:?}",
+        view.iter().map(|d| d.id).collect::<Vec<_>>()
     );
 
-    // The entry itself must still exist (Invariant 3: no hard deletes).
+    // The raw row is byte-unchanged (no hard delete) and the drop event still exists (provenance).
+    let raw_after = store
+        .get_decision(captured.decision_id)
+        .expect("get raw after")
+        .expect("raw still exists (no hard delete)");
+    assert_eq!(
+        raw_after, raw_snapshot,
+        "the raw captured row must remain byte-identical after a drop (overlay exclusion, never a \
+         hard delete)"
+    );
+    let overlay = list_overlay_entries_for_item(&store, &item_key);
     assert!(
-        entries.iter().any(|e| e.kind == OverlayKind::Drop),
-        "drop entry row must remain; wrong stub hard-deletes it"
+        overlay.iter().any(|e| e.kind == OverlayKind::Drop),
+        "the drop event must still exist as provenance"
+    );
+    assert!(
+        is_dropped(&item_key, &overlay),
+        "the overlay must mark the item dropped"
     );
 }
 
@@ -396,5 +591,123 @@ fn out_of_order_reversal_teaching_event_converges_to_same_read_view() {
     assert_eq!(
         read_in_order, original_value,
         "after correction then reversal, read view must equal original"
+    );
+}
+
+// LIBRARY-LEVEL OVERLAY FOLD: a vigil-style consumer calling `Store::find_via_digests` DIRECTLY
+// (no cg binary) must see the curation overlay folded in — a corrected decision reads its CORRECTED
+// value and a dropped decision is EXCLUDED — with the raw row byte-unchanged. The contract is "no
+// surface without an API beneath it": the fold must live in the library, not only in the CLI.
+//
+// RED today: `find_via_digests` / `digest_source_details` read the raw `description` column and never
+// consult the overlay, so the corrected-value and dropped-exclusion assertions fail.
+#[test]
+fn find_via_digests_folds_overlay_corrections_and_drops_beneath_the_library_read() {
+    let (_dir, store) = fresh_store("i_digest_overlay_fold");
+
+    // Capture a session producing a digest + a decision reachable via find_via_digests.
+    let report = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: "i-digest-fold-ctx".to_string(),
+            transcript:
+                "Goal G1: keep the cache layer\nDecision D1: use the redis cache layer serves G1"
+                    .to_string(),
+            model_available: true,
+        },
+        &LabeledTranscriptExtractor,
+    )
+    .expect("capture succeeds");
+    let context_id = store
+        .list_contexts()
+        .expect("list contexts")
+        .into_iter()
+        .find(|c| c.name == "i-digest-fold-ctx")
+        .map(|c| c.id)
+        .expect("capture context exists");
+    let decision_id = report
+        .stable_ids
+        .get("D1")
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .map(DecisionId::from)
+        .expect("captured decision D1 in stable_ids");
+    let raw_snapshot = store
+        .get_decision(decision_id)
+        .expect("get raw")
+        .expect("raw exists");
+
+    let filter = || DigestSearchFilter {
+        context_id: Some(context_id),
+        ..Default::default()
+    };
+
+    // Baseline: the digest read surfaces the captured decision text.
+    let baseline = store
+        .find_via_digests("redis cache layer", filter())
+        .expect("baseline digest read");
+    assert!(
+        baseline
+            .iter()
+            .any(|h| h.decision_ids.contains(&decision_id)),
+        "the captured decision must be reachable via find_via_digests before any overlay action"
+    );
+
+    // CORRECTION via the library action seam (keyed by the decision id).
+    let corrected_value = "use the memcached cache layer";
+    let _ = record_correction(&store, &decision_id.as_uuid().to_string(), corrected_value);
+
+    // The LIBRARY digest read must fold the correction: the hit shows the corrected value.
+    let after_correction = store
+        .find_via_digests("redis cache layer", filter())
+        .expect("digest read after correction");
+    let corrected_visible = after_correction
+        .iter()
+        .any(|h| h.decision_texts.iter().any(|t| t == corrected_value));
+    assert!(
+        corrected_visible,
+        "find_via_digests must fold the correction overlay at the LIBRARY level — the hit's \
+         decision_texts must show the corrected value '{corrected_value}'; HEAD reads the raw \
+         description and only the CLI folds the overlay. decision_texts: {:?}",
+        after_correction
+            .iter()
+            .flat_map(|h| h.decision_texts.clone())
+            .collect::<Vec<_>>()
+    );
+    // Raw row byte-unchanged.
+    assert_eq!(
+        store
+            .get_decision(decision_id)
+            .expect("get raw")
+            .expect("raw exists"),
+        raw_snapshot,
+        "the raw decision row must be byte-identical after a correction (overlay is a separate layer)"
+    );
+
+    // DROP via the library action seam.
+    let _ = record_drop(&store, &decision_id.as_uuid().to_string());
+
+    // The LIBRARY digest read must EXCLUDE the dropped decision.
+    let after_drop = store
+        .find_via_digests("redis cache layer", filter())
+        .expect("digest read after drop");
+    assert!(
+        after_drop
+            .iter()
+            .all(|h| !h.decision_ids.contains(&decision_id)),
+        "find_via_digests must EXCLUDE a dropped decision at the LIBRARY level; HEAD's digest read \
+         still returns the raw (un-excluded) decision. decision_ids: {:?}",
+        after_drop
+            .iter()
+            .flat_map(|h| h.decision_ids.clone())
+            .collect::<Vec<_>>()
+    );
+    // Raw row still byte-unchanged (overlay exclusion, never a hard delete).
+    assert_eq!(
+        store
+            .get_decision(decision_id)
+            .expect("get raw")
+            .expect("raw exists (no hard delete)"),
+        raw_snapshot,
+        "the raw decision row must remain byte-identical after a drop (overlay exclusion, no delete)"
     );
 }

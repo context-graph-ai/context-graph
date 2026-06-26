@@ -212,91 +212,83 @@ fn capture_harness_config_threads_prompt_overrides_and_recall_limit_and_window_a
         "capture with config knobs must still produce stored rows (pipeline ran end-to-end); \
          got 0 entities"
     );
-}
 
-// ---------------------------------------------------------------------------
-// Test 3 (single-source): The CLI capture path produces the same stored graph as a direct
-// library call. Full CLI≡library parity requires a cg-cli capture entry point that accepts
-// a ConversationExtractor double and CaptureHarnessConfig.
-//
-// NOTE for impl: add a cg-cli capture entry point (e.g. `cg_cli::capture_with_extractor`)
-// that accepts a `ConversationExtractor` double and `CaptureHarnessConfig` so that full
-// CLI≡library parity can be driven through deterministic doubles in integration tests.
-//
-// This test asserts the strongest honest LIBRARY store contract: the library path stores
-// entities with CORRECT entity types. A "type=module" entity must be stored as
-// EntityType::Module. Placeholder run_capture uses the placeholder From<ExtractedEntityType>
-// mapping (Module → File) → stored entity type is File, not Module → assertion FAILS.
-// ---------------------------------------------------------------------------
-#[test]
-fn cli_capture_is_a_thin_caller_of_the_library_harness() {
-    let (_dir, store) = fresh_store();
+    // TIER: the configured model tier must be threaded and surfaced on the applied-config report.
+    let applied = harness_report
+        .harness_config_applied
+        .as_deref()
+        .expect("harness_config_applied must be reported");
+    assert!(
+        applied.contains("tier=haiku"),
+        "the configured tier (haiku) must be threaded and surfaced in harness_config_applied; got: {applied:?}"
+    );
 
-    let config = CaptureHarnessConfig::default();
+    // PROMPT_OVERRIDE: when set, the descriptor the prompt derives from must carry the override text
+    // verbatim (the operator override is threaded into the rendered prompt block, not dropped).
+    let override_text = "OPERATOR PROMPT OVERRIDE: extract only library technology choices";
+    let override_config = CaptureHarnessConfig {
+        prompt_override: Some(override_text.to_string()),
+        ..CaptureHarnessConfig::default()
+    };
+    let descriptor = override_config
+        .schema_descriptor()
+        .expect("a schema descriptor must be produced");
+    assert_eq!(
+        descriptor.prompt_override.as_deref(),
+        Some(override_text),
+        "the configured prompt_override must thread into the schema descriptor"
+    );
+    assert!(
+        descriptor
+            .render_prompt_schema_block()
+            .contains(override_text),
+        "the rendered prompt schema block must carry the operator prompt_override verbatim; \
+         a config that drops prompt_override fails"
+    );
 
-    // Use type=module so the wrong From mapping (Module→File) is observable.
-    let (report, _harness_report) = run_capture(
-        &store,
+    // CHUNK_WINDOW: a small window over a multi-segment transcript must drive chunking — more than
+    // one Stage-1 extraction call. run_capture that ignores chunk_window extracts the whole
+    // transcript in ONE call → this fails (RED), exposing the unthreaded knob.
+    let (_w_dir, window_store) = fresh_store();
+    let window_counter = CountingExtractor::new(SpanFaithfulExtractor);
+    let long_transcript = (0..8)
+        .map(|i| {
+            format!("Goal G{i}: window segment {i}\nDecision D{i}: choose option_{i} serves G{i}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let small_window_config = CaptureHarnessConfig {
+        chunk_window: Some(64),
+        ..CaptureHarnessConfig::default()
+    };
+    let _ = run_capture(
+        &window_store,
         CaptureRequest {
-            context_label: "cli-library-parity-test".to_string(),
-            transcript:
-                "Goal G1: evaluate library harness parity\nEntity E1: ingest-module type=module"
-                    .to_string(),
+            context_label: "chunk-window-test".to_string(),
+            transcript: long_transcript,
             model_available: true,
         },
-        &SpanFaithfulExtractor,
-        &config,
+        &window_counter,
+        &small_window_config,
     )
-    .expect("library run_capture must succeed");
-
-    let context_id = store
-        .list_contexts()
-        .expect("list contexts")
-        .into_iter()
-        .find(|c| c.name == "cli-library-parity-test")
-        .map(|c| c.id);
-
-    let entities = store
-        .list_entities(ListEntityFilter {
-            context_id,
-            ..Default::default()
-        })
-        .expect("list entities after library capture");
-
+    .expect("chunk-window capture must succeed");
     assert!(
-        !entities.is_empty(),
-        "library run_capture must store at least one entity; \
-         got 0 — the pipeline did not run end-to-end"
-    );
-
-    // Primary load-bearing store assertion: the module entity must be stored as
-    // EntityType::Module. Placeholder From<ExtractedEntityType> maps Module→File →
-    // entity_type == EntityType::File ≠ EntityType::Module → FAILS.
-    let module_entity = entities.iter().find(|e| e.name.contains("ingest-module"));
-    assert!(
-        module_entity.is_some(),
-        "the 'ingest-module' entity must be present in the store"
-    );
-    if let Some(e) = module_entity {
-        assert_eq!(
-            e.entity_type,
-            EntityType::Module,
-            "entity '{}' captured with type=module must be stored as EntityType::Module; \
-             wrong From<ExtractedEntityType> maps Module→File → stored as {:?}",
-            e.name,
-            e.entity_type
-        );
-    }
-
-    // The library path must have captured at least a goal.
-    assert!(
-        report.wrote_digest || !report.stable_ids.is_empty() || report.last_harvest.goals > 0,
-        "library run_capture must produce a non-empty result"
+        window_counter.extraction_call_count() > 1,
+        "a small chunk_window (64) over a multi-segment transcript must drive more than one Stage-1 \
+         extraction call (chunking honors the window); run_capture that ignores chunk_window extracts \
+         in ONE call — observed {} extraction call(s)",
+        window_counter.extraction_call_count()
     );
 }
 
+// NOTE: `cli_capture_is_a_thin_caller_of_the_library_harness` moved to
+// `crates/cg-cli/tests/llm_client_refactor_cli.rs` — proving the CLI capture path produces a graph
+// identical to `run_capture` requires invoking the ACTUAL `cg` binary, reachable only from the
+// cg-cli crate (CARGO_BIN_EXE_cg + FakeProviderRig). The library-only consumer contract stays here
+// as `library_embedder_reaches_capture_without_the_cli` below.
+
 // ---------------------------------------------------------------------------
-// Test 4 (single-source): A library consumer (vigil-style, opening `Store` directly) can
+// Test (single-source): A library consumer (vigil-style, opening `Store` directly) can
 // reach the FULL ontology contract without any cg-cli on the path.
 //
 // Primary load-bearing store assertion: a "type=module" entity must be stored as

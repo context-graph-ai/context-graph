@@ -64,6 +64,46 @@ pub fn gate_passing_labels(skill_id: &str) -> (Vec<TeachingEvent>, Vec<TeachingE
     (training, heldout)
 }
 
+/// Build a GENERAL candidate's labels: training corrections that all assert the same target AND a
+/// disjoint held-out slice whose ground-truth target is the SAME — the rule holds on unseen events,
+/// so the held-out gate must pass it. Returns (training, heldout). Content-faithful: the held-out
+/// events agree with what the training rule predicts.
+pub fn general_candidate_labels(skill_id: &str) -> (Vec<TeachingEvent>, Vec<TeachingEvent>) {
+    let training = vec![
+        correction_event("gen1", skill_id, "g1", "technology_choice"),
+        correction_event("gen2", skill_id, "g2", "technology_choice"),
+        correction_event("gen3", skill_id, "g3", "technology_choice"),
+        correction_event("gen4", skill_id, "g4", "technology_choice"),
+    ];
+    // Held-out (unseen) events whose ground truth ALSO is technology_choice → the rule generalizes.
+    let heldout = vec![
+        correction_event("genh1", skill_id, "g5", "technology_choice"),
+        correction_event("genh2", skill_id, "g6", "technology_choice"),
+    ];
+    (training, heldout)
+}
+
+/// Build an OVERFIT candidate's labels: training corrections that all assert one target (fitting the
+/// training set perfectly) but a disjoint held-out slice whose ground-truth target is DIFFERENT —
+/// the rule memorizes the training content and FAILS to generalize, so the held-out gate must reject
+/// it. Returns (training, heldout). Content-faithful: the held-out events disagree with what the
+/// training rule predicts, which is exactly what overfitting looks like on unseen data.
+pub fn overfit_candidate_labels(skill_id: &str) -> (Vec<TeachingEvent>, Vec<TeachingEvent>) {
+    let training = vec![
+        correction_event("ovf1", skill_id, "o1", "technology_choice"),
+        correction_event("ovf2", skill_id, "o2", "technology_choice"),
+        correction_event("ovf3", skill_id, "o3", "technology_choice"),
+        correction_event("ovf4", skill_id, "o4", "technology_choice"),
+    ];
+    // Held-out events whose ground truth is code_reference, NOT technology_choice → the training
+    // rule predicts the wrong value on every unseen event (overfit, fails to generalize).
+    let heldout = vec![
+        correction_event("ovfh1", skill_id, "o5", "code_reference"),
+        correction_event("ovfh2", skill_id, "o6", "code_reference"),
+    ];
+    (training, heldout)
+}
+
 /// Build correction labels that should NOT pass the gate (too many reversals for precision).
 pub fn gate_failing_labels(skill_id: &str) -> (Vec<TeachingEvent>, Vec<TeachingEvent>) {
     let training = vec![

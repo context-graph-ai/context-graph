@@ -79,6 +79,26 @@ pub fn parse_verb(s: &str) -> Option<ReviewVerb> {
     }
 }
 
+/// The three sub-actions of the `group` verb. Each has a DISTINCT effect on a grouping proposal:
+/// `Confirm` links the candidate Intentions under one canonical entry; `Rename` retitles the
+/// catalog entry; `Reject` leaves the Intentions ungrouped. These are part of the single action
+/// surface (`group …`), not new top-level verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupAction {
+    Confirm,
+    Rename,
+    Reject,
+}
+
+/// Parse a `group` sub-action argument (`ok` / `rename` / `no`) into its distinct `GroupAction`.
+///
+/// SCAFFOLD STUB (deliberately wrong): this collapses ALL sub-actions to `Confirm`, so a test that
+/// asserts the three sub-actions are DISTINCT (confirm ≠ rename ≠ reject) fails on assertion.
+pub fn parse_group_action(_arg: &str) -> Option<GroupAction> {
+    // Wrong: every sub-action resolves to Confirm — the three are not distinguished.
+    Some(GroupAction::Confirm)
+}
+
 /// Returns all five message kinds emitted by the library seam.
 pub fn all_message_kinds() -> Vec<MessageKind> {
     vec![
@@ -132,6 +152,20 @@ pub fn build_review_summary_with_currency_category(items: &[ReviewItem]) -> Revi
         .filter(|i| i.category == ReviewCategory::CurrencyFlips)
         .count();
     summary
+}
+
+/// `cg review` summary GATHERED from STORE state (not a caller-supplied list): the uncertain
+/// category from capture-produced flagged items still pending, plus grouping proposals and drift
+/// alerts persisted in the store. The per-category counts are the TRUE store totals (the display
+/// lists may be capped); a pending flagged item persists here until acted on.
+///
+/// SCAFFOLD STUB (deliberately wrong): this gathers NOTHING from the store and returns an empty
+/// summary. So a capture-produced flagged item never appears under uncertain, the per-category
+/// counts are 0 regardless of store state, and pending items do not persist — the Surface-K
+/// store-gathered tests fail on assertion (review must summarize store state, not an empty set).
+pub fn gather_review_summary(_store: &Store, _cursor: &ReviewCursor) -> ReviewSummary {
+    // Wrong: no store gathering — empty summary regardless of capture flags / seeded categories.
+    ReviewSummary::default()
 }
 
 #[derive(Debug, Clone, Default)]

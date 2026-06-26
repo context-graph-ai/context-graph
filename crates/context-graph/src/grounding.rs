@@ -135,6 +135,23 @@ pub fn why_flagged_closed_vocab(_flagged_value: &str) -> Vec<String> {
     legal_entity_type_names()
 }
 
+/// `cg why @<item>` legal-vocabulary path: resolve a flagged item by id FROM THE STORE, find its
+/// closed field, and return the legal value set the correction must come from — but ONLY for a
+/// genuinely flagged closed-vocab item. A fully-grounded / non-flagged item (or an unknown id) has
+/// no closed-vocab legal list (the caller renders free text / provenance instead), so this returns
+/// `None`. Flagged-ness and the closed field are DERIVED from the resolved item; the caller passes
+/// only the store + item id.
+///
+/// SCAFFOLD STUB (deliberately wrong): this never reads the store and returns the constant legal
+/// list for ANY id — even a non-flagged item or one absent from the store — so the strengthened
+/// test's "non-flagged / unresolved item returns no closed-vocab list" arm fails on assertion. The
+/// real impl must resolve the item, confirm it is a flagged closed-vocab item, and read the legal
+/// set from the single vocabulary source only then.
+pub fn legal_types_for_flagged_item(_store: &crate::Store, _item_id: &str) -> Option<Vec<String>> {
+    // Wrong: ignores the store and the item; returns the list unconditionally.
+    Some(legal_entity_type_names())
+}
+
 /// Returns `Some(reason)` when the candidate set is empty, indicating the resolution
 /// could not be grounded against any existing candidate.
 pub fn flag_if_empty_candidates(candidates: &[String]) -> Option<String> {

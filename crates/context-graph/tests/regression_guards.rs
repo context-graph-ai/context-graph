@@ -94,6 +94,7 @@ fn full_ontology_harvest() -> StructuredHarvest {
             name: "atomic config".to_string(),
             path: "config/atomic.toml".to_string(),
             entity_type: ExtractedEntityType::Configuration,
+            entity_type_raw: None,
             context_id: None,
         }],
         decisions: vec![DecisionSeed {
@@ -206,6 +207,7 @@ impl ConversationExtractor for BothEndsRollingExtractor {
                 name: "sentinel session memory".to_string(),
                 path: "memory://sentinel-session".to_string(),
                 entity_type: ExtractedEntityType::Document,
+                entity_type_raw: None,
                 context_id: None,
             });
         }

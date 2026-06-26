@@ -171,6 +171,7 @@ impl ConversationExtractor for SpyRollingExtractor {
                 name: "sentinel session memory".to_string(),
                 path: "memory://sentinel-session".to_string(),
                 entity_type: ExtractedEntityType::Document,
+                entity_type_raw: None,
                 context_id: None,
             });
         }

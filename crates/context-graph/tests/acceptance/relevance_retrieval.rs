@@ -11,12 +11,37 @@
 //!   - `judge_candidate_set: []` (always empty)
 //!   - `stage2_model_calls: 1` (placeholder; correct is 0)
 
-use context_graph::harness::{CaptureHarnessConfig, VerdictValue, run_capture};
-use context_graph::ingest::CaptureRequest;
-use context_graph::{ListEntityFilter, Store, StoreConfig};
+use std::collections::HashMap;
+
+use context_graph::harness::{CaptureHarnessConfig, ResolutionKind, VerdictValue, run_capture};
+use context_graph::ingest::{CaptureRequest, DecisionRelationClassification};
+use context_graph::{ListEntityFilter, Store, StoreConfig, TxId};
+use contextdb_core::Value as DbValue;
 
 use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::{CountingExtractor, SpanFaithfulExtractor};
+use super::refactor_extractor::{
+    CountingExtractor, DecisionRelationExtractor, SpanFaithfulExtractor,
+};
+
+/// Insert a learned skill row directly into `cg_learned_skills` (test seeding).
+fn seed_skill(store: &Store, id: &str, description: &str) {
+    let db = store.sync_database();
+    db.execute(
+        "INSERT INTO cg_learned_skills (id, description, rule, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Text(id.to_string())),
+            ("description".to_string(), DbValue::Text(description.to_string())),
+            ("rule".to_string(), DbValue::Text(format!("rule for {id}"))),
+            ("provenance".to_string(), DbValue::Text("human-correction".to_string())),
+            ("active".to_string(), DbValue::Bool(true)),
+            ("held_for_review".to_string(), DbValue::Bool(false)),
+            ("fire_right".to_string(), DbValue::Int64(0)),
+            ("fire_wrong".to_string(), DbValue::Int64(0)),
+            ("created_at".to_string(), DbValue::TxId(TxId(1))),
+        ]),
+    )
+    .expect("seed learned skill");
+}
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -129,87 +154,123 @@ fn zero_candidates_makes_no_judge_call() {
 fn candidates_present_makes_exactly_one_small_judge_call_per_item() {
     let (_dir, store) = fresh_store();
 
-    // Seed 20 decisions so the retrieval block has a population to narrow against.
-    // Each transcript uses \n so SpanFaithfulExtractor sees Goal and Decision on separate lines.
-    for i in 0..20 {
+    // Seed a population of 20 prior decisions. A FEW share the lexical core of the new decision
+    // ("graphql gateway") — the KNOWN-NEAR identity set — and the rest are FAR/irrelevant rows on
+    // unrelated topics. Retrieval must narrow to exactly the near set and exclude every far row.
+    let near_texts = [
+        "adopt the graphql gateway for the public api",
+        "tune the graphql gateway cache for the public api",
+    ];
+    for (i, text) in near_texts.iter().enumerate() {
         let _ = run_capture(
             &store,
             request(
                 "e-candidates-context",
-                &format!(
-                    "Goal G{i}: seed intention #{i} for neighbor population\nDecision D{i}: use option_{i} serves G{i}"
-                ),
+                &format!("Goal GN{i}: gateway intention\nDecision DN{i}: {text} serves GN{i}"),
             ),
             &SpanFaithfulExtractor,
             &default_config(),
         )
-        .expect("seed neighbor");
+        .expect("seed near neighbor");
+    }
+    // 18 FAR rows on topics with no lexical overlap with "graphql gateway".
+    let far_topics = [
+        "rotate the tls certificate",
+        "schedule nightly database backups",
+        "raise the pod memory limit",
+        "migrate logging to opentelemetry",
+        "pin the rust toolchain version",
+        "add a smoke test to the pipeline",
+        "document the on-call rotation",
+        "archive the legacy billing module",
+        "throttle the email digest job",
+        "shard the search index by tenant",
+        "deprecate the old metrics dashboard",
+        "encrypt the audit log at rest",
+        "cache the avatar thumbnails",
+        "retry failed webhook deliveries",
+        "compress the cold storage tier",
+        "rename the staging namespace",
+        "batch the analytics ingestion",
+        "vendor the protobuf definitions",
+    ];
+    for (i, text) in far_topics.iter().enumerate() {
+        let _ = run_capture(
+            &store,
+            request(
+                "e-candidates-context",
+                &format!("Goal GF{i}: unrelated intention\nDecision DF{i}: {text} serves GF{i}"),
+            ),
+            &SpanFaithfulExtractor,
+            &default_config(),
+        )
+        .expect("seed far neighbor");
     }
 
-    // Capture a new decision that has prior neighbors to judge against.
+    // Capture a new decision lexically close to the near set, far from everything else.
     let counter = CountingExtractor::new(SpanFaithfulExtractor);
     let (_report, harness_report) = run_capture(
         &store,
         request(
             "e-candidates-context",
-            "Goal G_new: new intention\nDecision D_new: use option_0 — relates to prior serves G_new",
+            "Goal G_new: gateway latency\nDecision D_new: extend the graphql gateway for the public api serves G_new",
         ),
         &counter,
         &default_config(),
     )
     .expect("narrowed capture");
 
-    // Primary spy observable: judge must have been called at least once.
-    // Placeholder: classify_decision_relation is never forwarded → judge_call_count == 0.
+    // The judge must have run on the dedicated decision-relation seam.
     assert!(
         counter.judge_call_count() >= 1,
-        "at least one judge call must have been made when prior decisions exist; \
-         spy observed {} judge calls — wrong stub never calls classify_decision_relation",
+        "at least one decision-relation judge call must have been made when prior decisions exist; \
+         spy observed {} judge calls",
         counter.judge_call_count()
     );
 
-    // Spy: received_candidate_sets must be non-empty.
     let received = counter.received_candidate_sets();
     assert!(
         !received.is_empty(),
-        "received_candidate_sets must be non-empty when the judge was called; \
-         spy recorded 0 sets — wrong stub bypasses judge"
+        "received_candidate_sets must be non-empty when the judge was called"
     );
 
-    // Spy: each call must have received a NARROWED set (fewer than all 20 seeded decisions).
-    for (i, candidate_set) in received.iter().enumerate() {
+    // LOAD-BEARING: assert the received set BY IDENTITY. The near texts must be PRESENT and EVERY
+    // far text must be ABSENT — a positive-exclusion check, not just a size bound. A stub that
+    // passes the whole store (far rows included) fails; one that returns the right size but wrong
+    // members fails.
+    let last_set = received.last().expect("at least one candidate set");
+    for near in near_texts.iter() {
         assert!(
-            candidate_set.len() < 20,
-            "judge call #{} received {} candidates — must be narrowed (< 20, the full corpus); \
-             wrong stub would pass all or none",
-            i,
-            candidate_set.len()
+            last_set.iter().any(|c| c.contains("graphql gateway"))
+                && last_set.iter().any(|c| c == near),
+            "the known-near candidate {near:?} must be present in the judge's candidate set by \
+             identity; got: {last_set:?}"
         );
+    }
+    for far in far_topics.iter() {
         assert!(
-            !candidate_set.is_empty(),
-            "judge call #{} received an empty candidate set — retrieval must narrow to \
-             the relevant few, not collapse to zero",
-            i
+            !last_set.iter().any(|c| c == far),
+            "the far/irrelevant candidate {far:?} must be ABSENT from the judge's candidate set \
+             (positive exclusion); got: {last_set:?}"
         );
     }
 
-    // Report confirms: at least one judge call and non-empty candidate set.
+    // Report mirrors the spy.
     assert!(
         harness_report.judge_call_count >= 1,
-        "harness report: at least one judge call must have been made; \
-         wrong stub always returns judge_call_count=0"
+        "harness report: at least one judge call must have been made"
     );
     assert!(
         !harness_report.judge_candidate_set.is_empty(),
-        "when candidates exist, judge_candidate_set must be non-empty (narrowed neighbors); \
-         wrong stub always returns empty judge_candidate_set"
+        "when candidates exist, judge_candidate_set must be non-empty (narrowed neighbors)"
     );
-    assert!(
-        harness_report.judge_candidate_set.len() <= 10,
-        "judge_candidate_set must be a narrowed few (≤10), not the entire corpus (20); \
-         got {} candidates",
-        harness_report.judge_candidate_set.len()
-    );
+    for far in far_topics.iter() {
+        assert!(
+            !harness_report.judge_candidate_set.iter().any(|c| c == far),
+            "harness report judge_candidate_set must exclude the far candidate {far:?}; got: {:?}",
+            harness_report.judge_candidate_set
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,15 +322,22 @@ fn relevance_retrieval_unsure_keeps_separate() {
     )
     .expect("second entity capture");
 
-    // Primary load-bearing spy assertion: the judge MUST be consulted to decide entity
-    // separateness. Placeholder run_capture's per-decision judge loop never fires for entity-only
-    // harvests → counter.judge_call_count() == 0 → this assertion FAILS.
-    // Correct impl: calls the entity-identity judge, which returns unsure (None) → separate.
+    // Primary load-bearing spy assertion: the DEDICATED entity-identity judge seam must be the one
+    // consulted to decide entity separateness — NOT classify_decision_relation, which only
+    // classifies decisions. Entity identity is its own question, so it must run on its own seam.
     assert!(
-        counter.judge_call_count() >= 1,
-        "judge must be consulted at least once to decide entity separateness; \
-         wrong run_capture does not call the judge for entity-only harvests — \
-         spy observed {} judge calls",
+        counter.entity_identity_call_count() >= 1,
+        "the dedicated entity-identity judge must be consulted at least once for the resolved \
+         entity; spy observed {} entity-identity calls",
+        counter.entity_identity_call_count()
+    );
+    // The decision-relation classifier must NOT have been used to decide entity identity (routing
+    // entity identity through classify_decision_relation is the wrong seam — its counter stays 0).
+    assert_eq!(
+        counter.judge_call_count(),
+        0,
+        "entity identity must NOT be routed through classify_decision_relation (a decision judge); \
+         that counter must stay 0, but observed {}",
         counter.judge_call_count()
     );
 
@@ -282,6 +350,34 @@ fn relevance_retrieval_unsure_keeps_separate() {
         !silently_merged,
         "unsure judge verdict must not produce a silent VerdictValue::Same merge; \
          if Same appears, items were merged without clear evidence"
+    );
+
+    // False-merge guard: an any-relation (related-but-not-same) model answer must NOT collapse to
+    // Same — only an explicit exact-duplicate (Same) verdict merges. Drive a SECOND, separately
+    // named service entity whose identity judge returns a generic relation (Refines) rather than
+    // exact-duplicate, and assert it is kept separate (not merged into a prior).
+    let any_relation = DecisionRelationExtractor {
+        relation: DecisionRelationClassification::RefinesExisting,
+        ..Default::default()
+    };
+    let (_r3, hr3) = run_capture(
+        &store,
+        request(
+            "unsure-retrieval-context",
+            "Entity E_third: auth-service type=service",
+        ),
+        &any_relation,
+        &default_config(),
+    )
+    .expect("third entity capture with any-relation judge");
+    let any_relation_merged = hr3
+        .stage3_resolution_verdicts
+        .iter()
+        .any(|v| v.kind == ResolutionKind::Entity && v.verdict == VerdictValue::Same);
+    assert!(
+        !any_relation_merged,
+        "an any-relation (Refines) entity-identity answer must NOT collapse to Same; \
+         only an explicit exact-duplicate verdict may merge entities"
     );
 
     // Store assertion: entities must be in the store (pipeline ran).
@@ -311,84 +407,69 @@ fn relevance_retrieval_unsure_keeps_separate() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4 (retrieval): Skill selection retrieves only the skills whose description
-// matches the chunk — not every learned skill in the store.
+// Test 4 (retrieval): Skill selection surfaces ONLY the learned skills whose DESCRIPTION matches
+// the captured chunk — exactly the matching few by identity, not every active skill and not a
+// different set.
 //
-// Primary spy observable: when neighbors exist, the judge must be called with a
-// non-empty, narrowed candidate set via `received_candidate_sets()`.
-// Placeholder: judge is never invoked → received_candidate_sets is empty → fails.
+// Seed ~20 learned skills with varying descriptions, only 2 of which match the chunk; run a REAL
+// capture on that chunk; assert EXACTLY those 2 skills (by id) are in applied_skill_ids. HEAD's
+// run_capture never selects/applies skills (applied_skill_ids stays empty) → RED.
 // ---------------------------------------------------------------------------
 #[test]
 fn skill_selection_retrieves_the_relevant_few_not_the_whole_corpus() {
     let (_dir, store) = fresh_store();
 
-    // Seed 20 decisions so there are many potential neighbors.
-    // Each transcript uses \n so SpanFaithfulExtractor sees Goal and Decision on separate lines.
-    for i in 0..20 {
-        let _ = run_capture(
-            &store,
-            request(
-                "skill-selection-context",
-                &format!(
-                    "Goal G{i}: seed skill context intention #{i}\nDecision D{i}: use strategy_{i} serves G{i}"
-                ),
-            ),
-            &SpanFaithfulExtractor,
-            &default_config(),
-        )
-        .expect("seed skill context");
+    // Seed 20 learned skills with VARYING descriptions. Only the two "redis cache" skills match the
+    // captured chunk below; the other 18 are on unrelated topics.
+    let matching = ["sk-redis-ttl", "sk-redis-evict"];
+    seed_skill(&store, matching[0], "tune the redis cache TTL for hot keys");
+    seed_skill(&store, matching[1], "set the redis cache eviction policy");
+    let unrelated_topics = [
+        "rotate the tls certificate",
+        "schedule nightly database backups",
+        "raise the pod memory limit",
+        "migrate logging to opentelemetry",
+        "pin the rust toolchain version",
+        "add a smoke test to the pipeline",
+        "document the on-call rotation",
+        "archive the legacy billing module",
+        "throttle the email digest job",
+        "shard the search index by tenant",
+        "deprecate the old metrics dashboard",
+        "encrypt the audit log at rest",
+        "compress the cold storage tier",
+        "rename the staging namespace",
+        "batch the analytics ingestion",
+        "vendor the protobuf definitions",
+        "wire the feature flag service",
+        "back up the secrets vault",
+    ];
+    for (i, topic) in unrelated_topics.iter().enumerate() {
+        seed_skill(&store, &format!("sk-other-{i}"), topic);
     }
 
-    // Capture a decision that overlaps with only a few of the seeds.
-    let counter = CountingExtractor::new(SpanFaithfulExtractor);
+    // Capture a chunk matching ONLY the two redis-cache skills.
     let (_report, harness_report) = run_capture(
         &store,
         request(
             "skill-selection-context",
-            "Goal G_match: matching goal\nDecision D_match: use strategy_0 serves G_match",
+            "Goal G1: speed up reads\nDecision D1: tune the redis cache for hot keys serves G1",
         ),
-        &counter,
+        &SpanFaithfulExtractor,
         &default_config(),
     )
     .expect("skill-selection capture");
 
-    // Primary spy observable: the judge must have been called with a narrowed set.
-    // Placeholder: classify_decision_relation is never delegated → judge_call_count == 0.
-    let received = counter.received_candidate_sets();
-    assert!(
-        !received.is_empty(),
-        "when prior neighbors exist, judge must be called and received_candidate_sets \
-         must be non-empty; wrong stub never calls classify_decision_relation → empty"
-    );
-
-    // Spy: each received set must be narrowed (far fewer than all 20 seeded decisions).
-    for (i, candidate_set) in received.iter().enumerate() {
-        assert!(
-            candidate_set.len() <= 5,
-            "judge call #{} received {} candidates — skill selection must narrow to \
-             the relevant few (≤5 of 20); wrong stub would pass all or none",
-            i,
-            candidate_set.len()
-        );
-        assert!(
-            !candidate_set.is_empty(),
-            "judge call #{} received an empty set — retrieval must select the relevant few, \
-             not collapse to zero when neighbors exist",
-            i
-        );
-    }
-
-    // Report fields confirm the spy's observations.
-    assert!(
-        !harness_report.judge_candidate_set.is_empty(),
-        "when prior neighbors exist, judge_candidate_set must be non-empty (the relevant few); \
-         wrong stub always returns empty judge_candidate_set"
-    );
-    assert!(
-        harness_report.judge_candidate_set.len() <= 5,
-        "skill selection must retrieve only the relevant few (≤5 candidates); \
-         wrong stub returns judge_candidate_set={:?} (empty, but the correct impl \
-         returns a non-empty narrowed set which must still be small)",
-        harness_report.judge_candidate_set
+    // EXACTLY the two matching skills (by id) must be selected/applied — not 20 (selecting all
+    // active skills fails), and not a different 2 (selecting by anything but description match
+    // fails). HEAD never selects any → applied_skill_ids is empty → this fails.
+    let mut applied = harness_report.applied_skill_ids.clone();
+    applied.sort();
+    let mut expected: Vec<String> = matching.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        applied, expected,
+        "skill selection must apply EXACTLY the two description-matching skills by id ({expected:?}); \
+         got {applied:?} — HEAD's run_capture selects/applies no skills (empty)"
     );
 }
