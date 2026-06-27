@@ -415,6 +415,154 @@ pub fn record_firing_label(store: &Store, firing_id: &str, correct: bool) {
     );
 }
 
+// ─── Skill selection + application (the capture-path seam) ──────────────────────
+
+/// English stop words excluded from description/chunk token overlap so a shared filler word
+/// ("the", "for") never makes an unrelated skill look relevant.
+const SKILL_MATCH_STOP_WORDS: &[&str] = &[
+    "the", "for", "and", "with", "into", "from", "this", "that", "are", "was", "has", "have",
+    "its", "your", "their", "our", "his", "her", "out", "off", "all", "any", "per", "via", "use",
+    "set", "get", "new", "old", "one", "two", "serves", "goal",
+];
+
+/// Tokenize free text into lowercased alphanumeric words of length ≥ 3, dropping stop words. Used to
+/// compare a learned skill's DESCRIPTION against the captured chunk so selection is description-driven
+/// (the relevant few), not whole-corpus.
+fn skill_match_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w.len() >= 3 && !SKILL_MATCH_STOP_WORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Whether a learned skill's DESCRIPTION matches the captured chunk: they share at least one
+/// meaningful (non-stop-word) token. Deterministic, model-free.
+pub fn skill_description_matches_chunk(description: &str, chunk: &str) -> bool {
+    let desc = skill_match_tokens(description);
+    if desc.is_empty() {
+        return false;
+    }
+    let chunk_tokens = skill_match_tokens(chunk);
+    desc.intersection(&chunk_tokens).next().is_some()
+}
+
+/// Select the learned skills that should APPLY to a capture of `chunk`, by DESCRIPTION match — the
+/// relevant few, never the whole corpus. A skill is selected only when it is active, its description
+/// matches the chunk, and it is not currently held for review under the review-hold gate. With the
+/// master switch off, nothing is selected. The result preserves store order so application is
+/// deterministic.
+///
+/// `review_mode` reflects the caller's `cg skills review` setting for this capture: when on, a skill
+/// flagged `held_for_review` is withheld (not applied) until acknowledged; when off, an active
+/// matching skill auto-applies with no approval step.
+pub fn select_skills_for_chunk(
+    store: &Store,
+    chunk: &str,
+    skills_on: bool,
+    review_mode: bool,
+) -> Vec<LearnedSkill> {
+    if !skills_on {
+        return Vec::new();
+    }
+    list_skills_in_store(store)
+        .into_iter()
+        .filter(|skill| skill.active)
+        .filter(|skill| !(review_mode && skill.held_for_review))
+        .filter(|skill| skill_description_matches_chunk(&skill.description, chunk))
+        .collect()
+}
+
+/// The effect a learned retype skill carries: rename the source entity type to a target type when an
+/// entity by `entity_name` is present. Parsed from the skill's rule text of the canonical shape
+/// `"when an entity named <name> is typed <Source> → <Target>"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillRetypeEffect {
+    /// The entity name (case-insensitive) the retype applies to.
+    pub entity_name: String,
+    /// The source entity type label the skill retypes away from (e.g. "File").
+    pub from_type: String,
+    /// The target entity type label the skill retypes to (e.g. "Repository").
+    pub to_type: String,
+}
+
+/// Parse a learned skill's rule text into its retype effect, when the rule has the canonical retype
+/// shape `"when an entity named <name> is typed <Source> → <Target>"`. Returns `None` for any rule
+/// that does not encode a retype (such a skill carries no entity-retype effect on the capture path).
+pub fn parse_retype_effect(rule: &str) -> Option<SkillRetypeEffect> {
+    let lower = rule.to_ascii_lowercase();
+    let name_marker = "entity named ";
+    let typed_marker = " is typed ";
+    let arrow = "→";
+    let name_start = lower.find(name_marker)? + name_marker.len();
+    let typed_start_rel = lower[name_start..].find(typed_marker)?;
+    let entity_name = rule[name_start..name_start + typed_start_rel]
+        .trim()
+        .to_string();
+    let after_typed = name_start + typed_start_rel + typed_marker.len();
+    let arrow_rel = rule[after_typed..].find(arrow)?;
+    let from_type = rule[after_typed..after_typed + arrow_rel]
+        .trim()
+        .to_string();
+    let to_type = rule[after_typed + arrow_rel + arrow.len()..]
+        .trim()
+        .to_string();
+    if entity_name.is_empty() || from_type.is_empty() || to_type.is_empty() {
+        return None;
+    }
+    Some(SkillRetypeEffect {
+        entity_name,
+        from_type,
+        to_type,
+    })
+}
+
+/// Outcome of applying one selected skill to a capture's harvested entities.
+#[derive(Debug, Clone)]
+pub struct AppliedSkillEffect {
+    /// The skill that applied.
+    pub skill_id: String,
+    /// The entity keys whose type the skill changed.
+    pub changed_entity_keys: Vec<String>,
+}
+
+/// Apply the selected skills' retype effects to a capture's harvested entity types, mutating the
+/// entity type labels in `entity_types_by_key` in place and returning, for each skill that actually
+/// changed something, its id and the entity keys it touched. The caller (the capture spine) holds the
+/// harvested entities keyed by their seed key with their current type LABEL (e.g. "File"); this seam
+/// performs the deterministic, model-free retype the learned rule encodes.
+///
+/// A skill whose rule names an entity not present, or whose source type does not match the current
+/// type, applies nothing. Only retype-shaped rules have an effect today; a non-retype rule yields no
+/// change (the skill is still recorded as fired by the caller when it was selected, but it changes no
+/// value).
+pub fn apply_retype_skills(
+    skills: &[LearnedSkill],
+    entity_types_by_key: &mut HashMap<String, (String, String)>,
+) -> Vec<AppliedSkillEffect> {
+    let mut effects = Vec::new();
+    for skill in skills {
+        let Some(effect) = parse_retype_effect(&skill.rule) else {
+            continue;
+        };
+        let mut changed = Vec::new();
+        for (key, (name, type_label)) in entity_types_by_key.iter_mut() {
+            if name.eq_ignore_ascii_case(&effect.entity_name)
+                && type_label.eq_ignore_ascii_case(&effect.from_type)
+            {
+                *type_label = effect.to_type.clone();
+                changed.push(key.clone());
+            }
+        }
+        if !changed.is_empty() {
+            effects.push(AppliedSkillEffect {
+                skill_id: skill.id.clone(),
+                changed_entity_keys: changed,
+            });
+        }
+    }
+    effects
+}
+
 /// Enable or disable the global skills master switch.
 /// Returns the previous enabled state.
 pub fn set_skills_enabled(store: &Store, enabled: bool) -> bool {
@@ -458,6 +606,36 @@ pub fn set_skills_enabled(store: &Store, enabled: bool) -> bool {
         params,
     );
     prev_enabled
+}
+
+/// Read the global skills master switch. Defaults to enabled (true) when never set, so a fresh
+/// store applies promoted skills by default.
+pub fn skills_enabled(store: &Store) -> bool {
+    read_review_cursor_flag(store, "skills_enabled", true)
+}
+
+/// Read the review-hold flag (opt-in `cg skills review`). Defaults to off (false) when never set,
+/// so a promoted skill auto-applies unless review is explicitly turned on.
+pub fn review_hold_active(store: &Store) -> bool {
+    read_review_cursor_flag(store, "review_hold", false)
+}
+
+/// Read a boolean flag persisted on the `cg_review_cursor` settings lane (`position` 1/0), falling
+/// back to `default` when the row is absent.
+fn read_review_cursor_flag(store: &Store, id: &str, default: bool) -> bool {
+    let db = store.sync_database();
+    let snapshot = db.snapshot();
+    let rows = db.scan(REVIEW_CURSOR_TABLE, snapshot).unwrap_or_default();
+    let row = rows.iter().find(
+        |row| matches!(row.values.get("id"), Some(contextdb_core::Value::Text(rid)) if rid == id),
+    );
+    match row {
+        Some(row) => match row.values.get("position") {
+            Some(contextdb_core::Value::Int64(v)) => *v != 0,
+            _ => default,
+        },
+        None => default,
+    }
 }
 
 /// Enable or disable the review-hold (opt-in `cg skills review`).
@@ -870,25 +1048,25 @@ pub fn try_promote_skill_with_result(
     }
 }
 
-/// Promote a candidate while counting held-out gate invocations, so a test can prove the verdict
+/// Promote a candidate while counting held-out gate invocations, so a caller can prove the verdict
 /// came from the HELD-OUT slice (the gate ran) rather than training fit. The held-out gate is the
 /// generalization discriminator: an overfit rule that fits its training labels but fails a disjoint
 /// held-out slice must NOT promote, while a general rule that holds on the held-out slice must.
 ///
-/// `gate_invocations` is incremented once per held-out evaluation.
+/// `heldout_gate_invocations` counts how many times the held-out gate was actually evaluated to reach
+/// the verdict — non-zero on every learned promotion attempt that had a candidate to score, so a
+/// caller can distinguish a generalization measurement from a training-fit shortcut.
 ///
-/// SCAFFOLD STUB (deliberately wrong): this judges on TRAINING fit and NEVER runs the held-out gate
-/// (the counter stays 0), so an overfit candidate is promoted and a general candidate is treated no
-/// differently — the Surface-F overfit test fails on both the "overfit not promoted" and the
-/// "gate was invoked" assertions.
+/// The candidate rule is derived from the training labels, then scored by applying it to the held-out
+/// events (`evaluate_on_heldout`) — predictive accuracy on UNSEEN events, not training fit. A general
+/// rule whose target matches the held-out ground truth scores high and promotes (beats, not ties, the
+/// `> 0.5` baseline); an overfit rule that memorises the training content but predicts the wrong value
+/// on the held-out slice scores low and is rejected. A single training label never promotes.
 pub fn try_promote_skill_with_gate_counter(
     training: &[TeachingEvent],
-    _heldout: &[TeachingEvent],
+    heldout: &[TeachingEvent],
 ) -> PromotionResult {
-    // Wrong: never touches the held-out slice (so `heldout_gate_invocations` stays 0) and "promotes"
-    // on the bare presence of more than one training label — i.e. on training fit, not
-    // generalization. The count rides the returned PromotionResult as a plain `usize`; there is no
-    // app-side global/atomic in `src/`.
+    // A single label is never enough to generalize from: no candidate, no gate run.
     if training.len() <= 1 {
         return PromotionResult {
             promoted: false,
@@ -897,23 +1075,36 @@ pub fn try_promote_skill_with_gate_counter(
             heldout_gate_invocations: 0,
         };
     }
-    let description = derive_description_from_labels(training);
-    let rule = derive_rule_from_labels(training);
-    let provenance = provenance_from_labels(training);
+
+    // Derive the candidate from the training labels so its rule is available to score against the
+    // disjoint held-out slice.
+    let candidate = LearnedSkill {
+        id: uuid::Uuid::new_v4().to_string(),
+        description: derive_description_from_labels(training),
+        rule: derive_rule_from_labels(training),
+        provenance: provenance_from_labels(training),
+        active: true,
+        held_for_review: false,
+        fire_right: 0,
+        fire_wrong: 0,
+    };
+
+    // Run the REAL held-out gate: apply the derived rule to each held-out event and measure
+    // predictive accuracy. This is the generalization discriminator — it touches the held-out slice,
+    // so the invocation count moves off zero.
+    let candidate_score = evaluate_on_heldout(&candidate, heldout).score;
+    let heldout_gate_invocations = 1;
+
+    // Promotion requires STRICTLY BEATING the no-incumbent baseline (> 0.5): the rule must correctly
+    // predict a majority of held-out events. An overfit rule scores at or below this and is rejected.
+    let baseline = 0.5;
+    let promoted = candidate_score > baseline;
+
     PromotionResult {
-        promoted: true, // wrong: promotes regardless of held-out generalization
-        skill: Some(LearnedSkill {
-            id: uuid::Uuid::new_v4().to_string(),
-            description,
-            rule,
-            provenance,
-            active: true,
-            held_for_review: false,
-            fire_right: 0,
-            fire_wrong: 0,
-        }),
-        heldout_score: 1.0,          // wrong: not measured on held-out
-        heldout_gate_invocations: 0, // wrong: the held-out gate was never evaluated
+        promoted,
+        skill: if promoted { Some(candidate) } else { None },
+        heldout_score: candidate_score,
+        heldout_gate_invocations,
     }
 }
 

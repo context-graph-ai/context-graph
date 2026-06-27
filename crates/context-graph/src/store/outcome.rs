@@ -24,18 +24,35 @@ impl Store {
                 id: Some(decision_id.as_uuid().to_string()),
                 missing: Some("decision"),
             })?;
-        let _outcome_guard = self.outcome_mutex.lock().expect("outcome mutex poisoned");
-        let tx = self.begin_tx()?;
-        match self.record_outcome_in_tx(tx, context_id, decision_id, success, notes) {
-            Ok(outcome) => {
-                self.db.commit(tx).map_err(map_engine_err)?;
-                Ok(outcome)
+        let outcome = {
+            let _outcome_guard = self.outcome_mutex.lock().expect("outcome mutex poisoned");
+            let tx = self.begin_tx()?;
+            match self.record_outcome_in_tx(tx, context_id, decision_id, success, notes) {
+                Ok(outcome) => {
+                    self.db.commit(tx).map_err(map_engine_err)?;
+                    outcome
+                }
+                Err(e) => {
+                    let _ = self.db.rollback(tx);
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                let _ = self.db.rollback(tx);
-                Err(e)
+        };
+
+        // Confidence is evidence-derived (Decision §2): recording an Outcome is the production
+        // signal that a decision's track record changed. Recompute the confidence of this decision
+        // AND of every decision it CITES (a precedent's confidence accrues from the outcomes of the
+        // decisions that built on it via the CITES walk), so confidence accrues on the live path
+        // with no separate derive call. Best-effort: a derivation failure must not undo the
+        // committed Outcome.
+        let _ = crate::harness::derive_decision_confidence(self, decision_id);
+        if let Ok(precedents) = self.precedents_for_decision(decision_id, context_id) {
+            for precedent in precedents {
+                let _ = crate::harness::derive_decision_confidence(self, precedent);
             }
         }
+
+        Ok(outcome)
     }
 
     /// Write an Outcome inside an already-open transaction, replacing any active

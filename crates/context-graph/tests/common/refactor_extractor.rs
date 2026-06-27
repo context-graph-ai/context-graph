@@ -12,8 +12,8 @@
 use std::sync::Mutex;
 
 use context_graph::ingest::{
-    ConversationExtractor, DecisionSeed, EntitySeed, ExtractedEntityType, ExtractionRequest,
-    GoalSeed, ObservationSeed, OutcomeSeed, StructuredHarvest,
+    ConversationExtractor, DecisionSeed, EntitySeed, ExtractedEntityType, ExtractedSpan,
+    ExtractionRequest, GoalSeed, ObservationSeed, OutcomeSeed, StructuredHarvest,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,9 +86,17 @@ pub fn span_faithful_harvest(transcript: &str) -> StructuredHarvest {
                     .map(|k| k.trim_end_matches(',').to_string());
                 harvest.decisions.push(DecisionSeed {
                     key: key.trim().to_string(),
+                    // The decision phrase is the verbatim span justifying the in-vocab decision_type;
+                    // it is quoted from the transcript, so a span-faithful capture grounds cleanly.
+                    decision_type_span: Some(ExtractedSpan {
+                        text: Some(decision_text.clone()),
+                        ..Default::default()
+                    }),
                     text: decision_text,
                     goal_key,
                     decision_type: Some("technology_choice".to_string().into()),
+                    // agent_id is unverified metadata (no claimed quote), so it carries no span and is
+                    // not span-grounded.
                     agent_id: Some("agent-session".to_string()),
                     confidence: None, // null at capture per Decision §2
                     reasoning: vec!["span-faithful reasoning".to_string()],
@@ -121,6 +129,7 @@ pub fn span_faithful_harvest(transcript: &str) -> StructuredHarvest {
                     of_decision_key,
                     success: text.contains("success"),
                     notes: text.to_string(),
+                    value_span: None,
                     context_id: None,
                 });
             }
@@ -400,6 +409,7 @@ impl ConversationExtractor for OutcomeExtractor {
             of_decision_key: Some("D1".to_string()),
             success: true,
             notes: "first".to_string(),
+            value_span: None,
             context_id: None,
         });
         harvest.summary = Some("outcome captured".to_string());
@@ -554,31 +564,48 @@ impl ConversationExtractor for FiveFabricatedValuesExtractor {
             entity_type_raw: None,
             context_id: None,
         });
-        // Classes 2 + 3: a DECISION carrying a fabricated decision_type AND a fabricated agent_id.
+        // Classes 2 + 3: a DECISION carrying a fabricated decision_type AND a fabricated agent_id,
+        // each citing a span that is ABSENT from the transcript (the fabricated phrase itself).
         harvest.decisions.push(DecisionSeed {
             key: "D_fab".to_string(),
             text: Self::FAB_DECISION_TYPE.to_string(),
             goal_key: Some("G1".to_string()),
             decision_type: Some(Self::FAB_DECISION_TYPE.to_string().into()),
+            decision_type_span: Some(ExtractedSpan {
+                text: Some(Self::FAB_DECISION_TYPE.to_string()),
+                ..Default::default()
+            }),
             agent_id: Some(Self::FAB_AGENT_ID.to_string()),
+            agent_id_span: Some(ExtractedSpan {
+                text: Some(Self::FAB_AGENT_ID.to_string()),
+                ..Default::default()
+            }),
             confidence: None,
             ..Default::default()
         });
-        // Class 4: an OBSERVATION value not in the transcript.
+        // Class 4: an OBSERVATION value not in the transcript, with a fabricated span.
         harvest.observations.push(ObservationSeed {
             key: "Obs_fab".to_string(),
             text: Self::FAB_OBSERVATION.to_string(),
             entity_key: Some("E_fab".to_string()),
             observation_type: Some("metric_anomaly".to_string()),
             source: Some("agent-session".to_string()),
+            value_span: Some(ExtractedSpan {
+                text: Some(Self::FAB_OBSERVATION.to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         });
-        // Class 5: an OUTCOME value not in the transcript.
+        // Class 5: an OUTCOME value not in the transcript, with a fabricated span.
         harvest.outcomes.push(OutcomeSeed {
             key: "O_fab".to_string(),
             of_decision_key: Some("D_fab".to_string()),
             success: true,
             notes: Self::FAB_OUTCOME.to_string(),
+            value_span: Some(ExtractedSpan {
+                text: Some(Self::FAB_OUTCOME.to_string()),
+                ..Default::default()
+            }),
             context_id: None,
         });
         harvest.summary = Some("five fabricated values across all classes".to_string());
@@ -755,8 +782,15 @@ impl ConversationExtractor for MislabeledDecisionTypeExtractor {
             text: "rewrite the authentication module".to_string(),
             goal_key: Some("G1".to_string()),
             // Span "rewrite the authentication module" supports an architecture/refactor decision,
-            // NOT the chosen closed label "security_policy" — a mislabeled closed-vocab value.
+            // NOT the chosen closed label "security_policy" — a mislabeled closed-vocab value. The
+            // span is present in the chunk; the single competing label that differs from the chosen
+            // one is what drives the SpanDoesNotSupportLabel verdict.
             decision_type: Some("security_policy".to_string().into()),
+            decision_type_span: Some(ExtractedSpan {
+                text: Some("rewrite the authentication module".to_string()),
+                ..Default::default()
+            }),
+            decision_type_competing_labels: vec!["architecture".to_string()],
             agent_id: Some("eng".to_string()),
             confidence: None,
             ..Default::default()
@@ -782,8 +816,13 @@ impl ConversationExtractor for OutOfVocabDecisionTypeExtractor {
             key: "D1".to_string(),
             text: "use the wibblefangle approach".to_string(),
             goal_key: Some("G1".to_string()),
-            // Out-of-vocabulary closed decision_type token (the reserved "unknown" surrogate).
+            // Out-of-vocabulary closed decision_type token. The span is present in the chunk, so the
+            // flag is driven purely by the value being outside the decision_type vocabulary.
             decision_type: Some("wibblefangle".to_string().into()),
+            decision_type_span: Some(ExtractedSpan {
+                text: Some("use the wibblefangle approach".to_string()),
+                ..Default::default()
+            }),
             agent_id: Some("eng".to_string()),
             confidence: None,
             ..Default::default()
@@ -808,10 +847,19 @@ impl ConversationExtractor for AmbiguousDecisionTypeExtractor {
         harvest.decisions.push(DecisionSeed {
             key: "D1".to_string(),
             // "adjust the policy" is equally a security_policy and a monitoring_threshold change —
-            // ambiguous closed-vocab decision_type with no disambiguator in the chunk.
+            // ambiguous closed-vocab decision_type with no disambiguator in the chunk. The span is
+            // present; the two equally-supported competing labels drive the AmbiguousSpan verdict.
             text: "adjust the policy".to_string(),
             goal_key: Some("G1".to_string()),
             decision_type: Some("policy".to_string().into()),
+            decision_type_span: Some(ExtractedSpan {
+                text: Some("adjust the policy".to_string()),
+                ..Default::default()
+            }),
+            decision_type_competing_labels: vec![
+                "security_policy".to_string(),
+                "monitoring_threshold".to_string(),
+            ],
             agent_id: Some("eng".to_string()),
             confidence: None,
             ..Default::default()

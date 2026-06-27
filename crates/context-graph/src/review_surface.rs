@@ -90,13 +90,15 @@ pub enum GroupAction {
     Reject,
 }
 
-/// Parse a `group` sub-action argument (`ok` / `rename` / `no`) into its distinct `GroupAction`.
-///
-/// SCAFFOLD STUB (deliberately wrong): this collapses ALL sub-actions to `Confirm`, so a test that
-/// asserts the three sub-actions are DISTINCT (confirm ≠ rename ≠ reject) fails on assertion.
-pub fn parse_group_action(_arg: &str) -> Option<GroupAction> {
-    // Wrong: every sub-action resolves to Confirm — the three are not distinguished.
-    Some(GroupAction::Confirm)
+/// Parse a `group` sub-action argument into its distinct `GroupAction`: `ok` → `Confirm`,
+/// `rename` → `Rename`, `no` → `Reject`. Any other token is not a group sub-action (`None`).
+pub fn parse_group_action(arg: &str) -> Option<GroupAction> {
+    match arg {
+        "ok" => Some(GroupAction::Confirm),
+        "rename" => Some(GroupAction::Rename),
+        "no" => Some(GroupAction::Reject),
+        _ => None,
+    }
 }
 
 /// Returns all five message kinds emitted by the library seam.
@@ -154,18 +156,143 @@ pub fn build_review_summary_with_currency_category(items: &[ReviewItem]) -> Revi
     summary
 }
 
+/// Register every capture-produced flagged item as a pending review item, so `cg review` surfaces it
+/// from store state until it is acted on. Idempotent: re-registering an already-present item is a
+/// no-op (the `INSERT` hits the primary-key constraint and is ignored). Called on the capture path.
+pub(crate) fn register_flagged_items(store: &Store, flagged: &[crate::ingest::FlaggedItem]) {
+    for item in flagged {
+        if item.key.trim().is_empty() {
+            continue;
+        }
+        register_pending_uncertain_item(
+            store,
+            &item.key,
+            &item.reason,
+            item.legal_vocab.as_deref(),
+        );
+    }
+}
+
+fn register_pending_uncertain_item(
+    store: &Store,
+    item_id: &str,
+    content: &str,
+    legal_vocab: Option<&[String]>,
+) {
+    let db = store.sync_database();
+    // A closed-vocabulary flag carries the legal value set (JSON array) so `cg why @<id>` can resolve
+    // the item by its id and present the named set; a free-text flag stores NULL (no constrained set).
+    let legal_vocab_value = match legal_vocab {
+        Some(vocab) => {
+            contextdb_core::Value::Text(serde_json::to_string(vocab).unwrap_or_default())
+        }
+        None => contextdb_core::Value::Null,
+    };
+    let params = HashMap::from([
+        (
+            "id".to_string(),
+            contextdb_core::Value::Text(item_id.to_string()),
+        ),
+        ("acted_on".to_string(), contextdb_core::Value::Bool(false)),
+        (
+            "content".to_string(),
+            contextdb_core::Value::Text(content.to_string()),
+        ),
+        ("legal_vocab".to_string(), legal_vocab_value),
+    ]);
+    // INSERT only if not already present; a primary-key collision (already pending) is ignored so a
+    // pending item persists across windows and intervening captures until acted on.
+    let _ = execute_with_live_txid(
+        &db,
+        &format!(
+            "INSERT INTO {PENDING_ITEMS_TABLE} (id, acted_on, content, legal_vocab, created_at) VALUES ($id, $acted_on, $content, $legal_vocab, $created_at)"
+        ),
+        "created_at",
+        params,
+    );
+}
+
+/// Resolve a flagged item BY ITS ID against the persisted pending-review-item row, returning the
+/// legal value set the correction must come from when the item is a genuinely-flagged CLOSED-VOCAB
+/// item (the row carries a `legal_vocab`), or `None` when no pending item has that exact id or the
+/// flagged item is free-text (no constrained vocabulary). Exact-id resolution — never token overlap.
+pub(crate) fn legal_vocab_for_pending_item(store: &Store, item_id: &str) -> Option<Vec<String>> {
+    let db = store.sync_database();
+    let snapshot = db.snapshot();
+    let rows = db.scan(PENDING_ITEMS_TABLE, snapshot).unwrap_or_default();
+    let row = rows.into_iter().find(|row| {
+        matches!(row.values.get("id"), Some(contextdb_core::Value::Text(id)) if id == item_id)
+    })?;
+    let acted_on = match row.values.get("acted_on") {
+        Some(contextdb_core::Value::Bool(b)) => *b,
+        Some(contextdb_core::Value::Int64(i)) => *i != 0,
+        _ => false,
+    };
+    if acted_on {
+        return None;
+    }
+    match row.values.get("legal_vocab") {
+        Some(contextdb_core::Value::Text(json)) => serde_json::from_str::<Vec<String>>(json).ok(),
+        _ => None,
+    }
+}
+
 /// `cg review` summary GATHERED from STORE state (not a caller-supplied list): the uncertain
 /// category from capture-produced flagged items still pending, plus grouping proposals and drift
 /// alerts persisted in the store. The per-category counts are the TRUE store totals (the display
 /// lists may be capped); a pending flagged item persists here until acted on.
-///
-/// SCAFFOLD STUB (deliberately wrong): this gathers NOTHING from the store and returns an empty
-/// summary. So a capture-produced flagged item never appears under uncertain, the per-category
-/// counts are 0 regardless of store state, and pending items do not persist — the Surface-K
-/// store-gathered tests fail on assertion (review must summarize store state, not an empty set).
-pub fn gather_review_summary(_store: &Store, _cursor: &ReviewCursor) -> ReviewSummary {
-    // Wrong: no store gathering — empty summary regardless of capture flags / seeded categories.
-    ReviewSummary::default()
+pub fn gather_review_summary(store: &Store, _cursor: &ReviewCursor) -> ReviewSummary {
+    const DISPLAY_CAP: usize = 20;
+    let db = store.sync_database();
+    let snapshot = db.snapshot();
+    let rows = db.scan(PENDING_ITEMS_TABLE, snapshot).unwrap_or_default();
+    let uncertain: Vec<ReviewItem> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let acted_on = match row.values.get("acted_on") {
+                Some(contextdb_core::Value::Bool(b)) => *b,
+                Some(contextdb_core::Value::Int64(i)) => *i != 0,
+                _ => false,
+            };
+            if acted_on {
+                return None;
+            }
+            let id = match row.values.get("id") {
+                Some(contextdb_core::Value::Text(s)) => s.clone(),
+                _ => return None,
+            };
+            let content = match row.values.get("content") {
+                Some(contextdb_core::Value::Text(s)) => s.clone(),
+                _ => format!("pending-{id}"),
+            };
+            Some(ReviewItem {
+                id,
+                kind: "uncertain".to_string(),
+                content,
+                category: ReviewCategory::Uncertain,
+            })
+        })
+        .collect();
+
+    let drift: Vec<ReviewItem> = crate::skill_store::list_drift_alerts(store)
+        .into_iter()
+        .map(|alert| ReviewItem {
+            id: alert.skill_id.clone(),
+            kind: "drift".to_string(),
+            content: format!("skill {} drift", alert.skill_id),
+            category: ReviewCategory::Drift,
+        })
+        .collect();
+
+    ReviewSummary {
+        uncertain_count: uncertain.len(),
+        grouping_count: 0,
+        drift_count: drift.len(),
+        currency_flips_count: 0,
+        uncertain_items: uncertain.into_iter().take(DISPLAY_CAP).collect(),
+        grouping_items: Vec::new(),
+        drift_items: drift.into_iter().take(DISPLAY_CAP).collect(),
+    }
 }
 
 #[derive(Debug, Clone, Default)]

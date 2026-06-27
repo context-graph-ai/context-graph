@@ -1,7 +1,7 @@
 mod audit;
 mod conflict_detection;
 mod context;
-mod convert;
+pub(crate) mod convert;
 mod decision;
 mod digest;
 pub(crate) mod embedding;

@@ -313,6 +313,19 @@ impl Store {
         for (candidate, edge_sources, graph_trace) in candidate_graphs {
             let digest_id = candidate.digest_id;
             let context_id = candidate.context_id;
+            // Two-layer read view, folded at the library level so a direct (vigil-style) consumer
+            // gets the curated view: a capture-unit (digest) the overlay drops is excluded from the
+            // read, and a corrected one renders its corrected summary (the latest curation action
+            // wins). The raw digest row stays byte-unchanged underneath (Invariant 3) — this is a
+            // pure read-time projection.
+            let digest_overlay = crate::overlay::overlay_read_decision_for_item(
+                self,
+                &digest_id.as_uuid().to_string(),
+            );
+            if digest_overlay.dropped {
+                continue;
+            }
+            let summary = digest_overlay.corrected_value.unwrap_or(candidate.summary);
             let mut hit = DigestSearchHit {
                 digest_id,
                 context_id,
@@ -322,7 +335,7 @@ impl Store {
                     .unwrap_or_else(|| format!("context-{context_id}")),
                 created_at: candidate.created_at,
                 similarity: candidate.similarity,
-                summary: candidate.summary,
+                summary,
                 intention_ids: Vec::new(),
                 intention_texts: Vec::new(),
                 decision_ids: Vec::new(),
@@ -532,11 +545,19 @@ impl Store {
             .map_err(map_engine_err)?;
         for row in &intentions.rows {
             let raw_id = value_uuid(row, &intentions.columns, "id")?;
+            let overlay = crate::overlay::overlay_read_decision_for_item(self, &raw_id.to_string());
+            if overlay.dropped {
+                continue;
+            }
+            let text = overlay
+                .corrected_value
+                .map(Ok)
+                .unwrap_or_else(|| value_text(row, &intentions.columns, "description"))?;
             out.insert(
                 raw_id,
                 DigestSourceDetail::Intention {
                     id: IntentionId::from(raw_id),
-                    text: value_text(row, &intentions.columns, "description")?,
+                    text,
                 },
             );
         }
@@ -552,16 +573,24 @@ impl Store {
             .map_err(map_engine_err)?;
         for row in &decisions.rows {
             let raw_id = value_uuid(row, &decisions.columns, "id")?;
+            let overlay = crate::overlay::overlay_read_decision_for_item(self, &raw_id.to_string());
+            if overlay.dropped {
+                continue;
+            }
             let status = decision_status_from_text(&value_text(row, &decisions.columns, "status")?)
                 .ok_or_else(|| {
                     CgError::Engine("decision source returned invalid status".to_string())
                 })?;
+            let text = overlay
+                .corrected_value
+                .map(Ok)
+                .unwrap_or_else(|| value_text(row, &decisions.columns, "description"))?;
             out.insert(
                 raw_id,
                 DigestSourceDetail::Decision {
                     id: DecisionId::from(raw_id),
                     status,
-                    text: value_text(row, &decisions.columns, "description")?,
+                    text,
                 },
             );
         }
@@ -592,17 +621,22 @@ impl Store {
         }
         let entity_names = self.entity_names_for_ids(&entity_ids)?;
         for (raw_id, observation_type, state_delta_json, entity_id) in observation_rows {
+            let overlay = crate::overlay::overlay_read_decision_for_item(self, &raw_id.to_string());
+            if overlay.dropped {
+                continue;
+            }
             let entity_name = entity_names
                 .get(&entity_id)
                 .cloned()
                 .unwrap_or_else(|| "entity".to_string());
             let state_delta = state_delta_from_json(state_delta_json)?;
-            let text = state_delta
+            let raw_text = state_delta
                 .get("path")
                 .and_then(|value| value.as_ref())
                 .and_then(|value| value.as_str())
                 .map(|path| format!("{entity_name} observed at {path}"))
                 .unwrap_or(observation_type);
+            let text = overlay.corrected_value.unwrap_or(raw_text);
             out.insert(
                 raw_id,
                 DigestSourceDetail::Observation {

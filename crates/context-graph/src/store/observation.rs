@@ -372,6 +372,39 @@ impl Store {
         Ok(out)
     }
 
+    /// Count the NON-invalidating Observations on an entity: those whose `state_delta` carries no
+    /// state change (so they record no snapshot and cannot invalidate a decision). Each such
+    /// observation is a "survived scrutiny" signal feeding the evidence-derived confidence of a
+    /// decision based on this entity (Decision §2).
+    pub(crate) fn non_invalidating_observation_count(&self, entity_id: EntityId) -> Result<usize> {
+        let params: HashMap<String, Value> =
+            [("entity_id".to_string(), Value::Uuid(entity_id.as_uuid()))]
+                .into_iter()
+                .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT state_delta FROM observations WHERE entity_id = $entity_id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut count = 0usize;
+        for row in &result.rows {
+            let is_non_invalidating = match row.first() {
+                Some(Value::Json(json)) => state_delta_has_no_ops(json),
+                Some(Value::Text(text)) => serde_json::from_str::<JsonValue>(text)
+                    .map(|json| state_delta_has_no_ops(&json))
+                    .unwrap_or(false),
+                Some(Value::Null) | None => true,
+                _ => false,
+            };
+            if is_non_invalidating {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     fn ensure_context_and_entity_in_tx(
         &self,
         tx: crate::TxId,
@@ -1696,6 +1729,22 @@ fn contains_raw_media_state_delta(delta: &BTreeMap<String, Option<JsonValue>>) -
     delta.iter().any(|(key, value)| {
         is_raw_media_key(key) || value.as_ref().is_some_and(contains_raw_media_value)
     })
+}
+
+/// Whether a persisted `state_delta` carries no state-change ops — i.e. it is a non-invalidating
+/// observation (records nothing that could change an entity snapshot). Tolerates the canonical
+/// `{"format":"cg_state_delta_v1","ops":{}}` shape and a bare empty object.
+fn state_delta_has_no_ops(json: &JsonValue) -> bool {
+    match json {
+        JsonValue::Object(object) => match object.get("ops") {
+            Some(JsonValue::Object(ops)) => ops.is_empty(),
+            Some(_) => false,
+            // No "ops" key at all (a bare object) is empty only when the object itself is empty.
+            None => object.is_empty(),
+        },
+        JsonValue::Null => true,
+        _ => false,
+    }
 }
 
 fn state_delta_to_json(delta: &BTreeMap<String, Option<JsonValue>>) -> JsonValue {

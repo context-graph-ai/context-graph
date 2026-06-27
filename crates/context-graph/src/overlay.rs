@@ -400,6 +400,127 @@ pub fn list_compensation_events(store: &Store) -> Vec<CompensationEvent> {
         .collect()
 }
 
+/// The two-layer read-view decision for a single item, computed from its persisted overlay
+/// entries. `dropped` means the item is excluded from read-time projections; `corrected_value`
+/// holds the override the read path must substitute for the raw value (a non-reversed
+/// Correction/WrongTypeCorrection), or `None` when the raw value stands. The raw stored row is
+/// never consulted or mutated here — this is a pure projection over the append-only overlay.
+pub(crate) struct OverlayReadDecision {
+    pub dropped: bool,
+    pub corrected_value: Option<String>,
+}
+
+/// Resolve the read-view decision for `item_id` from the store's persisted overlay.
+///
+/// This is the production read-path entry point: a read method fetches the item's overlay entries
+/// once and folds them down to (excluded? / corrected value?) without touching the raw row. A
+/// missing/empty overlay yields `dropped = false, corrected_value = None`, so an item with no
+/// overlay reads exactly as captured.
+///
+/// Drop and correction compose order-tolerantly: the LATEST non-retracted curation action wins, so
+/// a correction after a drop re-includes the item with its corrected value, and a drop after a
+/// correction excludes it. (Both the same overlay entry across two reads, never an in-place edit.)
+pub(crate) fn overlay_read_decision_for_item(store: &Store, item_id: &str) -> OverlayReadDecision {
+    let entries = list_overlay_entries_for_item(store, item_id);
+    let cancelled = cancelled_overlay_ids(&entries);
+    // The latest non-retracted curation action (Correction/WrongTypeCorrection/Drop) governs.
+    let latest_curation = entries.iter().rev().find(|e| {
+        !cancelled.contains(e.id.as_str())
+            && matches!(
+                e.kind,
+                OverlayKind::Correction | OverlayKind::WrongTypeCorrection | OverlayKind::Drop
+            )
+    });
+    match latest_curation {
+        Some(entry) if matches!(entry.kind, OverlayKind::Drop) => OverlayReadDecision {
+            dropped: true,
+            corrected_value: None,
+        },
+        Some(entry) => OverlayReadDecision {
+            dropped: false,
+            corrected_value: Some(entry.value.clone().unwrap_or_default()),
+        },
+        None => OverlayReadDecision {
+            dropped: false,
+            corrected_value: None,
+        },
+    }
+}
+
+/// The catalog the item is grouped under in the read view, or `None` when ungrouped.
+///
+/// Order-free convergence: each non-reversed `GroupingLink` proposes its catalog; a
+/// `GroupingReversal` tombstone retracts a specific link, and reversing a grouping ungroups the
+/// item from that link's catalog entirely (so re-linking the same catalog and reversing one link
+/// converges to ungrouped regardless of scan order). The most-recent surviving distinct catalog
+/// wins; with the single-catalog flows the read path uses today this is simply "grouped under C
+/// unless C has been reversed."
+pub(crate) fn grouped_catalog_for_item(entries: &[OverlayEntry]) -> Option<String> {
+    let cancelled = cancelled_overlay_ids(entries);
+    // Catalogs whose grouping has been reversed: the catalog of every link a tombstone retracts.
+    let mut reversed_catalogs = std::collections::HashSet::new();
+    for entry in entries {
+        if !matches!(
+            entry.kind,
+            OverlayKind::GroupingReversal | OverlayKind::Reversal
+        ) {
+            continue;
+        }
+        let Some(target_id) = entry.value.as_deref() else {
+            continue;
+        };
+        if let Some(target) = entries
+            .iter()
+            .find(|e| e.id == target_id && matches!(e.kind, OverlayKind::GroupingLink))
+            && let Some(catalog) = target.value.as_deref()
+        {
+            reversed_catalogs.insert(catalog.to_string());
+        }
+    }
+    entries
+        .iter()
+        .filter(|e| {
+            matches!(e.kind, OverlayKind::GroupingLink)
+                && !cancelled.contains(e.id.as_str())
+                && !e.reversed
+        })
+        .filter_map(|e| e.value.as_deref())
+        .rfind(|catalog| !reversed_catalogs.contains(*catalog))
+        .map(|catalog| catalog.to_string())
+}
+
+/// Every distinct catalog name a LIVE (non-retracted) grouping link currently groups some item
+/// under, read from the persisted overlay across all items. A grouping link retracted by a
+/// `GroupingReversal`/`Reversal` tombstone — or whose catalog was reversed for an item — does not
+/// appear, so a grouping reversed by `cg group rename`/`no` (a retitle drops the old name, a reject
+/// drops the name entirely) is gone from the read view while every original overlay row stays
+/// byte-unchanged (Invariant 3). Names are returned once each, in first-seen order.
+pub fn live_grouping_catalogs(store: &Store) -> Vec<String> {
+    let db = store.sync_database();
+    let snapshot = db.snapshot();
+    let rows = db.scan(OVERLAY_TABLE, snapshot).unwrap_or_default();
+    let all: Vec<OverlayEntry> = rows
+        .into_iter()
+        .map(|r| entry_from_row(&r.values))
+        .collect();
+    let cancelled = cancelled_overlay_ids(&all);
+    let mut names: Vec<String> = Vec::new();
+    for entry in &all {
+        if !matches!(entry.kind, OverlayKind::GroupingLink) {
+            continue;
+        }
+        if entry.reversed || cancelled.contains(entry.id.as_str()) {
+            continue;
+        }
+        if let Some(catalog) = entry.value.as_deref()
+            && !names.iter().any(|n| n == catalog)
+        {
+            names.push(catalog.to_string());
+        }
+    }
+    names
+}
+
 /// Apply overlay entries to produce the final read value, order-tolerant.
 ///
 /// The convergence rule is:
