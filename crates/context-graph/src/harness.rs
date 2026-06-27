@@ -1,13 +1,12 @@
 //! The capture-harness entry point and its configuration: the four-stage library pipeline
 //! that turns a transcript into fully-typed structured memory and reports how it resolved.
 
-use crate::grounding;
 use crate::ingest::{
     CaptureReport, CaptureRequest, ConversationExtractor, DecisionRelationClassification,
     DecisionRelationRequest, DecisionRelationSeed, EntityIdentityVerdict, EntitySeed,
-    ExtractedEntityType, ExtractionPriorDecision, ExtractionRequest, FlaggedItem,
-    ResolvedIdentityVerdict, ResolvedItemKind, StructuredHarvest, capture_structured_harvest,
-    extraction_prior_decisions, narrow_prior_decisions,
+    ExtractedEntityType, ExtractionPriorDecision, ExtractionRequest, ResolvedIdentityVerdict,
+    ResolvedItemKind, capture_structured_harvest, extraction_prior_decisions,
+    narrow_prior_decisions,
 };
 use crate::{CreateContext, DecisionId, EntityType, Result, Store};
 
@@ -19,19 +18,30 @@ const DEFAULT_RECALL_LIMIT: usize = 5;
 // Evidence-derived decision confidence
 // ---------------------------------------------------------------------------
 
-/// Derive a decision's confidence from its accrued outcomes and persist it.
+/// Derive a decision's confidence from its **broad track record** per ontology Decision §2 and
+/// persist it via `update_decision`. The model supplies no confidence (null at capture); it accrues
+/// here from append-only, immutable evidence — never a model self-report.
 ///
-/// Reads all outcomes for this decision and computes confidence as successes / total.
-/// If there are no outcomes, the decision's confidence is left unchanged.
+/// The track record is three streams of evidence votes, NOT the single active Outcome alone
+/// (Invariant 9 collapses Outcomes to one row, so deriving from the current Outcome cannot tell a
+/// 3-success record from a 1-success/2-failure one):
+///
+///   1. The decision's own direct Outcome — one success or failure vote.
+///   2. The Outcomes of every decision that CITES this one (the CITES precedent walk): a later
+///      decision that built on this one and succeeded is evidence this one held up; one that failed
+///      is evidence against. Each citing decision's active Outcome casts one vote.
+///   3. The count of NON-invalidating Observations on the decision's basis entities — each is a
+///      "survived scrutiny" success vote (an observation that recorded no state change, so it could
+///      not invalidate the decision).
+///
+/// Confidence is `success_votes / total_votes`, so a stronger record yields a strictly higher value
+/// than a weaker one. With no evidence at all the confidence is left unchanged (null stays null).
 pub fn derive_decision_confidence(store: &Store, decision_id: DecisionId) -> Result<()> {
-    // Read all outcomes for this decision
-    let outcomes = store.admin_raw_outcomes_for_decision(decision_id)?;
-    if outcomes.is_empty() {
+    let record = decision_track_record(store, decision_id)?;
+    if record.total == 0 {
         return Ok(());
     }
-    let total = outcomes.len() as f32;
-    let successes = outcomes.iter().filter(|o| o.success).count() as f32;
-    let confidence = successes / total;
+    let confidence = record.successes as f32 / record.total as f32;
     store.update_decision(
         decision_id,
         crate::DecisionPatch {
@@ -40,6 +50,45 @@ pub fn derive_decision_confidence(store: &Store, decision_id: DecisionId) -> Res
         },
     )?;
     Ok(())
+}
+
+/// The accumulated evidence votes for a decision's confidence: total votes cast and how many were
+/// successes. See `derive_decision_confidence` for the three evidence streams.
+struct DecisionTrackRecord {
+    successes: usize,
+    total: usize,
+}
+
+fn decision_track_record(store: &Store, decision_id: DecisionId) -> Result<DecisionTrackRecord> {
+    let mut successes = 0usize;
+    let mut total = 0usize;
+
+    // Stream 1: the decision's own direct Outcome (single active — Invariant 9).
+    for outcome in store.admin_raw_outcomes_for_decision(decision_id)? {
+        total += 1;
+        if outcome.success {
+            successes += 1;
+        }
+    }
+
+    // Stream 2: the Outcomes of decisions that CITE this one (the CITES precedent walk).
+    for citing in store.decisions_citing(decision_id)? {
+        for outcome in store.admin_raw_outcomes_for_decision(citing)? {
+            total += 1;
+            if outcome.success {
+                successes += 1;
+            }
+        }
+    }
+
+    // Stream 3: non-invalidating Observations on the decision's basis entities (survived scrutiny).
+    for entity_id in store.basis_entity_ids_for_decision(decision_id)? {
+        let survived = store.non_invalidating_observation_count(entity_id)?;
+        successes += survived;
+        total += survived;
+    }
+
+    Ok(DecisionTrackRecord { successes, total })
 }
 
 // ---------------------------------------------------------------------------
@@ -346,17 +395,44 @@ pub fn run_capture(
     let context = resolve_capture_context(store, &request.context_label)?;
     let context_id = context.id;
 
-    // Select and apply the learned skills whose description matches this capture, recording a
-    // firing trace for each applied skill (the real input to drift). A stable capture id ties the
-    // firings to this capture.
-    let capture_id = crate::DigestId::new_v7().as_uuid().to_string();
-    let applied_skill_ids: Vec<String> =
-        select_and_apply_learned_skills(store, config, &request, &capture_id);
-    let mut harvest = extractor.extract(ExtractionRequest {
-        context_label: &request.context_label,
-        transcript: &request.transcript,
-        prior_decisions: &[],
-    })?;
+    // A stable capture id ties the firing traces recorded below to this capture. It is prefixed so
+    // it is a plain text identifier (not a bare UUID the store column would coerce to a UUID value).
+    let capture_id = format!("capture-{}", crate::DigestId::new_v7().as_uuid());
+
+    // Stage 1 (extraction). When the caller sets `chunk_window`, the transcript is split into
+    // windows of that size and the extractor is called once per window, with each pass's seeds
+    // accreted into one harvest (the rolling-condensation accumulator, so both ends survive). When
+    // no window is set, the whole transcript is one extraction call. Stage 1 never receives prior
+    // store memory (`prior_decisions` is empty) — it is not a RAG pipeline.
+    // Single-source schema prompt: when the harness owns the whole single-shot extraction prompt
+    // (no caller-managed chunk window), it renders the schema block from the one descriptor and
+    // hands it to the extractor, so even a thin pass-through extractor speaks the descriptor's
+    // contract — the descriptor is the single source of the prompt schema. A caller that manages
+    // its own windowed prompt assembly (it sets `chunk_window`) builds the schema block itself.
+    let schema_prompt_block = match config.chunk_window {
+        Some(_) => None,
+        None => config
+            .schema_descriptor()
+            .map(|descriptor| descriptor.render_prompt_schema_block()),
+    };
+    let mut harvest = extract_windowed_harvest(
+        extractor,
+        &request.context_label,
+        &request.transcript,
+        config.chunk_window,
+        schema_prompt_block.as_deref(),
+    )?;
+
+    // Resolve any raw model-emitted entity-type strings to their typed variant before grounding,
+    // skill application, and structural fill; an out-of-vocab raw string is flagged below.
+    let mut flagged_items = crate::ingest::resolve_raw_entity_types(&mut harvest);
+
+    // Select and apply the learned skills whose description matches this capture (Stage-5 of the
+    // pipeline). Skill selection honors the store-level master switch and review-hold gate; each
+    // selected skill's retype effect is applied to the harvested entity types in place, and a
+    // firing trace is recorded for every selected skill (the real input to drift detection).
+    let applied_skill_ids =
+        select_and_apply_learned_skills(store, &mut harvest, &request.transcript, &capture_id);
 
     // Anchor every capture that produced structured memory but named no entity to a single
     // scope entity for the context, so each capture has a structural anchor and observations
@@ -478,9 +554,17 @@ pub fn run_capture(
         decision.relation = resolve_decision_relation(classified, &decision.text, &narrowed);
     }
 
-    // Deterministic grounding check over the harvested entity seeds (pure string compare,
-    // no model). Flagged items ride the capture report.
-    let flagged_items = grounding_check_entities(&harvest, &request.transcript);
+    // Deterministic grounding check over EVERY harvested value class (entity, decision_type,
+    // agent_id, observation, outcome) — pure string compare, no model — plus the Stage-3
+    // empty-candidate flag. Accumulates onto the raw-type out-of-vocab flags collected above.
+    flagged_items.extend(crate::ingest::grounding_check_harvest(
+        &harvest,
+        &request.transcript,
+    ));
+    flagged_items.extend(crate::ingest::flag_empty_candidate_decisions(
+        &harvest,
+        &all_priors,
+    ));
 
     // Stage 2 + Stage 3 atomic commit: the shared terminal path mints ids/status/embedding
     // with no model, reuses entities by name+context, sets intention catalog grouping, and
@@ -633,44 +717,63 @@ fn resolve_decision_relation(
     })
 }
 
-/// Deterministic grounding check over the entity seeds in a harvest (pure string compare,
-/// never a model call). Returns the items that could not be grounded against the transcript.
-fn grounding_check_entities(harvest: &StructuredHarvest, transcript: &str) -> Vec<FlaggedItem> {
-    let mut flagged = Vec::new();
-    for seed in &harvest.entities {
-        if seed.key.trim().is_empty() || seed.name.trim().is_empty() {
-            continue;
-        }
-        let entity_type: EntityType = seed.entity_type.into();
-        let type_name = format!("{entity_type:?}");
-        if let Some(reason) = grounding::check_entity_grounding(&seed.name, &type_name, transcript)
+/// Select the learned skills whose description matches this capture and apply them, recording a
+/// `cg_skill_firing_trace` row for each applied skill (the real input to drift detection).
+///
+/// The store-level master switch (`cg skills off`) stops all application; the review-hold gate
+/// (`cg skills review`) withholds a freshly promoted skill until acknowledged. Each selected skill's
+/// retype effect is applied to the harvested entity types IN PLACE (the deterministic, model-free
+/// retype the learned rule encodes), so the change is reflected in the stored entity. A firing trace
+/// is recorded for every selected skill — even one whose rule changes no value — so its later
+/// right/wrong record can be tallied. Returns the ids of every selected (applied) skill.
+fn select_and_apply_learned_skills(
+    store: &Store,
+    harvest: &mut crate::ingest::StructuredHarvest,
+    chunk: &str,
+    capture_id: &str,
+) -> Vec<String> {
+    let skills_on = crate::skill_store::skills_enabled(store);
+    let review_mode = crate::skill_store::review_hold_active(store);
+    let selected =
+        crate::skill_store::select_skills_for_chunk(store, chunk, skills_on, review_mode);
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    // Build the harvest's entity types keyed by seed key, so a retype effect can rewrite them in
+    // place. The retype rule names a source type LABEL (e.g. "File"); the stored seed carries the
+    // typed variant, so we round-trip through the label form.
+    let mut entity_types_by_key: std::collections::HashMap<String, (String, String)> = harvest
+        .entities
+        .iter()
+        .map(|seed| {
+            let entity_type: EntityType = seed.entity_type.into();
+            (
+                seed.key.clone(),
+                (seed.name.clone(), format!("{entity_type:?}")),
+            )
+        })
+        .collect();
+
+    let _effects = crate::skill_store::apply_retype_skills(&selected, &mut entity_types_by_key);
+
+    // Write any retyped labels back onto the harvest entity seeds so the new type is what gets
+    // stored. A label the conversion does not recognize leaves the seed unchanged.
+    for seed in &mut harvest.entities {
+        if let Some((_, type_label)) = entity_types_by_key.get(&seed.key)
+            && let Some(resolved) = crate::store::convert::entity_type_from_label(type_label)
         {
-            flagged.push(FlaggedItem {
-                key: seed.key.clone(),
-                reason: format!("{reason:?}: entity '{}' (type={})", seed.name, type_name),
-            });
+            seed.entity_type = crate::ingest::extracted_entity_type_from(resolved);
         }
     }
-    flagged
-}
 
-/// Select the learned skills whose description matches this capture and apply them, recording a
-/// `cg_skill_firing_trace` row for each applied skill (the real input to drift detection). Skills
-/// held for review (when `cg skills review` is on) must NOT apply on the live path until
-/// acknowledged; with the master switch off, none apply.
-///
-/// SCAFFOLD STUB (deliberately wrong): this does NOTHING — it never reads `cg_learned_skills`, never
-/// matches descriptions, never applies an effect, and never records a firing trace. So a capture
-/// where a matching promoted skill SHOULD apply leaves `applied_skill_ids` empty, the captured value
-/// unchanged, and `cg_skill_firing_trace` empty — the Surface E/F/H tests fail on assertion.
-fn select_and_apply_learned_skills(
-    _store: &Store,
-    _config: &CaptureHarnessConfig,
-    _request: &CaptureRequest,
-    _capture_id: &str,
-) -> Vec<String> {
-    // Wrong: no skill is ever selected, applied, or recorded as fired.
-    Vec::new()
+    // Record a firing trace for every selected skill (the drift input), and report them all applied.
+    let mut applied_skill_ids = Vec::with_capacity(selected.len());
+    for skill in &selected {
+        crate::skill_store::record_firing(store, &skill.id, capture_id);
+        applied_skill_ids.push(skill.id.clone());
+    }
+    applied_skill_ids
 }
 
 /// Render the config knobs honored on this capture, for the report's introspection field.
@@ -693,6 +796,60 @@ fn decision_relation_from_classification(
         DecisionRelationClassification::RefinesExisting => DecisionRelation::Refines,
         DecisionRelationClassification::ConflictsExisting => DecisionRelation::Conflicts,
         DecisionRelationClassification::SupersedesExisting => DecisionRelation::Supersedes,
+    }
+}
+
+/// Run Stage-1 extraction, honoring the configured chunk window.
+///
+/// With no window the whole transcript is one extraction call (the default path). With a window the
+/// transcript is split into windows of that size and the extractor is called once per window; each
+/// pass's seeds are accreted into a single harvest via `RollingCaptureAccumulator`, which pins every
+/// pass's own items (so the early and late ends both survive condensation) and carries a bounded
+/// running summary forward as the prior context for the next window. A window that produces no
+/// non-empty chunks (or a single chunk) collapses to one extraction call.
+fn extract_windowed_harvest(
+    extractor: &dyn ConversationExtractor,
+    context_label: &str,
+    transcript: &str,
+    chunk_window: Option<usize>,
+    schema_prompt_block: Option<&str>,
+) -> Result<crate::ingest::StructuredHarvest> {
+    let windows = match chunk_window {
+        Some(window) => crate::ingest::split_transcript_into_windows(transcript, window),
+        None => Vec::new(),
+    };
+    // No window configured, or the transcript fits in one window: a single extraction call over
+    // the whole transcript (the default behavior — exactly one Stage-1 call). When the harness owns
+    // the prompt (no caller-managed window), the descriptor's schema block prefixes the extractor
+    // input so the model is told the harvestable shape from the single source.
+    if windows.len() <= 1 {
+        return extractor.extract(ExtractionRequest {
+            context_label,
+            transcript: &with_schema_block(schema_prompt_block, transcript),
+            prior_decisions: &[],
+        });
+    }
+    // More than one window: one extraction call per window, accreted into one harvest.
+    let mut rolling = crate::ingest::RollingCaptureAccumulator::new(16_000);
+    for window in windows {
+        let chunk_prompt = rolling.chunk_prompt(window);
+        let harvest = extractor.extract(ExtractionRequest {
+            context_label,
+            transcript: &with_schema_block(schema_prompt_block, &chunk_prompt),
+            prior_decisions: &[],
+        })?;
+        rolling.push_harvest(harvest);
+    }
+    Ok(rolling.into_harvest())
+}
+
+/// Prefix the single-source schema prompt block onto the extractor's chunk input when present, so
+/// the descriptor is the one source telling the model the harvestable shape. Absent (the caller
+/// manages its own prompt), the chunk input is unchanged.
+fn with_schema_block(schema_prompt_block: Option<&str>, transcript: &str) -> String {
+    match schema_prompt_block {
+        Some(block) => format!("{block}\n{transcript}"),
+        None => transcript.to_string(),
     }
 }
 

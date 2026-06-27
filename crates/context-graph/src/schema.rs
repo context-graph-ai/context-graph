@@ -197,7 +197,7 @@ pub const TABLES: &[TableSpec] = &[
     // been acted on. Items persist here until explicitly resolved via act_on_item.
     TableSpec {
         name: "cg_pending_review_items",
-        ddl: "CREATE TABLE cg_pending_review_items (id TEXT PRIMARY KEY, acted_on BOOLEAN NOT NULL DEFAULT false, created_at TXID NOT NULL)",
+        ddl: "CREATE TABLE cg_pending_review_items (id TEXT PRIMARY KEY, acted_on BOOLEAN NOT NULL DEFAULT false, content TEXT, legal_vocab TEXT, created_at TXID NOT NULL)",
     },
 ];
 

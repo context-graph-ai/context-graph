@@ -771,7 +771,19 @@ impl Store {
             .map_err(map_engine_err)?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
-            out.push(decode_intention(&result.columns, row)?);
+            let mut intention = decode_intention(&result.columns, row)?;
+            // Two-layer read merge: a confirmed grouping links the intention to a canonical catalog
+            // entry as an additive overlay. Override the read-view `blueprint_catalog_id` with the
+            // grouped catalog while leaving the raw `intentions` row untouched (Invariant 3);
+            // `admin_raw_scan_intention_rows` still returns the raw ungrouped row.
+            let overlay = crate::overlay::list_overlay_entries_for_item(
+                self,
+                &intention.id.as_uuid().to_string(),
+            );
+            if let Some(catalog) = crate::overlay::grouped_catalog_for_item(&overlay) {
+                intention.blueprint_catalog_id = Some(catalog);
+            }
+            out.push(intention);
         }
         Ok(out)
     }

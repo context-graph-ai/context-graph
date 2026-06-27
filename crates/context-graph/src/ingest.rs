@@ -122,6 +122,11 @@ pub struct CapturedOutcomeInfo {
 pub struct FlaggedItem {
     pub key: String,
     pub reason: String,
+    /// For a CLOSED-VOCABULARY flag (an entity type or a decision type), the legal value set the
+    /// correction must be chosen from — so `cg why @<id>` can resolve the item by its id and present
+    /// the named set. `None` for a free-text (open) flag (agent_id / observation / outcome), whose
+    /// correction is not constrained to a vocabulary.
+    pub legal_vocab: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -254,13 +259,12 @@ pub struct EntitySeed {
     #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub entity_type: ExtractedEntityType,
     /// The RAW model-emitted entity-type STRING, when the model reports the type as free text
-    /// (the Stage-1 JSON shape: `"entity_type": "Repository"`). When present, capture must resolve
-    /// it to the right `EntityType` variant through the live `entity_type_from_str` conversion and
-    /// flag it as out-of-vocab when the string is not recognized — never silently coerce it to a
-    /// default. SCAFFOLD STUB: the current capture path ignores this field (it uses the typed
-    /// `entity_type` only), so a raw `"module"` lands as the default `File` and a raw `"wormhole"`
-    /// is silently dropped rather than flagged — the deliberately-wrong behavior the Surface-A
-    /// from_str test fails on by assertion.
+    /// (the Stage-1 JSON shape: `"entity_type": "Repository"`). When present, capture resolves it to
+    /// the matching `EntityType` variant through the live `entity_type_from_str` conversion (in
+    /// `resolve_raw_entity_types`, run before grounding and structural fill): a recognized string
+    /// (e.g. `"module"` → `Module`) overrides the typed `entity_type`, and an unrecognized string
+    /// (e.g. `"wormhole"`) is flagged out-of-vocab — never silently coerced to a default and never
+    /// silently dropped.
     #[serde(default)]
     pub entity_type_raw: Option<String>,
     /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
@@ -390,6 +394,23 @@ pub struct DecisionSeed {
     /// From model extraction — properties.
     #[serde(default)]
     pub properties: serde_json::Value,
+    /// Verbatim supporting span justifying the `decision_type` closed-vocab label — a quote from the
+    /// chunk. The deterministic grounding check (Stage 1.5) reads it: a `decision_type` whose span is
+    /// absent, out-of-vocab, mislabeled, or ambiguous is flagged. When absent, the `decision_type` is
+    /// unverified metadata (not grounded).
+    #[serde(default)]
+    pub decision_type_span: Option<ExtractedSpan>,
+    /// Closed-vocab labels the `decision_type` span supports as well as (or instead of) the chosen
+    /// label. One competing label that differs from the chosen one means the span supports a
+    /// different label (mislabel); two or more means the span is ambiguous. The grounding check is
+    /// the verdict-holder — the model only supplies the span and the labels it reads from it.
+    #[serde(default)]
+    pub decision_type_competing_labels: Vec<String>,
+    /// Verbatim supporting span justifying the `agent_id` — a quote from the chunk naming the agent.
+    /// When absent, the `agent_id` is unverified metadata (not grounded); when present and absent
+    /// from the chunk, the agent_id is flagged (a fabricated attribution).
+    #[serde(default)]
+    pub agent_id_span: Option<ExtractedSpan>,
     /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
     /// under the emitted context instead of the capture context (cross-tenant leak). The
     /// correct impl ignores this field and always uses the capture context.
@@ -438,6 +459,11 @@ pub struct ObservationSeed {
     /// From model extraction — state_delta.
     #[serde(default)]
     pub state_delta: serde_json::Value,
+    /// Verbatim supporting span justifying this observation's value — a quote from the chunk. The
+    /// grounding check reads it: an observation whose claimed span is absent from the chunk is
+    /// flagged (a fabricated observation). When absent, the observation value is not span-grounded.
+    #[serde(default)]
+    pub value_span: Option<ExtractedSpan>,
     /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
     /// under the emitted context instead of the capture context (cross-tenant leak). The
     /// correct impl ignores this field and always uses the capture context.
@@ -457,6 +483,11 @@ pub struct OutcomeSeed {
     pub success: bool,
     #[serde(default)]
     pub notes: String,
+    /// Verbatim supporting span justifying this outcome's value — a quote from the chunk. The
+    /// grounding check reads it: an outcome whose claimed span is absent from the chunk is flagged
+    /// (a fabricated outcome). When absent, the outcome value is not span-grounded.
+    #[serde(default)]
+    pub value_span: Option<ExtractedSpan>,
     /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
     /// under the emitted context instead of the capture context (cross-tenant leak). The
     /// correct impl ignores this field and always uses the capture context.
@@ -925,6 +956,9 @@ fn record_conversation_internal(
         transcript: text,
         prior_decisions: &prior_decisions,
     })?;
+    // Resolve any raw model-emitted entity-type strings to their typed variant before grounding and
+    // structural fill; an out-of-vocab raw string is flagged here (never silently coerced).
+    let mut flagged_items = resolve_raw_entity_types(&mut harvest);
     prepare_harvest_for_capture(
         store,
         context.id,
@@ -933,14 +967,48 @@ fn record_conversation_internal(
         &prior_decisions,
         &tagger,
     )?;
-    // Run deterministic grounding check before consuming the harvest.
-    let flagged_items = grounding_check_harvest(&harvest, text);
+    // Run the deterministic grounding check over every value class before consuming the harvest,
+    // plus the Stage-3 empty-candidate-set flag for a decision that needed a candidate and found none.
+    flagged_items.extend(grounding_check_harvest(&harvest, text));
+    flagged_items.extend(flag_empty_candidate_decisions(&harvest, &prior_decisions));
     let mut report =
         capture_structured_harvest(store, context.id, &request.context_label, text, harvest)?
             .report;
     report.model_usage = tagger.drain_model_usage();
+    // Persist each flagged item as a pending review item so `cg review` surfaces it from store state
+    // until it is acted on (it survives intervening confident captures and cursor advances).
+    crate::review_surface::register_flagged_items(store, &flagged_items);
     report.flagged_items = flagged_items;
     Ok(report)
+}
+
+/// Flag the Stage-3 empty-candidate-set fact: a decision that needed a candidate to resolve against —
+/// it carries neither a basis entity in this harvest nor any prior decision in the store — has an
+/// empty candidate set, which is a deterministic flag (no model call). A decision anchored by a
+/// harvested entity, or with prior decisions available to narrow, is not flagged here.
+pub(crate) fn flag_empty_candidate_decisions(
+    harvest: &StructuredHarvest,
+    prior_decisions: &[ExtractionPriorDecision],
+) -> Vec<FlaggedItem> {
+    let mut flagged = Vec::new();
+    if !prior_decisions.is_empty() || !harvest.entities.is_empty() {
+        return flagged;
+    }
+    for seed in &harvest.decisions {
+        if seed.key.trim().is_empty() || seed.text.trim().is_empty() {
+            continue;
+        }
+        flagged.push(FlaggedItem {
+            key: format!("{}_resolution", seed.key),
+            reason: format!(
+                "{:?}: decision '{}' had no candidate to resolve against (no basis entity, no prior decision)",
+                grounding::FlagReason::EmptyCandidateSet,
+                seed.text
+            ),
+            legal_vocab: None,
+        });
+    }
+    flagged
 }
 
 pub fn import_conversation_text_with_extractor(
@@ -1176,6 +1244,21 @@ impl RollingCaptureAccumulator {
         }
     }
 
+    /// Consume the accumulator and return the merged harvest accreted across every pushed pass.
+    /// The harness path uses this when it has windowed extraction itself and wants the single
+    /// merged harvest to drive the rest of its pipeline (grounding, identity resolution, atomic
+    /// structural fill), rather than `finish_capture`'s self-contained one-shot store write.
+    pub fn into_harvest(mut self) -> StructuredHarvest {
+        if self.harvest.summary.as_deref().is_none_or(str::is_empty) {
+            self.harvest.summary = Some(if self.summary.trim().is_empty() {
+                "condensed capture".to_string()
+            } else {
+                self.summary
+            });
+        }
+        self.harvest
+    }
+
     pub fn finish_capture(
         self,
         store: &Store,
@@ -1268,9 +1351,22 @@ impl ConversationExtractor for OneShotRollingExtractor<'_> {
     }
 }
 
-fn stream_text_chunks<F>(text: &str, chunk_window: usize, mut on_chunk: F) -> Result<usize>
+/// Split a transcript into windows of at most `chunk_window` bytes, on char boundaries, dropping
+/// any empty windows. The harness (`run_capture`) uses this when `CaptureHarnessConfig.chunk_window`
+/// is set so a long transcript drives one Stage-1 extraction call per window — the same windowing
+/// `stream_text_chunks` performs for the rolling import path, exposed for the harness path.
+pub fn split_transcript_into_windows(text: &str, chunk_window: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let _ = stream_text_chunks(text, chunk_window, |chunk| {
+        chunks.push(chunk);
+        Ok(())
+    });
+    chunks
+}
+
+fn stream_text_chunks<'a, F>(text: &'a str, chunk_window: usize, mut on_chunk: F) -> Result<usize>
 where
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(&'a str) -> Result<()>,
 {
     let mut rest = text;
     let mut chunks = 0;
@@ -1824,11 +1920,93 @@ fn validate_harvest_relations(
     Ok(())
 }
 
-/// Run the deterministic grounding check over the entity seeds in a harvest.
-/// Returns the list of items that could not be grounded against the transcript.
-/// The flag predicate is purely textual — it never calls a model.
-fn grounding_check_harvest(harvest: &StructuredHarvest, transcript: &str) -> Vec<FlaggedItem> {
+/// The default closed vocabulary of `decision_type` labels the grounding check measures a model's
+/// `decision_type` against. A `decision_type` not in this set is flagged out-of-vocab. This is the
+/// `decision_type` analogue of the entity-type vocabulary single source; a later plan can widen it
+/// per tenant without touching the grounding logic.
+pub(crate) fn default_decision_type_vocabulary() -> &'static [&'static str] {
+    &[
+        "technology_choice",
+        "architecture",
+        "api_design",
+        "infrastructure",
+        "security",
+        "security_policy",
+        "monitoring_threshold",
+        "storage_choice",
+        "policy",
+        "process",
+        "change",
+    ]
+}
+
+/// Resolve any RAW model-emitted entity-type strings on a harvest's entity seeds to their typed
+/// variant through the canonical conversion, in place. An entity whose raw type string is recognized
+/// has its typed `entity_type` set to the resolved variant; one whose raw string is out of vocabulary
+/// is left at its default and reported here so the caller can flag it (never silently coerced). Runs
+/// before grounding and structural fill so the resolved type is what gets stored.
+pub(crate) fn resolve_raw_entity_types(harvest: &mut StructuredHarvest) -> Vec<FlaggedItem> {
     let mut flagged = Vec::new();
+    for seed in &mut harvest.entities {
+        let Some(raw) = seed.entity_type_raw.as_ref().map(|s| s.trim().to_string()) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        match crate::store::convert::entity_type_from_label(&raw) {
+            Some(resolved) => {
+                seed.entity_type = extracted_entity_type_from(resolved);
+            }
+            None => {
+                flagged.push(FlaggedItem {
+                    key: seed.key.clone(),
+                    reason: format!(
+                        "{:?}: entity '{}' raw type '{}' is not in the closed entity-type vocabulary",
+                        grounding::FlagReason::OutOfVocab,
+                        seed.name,
+                        raw
+                    ),
+                    legal_vocab: Some(grounding::legal_entity_type_names()),
+                });
+            }
+        }
+    }
+    flagged
+}
+
+/// Map a resolved `EntityType` back to the `ExtractedEntityType` the harvest seed carries (the two
+/// enums are 1:1 over the 13 closed variants), so a raw-string-resolved type rides the existing
+/// structural-fill path unchanged.
+pub(crate) fn extracted_entity_type_from(entity_type: EntityType) -> ExtractedEntityType {
+    match entity_type {
+        EntityType::Service => ExtractedEntityType::Service,
+        EntityType::Person => ExtractedEntityType::Person,
+        EntityType::Device => ExtractedEntityType::Device,
+        EntityType::Module => ExtractedEntityType::Module,
+        EntityType::Repository => ExtractedEntityType::Repository,
+        EntityType::Configuration => ExtractedEntityType::Configuration,
+        EntityType::Infrastructure => ExtractedEntityType::Infrastructure,
+        EntityType::Location => ExtractedEntityType::Location,
+        EntityType::File => ExtractedEntityType::File,
+        EntityType::Pipeline => ExtractedEntityType::Pipeline,
+        EntityType::Database => ExtractedEntityType::Database,
+        EntityType::Team => ExtractedEntityType::Team,
+        EntityType::Document => ExtractedEntityType::Document,
+    }
+}
+
+/// Run the deterministic grounding check over EVERY extracted value class in a harvest (entity,
+/// decision_type, agent_id, observation, outcome) — pure string comparison, zero model calls. The
+/// flag signal is a function of (span, chunk, value, vocab, competing labels); the model's confidence
+/// is never consulted. Returns the items that could not be grounded against the transcript.
+pub(crate) fn grounding_check_harvest(
+    harvest: &StructuredHarvest,
+    transcript: &str,
+) -> Vec<FlaggedItem> {
+    let mut flagged = Vec::new();
+
+    // Entities (name + chosen type), as before.
     for seed in &harvest.entities {
         if seed.key.trim().is_empty() || seed.name.trim().is_empty() {
             continue;
@@ -1839,10 +2017,121 @@ fn grounding_check_harvest(harvest: &StructuredHarvest, transcript: &str) -> Vec
             flagged.push(FlaggedItem {
                 key: seed.key.clone(),
                 reason: format!("{reason:?}: entity '{}' (type={})", seed.name, type_name),
+                legal_vocab: Some(grounding::legal_entity_type_names()),
             });
         }
     }
+
+    let decision_vocab: Vec<String> = default_decision_type_vocabulary()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    for seed in &harvest.decisions {
+        if seed.key.trim().is_empty() {
+            continue;
+        }
+        // decision_type — a closed-vocab value justified by a verbatim span (the decision phrase).
+        if let Some(decision_type) = seed.decision_type.as_ref().map(|f| f.as_str().to_string())
+            && !decision_type.is_empty()
+        {
+            let verdict = grounding::full_grounding_check(&grounding::GroundingInput {
+                value: decision_type.clone(),
+                cited_span: span_text(seed.decision_type_span.as_ref()),
+                chunk: transcript.to_string(),
+                model_confidence: 1.0,
+                vocab: Some(decision_vocab.clone()),
+                label: Some(decision_type.clone()),
+                competing_labels: seed.decision_type_competing_labels.clone(),
+            });
+            if let grounding::GroundingVerdict::Flagged(reason) = verdict {
+                flagged.push(FlaggedItem {
+                    key: format!("{}_decision_type", seed.key),
+                    reason: format!(
+                        "{reason:?}: decision_type '{}' (span={:?})",
+                        decision_type,
+                        seed.decision_type_span
+                            .as_ref()
+                            .and_then(|s| s.text.clone())
+                            .unwrap_or_default()
+                    ),
+                    legal_vocab: Some(decision_vocab.clone()),
+                });
+            }
+        }
+        // agent_id — only span-grounded when the model claims a quote; absent span = metadata.
+        if let Some(agent_id) = seed.agent_id.as_ref()
+            && !agent_id.is_empty()
+            && let Some(span) = span_text(seed.agent_id_span.as_ref())
+        {
+            let verdict = grounding::full_grounding_check(&grounding::GroundingInput {
+                value: agent_id.clone(),
+                cited_span: Some(span),
+                chunk: transcript.to_string(),
+                ..Default::default()
+            });
+            if let grounding::GroundingVerdict::Flagged(reason) = verdict {
+                flagged.push(FlaggedItem {
+                    key: format!("{}_agent_id", seed.key),
+                    reason: format!("{reason:?}: agent_id '{agent_id}'"),
+                    legal_vocab: None,
+                });
+            }
+        }
+    }
+
+    // Observations — span-grounded when the model claims a quote.
+    for seed in &harvest.observations {
+        if seed.key.trim().is_empty() {
+            continue;
+        }
+        if let Some(span) = span_text(seed.value_span.as_ref()) {
+            let verdict = grounding::full_grounding_check(&grounding::GroundingInput {
+                value: seed.text.clone(),
+                cited_span: Some(span),
+                chunk: transcript.to_string(),
+                ..Default::default()
+            });
+            if let grounding::GroundingVerdict::Flagged(reason) = verdict {
+                flagged.push(FlaggedItem {
+                    key: format!("{}_observation", seed.key),
+                    reason: format!("{reason:?}: observation '{}'", seed.text),
+                    legal_vocab: None,
+                });
+            }
+        }
+    }
+
+    // Outcomes — span-grounded when the model claims a quote.
+    for seed in &harvest.outcomes {
+        if seed.key.trim().is_empty() {
+            continue;
+        }
+        if let Some(span) = span_text(seed.value_span.as_ref()) {
+            let verdict = grounding::full_grounding_check(&grounding::GroundingInput {
+                value: seed.notes.clone(),
+                cited_span: Some(span),
+                chunk: transcript.to_string(),
+                ..Default::default()
+            });
+            if let grounding::GroundingVerdict::Flagged(reason) = verdict {
+                flagged.push(FlaggedItem {
+                    key: format!("{}_outcome", seed.key),
+                    reason: format!("{reason:?}: outcome '{}'", seed.notes),
+                    legal_vocab: None,
+                });
+            }
+        }
+    }
+
     flagged
+}
+
+/// Extract the verbatim span text from an optional `ExtractedSpan`, treating an empty quote as no
+/// span (the grounding check then flags it MissingSpan).
+fn span_text(span: Option<&ExtractedSpan>) -> Option<String> {
+    span.and_then(|s| s.text.clone())
+        .filter(|text| !text.is_empty())
 }
 
 pub(crate) fn capture_structured_harvest(
@@ -4649,6 +4938,10 @@ pub(crate) fn narrow_prior_decisions(
             let overlap = query_tokens.intersection(&prior_tokens).count();
             (overlap, order, prior)
         })
+        // A candidate set is the NEAR neighbours, not the whole store: a prior with zero
+        // distinguishing-token overlap is a far/irrelevant row and is excluded outright (a positive
+        // exclusion), so the judge never sees the whole store.
+        .filter(|(overlap, _, _)| *overlap > 0)
         .collect();
     // Highest overlap first; tie-break by original order (priors arrive most-recent-first).
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));

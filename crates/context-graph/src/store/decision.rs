@@ -267,7 +267,7 @@ impl Store {
         if result.rows.is_empty() {
             return Ok(None);
         }
-        let mut decision = decode_decision(&result.columns, &result.rows[0])?;
+        let mut decision = decode_decision_raw(&result.columns, &result.rows[0])?;
         decision.intention_ids = self.intentions_for_decision(id)?;
         decision.based_on_snapshots = self.basis_snapshots_for_decision(id)?;
         decision.outcome = self.outcome_for_decision(id)?;
@@ -543,6 +543,59 @@ impl Store {
         Ok(targets.into_iter().map(DecisionId::from).collect())
     }
 
+    /// The decisions that CITE this one (the reverse of the CITES precedent edge): every later
+    /// decision whose `precedent_ids` included `id`. Used by the evidence-derived confidence walk —
+    /// a cited decision's confidence accrues from the outcomes of the decisions that built on it.
+    pub(crate) fn decisions_citing(&self, id: DecisionId) -> Result<Vec<DecisionId>> {
+        let params: HashMap<String, Value> = [
+            ("target_id".to_string(), Value::Uuid(id.as_uuid())),
+            ("edge_type".to_string(), Value::Text("CITES".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT source_id FROM edges WHERE target_id = $target_id AND edge_type = $edge_type",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if let Some(Value::Uuid(u)) = row.first() {
+                out.push(DecisionId::from(*u));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The basis entities this decision is BASED_ON, read from `decision_basis_snapshots`. Used by
+    /// the evidence-derived confidence walk to count the non-invalidating Observations that show the
+    /// decision's basis survived scrutiny (Decision §2).
+    pub(crate) fn basis_entity_ids_for_decision(&self, id: DecisionId) -> Result<Vec<EntityId>> {
+        let params: HashMap<String, Value> =
+            [("decision_id".to_string(), Value::Uuid(id.as_uuid()))]
+                .into_iter()
+                .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT entity_id FROM decision_basis_snapshots WHERE decision_id = $decision_id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if let Some(Value::Uuid(u)) = row.first() {
+                let entity = EntityId::from(*u);
+                if !out.contains(&entity) {
+                    out.push(entity);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn precedents_for_decision_at_read(
         &self,
         id: DecisionId,
@@ -780,15 +833,27 @@ impl Store {
     ) -> Result<Vec<Decision>> {
         let mut decisions = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut decision = decode_decision(columns, row)?;
-            decision.intention_ids =
-                self.intentions_for_decision_at_read(decision.id, decision.context_id, snapshot)?;
-            decision.based_on_snapshots =
-                self.basis_snapshot_ids_for_decision_at_read(decision.id, snapshot)?;
-            decision.outcome = self.outcome_for_decision_at_read(decision.id, snapshot)?;
-            decision.precedent_ids =
-                self.precedents_for_decision_at_read(decision.id, decision.context_id, snapshot)?;
-            decisions.push(decision);
+            // `decode_decision` folds the item's append-only overlay over the raw row: it yields an
+            // empty result for a dropped item (excluded from the read view) and a corrected
+            // description for a corrected one, leaving the raw `decisions` row byte-unchanged. The
+            // (0-or-1) result iterates without a row-filter call, so this hydration loop stays a
+            // pure row projection. `get_decision`/`admin_raw_*` decode the raw row and never merge.
+            for mut decision in decode_decision(self, columns, row)? {
+                decision.intention_ids = self.intentions_for_decision_at_read(
+                    decision.id,
+                    decision.context_id,
+                    snapshot,
+                )?;
+                decision.based_on_snapshots =
+                    self.basis_snapshot_ids_for_decision_at_read(decision.id, snapshot)?;
+                decision.outcome = self.outcome_for_decision_at_read(decision.id, snapshot)?;
+                decision.precedent_ids = self.precedents_for_decision_at_read(
+                    decision.id,
+                    decision.context_id,
+                    snapshot,
+                )?;
+                decisions.push(decision);
+            }
         }
         Ok(decisions)
     }
@@ -1457,7 +1522,7 @@ impl Store {
                 missing: Some("decision"),
             });
         };
-        let mut decision = decode_decision(&decision_rows.columns, row)?;
+        let mut decision = decode_decision_raw(&decision_rows.columns, row)?;
         decision.based_on_snapshots = self.basis_snapshot_ids_for_decision_at_read(id, snapshot)?;
         decision.intention_ids =
             self.intentions_for_decision_at_read(id, decision.context_id, snapshot)?;
@@ -1929,7 +1994,26 @@ fn decode_decision_reasoning_producer_snapshot(
     })
 }
 
-fn decode_decision(columns: &[String], row: &[Value]) -> Result<Decision> {
+/// Decode a `decisions` row and fold the item's append-only overlay over the read view.
+///
+/// Returns an empty vector when an active Drop overlay excludes the item, and a single
+/// correction-applied `Decision` otherwise. The raw row is never mutated; the merge is a pure
+/// read-time projection (Invariant 3). This is the discovery read path's decoder; the raw decoder
+/// `decode_decision_raw` (used by `get_decision`/`replay`) returns the byte-unchanged row.
+fn decode_decision(store: &Store, columns: &[String], row: &[Value]) -> Result<Vec<Decision>> {
+    let mut decision = decode_decision_raw(columns, row)?;
+    let overlay =
+        crate::overlay::overlay_read_decision_for_item(store, &decision.id.as_uuid().to_string());
+    if overlay.dropped {
+        return Ok(Vec::new());
+    }
+    if let Some(corrected) = overlay.corrected_value {
+        decision.description = corrected;
+    }
+    Ok(vec![decision])
+}
+
+fn decode_decision_raw(columns: &[String], row: &[Value]) -> Result<Decision> {
     let reasoning_json = get_json(row, columns, "reasoning")?;
     let reasoning: Vec<ReasoningStep> = match reasoning_json {
         JsonValue::Null => Vec::new(),

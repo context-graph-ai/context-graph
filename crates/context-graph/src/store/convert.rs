@@ -224,6 +224,15 @@ pub(super) fn entity_type_str(et: EntityType) -> &'static str {
     }
 }
 
+/// Resolve a RAW model-emitted entity-type label (any case, e.g. `"module"`, `"Repository"`) to its
+/// `EntityType` variant through the canonical `entity_type_from_str` conversion. Returns `None` for a
+/// label the closed vocabulary does not recognize (e.g. `"wormhole"`) — the caller flags it
+/// out-of-vocab rather than silently coercing it to a default. This is the single conversion the
+/// capture path routes a model string through (per the schema-descriptor / grounding single source).
+pub(crate) fn entity_type_from_label(s: &str) -> Option<EntityType> {
+    entity_type_from_str(&s.trim().to_ascii_uppercase()).ok()
+}
+
 pub(super) fn entity_type_from_str(s: &str) -> Result<EntityType> {
     match s {
         "SERVICE" => Ok(EntityType::Service),
