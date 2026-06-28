@@ -26,6 +26,20 @@ pub struct UnderstandingRequest {
     pub paid: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OutputContract {
+    #[default]
+    Unconstrained,
+    Schema(String),
+}
+
+impl UnderstandingRequest {
+    #[must_use]
+    pub fn with_output_contract(self, _contract: OutputContract) -> Self {
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ModelInvocation {

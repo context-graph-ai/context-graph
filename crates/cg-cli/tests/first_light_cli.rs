@@ -2,7 +2,7 @@ mod support;
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
@@ -52,6 +52,17 @@ fn assert_record_contains(output: &CommandOutput, expected: &str) {
     assert_eq!(
         json.pointer("/captured/decisions").and_then(Value::as_u64),
         Some(1),
+        "{text}"
+    );
+}
+
+fn assert_record_observation_count(output: &CommandOutput, expected: u64) {
+    let text = combined(output);
+    let json = output_json(output).expect("record output json");
+    assert_eq!(
+        json.pointer("/captured/observations")
+            .and_then(Value::as_u64),
+        Some(expected),
         "{text}"
     );
 }
@@ -225,6 +236,847 @@ fn spawn_one_shot_chat_completion_server(
             .expect("write provider response");
     });
     (format!("http://{address}/v1"), rx)
+}
+
+#[derive(Clone)]
+struct ChatCompletionStubResponse {
+    status: u16,
+    body: Value,
+}
+
+impl ChatCompletionStubResponse {
+    fn ok_content(content: impl Into<String>, prompt_tokens: u64, completion_tokens: u64) -> Self {
+        Self {
+            status: 200,
+            body: chat_completion_body(
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": content.into(),
+                }),
+                "stop",
+                prompt_tokens,
+                completion_tokens,
+            ),
+        }
+    }
+
+    fn raw(status: u16, body: Value) -> Self {
+        Self { status, body }
+    }
+}
+
+struct HostedCapture {
+    harness: CliHarness,
+    output: CommandOutput,
+    requests: Vec<String>,
+}
+
+fn chat_completion_body(
+    message: Value,
+    finish_reason: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Value {
+    serde_json::json!({
+        "id": "chatcmpl-cli-sequence",
+        "object": "chat.completion",
+        "created": 1766019000,
+        "model": "local-vllm/test-model",
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    })
+}
+
+fn spawn_chat_completion_sequence_server(
+    responses: Vec<ChatCompletionStubResponse>,
+) -> (String, mpsc::Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hosted provider fixture");
+    listener
+        .set_nonblocking(true)
+        .expect("sequence listener nonblocking");
+    let address = listener.local_addr().expect("hosted provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for response in responses {
+            let Some(mut stream) = accept_sequence_request(&listener) else {
+                break;
+            };
+            requests.push(read_http_request(&mut stream));
+            write_http_response(&mut stream, response.status, &response.body);
+        }
+        let _ = tx.send(requests);
+    });
+    (format!("http://{address}/v1"), rx)
+}
+
+fn accept_sequence_request(listener: &TcpListener) -> Option<TcpStream> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return Some(stream),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+    let mut first_line = String::new();
+    reader
+        .read_line(&mut first_line)
+        .expect("read provider request line");
+    let mut request = first_line;
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).expect("read provider header");
+        if bytes == 0 || line == "\r\n" {
+            request.push_str("\r\n");
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().unwrap_or(0);
+        }
+        request.push_str(&line);
+    }
+    if content_length > 0 {
+        let mut request_body = vec![0; content_length];
+        reader
+            .read_exact(&mut request_body)
+            .expect("read provider request body");
+        request.push_str(&String::from_utf8_lossy(&request_body));
+    }
+    request
+}
+
+fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) {
+    let body = body.to_string();
+    let reason = if status == 400 { "Bad Request" } else { "OK" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .expect("write provider response");
+}
+
+fn hosted_requests(rx: mpsc::Receiver<Vec<String>>) -> Vec<String> {
+    rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default()
+}
+
+fn hosted_request_body(request: &str) -> Value {
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("hosted request must include a body separator");
+    serde_json::from_str(body).expect("hosted request body JSON")
+}
+
+fn strict_response_format_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema.clone();
+    };
+
+    let mut transformed = object.clone();
+    if let Some(Value::Object(properties)) = object.get("properties") {
+        transformed.insert("additionalProperties".to_string(), Value::Bool(false));
+        transformed.insert(
+            "properties".to_string(),
+            Value::Object(
+                properties
+                    .iter()
+                    .map(|(name, property)| (name.clone(), strict_response_format_schema(property)))
+                    .collect(),
+            ),
+        );
+        transformed.insert(
+            "required".to_string(),
+            Value::Array(properties.keys().cloned().map(Value::String).collect()),
+        );
+    }
+    if let Some(items) = object.get("items") {
+        transformed.insert("items".to_string(), strict_response_format_schema(items));
+    }
+
+    Value::Object(transformed)
+}
+
+fn normalize_required_sets(schema: &Value) -> Value {
+    match schema {
+        Value::Object(object) => {
+            let mut normalized = serde_json::Map::new();
+            for (key, value) in object {
+                if key == "required" {
+                    let mut required = value.as_array().cloned().unwrap_or_default();
+                    required.sort_by_key(|item| item.as_str().unwrap_or_default().to_owned());
+                    normalized.insert(key.clone(), Value::Array(required));
+                } else {
+                    normalized.insert(key.clone(), normalize_required_sets(value));
+                }
+            }
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(normalize_required_sets).collect()),
+        _ => schema.clone(),
+    }
+}
+
+fn assert_response_format_schema_request(request: &str) {
+    let body = hosted_request_body(request);
+    let fixture_schema = fixture_value(include_str!("fixtures/fixture_output_schema.json"));
+    let expected_schema = strict_response_format_schema(&fixture_schema);
+    assert_eq!(
+        body.pointer("/response_format/type")
+            .and_then(Value::as_str),
+        Some("json_schema"),
+        "Native-configured request must carry response_format json_schema: {body}"
+    );
+    assert_eq!(
+        body.pointer("/response_format/json_schema/strict")
+            .and_then(Value::as_bool),
+        Some(true),
+        "Native-configured request must ask the endpoint for strict schema enforcement: {body}"
+    );
+    assert_eq!(
+        body.pointer("/response_format/json_schema/schema")
+            .map(normalize_required_sets),
+        Some(normalize_required_sets(&expected_schema)),
+        "Native-configured request must carry the attached schema body: {body}"
+    );
+}
+
+fn assert_json_object_request(request: &str) {
+    let body = hosted_request_body(request);
+    assert_eq!(
+        body.pointer("/response_format/type")
+            .and_then(Value::as_str),
+        Some("json_object"),
+        "ShapeOnly-configured request must carry response_format json_object: {body}"
+    );
+}
+
+fn assert_no_structured_output_field_request(request: &str) {
+    let body = hosted_request_body(request);
+    for field in ["response_format", "guided_json", "grammar"] {
+        assert!(
+            body.get(field).is_none(),
+            "fallback request must drop structured-output field {field}: {body}"
+        );
+    }
+}
+
+fn write_local_vllm_structured_output_override(harness: &CliHarness, style: Option<&str>) {
+    let Some(style) = style else {
+        return;
+    };
+    let config_dir = harness.data_root.path().join("cg");
+    std::fs::create_dir_all(&config_dir).expect("provider override dir");
+    std::fs::write(
+        config_dir.join("providers.toml"),
+        format!(
+            r#"[providers.local-vllm]
+structured_output = "{style}"
+"#,
+        ),
+    )
+    .expect("write structured-output provider override");
+}
+
+fn run_hosted_capture_with_responses(
+    style: Option<&str>,
+    responses: Vec<ChatCompletionStubResponse>,
+    transcript: &str,
+) -> HostedCapture {
+    let harness = CliHarness::new();
+    write_local_vllm_structured_output_override(&harness, style);
+    let cwd = tempfile::tempdir().expect("hosted capture cwd");
+    let (endpoint, requests) = spawn_chat_completion_sequence_server(responses);
+    let connect = harness.run(&[
+        "model",
+        "connect",
+        "local-vllm",
+        "--endpoint",
+        &endpoint,
+        "--model",
+        "test-model",
+        "--no-auth",
+        "--consent",
+    ]);
+    assert_eq!(connect.code, 0, "{}", combined(&connect));
+    let output = run_in_dir_with_stdin(&harness, cwd.path(), &["record"], transcript);
+    HostedCapture {
+        harness,
+        output,
+        requests: hosted_requests(requests),
+    }
+}
+
+fn assert_query_readback_contains(harness: &CliHarness, query: &str, expected: &[&str]) {
+    let output = harness.run(&["query", query]);
+    let text = combined(&output);
+    assert_eq!(output.code, 0, "{text}");
+    for needle in expected {
+        assert!(
+            text.contains(needle),
+            "captured memory must be readable through query; missing {needle:?}: {text}"
+        );
+    }
+}
+
+fn fixture_value(raw: &str) -> Value {
+    serde_json::from_str(raw).expect("fixture JSON")
+}
+
+fn fixture_content(value: &Value) -> String {
+    match value.get("content").expect("fixture content") {
+        Value::String(content) => content.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn malformed_then_good_responses() -> Vec<ChatCompletionStubResponse> {
+    let replies = fixture_value(include_str!("fixtures/malformed_then_good_replies.json"));
+    replies
+        .as_array()
+        .expect("malformed-then-good array")
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            ChatCompletionStubResponse::ok_content(
+                fixture_content(item),
+                400 + index as u64,
+                40 + index as u64,
+            )
+        })
+        .collect()
+}
+
+fn malformed_then_uncleanable_responses() -> Vec<ChatCompletionStubResponse> {
+    let replies = fixture_value(include_str!(
+        "fixtures/malformed_then_uncleanable_replies.json"
+    ));
+    replies
+        .as_array()
+        .expect("malformed-then-uncleanable array")
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            ChatCompletionStubResponse::ok_content(
+                fixture_content(item),
+                500 + index as u64,
+                50 + index as u64,
+            )
+        })
+        .collect()
+}
+
+fn good_harvest_response() -> ChatCompletionStubResponse {
+    malformed_then_good_responses()
+        .pop()
+        .expect("good harvest response")
+}
+
+fn receipt_call_string(output: &CommandOutput, field: &str) -> Option<String> {
+    output_json(output)?
+        .pointer(&format!("/usage/calls/0/{field}"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn first_reliability_level(output: &CommandOutput) -> Option<String> {
+    receipt_call_string(output, "reliability_level")
+}
+
+fn first_outcome(output: &CommandOutput) -> Option<String> {
+    receipt_call_string(output, "outcome")
+}
+
+fn all_reliability_levels(output: &CommandOutput) -> Vec<String> {
+    output_json(output)
+        .and_then(|json| {
+            json.pointer("/usage/calls")
+                .and_then(Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| {
+                            call.pointer("/reliability_level")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn assert_receipt_omits_endpoint_specific_output_names(output: &CommandOutput) {
+    let json = output_json(output).expect("record output json");
+    let receipt = serde_json::to_string(&json)
+        .expect("record output json must render for endpoint vocabulary check")
+        .to_ascii_lowercase();
+    for vendor_name in [
+        "response_format",
+        "guided_json",
+        "grammar",
+        "json-schema",
+        "output-schema",
+    ] {
+        assert!(
+            !receipt.contains(vendor_name),
+            "receipt must use endpoint-agnostic reliability vocabulary and omit provider field name {vendor_name}: {receipt}"
+        );
+    }
+}
+
+fn assert_floor_harvest_rows(output: &CommandOutput) {
+    assert_record_contains(output, "record malformed replies through the repair floor");
+    assert_record_contains(output, "keep first-day capture reliable");
+    assert_record_observation_count(output, 1);
+}
+
+fn assert_observation_stored(output: &CommandOutput, expected: &str) {
+    let store =
+        persisted_store(store_path_from(&[output])).expect("record output must expose store path");
+    let context_id = context_id_from(&[output]).expect("record output must expose context id");
+    let observations = store
+        .list_observations(Some(context_id))
+        .expect("recorded observations");
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation.observation_type == expected),
+        "recorded observation {expected:?} must be stored in the engine rows: {observations:?}"
+    );
+}
+
+fn assert_floor_observation_stored(output: &CommandOutput) {
+    assert_observation_stored(
+        output,
+        "capture door observed a malformed reply before repair",
+    );
+}
+
+#[test]
+fn floor_capture_recovers_from_malformed_reply_and_writes_memory() {
+    let HostedCapture {
+        harness,
+        output,
+        requests,
+    } = run_hosted_capture_with_responses(
+        None,
+        malformed_then_good_responses(),
+        "A real session says the capture door should repair malformed replies and keep first-day capture reliable.",
+    );
+
+    assert_eq!(
+        requests.len(),
+        2,
+        "the shipped floor must fire one repair retry after an off-shape reply"
+    );
+    assert_floor_harvest_rows(&output);
+    assert_query_readback_contains(
+        &harness,
+        "first-day capture reliable",
+        &[
+            "record malformed replies through the repair floor",
+            "keep first-day capture reliable",
+        ],
+    );
+    assert_floor_observation_stored(&output);
+}
+
+#[test]
+fn floor_exhaustion_is_not_a_silent_empty_graph() {
+    let HostedCapture { output, .. } = run_hosted_capture_with_responses(
+        None,
+        malformed_then_uncleanable_responses(),
+        "A real session asks cg to keep first-day capture reliable even when both floor attempts are off-shape.",
+    );
+    let json = output_json(&output);
+    let silently_empty = output.code == 0
+        && json
+            .as_ref()
+            .and_then(|value| value.pointer("/captured/goals"))
+            .and_then(Value::as_u64)
+            == Some(0)
+        && json
+            .as_ref()
+            .and_then(|value| value.pointer("/captured/decisions"))
+            .and_then(Value::as_u64)
+            == Some(0);
+
+    assert!(
+        !silently_empty,
+        "floor exhaustion must not end as success with an empty graph and no observable failure"
+    );
+    assert_eq!(
+        first_reliability_level(&output).as_deref(),
+        Some("Floor"),
+        "the exhausted floor must be recorded as the achieved Floor level"
+    );
+}
+
+#[test]
+fn unsupported_field_400_retries_without_field_and_still_captures() {
+    let HostedCapture {
+        harness,
+        output,
+        requests,
+    } = run_hosted_capture_with_responses(
+        Some("response_format_schema"),
+        vec![
+            ChatCompletionStubResponse::raw(
+                400,
+                serde_json::json!({
+                    "error": {
+                        "message": "unsupported response_format field",
+                        "type": "invalid_request_error"
+                    }
+                }),
+            ),
+            good_harvest_response(),
+        ],
+        "A real session says unsupported schema fields should fall back and still capture.",
+    );
+
+    assert_eq!(
+        requests.len(),
+        2,
+        "the 400 fallback must retry once without the structured-output field"
+    );
+    assert_response_format_schema_request(&requests[0]);
+    assert_no_structured_output_field_request(&requests[1]);
+    assert_eq!(
+        output.code,
+        0,
+        "an unsupported structured-output field must fall back instead of hard-erroring: {}",
+        combined(&output)
+    );
+    assert_floor_harvest_rows(&output);
+    assert_query_readback_contains(
+        &harness,
+        "first-day capture reliable",
+        &[
+            "record malformed replies through the repair floor",
+            "keep first-day capture reliable",
+        ],
+    );
+    assert_floor_observation_stored(&output);
+    assert_eq!(
+        first_reliability_level(&output).as_deref(),
+        Some("Floor"),
+        "the 400 fallback must record the achieved Floor level, not the configured Native rung"
+    );
+}
+
+#[test]
+fn enforcing_endpoint_whose_reply_needed_repair_records_achieved_not_configured_level() {
+    let HostedCapture {
+        harness: native_harness,
+        output: native_output,
+        requests: native_requests,
+    } = run_hosted_capture_with_responses(
+        Some("response_format_schema"),
+        malformed_then_good_responses(),
+        "A real session reaches a Native-configured endpoint whose first reply still needs repair.",
+    );
+    let HostedCapture {
+        harness: shape_harness,
+        output: shape_output,
+        requests: shape_requests,
+    } = run_hosted_capture_with_responses(
+        Some("json_object"),
+        malformed_then_good_responses(),
+        "A real session reaches a ShapeOnly-configured endpoint whose first reply still needs repair.",
+    );
+
+    assert_eq!(native_requests.len(), 2, "Native case must run repair");
+    assert_eq!(shape_requests.len(), 2, "ShapeOnly case must run repair");
+    assert_floor_harvest_rows(&native_output);
+    assert_floor_harvest_rows(&shape_output);
+    assert_query_readback_contains(
+        &native_harness,
+        "first-day capture reliable",
+        &[
+            "record malformed replies through the repair floor",
+            "keep first-day capture reliable",
+        ],
+    );
+    assert_floor_observation_stored(&native_output);
+    assert_query_readback_contains(
+        &shape_harness,
+        "first-day capture reliable",
+        &[
+            "record malformed replies through the repair floor",
+            "keep first-day capture reliable",
+        ],
+    );
+    assert_floor_observation_stored(&shape_output);
+    assert_eq!(
+        first_reliability_level(&native_output).as_deref(),
+        Some("Floor"),
+        "a Native-configured call that needed repair achieved Floor"
+    );
+    assert_eq!(
+        first_reliability_level(&shape_output).as_deref(),
+        Some("Floor"),
+        "a ShapeOnly-configured call that needed repair achieved Floor"
+    );
+    assert_response_format_schema_request(&native_requests[0]);
+    assert_json_object_request(&shape_requests[0]);
+}
+
+#[test]
+fn refusal_and_truncation_are_distinct_outcomes_not_malformed() {
+    let fixture = fixture_value(include_str!("fixtures/refusal_and_truncation_replies.json"));
+    let malformed = fixture.get("malformed").expect("malformed control fixture");
+    let repair = fixture.get("repair").expect("repair fixture");
+    let HostedCapture {
+        output: malformed_output,
+        requests: malformed_requests,
+        ..
+    } = run_hosted_capture_with_responses(
+        None,
+        vec![
+            ChatCompletionStubResponse::ok_content(fixture_content(malformed), 610, 61),
+            ChatCompletionStubResponse::ok_content(fixture_content(repair), 611, 62),
+        ],
+        "A real session produces a malformed control reply before repair.",
+    );
+    let HostedCapture {
+        output: refusal_output,
+        requests: refusal_requests,
+        ..
+    } = run_hosted_capture_with_responses(
+        None,
+        vec![ChatCompletionStubResponse::raw(
+            200,
+            fixture
+                .get("refusal_body")
+                .expect("refusal fixture")
+                .clone(),
+        )],
+        "A real session asks the model to refuse extraction of private credentials.",
+    );
+    let HostedCapture {
+        output: truncation_output,
+        requests: truncation_requests,
+        ..
+    } = run_hosted_capture_with_responses(
+        None,
+        vec![ChatCompletionStubResponse::raw(
+            200,
+            fixture
+                .get("truncation_body")
+                .expect("truncation fixture")
+                .clone(),
+        )],
+        "A real session returns a response capped by max tokens.",
+    );
+
+    assert_eq!(
+        malformed_requests.len(),
+        2,
+        "malformed control burns repair"
+    );
+    assert_eq!(refusal_requests.len(), 1, "refusal must not burn repair");
+    assert_eq!(
+        truncation_requests.len(),
+        1,
+        "truncation must not burn repair"
+    );
+    assert_eq!(
+        [
+            first_outcome(&malformed_output),
+            first_outcome(&refusal_output),
+            first_outcome(&truncation_output),
+        ],
+        [
+            Some("malformed".to_string()),
+            Some("refusal".to_string()),
+            Some("truncation".to_string()),
+        ],
+        "malformed, refusal, and truncation must be named as pairwise-distinct receipt outcomes"
+    );
+}
+
+#[test]
+fn enforcement_level_native_shapeonly_floor_recorded_per_call() {
+    let HostedCapture {
+        harness: native_harness,
+        output: native_output,
+        requests: native_requests,
+    } = run_hosted_capture_with_responses(
+        Some("response_format_schema"),
+        vec![good_harvest_response()],
+        "A real session succeeds under a schema-honoring endpoint.",
+    );
+    let HostedCapture {
+        harness: shape_harness,
+        output: shape_output,
+        requests: shape_requests,
+    } = run_hosted_capture_with_responses(
+        Some("json_object"),
+        vec![good_harvest_response()],
+        "A real session succeeds under a json_object endpoint.",
+    );
+    let HostedCapture {
+        harness: floor_harness,
+        output: floor_output,
+        requests: floor_requests,
+    } = run_hosted_capture_with_responses(
+        None,
+        vec![good_harvest_response()],
+        "A real session succeeds under an unconstrained endpoint.",
+    );
+
+    assert_eq!(
+        native_requests.len(),
+        1,
+        "Native success should use one call"
+    );
+    assert_eq!(
+        shape_requests.len(),
+        1,
+        "ShapeOnly success should use one call"
+    );
+    assert_eq!(floor_requests.len(), 1, "Floor success should use one call");
+    assert_response_format_schema_request(&native_requests[0]);
+    assert_json_object_request(&shape_requests[0]);
+    assert_no_structured_output_field_request(&floor_requests[0]);
+    assert_query_readback_contains(
+        &native_harness,
+        "first-day capture reliable",
+        &[
+            "record malformed replies through the repair floor",
+            "keep first-day capture reliable",
+        ],
+    );
+    assert_floor_observation_stored(&native_output);
+    assert_query_readback_contains(
+        &shape_harness,
+        "first-day capture reliable",
+        &[
+            "record malformed replies through the repair floor",
+            "keep first-day capture reliable",
+        ],
+    );
+    assert_floor_observation_stored(&shape_output);
+    assert_query_readback_contains(
+        &floor_harness,
+        "first-day capture reliable",
+        &[
+            "record malformed replies through the repair floor",
+            "keep first-day capture reliable",
+        ],
+    );
+    assert_floor_observation_stored(&floor_output);
+    assert_eq!(
+        first_reliability_level(&native_output).as_deref(),
+        Some("Native")
+    );
+    assert_eq!(
+        first_reliability_level(&shape_output).as_deref(),
+        Some("ShapeOnly")
+    );
+    assert_eq!(
+        first_reliability_level(&floor_output).as_deref(),
+        Some("Floor")
+    );
+}
+
+#[test]
+fn installed_cli_default_path_records_floor_enforcement_level() {
+    let harness = extraction_harness();
+    let output = harness.run_with_stdin(
+        &["record"],
+        "Goal G_installed: keep installed CLI capture reliable. Entity E_installed: capture receipt path=receipt.json. Decision D_installed: installed CLI default path lands memory serves G_installed based_on E_installed. Observation O_installed: installed CLI observation lane lands on E_installed.",
+    );
+
+    assert_record_contains(&output, "installed CLI default path lands memory");
+    assert_record_observation_count(&output, 1);
+    assert_query_readback_contains(
+        &harness,
+        "installed CLI default path lands memory",
+        &["installed CLI default path lands memory"],
+    );
+    assert_observation_stored(
+        &output,
+        "installed CLI observation lane lands on E_installed",
+    );
+    assert_eq!(
+        first_reliability_level(&output).as_deref(),
+        Some("Floor"),
+        "the installed CLI default path must report the achieved Floor level until a schema flag is wired"
+    );
+}
+
+#[test]
+fn receipt_reliability_vocabulary_is_endpoint_agnostic() {
+    let HostedCapture {
+        output: response_format_output,
+        ..
+    } = run_hosted_capture_with_responses(
+        Some("response_format_schema"),
+        vec![good_harvest_response()],
+        "A real session uses a response_format_schema endpoint.",
+    );
+    let HostedCapture {
+        output: guided_json_output,
+        ..
+    } = run_hosted_capture_with_responses(
+        Some("guided_json"),
+        vec![good_harvest_response()],
+        "A real session uses a guided_json endpoint.",
+    );
+    let mut levels = all_reliability_levels(&response_format_output);
+    levels.extend(all_reliability_levels(&guided_json_output));
+    assert_receipt_omits_endpoint_specific_output_names(&response_format_output);
+    assert_receipt_omits_endpoint_specific_output_names(&guided_json_output);
+
+    assert!(
+        !levels.is_empty(),
+        "fixture captures must emit receipt levels"
+    );
+    for level in levels {
+        assert!(
+            matches!(level.as_str(), "Native" | "ShapeOnly" | "Floor"),
+            "receipt reliability level must stay in the endpoint-agnostic vocabulary: {level}"
+        );
+        let lower = level.to_ascii_lowercase();
+        assert!(
+            ![
+                "response_format",
+                "guided_json",
+                "grammar",
+                "json-schema",
+                "output-schema"
+            ]
+            .iter()
+            .any(|vendor| lower.contains(vendor)),
+            "receipt reliability level must not leak vendor field names: {level}"
+        );
+    }
 }
 
 fn stable_id(output: &CommandOutput, keys: &[&str]) -> Option<String> {

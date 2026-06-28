@@ -4,21 +4,26 @@ use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use super::fake_extractor::open_store_with_lexical_embedder;
 use cg_catalog::{
     DEGRADED_MARKER, ModelConnectionCatalog, ModelKind, NoopLlmClient, PrincipalAwareConfig,
     UnderstandingRuntime,
 };
 use chrono::Utc;
 use context_graph::embedder::mock::MockEmbedder;
+use context_graph::ingest::{
+    CaptureRequest, ConversationExtractor, ExtractionRequest, StructuredHarvest,
+    record_conversation_with_extractor,
+};
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId,
-    DeploymentSurface, Embedder, EmbedderConfig, EmbedderRegistration, EntityType, EvidenceId,
-    EvidenceKind, EvidenceRef, FailureBucket, InvalidationSeverity, InvalidationStatus, LlmClient,
-    ModelInvocation, ModelReply, ObservationId, Principal, RecordObservation,
-    RecordObservationResult, RetentionStatus, Store, StoreConfig, UnderstandingConsumer,
-    UnderstandingOutcome, UnderstandingRequest,
+    DeploymentSurface, DiscoveryFilter, Embedder, EmbedderConfig, EmbedderRegistration, EntityType,
+    EvidenceId, EvidenceKind, EvidenceRef, FailureBucket, IntentionId, InvalidationSeverity,
+    InvalidationStatus, ListEntityFilter, LlmClient, ModelInvocation, ModelReply, ObservationId,
+    Principal, RecordObservation, RecordObservationResult, RetentionStatus, Store, StoreConfig,
+    UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn developer() -> Principal {
@@ -144,6 +149,37 @@ impl LlmClient for RecordingClient {
             malformed: false,
             usage: None,
         })
+    }
+}
+
+struct RuntimeHarvestExtractor {
+    runtime: Mutex<UnderstandingRuntime<RecordingClient>>,
+    context_id: ContextId,
+}
+
+impl ConversationExtractor for RuntimeHarvestExtractor {
+    fn extract(
+        &self,
+        extraction: ExtractionRequest<'_>,
+    ) -> context_graph::Result<StructuredHarvest> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| CgError::Engine("runtime extractor lock poisoned".to_string()))?;
+        let outcome = runtime
+            .understand(request(
+                self.context_id,
+                UnderstandingConsumer::ConversationCondensation,
+                DeploymentSurface::Edge,
+                extraction.transcript,
+            ))
+            .map_err(|err| CgError::Engine(format!("runtime extraction failed: {err:?}")))?;
+        if let Some(bucket) = outcome.failure_bucket {
+            return Err(CgError::Engine(format!(
+                "runtime extraction degraded before capture: {bucket:?}"
+            )));
+        }
+        StructuredHarvest::from_json_str(outcome.phrasing.as_deref().unwrap_or_default())
     }
 }
 
@@ -507,6 +543,128 @@ fn record_engine_case(
         })
         .collect();
     (normalized, outcome)
+}
+
+#[test]
+fn model_client_swap_at_runtime_seam_preserves_store_outcome() {
+    let dir = TempDir::new().expect("runtime seam tempdir");
+    let store = open_store_with_lexical_embedder(StoreConfig {
+        db_path: dir.path().join("runtime-seam.db"),
+        ..Default::default()
+    });
+    let context = store
+        .create_context(CreateContext {
+            name: "runtime seam capture".to_string(),
+            ..Default::default()
+        })
+        .expect("create runtime seam context");
+    let harvest = json!({
+        "summary": "runtime seam double captured memory",
+        "goals": [{
+            "key": "G_runtime_swap",
+            "text": "preserve store outcome through the runtime client seam"
+        }],
+        "entities": [{
+            "key": "E_runtime_swap",
+            "name": "runtime seam file",
+            "path": "src/runtime_seam.rs",
+            "entity_type": "file"
+        }],
+        "decisions": [{
+            "key": "D_runtime_swap",
+            "text": "registered LlmClient doubles can drive capture into the store",
+            "goal_key": "G_runtime_swap",
+            "entity_key": "E_runtime_swap",
+            "relation": null
+        }],
+        "observations": [{
+            "key": "O_runtime_swap",
+            "text": "runtime seam file observed at src/runtime_seam.rs",
+            "entity_key": "E_runtime_swap",
+            "path_change": null
+        }]
+    });
+    let client = Arc::new(RecordingClient::fixed(ModelReply {
+        marker: "runtime-seam-harvest".to_string(),
+        phrasing: harvest.to_string(),
+        advisory_flag: false,
+        malformed: false,
+        usage: None,
+    }));
+    let runtime = hosted_runtime_for_context(
+        HostedRuntimeSpec {
+            context_id: context.id,
+            connection_name: "runtime-seam-reasoning",
+            model_id: "runtime-seam-model",
+            env_var: "RUNTIME_SEAM_KEY",
+            secret: "runtime-seam-secret",
+            spend_owner: "test quota",
+            consent: true,
+        },
+        client.clone(),
+    );
+    let extractor = RuntimeHarvestExtractor {
+        runtime: Mutex::new(runtime),
+        context_id: context.id,
+    };
+
+    let report = record_conversation_with_extractor(
+        &store,
+        CaptureRequest {
+            context_label: context.name.clone(),
+            transcript:
+                "A real capture says registered LlmClient doubles can drive capture into the store."
+                    .to_string(),
+            model_available: true,
+        },
+        &extractor,
+    )
+    .expect("runtime seam capture");
+
+    assert_eq!(
+        client.call_count(),
+        1,
+        "capture must reach the registered LlmClient through UnderstandingRuntime"
+    );
+    let intention_id = report
+        .stable_ids
+        .get("G_runtime_swap")
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        .map(IntentionId::from)
+        .expect("stable runtime intention id");
+    let decisions = store
+        .by_intention(intention_id, DiscoveryFilter::default())
+        .expect("runtime seam decisions by intention");
+    assert!(
+        decisions.iter().any(|decision| {
+            decision.description == "registered LlmClient doubles can drive capture into the store"
+        }),
+        "runtime seam capture must store the expected decision rows: {decisions:?}"
+    );
+    let entities = store
+        .list_entities(ListEntityFilter {
+            context_id: Some(context.id),
+            name_contains: Some("runtime seam file".to_string()),
+            ..Default::default()
+        })
+        .expect("runtime seam entities");
+    assert!(
+        entities.iter().any(|entity| {
+            entity.name == "runtime seam file"
+                && entity.properties.get("path").and_then(Value::as_str)
+                    == Some("src/runtime_seam.rs")
+        }),
+        "runtime seam capture must store the expected entity rows: {entities:?}"
+    );
+    let observations = store
+        .list_observations(Some(context.id))
+        .expect("runtime seam observations");
+    assert!(
+        observations.iter().any(|observation| {
+            observation.observation_type == "runtime seam file observed at src/runtime_seam.rs"
+        }),
+        "runtime seam capture must store the expected observation rows: {observations:?}"
+    );
 }
 
 // Use case: a connected reasoning implementation should show up in the catalog as callable understanding, not as an inert embedder label.

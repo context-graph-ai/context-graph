@@ -171,6 +171,8 @@ pub struct ProviderSpec {
     pub reply_framing: ReplyFraming,
     #[serde(default)]
     pub reply_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<String>,
     #[serde(default)]
     pub success: Option<PredicateSpec>,
     pub timeout_ms: u64,
@@ -375,6 +377,8 @@ struct RawProviderSpec {
     #[serde(default)]
     reply_path: String,
     #[serde(default)]
+    structured_output: Option<String>,
+    #[serde(default)]
     success: Option<PredicateSpec>,
     timeout_ms: Option<u64>,
     consent_required: Option<bool>,
@@ -407,6 +411,7 @@ struct ProviderSpecOverride {
     env_preserve: Option<Vec<String>>,
     reply_framing: Option<String>,
     reply_path: Option<String>,
+    structured_output: Option<String>,
     success: Option<PredicateSpec>,
     timeout_ms: Option<u64>,
     consent_required: Option<bool>,
@@ -626,6 +631,7 @@ fn provider_spec_from_raw(
         env_preserve: raw.env_preserve,
         reply_framing,
         reply_path: raw.reply_path,
+        structured_output: raw.structured_output,
         success: raw.success,
         timeout_ms,
         consent_required,
@@ -964,6 +970,7 @@ fn provider_spec_from_override(
         env_preserve: override_layer.env_preserve.unwrap_or_default(),
         reply_framing,
         reply_path: override_layer.reply_path.unwrap_or_default(),
+        structured_output: override_layer.structured_output,
         success: override_layer.success,
         timeout_ms,
         consent_required,
@@ -1172,6 +1179,9 @@ fn apply_provider_override(
     }
     if let Some(reply_path) = override_layer.reply_path {
         spec.reply_path = reply_path;
+    }
+    if let Some(structured_output) = override_layer.structured_output {
+        spec.structured_output = Some(structured_output);
     }
     if let Some(success) = override_layer.success {
         spec.success = Some(success);
