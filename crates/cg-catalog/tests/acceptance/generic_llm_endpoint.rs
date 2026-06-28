@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -10,7 +11,7 @@ use cg_catalog::{
     load_provider_specs, try_load_provider_specs,
 };
 use context_graph::{
-    ContextId, DeploymentSurface, FailureBucket, Principal, UnderstandingConsumer,
+    ContextId, DeploymentSurface, FailureBucket, OutputContract, Principal, UnderstandingConsumer,
     UnderstandingOutcome, UnderstandingRequest,
 };
 use serde_json::{Value, json};
@@ -39,6 +40,14 @@ fn request(context_id: ContextId, input: &str) -> UnderstandingRequest {
         UnderstandingConsumer::ConversationCondensation,
         input,
     )
+}
+
+fn request_with_schema_contract(
+    context_id: ContextId,
+    input: &str,
+    schema: &str,
+) -> UnderstandingRequest {
+    request(context_id, input).with_output_contract(OutputContract::Schema(schema.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,6 +452,301 @@ fn message_envelope_shape(value: &Value) -> Vec<(Option<String>, Vec<String>, &'
                 .collect()
         })
         .unwrap_or_default()
+}
+
+const PRIMARY_SCHEMA: &str =
+    include_str!("../../../cg-cli/tests/fixtures/fixture_output_schema.json");
+const ALT_SCHEMA: &str =
+    include_str!("../../../cg-cli/tests/fixtures/fixture_output_schema_alt.json");
+
+fn write_structured_output_override(root: &std::path::Path, provider: &str, style: &str) {
+    fs::create_dir_all(root.join("cg")).expect("provider override dir");
+    fs::write(
+        root.join("cg/providers.toml"),
+        format!(
+            r#"[providers.{provider}]
+structured_output = "{style}"
+"#,
+        ),
+    )
+    .expect("write structured-output provider override");
+}
+
+fn local_vllm_runtime(
+    root: &std::path::Path,
+    context_id: ContextId,
+    server: &StubServer,
+    connection_name: &str,
+) -> UnderstandingRuntime<NoopLlmClient> {
+    connected_runtime(RuntimeSpec {
+        root,
+        context_id,
+        model_id: connection_name,
+        connection_name,
+        base_url: &server.base_url,
+        provider: "local-vllm",
+        provider_model: "test-model",
+        auth_scheme: HttpAuthScheme::None,
+        secret: None,
+        consent: true,
+    })
+}
+
+fn schema_property_names(schema: &Value) -> BTreeSet<String> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| properties.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn required_property_names(schema: &Value) -> BTreeSet<String> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn strict_response_format_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema.clone();
+    };
+
+    let mut transformed = object.clone();
+    if let Some(Value::Object(properties)) = object.get("properties") {
+        transformed.insert("additionalProperties".to_string(), Value::Bool(false));
+        transformed.insert(
+            "properties".to_string(),
+            Value::Object(
+                properties
+                    .iter()
+                    .map(|(name, property)| (name.clone(), strict_response_format_schema(property)))
+                    .collect(),
+            ),
+        );
+        transformed.insert(
+            "required".to_string(),
+            Value::Array(properties.keys().cloned().map(Value::String).collect()),
+        );
+    }
+    if let Some(items) = object.get("items") {
+        transformed.insert("items".to_string(), strict_response_format_schema(items));
+    }
+
+    Value::Object(transformed)
+}
+
+fn normalize_required_sets(schema: &Value) -> Value {
+    match schema {
+        Value::Object(object) => {
+            let mut normalized = serde_json::Map::new();
+            for (key, value) in object {
+                if key == "required" {
+                    let mut required = value.as_array().cloned().unwrap_or_default();
+                    required.sort_by_key(|item| item.as_str().unwrap_or_default().to_owned());
+                    normalized.insert(key.clone(), Value::Array(required));
+                } else {
+                    normalized.insert(key.clone(), normalize_required_sets(value));
+                }
+            }
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(normalize_required_sets).collect()),
+        _ => schema.clone(),
+    }
+}
+
+fn response_format_schema(body: &Value) -> Option<&Value> {
+    body.pointer("/response_format/json_schema/schema")
+}
+
+fn assert_strict_response_format_schema(body: &Value, fixture_schema: &Value) {
+    assert_eq!(
+        body.pointer("/response_format/type")
+            .and_then(Value::as_str),
+        Some("json_schema"),
+        "structured-output response_format.type must request json_schema; body={body}"
+    );
+    assert_eq!(
+        body.pointer("/response_format/json_schema/strict")
+            .and_then(Value::as_bool),
+        Some(true),
+        "structured-output response_format must request strict schema enforcement; body={body}"
+    );
+    let Some(wire_schema) = response_format_schema(body) else {
+        assert!(
+            body.pointer("/response_format/json_schema/schema")
+                .is_some(),
+            "structured-output response_format json_schema.schema is absent from the outbound body: {body}"
+        );
+        return;
+    };
+    assert_eq!(
+        wire_schema.get("type").and_then(Value::as_str),
+        Some("object"),
+        "wire schema must be a strict root object: {wire_schema}"
+    );
+    assert_eq!(
+        wire_schema
+            .get("additionalProperties")
+            .and_then(Value::as_bool),
+        Some(false),
+        "wire schema must close additional properties: {wire_schema}"
+    );
+    assert_eq!(
+        schema_property_names(wire_schema),
+        schema_property_names(fixture_schema),
+        "wire schema property names must track the attached fixture schema"
+    );
+    assert_eq!(
+        required_property_names(wire_schema),
+        schema_property_names(fixture_schema),
+        "strict wire schema must require every attached fixture property"
+    );
+    let expected_schema = strict_response_format_schema(fixture_schema);
+    assert_eq!(
+        normalize_required_sets(wire_schema),
+        normalize_required_sets(&expected_schema),
+        "wire schema must equal the full strict transform of the attached fixture schema, including nested bodies: {wire_schema}"
+    );
+}
+
+fn assert_schema_contract_request(
+    style: &str,
+    schema: &str,
+    input: &str,
+    connection_name: &str,
+) -> RecordedRequest {
+    let temp = tempfile::tempdir().expect("tempdir");
+    write_structured_output_override(temp.path(), "local-vllm", style);
+    let context_id = ContextId::new_v7();
+    let server = stub_server(200, openai_choice("structured-output wire probe"));
+    let mut runtime = local_vllm_runtime(temp.path(), context_id, &server, connection_name);
+    let _ = runtime
+        .understand(request_with_schema_contract(context_id, input, schema))
+        .expect("understanding should complete");
+    required_request(server.join(), input)
+}
+
+#[test]
+fn schema_contract_rides_the_wire_as_response_format_json_schema() {
+    let recorded = assert_schema_contract_request(
+        "response_format_schema",
+        PRIMARY_SCHEMA,
+        "primary schema contract",
+        "response-format-schema-contract",
+    );
+    let fixture_schema =
+        serde_json::from_str::<Value>(PRIMARY_SCHEMA).expect("primary schema JSON");
+
+    assert_openai_chat_request(
+        &recorded,
+        "/chat/completions",
+        "test-model",
+        "primary schema contract",
+        None,
+    );
+    assert_strict_response_format_schema(&recorded.body, &fixture_schema);
+}
+
+#[test]
+fn guided_json_style_rides_the_wire_under_its_configured_field_name() {
+    let recorded = assert_schema_contract_request(
+        "guided_json",
+        PRIMARY_SCHEMA,
+        "guided json schema contract",
+        "guided-json-schema-contract",
+    );
+    let fixture_schema =
+        serde_json::from_str::<Value>(PRIMARY_SCHEMA).expect("primary schema JSON");
+
+    assert!(
+        recorded.body.get("response_format").is_none(),
+        "guided_json endpoints must not receive response_format: {}",
+        recorded.raw_body
+    );
+    assert_eq!(
+        recorded.body.get("guided_json"),
+        Some(&fixture_schema),
+        "guided_json endpoints must receive the attached schema under the configured field name"
+    );
+}
+
+#[test]
+fn wire_schema_tracks_the_attached_contract_not_a_constant() {
+    let recorded = assert_schema_contract_request(
+        "response_format_schema",
+        ALT_SCHEMA,
+        "alternate schema contract",
+        "response-format-alt-contract",
+    );
+    let primary_schema =
+        serde_json::from_str::<Value>(PRIMARY_SCHEMA).expect("primary schema JSON");
+    let alt_schema = serde_json::from_str::<Value>(ALT_SCHEMA).expect("alt schema JSON");
+
+    let Some(wire_schema) = response_format_schema(&recorded.body) else {
+        assert!(
+            recorded
+                .body
+                .pointer("/response_format/json_schema/schema")
+                .is_some(),
+            "structured-output response_format json_schema.schema is absent from the outbound body: {}",
+            recorded.raw_body
+        );
+        return;
+    };
+    assert_strict_response_format_schema(&recorded.body, &alt_schema);
+    assert_eq!(
+        schema_property_names(wire_schema),
+        schema_property_names(&alt_schema),
+        "wire schema must use the attached ALT fixture property set"
+    );
+    assert_ne!(
+        normalize_required_sets(wire_schema),
+        normalize_required_sets(&strict_response_format_schema(&primary_schema)),
+        "wire schema must not echo the primary fixture as a constant"
+    );
+}
+
+#[test]
+fn unconstrained_capture_sends_no_structured_output_field() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let context_id = ContextId::new_v7();
+    let server = stub_server(200, openai_choice("unconstrained wire probe"));
+    let mut runtime =
+        local_vllm_runtime(temp.path(), context_id, &server, "unconstrained-contract");
+    let _ = runtime
+        .understand(request(context_id, "unconstrained request"))
+        .expect("understanding should complete");
+    let recorded = required_request(server.join(), "unconstrained request");
+    let keys = recorded
+        .body
+        .as_object()
+        .expect("request body object")
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "max_tokens".to_string(),
+            "messages".to_string(),
+            "model".to_string(),
+            "temperature".to_string(),
+        ]),
+        "unconstrained capture must keep today's four-field OpenAI-compatible body"
+    );
+    assert!(recorded.body.get("response_format").is_none());
+    assert!(recorded.body.get("guided_json").is_none());
+    assert!(recorded.body.get("grammar").is_none());
 }
 
 #[test]

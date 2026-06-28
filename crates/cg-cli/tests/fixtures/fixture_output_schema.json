@@ -1,0 +1,119 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string"
+    },
+    "goals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": ["key", "text"]
+      }
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "entity_type": {
+            "type": "string",
+            "enum": [
+              "service",
+              "configuration",
+              "file",
+              "pipeline",
+              "document"
+            ]
+          }
+        },
+        "required": ["key", "name", "path", "entity_type"]
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "goal_key": {
+            "type": ["string", "null"]
+          },
+          "entity_key": {
+            "type": ["string", "null"]
+          },
+          "relation": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "properties": {
+              "prior_decision_id": {
+                "type": "string"
+              },
+              "classification": {
+                "type": "string",
+                "enum": [
+                  "new_insertion",
+                  "exact_duplicate",
+                  "refines_existing",
+                  "conflicts_existing",
+                  "supersedes_existing"
+                ]
+              }
+            },
+            "required": ["prior_decision_id", "classification"]
+          }
+        },
+        "required": ["key", "text", "goal_key", "entity_key", "relation"]
+      }
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "entity_key": {
+            "type": ["string", "null"]
+          },
+          "path_change": {
+            "type": ["string", "null"]
+          }
+        },
+        "required": ["key", "text", "entity_key", "path_change"]
+      }
+    }
+  },
+  "required": ["summary", "goals", "entities", "decisions", "observations"]
+}

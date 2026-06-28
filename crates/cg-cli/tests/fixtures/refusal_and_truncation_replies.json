@@ -1,0 +1,77 @@
+{
+  "malformed": {
+    "content": "Here is the capture JSON: {\"summary\":\"malformed control\",\"goals\":\"not an array\""
+  },
+  "repair": {
+    "content": {
+      "summary": "malformed control repaired",
+      "goals": [
+        {
+          "key": "G_refusal_control",
+          "text": "classify malformed refusal and truncation outcomes"
+        }
+      ],
+      "entities": [
+        {
+          "key": "E_refusal_control",
+          "name": "receipt outcome field",
+          "path": "receipt.json",
+          "entity_type": "document"
+        }
+      ],
+      "decisions": [
+        {
+          "key": "D_refusal_control",
+          "text": "record malformed as its own receipt outcome",
+          "goal_key": "G_refusal_control",
+          "entity_key": "E_refusal_control",
+          "relation": null
+        }
+      ],
+      "observations": []
+    }
+  },
+  "refusal_body": {
+    "id": "chatcmpl-refusal-fixture",
+    "object": "chat.completion",
+    "created": 1766019000,
+    "model": "local-vllm/test-model",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "refusal": "I cannot extract private credentials from that session.",
+          "content": null
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 51,
+      "completion_tokens": 7,
+      "total_tokens": 58
+    }
+  },
+  "truncation_body": {
+    "id": "chatcmpl-truncation-fixture",
+    "object": "chat.completion",
+    "created": 1766019000,
+    "model": "local-vllm/test-model",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "{\"summary\":\"truncated but syntactically complete fixture\",\"goals\":[{\"key\":\"G_truncation\",\"text\":\"classify truncation outcome separately\"}],\"entities\":[{\"key\":\"E_truncation\",\"name\":\"truncated capture receipt\",\"path\":\"receipt.json\",\"entity_type\":\"document\"}],\"decisions\":[{\"key\":\"D_truncation\",\"text\":\"record truncation as its own receipt outcome\",\"goal_key\":\"G_truncation\",\"entity_key\":\"E_truncation\",\"relation\":null}],\"observations\":[]}"
+        },
+        "finish_reason": "length"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 53,
+      "completion_tokens": 19,
+      "total_tokens": 72
+    }
+  }
+}

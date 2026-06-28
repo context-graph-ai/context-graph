@@ -1,0 +1,41 @@
+[
+  {
+    "content": "I found the memory. {\"summary\":\"floor retry started\",\"goals\":\"keep capture reliable\",\"entities\":[{\"key\":\"E_floor\",\"name\":\"capture door\",\"path\":\"crates/cg-cli/src/main.rs\",\"entity_type\":\"file\"}],\"decisions\":[{\"key\":\"D_floor\",\"text\":\"record malformed replies through the repair floor\",\"goal_key\":\"G_floor\",\"entity_key\":\"E_floor\"}],\"observations\":[]"
+  },
+  {
+    "content": {
+      "summary": "floor retry captured a clean harvest",
+      "goals": [
+        {
+          "key": "G_floor",
+          "text": "keep first-day capture reliable"
+        }
+      ],
+      "entities": [
+        {
+          "key": "E_floor",
+          "name": "capture door",
+          "path": "crates/cg-cli/src/main.rs",
+          "entity_type": "file"
+        }
+      ],
+      "decisions": [
+        {
+          "key": "D_floor",
+          "text": "record malformed replies through the repair floor",
+          "goal_key": "G_floor",
+          "entity_key": "E_floor",
+          "relation": null
+        }
+      ],
+      "observations": [
+        {
+          "key": "O_floor",
+          "text": "capture door observed a malformed reply before repair",
+          "entity_key": "E_floor",
+          "path_change": null
+        }
+      ]
+    }
+  }
+]

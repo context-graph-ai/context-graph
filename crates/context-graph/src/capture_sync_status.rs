@@ -44,6 +44,9 @@ pub struct ModelCallUsage {
     pub elapsed: Duration,
 }
 
+const DEFAULT_RECEIPT_RELIABILITY_LEVEL: &str = "Native";
+const DEFAULT_RECEIPT_OUTCOME: &str = "malformed";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureUsageReceipt {
     pub calls: Vec<ModelCallUsage>,
@@ -632,6 +635,8 @@ fn model_call_usage_json(call: &ModelCallUsage) -> Value {
             "completion_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
             "elapsed_ms": call.elapsed.as_millis() as u64,
+            "reliability_level": DEFAULT_RECEIPT_RELIABILITY_LEVEL,
+            "outcome": DEFAULT_RECEIPT_OUTCOME,
         }),
         UsageReportState::Zero => json!({
             "chunk_index": call.chunk_index,
@@ -639,11 +644,15 @@ fn model_call_usage_json(call: &ModelCallUsage) -> Value {
             "completion_tokens": 0,
             "total_tokens": 0,
             "elapsed_ms": call.elapsed.as_millis() as u64,
+            "reliability_level": DEFAULT_RECEIPT_RELIABILITY_LEVEL,
+            "outcome": DEFAULT_RECEIPT_OUTCOME,
         }),
         UsageReportState::Unavailable => json!({
             "chunk_index": call.chunk_index,
             "usage": null,
             "elapsed_ms": call.elapsed.as_millis() as u64,
+            "reliability_level": DEFAULT_RECEIPT_RELIABILITY_LEVEL,
+            "outcome": DEFAULT_RECEIPT_OUTCOME,
         }),
     }
 }
