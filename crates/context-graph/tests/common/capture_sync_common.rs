@@ -13,13 +13,14 @@ use context_graph::schema::{DIGEST_VECTOR_DIMENSION, TABLES};
 use context_graph::{
     CapturePricing, ContextGraphSyncRegistration, ContextGraphSyncTablePolicy, ContextId,
     CreateContext, CreateDecision, CreateDigest, CreateEntity, CreateIntention, Decision,
-    DecisionId, DecisionStatus, DigestId, EmbeddingId, EmbeddingTarget, EntityId, EntitySnapshotId,
-    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, HostedProviderBoundary,
-    HostedProviderReply, Intention, IntentionOrigin, IntentionPatch, IntentionStatus,
-    ModelCallUsage, ObservationId, Outcome, PrecomputedEmbedding, ProgressKind, ProviderUsage,
-    RecordObservation, Store, StoreConfig, SyncStatusBoundary, TxId, UsageReportState,
-    context_graph_pending_push_change_count, context_graph_sync_conflict_policies,
-    context_graph_sync_table_contract, provider_usage_from_str, register_context_graph_sync_client,
+    DecisionId, DecisionStatus, DigestId, EmbeddingId, EmbeddingTarget, EnforcementLevel, EntityId,
+    EntitySnapshotId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef,
+    HostedProviderBoundary, HostedProviderReply, Intention, IntentionOrigin, IntentionPatch,
+    IntentionStatus, ModelCallOutcome, ModelCallUsage, ObservationId, Outcome,
+    PrecomputedEmbedding, ProgressKind, ProviderUsage, RecordObservation, Store, StoreConfig,
+    SyncStatusBoundary, TxId, UsageReportState, context_graph_pending_push_change_count,
+    context_graph_sync_conflict_policies, context_graph_sync_table_contract,
+    provider_usage_from_str, register_context_graph_sync_client,
 };
 use contextdb_core::{Lsn, Value as DbValue};
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
@@ -144,6 +145,8 @@ pub fn provider_with_unique_usage_for_chunks(
             chunk_index: index + 1,
             usage: UsageReportState::Tokens(usage),
             elapsed: dynamic_provider_elapsed(index),
+            reliability_level: EnforcementLevel::Native,
+            outcome: ModelCallOutcome::Captured,
         })
         .collect::<Vec<_>>();
     (
@@ -343,6 +346,8 @@ impl<'a> ProviderBackedExtractor<'a> {
             chunk_index,
             usage,
             elapsed: reply.elapsed,
+            reliability_level: EnforcementLevel::Native,
+            outcome: ModelCallOutcome::Captured,
         });
     }
 }

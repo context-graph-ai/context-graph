@@ -11,9 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use candle_core::{Device, Tensor};
 use cg_cli_conventions::{CheckRegistrar, DiagnosticCheck, Finding};
 use context_graph::{
-    AuthorizedModelInvocationParts, CgError, ContextId, DeploymentSurface, FailureBucket,
-    LlmClient, ModelInvocation, ModelReply, Principal, ProviderInvocationConfig, ProviderUsage,
-    UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest, provider_usage_from_str,
+    AuthorizedModelInvocationParts, CanonicalJsonSchema, CgError, ContextId, DeploymentSurface,
+    EnforcementLevel, FailureBucket, LlmClient, ModelCallOutcome, ModelCallReceipt,
+    ModelInvocation, ModelReply, OutputContract, Principal, ProviderInvocationConfig,
+    ProviderUsage, UnderstandingConsumer, UnderstandingOutcome, UnderstandingRequest,
+    provider_usage_from_str,
 };
 use fs4::fs_std::FileExt;
 use safetensors::SafeTensors;
@@ -31,6 +33,51 @@ pub const DEGRADED_MARKER: &str = "running without a connected model";
 const HOSTED_TIMEOUT: Duration = Duration::from_secs(10);
 const HOSTED_BODY_LIMIT: u64 = 1024 * 1024;
 const HOSTED_CHAT_MAX_TOKENS: u32 = 4096;
+const STRICT_SCHEMA_MAX_UNION_PARAMS: usize = 16;
+const STRICT_SCHEMA_MAX_OPTIONAL_FIELDS: usize = 24;
+const STRICT_SCHEMA_UNREPRESENTABLE_KEYS: &[&str] = &[
+    "$ref",
+    "$defs",
+    "definitions",
+    "allOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "patternProperties",
+    "dependentSchemas",
+    "dependencies",
+    "dependentRequired",
+    "propertyNames",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "prefixItems",
+    "contains",
+];
+const STRICT_SCHEMA_STRIPPED_KEYS: &[&str] = &[
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+    "title",
+    "description",
+    "default",
+    "examples",
+    "readOnly",
+    "writeOnly",
+    "deprecated",
+];
 const CONNECTION_CATALOG_SCOPE: &str = "connection-substrate";
 const EMBEDDED_PROVIDER_SPECS: &str = include_str!("../providers.toml");
 const NEW_PROVIDER_REQUIRED_FIELDS: &[&str] = &[
@@ -671,6 +718,9 @@ fn validate_provider_override(
             ReplyFraming::ACCEPTED,
         ));
     }
+    if let Some(value) = &override_layer.structured_output {
+        validate_structured_output_style(provider, value, Some(path))?;
+    }
     if let Some(args) = &override_layer.completion_args {
         validate_completion_arg_placeholders(provider, args, Some(path))?;
     }
@@ -772,10 +822,30 @@ fn validate_provider_spec(
             &["positive timeout in milliseconds"],
         ));
     }
+    if let Some(value) = &spec.structured_output {
+        validate_structured_output_style(provider, value, path)?;
+    }
     validate_optional_predicate(provider, "success", spec.success.as_ref(), path)?;
     validate_optional_predicate(provider, "auth_success", spec.auth_success.as_ref(), path)?;
     validate_optional_predicate(provider, "auth_required", spec.auth_required.as_ref(), path)?;
     Ok(())
+}
+
+fn validate_structured_output_style(
+    provider: &str,
+    value: &str,
+    path: Option<&Path>,
+) -> std::result::Result<(), ProviderSpecLoadError> {
+    if StructuredOutputStyle::parse(Some(value)).is_some() {
+        return Ok(());
+    }
+    Err(invalid_value(
+        path,
+        provider,
+        "structured_output",
+        value.to_string(),
+        StructuredOutputStyle::ACCEPTED,
+    ))
 }
 
 fn validate_http_base_url(
@@ -1964,7 +2034,7 @@ impl HostSessionLlmClient {
             &self.provider,
             &binary,
             spec,
-            &invocation.request.input,
+            invocation.request.input_without_output_contract(),
             output_file,
             self.progress_to_stdout,
         );
@@ -4920,6 +4990,7 @@ impl ModelConnectionCatalog {
         }
         let reply_path = spec.reply_path.clone();
         let timeout_ms = spec.timeout_ms;
+        let structured_output = spec.structured_output.clone();
         Some(ProviderInvocationConfig {
             provider: endpoint.provider.clone(),
             provider_model: endpoint.provider_model.clone(),
@@ -4930,6 +5001,8 @@ impl ModelConnectionCatalog {
             reply_path,
             timeout_ms,
             transport: "http".to_string(),
+            structured_output,
+            request_output_contract: OutputContract::Unconstrained,
         })
     }
 
@@ -5138,6 +5211,16 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
         &mut self,
         request: UnderstandingRequest,
     ) -> std::result::Result<UnderstandingOutcome, UnderstandingRuntimeError> {
+        self.understand_async_with_receipt(request)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    pub async fn understand_async_with_receipt(
+        &mut self,
+        request: UnderstandingRequest,
+    ) -> std::result::Result<(UnderstandingOutcome, ModelCallReceipt), UnderstandingRuntimeError>
+    {
         match self.prepare_understanding(&request)? {
             PreparedUnderstanding::Invoke {
                 model_id,
@@ -5150,19 +5233,30 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                 } else if let Some(native) = self.native_fallback.clone() {
                     native.understand(&invocation).await
                 } else {
-                    return Ok(degraded_outcome(&request, FailureBucket::NotConnected));
+                    return Ok((
+                        degraded_outcome(&request, FailureBucket::NotConnected),
+                        degraded_model_call_receipt(),
+                    ));
                 };
                 match reply {
-                    Ok(reply) => {
-                        Ok(self.outcome_after_reply(&request, &model_id, &invocation, reply))
-                    }
+                    Ok(reply) => Ok(self.outcome_after_reply_with_receipt(
+                        &request,
+                        &model_id,
+                        &invocation,
+                        reply,
+                    )),
                     Err(err) => {
                         self.record_provider_attempt_failure(&model_id, &invocation, &err);
-                        Ok(degraded_outcome(&request, failure_bucket_from_error(&err)))
+                        Ok((
+                            degraded_outcome(&request, failure_bucket_from_error(&err)),
+                            degraded_model_call_receipt(),
+                        ))
                     }
                 }
             }
-            PreparedUnderstanding::Degraded(outcome) => Ok(outcome),
+            PreparedUnderstanding::Degraded(outcome) => {
+                Ok((outcome, degraded_model_call_receipt()))
+            }
         }
     }
 
@@ -5171,6 +5265,16 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
         &mut self,
         request: UnderstandingRequest,
     ) -> std::result::Result<UnderstandingOutcome, UnderstandingRuntimeError> {
+        self.understand_with_receipt(request)
+            .map(|(outcome, _)| outcome)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn understand_with_receipt(
+        &mut self,
+        request: UnderstandingRequest,
+    ) -> std::result::Result<(UnderstandingOutcome, ModelCallReceipt), UnderstandingRuntimeError>
+    {
         match self.prepare_understanding(&request)? {
             PreparedUnderstanding::Invoke {
                 model_id,
@@ -5183,19 +5287,30 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
                 } else if let Some(native) = self.native_fallback.clone() {
                     native.understand_native(&invocation)
                 } else {
-                    return Ok(degraded_outcome(&request, FailureBucket::NotConnected));
+                    return Ok((
+                        degraded_outcome(&request, FailureBucket::NotConnected),
+                        degraded_model_call_receipt(),
+                    ));
                 };
                 match reply {
-                    Ok(reply) => {
-                        Ok(self.outcome_after_reply(&request, &model_id, &invocation, reply))
-                    }
+                    Ok(reply) => Ok(self.outcome_after_reply_with_receipt(
+                        &request,
+                        &model_id,
+                        &invocation,
+                        reply,
+                    )),
                     Err(err) => {
                         self.record_provider_attempt_failure(&model_id, &invocation, &err);
-                        Ok(degraded_outcome(&request, failure_bucket_from_error(&err)))
+                        Ok((
+                            degraded_outcome(&request, failure_bucket_from_error(&err)),
+                            degraded_model_call_receipt(),
+                        ))
                     }
                 }
             }
-            PreparedUnderstanding::Degraded(outcome) => Ok(outcome),
+            PreparedUnderstanding::Degraded(outcome) => {
+                Ok((outcome, degraded_model_call_receipt()))
+            }
         }
     }
 
@@ -5237,7 +5352,14 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
             .hosted_endpoint
             .as_ref()
             .map(|endpoint| endpoint.base_url.clone());
-        let provider_config = self.catalog.provider_invocation_config(&model);
+        let output_contract = request.output_contract();
+        let provider_config = self
+            .catalog
+            .provider_invocation_config(&model)
+            .map(|mut config| {
+                config.request_output_contract = output_contract.clone();
+                config
+            });
         if hosted_endpoint.is_some() && provider_config.is_none() {
             return Ok(PreparedUnderstanding::Degraded(degraded_outcome(
                 request,
@@ -5327,6 +5449,9 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
             }
         }
 
+        let runtime_request = request
+            .clone()
+            .with_output_contract(OutputContract::Unconstrained);
         Ok(PreparedUnderstanding::Invoke {
             model_id,
             // SAFETY: this path has either passed the named-connection consent
@@ -5334,7 +5459,7 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
             invocation: unsafe {
                 Box::new(ModelInvocation::from_authorized_runtime_parts(
                     AuthorizedModelInvocationParts {
-                        request: request.clone(),
+                        request: runtime_request,
                         resolved_connection,
                         resolved_credential,
                         hosted_endpoint,
@@ -5348,18 +5473,22 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
         })
     }
 
-    fn outcome_after_reply(
+    fn outcome_after_reply_with_receipt(
         &mut self,
         request: &UnderstandingRequest,
         model_id: &str,
         invocation: &ModelInvocation,
         reply: context_graph::ModelReply,
-    ) -> UnderstandingOutcome {
+    ) -> (UnderstandingOutcome, ModelCallReceipt) {
+        let receipt = reply.model_call_receipt();
         if reply.malformed {
             self.record_provider_diagnostic(model_id, invocation, "malformed provider reply");
-            degraded_outcome(request, FailureBucket::ReplyMalformed)
+            (
+                degraded_outcome(request, FailureBucket::ReplyMalformed),
+                receipt,
+            )
         } else {
-            success_outcome(request, invocation, reply)
+            (success_outcome(request, invocation, reply), receipt)
         }
     }
 
@@ -5452,7 +5581,7 @@ fn understand_local_single_file(
         marker: understanding_marker(&invocation.request),
         phrasing: format!(
             "local-candle:{artifact}:{proof}:{}",
-            invocation.request.input
+            invocation.request.input_without_output_contract()
         ),
         advisory_flag: false,
         malformed: false,
@@ -5619,28 +5748,22 @@ fn understand_hosted(
         .http_status_as_error(false)
         .build();
     let agent: ureq::Agent = agent_config.into();
-    let body = serde_json::json!({
-        "model": provider_config.provider_model.as_str(),
-        "max_tokens": HOSTED_CHAT_MAX_TOKENS,
-        "temperature": 0,
-        "messages": [{
-            "role": "user",
-            "content": invocation.request.input.as_str(),
-        }],
-    });
-    let body = serde_json::to_string(&body).map_err(|err| {
-        CgError::Engine(format!("hosted llm request serialization failed: {err}"))
-    })?;
-    let mut request = agent
-        .post(&endpoint)
-        .header("Content-Type", "application/json");
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", authorization);
+    let base_body = hosted_chat_body(invocation);
+    let (body, mut receipt, structured_field_sent) =
+        hosted_body_with_structured_output(invocation, &base_body)?;
+    let mut response =
+        send_hosted_chat_request(&agent, &endpoint, authorization.as_deref(), &body)?;
+    let mut status = response.status;
+    if status == 400 && structured_field_sent && structured_output_rejected(&response.payload) {
+        response =
+            send_hosted_chat_request(&agent, &endpoint, authorization.as_deref(), &base_body)?;
+        status = response.status;
+        receipt = ModelCallReceipt {
+            reliability_level: EnforcementLevel::Floor,
+            outcome: ModelCallOutcome::Captured,
+            structured_output_rejected: true,
+        };
     }
-    let mut response = request
-        .send(body)
-        .map_err(|err| provider_failure(ureq_failure_bucket(&err), &format!("{err}")))?;
-    let status = response.status().as_u16();
     if (400..500).contains(&status) {
         return Err(provider_failure(
             FailureBucket::Unauthorized,
@@ -5653,19 +5776,22 @@ fn understand_hosted(
             &format!("hosted llm request returned HTTP {status}"),
         ));
     }
-    let reader = response
-        .body_mut()
-        .with_config()
-        .limit(HOSTED_BODY_LIMIT)
-        .reader();
-    let mut payload = String::new();
-    let mut reader = reader;
-    reader.read_to_string(&mut payload).map_err(|err| {
-        provider_failure(
-            FailureBucket::Unreachable,
-            &format!("hosted llm response read failed: {err}"),
-        )
-    })?;
+    let payload = response.payload;
+    if response_is_refusal(&payload) {
+        return Ok(context_graph::ModelReply {
+            marker: understanding_marker(&invocation.request),
+            phrasing: String::new(),
+            advisory_flag: true,
+            malformed: false,
+            usage: provider_usage_from_str(&payload),
+        }
+        .with_model_receipt(ModelCallReceipt {
+            reliability_level: EnforcementLevel::Floor,
+            outcome: ModelCallOutcome::Refusal,
+            structured_output_rejected: receipt.structured_output_rejected,
+        }));
+    }
+    let truncated = response_is_truncated(&payload);
     let spec = ProviderSpec {
         reply_framing: ReplyFraming::Json,
         reply_path: invocation
@@ -5694,16 +5820,433 @@ fn understand_hosted(
                 advisory_flag: false,
                 malformed: true,
                 usage: None,
-            });
+            }
+            .with_model_receipt(ModelCallReceipt {
+                reliability_level: EnforcementLevel::Floor,
+                outcome: ModelCallOutcome::Malformed,
+                structured_output_rejected: receipt.structured_output_rejected,
+            }));
         }
     };
+    if truncated {
+        receipt = ModelCallReceipt {
+            reliability_level: EnforcementLevel::Floor,
+            outcome: ModelCallOutcome::Truncation,
+            structured_output_rejected: receipt.structured_output_rejected,
+        };
+    }
     Ok(context_graph::ModelReply {
         marker: understanding_marker(&invocation.request),
         phrasing,
-        advisory_flag: false,
+        advisory_flag: receipt.reliability_level == EnforcementLevel::Floor,
         malformed: false,
         usage: provider_usage_from_str(&payload),
+    }
+    .with_model_receipt(receipt))
+}
+
+struct HostedHttpResponse {
+    status: u16,
+    payload: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredOutputStyle {
+    ResponseFormatSchema,
+    JsonObject,
+    GuidedJson,
+    Grammar,
+    None,
+}
+
+impl StructuredOutputStyle {
+    const ACCEPTED: &'static [&'static str] = &[
+        "response_format_schema",
+        "json_object",
+        "guided_json",
+        "grammar",
+        "none",
+    ];
+
+    fn parse(value: Option<&str>) -> Option<Self> {
+        match value.unwrap_or("none").trim() {
+            "response_format_schema" => Some(Self::ResponseFormatSchema),
+            "json_object" => Some(Self::JsonObject),
+            "guided_json" => Some(Self::GuidedJson),
+            "grammar" => Some(Self::Grammar),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+fn hosted_chat_body(invocation: &ModelInvocation) -> Value {
+    let provider_config = invocation
+        .provider_config
+        .as_ref()
+        .expect("provider config checked before hosted body build");
+    serde_json::json!({
+        "model": provider_config.provider_model.as_str(),
+        "max_tokens": HOSTED_CHAT_MAX_TOKENS,
+        "temperature": 0,
+        "messages": [{
+            "role": "user",
+            "content": invocation.request.input_without_output_contract(),
+        }],
     })
+}
+
+fn hosted_body_with_structured_output(
+    invocation: &ModelInvocation,
+    base_body: &Value,
+) -> context_graph::Result<(Value, ModelCallReceipt, bool)> {
+    let style_value = invocation
+        .provider_config
+        .as_ref()
+        .and_then(|config| config.structured_output.as_deref());
+    let style = StructuredOutputStyle::parse(style_value).ok_or_else(|| {
+        CgError::Engine(format!(
+            "provider structured_output has invalid value `{}`",
+            style_value.unwrap_or("")
+        ))
+    })?;
+    if style == StructuredOutputStyle::None || !request_has_output_contract(invocation) {
+        return Ok((
+            base_body.clone(),
+            ModelCallReceipt::captured(EnforcementLevel::Floor),
+            false,
+        ));
+    }
+    let mut body = base_body.clone();
+    let Some(object) = body.as_object_mut() else {
+        return Ok((
+            base_body.clone(),
+            ModelCallReceipt::captured(EnforcementLevel::Floor),
+            false,
+        ));
+    };
+    match style {
+        StructuredOutputStyle::JsonObject => {
+            object.insert(
+                "response_format".to_string(),
+                serde_json::json!({ "type": "json_object" }),
+            );
+            Ok((
+                body,
+                ModelCallReceipt::captured(EnforcementLevel::ShapeOnly),
+                true,
+            ))
+        }
+        StructuredOutputStyle::ResponseFormatSchema
+        | StructuredOutputStyle::GuidedJson
+        | StructuredOutputStyle::Grammar => {
+            let Some(schema) = request_contract_schema(invocation)? else {
+                return Ok((
+                    base_body.clone(),
+                    ModelCallReceipt::captured(EnforcementLevel::Floor),
+                    false,
+                ));
+            };
+            if strict_schema_has_unrepresentable_construct(&schema) {
+                return Ok((
+                    base_body.clone(),
+                    ModelCallReceipt::captured(EnforcementLevel::Floor),
+                    false,
+                ));
+            }
+            if strict_schema_budget(&schema).exceeds_limits() {
+                return Ok((
+                    base_body.clone(),
+                    ModelCallReceipt::captured(EnforcementLevel::Floor),
+                    false,
+                ));
+            };
+            match style {
+                StructuredOutputStyle::ResponseFormatSchema => {
+                    object.insert(
+                        "response_format".to_string(),
+                        serde_json::json!({
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "context_graph_capture",
+                                "strict": true,
+                                "schema": strict_response_format_schema(&schema),
+                            },
+                        }),
+                    );
+                }
+                StructuredOutputStyle::GuidedJson => {
+                    object.insert("guided_json".to_string(), schema);
+                }
+                StructuredOutputStyle::Grammar => {
+                    object.insert("grammar".to_string(), schema);
+                }
+                StructuredOutputStyle::JsonObject | StructuredOutputStyle::None => {}
+            }
+            Ok((
+                body,
+                ModelCallReceipt::captured(EnforcementLevel::Native),
+                true,
+            ))
+        }
+        StructuredOutputStyle::None => Ok((
+            base_body.clone(),
+            ModelCallReceipt::captured(EnforcementLevel::Floor),
+            false,
+        )),
+    }
+}
+
+fn request_contract_schema(invocation: &ModelInvocation) -> context_graph::Result<Option<Value>> {
+    let contract = invocation
+        .provider_config
+        .as_ref()
+        .map(|config| config.request_output_contract.clone())
+        .filter(|contract| !matches!(contract, OutputContract::Unconstrained))
+        .unwrap_or_else(|| invocation.request.output_contract());
+    match contract {
+        OutputContract::Unconstrained => Ok(None),
+        OutputContract::Schema(raw) => {
+            let value = serde_json::from_str::<Value>(&raw).map_err(|err| {
+                CgError::Engine(format!("output contract schema is invalid JSON: {err}"))
+            })?;
+            Ok(Some(CanonicalJsonSchema::new(value)?.as_value().clone()))
+        }
+    }
+}
+
+fn request_has_output_contract(invocation: &ModelInvocation) -> bool {
+    let contract = invocation
+        .provider_config
+        .as_ref()
+        .map(|config| config.request_output_contract.clone())
+        .filter(|contract| !matches!(contract, OutputContract::Unconstrained))
+        .unwrap_or_else(|| invocation.request.output_contract());
+    !matches!(contract, OutputContract::Unconstrained)
+}
+
+#[derive(Default)]
+struct StrictSchemaBudget {
+    union_params: usize,
+    optional_fields: usize,
+}
+
+impl StrictSchemaBudget {
+    fn exceeds_limits(&self) -> bool {
+        self.union_params > STRICT_SCHEMA_MAX_UNION_PARAMS
+            || self.optional_fields > STRICT_SCHEMA_MAX_OPTIONAL_FIELDS
+    }
+}
+
+fn strict_schema_budget(schema: &Value) -> StrictSchemaBudget {
+    let mut budget = StrictSchemaBudget::default();
+    count_strict_schema_budget(schema, &mut budget);
+    budget
+}
+
+fn count_strict_schema_budget(value: &Value, budget: &mut StrictSchemaBudget) {
+    match value {
+        Value::Object(object) => {
+            if object.get("type").is_some_and(Value::is_array) {
+                budget.union_params += 1;
+            }
+            if object.get("anyOf").is_some_and(Value::is_array) {
+                budget.union_params += 1;
+            }
+            if let Some(Value::Object(properties)) = object.get("properties") {
+                let required = object
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<BTreeSet<_>>();
+                budget.optional_fields += properties
+                    .keys()
+                    .filter(|property| !required.contains(property.as_str()))
+                    .count();
+            }
+            for item in object.values() {
+                count_strict_schema_budget(item, budget);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                count_strict_schema_budget(item, budget);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn strict_schema_has_unrepresentable_construct(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            if object.keys().any(|key| {
+                STRICT_SCHEMA_UNREPRESENTABLE_KEYS
+                    .iter()
+                    .any(|unsupported| key == unsupported)
+            }) {
+                return true;
+            }
+            if object
+                .get("additionalProperties")
+                .is_some_and(|additional| additional != &Value::Bool(false))
+                && !object.contains_key("properties")
+            {
+                return true;
+            }
+            object
+                .values()
+                .any(strict_schema_has_unrepresentable_construct)
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(strict_schema_has_unrepresentable_construct),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+fn strict_response_format_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema.clone();
+    };
+    let mut transformed = serde_json::Map::new();
+    for (key, value) in object {
+        if STRICT_SCHEMA_STRIPPED_KEYS
+            .iter()
+            .any(|stripped| key == stripped)
+        {
+            continue;
+        }
+        let transformed_value = match key.as_str() {
+            "items" => strict_response_format_schema(value),
+            "anyOf" => Value::Array(
+                value
+                    .as_array()
+                    .map(|items| items.iter().map(strict_response_format_schema).collect())
+                    .unwrap_or_default(),
+            ),
+            _ => value.clone(),
+        };
+        transformed.insert(key.clone(), transformed_value);
+    }
+    if let Some(Value::Object(properties)) = object.get("properties") {
+        transformed.insert("additionalProperties".to_string(), Value::Bool(false));
+        transformed.insert(
+            "properties".to_string(),
+            Value::Object(
+                properties
+                    .iter()
+                    .map(|(name, property)| (name.clone(), strict_response_format_schema(property)))
+                    .collect(),
+            ),
+        );
+        transformed.insert(
+            "required".to_string(),
+            Value::Array(properties.keys().cloned().map(Value::String).collect()),
+        );
+    }
+    if let Some(items) = object.get("items") {
+        transformed.insert("items".to_string(), strict_response_format_schema(items));
+    }
+    Value::Object(transformed)
+}
+
+fn send_hosted_chat_request(
+    agent: &ureq::Agent,
+    endpoint: &str,
+    authorization: Option<&str>,
+    body: &Value,
+) -> context_graph::Result<HostedHttpResponse> {
+    let body = serde_json::to_string(body).map_err(|err| {
+        CgError::Engine(format!("hosted llm request serialization failed: {err}"))
+    })?;
+    let mut request = agent
+        .post(endpoint)
+        .header("Content-Type", "application/json");
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let mut response = request
+        .send(body)
+        .map_err(|err| provider_failure(ureq_failure_bucket(&err), &format!("{err}")))?;
+    let status = response.status().as_u16();
+    let reader = response
+        .body_mut()
+        .with_config()
+        .limit(HOSTED_BODY_LIMIT)
+        .reader();
+    let mut payload = String::new();
+    let mut reader = reader;
+    reader.read_to_string(&mut payload).map_err(|err| {
+        provider_failure(
+            FailureBucket::Unreachable,
+            &format!("hosted llm response read failed: {err}"),
+        )
+    })?;
+    Ok(HostedHttpResponse { status, payload })
+}
+
+fn structured_output_rejected(payload: &str) -> bool {
+    let lower = payload.to_ascii_lowercase();
+    let names_field = [
+        "response_format",
+        "response format",
+        "guided_json",
+        "guided json",
+        "grammar",
+        "json_schema",
+        "json schema",
+        "json_object",
+        "json object",
+        "structured_output",
+        "structured output",
+        "structured outputs",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let names_rejection = [
+        "unsupported",
+        "not supported",
+        "does not support",
+        "unrecognized",
+        "unknown",
+        "invalid",
+        "malformed",
+        "schema",
+        "not allowed",
+        "not permitted",
+        "extra fields",
+        "extra inputs",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    names_field && names_rejection
+}
+
+fn response_is_refusal(payload: &str) -> bool {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/choices/0/message/refusal")
+                .and_then(Value::as_str)
+                .map(|refusal| !refusal.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+fn response_is_truncated(payload: &str) -> bool {
+    serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .map(|reason| reason == "length")
+        })
+        .unwrap_or(false)
 }
 
 const PROVIDER_FAILURE_PREFIX: &str = "llm_provider_failure";
@@ -6078,27 +6621,30 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 fn public_marker(request: &UnderstandingRequest, reply: &context_graph::ModelReply) -> String {
     let deterministic = understanding_marker(request);
-    let scaffold_marker = format!("understood:{}", request.input);
-    if reply.marker == deterministic || reply.marker == scaffold_marker {
-        reply.marker.clone()
+    let input = request.input_without_output_contract();
+    let scaffold_marker = format!("understood:{input}");
+    let reply_marker = reply.marker_without_model_receipt();
+    if reply_marker == deterministic || reply_marker == scaffold_marker {
+        reply_marker.to_string()
     } else {
         deterministic
     }
 }
 
 fn understanding_marker(request: &UnderstandingRequest) -> String {
+    let input = request.input_without_output_contract();
     match request.consumer {
         context_graph::UnderstandingConsumer::ConversationCondensation => {
-            format!("condensed:{}", request.input)
+            format!("condensed:{input}")
         }
         context_graph::UnderstandingConsumer::BlueprintNormalization => {
-            format!("blueprint:{}", request.input)
+            format!("blueprint:{input}")
         }
         context_graph::UnderstandingConsumer::WebhookEntityResolution => {
-            format!("entity:{}", request.input)
+            format!("entity:{input}")
         }
         context_graph::UnderstandingConsumer::SignatureSemanticJudgment => {
-            format!("signature-judgment:{}", request.input)
+            format!("signature-judgment:{input}")
         }
     }
 }
@@ -6239,15 +6785,24 @@ fn degraded_outcome(
     request: &UnderstandingRequest,
     failure_bucket: FailureBucket,
 ) -> UnderstandingOutcome {
+    let input = request.input_without_output_contract();
     UnderstandingOutcome {
-        marker: format!("declarative:{}", request.input),
+        marker: format!("declarative:{input}"),
         degraded_marker: Some(DEGRADED_MARKER.to_string()),
         failure_bucket: Some(failure_bucket),
         phrasing: None,
         model_invoked: false,
         resolved_connection: None,
         cache_path_consulted: None,
-        stored_understanding: Some(request.input.clone()),
+        stored_understanding: Some(input.to_string()),
         usage: None,
+    }
+}
+
+fn degraded_model_call_receipt() -> ModelCallReceipt {
+    ModelCallReceipt {
+        reliability_level: EnforcementLevel::Floor,
+        outcome: ModelCallOutcome::Malformed,
+        structured_output_rejected: false,
     }
 }

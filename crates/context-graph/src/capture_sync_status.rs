@@ -18,9 +18,9 @@ use crate::ingest::{
 };
 use crate::schema::TABLES;
 use crate::{
-    CgError, ContextId, CreateEntity, EntityId, EntityType, EvidenceId, EvidenceKind,
-    EvidenceProducer, EvidenceRef, ListEntityFilter, ObservationId, RecordObservation, Result,
-    RetentionStatus, Store,
+    CgError, ContextId, CreateEntity, EnforcementLevel, EntityId, EntityType, EvidenceId,
+    EvidenceKind, EvidenceProducer, EvidenceRef, ListEntityFilter, ModelCallOutcome,
+    ModelCallReceipt, ObservationId, RecordObservation, Result, RetentionStatus, Store,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,10 +42,20 @@ pub struct ModelCallUsage {
     pub chunk_index: usize,
     pub usage: UsageReportState,
     pub elapsed: Duration,
+    pub reliability_level: EnforcementLevel,
+    pub outcome: ModelCallOutcome,
 }
 
-const DEFAULT_RECEIPT_RELIABILITY_LEVEL: &str = "Native";
-const DEFAULT_RECEIPT_OUTCOME: &str = "malformed";
+impl ModelCallUsage {
+    #[must_use]
+    pub fn model_receipt(&self) -> ModelCallReceipt {
+        ModelCallReceipt {
+            reliability_level: self.reliability_level,
+            outcome: self.outcome,
+            structured_output_rejected: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureUsageReceipt {
@@ -628,6 +638,9 @@ fn persist_usage_receipt(
 }
 
 fn model_call_usage_json(call: &ModelCallUsage) -> Value {
+    let receipt = call.model_receipt();
+    let reliability_level = receipt.reliability_level.as_receipt_str();
+    let outcome = receipt.outcome.as_receipt_str();
     match &call.usage {
         UsageReportState::Tokens(usage) => json!({
             "chunk_index": call.chunk_index,
@@ -635,8 +648,8 @@ fn model_call_usage_json(call: &ModelCallUsage) -> Value {
             "completion_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
             "elapsed_ms": call.elapsed.as_millis() as u64,
-            "reliability_level": DEFAULT_RECEIPT_RELIABILITY_LEVEL,
-            "outcome": DEFAULT_RECEIPT_OUTCOME,
+            "reliability_level": reliability_level,
+            "outcome": outcome,
         }),
         UsageReportState::Zero => json!({
             "chunk_index": call.chunk_index,
@@ -644,15 +657,15 @@ fn model_call_usage_json(call: &ModelCallUsage) -> Value {
             "completion_tokens": 0,
             "total_tokens": 0,
             "elapsed_ms": call.elapsed.as_millis() as u64,
-            "reliability_level": DEFAULT_RECEIPT_RELIABILITY_LEVEL,
-            "outcome": DEFAULT_RECEIPT_OUTCOME,
+            "reliability_level": reliability_level,
+            "outcome": outcome,
         }),
         UsageReportState::Unavailable => json!({
             "chunk_index": call.chunk_index,
             "usage": null,
             "elapsed_ms": call.elapsed.as_millis() as u64,
-            "reliability_level": DEFAULT_RECEIPT_RELIABILITY_LEVEL,
-            "outcome": DEFAULT_RECEIPT_OUTCOME,
+            "reliability_level": reliability_level,
+            "outcome": outcome,
         }),
     }
 }
