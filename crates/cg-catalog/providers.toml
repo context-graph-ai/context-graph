@@ -1,5 +1,6 @@
 [providers.claude]
 binary = "claude"
+structured_output = "none"
 prompt_delivery = "stdin"
 completion_args = [
   "-p",
@@ -45,6 +46,7 @@ all_of = [
 
 [providers.codex]
 binary = "codex"
+structured_output = "none"
 prompt_delivery = "stdin"
 completion_args = [
   "exec",
@@ -73,6 +75,7 @@ base_url = "https://api.openai.com/v1"
 default_model = "gpt-4.1-mini"
 dialect = "openai-chat-completions"
 reply_path = "/choices/0/message/content"
+structured_output = "response_format_schema"
 timeout_ms = 10000
 consent_required = true
 
@@ -82,6 +85,7 @@ auth_scheme = "bearer"
 base_url = "https://provider.example.invalid/v1"
 dialect = "openai-chat-completions"
 reply_path = "/choices/0/message/content"
+structured_output = "response_format_schema"
 timeout_ms = 10000
 consent_required = true
 
@@ -91,6 +95,7 @@ auth_scheme = "bearer"
 base_url = "https://api.studio.nebius.com/v1"
 dialect = "openai-chat-completions"
 reply_path = "/choices/0/message/content"
+structured_output = "response_format_schema"
 timeout_ms = 10000
 consent_required = true
 
@@ -100,6 +105,7 @@ auth_scheme = "bearer"
 base_url = "https://openrouter.ai/api/v1"
 dialect = "openai-chat-completions"
 reply_path = "/choices/0/message/content"
+structured_output = "response_format_schema"
 timeout_ms = 10000
 consent_required = true
 
@@ -110,5 +116,17 @@ base_url = "http://127.0.0.1:8000/v1"
 default_model = "llama-local"
 dialect = "openai-chat-completions"
 reply_path = "/choices/0/message/content"
+structured_output = "none"
+timeout_ms = 10000
+consent_required = true
+
+[providers.vllm]
+transport = "http"
+auth_scheme = "none"
+base_url = "http://127.0.0.1:8000/v1"
+default_model = "llama-local"
+dialect = "openai-chat-completions"
+reply_path = "/choices/0/message/content"
+structured_output = "guided_json"
 timeout_ms = 10000
 consent_required = true
