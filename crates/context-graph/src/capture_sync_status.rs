@@ -325,6 +325,8 @@ pub fn capture_with_progress_observer(
                 chunk_index,
                 usage: UsageReportState::Unavailable,
                 elapsed: chunk_elapsed,
+                reliability_level: EnforcementLevel::Floor,
+                outcome: ModelCallOutcome::Captured,
                 flow_tag: None,
                 model_id: None,
             });

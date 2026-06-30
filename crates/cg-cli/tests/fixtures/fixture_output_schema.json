@@ -1,6 +1,44 @@
 {
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "decision_relation": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "prior_decision_id": {
+          "type": "string"
+        },
+        "classification": {
+          "type": "string",
+          "enum": [
+            "new_insertion",
+            "exact_duplicate",
+            "refines_existing",
+            "conflicts_existing",
+            "supersedes_existing"
+          ]
+        }
+      },
+      "required": ["prior_decision_id", "classification"]
+    },
+    "extracted_span": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": ["string", "null"]
+        },
+        "start": {
+          "type": ["integer", "null"]
+        },
+        "end": {
+          "type": ["integer", "null"]
+        }
+      },
+      "required": ["text", "start", "end"]
+    }
+  },
   "properties": {
     "summary": {
       "type": "string"
@@ -40,9 +78,17 @@
             "type": "string",
             "enum": [
               "service",
+              "person",
+              "device",
+              "module",
+              "repository",
               "configuration",
+              "infrastructure",
+              "location",
               "file",
               "pipeline",
+              "database",
+              "team",
               "document"
             ]
           }
@@ -69,27 +115,64 @@
             "type": ["string", "null"]
           },
           "relation": {
-            "type": ["object", "null"],
-            "additionalProperties": false,
-            "properties": {
-              "prior_decision_id": {
-                "type": "string"
-              },
-              "classification": {
-                "type": "string",
-                "enum": [
-                  "new_insertion",
-                  "exact_duplicate",
-                  "refines_existing",
-                  "conflicts_existing",
-                  "supersedes_existing"
-                ]
-              }
-            },
-            "required": ["prior_decision_id", "classification"]
+            "$ref": "#/$defs/decision_relation"
+          },
+          "decision_type": {
+            "type": ["string", "null"]
+          },
+          "agent_id": {
+            "type": ["string", "null"]
+          },
+          "confidence": {
+            "type": ["number", "null"]
+          },
+          "reasoning": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "properties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": ["string", "number", "boolean", "null"]
+            }
+          },
+          "decision_type_span": {
+            "$ref": "#/$defs/extracted_span"
+          },
+          "decision_type_competing_labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "agent_id_span": {
+            "$ref": "#/$defs/extracted_span"
           }
         },
-        "required": ["key", "text", "goal_key", "entity_key", "relation"]
+        "required": [
+          "key",
+          "text",
+          "goal_key",
+          "entity_key",
+          "relation",
+          "decision_type",
+          "agent_id",
+          "confidence",
+          "reasoning",
+          "tags",
+          "properties",
+          "decision_type_span",
+          "decision_type_competing_labels",
+          "agent_id_span"
+        ]
       }
     },
     "observations": {
@@ -109,11 +192,67 @@
           },
           "path_change": {
             "type": ["string", "null"]
+          },
+          "observation_type": {
+            "type": ["string", "null"]
+          },
+          "source": {
+            "type": ["string", "null"]
+          },
+          "observed_properties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": ["string", "number", "boolean", "null"]
+            }
+          },
+          "state_delta": {
+            "type": "object",
+            "additionalProperties": {
+              "type": ["string", "number", "boolean", "null"]
+            }
+          },
+          "value_span": {
+            "$ref": "#/$defs/extracted_span"
           }
         },
-        "required": ["key", "text", "entity_key", "path_change"]
+        "required": [
+          "key",
+          "text",
+          "entity_key",
+          "path_change",
+          "observation_type",
+          "source",
+          "observed_properties",
+          "state_delta",
+          "value_span"
+        ]
+      }
+    },
+    "outcomes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "of_decision_key": {
+            "type": ["string", "null"]
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "notes": {
+            "type": "string"
+          },
+          "value_span": {
+            "$ref": "#/$defs/extracted_span"
+          }
+        },
+        "required": ["key", "of_decision_key", "success", "notes", "value_span"]
       }
     }
   },
-  "required": ["summary", "goals", "entities", "decisions", "observations"]
+  "required": ["summary", "goals", "entities", "decisions", "observations", "outcomes"]
 }

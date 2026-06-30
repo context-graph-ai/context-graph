@@ -9,6 +9,7 @@ use crate::ingest::{
     narrow_prior_decisions,
 };
 use crate::{CreateContext, DecisionId, EntityType, Result, Store};
+use serde_json::{Value, json};
 
 /// Default bound on the prior-decision candidate set fed to the identity judge when the
 /// caller sets no `recall_limit` — the near few neighbours, never the whole store.
@@ -136,44 +137,41 @@ impl CaptureHarnessConfig {
     /// source). When `prompt_override` is set, the rendered prompt block carries that text
     /// instead, while the parser still targets the structural fields.
     pub fn schema_descriptor(&self) -> Option<SchemaDescriptor> {
-        let entity_vocab = self
-            .allowed_entity_types()
-            .iter()
-            .map(|t| format!("{t:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let entity_type_values = self.allowed_entity_type_schema_values();
+        let entity_vocab = entity_type_values.join(", ");
         Some(SchemaDescriptor {
             fields: vec![
                 SchemaFieldSpec {
                     name: "goals".to_string(),
                     description: "intentions or goals expressed in the conversation".to_string(),
-                    required: false,
+                    required: true,
                 },
                 SchemaFieldSpec {
                     name: "entities".to_string(),
                     description: format!(
                         "named things referenced, each typed as one of: {entity_vocab}"
                     ),
-                    required: false,
+                    required: true,
                 },
                 SchemaFieldSpec {
                     name: "decisions".to_string(),
                     description: "decisions made, with decision_type, reasoning, and rationale"
                         .to_string(),
-                    required: false,
+                    required: true,
                 },
                 SchemaFieldSpec {
                     name: "observations".to_string(),
                     description: "observed facts or state changes about entities, with their lanes"
                         .to_string(),
-                    required: false,
+                    required: true,
                 },
                 SchemaFieldSpec {
                     name: "outcomes".to_string(),
                     description: "results recorded for a decision (success or failure)".to_string(),
-                    required: false,
+                    required: true,
                 },
             ],
+            entity_type_values,
             prompt_override: self.prompt_override.clone(),
         })
     }
@@ -184,6 +182,20 @@ impl CaptureHarnessConfig {
     /// a single change point. (A per-tenant override field is a recorded follow-up.)
     pub fn allowed_entity_types(&self) -> Vec<crate::EntityType> {
         crate::EntityType::ALL.to_vec()
+    }
+
+    pub fn allowed_entity_type_names(&self) -> Vec<String> {
+        self.allowed_entity_types()
+            .iter()
+            .map(|entity_type| format!("{entity_type:?}"))
+            .collect()
+    }
+
+    pub fn allowed_entity_type_schema_values(&self) -> Vec<String> {
+        self.allowed_entity_type_names()
+            .iter()
+            .map(|label| debug_label_to_snake_case(label))
+            .collect()
     }
 }
 
@@ -198,6 +210,9 @@ pub struct SchemaDescriptor {
     /// The fields declared in this descriptor. Both the rendered prompt schema block and
     /// the parser targets derive from this one list, so they cannot drift.
     pub fields: Vec<SchemaFieldSpec>,
+    /// JSON values accepted for `entities[].entity_type`, copied from the capture config's
+    /// swappable entity vocabulary.
+    pub entity_type_values: Vec<String>,
     /// When set, the rendered prompt schema block is this text verbatim (an operator
     /// override); the parser still targets `fields`.
     pub prompt_override: Option<String>,
@@ -231,11 +246,280 @@ impl SchemaDescriptor {
         lines.join("\n")
     }
 
+    /// Renders object-field guidance for the extraction prompt from the same descriptor field list
+    /// that drives the schema block and provider JSON Schema.
+    pub fn render_prompt_shape_guidance(&self) -> String {
+        let clauses = self
+            .fields
+            .iter()
+            .map(|field| match field.name.as_str() {
+                "goals" => "Goal objects: key,text.".to_string(),
+                "entities" => "Entity objects: key,name,path,entity_type.".to_string(),
+                "decisions" => {
+                    "Decision objects: key,text,goal_key,entity_key,relation,decision_type,agent_id,confidence,reasoning,tags,properties,decision_type_span,decision_type_competing_labels,agent_id_span."
+                        .to_string()
+                }
+                "observations" => {
+                    "Observation objects: key,text,entity_key,path_change,observation_type,source,observed_properties,state_delta,value_span."
+                        .to_string()
+                }
+                "outcomes" => "Outcome objects: key,of_decision_key,success,notes,value_span."
+                    .to_string(),
+                other => format!("{other} objects must match the provider JSON Schema."),
+            })
+            .collect::<Vec<_>>();
+        clauses.join(" ")
+    }
+
     /// Returns the parse target names. Derived from `self.fields` — removing or adding a
     /// field from `self.fields` immediately changes the returned list.
     pub fn parse_targets(&self) -> Vec<String> {
         self.fields.iter().map(|f| f.name.clone()).collect()
     }
+
+    /// Renders the JSON Schema passed to providers that support structured output.
+    ///
+    /// The top-level harvest properties derive from `self.fields`, matching
+    /// `render_prompt_schema_block()` and `parse_targets()`. `summary` is always included because it
+    /// is part of the `StructuredHarvest` envelope, while the field list supplies the harvest arrays.
+    pub fn render_output_json_schema(&self) -> Value {
+        let mut properties = serde_json::Map::new();
+        properties.insert("summary".to_string(), json!({ "type": "string" }));
+        for field in &self.fields {
+            properties.insert(field.name.clone(), self.harvest_field_schema(&field.name));
+        }
+        let mut required = vec![Value::String("summary".to_string())];
+        required.extend(
+            self.fields
+                .iter()
+                .filter(|field| field.required)
+                .map(|field| Value::String(field.name.clone())),
+        );
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "$defs": schema_defs(),
+            "properties": properties,
+            "required": required,
+        })
+    }
+
+    /// Renders the provider JSON Schema as a compact string for `OutputContract::Schema`.
+    pub fn render_output_json_schema_string(&self) -> String {
+        self.render_output_json_schema().to_string()
+    }
+
+    fn harvest_field_schema(&self, name: &str) -> Value {
+        match name {
+            "goals" => json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "key": { "type": "string" },
+                        "text": { "type": "string" },
+                    },
+                    "required": ["key", "text"],
+                },
+            }),
+            "entities" => json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "key": { "type": "string" },
+                        "name": { "type": "string" },
+                        "path": { "type": "string" },
+                        "entity_type": {
+                            "type": "string",
+                            "enum": self.entity_type_values.clone(),
+                        },
+                    },
+                    "required": ["key", "name", "path", "entity_type"],
+                },
+            }),
+            "decisions" => json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "key": { "type": "string" },
+                        "text": { "type": "string" },
+                        "goal_key": { "type": ["string", "null"] },
+                        "entity_key": { "type": ["string", "null"] },
+                        "relation": decision_relation_schema_ref(),
+                        "decision_type": { "type": ["string", "null"] },
+                        "agent_id": { "type": ["string", "null"] },
+                        "confidence": { "type": ["number", "null"] },
+                        "reasoning": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                        },
+                        "properties": json_object_schema(),
+                        "decision_type_span": extracted_span_schema_ref(),
+                        "decision_type_competing_labels": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                        },
+                        "agent_id_span": extracted_span_schema_ref(),
+                    },
+                    "required": [
+                        "key",
+                        "text",
+                        "goal_key",
+                        "entity_key",
+                        "relation",
+                        "decision_type",
+                        "agent_id",
+                        "confidence",
+                        "reasoning",
+                        "tags",
+                        "properties",
+                        "decision_type_span",
+                        "decision_type_competing_labels",
+                        "agent_id_span"
+                    ],
+                },
+            }),
+            "observations" => json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "key": { "type": "string" },
+                        "text": { "type": "string" },
+                        "entity_key": { "type": ["string", "null"] },
+                        "path_change": { "type": ["string", "null"] },
+                        "observation_type": { "type": ["string", "null"] },
+                        "source": { "type": ["string", "null"] },
+                        "observed_properties": json_object_schema(),
+                        "state_delta": json_object_schema(),
+                        "value_span": extracted_span_schema_ref(),
+                    },
+                    "required": [
+                        "key",
+                        "text",
+                        "entity_key",
+                        "path_change",
+                        "observation_type",
+                        "source",
+                        "observed_properties",
+                        "state_delta",
+                        "value_span"
+                    ],
+                },
+            }),
+            "outcomes" => json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "key": { "type": "string" },
+                        "of_decision_key": { "type": ["string", "null"] },
+                        "success": { "type": "boolean" },
+                        "notes": { "type": "string" },
+                        "value_span": extracted_span_schema_ref(),
+                    },
+                    "required": ["key", "of_decision_key", "success", "notes", "value_span"],
+                },
+            }),
+            _ => json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {},
+                    "required": [],
+                },
+            }),
+        }
+    }
+}
+
+fn decision_relation_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "properties": {
+            "prior_decision_id": { "type": "string" },
+            "classification": {
+                "type": "string",
+                "enum": [
+                    "new_insertion",
+                    "exact_duplicate",
+                    "refines_existing",
+                    "conflicts_existing",
+                    "supersedes_existing"
+                ],
+            },
+        },
+        "required": ["prior_decision_id", "classification"],
+    })
+}
+
+fn decision_relation_schema_ref() -> Value {
+    json!({ "$ref": "#/$defs/decision_relation" })
+}
+
+fn extracted_span_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "properties": {
+            "text": { "type": ["string", "null"] },
+            "start": { "type": ["integer", "null"] },
+            "end": { "type": ["integer", "null"] },
+        },
+        "required": ["text", "start", "end"],
+    })
+}
+
+fn extracted_span_schema_ref() -> Value {
+    json!({ "$ref": "#/$defs/extracted_span" })
+}
+
+fn schema_defs() -> Value {
+    json!({
+        "decision_relation": decision_relation_schema(),
+        "extracted_span": extracted_span_schema(),
+    })
+}
+
+fn json_object_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": json_scalar_schema(),
+    })
+}
+
+fn json_scalar_schema() -> Value {
+    json!({
+        "type": ["string", "number", "boolean", "null"],
+    })
+}
+
+fn debug_label_to_snake_case(label: &str) -> String {
+    let mut out = String::new();
+    for (index, character) in label.chars().enumerate() {
+        if character.is_uppercase() {
+            if index > 0 {
+                out.push('_');
+            }
+            out.extend(character.to_lowercase());
+        } else {
+            out.push(character);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

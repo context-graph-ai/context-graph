@@ -12,10 +12,10 @@ use crate::grounding;
 use crate::{
     AgentId, AuditId, BasisDiffResult, CgError, ContextId, CreateContext, CreateDecision,
     CreateDigest, Decision, DecisionId, DecisionStatus, DigestId, Embedder, EmbeddingId,
-    EmbeddingInput, EmbeddingOutput, EmbeddingTarget, EntityId, EntitySnapshotId, EntityType,
-    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionId, InvalidationId,
-    InvalidationSeverity, InvalidationStatus, ObservationId, PrecomputedEmbedding, ReasoningStep,
-    Result, Store,
+    EmbeddingInput, EmbeddingOutput, EmbeddingTarget, EnforcementLevel, EntityId, EntitySnapshotId,
+    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionId,
+    InvalidationId, InvalidationSeverity, InvalidationStatus, ModelCallOutcome, ObservationId,
+    PrecomputedEmbedding, ReasoningStep, Result, Store,
 };
 
 const EXTRACTION_PRIOR_DECISION_LIMIT: usize = 64;
@@ -609,6 +609,8 @@ impl<'a> FlowTaggingWrapper<'a> {
             chunk_index,
             usage: UsageReportState::Unavailable,
             elapsed,
+            reliability_level: EnforcementLevel::Floor,
+            outcome: ModelCallOutcome::Captured,
             flow_tag: Some(flow.to_string()),
             model_id: Some(self.default_model_id.to_string()),
         });
@@ -2080,47 +2082,44 @@ pub(crate) fn grounding_check_harvest(
         }
     }
 
-    // Observations — span-grounded when the model claims a quote.
+    // Observations — a value with no supporting span flags MissingSpan (§2: flagged when, and only
+    // when, the span is missing or does not occur in the chunk).
     for seed in &harvest.observations {
         if seed.key.trim().is_empty() {
             continue;
         }
-        if let Some(span) = span_text(seed.value_span.as_ref()) {
-            let verdict = grounding::full_grounding_check(&grounding::GroundingInput {
-                value: seed.text.clone(),
-                cited_span: Some(span),
-                chunk: transcript.to_string(),
-                ..Default::default()
+        let verdict = grounding::full_grounding_check(&grounding::GroundingInput {
+            value: seed.text.clone(),
+            cited_span: span_text(seed.value_span.as_ref()),
+            chunk: transcript.to_string(),
+            ..Default::default()
+        });
+        if let grounding::GroundingVerdict::Flagged(reason) = verdict {
+            flagged.push(FlaggedItem {
+                key: format!("{}_observation", seed.key),
+                reason: format!("{reason:?}: observation '{}'", seed.text),
+                legal_vocab: None,
             });
-            if let grounding::GroundingVerdict::Flagged(reason) = verdict {
-                flagged.push(FlaggedItem {
-                    key: format!("{}_observation", seed.key),
-                    reason: format!("{reason:?}: observation '{}'", seed.text),
-                    legal_vocab: None,
-                });
-            }
         }
     }
 
-    // Outcomes — span-grounded when the model claims a quote.
+    // Outcomes — a value with no supporting span flags MissingSpan (§2, as for observations).
     for seed in &harvest.outcomes {
         if seed.key.trim().is_empty() {
             continue;
         }
-        if let Some(span) = span_text(seed.value_span.as_ref()) {
-            let verdict = grounding::full_grounding_check(&grounding::GroundingInput {
-                value: seed.notes.clone(),
-                cited_span: Some(span),
-                chunk: transcript.to_string(),
-                ..Default::default()
+        let verdict = grounding::full_grounding_check(&grounding::GroundingInput {
+            value: seed.notes.clone(),
+            cited_span: span_text(seed.value_span.as_ref()),
+            chunk: transcript.to_string(),
+            ..Default::default()
+        });
+        if let grounding::GroundingVerdict::Flagged(reason) = verdict {
+            flagged.push(FlaggedItem {
+                key: format!("{}_outcome", seed.key),
+                reason: format!("{reason:?}: outcome '{}'", seed.notes),
+                legal_vocab: None,
             });
-            if let grounding::GroundingVerdict::Flagged(reason) = verdict {
-                flagged.push(FlaggedItem {
-                    key: format!("{}_outcome", seed.key),
-                    reason: format!("{reason:?}: outcome '{}'", seed.notes),
-                    legal_vocab: None,
-                });
-            }
         }
     }
 

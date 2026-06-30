@@ -57,119 +57,6 @@ const IMPORT_PROMPT_OVERHEAD_TOKENS: usize = 4_096;
 const IMPORT_OUTPUT_BUDGET_TOKENS: usize = 4_096;
 const IMPORT_RUNNING_STATE_CAP_TOKENS: usize = 4_096;
 const CONNECTION_SCOPE: &str = "connection-substrate";
-const CAPTURE_OUTPUT_SCHEMA: &str = r#"{
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "summary": {
-      "type": "string"
-    },
-    "goals": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "key": {
-            "type": "string"
-          },
-          "text": {
-            "type": "string"
-          }
-        },
-        "required": ["key", "text"]
-      }
-    },
-    "entities": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "key": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "path": {
-            "type": "string"
-          },
-          "entity_type": {
-            "type": "string",
-            "enum": ["service", "configuration", "file", "pipeline", "document"]
-          }
-        },
-        "required": ["key", "name", "path", "entity_type"]
-      }
-    },
-    "decisions": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "key": {
-            "type": "string"
-          },
-          "text": {
-            "type": "string"
-          },
-          "goal_key": {
-            "type": ["string", "null"]
-          },
-          "entity_key": {
-            "type": ["string", "null"]
-          },
-          "relation": {
-            "type": ["object", "null"],
-            "additionalProperties": false,
-            "properties": {
-              "prior_decision_id": {
-                "type": "string"
-              },
-              "classification": {
-                "type": "string",
-                "enum": [
-                  "new_insertion",
-                  "exact_duplicate",
-                  "refines_existing",
-                  "conflicts_existing",
-                  "supersedes_existing"
-                ]
-              }
-            },
-            "required": ["prior_decision_id", "classification"]
-          }
-        },
-        "required": ["key", "text", "goal_key", "entity_key", "relation"]
-      }
-    },
-    "observations": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "key": {
-            "type": "string"
-          },
-          "text": {
-            "type": "string"
-          },
-          "entity_key": {
-            "type": ["string", "null"]
-          },
-          "path_change": {
-            "type": ["string", "null"]
-          }
-        },
-        "required": ["key", "text", "entity_key", "path_change"]
-      }
-    }
-  },
-  "required": ["summary", "goals", "entities", "decisions", "observations"]
-}"#;
 const RELATION_OUTPUT_SCHEMA: &str = r#"{
   "type": "object",
   "additionalProperties": false,
@@ -2814,6 +2701,7 @@ impl ConnectedModelExtractor {
         prior_decisions: &[ExtractionPriorDecision],
     ) -> String {
         let schema_block = self.descriptor.render_prompt_schema_block();
+        let shape_guidance = self.descriptor.render_prompt_shape_guidance();
         let prior_memory = render_prior_decisions_for_prompt(prior_decisions);
         format!(
             "Extract context-graph memory from this conversation.\n\
@@ -2824,7 +2712,7 @@ Your entire response must begin with {{ and end with }}.\n\
 The JSON object has these fields (empty arrays when nothing applies):\n\
 {schema_block}\n\
 Keep any summary under 40 words. Return at most 3 goals, 6 entities, 6 decisions, 6 observations; prefer durable product/work decisions over review chatter.\n\
-Goal objects: key,text. Entity objects: key,name,path,entity_type. Decision objects: key,text,goal_key,entity_key,decision_type,reasoning,relation. Observation objects: key,text,entity_key,path_change. Outcome objects: key,decision_key,success.\n\
+{shape_guidance}\n\
 relation is null for a new decision. If a decision duplicates, refines, conflicts with, or supersedes an existing active decision below, set relation to {{\"prior_decision_id\":\"<id>\",\"classification\":\"exact_duplicate|refines_existing|conflicts_existing|supersedes_existing\"}}. Use supersedes_existing when a newer decision replaces an older one under the same goal without a basis change; conflicts_existing when it contradicts an active decision. Do not classify from shared words alone; handle negation and paraphrase by meaning.\n\
 For observation path_change, emit only the new path value, not \"old -> new\". Use null only for absent optional fields. Do not invent facts not present in the transcript.\n\
 Context: {context_label}\n\
@@ -2873,7 +2761,8 @@ impl ConversationExtractor for ConnectedModelExtractor {
             request.transcript,
             request.prior_decisions,
         );
-        let reply = self.call_model(prompt.clone(), Some(CAPTURE_OUTPUT_SCHEMA))?;
+        let output_schema = self.descriptor.render_output_json_schema_string();
+        let reply = self.call_model(prompt.clone(), Some(output_schema.as_str()))?;
         if matches!(
             reply.receipt.outcome,
             ModelCallOutcome::Refusal | ModelCallOutcome::Truncation
@@ -2910,7 +2799,7 @@ impl ConversationExtractor for ConnectedModelExtractor {
                     );
                 }
                 let repair_prompt = structured_capture_repair_prompt(&prompt, &reply.text);
-                let retry = self.call_model(repair_prompt, Some(CAPTURE_OUTPUT_SCHEMA))?;
+                let retry = self.call_model(repair_prompt, Some(output_schema.as_str()))?;
                 if matches!(
                     retry.receipt.outcome,
                     ModelCallOutcome::Refusal | ModelCallOutcome::Truncation
