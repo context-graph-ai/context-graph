@@ -54,6 +54,140 @@ fn structured_harvest_accepts_nullable_top_level_collections_as_empty() {
     }
 }
 
+#[test]
+fn structured_harvest_accepts_nullable_nested_decision_collections_as_empty() {
+    let harvest = StructuredHarvest::from_json_str(
+        &json!({
+            "summary": "live hosted model returned nullable nested decision collections",
+            "goals": [],
+            "entities": [],
+            "decisions": [{
+                "key": "decision-null-nested",
+                "text": "keep decision with nullable nested arrays",
+                "reasoning": null,
+                "tags": null,
+                "decision_type_competing_labels": null,
+                "decision_type": "technology_choice",
+                "agent_id": "hosted-model"
+            }],
+            "observations": [],
+            "outcomes": []
+        })
+        .to_string(),
+    );
+    assert!(
+        harvest.is_ok(),
+        "hosted structured-output models may emit null for absent nested decision arrays; \
+         capture must treat those as empty collections while preserving the decision: {harvest:?}",
+    );
+    let harvest = harvest.unwrap();
+
+    assert_eq!(
+        harvest.decisions.len(),
+        1,
+        "the decision row must survive nullable nested arrays"
+    );
+    let decision = &harvest.decisions[0];
+    assert_eq!(decision.key, "decision-null-nested");
+    assert_eq!(decision.text, "keep decision with nullable nested arrays");
+    assert_eq!(
+        decision.decision_type.as_ref().map(|field| field.as_str()),
+        Some("technology_choice")
+    );
+    assert_eq!(decision.agent_id.as_deref(), Some("hosted-model"));
+    assert_eq!(decision.reasoning, Vec::<String>::new());
+    assert_eq!(decision.tags, Vec::<String>::new());
+    assert_eq!(
+        decision.decision_type_competing_labels,
+        Vec::<String>::new()
+    );
+
+    for field in ["reasoning", "tags", "decision_type_competing_labels"] {
+        let raw = nested_decision_harvest_with(field, Value::Null);
+        let harvest = StructuredHarvest::from_json_str(&raw.to_string()).unwrap_or_else(|err| {
+            panic!("null nested decision collection {field} must parse without dropping siblings: {err}")
+        });
+        assert_eq!(harvest.decisions.len(), 1);
+        let decision = &harvest.decisions[0];
+        assert_eq!(decision.key, "decision-nested-sentinel");
+        assert_eq!(decision.text, "preserve sibling nested arrays");
+        assert_eq!(
+            decision.decision_type.as_ref().map(|field| field.as_str()),
+            Some("technology_choice")
+        );
+        assert_eq!(decision.agent_id.as_deref(), Some("hosted-model"));
+        assert_eq!(
+            decision.reasoning,
+            if field == "reasoning" {
+                Vec::new()
+            } else {
+                strings(&["model supplied reason"])
+            },
+            "null {field} must not erase sibling reasoning"
+        );
+        assert_eq!(
+            decision.tags,
+            if field == "tags" {
+                Vec::new()
+            } else {
+                strings(&["parser", "hosted-output"])
+            },
+            "null {field} must not erase sibling tags"
+        );
+        assert_eq!(
+            decision.decision_type_competing_labels,
+            if field == "decision_type_competing_labels" {
+                Vec::new()
+            } else {
+                strings(&["architecture", "technology_choice"])
+            },
+            "null {field} must not erase sibling competing labels"
+        );
+    }
+
+    for field in ["reasoning", "tags", "decision_type_competing_labels"] {
+        for malformed_value in [json!("not-an-array"), json!({"not": "array"})] {
+            let raw = nested_decision_harvest_with(field, malformed_value);
+            assert!(
+                StructuredHarvest::from_json_str(&raw.to_string()).is_err(),
+                "only null is tolerated for nested decision collection {field}; malformed non-array values must remain rejected"
+            );
+        }
+    }
+}
+
+fn nested_decision_harvest_with(field: &str, value: Value) -> Value {
+    let mut harvest = json!({
+        "summary": "malformed nested decision collection must stay rejected",
+        "goals": [],
+        "entities": [],
+        "decisions": [{
+            "key": "decision-nested-sentinel",
+            "text": "preserve sibling nested arrays",
+            "reasoning": ["model supplied reason"],
+            "tags": ["parser", "hosted-output"],
+            "decision_type_competing_labels": ["architecture", "technology_choice"],
+            "decision_type": "technology_choice",
+            "agent_id": "hosted-model"
+        }],
+        "observations": [],
+        "outcomes": []
+    });
+    let target = harvest
+        .get_mut("decisions")
+        .and_then(Value::as_array_mut)
+        .and_then(|decisions| decisions.first_mut())
+        .and_then(Value::as_object_mut)
+        .and_then(|decision| decision.get_mut(field))
+        .expect("test only replaces a known nested decision collection");
+    *target = value;
+    harvest
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
 fn sentinel_harvest_with(field: &str, value: Value) -> Value {
     let mut harvest = json!({
         "summary": "nullable collection preserves valid sibling rows",
