@@ -112,7 +112,7 @@ pub fn default_capture_context(tenant_id: &str, _cwd: &str) -> String {
 
 /// Configuration passed to the harness capture entry point. Every knob is data the harness
 /// honors during capture.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CaptureHarnessConfig {
     /// Bound on the prior-decision candidate set narrowed into Stage-3 identity resolution.
     /// When unset the harness uses its internal default.
@@ -128,6 +128,19 @@ pub struct CaptureHarnessConfig {
     pub prompt_override: Option<String>,
     /// Model tier (e.g. "haiku", "sonnet").
     pub tier: Option<String>,
+}
+
+impl Default for CaptureHarnessConfig {
+    fn default() -> Self {
+        Self {
+            recall_limit: None,
+            chunk_window: None,
+            skills_enabled: true,
+            review_mode: false,
+            prompt_override: None,
+            tier: None,
+        }
+    }
 }
 
 impl CaptureHarnessConfig {
@@ -715,8 +728,14 @@ pub fn run_capture(
     // pipeline). Skill selection honors the store-level master switch and review-hold gate; each
     // selected skill's retype effect is applied to the harvested entity types in place, and a
     // firing trace is recorded for every selected skill (the real input to drift detection).
-    let applied_skill_ids =
-        select_and_apply_learned_skills(store, &mut harvest, &request.transcript, &capture_id);
+    let applied_skill_ids = select_and_apply_learned_skills(
+        store,
+        &mut harvest,
+        &request.transcript,
+        &capture_id,
+        config.skills_enabled,
+        config.review_mode,
+    );
 
     // Anchor every capture that produced structured memory but named no entity to a single
     // scope entity for the context, so each capture has a structural anchor and observations
@@ -1015,9 +1034,11 @@ fn select_and_apply_learned_skills(
     harvest: &mut crate::ingest::StructuredHarvest,
     chunk: &str,
     capture_id: &str,
+    config_skills_enabled: bool,
+    config_review_mode: bool,
 ) -> Vec<String> {
-    let skills_on = crate::skill_store::skills_enabled(store);
-    let review_mode = crate::skill_store::review_hold_active(store);
+    let skills_on = config_skills_enabled && crate::skill_store::skills_enabled(store);
+    let review_mode = config_review_mode || crate::skill_store::review_hold_active(store);
     let selected =
         crate::skill_store::select_skills_for_chunk(store, chunk, skills_on, review_mode);
     if selected.is_empty() {

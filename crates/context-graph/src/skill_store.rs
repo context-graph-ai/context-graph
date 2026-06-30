@@ -2,7 +2,7 @@
 //! drift records. Functions that need a store read/write against the real engine tables;
 //! pure-logic functions (promotion gate, parse) are store-free.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +150,14 @@ fn provenance_from_str(s: &str) -> SkillProvenance {
     }
 }
 
+fn provenance_to_str(provenance: &SkillProvenance) -> &'static str {
+    match provenance {
+        SkillProvenance::HumanCorrection => "human-correction",
+        SkillProvenance::LlmAuthored => "llm-authored",
+        SkillProvenance::HumanAuthored => "human-authored",
+    }
+}
+
 fn kind_from_str(s: &str) -> TeachingEventKind {
     match s {
         "correction" => TeachingEventKind::Correction,
@@ -173,6 +181,65 @@ pub fn list_skills_in_store(store: &Store) -> Vec<LearnedSkill> {
     rows.into_iter()
         .map(|row| skill_from_row(&row.values))
         .collect()
+}
+
+/// Persist a learned skill row exactly as supplied. Returns false when the id already exists
+/// or the insert fails.
+pub fn persist_skill(store: &Store, skill: &LearnedSkill) -> bool {
+    if skill_exists(store, &skill.id) {
+        return false;
+    }
+    insert_skill_row(store, skill)
+}
+
+fn skill_exists(store: &Store, skill_id: &str) -> bool {
+    list_skills_in_store(store)
+        .into_iter()
+        .any(|skill| skill.id == skill_id)
+}
+
+fn insert_skill_row(store: &Store, skill: &LearnedSkill) -> bool {
+    let db = store.sync_database();
+    let params = HashMap::from([
+        (
+            "id".to_string(),
+            contextdb_core::Value::Text(skill.id.clone()),
+        ),
+        (
+            "description".to_string(),
+            contextdb_core::Value::Text(skill.description.clone()),
+        ),
+        (
+            "rule".to_string(),
+            contextdb_core::Value::Text(skill.rule.clone()),
+        ),
+        (
+            "provenance".to_string(),
+            contextdb_core::Value::Text(provenance_to_str(&skill.provenance).to_string()),
+        ),
+        (
+            "active".to_string(),
+            contextdb_core::Value::Bool(skill.active),
+        ),
+        (
+            "held_for_review".to_string(),
+            contextdb_core::Value::Bool(skill.held_for_review),
+        ),
+        (
+            "fire_right".to_string(),
+            contextdb_core::Value::Int64(i64::from(skill.fire_right)),
+        ),
+        (
+            "fire_wrong".to_string(),
+            contextdb_core::Value::Int64(i64::from(skill.fire_wrong)),
+        ),
+    ]);
+    execute_with_live_txid(
+        &db,
+        "INSERT INTO cg_learned_skills (id, description, rule, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
+        "created_at",
+        params,
+    )
 }
 
 fn skill_from_row(values: &HashMap<String, contextdb_core::Value>) -> LearnedSkill {
@@ -220,6 +287,255 @@ fn skill_from_row(values: &HashMap<String, contextdb_core::Value>) -> LearnedSki
         held_for_review,
         fire_right,
         fire_wrong,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RetypeLessonKey {
+    entity_name_norm: String,
+    entity_name: String,
+    from_type: String,
+    to_type: String,
+}
+
+fn promotion_threshold() -> usize {
+    // Two training labels plus one held-out label: a single correction is only a lesson.
+    3
+}
+
+fn normalize_lesson_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+fn sanitize_skill_id_part(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn retype_skill_id(key: &RetypeLessonKey) -> String {
+    format!(
+        "skill-retype-{}-{}-{}",
+        sanitize_skill_id_part(&key.entity_name),
+        sanitize_skill_id_part(&key.from_type),
+        sanitize_skill_id_part(&key.to_type)
+    )
+}
+
+fn retype_skill_from_key(store: &Store, key: &RetypeLessonKey) -> LearnedSkill {
+    LearnedSkill {
+        id: retype_skill_id(key),
+        description: format!(
+            "retype {} from {} to {} when future captures mention this entity",
+            key.entity_name, key.from_type, key.to_type
+        ),
+        rule: format!(
+            "when an entity named {} is typed {} → {}",
+            key.entity_name, key.from_type, key.to_type
+        ),
+        provenance: SkillProvenance::HumanCorrection,
+        active: true,
+        held_for_review: review_hold_active(store),
+        fire_right: 0,
+        fire_wrong: 0,
+    }
+}
+
+fn entity_type_label_for_skill(entity_type: crate::EntityType) -> &'static str {
+    match entity_type {
+        crate::EntityType::Service => "Service",
+        crate::EntityType::Person => "Person",
+        crate::EntityType::Device => "Device",
+        crate::EntityType::Module => "Module",
+        crate::EntityType::Repository => "Repository",
+        crate::EntityType::Configuration => "Configuration",
+        crate::EntityType::Infrastructure => "Infrastructure",
+        crate::EntityType::Location => "Location",
+        crate::EntityType::File => "File",
+        crate::EntityType::Pipeline => "Pipeline",
+        crate::EntityType::Database => "Database",
+        crate::EntityType::Team => "Team",
+        crate::EntityType::Document => "Document",
+    }
+}
+
+fn entity_type_from_correction_label(label: &str) -> Option<(crate::EntityType, &'static str)> {
+    let normalized = label
+        .trim()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+        .to_ascii_lowercase()
+        .replace(['_', '-'], "");
+    let entity_type = match normalized.as_str() {
+        "service" => crate::EntityType::Service,
+        "person" => crate::EntityType::Person,
+        "device" => crate::EntityType::Device,
+        "module" => crate::EntityType::Module,
+        "repository" | "repo" => crate::EntityType::Repository,
+        "configuration" | "config" => crate::EntityType::Configuration,
+        "infrastructure" | "infra" => crate::EntityType::Infrastructure,
+        "location" => crate::EntityType::Location,
+        "file" => crate::EntityType::File,
+        "pipeline" => crate::EntityType::Pipeline,
+        "database" | "db" => crate::EntityType::Database,
+        "team" => crate::EntityType::Team,
+        "document" | "doc" => crate::EntityType::Document,
+        _ => return None,
+    };
+    Some((entity_type, entity_type_label_for_skill(entity_type)))
+}
+
+fn parse_retype_correction_content(content: &str) -> Option<(&'static str, Option<String>)> {
+    let mut parts = content.split_whitespace();
+    let first = parts.next()?;
+    let (_target_type, target_label) = entity_type_from_correction_label(first)?;
+    let target_name = parts.collect::<Vec<_>>().join(" ");
+    let target_name = target_name.trim();
+    let target_name = if target_name.is_empty() {
+        None
+    } else {
+        Some(target_name.to_string())
+    };
+    Some((target_label, target_name))
+}
+
+fn entity_from_item_or_digest(
+    store: &Store,
+    item_id: &str,
+    target_name: Option<&str>,
+) -> Option<crate::Entity> {
+    let item_uuid = uuid::Uuid::parse_str(item_id).ok()?;
+    if let Ok(Some(entity)) = store.get_entity(crate::EntityId::from(item_uuid)) {
+        return Some(entity);
+    }
+
+    let db = store.sync_database();
+    let params = HashMap::from([(
+        "digest_id".to_string(),
+        contextdb_core::Value::Uuid(item_uuid),
+    )]);
+    let result = db
+        .execute(
+            "SELECT source_id FROM GRAPH_TABLE(
+                edges MATCH (d)<-[:EXTRACTED_FROM]-(s)
+                WHERE d.id = $digest_id
+                COLUMNS (s.id AS source_id)
+            )",
+            &params,
+        )
+        .ok()?;
+    let target_name_norm = target_name.map(normalize_lesson_name);
+    let mut candidates = Vec::new();
+    for row in &result.rows {
+        let Some(contextdb_core::Value::Uuid(source_id)) = row.first() else {
+            continue;
+        };
+        if let Ok(Some(entity)) = store.get_entity(crate::EntityId::from(*source_id)) {
+            candidates.push(entity);
+        }
+    }
+    if let Some(target_name_norm) = target_name_norm {
+        candidates
+            .into_iter()
+            .find(|entity| normalize_lesson_name(&entity.name) == target_name_norm)
+    } else if candidates.len() == 1 {
+        candidates.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn retype_lesson_from_event(store: &Store, event: &TeachingEvent) -> Option<RetypeLessonKey> {
+    if event.kind != TeachingEventKind::Correction {
+        return None;
+    }
+    let (target_type_label, target_name) = parse_retype_correction_content(&event.content)?;
+    let entity =
+        entity_from_item_or_digest(store, &event.corrected_item_id, target_name.as_deref())?;
+    let entity_name = target_name.unwrap_or(entity.name);
+    let from_type = entity_type_label_for_skill(entity.entity_type).to_string();
+    if from_type.eq_ignore_ascii_case(target_type_label) {
+        return None;
+    }
+    Some(RetypeLessonKey {
+        entity_name_norm: normalize_lesson_name(&entity_name),
+        entity_name,
+        from_type,
+        to_type: target_type_label.to_string(),
+    })
+}
+
+fn promote_skills_from_teaching_events(store: &Store) -> bool {
+    let mut grouped: BTreeMap<RetypeLessonKey, usize> = BTreeMap::new();
+    for event in list_teaching_events_in_store(store) {
+        if !event.skill_id.is_empty() {
+            continue;
+        }
+        if let Some(key) = retype_lesson_from_event(store, &event) {
+            *grouped.entry(key).or_default() += 1;
+        }
+    }
+
+    let mut created = false;
+    for (key, count) in grouped {
+        if count < promotion_threshold() {
+            continue;
+        }
+        let skill = retype_skill_from_key(store, &key);
+        created |= persist_skill(store, &skill);
+    }
+    created
+}
+
+fn label_latest_unresolved_firing_for_skill(store: &Store, skill_id: &str, correct: bool) -> bool {
+    let db = store.sync_database();
+    let snapshot = db.snapshot();
+    let mut candidates: Vec<(contextdb_core::Value, String)> = db
+        .scan(FIRING_TRACE_TABLE, snapshot)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| {
+            match row.values.get("skill_id") {
+                Some(contextdb_core::Value::Text(id)) if id == skill_id => {}
+                _ => return None,
+            }
+            if !matches!(
+                row.values.get("correct"),
+                None | Some(contextdb_core::Value::Null)
+            ) {
+                return None;
+            }
+            let id = match row.values.get("id") {
+                Some(contextdb_core::Value::Text(id)) => id.clone(),
+                Some(contextdb_core::Value::Uuid(id)) => id.to_string(),
+                _ => return None,
+            };
+            let created = row
+                .values
+                .get("created_at")
+                .cloned()
+                .unwrap_or(contextdb_core::Value::Null);
+            Some((created, id))
+        })
+        .collect();
+    candidates.sort_by(|a, b| value_order_key(&b.0).cmp(&value_order_key(&a.0)));
+    let Some((_, firing_id)) = candidates.into_iter().next() else {
+        return false;
+    };
+    record_firing_label(store, &firing_id, correct);
+    true
+}
+
+fn value_order_key(value: &contextdb_core::Value) -> i128 {
+    match value {
+        contextdb_core::Value::TxId(tx) => i128::from(tx.0),
+        contextdb_core::Value::Int64(value) => i128::from(*value),
+        _ => 0,
     }
 }
 
@@ -278,11 +594,21 @@ pub fn apply_correction(
         kind: TeachingEventKind::Correction,
         content: new_value.to_string(),
     };
+    if let Some(skill_id) = skill_id
+        && !skill_id.trim().is_empty()
+    {
+        let _ = label_latest_unresolved_firing_for_skill(store, skill_id, false);
+    }
+    let new_skill_created = if skill_id.is_none() {
+        promote_skills_from_teaching_events(store)
+    } else {
+        false
+    };
 
     CorrectionResult {
         applied: true,
         teaching_event: Some(teaching_event),
-        new_skill_created: false,
+        new_skill_created,
     }
 }
 
@@ -492,18 +818,21 @@ pub fn parse_retype_effect(rule: &str) -> Option<SkillRetypeEffect> {
     let lower = rule.to_ascii_lowercase();
     let name_marker = "entity named ";
     let typed_marker = " is typed ";
-    let arrow = "→";
     let name_start = lower.find(name_marker)? + name_marker.len();
     let typed_start_rel = lower[name_start..].find(typed_marker)?;
     let entity_name = rule[name_start..name_start + typed_start_rel]
         .trim()
         .to_string();
     let after_typed = name_start + typed_start_rel + typed_marker.len();
-    let arrow_rel = rule[after_typed..].find(arrow)?;
+    let rest = &rule[after_typed..];
+    let (arrow_rel, arrow_len) = rest
+        .find('→')
+        .map(|pos| (pos, '→'.len_utf8()))
+        .or_else(|| rest.find("->").map(|pos| (pos, 2)))?;
     let from_type = rule[after_typed..after_typed + arrow_rel]
         .trim()
         .to_string();
-    let to_type = rule[after_typed + arrow_rel + arrow.len()..]
+    let to_type = rule[after_typed + arrow_rel + arrow_len..]
         .trim()
         .to_string();
     if entity_name.is_empty() || from_type.is_empty() || to_type.is_empty() {

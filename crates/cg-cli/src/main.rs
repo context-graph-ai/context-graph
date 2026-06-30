@@ -1247,6 +1247,55 @@ fn handle_skills(args: &[String]) -> i32 {
                 context_id,
             );
         }
+        Some("add") => {
+            let Some(path) = positionals.get(1) else {
+                return usage_error("skills add requires a SKILL.md file path");
+            };
+            let content = match fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(err) => {
+                    return usage_error(&format!("could not read skill file `{path}`: {err}"));
+                }
+            };
+            let parsed = context_graph::skill_store::parse_human_authored_skill(&content);
+            let Some(skill) = parsed.skill else {
+                return usage_error(
+                    parsed
+                        .error
+                        .as_deref()
+                        .unwrap_or("could not parse human-authored skill"),
+                );
+            };
+            if !context_graph::skill_store::persist_skill(&store, &skill) {
+                return usage_error(&format!(
+                    "skill `{}` already exists or could not be added",
+                    skill.id
+                ));
+            }
+            print_action_result(
+                json!({
+                    "ok": true,
+                    "verb": "skills-add",
+                    "skill": skill_json(&skill),
+                    "rendered": format!("added skill {} as human-authored", skill.id),
+                }),
+                &db_path,
+                &context_label,
+                context_id,
+            );
+        }
+        Some("export") => {
+            let Some(skill_id) = positionals.get(1) else {
+                return usage_error("skills export requires a skill id");
+            };
+            let Some(skill) = context_graph::skill_store::list_skills_in_store(&store)
+                .into_iter()
+                .find(|skill| &skill.id == skill_id)
+            else {
+                return usage_error(&format!("no learned skill `{skill_id}`"));
+            };
+            println!("{}", context_graph::skill_store::export_skill(&skill));
+        }
         None => {
             let skills = context_graph::skill_store::list_skills_in_store(&store);
             let rendered = render_skill_cards(&skills);
