@@ -37,6 +37,16 @@ fn repository_transcript() -> String {
     .join("\n")
 }
 
+fn repository_with_ingest_transcript() -> String {
+    [
+        "Goal G1: keep the context-graph repository classified with ingest",
+        "Entity E1: context-graph type=file",
+        "Entity E2: ingest type=file",
+        "Decision D1: treat context-graph as the repository root and ingest as the module serves G1",
+    ]
+    .join("\n")
+}
+
 fn run_repository_capture(store: &Store, context_label: &str) -> Entity {
     let (_report, _harness) = run_capture(
         store,
@@ -257,7 +267,102 @@ fn repeated_real_corrections_promote_persisted_skill_then_run_capture_auto_appli
 
 #[test]
 fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firing_label() {
+    let (_noop_dir, noop_store) = fresh_store();
+    let noop_skill_id = "skill-cofired-module-repository-noop".to_string();
+    assert!(
+        persist_skill(
+            &noop_store,
+            &LearnedSkill {
+                id: noop_skill_id.clone(),
+                description: "context-graph module to repository co-firing guard".to_string(),
+                rule: "when an entity named context-graph is typed Module → Repository".to_string(),
+                provenance: SkillProvenance::HumanCorrection,
+                active: true,
+                held_for_review: false,
+                fire_right: 0,
+                fire_wrong: 0,
+            }
+        ),
+        "the no-op fixture must persist the co-fired retype skill"
+    );
+    let (noop_report, noop_harness) = run_capture(
+        &noop_store,
+        CaptureRequest {
+            context_label: "cofired-retype-noop".to_string(),
+            transcript: repository_transcript(),
+            model_available: true,
+        },
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("co-fired no-op capture must succeed");
+    assert!(
+        noop_harness
+            .applied_skill_ids
+            .iter()
+            .any(|id| id == &noop_skill_id),
+        "the co-fired retype skill must be selected so the negative-control trace is real; applied_skill_ids={:?}",
+        noop_harness.applied_skill_ids
+    );
+    let noop_entity = entity_named_in_context(&noop_store, "cofired-retype-noop", "context-graph");
+    assert_eq!(
+        noop_entity.entity_type,
+        EntityType::File,
+        "the Module -> Repository co-fired skill must not change a File entity; otherwise the drift \
+         negative control is not proving non-changing retype attribution"
+    );
+    let noop_digest_id = single_digest_id(&noop_report);
+    let noop_traces = firing_traces_for_skill(&noop_store, &noop_skill_id);
+    assert_eq!(
+        noop_traces.len(),
+        1,
+        "the no-op co-fired skill must record exactly one capture-produced firing trace; \
+         noop_traces={noop_traces:?}"
+    );
+    assert_eq!(
+        (noop_traces[0].capture_id.as_str(), noop_traces[0].correct),
+        (noop_digest_id.as_str(), None),
+        "the no-op co-fired skill trace must be keyed to the digest it selected on"
+    );
+
     let (_dir, store) = fresh_store();
+    let unrelated_skill_id = "skill-unrelated-context-graph-note".to_string();
+    let cofired_retype_skill_id = "skill-cofired-module-repository".to_string();
+    let cofired_effectful_skill_id = "skill-cofired-ingest-module".to_string();
+    assert!(
+        persist_skill(
+            &store,
+            &LearnedSkill {
+                id: cofired_retype_skill_id.clone(),
+                description: "context-graph module to repository co-firing guard".to_string(),
+                rule: "when an entity named context-graph is typed Module → Repository".to_string(),
+                provenance: SkillProvenance::HumanCorrection,
+                active: true,
+                held_for_review: false,
+                fire_right: 0,
+                fire_wrong: 0,
+            }
+        ),
+        "the co-fired retype skill must be older than the learned File -> Repository skill so \
+         first-matching-skill shortcuts fail"
+    );
+    assert!(
+        persist_skill(
+            &store,
+            &LearnedSkill {
+                id: cofired_effectful_skill_id.clone(),
+                description: "ingest module co-firing guard".to_string(),
+                rule: "when an entity named ingest is typed File → Module".to_string(),
+                provenance: SkillProvenance::HumanCorrection,
+                active: true,
+                held_for_review: false,
+                fire_right: 0,
+                fire_wrong: 0,
+            }
+        ),
+        "the effectful co-fired retype skill must be older than the learned File -> Repository skill \
+         so first-effectful-skill shortcuts fail"
+    );
 
     let skills = teach_repository_skill_from_real_corrections(&store);
     let skill = learned_repository_retype_skill(&skills).unwrap_or_else(|| {
@@ -267,7 +372,31 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         )
     });
     let learned_skill_id = skill.id.clone();
-    let unrelated_skill_id = "skill-unrelated-context-graph-note".to_string();
+    let cofired_training_traces = firing_traces_for_skill(&store, &cofired_retype_skill_id);
+    assert_eq!(
+        cofired_training_traces.len(),
+        3,
+        "because the co-fired retype skill is older than the learned skill, it should have fired on \
+         the three training captures before drift; cofired_training_traces={cofired_training_traces:?}"
+    );
+    let cofired_training_by_id = cofired_training_traces
+        .iter()
+        .map(|trace| (trace.id.clone(), (trace.capture_id.clone(), trace.correct)))
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        cofired_training_by_id
+            .values()
+            .all(|(_, correct)| correct.is_none()),
+        "training co-fired traces must be unresolved before the drift correction; \
+         cofired_training_traces={cofired_training_traces:?}"
+    );
+    let effectful_training_traces = firing_traces_for_skill(&store, &cofired_effectful_skill_id);
+    assert!(
+        effectful_training_traces.is_empty(),
+        "the effectful co-fired skill is older than the learned skill, but the training captures do \
+         not mention ingest, so it must not have pre-drift traces; \
+         effectful_training_traces={effectful_training_traces:?}"
+    );
     assert!(
         persist_skill(
             &store,
@@ -290,7 +419,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         &store,
         CaptureRequest {
             context_label: "drift-stale-capture".to_string(),
-            transcript: repository_transcript(),
+            transcript: repository_with_ingest_transcript(),
             model_available: true,
         },
         &super::refactor_extractor::SpanFaithfulExtractor,
@@ -311,7 +440,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         &store,
         CaptureRequest {
             context_label: "drift-target-capture".to_string(),
-            transcript: repository_transcript(),
+            transcript: repository_with_ingest_transcript(),
             model_available: true,
         },
         &super::refactor_extractor::SpanFaithfulExtractor,
@@ -332,7 +461,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         &store,
         CaptureRequest {
             context_label: "drift-later-capture".to_string(),
-            transcript: repository_transcript(),
+            transcript: repository_with_ingest_transcript(),
             model_available: true,
         },
         &super::refactor_extractor::SpanFaithfulExtractor,
@@ -355,6 +484,9 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
 
     let traces_before = firing_traces_for_skill(&store, &learned_skill_id);
     let unrelated_traces_before = firing_traces_for_skill(&store, &unrelated_skill_id);
+    let cofired_retype_traces_before = firing_traces_for_skill(&store, &cofired_retype_skill_id);
+    let effectful_retype_traces_before =
+        firing_traces_for_skill(&store, &cofired_effectful_skill_id);
     assert_eq!(
         traces_before.len(),
         3,
@@ -366,6 +498,19 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         3,
         "the unrelated skill should co-fire on the same three captures before correction; \
          unrelated_traces_before={unrelated_traces_before:?}"
+    );
+    assert_eq!(
+        cofired_retype_traces_before.len(),
+        6,
+        "the older co-fired retype skill should have three training traces plus traces on the same \
+         stale, target, and later captures before correction; \
+         before correction; cofired_retype_traces_before={cofired_retype_traces_before:?}"
+    );
+    assert_eq!(
+        effectful_retype_traces_before.len(),
+        3,
+        "the effectful co-fired retype skill should have traces on the same stale, target, and later \
+         captures before correction; effectful_retype_traces_before={effectful_retype_traces_before:?}"
     );
     let stale_trace = traces_before
         .iter()
@@ -420,6 +565,112 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         "the unrelated skill must have an unresolved co-firing on the corrected target digest; \
          unrelated_traces_before={unrelated_traces_before:?}"
     );
+    let stale_cofired_trace = cofired_retype_traces_before
+        .iter()
+        .find(|trace| trace.capture_id == stale_digest_id && trace.correct.is_none())
+        .unwrap_or_else(|| {
+            panic!(
+                "the co-fired retype skill must have an unresolved firing on the stale digest; \
+                 cofired_retype_traces_before={cofired_retype_traces_before:?}"
+            )
+        })
+        .clone();
+    let target_cofired_trace = cofired_retype_traces_before
+        .iter()
+        .find(|trace| trace.capture_id == target_digest_id && trace.correct.is_none())
+        .unwrap_or_else(|| {
+            panic!(
+                "the co-fired retype skill must have an unresolved firing on the corrected target \
+                 digest; cofired_retype_traces_before={cofired_retype_traces_before:?}"
+            )
+        })
+        .clone();
+    let later_cofired_trace = cofired_retype_traces_before
+        .iter()
+        .find(|trace| trace.capture_id == later_digest_id && trace.correct.is_none())
+        .unwrap_or_else(|| {
+            panic!(
+                "the co-fired retype skill must have an unresolved firing on the later digest; \
+                 cofired_retype_traces_before={cofired_retype_traces_before:?}"
+            )
+        })
+        .clone();
+    let cofired_before_by_id = cofired_retype_traces_before
+        .iter()
+        .map(|trace| (trace.id.clone(), (trace.capture_id.clone(), trace.correct)))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_cofired_before_by_id = cofired_training_by_id.clone();
+    expected_cofired_before_by_id.insert(
+        stale_cofired_trace.id.clone(),
+        (stale_digest_id.clone(), None),
+    );
+    expected_cofired_before_by_id.insert(
+        target_cofired_trace.id.clone(),
+        (target_digest_id.clone(), None),
+    );
+    expected_cofired_before_by_id.insert(
+        later_cofired_trace.id.clone(),
+        (later_digest_id.clone(), None),
+    );
+    assert_eq!(
+        cofired_before_by_id, expected_cofired_before_by_id,
+        "the co-fired retype skill must have exactly the three training traces plus one unresolved \
+         trace for each drift fixture digest; \
+         cofired_retype_traces_before={cofired_retype_traces_before:?}"
+    );
+    let stale_effectful_trace = effectful_retype_traces_before
+        .iter()
+        .find(|trace| trace.capture_id == stale_digest_id && trace.correct.is_none())
+        .unwrap_or_else(|| {
+            panic!(
+                "the effectful co-fired skill must have an unresolved firing on the stale digest; \
+                 effectful_retype_traces_before={effectful_retype_traces_before:?}"
+            )
+        })
+        .clone();
+    let target_effectful_trace = effectful_retype_traces_before
+        .iter()
+        .find(|trace| trace.capture_id == target_digest_id && trace.correct.is_none())
+        .unwrap_or_else(|| {
+            panic!(
+                "the effectful co-fired skill must have an unresolved firing on the corrected target \
+                 digest; effectful_retype_traces_before={effectful_retype_traces_before:?}"
+            )
+        })
+        .clone();
+    let later_effectful_trace = effectful_retype_traces_before
+        .iter()
+        .find(|trace| trace.capture_id == later_digest_id && trace.correct.is_none())
+        .unwrap_or_else(|| {
+            panic!(
+                "the effectful co-fired skill must have an unresolved firing on the later digest; \
+                 effectful_retype_traces_before={effectful_retype_traces_before:?}"
+            )
+        })
+        .clone();
+    let effectful_before_by_id = effectful_retype_traces_before
+        .iter()
+        .map(|trace| (trace.id.clone(), (trace.capture_id.clone(), trace.correct)))
+        .collect::<BTreeMap<_, _>>();
+    let expected_effectful_before_by_id = BTreeMap::from([
+        (
+            stale_effectful_trace.id.clone(),
+            (stale_digest_id.clone(), None),
+        ),
+        (
+            target_effectful_trace.id.clone(),
+            (target_digest_id.clone(), None),
+        ),
+        (
+            later_effectful_trace.id.clone(),
+            (later_digest_id.clone(), None),
+        ),
+    ]);
+    assert_eq!(
+        effectful_before_by_id, expected_effectful_before_by_id,
+        "the effectful co-fired skill must have exactly one unresolved trace for each drift fixture \
+         digest; effectful_retype_traces_before={effectful_retype_traces_before:?}"
+    );
     assert!(
         list_drift_alerts(&store).is_empty(),
         "unlabeled firing traces alone must not raise drift before the correction labels a specific \
@@ -431,6 +682,13 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         corrected_entity.entity_type,
         EntityType::Repository,
         "the drift correction must target a value that the learned skill changed on the capture path"
+    );
+    let other_changed_entity = entity_named_in_context(&store, "drift-target-capture", "ingest");
+    assert_eq!(
+        other_changed_entity.entity_type,
+        EntityType::Module,
+        "the target captured unit must also contain a different value changed by a different \
+         same-provenance skill, so digest-wide changed-skill blame cannot pass"
     );
     let overlay =
         context_graph::overlay::record_correction(&store, &target_digest_id, "File context-graph");
@@ -451,6 +709,9 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
     let alerts = list_drift_alerts(&store);
     let traces_after = firing_traces_for_skill(&store, &learned_skill_id);
     let unrelated_traces_after = firing_traces_for_skill(&store, &unrelated_skill_id);
+    let cofired_retype_traces_after = firing_traces_for_skill(&store, &cofired_retype_skill_id);
+    let effectful_retype_traces_after =
+        firing_traces_for_skill(&store, &cofired_effectful_skill_id);
     let mut trace_ids_after = traces_after
         .iter()
         .map(|trace| trace.id.clone())
@@ -478,11 +739,37 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         "the correction must change exactly one persisted firing row: the corrected target digest's \
          row. No stale, later, synthetic, or unrelated row may be labeled; traces_after={traces_after:?}"
     );
+    let unrelated_before_by_id = unrelated_traces_before
+        .iter()
+        .map(|trace| (trace.id.clone(), (trace.capture_id.clone(), trace.correct)))
+        .collect::<BTreeMap<_, _>>();
+    let unrelated_after_by_id = unrelated_traces_after
+        .iter()
+        .map(|trace| (trace.id.clone(), (trace.capture_id.clone(), trace.correct)))
+        .collect::<BTreeMap<_, _>>();
     assert_eq!(
-        unrelated_traces_after, unrelated_traces_before,
+        unrelated_after_by_id, unrelated_before_by_id,
         "the correction must not label or insert traces for an unrelated skill that fired on the \
          same corrected digest; unrelated_before={unrelated_traces_before:?} \
          unrelated_after={unrelated_traces_after:?}"
+    );
+    let cofired_after_by_id = cofired_retype_traces_after
+        .iter()
+        .map(|trace| (trace.id.clone(), (trace.capture_id.clone(), trace.correct)))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        cofired_after_by_id, cofired_before_by_id,
+        "the exact co-fired HumanCorrection retype trace rows must stay unresolved after correcting \
+         the target digest because that skill did not change the File value"
+    );
+    let effectful_after_by_id = effectful_retype_traces_after
+        .iter()
+        .map(|trace| (trace.id.clone(), (trace.capture_id.clone(), trace.correct)))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        effectful_after_by_id, effectful_before_by_id,
+        "the exact same-provenance effectful co-fired trace rows must stay unresolved after correcting \
+         context-graph because that different skill changed ingest, not the corrected File value"
     );
     assert!(
         traces_after
