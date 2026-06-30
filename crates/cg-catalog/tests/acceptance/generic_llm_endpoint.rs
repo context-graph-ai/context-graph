@@ -472,6 +472,19 @@ structured_output = "{style}"
     .expect("write structured-output provider override");
 }
 
+fn write_http_timeout_override(root: &std::path::Path, provider: &str, timeout_ms: u64) {
+    fs::create_dir_all(root.join("cg")).expect("provider override dir");
+    fs::write(
+        root.join("cg/providers.toml"),
+        format!(
+            r#"[providers.{provider}]
+timeout_ms = {timeout_ms}
+"#,
+        ),
+    )
+    .expect("write HTTP timeout provider override");
+}
+
 fn local_vllm_runtime(
     root: &std::path::Path,
     context_id: ContextId,
@@ -519,6 +532,8 @@ fn strict_response_format_schema(schema: &Value) -> Value {
         return schema.clone();
     };
 
+    let originally_required = required_property_names(schema);
+    let required_was_declared = object.contains_key("required");
     let mut transformed = object.clone();
     if let Some(Value::Object(properties)) = object.get("properties") {
         transformed.insert("additionalProperties".to_string(), Value::Bool(false));
@@ -527,7 +542,16 @@ fn strict_response_format_schema(schema: &Value) -> Value {
             Value::Object(
                 properties
                     .iter()
-                    .map(|(name, property)| (name.clone(), strict_response_format_schema(property)))
+                    .map(|(name, property)| {
+                        let property_schema = strict_response_format_schema(property);
+                        let property_schema =
+                            if required_was_declared && originally_required.contains(name) {
+                                property_schema
+                            } else {
+                                schema_with_null(property_schema)
+                            };
+                        (name.clone(), property_schema)
+                    })
                     .collect(),
             ),
         );
@@ -541,6 +565,63 @@ fn strict_response_format_schema(schema: &Value) -> Value {
     }
 
     Value::Object(transformed)
+}
+
+fn schema_with_null(mut schema: Value) -> Value {
+    if schema_allows_null(&schema) {
+        return schema;
+    }
+    let Value::Object(object) = &mut schema else {
+        return json!({ "anyOf": [schema, { "type": "null" }] });
+    };
+    if let Some(type_value) = object.get_mut("type") {
+        match type_value {
+            Value::String(type_name) => {
+                *type_value = Value::Array(vec![
+                    Value::String(type_name.clone()),
+                    Value::String("null".to_string()),
+                ]);
+                return schema;
+            }
+            Value::Array(types) => {
+                types.push(Value::String("null".to_string()));
+                return schema;
+            }
+            _ => {}
+        }
+    }
+    if let Some(items) = object.get_mut("anyOf").and_then(Value::as_array_mut) {
+        items.push(json!({ "type": "null" }));
+        return schema;
+    }
+    json!({ "anyOf": [schema, { "type": "null" }] })
+}
+
+fn schema_allows_null(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    if let Some(type_value) = object.get("type") {
+        match type_value {
+            Value::String(type_name) => {
+                if type_name == "null" {
+                    return true;
+                }
+            }
+            Value::Array(types) => {
+                if types.iter().any(|item| item.as_str() == Some("null")) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    object
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(schema_allows_null)
 }
 
 fn normalize_required_sets(schema: &Value) -> Value {
@@ -703,6 +784,16 @@ fn wire_schema_tracks_the_attached_contract_not_a_constant() {
         return;
     };
     assert_strict_response_format_schema(&recorded.body, &alt_schema);
+    assert_eq!(
+        wire_schema.pointer("/properties/confidence_note/type"),
+        Some(&json!(["string", "null"])),
+        "optional top-level fields must be nullable when strict response_format requires every property: {wire_schema}"
+    );
+    assert_eq!(
+        wire_schema.pointer("/properties/memory/properties/source_paths/type"),
+        Some(&json!(["array", "null"])),
+        "optional nested fields must be nullable when strict response_format requires every property: {wire_schema}"
+    );
     assert_eq!(
         schema_property_names(wire_schema),
         schema_property_names(&alt_schema),
@@ -1213,6 +1304,7 @@ fn timeout_hang_degrades_to_typed_unreachable_bucket_within_bounded_time_agent_k
     let context_id = ContextId::new_v7();
     let input = "retain this input after timeout";
     let server = silent_timeout_stub_server();
+    write_http_timeout_override(temp.path(), "openai-compatible", 1_000);
     let mut runtime = connected_runtime(RuntimeSpec {
         root: temp.path(),
         context_id,

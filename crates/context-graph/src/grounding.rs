@@ -1,8 +1,6 @@
 //! Deterministic grounding predicates. A value is flagged based on span presence and alignment
 //! in the source transcript — the model's confidence score is never consulted.
 
-use crate::EntityType;
-
 #[derive(Debug, Clone)]
 pub struct GroundingInput {
     pub value: String,
@@ -121,7 +119,7 @@ pub enum FlagReason {
 /// All three consumers — the schema descriptor, the grounding closed-vocab check, and
 /// the `why_flagged_closed_vocab` response — read from this one function.
 pub fn legal_entity_type_names() -> Vec<String> {
-    EntityType::ALL.iter().map(|t| format!("{t:?}")).collect()
+    crate::harness::CaptureHarnessConfig::default().allowed_entity_type_names()
 }
 
 /// Returns the canonical legal entity type values (same source as `legal_entity_type_names`).

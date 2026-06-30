@@ -391,11 +391,27 @@ fn hosted_request_body(request: &str) -> Value {
     serde_json::from_str(body).expect("hosted request body JSON")
 }
 
+fn required_property_names(schema: &Value) -> BTreeSet<String> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn strict_response_format_schema(schema: &Value) -> Value {
     let Some(object) = schema.as_object() else {
         return schema.clone();
     };
 
+    let originally_required = required_property_names(schema);
+    let required_was_declared = object.contains_key("required");
     let mut transformed = object.clone();
     if let Some(Value::Object(properties)) = object.get("properties") {
         transformed.insert("additionalProperties".to_string(), Value::Bool(false));
@@ -404,7 +420,16 @@ fn strict_response_format_schema(schema: &Value) -> Value {
             Value::Object(
                 properties
                     .iter()
-                    .map(|(name, property)| (name.clone(), strict_response_format_schema(property)))
+                    .map(|(name, property)| {
+                        let property_schema = strict_response_format_schema(property);
+                        let property_schema =
+                            if required_was_declared && originally_required.contains(name) {
+                                property_schema
+                            } else {
+                                schema_with_null(property_schema)
+                            };
+                        (name.clone(), property_schema)
+                    })
                     .collect(),
             ),
         );
@@ -418,6 +443,63 @@ fn strict_response_format_schema(schema: &Value) -> Value {
     }
 
     Value::Object(transformed)
+}
+
+fn schema_with_null(mut schema: Value) -> Value {
+    if schema_allows_null(&schema) {
+        return schema;
+    }
+    let Value::Object(object) = &mut schema else {
+        return serde_json::json!({ "anyOf": [schema, { "type": "null" }] });
+    };
+    if let Some(type_value) = object.get_mut("type") {
+        match type_value {
+            Value::String(type_name) => {
+                *type_value = Value::Array(vec![
+                    Value::String(type_name.clone()),
+                    Value::String("null".to_string()),
+                ]);
+                return schema;
+            }
+            Value::Array(types) => {
+                types.push(Value::String("null".to_string()));
+                return schema;
+            }
+            _ => {}
+        }
+    }
+    if let Some(items) = object.get_mut("anyOf").and_then(Value::as_array_mut) {
+        items.push(serde_json::json!({ "type": "null" }));
+        return schema;
+    }
+    serde_json::json!({ "anyOf": [schema, { "type": "null" }] })
+}
+
+fn schema_allows_null(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    if let Some(type_value) = object.get("type") {
+        match type_value {
+            Value::String(type_name) => {
+                if type_name == "null" {
+                    return true;
+                }
+            }
+            Value::Array(types) => {
+                if types.iter().any(|item| item.as_str() == Some("null")) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    object
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(schema_allows_null)
 }
 
 fn normalize_required_sets(schema: &Value) -> Value {

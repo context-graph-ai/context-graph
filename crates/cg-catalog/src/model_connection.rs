@@ -30,14 +30,12 @@ use crate::{
 };
 
 pub const DEGRADED_MARKER: &str = "running without a connected model";
-const HOSTED_TIMEOUT: Duration = Duration::from_secs(10);
+const HOSTED_TIMEOUT: Duration = Duration::from_secs(45);
 const HOSTED_BODY_LIMIT: u64 = 1024 * 1024;
 const HOSTED_CHAT_MAX_TOKENS: u32 = 4096;
-const STRICT_SCHEMA_MAX_UNION_PARAMS: usize = 16;
+const STRICT_SCHEMA_MAX_UNION_PARAMS: usize = 64;
 const STRICT_SCHEMA_MAX_OPTIONAL_FIELDS: usize = 24;
 const STRICT_SCHEMA_UNREPRESENTABLE_KEYS: &[&str] = &[
-    "$ref",
-    "$defs",
     "definitions",
     "allOf",
     "oneOf",
@@ -6091,8 +6089,9 @@ fn strict_schema_has_unrepresentable_construct(value: &Value) -> bool {
             }
             if object
                 .get("additionalProperties")
-                .is_some_and(|additional| additional != &Value::Bool(false))
-                && !object.contains_key("properties")
+                .is_some_and(|additional| {
+                    !strict_additional_properties_schema_is_representable(additional)
+                })
             {
                 return true;
             }
@@ -6107,10 +6106,46 @@ fn strict_schema_has_unrepresentable_construct(value: &Value) -> bool {
     }
 }
 
+fn strict_additional_properties_schema_is_representable(schema: &Value) -> bool {
+    match schema {
+        Value::Bool(false) => true,
+        Value::Object(object) => object
+            .get("type")
+            .is_some_and(strict_schema_type_is_scalar_only),
+        Value::Bool(true) | Value::Array(_) | Value::Null | Value::Number(_) | Value::String(_) => {
+            false
+        }
+    }
+}
+
+fn strict_schema_type_is_scalar_only(value: &Value) -> bool {
+    match value {
+        Value::String(type_name) => strict_schema_type_name_is_scalar(type_name),
+        Value::Array(type_names) => {
+            !type_names.is_empty()
+                && type_names.iter().all(|type_name| {
+                    type_name
+                        .as_str()
+                        .is_some_and(strict_schema_type_name_is_scalar)
+                })
+        }
+        Value::Object(_) | Value::Bool(_) | Value::Null | Value::Number(_) => false,
+    }
+}
+
+fn strict_schema_type_name_is_scalar(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "string" | "number" | "integer" | "boolean" | "null"
+    )
+}
+
 fn strict_response_format_schema(schema: &Value) -> Value {
     let Some(object) = schema.as_object() else {
         return schema.clone();
     };
+    let originally_required = strict_schema_required_property_names(object);
+    let required_was_declared = object.contains_key("required");
     let mut transformed = serde_json::Map::new();
     for (key, value) in object {
         if STRICT_SCHEMA_STRIPPED_KEYS
@@ -6138,7 +6173,16 @@ fn strict_response_format_schema(schema: &Value) -> Value {
             Value::Object(
                 properties
                     .iter()
-                    .map(|(name, property)| (name.clone(), strict_response_format_schema(property)))
+                    .map(|(name, property)| {
+                        let property_schema = strict_response_format_schema(property);
+                        let property_schema =
+                            if required_was_declared && originally_required.contains(name) {
+                                property_schema
+                            } else {
+                                schema_with_null(property_schema)
+                            };
+                        (name.clone(), property_schema)
+                    })
                     .collect(),
             ),
         );
@@ -6151,6 +6195,76 @@ fn strict_response_format_schema(schema: &Value) -> Value {
         transformed.insert("items".to_string(), strict_response_format_schema(items));
     }
     Value::Object(transformed)
+}
+
+fn strict_schema_required_property_names(
+    object: &serde_json::Map<String, Value>,
+) -> BTreeSet<String> {
+    object
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn schema_with_null(mut schema: Value) -> Value {
+    if schema_allows_null(&schema) {
+        return schema;
+    }
+    let Value::Object(object) = &mut schema else {
+        return serde_json::json!({ "anyOf": [schema, { "type": "null" }] });
+    };
+    if let Some(type_value) = object.get_mut("type") {
+        match type_value {
+            Value::String(type_name) => {
+                *type_value = Value::Array(vec![
+                    Value::String(type_name.clone()),
+                    Value::String("null".to_string()),
+                ]);
+                return schema;
+            }
+            Value::Array(types) => {
+                types.push(Value::String("null".to_string()));
+                return schema;
+            }
+            _ => {}
+        }
+    }
+    if let Some(items) = object.get_mut("anyOf").and_then(Value::as_array_mut) {
+        items.push(serde_json::json!({ "type": "null" }));
+        return schema;
+    }
+    serde_json::json!({ "anyOf": [schema, { "type": "null" }] })
+}
+
+fn schema_allows_null(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    if let Some(type_value) = object.get("type") {
+        match type_value {
+            Value::String(type_name) => {
+                if type_name == "null" {
+                    return true;
+                }
+            }
+            Value::Array(types) => {
+                if types.iter().any(|item| item.as_str() == Some("null")) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    object
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(schema_allows_null)
 }
 
 fn send_hosted_chat_request(

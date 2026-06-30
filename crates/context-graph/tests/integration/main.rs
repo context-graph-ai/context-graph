@@ -19,6 +19,7 @@ mod entity_reference_edge_cases;
 mod entity_reference_embeddings;
 mod four_stages_three_sources;
 mod harness_contract_single_source;
+mod provider_schema_coverage;
 #[cfg(context_graph_internal_test_support)]
 mod engine_probes {
     pub mod embedder_concurrency;

@@ -22,8 +22,8 @@ use context_graph::ingest::{
     record_conversation_with_extractor,
 };
 use context_graph::{
-    CapturePricing, HostedProviderBoundary, HostedProviderReply, Store, StoreConfig,
-    capture_with_usage_visibility,
+    CapturePricing, EnforcementLevel, HostedProviderBoundary, HostedProviderReply,
+    ModelCallOutcome, Store, StoreConfig, capture_with_usage_visibility,
 };
 
 use super::fake_extractor::open_store_with_lexical_embedder;
@@ -126,6 +126,8 @@ impl ConversationExtractor for FlowTaggedUsageExtractor {
                 total_tokens: 150,
             }),
             elapsed: Duration::from_millis(200),
+            reliability_level: EnforcementLevel::Floor,
+            outcome: ModelCallOutcome::Captured,
             flow_tag: None,
             model_id: None,
         });
@@ -162,6 +164,8 @@ impl ConversationExtractor for FlowTaggedUsageExtractor {
                 total_tokens: 110,
             }),
             elapsed: Duration::from_millis(150),
+            reliability_level: EnforcementLevel::Floor,
+            outcome: ModelCallOutcome::Captured,
             flow_tag: None,
             model_id: None,
         });
