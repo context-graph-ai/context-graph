@@ -177,7 +177,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "cg_skill_firing_trace",
-        ddl: "CREATE TABLE cg_skill_firing_trace (id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, capture_id TEXT NOT NULL, correct INTEGER, created_at TXID NOT NULL)",
+        ddl: "CREATE TABLE cg_skill_firing_trace (id TEXT PRIMARY KEY, skill_id TEXT NOT NULL, capture_id TEXT NOT NULL, correct INTEGER, effect_entity_key TEXT, effect_entity_name TEXT, effect_from_type TEXT, effect_to_type TEXT, created_at TXID NOT NULL)",
     },
     TableSpec {
         name: "cg_review_cursor",
