@@ -5,7 +5,7 @@
 // teaching event -> persisted learned skill -> later run_capture auto-application -> drift
 // from the capture-produced firing trace.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use context_graph::harness::{CaptureHarnessConfig, run_capture};
 use context_graph::ingest::{CaptureReport, CaptureRequest};
@@ -135,6 +135,11 @@ struct SkillFiringRow {
     id: String,
     capture_id: String,
     correct: Option<bool>,
+    created_at: i128,
+    effect_entity_key: Option<String>,
+    effect_entity_name: Option<String>,
+    effect_from_type: Option<String>,
+    effect_to_type: Option<String>,
 }
 
 fn firing_traces_for_skill(store: &Store, skill_id: &str) -> Vec<SkillFiringRow> {
@@ -166,10 +171,25 @@ fn firing_traces_for_skill(store: &Store, skill_id: &str) -> Vec<SkillFiringRow>
                 Some(DbValue::Null) | None => None,
                 _ => return None,
             };
+            let created_at = match row.values.get("created_at") {
+                Some(DbValue::TxId(tx)) => i128::from(tx.0),
+                Some(DbValue::Int64(value)) => i128::from(*value),
+                _ => return None,
+            };
+            let optional_text = |field: &str| match row.values.get(field) {
+                Some(DbValue::Text(value)) => Some(value.clone()),
+                Some(DbValue::Null) | None => None,
+                _ => None,
+            };
             Some(SkillFiringRow {
                 id,
                 capture_id,
                 correct,
+                created_at,
+                effect_entity_key: optional_text("effect_entity_key"),
+                effect_entity_name: optional_text("effect_entity_name"),
+                effect_from_type: optional_text("effect_from_type"),
+                effect_to_type: optional_text("effect_to_type"),
             })
         })
         .collect()
@@ -180,6 +200,81 @@ fn firing_trace_ids_for_skill(store: &Store, skill_id: &str) -> Vec<String> {
         .into_iter()
         .map(|trace| trace.id)
         .collect()
+}
+
+fn rewrite_skill_rule(store: &Store, skill_id: &str, rule: &str) {
+    let db = store.sync_database();
+    let result = db
+        .execute(
+            "UPDATE cg_learned_skills SET rule = $rule WHERE id = $id",
+            &HashMap::from([
+                ("id".to_string(), DbValue::Text(skill_id.to_string())),
+                ("rule".to_string(), DbValue::Text(rule.to_string())),
+            ]),
+        )
+        .expect("rewrite skill rule");
+    assert_eq!(
+        result.rows_affected, 1,
+        "the skill rule rewrite must update exactly one row for {skill_id}"
+    );
+}
+
+struct ChainedRetypeCorrection<'a> {
+    target_digest_id: &'a str,
+    entity_name: &'a str,
+    starting_type: &'a str,
+    first_skill_id: &'a str,
+    second_skill_id: &'a str,
+    branch_skill_id: &'a str,
+    other_skill_id: &'a str,
+}
+
+fn correct_chained_retype_after_reopen_with_rules_rewritten(
+    store: &Store,
+    fixture: ChainedRetypeCorrection<'_>,
+) {
+    rewrite_skill_rule(
+        store,
+        fixture.first_skill_id,
+        &format!(
+            "when an entity named unrelated-{} is typed Team → Location",
+            fixture.entity_name
+        ),
+    );
+    rewrite_skill_rule(
+        store,
+        fixture.second_skill_id,
+        &format!(
+            "when an entity named unrelated-{} is typed Database → Team",
+            fixture.entity_name
+        ),
+    );
+    rewrite_skill_rule(
+        store,
+        fixture.branch_skill_id,
+        &format!(
+            "when an entity named unrelated-{} is typed Configuration → Pipeline",
+            fixture.entity_name
+        ),
+    );
+    rewrite_skill_rule(
+        store,
+        fixture.other_skill_id,
+        &format!(
+            "when an entity named unrelated-{} is typed Document → Team",
+            fixture.entity_name
+        ),
+    );
+    let correction = apply_correction(
+        store,
+        fixture.target_digest_id,
+        &format!("{} {}", fixture.starting_type, fixture.entity_name),
+        None,
+    );
+    assert!(
+        correction.applied,
+        "the reopened store must accept the digest correction using only persisted trace metadata"
+    );
 }
 
 fn single_digest_id(report: &CaptureReport) -> String {
@@ -824,5 +919,659 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         list_drift_alerts(&store).is_empty(),
         "drift must be derived from the persisted firing trace labels: when the same target firing \
          is no longer wrong, the alert must disappear"
+    );
+}
+
+#[test]
+fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("chained_retype_drift.db");
+    let store = open_store_with_lexical_embedder(StoreConfig {
+        db_path: db_path.clone(),
+        default_text_embedder: None,
+        ..Default::default()
+    });
+    let fixture_uuid = uuid::Uuid::new_v4();
+    let fixture_token = fixture_uuid.simple().to_string();
+    let entity_name = format!("unit-{fixture_token}");
+    let other_entity_name = format!("side-{fixture_token}");
+    let entity_key = format!("E{}", 10 + usize::from(fixture_uuid.as_bytes()[4] % 80));
+    let other_entity_key = format!("E{}", 100 + usize::from(fixture_uuid.as_bytes()[5] % 80));
+    let first_changing_skill_id = format!("sk-{}", uuid::Uuid::new_v4().simple());
+    let second_changing_skill_id = format!("sk-{}", uuid::Uuid::new_v4().simple());
+    let unapplied_branch_skill_id = format!("sk-{}", uuid::Uuid::new_v4().simple());
+    let other_effectful_skill_id = format!("sk-{}", uuid::Uuid::new_v4().simple());
+    let ontology_types = [
+        ("Service", "service", EntityType::Service),
+        ("Person", "person", EntityType::Person),
+        ("Device", "device", EntityType::Device),
+        ("Module", "module", EntityType::Module),
+        ("Repository", "repository", EntityType::Repository),
+        ("Configuration", "configuration", EntityType::Configuration),
+        (
+            "Infrastructure",
+            "infrastructure",
+            EntityType::Infrastructure,
+        ),
+        ("Location", "location", EntityType::Location),
+        ("File", "file", EntityType::File),
+        ("Pipeline", "pipeline", EntityType::Pipeline),
+        ("Database", "database", EntityType::Database),
+        ("Team", "team", EntityType::Team),
+        ("Document", "document", EntityType::Document),
+    ];
+    let choose_unused = |seed: u8, used: &[usize]| -> usize {
+        let mut index = usize::from(seed) % ontology_types.len();
+        while used.contains(&index) {
+            index = (index + 1) % ontology_types.len();
+        }
+        index
+    };
+    let bytes = fixture_uuid.as_bytes();
+    let starting_index = choose_unused(bytes[0], &[]);
+    let intermediate_index = choose_unused(bytes[1], &[starting_index]);
+    let final_index = choose_unused(bytes[2], &[starting_index, intermediate_index]);
+    let branch_index = choose_unused(bytes[3], &[starting_index, intermediate_index, final_index]);
+    let (starting_type, transcript_type, _starting_entity_type) = ontology_types[starting_index];
+    let (intermediate_type, _intermediate_transcript_type, _intermediate_entity_type) =
+        ontology_types[intermediate_index];
+    let (final_type, _final_transcript_type, expected_final_entity_type) =
+        ontology_types[final_index];
+    let (branch_type, _branch_transcript_type, _branch_entity_type) = ontology_types[branch_index];
+    let other_start_index = choose_unused(bytes[6], &[starting_index]);
+    let other_final_index = choose_unused(bytes[7], &[other_start_index]);
+    let (other_starting_type, other_transcript_type, _other_starting_entity_type) =
+        ontology_types[other_start_index];
+    let (other_final_type, _other_final_transcript_type, expected_other_entity_type) =
+        ontology_types[other_final_index];
+    let transcript = [
+        format!("Goal G1: keep {entity_name} classified"),
+        format!("Entity {entity_key}: {entity_name} type={transcript_type}"),
+        format!("Entity {other_entity_key}: {other_entity_name} type={other_transcript_type}"),
+        format!("Decision D1: treat {entity_name} as the runtime unit serves G1"),
+    ]
+    .join("\n");
+    assert!(
+        persist_skill(
+            &store,
+            &LearnedSkill {
+                id: first_changing_skill_id.clone(),
+                description: format!("{entity_name} {}", uuid::Uuid::new_v4().simple()),
+                rule: format!(
+                    "when an entity named {entity_name} is typed {starting_type} → {intermediate_type}"
+                ),
+                provenance: SkillProvenance::HumanCorrection,
+                active: true,
+                held_for_review: false,
+                fire_right: 0,
+                fire_wrong: 0,
+            }
+        ),
+        "the first chain skill must persist"
+    );
+    assert!(
+        persist_skill(
+            &store,
+            &LearnedSkill {
+                id: second_changing_skill_id.clone(),
+                description: format!("{entity_name} {}", uuid::Uuid::new_v4().simple()),
+                rule: format!(
+                    "when an entity named {entity_name} is typed {intermediate_type} → {final_type}"
+                ),
+                provenance: SkillProvenance::HumanCorrection,
+                active: true,
+                held_for_review: false,
+                fire_right: 0,
+                fire_wrong: 0,
+            }
+        ),
+        "the second chain skill must persist"
+    );
+    assert!(
+        persist_skill(
+            &store,
+            &LearnedSkill {
+                id: unapplied_branch_skill_id.clone(),
+                description: format!("{entity_name} {}", uuid::Uuid::new_v4().simple()),
+                rule: format!(
+                    "when an entity named {entity_name} is typed {starting_type} → {branch_type}"
+                ),
+                provenance: SkillProvenance::HumanCorrection,
+                active: true,
+                held_for_review: false,
+                fire_right: 0,
+                fire_wrong: 0,
+            }
+        ),
+        "the selected-but-unapplied branch skill must persist"
+    );
+    assert!(
+        persist_skill(
+            &store,
+            &LearnedSkill {
+                id: other_effectful_skill_id.clone(),
+                description: format!("{other_entity_name} {}", uuid::Uuid::new_v4().simple()),
+                rule: format!(
+                    "when an entity named {other_entity_name} is typed {other_starting_type} → {other_final_type}"
+                ),
+                provenance: SkillProvenance::HumanCorrection,
+                active: true,
+                held_for_review: false,
+                fire_right: 0,
+                fire_wrong: 0,
+            }
+        ),
+        "the unrelated effectful skill must persist"
+    );
+
+    let mut digest_ids = Vec::new();
+    for context_label in [
+        "chained-retype-stale",
+        "chained-retype-target",
+        "chained-retype-later",
+    ] {
+        let (report, harness) = run_capture(
+            &store,
+            CaptureRequest {
+                context_label: context_label.to_string(),
+                transcript: transcript.clone(),
+                model_available: true,
+            },
+            &super::refactor_extractor::SpanFaithfulExtractor,
+            &CaptureHarnessConfig::default(),
+        )
+        .expect("chained retype capture must succeed");
+        assert!(
+            harness
+                .applied_skill_ids
+                .iter()
+                .any(|id| id == &first_changing_skill_id),
+            "the first opaque skill must be selected on the capture path; applied_skill_ids={:?}",
+            harness.applied_skill_ids
+        );
+        assert!(
+            harness
+                .applied_skill_ids
+                .iter()
+                .any(|id| id == &second_changing_skill_id),
+            "the second opaque skill must be selected on the capture path; applied_skill_ids={:?}",
+            harness.applied_skill_ids
+        );
+        assert!(
+            harness
+                .applied_skill_ids
+                .iter()
+                .any(|id| id == &unapplied_branch_skill_id),
+            "the branch skill must be selected on the same digest so digest-wide blame cannot pass; \
+             applied_skill_ids={:?}",
+            harness.applied_skill_ids
+        );
+        assert!(
+            harness
+                .applied_skill_ids
+                .iter()
+                .any(|id| id == &other_effectful_skill_id),
+            "the unrelated effectful skill must be selected on the same digest so effectful \
+             digest-wide blame cannot pass; applied_skill_ids={:?}",
+            harness.applied_skill_ids
+        );
+        let changed_entity = entity_named_in_context(&store, context_label, &entity_name);
+        assert_eq!(
+            changed_entity.entity_type, expected_final_entity_type,
+            "both changing skills must have actually changed the captured starting value before \
+             drift is corrected"
+        );
+        let other_changed_entity =
+            entity_named_in_context(&store, context_label, &other_entity_name);
+        assert_eq!(
+            other_changed_entity.entity_type, expected_other_entity_type,
+            "the unrelated skill must actually change another entity on the same capture"
+        );
+        digest_ids.push(single_digest_id(&report));
+    }
+    let stale_digest_id = digest_ids[0].clone();
+    let target_digest_id = digest_ids[1].clone();
+    let later_digest_id = digest_ids[2].clone();
+    assert_ne!(
+        stale_digest_id, target_digest_id,
+        "the stale and target captured units must be distinct so oldest-firing shortcuts fail"
+    );
+    assert_ne!(
+        target_digest_id, later_digest_id,
+        "the target and later captured units must be distinct so latest-firing shortcuts fail"
+    );
+    assert_ne!(
+        stale_digest_id, later_digest_id,
+        "the stale and later captured units must be distinct"
+    );
+
+    let first_before = firing_traces_for_skill(&store, &first_changing_skill_id);
+    let second_before = firing_traces_for_skill(&store, &second_changing_skill_id);
+    let branch_before = firing_traces_for_skill(&store, &unapplied_branch_skill_id);
+    let other_before = firing_traces_for_skill(&store, &other_effectful_skill_id);
+    assert_eq!(
+        first_before.len(),
+        3,
+        "the first changing skill must have stale, target, and later traces"
+    );
+    assert_eq!(
+        second_before.len(),
+        3,
+        "the second changing skill must have stale, target, and later traces"
+    );
+    assert_eq!(
+        branch_before.len(),
+        3,
+        "the selected branch skill must have stale, target, and later co-firing traces"
+    );
+    assert_eq!(
+        other_before.len(),
+        3,
+        "the unrelated effectful skill must have stale, target, and later traces"
+    );
+    let first_target_trace = first_before
+        .iter()
+        .find(|trace| trace.capture_id == target_digest_id && trace.correct.is_none());
+    assert!(
+        first_target_trace.is_some(),
+        "the first changing skill must have an unresolved trace keyed to the target digest, not an \
+         older/latest/synthetic capture id; target_digest_id={target_digest_id} traces={first_before:?}"
+    );
+    let first_target_trace = first_target_trace.expect("asserted present");
+    let second_target_trace = second_before
+        .iter()
+        .find(|trace| trace.capture_id == target_digest_id && trace.correct.is_none());
+    assert!(
+        second_target_trace.is_some(),
+        "the second changing skill must have an unresolved trace keyed to the target digest, not an \
+         older/latest/synthetic capture id; target_digest_id={target_digest_id} traces={second_before:?}"
+    );
+    let second_target_trace = second_target_trace.expect("asserted present");
+    let branch_target_trace = branch_before
+        .iter()
+        .find(|trace| trace.capture_id == target_digest_id && trace.correct.is_none());
+    assert!(
+        branch_target_trace.is_some(),
+        "the selected branch skill must have an unresolved trace keyed to the same target digest so \
+         branch blame can be rejected; target_digest_id={target_digest_id} traces={branch_before:?}"
+    );
+    let branch_target_trace = branch_target_trace.expect("asserted present");
+    let other_target_trace = other_before
+        .iter()
+        .find(|trace| trace.capture_id == target_digest_id && trace.correct.is_none());
+    assert!(
+        other_target_trace.is_some(),
+        "the unrelated effectful skill must have an unresolved target trace keyed to the same \
+         digest; target_digest_id={target_digest_id} traces={other_before:?}"
+    );
+    let other_target_trace = other_target_trace.expect("asserted present");
+    let branch_before_by_digest = branch_before
+        .iter()
+        .map(|trace| {
+            (
+                trace.capture_id.clone(),
+                (
+                    trace.correct,
+                    trace.effect_entity_key.clone(),
+                    trace.effect_entity_name.clone(),
+                    trace.effect_from_type.clone(),
+                    trace.effect_to_type.clone(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        branch_before_by_digest,
+        BTreeMap::from([
+            (stale_digest_id.clone(), (None, None, None, None, None)),
+            (target_digest_id.clone(), (None, None, None, None, None)),
+            (later_digest_id.clone(), (None, None, None, None, None)),
+        ]),
+        "all selected branch traces must be unresolved and effect-empty before correction; \
+         branch_before={branch_before:?}"
+    );
+    let first_before_by_digest = first_before
+        .iter()
+        .map(|trace| {
+            (
+                trace.capture_id.clone(),
+                (
+                    trace.correct,
+                    trace.effect_entity_key.clone(),
+                    trace.effect_entity_name.clone(),
+                    trace.effect_from_type.clone(),
+                    trace.effect_to_type.clone(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        first_before_by_digest,
+        BTreeMap::from([
+            (
+                stale_digest_id.clone(),
+                (
+                    None,
+                    Some(entity_key.clone()),
+                    Some(entity_name.clone()),
+                    Some(starting_type.to_string()),
+                    Some(intermediate_type.to_string()),
+                ),
+            ),
+            (
+                target_digest_id.clone(),
+                (
+                    None,
+                    Some(entity_key.clone()),
+                    Some(entity_name.clone()),
+                    Some(starting_type.to_string()),
+                    Some(intermediate_type.to_string()),
+                ),
+            ),
+            (
+                later_digest_id.clone(),
+                (
+                    None,
+                    Some(entity_key.clone()),
+                    Some(entity_name.clone()),
+                    Some(starting_type.to_string()),
+                    Some(intermediate_type.to_string()),
+                ),
+            ),
+        ]),
+        "every first-skill trace, not only the target row, must persist capture-time effect \
+         metadata; first_before={first_before:?}"
+    );
+    let second_before_by_digest = second_before
+        .iter()
+        .map(|trace| {
+            (
+                trace.capture_id.clone(),
+                (
+                    trace.correct,
+                    trace.effect_entity_key.clone(),
+                    trace.effect_entity_name.clone(),
+                    trace.effect_from_type.clone(),
+                    trace.effect_to_type.clone(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        second_before_by_digest,
+        BTreeMap::from([
+            (
+                stale_digest_id.clone(),
+                (
+                    None,
+                    Some(entity_key.clone()),
+                    Some(entity_name.clone()),
+                    Some(intermediate_type.to_string()),
+                    Some(final_type.to_string()),
+                ),
+            ),
+            (
+                target_digest_id.clone(),
+                (
+                    None,
+                    Some(entity_key.clone()),
+                    Some(entity_name.clone()),
+                    Some(intermediate_type.to_string()),
+                    Some(final_type.to_string()),
+                ),
+            ),
+            (
+                later_digest_id.clone(),
+                (
+                    None,
+                    Some(entity_key.clone()),
+                    Some(entity_name.clone()),
+                    Some(intermediate_type.to_string()),
+                    Some(final_type.to_string()),
+                ),
+            ),
+        ]),
+        "every second-skill trace, not only the target row, must persist capture-time effect \
+         metadata; second_before={second_before:?}"
+    );
+    let other_before_by_digest = other_before
+        .iter()
+        .map(|trace| {
+            (
+                trace.capture_id.clone(),
+                (
+                    trace.correct,
+                    trace.effect_entity_key.clone(),
+                    trace.effect_entity_name.clone(),
+                    trace.effect_from_type.clone(),
+                    trace.effect_to_type.clone(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        other_before_by_digest,
+        BTreeMap::from([
+            (
+                stale_digest_id.clone(),
+                (
+                    None,
+                    Some(other_entity_key.clone()),
+                    Some(other_entity_name.clone()),
+                    Some(other_starting_type.to_string()),
+                    Some(other_final_type.to_string()),
+                ),
+            ),
+            (
+                target_digest_id.clone(),
+                (
+                    None,
+                    Some(other_entity_key.clone()),
+                    Some(other_entity_name.clone()),
+                    Some(other_starting_type.to_string()),
+                    Some(other_final_type.to_string()),
+                ),
+            ),
+            (
+                later_digest_id.clone(),
+                (
+                    None,
+                    Some(other_entity_key.clone()),
+                    Some(other_entity_name.clone()),
+                    Some(other_starting_type.to_string()),
+                    Some(other_final_type.to_string()),
+                ),
+            ),
+        ]),
+        "the unrelated effectful skill must carry real capture-time effect metadata on the same \
+         digest, so correction cannot label every effectful target row; other_before={other_before:?}"
+    );
+    assert_eq!(
+        (
+            first_target_trace.effect_entity_key.as_deref(),
+            first_target_trace.effect_entity_name.as_deref(),
+            first_target_trace.effect_from_type.as_deref(),
+            first_target_trace.effect_to_type.as_deref(),
+        ),
+        (
+            Some(entity_key.as_str()),
+            Some(entity_name.as_str()),
+            Some(starting_type),
+            Some(intermediate_type)
+        ),
+        "the first target trace must persist the capture-time effect it actually applied before \
+         correction runs; replaying current skill rules later is not enough. trace={first_target_trace:?}"
+    );
+    assert_eq!(
+        (
+            second_target_trace.effect_entity_key.as_deref(),
+            second_target_trace.effect_entity_name.as_deref(),
+            second_target_trace.effect_from_type.as_deref(),
+            second_target_trace.effect_to_type.as_deref(),
+        ),
+        (
+            Some(entity_key.as_str()),
+            Some(entity_name.as_str()),
+            Some(intermediate_type),
+            Some(final_type),
+        ),
+        "the second target trace must persist the capture-time effect it actually applied before \
+         correction runs; replaying current skill rules later is not enough. trace={second_target_trace:?}"
+    );
+    assert_eq!(
+        (
+            branch_target_trace.effect_entity_key.as_deref(),
+            branch_target_trace.effect_entity_name.as_deref(),
+            branch_target_trace.effect_from_type.as_deref(),
+            branch_target_trace.effect_to_type.as_deref(),
+        ),
+        (None, None, None, None),
+        "the branch trace was selected but did not change the captured value, so persisted \
+         capture-time effect evidence must stay empty. trace={branch_target_trace:?}"
+    );
+    assert!(
+        first_before
+            .iter()
+            .any(|trace| trace.capture_id == stale_digest_id && trace.correct.is_none())
+            && first_before
+                .iter()
+                .any(|trace| trace.capture_id == later_digest_id && trace.correct.is_none()),
+        "the first changing skill needs stale and later unresolved rows so latest/oldest shortcuts \
+         fail; traces={first_before:?}"
+    );
+    assert!(
+        second_before
+            .iter()
+            .any(|trace| trace.capture_id == stale_digest_id && trace.correct.is_none())
+            && second_before
+                .iter()
+                .any(|trace| trace.capture_id == later_digest_id && trace.correct.is_none()),
+        "the second changing skill needs stale and later unresolved rows so latest/oldest shortcuts \
+         fail; traces={second_before:?}"
+    );
+
+    drop(store);
+    let reopened_store = open_store_with_lexical_embedder(StoreConfig {
+        db_path,
+        default_text_embedder: None,
+        ..Default::default()
+    });
+    correct_chained_retype_after_reopen_with_rules_rewritten(
+        &reopened_store,
+        ChainedRetypeCorrection {
+            target_digest_id: &target_digest_id,
+            entity_name: &entity_name,
+            starting_type,
+            first_skill_id: &first_changing_skill_id,
+            second_skill_id: &second_changing_skill_id,
+            branch_skill_id: &unapplied_branch_skill_id,
+            other_skill_id: &other_effectful_skill_id,
+        },
+    );
+    let first_after = firing_traces_for_skill(&reopened_store, &first_changing_skill_id);
+    let second_after = firing_traces_for_skill(&reopened_store, &second_changing_skill_id);
+    let branch_after = firing_traces_for_skill(&reopened_store, &unapplied_branch_skill_id);
+    let other_after = firing_traces_for_skill(&reopened_store, &other_effectful_skill_id);
+    let row_state = |trace: &SkillFiringRow| {
+        (
+            trace.capture_id.clone(),
+            trace.correct,
+            trace.created_at,
+            trace.effect_entity_key.clone(),
+            trace.effect_entity_name.clone(),
+            trace.effect_from_type.clone(),
+            trace.effect_to_type.clone(),
+        )
+    };
+    let first_after_by_id = first_after
+        .iter()
+        .map(|trace| (trace.id.clone(), row_state(trace)))
+        .collect::<BTreeMap<_, _>>();
+    let second_after_by_id = second_after
+        .iter()
+        .map(|trace| (trace.id.clone(), row_state(trace)))
+        .collect::<BTreeMap<_, _>>();
+    let branch_after_by_id = branch_after
+        .iter()
+        .map(|trace| (trace.id.clone(), row_state(trace)))
+        .collect::<BTreeMap<_, _>>();
+    let other_after_by_id = other_after
+        .iter()
+        .map(|trace| (trace.id.clone(), row_state(trace)))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_first_after = first_before
+        .iter()
+        .map(|trace| (trace.id.clone(), row_state(trace)))
+        .collect::<BTreeMap<_, _>>();
+    expected_first_after.insert(
+        first_target_trace.id.clone(),
+        (
+            target_digest_id.clone(),
+            Some(false),
+            first_target_trace.created_at,
+            first_target_trace.effect_entity_key.clone(),
+            first_target_trace.effect_entity_name.clone(),
+            first_target_trace.effect_from_type.clone(),
+            first_target_trace.effect_to_type.clone(),
+        ),
+    );
+    let mut expected_second_after = second_before
+        .iter()
+        .map(|trace| (trace.id.clone(), row_state(trace)))
+        .collect::<BTreeMap<_, _>>();
+    expected_second_after.insert(
+        second_target_trace.id.clone(),
+        (
+            target_digest_id.clone(),
+            Some(false),
+            second_target_trace.created_at,
+            second_target_trace.effect_entity_key.clone(),
+            second_target_trace.effect_entity_name.clone(),
+            second_target_trace.effect_from_type.clone(),
+            second_target_trace.effect_to_type.clone(),
+        ),
+    );
+    let expected_branch_after = branch_before
+        .iter()
+        .map(|trace| (trace.id.clone(), row_state(trace)))
+        .collect::<BTreeMap<_, _>>();
+    let expected_other_after = other_before
+        .iter()
+        .map(|trace| (trace.id.clone(), row_state(trace)))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        first_after_by_id, expected_first_after,
+        "the File -> Module firing changed the corrected entity away from the owner-confirmed File \
+         value, so only the original target trace row must be labeled wrong; traces={first_after:?}"
+    );
+    assert_eq!(
+        second_after_by_id, expected_second_after,
+        "the Module -> Service firing also changed the same corrected entity before the final stored \
+         type was reached, so final-type inference is not enough; traces={second_after:?}"
+    );
+    assert_eq!(
+        branch_after_by_id, expected_branch_after,
+        "the File -> Document branch was selected on the same digest but did not change the value \
+         after File -> Module ran first, so digest-wide or inferred-path blame must leave it \
+         unresolved; target_branch_trace={branch_target_trace:?} traces={branch_after:?}"
+    );
+    assert_eq!(
+        other_after_by_id, expected_other_after,
+        "the unrelated effectful target row must stay unresolved after correcting {entity_name}; \
+         effectful digest-wide blame would label it wrong. target_other_trace={other_target_trace:?} \
+         traces={other_after:?}"
+    );
+    let alert_ids = list_drift_alerts(&reopened_store)
+        .into_iter()
+        .map(|alert| alert.skill_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        alert_ids,
+        std::collections::BTreeSet::from([
+            first_changing_skill_id.clone(),
+            second_changing_skill_id.clone()
+        ]),
+        "drift review must surface exactly the two changing skills and no branch or synthetic \
+         attribution; alerts={alert_ids:?}"
     );
 }
