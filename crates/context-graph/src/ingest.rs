@@ -200,16 +200,16 @@ pub struct CaptureRequest {
 pub struct StructuredHarvest {
     #[serde(default)]
     pub summary: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub goals: Vec<GoalSeed>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub entities: Vec<EntitySeed>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub decisions: Vec<DecisionSeed>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub observations: Vec<ObservationSeed>,
     /// Outcomes extracted from the model — currently ignored by the capture harness.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub outcomes: Vec<OutcomeSeed>,
 }
 
@@ -386,10 +386,10 @@ pub struct DecisionSeed {
     #[serde(default)]
     pub confidence: Option<f32>,
     /// From model extraction — reasoning steps.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub reasoning: Vec<String>,
     /// From model extraction — tags.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub tags: Vec<String>,
     /// From model extraction — properties.
     #[serde(default)]
@@ -404,7 +404,7 @@ pub struct DecisionSeed {
     /// label. One competing label that differs from the chosen one means the span supports a
     /// different label (mislabel); two or more means the span is ambiguous. The grounding check is
     /// the verdict-holder — the model only supplies the span and the labels it reads from it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub decision_type_competing_labels: Vec<String>,
     /// Verbatim supporting span justifying the `agent_id` — a quote from the chunk naming the agent.
     /// When absent, the `agent_id` is unverified metadata (not grounded); when present and absent
@@ -973,9 +973,15 @@ fn record_conversation_internal(
     // plus the Stage-3 empty-candidate-set flag for a decision that needed a candidate and found none.
     flagged_items.extend(grounding_check_harvest(&harvest, text));
     flagged_items.extend(flag_empty_candidate_decisions(&harvest, &prior_decisions));
-    let mut report =
-        capture_structured_harvest(store, context.id, &request.context_label, text, harvest)?
-            .report;
+    let mut report = capture_structured_harvest(
+        store,
+        context.id,
+        &request.context_label,
+        text,
+        harvest,
+        &[],
+    )?
+    .report;
     report.model_usage = tagger.drain_model_usage();
     // Persist each flagged item as a pending review item so `cg review` surfaces it from store state
     // until it is acted on (it survives intervening confident captures and cursor advances).
@@ -2139,6 +2145,7 @@ pub(crate) fn capture_structured_harvest(
     context_label: &str,
     transcript: &str,
     harvest: StructuredHarvest,
+    skill_firing_records: &[crate::skill_store::SkillFiringRecord],
 ) -> Result<HarvestCaptureResult> {
     if harvest.is_empty() {
         return Ok(HarvestCaptureResult {
@@ -2602,6 +2609,7 @@ pub(crate) fn capture_structured_harvest(
         .map(|(key, id)| (key.as_str(), *id))
         .collect::<Vec<_>>();
     let provenance = tx.add_provenance_edges(context_id, digest.id, &source_refs)?;
+    tx.record_skill_firings(skill_firing_records, &provenance)?;
     let mut invalidated_decision_ids = invalidation_rows
         .iter()
         .map(|row| row.affected_decision_id)
@@ -3586,6 +3594,64 @@ impl<'a> CaptureTxn<'a> {
             });
         }
         Ok(out)
+    }
+
+    fn record_skill_firings(
+        &mut self,
+        skill_firing_records: &[crate::skill_store::SkillFiringRecord],
+        provenance_edges: &[ExtractionProvenance],
+    ) -> Result<()> {
+        if skill_firing_records.is_empty() {
+            return Ok(());
+        }
+        let mut capture_unit_ids = provenance_edges
+            .iter()
+            .map(|edge| edge.digest_id.as_uuid().to_string())
+            .collect::<Vec<_>>();
+        capture_unit_ids.sort();
+        capture_unit_ids.dedup();
+
+        for firing in skill_firing_records {
+            for capture_unit_id in &capture_unit_ids {
+                self.insert_skill_firing_trace(firing, capture_unit_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_skill_firing_trace(
+        &self,
+        firing: &crate::skill_store::SkillFiringRecord,
+        capture_id: &str,
+    ) -> Result<()> {
+        let (effect_entity_key, effect_entity_name, effect_from_type, effect_to_type) =
+            match &firing.effect {
+                Some(effect) => (
+                    DbValue::Text(effect.entity_key.clone()),
+                    DbValue::Text(effect.entity_name.clone()),
+                    DbValue::Text(effect.from_type.clone()),
+                    DbValue::Text(effect.to_type.clone()),
+                ),
+                None => (DbValue::Null, DbValue::Null, DbValue::Null, DbValue::Null),
+            };
+        self.execute(
+            "INSERT INTO cg_skill_firing_trace (id, skill_id, capture_id, correct, effect_entity_key, effect_entity_name, effect_from_type, effect_to_type, created_at) VALUES ($id, $skill_id, $capture_id, $correct, $effect_entity_key, $effect_entity_name, $effect_from_type, $effect_to_type, $created_at)",
+            HashMap::from([
+                (
+                    "id".to_string(),
+                    DbValue::Text(uuid::Uuid::new_v4().to_string()),
+                ),
+                ("skill_id".to_string(), DbValue::Text(firing.skill_id.clone())),
+                ("capture_id".to_string(), DbValue::Text(capture_id.to_string())),
+                ("correct".to_string(), DbValue::Null),
+                ("effect_entity_key".to_string(), effect_entity_key),
+                ("effect_entity_name".to_string(), effect_entity_name),
+                ("effect_from_type".to_string(), effect_from_type),
+                ("effect_to_type".to_string(), effect_to_type),
+                ("created_at".to_string(), DbValue::TxId(self.tx)),
+            ]),
+        )?;
+        Ok(())
     }
 
     fn insert_decision_row(

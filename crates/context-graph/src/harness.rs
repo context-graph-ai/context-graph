@@ -692,10 +692,6 @@ pub fn run_capture(
     let context = resolve_capture_context(store, &request.context_label)?;
     let context_id = context.id;
 
-    // A stable capture id ties the firing traces recorded below to this capture. It is prefixed so
-    // it is a plain text identifier (not a bare UUID the store column would coerce to a UUID value).
-    let capture_id = format!("capture-{}", crate::DigestId::new_v7().as_uuid());
-
     // Stage 1 (extraction). When the caller sets `chunk_window`, the transcript is split into
     // windows of that size and the extractor is called once per window, with each pass's seeds
     // accreted into one harvest (the rolling-condensation accumulator, so both ends survive). When
@@ -726,13 +722,13 @@ pub fn run_capture(
 
     // Select and apply the learned skills whose description matches this capture (Stage-5 of the
     // pipeline). Skill selection honors the store-level master switch and review-hold gate; each
-    // selected skill's retype effect is applied to the harvested entity types in place, and a
-    // firing trace is recorded for every selected skill (the real input to drift detection).
-    let applied_skill_ids = select_and_apply_learned_skills(
+    // selected skill's retype effect is applied to the harvested entity types in place. The shared
+    // capture transaction records firing traces keyed to the digest the user can later correct with
+    // `cg fix`.
+    let skill_application = select_and_apply_learned_skills(
         store,
         &mut harvest,
         &request.transcript,
-        &capture_id,
         config.skills_enabled,
         config.review_mode,
     );
@@ -878,6 +874,7 @@ pub fn run_capture(
         &request.context_label,
         &request.transcript,
         harvest,
+        &skill_application.firing_records,
     )?;
     outcome.report.model_usage = extractor.drain_model_usage();
     outcome.report.flagged_items = flagged_items;
@@ -924,7 +921,7 @@ pub fn run_capture(
         stage3_resolution_verdicts,
         judge_call_count,
         judge_candidate_set,
-        applied_skill_ids,
+        applied_skill_ids: skill_application.applied_skill_ids,
         receipt_leads_with_intention: true,
     };
     Ok((outcome.report, harness_report))
@@ -1020,29 +1017,35 @@ fn resolve_decision_relation(
     })
 }
 
-/// Select the learned skills whose description matches this capture and apply them, recording a
-/// `cg_skill_firing_trace` row for each applied skill (the real input to drift detection).
+struct SelectedSkillApplication {
+    applied_skill_ids: Vec<String>,
+    firing_records: Vec<crate::skill_store::SkillFiringRecord>,
+}
+
+/// Select the learned skills whose description matches this capture and apply them.
 ///
 /// The store-level master switch (`cg skills off`) stops all application; the review-hold gate
 /// (`cg skills review`) withholds a freshly promoted skill until acknowledged. Each selected skill's
 /// retype effect is applied to the harvested entity types IN PLACE (the deterministic, model-free
-/// retype the learned rule encodes), so the change is reflected in the stored entity. A firing trace
-/// is recorded for every selected skill — even one whose rule changes no value — so its later
-/// right/wrong record can be tallied. Returns the ids of every selected (applied) skill.
+/// retype the learned rule encodes), so the change is reflected in the stored entity. Returns the ids
+/// of every selected skill for the receipt plus the capture-time firing records the shared capture
+/// transaction writes once the digest exists.
 fn select_and_apply_learned_skills(
     store: &Store,
     harvest: &mut crate::ingest::StructuredHarvest,
     chunk: &str,
-    capture_id: &str,
     config_skills_enabled: bool,
     config_review_mode: bool,
-) -> Vec<String> {
+) -> SelectedSkillApplication {
     let skills_on = config_skills_enabled && crate::skill_store::skills_enabled(store);
     let review_mode = config_review_mode || crate::skill_store::review_hold_active(store);
     let selected =
         crate::skill_store::select_skills_for_chunk(store, chunk, skills_on, review_mode);
     if selected.is_empty() {
-        return Vec::new();
+        return SelectedSkillApplication {
+            applied_skill_ids: Vec::new(),
+            firing_records: Vec::new(),
+        };
     }
 
     // Build the harvest's entity types keyed by seed key, so a retype effect can rewrite them in
@@ -1060,7 +1063,35 @@ fn select_and_apply_learned_skills(
         })
         .collect();
 
-    let _effects = crate::skill_store::apply_retype_skills(&selected, &mut entity_types_by_key);
+    let effects = crate::skill_store::apply_retype_skills(&selected, &mut entity_types_by_key);
+    let mut effects_by_skill: std::collections::BTreeMap<
+        String,
+        Vec<crate::skill_store::SkillFiringEffect>,
+    > = std::collections::BTreeMap::new();
+    for applied in effects {
+        effects_by_skill
+            .entry(applied.skill_id)
+            .or_default()
+            .push(applied.effect);
+    }
+
+    let mut firing_records = Vec::new();
+    for skill in &selected {
+        match effects_by_skill.remove(&skill.id) {
+            Some(effects) => {
+                for effect in effects {
+                    firing_records.push(crate::skill_store::SkillFiringRecord {
+                        skill_id: skill.id.clone(),
+                        effect: Some(effect),
+                    });
+                }
+            }
+            None => firing_records.push(crate::skill_store::SkillFiringRecord {
+                skill_id: skill.id.clone(),
+                effect: None,
+            }),
+        }
+    }
 
     // Write any retyped labels back onto the harvest entity seeds so the new type is what gets
     // stored. A label the conversion does not recognize leaves the seed unchanged.
@@ -1072,13 +1103,10 @@ fn select_and_apply_learned_skills(
         }
     }
 
-    // Record a firing trace for every selected skill (the drift input), and report them all applied.
-    let mut applied_skill_ids = Vec::with_capacity(selected.len());
-    for skill in &selected {
-        crate::skill_store::record_firing(store, &skill.id, capture_id);
-        applied_skill_ids.push(skill.id.clone());
+    SelectedSkillApplication {
+        applied_skill_ids: selected.into_iter().map(|skill| skill.id).collect(),
+        firing_records,
     }
-    applied_skill_ids
 }
 
 /// Render the config knobs honored on this capture, for the report's introspection field.

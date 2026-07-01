@@ -1004,10 +1004,20 @@ fn handle_fix(args: &[String]) -> i32 {
     let Some(item_id) = resolve_item_handle(&store, context_id, handle) else {
         return usage_error(&format!("no item matches handle `{handle}`"));
     };
-    let overlay = context_graph::overlay::record_correction(&store, &item_id, &new_value);
     // A correction is filed as a lesson (teaching event), not a skill — the learning loop promotes a
     // skill only after enough aligned labels beat a held-out check. No skill is created here.
-    let _ = context_graph::skill_store::apply_correction(&store, &item_id, &new_value, None);
+    let correction =
+        context_graph::skill_store::apply_correction(&store, &item_id, &new_value, None);
+    if !correction.applied {
+        return memory_failure(
+            1,
+            "CorrectionFailed",
+            &db_path,
+            &context_label,
+            "correction could not be logged as a teaching event or firing-label update",
+        );
+    }
+    let overlay = context_graph::overlay::record_correction(&store, &item_id, &new_value);
     let message = context_graph::review_surface::emit_capture_receipt(&format!(
         "corrected {item_id} → {new_value}"
     ));

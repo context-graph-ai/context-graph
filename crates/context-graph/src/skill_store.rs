@@ -83,6 +83,21 @@ pub struct FiringTrace {
     pub correct: Option<bool>,
 }
 
+/// The value-level effect a selected skill actually applied during capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillFiringEffect {
+    pub entity_key: String,
+    pub entity_name: String,
+    pub from_type: String,
+    pub to_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillFiringRecord {
+    pub skill_id: String,
+    pub effect: Option<SkillFiringEffect>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DriftAlert {
     pub skill_id: String,
@@ -492,16 +507,36 @@ fn promote_skills_from_teaching_events(store: &Store) -> bool {
     created
 }
 
-fn label_latest_unresolved_firing_for_skill(store: &Store, skill_id: &str, correct: bool) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FiringLabelTarget {
+    firing_id: String,
+    correct: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnresolvedFiringEffectRow {
+    firing_id: String,
+    effect_entity_name: String,
+    effect_to_type: String,
+}
+
+fn unresolved_firing_id_for_skill_capture(
+    store: &Store,
+    skill_id: &str,
+    capture_id: &str,
+) -> Option<Option<String>> {
     let db = store.sync_database();
     let snapshot = db.snapshot();
-    let mut candidates: Vec<(contextdb_core::Value, String)> = db
-        .scan(FIRING_TRACE_TABLE, snapshot)
-        .unwrap_or_default()
+    let rows = db.scan(FIRING_TRACE_TABLE, snapshot).ok()?;
+    let mut candidates: Vec<(contextdb_core::Value, String)> = rows
         .into_iter()
         .filter_map(|row| {
             match row.values.get("skill_id") {
                 Some(contextdb_core::Value::Text(id)) if id == skill_id => {}
+                _ => return None,
+            }
+            match row.values.get("capture_id") {
+                Some(contextdb_core::Value::Text(id)) if id == capture_id => {}
                 _ => return None,
             }
             if !matches!(
@@ -524,11 +559,109 @@ fn label_latest_unresolved_firing_for_skill(store: &Store, skill_id: &str, corre
         })
         .collect();
     candidates.sort_by(|a, b| value_order_key(&b.0).cmp(&value_order_key(&a.0)));
-    let Some((_, firing_id)) = candidates.into_iter().next() else {
-        return false;
+    Some(
+        candidates
+            .into_iter()
+            .next()
+            .map(|(_, firing_id)| firing_id),
+    )
+}
+
+fn unresolved_firing_effect_rows_for_capture(
+    store: &Store,
+    capture_id: &str,
+) -> Option<Vec<UnresolvedFiringEffectRow>> {
+    let db = store.sync_database();
+    let snapshot = db.snapshot();
+    let rows = db.scan(FIRING_TRACE_TABLE, snapshot).ok()?;
+    let mut candidates: Vec<(contextdb_core::Value, UnresolvedFiringEffectRow)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            match row.values.get("capture_id") {
+                Some(contextdb_core::Value::Text(id)) if id == capture_id => {}
+                _ => return None,
+            }
+            if !matches!(
+                row.values.get("correct"),
+                None | Some(contextdb_core::Value::Null)
+            ) {
+                return None;
+            }
+            let firing_id = match row.values.get("id") {
+                Some(contextdb_core::Value::Text(id)) => id.clone(),
+                Some(contextdb_core::Value::Uuid(id)) => id.to_string(),
+                _ => return None,
+            };
+            let effect_entity_name = match row.values.get("effect_entity_name") {
+                Some(contextdb_core::Value::Text(value)) => value.clone(),
+                _ => return None,
+            };
+            let effect_to_type = match row.values.get("effect_to_type") {
+                Some(contextdb_core::Value::Text(value)) => value.clone(),
+                _ => return None,
+            };
+            let created = row
+                .values
+                .get("created_at")
+                .cloned()
+                .unwrap_or(contextdb_core::Value::Null);
+            Some((
+                created,
+                UnresolvedFiringEffectRow {
+                    firing_id,
+                    effect_entity_name,
+                    effect_to_type,
+                },
+            ))
+        })
+        .collect();
+    candidates.sort_by(|a, b| value_order_key(&a.0).cmp(&value_order_key(&b.0)));
+    Some(candidates.into_iter().map(|(_, row)| row).collect())
+}
+
+fn firing_label_targets_for_correction(
+    store: &Store,
+    item_id: &str,
+    new_value: &str,
+    skill_id: Option<&str>,
+) -> Option<Vec<FiringLabelTarget>> {
+    if let Some(skill_id) = skill_id.filter(|id| !id.trim().is_empty()) {
+        let firing_id = unresolved_firing_id_for_skill_capture(store, skill_id, item_id)?;
+        return Some(
+            firing_id
+                .map(|firing_id| {
+                    vec![FiringLabelTarget {
+                        firing_id,
+                        correct: false,
+                    }]
+                })
+                .unwrap_or_default(),
+        );
+    }
+
+    let Some((corrected_type_label, target_name)) = parse_retype_correction_content(new_value)
+    else {
+        return Some(Vec::new());
     };
-    record_firing_label(store, &firing_id, correct);
-    true
+    let corrected_entity_name = if let Some(target_name) = target_name {
+        target_name
+    } else {
+        let Some(entity) = entity_from_item_or_digest(store, item_id, None) else {
+            return Some(Vec::new());
+        };
+        entity.name
+    };
+    let corrected_entity_name_norm = normalize_lesson_name(&corrected_entity_name);
+    let targets = unresolved_firing_effect_rows_for_capture(store, item_id)?
+        .into_iter()
+        .filter(|row| normalize_lesson_name(&row.effect_entity_name) == corrected_entity_name_norm)
+        .map(|row| FiringLabelTarget {
+            firing_id: row.firing_id,
+            correct: corrected_type_label.eq_ignore_ascii_case(&row.effect_to_type),
+        })
+        .collect();
+
+    Some(targets)
 }
 
 fn value_order_key(value: &contextdb_core::Value) -> i128 {
@@ -550,36 +683,24 @@ pub fn apply_correction(
     let event_id = uuid::Uuid::new_v4().to_string();
     let skill_id_str = skill_id.unwrap_or("").to_string();
     let db = store.sync_database();
-    let params = HashMap::from([
-        (
-            "id".to_string(),
-            contextdb_core::Value::Text(event_id.clone()),
-        ),
-        (
-            "skill_id".to_string(),
-            contextdb_core::Value::Text(skill_id_str.clone()),
-        ),
-        (
-            "corrected_item_id".to_string(),
-            contextdb_core::Value::Text(item_id.to_string()),
-        ),
-        (
-            "kind".to_string(),
-            contextdb_core::Value::Text("correction".to_string()),
-        ),
-        (
-            "content".to_string(),
-            contextdb_core::Value::Text(new_value.to_string()),
-        ),
-    ]);
-    let insert_ok = execute_with_live_txid(
-        &db,
-        "INSERT INTO cg_teaching_events (id, skill_id, corrected_item_id, kind, content, created_at) VALUES ($id, $skill_id, $corrected_item_id, $kind, $content, $created_at)",
-        "created_at",
-        params,
-    );
+    let Some(label_targets) =
+        firing_label_targets_for_correction(store, item_id, new_value, skill_id)
+    else {
+        return CorrectionResult {
+            applied: false,
+            teaching_event: None,
+            new_skill_created: false,
+        };
+    };
 
-    if !insert_ok {
+    if !insert_correction_and_labels(
+        &db,
+        &event_id,
+        &skill_id_str,
+        item_id,
+        new_value,
+        &label_targets,
+    ) {
         return CorrectionResult {
             applied: false,
             teaching_event: None,
@@ -594,11 +715,6 @@ pub fn apply_correction(
         kind: TeachingEventKind::Correction,
         content: new_value.to_string(),
     };
-    if let Some(skill_id) = skill_id
-        && !skill_id.trim().is_empty()
-    {
-        let _ = label_latest_unresolved_firing_for_skill(store, skill_id, false);
-    }
     let new_skill_created = if skill_id.is_none() {
         promote_skills_from_teaching_events(store)
     } else {
@@ -609,6 +725,68 @@ pub fn apply_correction(
         applied: true,
         teaching_event: Some(teaching_event),
         new_skill_created,
+    }
+}
+
+fn insert_correction_and_labels(
+    db: &contextdb_engine::Database,
+    event_id: &str,
+    skill_id: &str,
+    item_id: &str,
+    new_value: &str,
+    label_targets: &[FiringLabelTarget],
+) -> bool {
+    let Ok(tx) = db.begin() else {
+        return false;
+    };
+    let teaching_params = HashMap::from([
+        (
+            "id".to_string(),
+            contextdb_core::Value::Text(event_id.to_string()),
+        ),
+        (
+            "skill_id".to_string(),
+            contextdb_core::Value::Text(skill_id.to_string()),
+        ),
+        (
+            "corrected_item_id".to_string(),
+            contextdb_core::Value::Text(item_id.to_string()),
+        ),
+        (
+            "kind".to_string(),
+            contextdb_core::Value::Text("correction".to_string()),
+        ),
+        (
+            "content".to_string(),
+            contextdb_core::Value::Text(new_value.to_string()),
+        ),
+        ("created_at".to_string(), contextdb_core::Value::TxId(tx)),
+    ]);
+    let inserted = db
+        .execute_in_tx(
+            tx,
+            "INSERT INTO cg_teaching_events (id, skill_id, corrected_item_id, kind, content, created_at) VALUES ($id, $skill_id, $corrected_item_id, $kind, $content, $created_at)",
+            &teaching_params,
+        )
+        .map(|result| result.rows_affected == 1)
+        .unwrap_or(false);
+    if !inserted {
+        let _ = db.rollback(tx);
+        return false;
+    }
+
+    for target in label_targets {
+        if !record_firing_label_in_tx(db, tx, &target.firing_id, target.correct) {
+            let _ = db.rollback(tx);
+            return false;
+        }
+    }
+
+    if db.commit(tx).is_ok() {
+        true
+    } else {
+        let _ = db.rollback(tx);
+        false
     }
 }
 
@@ -722,10 +900,34 @@ pub fn record_firing(store: &Store, skill_id: &str, capture_id: &str) -> FiringT
 }
 
 /// Record a ground-truth label for a firing (correct or incorrect).
-pub fn record_firing_label(store: &Store, firing_id: &str, correct: bool) {
+pub fn record_firing_label(store: &Store, firing_id: &str, correct: bool) -> bool {
     let db = store.sync_database();
+    db.execute(
+        "UPDATE cg_skill_firing_trace SET correct = $correct WHERE id = $id",
+        &firing_label_params(firing_id, correct),
+    )
+    .map(|result| result.rows_affected == 1)
+    .unwrap_or(false)
+}
+
+fn record_firing_label_in_tx(
+    db: &contextdb_engine::Database,
+    tx: contextdb_core::TxId,
+    firing_id: &str,
+    correct: bool,
+) -> bool {
+    db.execute_in_tx(
+        tx,
+        "UPDATE cg_skill_firing_trace SET correct = $correct WHERE id = $id",
+        &firing_label_params(firing_id, correct),
+    )
+    .map(|result| result.rows_affected == 1)
+    .unwrap_or(false)
+}
+
+fn firing_label_params(firing_id: &str, correct: bool) -> HashMap<String, contextdb_core::Value> {
     let correct_val: i64 = if correct { 1 } else { 0 };
-    let params = HashMap::from([
+    HashMap::from([
         (
             "id".to_string(),
             contextdb_core::Value::Text(firing_id.to_string()),
@@ -734,11 +936,7 @@ pub fn record_firing_label(store: &Store, firing_id: &str, correct: bool) {
             "correct".to_string(),
             contextdb_core::Value::Int64(correct_val),
         ),
-    ]);
-    let _ = db.execute(
-        "UPDATE cg_skill_firing_trace SET correct = $correct WHERE id = $id",
-        &params,
-    );
+    ])
 }
 
 // ─── Skill selection + application (the capture-path seam) ──────────────────────
@@ -850,15 +1048,16 @@ pub fn parse_retype_effect(rule: &str) -> Option<SkillRetypeEffect> {
 pub struct AppliedSkillEffect {
     /// The skill that applied.
     pub skill_id: String,
-    /// The entity keys whose type the skill changed.
-    pub changed_entity_keys: Vec<String>,
+    /// The value-level retype effect that actually changed the capture.
+    pub effect: SkillFiringEffect,
 }
 
 /// Apply the selected skills' retype effects to a capture's harvested entity types, mutating the
-/// entity type labels in `entity_types_by_key` in place and returning, for each skill that actually
-/// changed something, its id and the entity keys it touched. The caller (the capture spine) holds the
-/// harvested entities keyed by their seed key with their current type LABEL (e.g. "File"); this seam
-/// performs the deterministic, model-free retype the learned rule encodes.
+/// entity type labels in `entity_types_by_key` in place and returning, for each skill effect that
+/// actually changed something, the skill id plus the exact entity/type transition it touched. The
+/// caller (the capture spine) holds the harvested entities keyed by their seed key with their current
+/// type LABEL (e.g. "File"); this seam performs the deterministic, model-free retype the learned rule
+/// encodes.
 ///
 /// A skill whose rule names an entity not present, or whose source type does not match the current
 /// type, applies nothing. Only retype-shaped rules have an effect today; a non-retype rule yields no
@@ -873,20 +1072,22 @@ pub fn apply_retype_skills(
         let Some(effect) = parse_retype_effect(&skill.rule) else {
             continue;
         };
-        let mut changed = Vec::new();
         for (key, (name, type_label)) in entity_types_by_key.iter_mut() {
             if name.eq_ignore_ascii_case(&effect.entity_name)
                 && type_label.eq_ignore_ascii_case(&effect.from_type)
             {
+                let applied = SkillFiringEffect {
+                    entity_key: key.clone(),
+                    entity_name: name.clone(),
+                    from_type: effect.from_type.clone(),
+                    to_type: effect.to_type.clone(),
+                };
                 *type_label = effect.to_type.clone();
-                changed.push(key.clone());
+                effects.push(AppliedSkillEffect {
+                    skill_id: skill.id.clone(),
+                    effect: applied,
+                });
             }
-        }
-        if !changed.is_empty() {
-            effects.push(AppliedSkillEffect {
-                skill_id: skill.id.clone(),
-                changed_entity_keys: changed,
-            });
         }
     }
     effects
