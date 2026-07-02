@@ -20,7 +20,8 @@ use cg_cli_conventions::{
     model_byok_status_exit_code,
 };
 use context_graph::harness::{
-    CaptureHarnessConfig, CaptureHarnessReport, SchemaDescriptor, run_capture, run_capture_verbatim,
+    CaptureHarnessConfig, CaptureHarnessReport, SchemaDescriptor, run_capture,
+    run_capture_into_digest, run_capture_verbatim,
 };
 use context_graph::ingest::{
     CaptureReport, CaptureRequest, ConversationExtractor, DecisionRelationClassification,
@@ -38,7 +39,8 @@ use context_graph::understanding::{
 };
 use context_graph::{
     CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
-    CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestSearchFilter,
+    CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestId,
+    DigestSearchFilter,
     DiscoveryFilter, Embedder, EmbedderRegistration, EnforcementLevel, Entity, EntityId,
     EntitySnapshot, Invalidation, InvalidationStatus, LlmClient, ModelCallOutcome,
     ModelCallReceipt, ModelCallUsage, ModelInvocation, ModelReply, OutputContract, ProviderUsage,
@@ -744,8 +746,9 @@ fn handle_understand(args: &[String]) -> i32 {
         &budget,
         &mut spent,
         true,
+        None,
     ) {
-        Ok(counts) => counts,
+        Ok(outcome) => outcome.counts,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
     let pending_after = queue_counts(&store, context.id)
@@ -787,7 +790,7 @@ fn understand_worker(args: &[String]) -> i32 {
         if budget.exhausted(&spent) {
             break;
         }
-        if let Ok(counts) = drain_context_queue(
+        if let Ok(outcome) = drain_context_queue(
             &root,
             &store,
             &context.name,
@@ -795,10 +798,11 @@ fn understand_worker(args: &[String]) -> i32 {
             &budget,
             &mut spent,
             false,
+            None,
         ) {
-            agg.understood += counts.understood;
-            agg.failed += counts.failed;
-            agg.claim_skipped += counts.claim_skipped;
+            agg.understood += outcome.counts.understood;
+            agg.failed += outcome.counts.failed;
+            agg.claim_skipped += outcome.counts.claim_skipped;
         }
     }
     let summary = DrainSummary {
@@ -858,6 +862,15 @@ struct DrainCounts {
     claim_skipped: usize,
 }
 
+/// The result of one drain pass: the per-context counts plus the per-digest capture reports the
+/// drain produced. The background worker and plain `cg understand` ignore the reports (they print a
+/// drain receipt); the foreground `--understand-now` path aggregates them into ONE capture receipt
+/// so its stdout matches the old synchronous capture shape.
+struct DrainOutcome {
+    counts: DrainCounts,
+    reports: Vec<(CaptureReport, CaptureHarnessReport)>,
+}
+
 struct DrainSummary {
     counts: DrainCounts,
     spent: Vec<ModelCallUsage>,
@@ -867,9 +880,15 @@ struct DrainSummary {
 
 /// Drain one context's pending understanding backlog in priority order. Each digest: claim it
 /// atomically (skip if another worker already took it), run the SAME `run_capture` terminal path
-/// capture uses over the stored raw chunk, then record the outcome (structured + completion on
-/// success, attempt-with-cap on model failure). Accumulates spend into `spent` so a caller draining
-/// several contexts shares one budget. Returns per-context counts.
+/// capture uses over the stored raw chunk — anchoring the structured graph ONTO that tier-0 digest
+/// (`run_capture_into_digest`, so understanding never mints a second digest) — then record the
+/// outcome (structured + completion on success, attempt-with-cap on model failure). Accumulates
+/// spend into `spent` so a caller draining several contexts shares one budget.
+///
+/// `only` scopes the drain to a specific set of just-captured digests: the `--understand-now`
+/// foreground path passes the digests it just captured so it understands exactly those and blocks;
+/// the background worker and the plain `cg understand` foreground run pass `None` to drain the whole
+/// context backlog. Either way the SAME drainer code runs — there is one understanding path.
 #[allow(clippy::too_many_arguments)]
 fn drain_context_queue(
     root: &Path,
@@ -879,13 +898,15 @@ fn drain_context_queue(
     budget: &DrainBudget,
     spent: &mut Vec<ModelCallUsage>,
     progress: bool,
-) -> context_graph::Result<DrainCounts> {
+    only: Option<&std::collections::HashSet<DigestId>>,
+) -> context_graph::Result<DrainOutcome> {
     let mut counts = DrainCounts::default();
+    let mut reports: Vec<(CaptureReport, CaptureHarnessReport)> = Vec::new();
     let model_name = memory_capture_connection_name(root).unwrap_or_default();
     // No connected model: nothing to drain (the worker already short-circuits, but this keeps the
     // library-facing drain honest when called directly).
     if memory_capture_connection_name(root).is_none() {
-        return Ok(counts);
+        return Ok(DrainOutcome { counts, reports });
     }
     let config = CaptureHarnessConfig {
         chunk_window: None,
@@ -895,6 +916,11 @@ fn drain_context_queue(
     // Snapshot the pending set once; retries land on a later drain, never an in-run loop.
     let pending = list_pending_digests(store, context_id, None)?;
     for pending_digest in pending {
+        if let Some(only) = only {
+            if !only.contains(&pending_digest.digest_id) {
+                continue;
+            }
+        }
         if budget.exhausted(spent) {
             break;
         }
@@ -925,8 +951,17 @@ fn drain_context_queue(
             transcript: pending_digest.chunk_text.clone(),
             model_available: true,
         };
-        match run_capture(store, request, &extractor, &config) {
-            Ok((report, _harness)) => {
+        // Understand INTO the tier-0 digest: the structured graph anchors onto the existing digest
+        // instead of minting a second one, so a chunk stays exactly one digest (verbatim ->
+        // structured).
+        match run_capture_into_digest(
+            store,
+            request,
+            &extractor,
+            &config,
+            Some(pending_digest.digest_id),
+        ) {
+            Ok((report, harness)) => {
                 let receipt = usage_receipt_from_calls(
                     report.model_usage.clone(),
                     CapturePricing::FlatSubscription,
@@ -940,7 +975,8 @@ fn drain_context_queue(
                     &model_name,
                     Some(&receipt_json),
                 )?;
-                spent.extend(report.model_usage);
+                spent.extend(report.model_usage.clone());
+                reports.push((report, harness));
                 counts.understood += 1;
                 if progress {
                     eprintln!(
@@ -972,7 +1008,7 @@ fn drain_context_queue(
             }
         }
     }
-    Ok(counts)
+    Ok(DrainOutcome { counts, reports })
 }
 
 /// Acquire the exclusive per-data-root understanding-worker lock. Returns the held file (the flock

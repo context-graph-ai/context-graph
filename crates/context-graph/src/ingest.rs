@@ -1007,6 +1007,7 @@ fn record_conversation_internal_with_stored_text(
         stored_text,
         harvest,
         &skill_application.firing_records,
+        None,
     )?
     .report;
     report.model_usage = tagger.drain_model_usage();
@@ -2174,10 +2175,11 @@ pub(crate) fn capture_structured_harvest(
     transcript: &str,
     harvest: StructuredHarvest,
     skill_firing_records: &[crate::skill_store::SkillFiringRecord],
+    reuse_digest: Option<DigestId>,
 ) -> Result<HarvestCaptureResult> {
     if harvest.is_empty() {
         return Ok(HarvestCaptureResult {
-            report: capture_zero_harvest_digest(store, context_id, transcript)?,
+            report: capture_zero_harvest_digest(store, context_id, transcript, reuse_digest)?,
             resolutions: Vec::new(),
         });
     }
@@ -2193,7 +2195,14 @@ pub(crate) fn capture_structured_harvest(
         .filter(|summary| !summary.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| compact_summary(transcript));
-    let digest = tx.create_text_digest(context_id, &summary, &summary)?;
+    // The understanding-queue drainer passes the id of the digest it is understanding: the
+    // structured graph anchors onto that existing tier-0 digest instead of minting a second one,
+    // so a chunk yields exactly ONE digest that transitions verbatim -> structured. Every other
+    // caller passes `None` and gets a fresh digest as before.
+    let digest_id = match reuse_digest {
+        Some(id) => id,
+        None => tx.create_text_digest(context_id, &summary, &summary)?.id,
+    };
     let mut stable = BTreeMap::new();
     let mut source_ids = Vec::<(String, uuid::Uuid)>::new();
     let mut derived_items = Vec::new();
@@ -2240,7 +2249,7 @@ pub(crate) fn capture_structured_harvest(
             "intention",
             &seed.text,
             "active",
-            digest.id,
+            digest_id,
             context_label,
         ));
         goals.insert(seed.key.clone(), goal);
@@ -2360,7 +2369,7 @@ pub(crate) fn capture_structured_harvest(
             "observation",
             &observation_text,
             "current",
-            digest.id,
+            digest_id,
             context_label,
         ));
         dedup_events.push(DedupEvent {
@@ -2418,7 +2427,7 @@ pub(crate) fn capture_structured_harvest(
             "observation",
             &seed.text,
             "current",
-            digest.id,
+            digest_id,
             context_label,
         ));
         if let (Some(entity_key), Some(prior_value), Some(candidate_value)) =
@@ -2625,7 +2634,7 @@ pub(crate) fn capture_structured_harvest(
             "decision",
             text,
             status,
-            digest.id,
+            digest_id,
             context_label,
         ));
     }
@@ -2636,7 +2645,7 @@ pub(crate) fn capture_structured_harvest(
         .iter()
         .map(|(key, id)| (key.as_str(), *id))
         .collect::<Vec<_>>();
-    let provenance = tx.add_provenance_edges(context_id, digest.id, &source_refs)?;
+    let provenance = tx.add_provenance_edges(context_id, digest_id, &source_refs)?;
     tx.record_skill_firings(skill_firing_records, &provenance)?;
     let mut invalidated_decision_ids = invalidation_rows
         .iter()
@@ -4810,14 +4819,30 @@ fn capture_zero_harvest_digest(
     store: &Store,
     context_id: ContextId,
     transcript: &str,
+    reuse_digest: Option<DigestId>,
 ) -> Result<CaptureReport> {
-    let digest = create_text_digest(store, context_id, transcript, transcript)?;
+    // When understanding an existing tier-0 digest that yielded no structured items, reuse that
+    // digest (it already carries the verbatim summary) rather than minting a second one; every
+    // other caller mints a fresh digest for this transcript.
+    let (digest_summary, wrote_digest) = match reuse_digest {
+        Some(id) => (
+            store
+                .get_digest(id)?
+                .map(|digest| digest.summary)
+                .unwrap_or_default(),
+            false,
+        ),
+        None => (
+            create_text_digest(store, context_id, transcript, transcript)?.summary,
+            true,
+        ),
+    };
     let mut report = CaptureReport::empty(
         CaptureMode::Condensed,
         "model completed: zero structured items extracted from this capture",
     );
-    report.digest_summary = digest.summary;
-    report.wrote_digest = true;
+    report.digest_summary = digest_summary;
+    report.wrote_digest = wrote_digest;
     report.total_harvest = total_counts(store, context_id)?;
     Ok(report)
 }
