@@ -33,7 +33,9 @@ const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"propertie
 #[test]
 fn local_gguf_understanding_runs_in_process_native() {
     let Some(gguf) = locate_gguf() else {
-        eprintln!("SKIP local_gguf_understanding_runs_in_process_native: no GGUF (set CG_LOCAL_LLM_TEST_GGUF)");
+        eprintln!(
+            "SKIP local_gguf_understanding_runs_in_process_native: no GGUF (set CG_LOCAL_LLM_TEST_GGUF)"
+        );
         return;
     };
 
@@ -84,7 +86,10 @@ fn local_gguf_understanding_runs_in_process_native() {
         outcome.phrasing,
     );
 
-    assert!(outcome.model_invoked, "the in-process model must be invoked");
+    assert!(
+        outcome.model_invoked,
+        "the in-process model must be invoked"
+    );
     assert_eq!(
         receipt.reliability_level,
         EnforcementLevel::Native,

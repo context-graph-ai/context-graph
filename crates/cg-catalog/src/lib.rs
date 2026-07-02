@@ -85,8 +85,7 @@ const UNDERSTANDING_REVISION: &str = "main";
 const UNDERSTANDING_BYTES: u64 = 3_106_736_256;
 /// Pinned sha256 of the production GGUF, computed from the fetched copy and verified to load and
 /// run in-process (a grammar-constrained extraction) before it was trusted.
-const UNDERSTANDING_SHA: &str =
-    "9378bc471710229ef165709b62e34bfb62231420ddaf6d729e727305b5b8672d";
+const UNDERSTANDING_SHA: &str = "9378bc471710229ef165709b62e34bfb62231420ddaf6d729e727305b5b8672d";
 const UNDERSTANDING_LICENSE_SPDX: &str = "Gemma";
 const UNDERSTANDING_LICENSE_URL: &str = "https://ai.google.dev/gemma/terms";
 
@@ -751,21 +750,18 @@ impl Catalog {
             ) => {}
             Err(err) => return Err(err),
         }
-        match self.fetch_understanding_default() {
-            Ok(
-                FetchResult::Completed
-                | FetchResult::AlreadyCached
-                | FetchResult::AlreadyCachedByConcurrentWinner,
-            ) => {
+        // The understanding model is large (~3.1GB). `prefetch_defaults` seeds it from an
+        // already-downloaded staged copy (or reports it already cached) but never triggers the
+        // network download itself — that is the explicit `cg model fetch` path, so library and
+        // test callers of `prefetch_defaults` never block on a multi-gigabyte fetch.
+        match self.seed_understanding_if_cached_or_staged() {
+            Ok(true) => {
                 summary.fetched.push(FetchedEntry {
                     model_id: UNDERSTANDING_DEFAULT_ID.to_string(),
                     artifact_sha: UNDERSTANDING_SHA.to_string(),
                 });
             }
-            Ok(
-                FetchResult::AlreadyCachedAndAccepted | FetchResult::CompletedAcceptanceRequired,
-            ) => {}
-            Err(_) => {
+            Ok(false) | Err(_) => {
                 summary.skipped.push(SkippedEntry {
                     model_id: UNDERSTANDING_DEFAULT_ID.to_string(),
                     reason: SkipReason::NetworkUnavailable,
@@ -783,12 +779,30 @@ impl Catalog {
     /// matches the pinned sha (a corrupt/partial copy is not "cached").
     #[must_use]
     pub fn understanding_model_cached(&self) -> bool {
-        let artifact = self.model_dir(UNDERSTANDING_DEFAULT_ID).join(UNDERSTANDING_FILE);
+        let artifact = self
+            .model_dir(UNDERSTANDING_DEFAULT_ID)
+            .join(UNDERSTANDING_FILE);
         self.manifest_path(UNDERSTANDING_DEFAULT_ID).is_file()
             && artifact.is_file()
             && sha256_file(&artifact)
                 .map(|sha| sha == UNDERSTANDING_SHA)
                 .unwrap_or(false)
+    }
+
+    /// Seed the understanding model only if it is already cached or a staged copy exists — never
+    /// downloading. Returns whether the model is now cached. Used by `prefetch_defaults` so it
+    /// never blocks on the multi-gigabyte network fetch.
+    fn seed_understanding_if_cached_or_staged(&self) -> Result<bool> {
+        if self.understanding_model_cached() {
+            return Ok(true);
+        }
+        if let Some(staged) = self.staged_understanding_artifact()
+            && staged.is_file()
+        {
+            self.seed_understanding_model_from_path(&staged)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Fetch the bundled understanding model into the catalog cache. Order of preference:
@@ -929,7 +943,10 @@ impl Catalog {
             toml::Value::String(UNDERSTANDING_SHA.to_string()),
         );
         table.insert("per_file_sha256".to_string(), toml::Value::Table(sha_table));
-        write_toml_value(&self.manifest_path(UNDERSTANDING_DEFAULT_ID), &toml::Value::Table(table))
+        write_toml_value(
+            &self.manifest_path(UNDERSTANDING_DEFAULT_ID),
+            &toml::Value::Table(table),
+        )
     }
 
     pub fn update_check(&self, store: &Store) -> Result<Vec<UpdateCheckObservation>> {
@@ -3412,13 +3429,12 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 /// Stream a single file from `url` to `dest`, following Hugging Face's CDN redirect. Used for the
 /// large single-file GGUF download; the caller verifies the sha before publishing.
 fn download_to_file(url: &str, dest: &Path, model_id: &str) -> Result<()> {
-    let mut response =
-        ureq::get(url)
-            .call()
-            .map_err(|err| CgCatalogError::SourceUnavailable {
-                model_id: model_id.to_string(),
-                message: err.to_string(),
-            })?;
+    let mut response = ureq::get(url)
+        .call()
+        .map_err(|err| CgCatalogError::SourceUnavailable {
+            model_id: model_id.to_string(),
+            message: err.to_string(),
+        })?;
     let mut reader = response
         .body_mut()
         .with_config()

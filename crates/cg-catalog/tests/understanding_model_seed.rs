@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use cg_catalog::{
-    Catalog, CacheStatus, Source, UNDERSTANDING_DEFAULT_ID, understanding_default_disclosure,
+    CacheStatus, Catalog, Source, UNDERSTANDING_DEFAULT_ID, understanding_default_disclosure,
 };
 
 fn locate_gguf() -> Option<PathBuf> {
@@ -26,7 +26,9 @@ fn locate_gguf() -> Option<PathBuf> {
 #[test]
 fn seed_from_path_produces_cached_local_entry() {
     let Some(gguf) = locate_gguf() else {
-        eprintln!("SKIP seed_from_path_produces_cached_local_entry: no GGUF (set CG_LOCAL_LLM_TEST_GGUF)");
+        eprintln!(
+            "SKIP seed_from_path_produces_cached_local_entry: no GGUF (set CG_LOCAL_LLM_TEST_GGUF)"
+        );
         return;
     };
 
