@@ -1,0 +1,19 @@
+[package]
+name = "cg-gap-report"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Measurement harness only (NOT a shipped product surface): runs the prompted-SLM gap report that
+# scores the bundled local gemma model against the hosted OpenRouter baseline on the same
+# single-source descriptor, prompt, and parse path. Weights + OPENROUTER_API_KEY gated.
+[[bin]]
+name = "gap-report"
+path = "src/main.rs"
+
+[dependencies]
+context-graph = { path = "../context-graph" }
+cg-catalog = { path = "../cg-catalog" }
+cg-local-llm = { path = "../cg-local-llm" }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }

@@ -1,0 +1,4 @@
+User: I want to add nomic as our embedding provider. Let's make nomic the default text embedder and keep embeddinggemma as the fallback.
+Assistant: I'll set the default text embedder to nomic (nomic-embed-text-v1.5) and register embeddinggemma as the secondary space. The nomic weights get fetched from Hugging Face on first use.
+User: Yes. And put the whole thing behind the context-graph repo's nomic-embedder feature flag so downstream crates can opt out.
+Assistant: Done — the nomic embedder is gated behind the `nomic-embedder` cargo feature on the context-graph crate, default-on.

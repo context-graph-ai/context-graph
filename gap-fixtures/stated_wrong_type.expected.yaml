@@ -1,0 +1,18 @@
+name: stated_wrong_type
+description: Entities whose correct ontology type is easy to mis-assign. "nomic" is a Model/Provider (not a File), "context-graph" is a Repository (not a File — the exact class the shipped retype rule corrects), "nomic-embedder" is a Feature/Config flag. Tests the probe's known weak spot (entity typing) and mirrors the one error class the learned-retype correction rule exists to fix.
+allow_empty: false
+decisions:
+  must_contain:
+    - "nomic"
+    - "default text embedder"
+entities:
+  must_contain:
+    - name: "nomic"
+      type_any_of: ["Model", "Provider", "Library", "Component"]
+      type_must_not_be: ["File"]
+    - name: "context-graph"
+      type_any_of: ["Repository", "Module", "Component"]
+      type_must_not_be: ["File"]        # the shipped skill-retype-context-graph-file-repository case
+    - name: "nomic-embedder"
+      type_any_of: ["Config", "Feature", "Concept"]
+notes: "Score entity typing strictly. context-graph typed as File is the canonical failure the learned correction loop targets; if the local model reproduces it consistently, that is EXPECTED (it is the teachable class) and should be reported as 'correctable by existing retype rule', not counted as a hopeless miss."

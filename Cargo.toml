@@ -7,6 +7,7 @@ members = [
     "crates/cg-cli-conventions",
     "crates/cg-cli",
     "crates/cg-local-llm",
+    "crates/cg-gap-report",
 ]
 
 [workspace.package]
