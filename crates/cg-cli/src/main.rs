@@ -4803,13 +4803,157 @@ fn handle_model(args: &[String]) -> i32 {
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::ModelByok),
         Some("list") => handle_model_list(&args[1..]),
         Some("show") => handle_model_show(&args[1..]),
+        Some("fetch") => handle_model_fetch(&args[1..]),
         Some("auth") if args.get(1).map(String::as_str) == Some("login") => {
             handle_model_auth_login(&args[2..])
         }
         Some("auth") => usage_error("expected `cg model auth login`"),
         _ => usage_error(
-            "expected `cg model connect`, `cg model status`, `cg model selftest`, `cg model list`, `cg model show`, or `cg model auth login`",
+            "expected `cg model connect`, `cg model status`, `cg model selftest`, `cg model list`, `cg model show`, `cg model fetch`, or `cg model auth login`",
         ),
+    }
+}
+
+/// Format a byte count as a human-readable size for fetch disclosure (e.g. `3.1 GB`, `548 MB`).
+fn format_bytes(bytes: u64) -> String {
+    const GB: f64 = 1_000_000_000.0;
+    const MB: f64 = 1_000_000.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GB {
+        format!("{:.1} GB", bytes_f / GB)
+    } else {
+        format!("{:.0} MB", bytes_f / MB)
+    }
+}
+
+fn handle_model_fetch(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg model fetch [--defaults | <id>] [--format json|text]\n\n\
+Prefetches model artifacts into the local cache with honest size disclosure.\n\
+  cg model fetch --defaults   Fetch the default embedder AND the local understanding model.\n\
+  cg model fetch <id>         Fetch one model by catalog id.\n\n\
+The local understanding model runs fully in-process (no server, no ollama); a staged copy next \
+to the cache is seeded without re-downloading."
+        );
+        return 0;
+    }
+    let format = output_format(args);
+    let root = data_root();
+    let catalog = match Catalog::open_with_scope_against_root(&root, CONNECTION_SCOPE) {
+        Ok(catalog) => catalog,
+        Err(err) => return failure(1, "catalog_open_failed", "config", &format!("{err:?}")),
+    };
+
+    let embedder = cg_catalog::embedder_default_disclosure();
+    let understanding = cg_catalog::understanding_default_disclosure();
+    let target = positional_arg(args);
+    let defaults = has_flag(args, "--defaults") || target.is_none();
+
+    if defaults {
+        // Disclose what will be fetched, with sizes, before downloading.
+        if format == OutputFormat::Text {
+            println!("fetching defaults:");
+            println!(
+                "  {} (embedder)\t{}",
+                embedder.id,
+                format_bytes(embedder.byte_size)
+            );
+            println!(
+                "  {} (understanding)\t{}",
+                understanding.id,
+                format_bytes(understanding.byte_size)
+            );
+        }
+        return match catalog.prefetch_defaults() {
+            Ok(mut summary) => {
+                // prefetch_defaults seeds the understanding model from a staged copy but never
+                // downloads; the explicit fetch verb does the network download on a fresh machine.
+                if !catalog.understanding_model_cached() {
+                    match catalog.fetch_understanding_default() {
+                        Ok(_) => {
+                            summary
+                                .skipped
+                                .retain(|entry| entry.model_id != understanding.id);
+                            summary.fetched.push(cg_catalog::FetchedEntry {
+                                model_id: understanding.id.clone(),
+                                artifact_sha: String::new(),
+                            });
+                        }
+                        Err(err) => {
+                            if format == OutputFormat::Text {
+                                eprintln!("WARN understanding model fetch failed: {err:?}");
+                            }
+                        }
+                    }
+                }
+                if format == OutputFormat::Text {
+                    for fetched in &summary.fetched {
+                        println!("fetched\t{}\t{}", fetched.model_id, fetched.artifact_sha);
+                    }
+                    for skipped in &summary.skipped {
+                        println!("skipped\t{}\t{:?}", skipped.model_id, skipped.reason);
+                    }
+                } else {
+                    print_json(&json!({
+                        "fetched": summary.fetched.iter().map(|entry| json!({
+                            "id": entry.model_id, "sha": entry.artifact_sha,
+                        })).collect::<Vec<_>>(),
+                        "skipped": summary.skipped.iter().map(|entry| json!({
+                            "id": entry.model_id, "reason": format!("{:?}", entry.reason),
+                        })).collect::<Vec<_>>(),
+                        "disclosed": [
+                            json!({"id": embedder.id, "bytes": embedder.byte_size, "size": format_bytes(embedder.byte_size)}),
+                            json!({"id": understanding.id, "bytes": understanding.byte_size, "size": format_bytes(understanding.byte_size)}),
+                        ],
+                    }));
+                }
+                0
+            }
+            Err(err) => failure(1, "fetch_failed", "network", &format!("{err:?}")),
+        };
+    }
+
+    let Some(id) = target else {
+        return usage_error("expected `cg model fetch --defaults` or `cg model fetch <id>`");
+    };
+    let (disclosed_bytes, fetch_result) = if id == cg_catalog::UNDERSTANDING_DEFAULT_ID {
+        if format == OutputFormat::Text {
+            println!(
+                "fetching\t{}\t{}",
+                understanding.id,
+                format_bytes(understanding.byte_size)
+            );
+        }
+        (
+            understanding.byte_size,
+            catalog.fetch_understanding_default(),
+        )
+    } else {
+        let bytes = catalog.show(&id).map(|entry| entry.byte_size).unwrap_or(0);
+        if format == OutputFormat::Text {
+            println!("fetching\t{id}\t{}", format_bytes(bytes));
+        }
+        (
+            bytes,
+            catalog.fetch(None, &id, cg_catalog::OutputMode::Headless),
+        )
+    };
+    match fetch_result {
+        Ok(result) => {
+            if format == OutputFormat::Text {
+                println!("result\t{result:?}");
+            } else {
+                print_json(&json!({
+                    "id": id,
+                    "bytes": disclosed_bytes,
+                    "size": format_bytes(disclosed_bytes),
+                    "result": format!("{result:?}"),
+                }));
+            }
+            0
+        }
+        Err(err) => failure(1, "fetch_failed", "network", &format!("{err:?}")),
     }
 }
 
