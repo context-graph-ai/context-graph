@@ -241,60 +241,8 @@ pub fn mark_failed(
     }
 }
 
-/// Increment a digest's retrieval touch count (the drain-priority signal). Idempotent-safe under
-/// re-open: the count is persisted. Public so the injection/query path can bump a digest each time it
-/// is surfaced, promoting frequently-retrieved memory to the front of the understanding queue.
-pub fn bump_touch(store: &Store, digest_id: DigestId) -> Result<()> {
-    let db = store.internal_db();
-    let digest_text = digest_id.to_string();
-    let current = touch_count_for_digest(store, &digest_text)?;
-    let context_id = context_id_for_digest(store, &digest_text)?;
-    let tx = db.begin().map_err(map_engine)?;
-    let outcome = (|| -> Result<()> {
-        let updated = db
-            .execute_in_tx(
-                tx,
-                "UPDATE cg_retrieval_touches SET touch_count = $touch_count, last_touched_at = $last_touched_at WHERE digest_id = $digest_id",
-                &HashMap::from([
-                    (
-                        "touch_count".to_string(),
-                        DbValue::Int64((current + 1) as i64),
-                    ),
-                    ("last_touched_at".to_string(), DbValue::TxId(tx)),
-                    ("digest_id".to_string(), DbValue::Text(digest_text.clone())),
-                ]),
-            )
-            .map_err(map_engine)?;
-        if updated.rows_affected == 0 {
-            let Some(context_id) = context_id else {
-                // No digest/context to attribute the touch to; nothing to bump.
-                return Ok(());
-            };
-            db.execute_in_tx(
-                tx,
-                "INSERT INTO cg_retrieval_touches (digest_id, context_id, touch_count, last_touched_at) VALUES ($digest_id, $context_id, $touch_count, $last_touched_at)",
-                &HashMap::from([
-                    ("digest_id".to_string(), DbValue::Text(digest_text.clone())),
-                    (
-                        "context_id".to_string(),
-                        DbValue::Uuid(context_id.as_uuid()),
-                    ),
-                    ("touch_count".to_string(), DbValue::Int64(1)),
-                    ("last_touched_at".to_string(), DbValue::TxId(tx)),
-                ]),
-            )
-            .map_err(map_engine)?;
-        }
-        Ok(())
-    })();
-    match outcome {
-        Ok(()) => db.commit(tx).map_err(map_engine),
-        Err(err) => {
-            let _ = db.rollback(tx);
-            Err(err)
-        }
-    }
-}
+// Retrieval-touch bumping is owned by `tier0::bump_touch` (the injection/query path calls it); this
+// module reads touch counts for drain priority but does not write them.
 
 // --- internal read helpers --------------------------------------------------------------------
 
