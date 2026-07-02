@@ -1112,36 +1112,6 @@ fn teaching_event_from_row(values: &HashMap<String, contextdb_core::Value>) -> T
     }
 }
 
-/// Record a firing trace entry for a skill that just fired.
-pub fn record_firing(store: &Store, skill_id: &str, capture_id: &str) -> FiringTrace {
-    let id = uuid::Uuid::new_v4().to_string();
-    let db = store.sync_database();
-    let params = HashMap::from([
-        ("id".to_string(), contextdb_core::Value::Text(id.clone())),
-        (
-            "skill_id".to_string(),
-            contextdb_core::Value::Text(skill_id.to_string()),
-        ),
-        (
-            "capture_id".to_string(),
-            contextdb_core::Value::Text(capture_id.to_string()),
-        ),
-        ("correct".to_string(), contextdb_core::Value::Null),
-    ]);
-    let _ = execute_with_live_txid(
-        &db,
-        "INSERT INTO cg_skill_firing_trace (id, skill_id, capture_id, correct, created_at) VALUES ($id, $skill_id, $capture_id, $correct, $created_at)",
-        "created_at",
-        params,
-    );
-    FiringTrace {
-        id,
-        skill_id: skill_id.to_string(),
-        capture_id: capture_id.to_string(),
-        correct: None,
-    }
-}
-
 /// Record a ground-truth label for a firing (correct or incorrect).
 pub fn record_firing_label(store: &Store, firing_id: &str, correct: bool) -> bool {
     let db = store.sync_database();
@@ -1649,12 +1619,8 @@ pub fn list_drift_alerts(store: &Store) -> Vec<DriftAlert> {
             .filter(|t| t.skill_id == skill.id)
             .collect();
         let owned: Vec<FiringTrace> = skill_traces.into_iter().cloned().collect();
-        if traces_record_gone_bad(&owned) {
-            alerts.push(DriftAlert {
-                skill_id: skill.id.clone(),
-                provenance: skill.provenance.clone(),
-                active: true,
-            });
+        if let Some(alert) = check_drift(skill, &owned) {
+            alerts.push(alert);
         }
     }
     alerts
@@ -1713,12 +1679,8 @@ fn traces_record_gone_bad(traces: &[FiringTrace]) -> bool {
 
 // ─── Pure-logic functions (store-free) ────────────────────────────────────────
 
-/// Extract the predicted classification value from a rule string.
-///
-/// Rules derived by `derive_rule_from_labels` have the form
-/// `"when applicable → classify as {value}"`. This function extracts `{value}`
-/// so the rule can be applied to held-out events and its prediction compared to
-/// ground truth.
+/// Extract the predicted classification value from a rule string so a candidate
+/// can be scored against held-out teaching events.
 ///
 /// Returns `None` for rules whose format cannot be parsed (e.g. the fallback
 /// `"correction-derived rule"` string produced when no training corrections exist).
@@ -1726,7 +1688,6 @@ fn extract_rule_target(rule: &str) -> Option<String> {
     if let Some(effect) = parse_retype_effect(rule) {
         return Some(effect.to_type);
     }
-    // The canonical separator produced by `derive_rule_from_labels`.
     const MARKER: &str = "classify as ";
     let pos = rule.find(MARKER)?;
     let value = rule[pos + MARKER.len()..].trim();
@@ -1796,201 +1757,6 @@ pub fn evaluate_on_heldout(skill: &LearnedSkill, heldout: &[TeachingEvent]) -> H
 
     HeldOutResult {
         score: correct as f64 / heldout.len() as f64,
-    }
-}
-
-/// Derive a rule description from a set of aligned training labels.
-/// The rule is extracted from the majority correction content in the training set.
-fn derive_rule_from_labels(labels: &[TeachingEvent]) -> String {
-    // Find the most common content among Correction events.
-    let mut content_counts: HashMap<&str, usize> = HashMap::new();
-    for ev in labels {
-        if ev.kind == TeachingEventKind::Correction {
-            *content_counts.entry(ev.content.as_str()).or_default() += 1;
-        }
-    }
-    content_counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(content, _)| format!("when applicable → classify as {content}"))
-        .unwrap_or_else(|| "correction-derived rule".to_string())
-}
-
-/// Derive a description from aligned labels.
-fn derive_description_from_labels(labels: &[TeachingEvent]) -> String {
-    let mut content_counts: HashMap<&str, usize> = HashMap::new();
-    for ev in labels {
-        if ev.kind == TeachingEventKind::Correction {
-            *content_counts.entry(ev.content.as_str()).or_default() += 1;
-        }
-    }
-    content_counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(content, _)| format!("prefer {content} for matching decisions"))
-        .unwrap_or_else(|| "correction-derived skill".to_string())
-}
-
-/// The provenance of a skill promoted from teaching labels. Teaching events are human corrections,
-/// so a promoted skill carries human-correction provenance. (No machine-authored teaching source
-/// exists today; when one does, mixed-origin labels would resolve to a learned provenance here.)
-fn provenance_from_labels(_labels: &[TeachingEvent]) -> SkillProvenance {
-    SkillProvenance::HumanCorrection
-}
-
-/// Try to promote a skill from training and held-out label sets.
-///
-/// Returns `Some(LearnedSkill)` only when:
-/// - There is more than one training label (a single label never promotes).
-/// - The held-out precision STRICTLY EXCEEDS the promotion threshold (0.5).
-/// - There is no incumbent (this variant treats any passing score as a win).
-///
-/// The held-out score derives FROM the labels (precision of Correction events),
-/// not from a hardcoded constant unrelated to the data.
-pub fn try_promote_skill(
-    labels: &[TeachingEvent],
-    heldout: &[TeachingEvent],
-) -> Option<LearnedSkill> {
-    let result = try_promote_skill_with_result(labels, heldout, None);
-    if result.promoted { result.skill } else { None }
-}
-
-/// Promotion with explicit tie-detection against an incumbent score.
-///
-/// A candidate is promoted only when its held-out score STRICTLY BEATS (>) the
-/// incumbent. A tie (==) is not promoted; a single label never promotes.
-///
-/// The score is computed by `evaluate_on_heldout`, which applies the candidate
-/// rule to each held-out event and measures predictive accuracy — a function of
-/// BOTH the candidate rule and the held-out events, not a label-mix count alone.
-///
-/// The minimum promotion threshold when no incumbent exists is > 0.5: the rule
-/// must correctly predict a majority of held-out events. The incumbent score is the
-/// previously established score; the candidate must exceed it strictly (beats, not
-/// ties).
-pub fn try_promote_skill_with_result(
-    labels: &[TeachingEvent],
-    heldout: &[TeachingEvent],
-    incumbent_score: Option<f64>,
-) -> PromotionResult {
-    // A single label must never promote.
-    if labels.len() <= 1 {
-        return PromotionResult {
-            promoted: false,
-            skill: None,
-            heldout_score: 0.0,
-            heldout_gate_invocations: 0,
-        };
-    }
-
-    // Derive the candidate skill from the training labels first, so the rule is
-    // available for `evaluate_on_heldout` to apply against held-out events.
-    let description = derive_description_from_labels(labels);
-    let rule = derive_rule_from_labels(labels);
-    let provenance = provenance_from_labels(labels);
-
-    let candidate = LearnedSkill {
-        id: uuid::Uuid::new_v4().to_string(),
-        description,
-        rule,
-        provenance,
-        active: true,
-        held_for_review: false,
-        fire_right: 0,
-        fire_wrong: 0,
-    };
-
-    // Score the candidate by applying its rule to the held-out events.
-    // The result is a predictive-accuracy score (correct_predictions / |heldout|),
-    // not a label-mix fraction — so an overfit rule that memorises training content
-    // but fails on unseen events scores LOWER than a general rule that captures the
-    // real pattern.
-    let candidate_score = evaluate_on_heldout(&candidate, heldout).score;
-    // This path evaluated the held-out gate exactly once to reach its verdict.
-    let heldout_gate_invocations = 1;
-
-    // The minimum promotion threshold when no incumbent exists.
-    // Derives from the data: the rule must correctly predict more than half of
-    // held-out events.
-    let baseline = incumbent_score.unwrap_or(0.5);
-
-    // Promotion requires STRICTLY BEATING the baseline (> not >=).
-    let promoted = candidate_score > baseline;
-
-    if !promoted {
-        return PromotionResult {
-            promoted: false,
-            skill: None,
-            heldout_score: candidate_score,
-            heldout_gate_invocations,
-        };
-    }
-
-    PromotionResult {
-        promoted: true,
-        skill: Some(candidate),
-        heldout_score: candidate_score,
-        heldout_gate_invocations,
-    }
-}
-
-/// Promote a candidate while counting held-out gate invocations, so a caller can prove the verdict
-/// came from the HELD-OUT slice (the gate ran) rather than training fit. The held-out gate is the
-/// generalization discriminator: an overfit rule that fits its training labels but fails a disjoint
-/// held-out slice must NOT promote, while a general rule that holds on the held-out slice must.
-///
-/// `heldout_gate_invocations` counts how many times the held-out gate was actually evaluated to reach
-/// the verdict — non-zero on every learned promotion attempt that had a candidate to score, so a
-/// caller can distinguish a generalization measurement from a training-fit shortcut.
-///
-/// The candidate rule is derived from the training labels, then scored by applying it to the held-out
-/// events (`evaluate_on_heldout`) — predictive accuracy on UNSEEN events, not training fit. A general
-/// rule whose target matches the held-out ground truth scores high and promotes (beats, not ties, the
-/// `> 0.5` baseline); an overfit rule that memorises the training content but predicts the wrong value
-/// on the held-out slice scores low and is rejected. A single training label never promotes.
-pub fn try_promote_skill_with_gate_counter(
-    training: &[TeachingEvent],
-    heldout: &[TeachingEvent],
-) -> PromotionResult {
-    // A single label is never enough to generalize from: no candidate, no gate run.
-    if training.len() <= 1 {
-        return PromotionResult {
-            promoted: false,
-            skill: None,
-            heldout_score: 0.0,
-            heldout_gate_invocations: 0,
-        };
-    }
-
-    // Derive the candidate from the training labels so its rule is available to score against the
-    // disjoint held-out slice.
-    let candidate = LearnedSkill {
-        id: uuid::Uuid::new_v4().to_string(),
-        description: derive_description_from_labels(training),
-        rule: derive_rule_from_labels(training),
-        provenance: provenance_from_labels(training),
-        active: true,
-        held_for_review: false,
-        fire_right: 0,
-        fire_wrong: 0,
-    };
-
-    // Run the REAL held-out gate: apply the derived rule to each held-out event and measure
-    // predictive accuracy. This is the generalization discriminator — it touches the held-out slice,
-    // so the invocation count moves off zero.
-    let candidate_score = evaluate_on_heldout(&candidate, heldout).score;
-    let heldout_gate_invocations = 1;
-
-    // Promotion requires STRICTLY BEATING the no-incumbent baseline (> 0.5): the rule must correctly
-    // predict a majority of held-out events. An overfit rule scores at or below this and is rejected.
-    let baseline = 0.5;
-    let promoted = candidate_score > baseline;
-
-    PromotionResult {
-        promoted,
-        skill: if promoted { Some(candidate) } else { None },
-        heldout_score: candidate_score,
-        heldout_gate_invocations,
     }
 }
 

@@ -836,7 +836,8 @@ fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
         GROUPING_CONTENT,
     );
 
-    // Seed a skill card + drift alert via the learned-skills table (drift reads firing record).
+    // Seed a skill card plus a drifting skill. Drift must come from a real firing-trace row, not
+    // the legacy aggregate counters on the skill row.
     let db = store.sync_database();
     db.execute(
         "INSERT INTO cg_learned_skills (id, description, rule, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
@@ -848,7 +849,7 @@ fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
             ("active".to_string(), contextdb_core::Value::Bool(true)),
             ("held_for_review".to_string(), contextdb_core::Value::Bool(false)),
             ("fire_right".to_string(), contextdb_core::Value::Int64(0)),
-            ("fire_wrong".to_string(), contextdb_core::Value::Int64(5)),
+            ("fire_wrong".to_string(), contextdb_core::Value::Int64(0)),
             ("created_at".to_string(), contextdb_core::Value::TxId(context_graph::TxId(1))),
         ]),
     ).ok();
@@ -862,7 +863,26 @@ fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
             ("active".to_string(), contextdb_core::Value::Bool(true)),
             ("held_for_review".to_string(), contextdb_core::Value::Bool(false)),
             ("fire_right".to_string(), contextdb_core::Value::Int64(0)),
-            ("fire_wrong".to_string(), contextdb_core::Value::Int64(9)),
+            ("fire_wrong".to_string(), contextdb_core::Value::Int64(0)),
+            ("created_at".to_string(), contextdb_core::Value::TxId(context_graph::TxId(1))),
+        ]),
+    ).ok();
+    db.execute(
+        "INSERT INTO cg_skill_firing_trace (id, skill_id, capture_id, correct, created_at) VALUES ($id, $skill_id, $capture_id, $correct, $created_at)",
+        &std::collections::HashMap::from([
+            (
+                "id".to_string(),
+                contextdb_core::Value::Text("trace-driftalert-marker-wobblethorn".to_string()),
+            ),
+            (
+                "skill_id".to_string(),
+                contextdb_core::Value::Text(DRIFT_CONTENT.to_string()),
+            ),
+            (
+                "capture_id".to_string(),
+                contextdb_core::Value::Text("capture-driftalert-marker-wobblethorn".to_string()),
+            ),
+            ("correct".to_string(), contextdb_core::Value::Int64(0)),
             ("created_at".to_string(), contextdb_core::Value::TxId(context_graph::TxId(1))),
         ]),
     ).ok();

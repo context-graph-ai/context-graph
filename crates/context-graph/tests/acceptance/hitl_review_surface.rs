@@ -5,15 +5,13 @@
 //   - capture_receipt_leads_with_intention: placeholder prefixes "Decisions:"
 //   - six_verbs_are_the_whole_action_surface: placeholder accepts unknown verbs
 //
-// Store-state tests: cursor persistence, pending-item persistence, sync-policy.
+// Store-state tests: local-only cursor behavior, pending-item persistence, sync-policy.
 //   - review_cursor_is_local_only_bare_review_advances_it: placeholder always advances
 //   - pending_item_persists_in_every_window_until_acted_on: placeholder returns empty
 //   - pending_item_persists_through_an_intervening_confident_capture: placeholder clears on advance
 //   - review_cursor_is_not_synced: placeholder policy is Both
 //   - cg_review_surfaces_three_single_edge_categories_currency_flips_structurally_empty: placeholder omits category
 //   - cg_review_summary_reports_true_per_category_counts: placeholder reports capped length
-
-use std::collections::HashMap;
 
 use context_graph::capture_sync_status::context_graph_sync_table_contract;
 use context_graph::ingest::{CaptureRequest, record_conversation_with_extractor};
@@ -23,8 +21,7 @@ use context_graph::review_surface::{
     is_cursor_local, maybe_advance_cursor,
 };
 use context_graph::skill_store::REVIEW_CURSOR_TABLE;
-use context_graph::{ContextGraphSyncTablePolicy, Store, StoreConfig, TxId};
-use contextdb_core::Value as DbValue;
+use context_graph::{ContextGraphSyncTablePolicy, Store, StoreConfig};
 use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
 
 use super::fake_extractor::open_store_with_lexical_embedder;
@@ -48,20 +45,6 @@ fn find_policy(
         .iter()
         .find(|p| p.table == table)
         .map(|p| (p.direction, p.conflict_policy))
-}
-
-fn insert_cursor_row(store: &Store, id: &str, position: i64) {
-    let db = store.sync_database();
-    db.execute(
-        "INSERT INTO cg_review_cursor (id, position, is_local, updated_at) VALUES ($id, $position, $is_local, $updated_at)",
-        &HashMap::from([
-            ("id".to_string(), DbValue::Text(id.to_string())),
-            ("position".to_string(), DbValue::Int64(position)),
-            ("is_local".to_string(), DbValue::Bool(true)),
-            ("updated_at".to_string(), DbValue::TxId(TxId(1))),
-        ]),
-    )
-    .expect("insert cursor row");
 }
 
 fn make_review_item(id: &str, category: ReviewCategory) -> ReviewItem {
@@ -207,32 +190,28 @@ fn cg_review_summary_reports_true_per_category_counts() {
 #[test]
 fn review_cursor_is_local_only_bare_review_advances_it() {
     let (_dir, store) = fresh_store("k_cursor_local");
-    insert_cursor_row(&store, "cursor-local-001", 0);
 
     let mut cursor = ReviewCursor {
         position: 0,
-        is_local: false, // placeholder default value
+        is_local: false,
     };
 
-    // is_cursor_local must return true. Placeholder returns false.
     assert!(
         is_cursor_local(&cursor),
-        "is_cursor_local must return true; wrong stub returns false"
+        "the review cursor must be local-only regardless of stored field defaults"
     );
 
-    // A filtered lens call must NOT advance the cursor. Placeholder always advances.
     let position_before = cursor.position;
     maybe_advance_cursor(&store, &mut cursor, false);
     assert_eq!(
         cursor.position, position_before,
-        "a filtered lens call (is_bare_review=false) must not advance the cursor; wrong stub always advances"
+        "a filtered lens call (is_bare_review=false) must not advance the local cursor"
     );
 
-    // A bare review call MUST advance the cursor.
     maybe_advance_cursor(&store, &mut cursor, true);
     assert!(
         cursor.position > position_before,
-        "a bare review call (is_bare_review=true) must advance the cursor"
+        "a bare review call (is_bare_review=true) must advance the in-memory cursor"
     );
 }
 

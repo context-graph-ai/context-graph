@@ -1573,10 +1573,9 @@ fn review_message_json(msg: &context_graph::review_surface::ReviewMessage) -> Va
     json!({ "kind": format!("{:?}", msg.kind), "content": msg.content })
 }
 
-/// Drift alerts to surface in review, deduped by skill id: the trace-based alerts from the library
-/// (per-firing-identity right/wrong record) plus skills whose persisted aggregate right/wrong record
-/// on the row has turned bad (more wrong fires than right). A drift alert only informs — nothing is
-/// auto-disabled. Each entry is `(skill_id, provenance)`; the skill id names the bad skill.
+/// Drift alerts to surface in review, deduped by skill id. The verdict comes from persisted
+/// per-firing trace rows; the legacy aggregate counters on skill rows are not treated as evidence.
+/// A drift alert only informs — nothing is auto-disabled.
 fn drift_alerts_from_record(store: &Store) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -1585,19 +1584,6 @@ fn drift_alerts_from_record(store: &Store) -> Vec<(String, String)> {
             out.push((
                 alert.skill_id.clone(),
                 skill_provenance_label(&alert.provenance).to_string(),
-            ));
-        }
-    }
-    for skill in context_graph::skill_store::list_skills_in_store(store) {
-        // The persisted aggregate record (fire_right / fire_wrong) is the per-skill right/wrong
-        // record; a record gone bad (more wrong than right, at least one wrong) raises one alert.
-        if skill.fire_wrong > 0
-            && skill.fire_wrong > skill.fire_right
-            && seen.insert(skill.id.clone())
-        {
-            out.push((
-                skill.id.clone(),
-                skill_provenance_label(&skill.provenance).to_string(),
             ));
         }
     }
@@ -1634,11 +1620,9 @@ fn render_skill_cards(skills: &[context_graph::skill_store::LearnedSkill]) -> St
         .iter()
         .map(|s| {
             format!(
-                "skill {} [{}] right={} wrong={}: {}",
+                "skill {} [{}]: {}",
                 s.id,
                 skill_provenance_label(&s.provenance),
-                s.fire_right,
-                s.fire_wrong,
                 s.description
             )
         })
