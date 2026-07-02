@@ -8,7 +8,7 @@ use crate::ingest::{
     ResolvedItemKind, capture_structured_harvest, extraction_prior_decisions,
     narrow_prior_decisions,
 };
-use crate::{CreateContext, DecisionId, EntityType, Result, Store};
+use crate::{CreateContext, DecisionId, DigestId, EntityType, Result, Store};
 use serde_json::{Value, json};
 
 /// Default bound on the prior-decision candidate set fed to the identity judge when the
@@ -692,6 +692,21 @@ pub fn run_capture(
     extractor: &dyn ConversationExtractor,
     config: &CaptureHarnessConfig,
 ) -> Result<(CaptureReport, CaptureHarnessReport)> {
+    run_capture_into_digest(store, request, extractor, config, None)
+}
+
+/// Run the same terminal capture path as [`run_capture`], but anchor the structured graph onto an
+/// existing digest (`reuse_digest`) instead of minting a new one. The understanding-queue drainer
+/// passes the id of the tier-0 digest it is understanding, so a chunk yields exactly ONE digest
+/// that transitions verbatim -> structured (no duplicate digest, no retrieval double-count). With
+/// `None` this is identical to [`run_capture`].
+pub fn run_capture_into_digest(
+    store: &Store,
+    request: CaptureRequest,
+    extractor: &dyn ConversationExtractor,
+    config: &CaptureHarnessConfig,
+    reuse_digest: Option<DigestId>,
+) -> Result<(CaptureReport, CaptureHarnessReport)> {
     // Resolve (or create) the capture context first. Every row lands under this context;
     // the context_id always comes from here, never from a model-emitted seed field.
     let context = resolve_capture_context(store, &request.context_label)?;
@@ -880,6 +895,7 @@ pub fn run_capture(
         &request.transcript,
         harvest,
         &skill_application.firing_records,
+        reuse_digest,
     )?;
     outcome.report.model_usage = extractor.drain_model_usage();
     outcome.report.flagged_items = flagged_items;
