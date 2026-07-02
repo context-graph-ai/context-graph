@@ -1,0 +1,13 @@
+name: pure_tool_noise
+description: A chunk that is entirely tool invocations, test output, and file reads — no human intent, decision, or reasoning. Faithful extraction is EMPTY. This is the laziest-valid-completion trap in reverse: the model must resist inventing structure from mechanical noise. Empty output is the ONLY correct answer.
+allow_empty: true
+decisions:
+  must_not_contain:
+    - "digest"
+    - "test"
+    - "embed"
+observations:
+  must_not_contain:
+    - "cargo"
+    - "git status"
+notes: "Score 1.0 iff intentions, decisions, observations, AND entities are all empty. Any extracted item is a hallucination-from-noise failure. A model that emits 'the developer decided to run tests' fails this fixture."

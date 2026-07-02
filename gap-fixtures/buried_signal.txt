@@ -1,0 +1,12 @@
+Assistant: [tool_use: Bash] ls -la crates/ && cat Cargo.toml
+[tool_result] total 48
+drwxr-xr-x 7 lucid lucid 4096 crates
+-rw-r--r-- 1 lucid lucid 1203 Cargo.toml
+[workspace]
+members = ["crates/context-graph", "crates/cg-cli"]
+Assistant: [tool_use: Read] crates/context-graph/src/llm.rs
+[tool_result] (340 lines elided)
+User: while that runs — I've been thinking about the timeout. The reason we're bumping HOSTED_TIMEOUT from 10s to 45s isn't just slowness, it's that the real capture prompt with the full schema block is genuinely large and a cold model on the provider side can take 30s+ to first token. If we keep it at 10s we get silent-empty captures on exactly the big imports that matter most. So 45s is the floor, not a guess.
+Assistant: Right — I'll set HOSTED_TIMEOUT to 45s and add a comment explaining it's the cold-start-plus-large-prompt floor, not an arbitrary bump.
+[tool_result] Compiling...
+Assistant: [tool_use: Bash] cargo build --release

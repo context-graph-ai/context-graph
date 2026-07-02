@@ -1,0 +1,19 @@
+[package]
+name = "cg-local-llm"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process, CPU-only, grammar-constrained local understanding engine (llama.cpp GGUF)"
+edition = "2024"
+
+[dependencies]
+# CPU-only: default features (which include `openmp`/android stdcxx) are disabled; only `common`
+# is enabled, which is what carries `json_schema_to_grammar` (schema -> GBNF) and the grammar
+# sampler accept path. No `cuda`/`vulkan`/`metal`/`rocm` feature -> no GPU backend is built.
+llama-cpp-2 = { version = "0.1.150", default-features = false, features = ["common"] }
+encoding_rs = "0.8.35"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

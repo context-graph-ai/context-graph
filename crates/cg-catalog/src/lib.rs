@@ -72,6 +72,55 @@ const PRODUCTION_GEMMA_CONFIG_JSON_SHA: &str =
 const PRODUCTION_GEMMA_REVISION_SHA: &str =
     "240bf6458e37b64ab66077a6e6900fdb4089c848f8372fa64b8dc490d4ef81e3";
 
+// The bundled local understanding model: a single-file quantized GGUF run in-process by
+// `cg-local-llm`. It is a catalog artifact exactly like the embedders (local, no network at
+// runtime), but a single GGUF file rather than the four-file safetensors layout — so it carries
+// its own single-file cache-seed/fetch path below rather than threading through the embedder
+// `ModelSpec`/`ARTIFACT_FILES` machinery.
+/// Catalog id for the bundled local understanding model.
+pub const UNDERSTANDING_DEFAULT_ID: &str = "gemma4-e2b-it-q4";
+const UNDERSTANDING_REPO: &str = "unsloth/gemma-4-E2B-it-GGUF";
+const UNDERSTANDING_FILE: &str = "gemma-4-E2B-it-Q4_K_M.gguf";
+const UNDERSTANDING_REVISION: &str = "main";
+const UNDERSTANDING_BYTES: u64 = 3_106_736_256;
+/// Pinned sha256 of the production GGUF, computed from the fetched copy and verified to load and
+/// run in-process (a grammar-constrained extraction) before it was trusted.
+const UNDERSTANDING_SHA: &str = "9378bc471710229ef165709b62e34bfb62231420ddaf6d729e727305b5b8672d";
+const UNDERSTANDING_LICENSE_SPDX: &str = "Gemma";
+const UNDERSTANDING_LICENSE_URL: &str = "https://ai.google.dev/gemma/terms";
+
+/// The size-disclosure line for the bundled understanding model, so `cg model fetch` can show the
+/// ~3.1GB alongside the embedder's ~548MB before anything downloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelDisclosure {
+    pub id: String,
+    pub file: String,
+    pub repo: String,
+    pub byte_size: u64,
+}
+
+/// Disclosure for the bundled local understanding model.
+#[must_use]
+pub fn understanding_default_disclosure() -> ModelDisclosure {
+    ModelDisclosure {
+        id: UNDERSTANDING_DEFAULT_ID.to_string(),
+        file: UNDERSTANDING_FILE.to_string(),
+        repo: UNDERSTANDING_REPO.to_string(),
+        byte_size: UNDERSTANDING_BYTES,
+    }
+}
+
+/// Disclosure for the default embedder (nomic), for the same fetch listing.
+#[must_use]
+pub fn embedder_default_disclosure() -> ModelDisclosure {
+    ModelDisclosure {
+        id: NOMIC_ID.to_string(),
+        file: "model.safetensors".to_string(),
+        repo: NOMIC_REPO.to_string(),
+        byte_size: NOMIC_BYTES,
+    }
+}
+
 const ARTIFACT_FILES: [&str; 4] = [
     "model.safetensors",
     "tokenizer.json",
@@ -701,11 +750,203 @@ impl Catalog {
             ) => {}
             Err(err) => return Err(err),
         }
+        // The understanding model is large (~3.1GB). `prefetch_defaults` seeds it from an
+        // already-downloaded staged copy (or reports it already cached) but never triggers the
+        // network download itself — that is the explicit `cg model fetch` path, so library and
+        // test callers of `prefetch_defaults` never block on a multi-gigabyte fetch.
+        match self.seed_understanding_if_cached_or_staged() {
+            Ok(true) => {
+                summary.fetched.push(FetchedEntry {
+                    model_id: UNDERSTANDING_DEFAULT_ID.to_string(),
+                    artifact_sha: UNDERSTANDING_SHA.to_string(),
+                });
+            }
+            Ok(false) | Err(_) => {
+                summary.skipped.push(SkippedEntry {
+                    model_id: UNDERSTANDING_DEFAULT_ID.to_string(),
+                    reason: SkipReason::NetworkUnavailable,
+                });
+            }
+        }
         summary.skipped.push(SkippedEntry {
             model_id: GEMMA_ID.to_string(),
             reason: SkipReason::ManualAcceptanceRequired,
         });
         Ok(summary)
+    }
+
+    /// Whether the bundled understanding model is already cached and its single GGUF artifact
+    /// matches the pinned sha (a corrupt/partial copy is not "cached").
+    #[must_use]
+    pub fn understanding_model_cached(&self) -> bool {
+        let artifact = self
+            .model_dir(UNDERSTANDING_DEFAULT_ID)
+            .join(UNDERSTANDING_FILE);
+        self.manifest_path(UNDERSTANDING_DEFAULT_ID).is_file()
+            && artifact.is_file()
+            && sha256_file(&artifact)
+                .map(|sha| sha == UNDERSTANDING_SHA)
+                .unwrap_or(false)
+    }
+
+    /// Seed the understanding model only if it is already cached or a staged copy exists — never
+    /// downloading. Returns whether the model is now cached. Used by `prefetch_defaults` so it
+    /// never blocks on the multi-gigabyte network fetch.
+    fn seed_understanding_if_cached_or_staged(&self) -> Result<bool> {
+        if self.understanding_model_cached() {
+            return Ok(true);
+        }
+        if let Some(staged) = self.staged_understanding_artifact()
+            && staged.is_file()
+        {
+            self.seed_understanding_model_from_path(&staged)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Fetch the bundled understanding model into the catalog cache. Order of preference:
+    /// (1) already cached with the right sha — nothing to do; (2) a staged copy next to the cache
+    /// root (`../staging/<file>`) — seed from it with no download; (3) download the single GGUF
+    /// from Hugging Face. In every case the sha is verified against the pin before publish.
+    pub fn fetch_understanding_default(&self) -> Result<FetchResult> {
+        if self.understanding_model_cached() {
+            return Ok(FetchResult::AlreadyCached);
+        }
+        if let Some(staged) = self.staged_understanding_artifact()
+            && staged.is_file()
+        {
+            return self.seed_understanding_model_from_path(&staged);
+        }
+        self.download_understanding_default()
+    }
+
+    /// The staged copy location checked before downloading: `<cache-root>/../staging/<file>`
+    /// (i.e. `~/.cache/cg/staging/<file>` when the cache root is `~/.cache/cg/models`).
+    fn staged_understanding_artifact(&self) -> Option<PathBuf> {
+        self.root()
+            .parent()
+            .map(|parent| parent.join("staging").join(UNDERSTANDING_FILE))
+    }
+
+    /// Seed the understanding model into the cache from an already-downloaded single-file GGUF,
+    /// verifying the pinned sha and writing the single-file manifest that `show`/`declared_local_model`
+    /// read. This is what lets the owner's machine and tests avoid re-downloading ~3.1GB.
+    pub fn seed_understanding_model_from_path(&self, source_file: &Path) -> Result<FetchResult> {
+        let sha = sha256_file(source_file)?;
+        if sha != UNDERSTANDING_SHA {
+            return Err(CgCatalogError::ArtifactShaMismatch {
+                expected: UNDERSTANDING_SHA.to_string(),
+                actual: sha,
+            });
+        }
+        let lock = self.lock_model(UNDERSTANDING_DEFAULT_ID)?;
+        let model_dir = self.model_dir(UNDERSTANDING_DEFAULT_ID);
+        fs::create_dir_all(&model_dir).map_err(|err| io_error(&model_dir, err))?;
+        let dest = model_dir.join(UNDERSTANDING_FILE);
+        let already_in_place = matches!(
+            (fs::canonicalize(source_file), fs::canonicalize(&dest)),
+            (Ok(ref a), Ok(ref b)) if a == b
+        );
+        if !already_in_place {
+            fs::copy(source_file, &dest).map_err(|err| io_error(source_file, err))?;
+        }
+        self.write_understanding_manifest(&model_dir)?;
+        drop(lock);
+        Ok(FetchResult::Completed)
+    }
+
+    /// Download the single-file GGUF from Hugging Face into a temp file, verify the pinned sha,
+    /// then publish it into the cache with the single-file manifest.
+    fn download_understanding_default(&self) -> Result<FetchResult> {
+        let lock = self.lock_model(UNDERSTANDING_DEFAULT_ID)?;
+        let model_dir = self.model_dir(UNDERSTANDING_DEFAULT_ID);
+        fs::create_dir_all(&model_dir).map_err(|err| io_error(&model_dir, err))?;
+        let dest = model_dir.join(UNDERSTANDING_FILE);
+        let url = format!(
+            "https://huggingface.co/{UNDERSTANDING_REPO}/resolve/{UNDERSTANDING_REVISION}/{UNDERSTANDING_FILE}"
+        );
+        let tmp = self.temp_publish_dir(UNDERSTANDING_DEFAULT_ID);
+        clean_dir(&tmp)?;
+        fs::create_dir_all(&tmp).map_err(|err| io_error(&tmp, err))?;
+        let tmp_file = tmp.join(UNDERSTANDING_FILE);
+        download_to_file(&url, &tmp_file, UNDERSTANDING_DEFAULT_ID)?;
+        let sha = sha256_file(&tmp_file)?;
+        if sha != UNDERSTANDING_SHA {
+            clean_dir(&tmp)?;
+            return Err(CgCatalogError::ArtifactShaMismatch {
+                expected: UNDERSTANDING_SHA.to_string(),
+                actual: sha,
+            });
+        }
+        fs::rename(&tmp_file, &dest)
+            .or_else(|_| fs::copy(&tmp_file, &dest).map(|_| ()))
+            .map_err(|err| io_error(&dest, err))?;
+        clean_dir(&tmp)?;
+        self.write_understanding_manifest(&model_dir)?;
+        drop(lock);
+        Ok(FetchResult::Completed)
+    }
+
+    /// Write the single-file GGUF manifest: a `LocalPath` source so the runtime treats it as a
+    /// local artifact, `cache_status = cached`, one artifact filename and one sha — exactly the
+    /// shape `declared_local_model` requires.
+    fn write_understanding_manifest(&self, model_dir: &Path) -> Result<()> {
+        let mut table = toml::Table::new();
+        table.insert(
+            "model_id".to_string(),
+            toml::Value::String(UNDERSTANDING_DEFAULT_ID.to_string()),
+        );
+        table.insert(
+            "kind".to_string(),
+            toml::Value::String("LlmClient".to_string()),
+        );
+        table.insert(
+            "input_modality".to_string(),
+            toml::Value::String("text".to_string()),
+        );
+        table.insert(
+            "license_spdx".to_string(),
+            toml::Value::String(UNDERSTANDING_LICENSE_SPDX.to_string()),
+        );
+        table.insert(
+            "license_url".to_string(),
+            toml::Value::String(UNDERSTANDING_LICENSE_URL.to_string()),
+        );
+        table.insert(
+            "source_kind".to_string(),
+            toml::Value::String("LocalPath".to_string()),
+        );
+        table.insert(
+            "source_dir".to_string(),
+            toml::Value::String(model_dir.display().to_string()),
+        );
+        table.insert(
+            "byte_size".to_string(),
+            toml::Value::Integer(UNDERSTANDING_BYTES as i64),
+        );
+        table.insert(
+            "cache_status".to_string(),
+            toml::Value::String("cached".to_string()),
+        );
+        table.insert(
+            "manual_install_url".to_string(),
+            toml::Value::String(format!("https://huggingface.co/{UNDERSTANDING_REPO}")),
+        );
+        table.insert(
+            "artifact_filenames".to_string(),
+            toml::Value::Array(vec![toml::Value::String(UNDERSTANDING_FILE.to_string())]),
+        );
+        let mut sha_table = toml::Table::new();
+        sha_table.insert(
+            UNDERSTANDING_FILE.to_string(),
+            toml::Value::String(UNDERSTANDING_SHA.to_string()),
+        );
+        table.insert("per_file_sha256".to_string(), toml::Value::Table(sha_table));
+        write_toml_value(
+            &self.manifest_path(UNDERSTANDING_DEFAULT_ID),
+            &toml::Value::Table(table),
+        )
     }
 
     pub fn update_check(&self, store: &Store) -> Result<Vec<UpdateCheckObservation>> {
@@ -3183,6 +3424,28 @@ fn sha256_file(path: &Path) -> Result<String> {
 
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Stream a single file from `url` to `dest`, following Hugging Face's CDN redirect. Used for the
+/// large single-file GGUF download; the caller verifies the sha before publishing.
+fn download_to_file(url: &str, dest: &Path, model_id: &str) -> Result<()> {
+    let mut response = ureq::get(url)
+        .call()
+        .map_err(|err| CgCatalogError::SourceUnavailable {
+            model_id: model_id.to_string(),
+            message: err.to_string(),
+        })?;
+    let mut reader = response
+        .body_mut()
+        .with_config()
+        .limit(UNDERSTANDING_BYTES + 1_048_576)
+        .reader();
+    let mut file = File::create(dest).map_err(|err| io_error(dest, err))?;
+    io::copy(&mut reader, &mut file).map_err(|err| CgCatalogError::SourceUnavailable {
+        model_id: model_id.to_string(),
+        message: err.to_string(),
+    })?;
+    Ok(())
 }
 
 fn shas_from_artifact_dir(dir: &Path) -> Result<Vec<(String, String)>> {

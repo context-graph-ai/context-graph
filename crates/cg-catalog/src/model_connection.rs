@@ -1,15 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use candle_core::{Device, Tensor};
 use cg_cli_conventions::{CheckRegistrar, DiagnosticCheck, Finding};
+use cg_local_llm::LocalUnderstandingEngine;
 use context_graph::{
     AuthorizedModelInvocationParts, CanonicalJsonSchema, CgError, ContextId, DeploymentSurface,
     EnforcementLevel, FailureBucket, LlmClient, ModelCallOutcome, ModelCallReceipt,
@@ -5447,9 +5448,17 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
             }
         }
 
-        let runtime_request = request
-            .clone()
-            .with_output_contract(OutputContract::Unconstrained);
+        // Hosted transports re-derive structured output from the provider config, so the contract
+        // is stripped from the message input. A local (cache-path) model has no provider config —
+        // the in-process GGUF path reads the schema off the request itself to build its grammar —
+        // so the contract is retained for it.
+        let runtime_request = if cache_path.is_some() {
+            request.clone()
+        } else {
+            request
+                .clone()
+                .with_output_contract(OutputContract::Unconstrained)
+        };
         Ok(PreparedUnderstanding::Invoke {
             model_id,
             // SAFETY: this path has either passed the named-connection consent
@@ -5570,6 +5579,15 @@ fn understand_local_single_file(
         ));
     }
     let artifact_path = &invocation.local_artifacts[0];
+    // A single-file GGUF is the bundled understanding model: run it in-process through
+    // `cg-local-llm` (grammar-constrained, CPU-only), not the candle safetensors proof path.
+    if artifact_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+    {
+        return understand_local_gguf(invocation, artifact_path);
+    }
     let proof = local_candle_artifact_proof(artifact_path)?;
     let artifact = artifact_path
         .file_name()
@@ -5585,6 +5603,88 @@ fn understand_local_single_file(
         malformed: false,
         usage: None,
     })
+}
+
+/// Explicit context window for the in-process understanding model — never a silent default (an
+/// unset window truncates). Sized well above a normal capture chunk; a prompt that overruns it
+/// fails loudly (`ContextTooSmall`) rather than being silently cut.
+const LOCAL_UNDERSTANDING_N_CTX: u32 = 8192;
+/// Generation budget for one in-process understanding call.
+const LOCAL_UNDERSTANDING_MAX_TOKENS: u32 = 2048;
+
+/// Process-global cache of loaded in-process engines, keyed by GGUF artifact path, so a 3.1GB
+/// model is loaded once per process rather than per capture chunk.
+static LOCAL_GGUF_ENGINES: OnceLock<Mutex<HashMap<PathBuf, Arc<cg_local_llm::LlamaCppEngine>>>> =
+    OnceLock::new();
+
+fn local_gguf_engine(path: &Path) -> context_graph::Result<Arc<cg_local_llm::LlamaCppEngine>> {
+    let cache = LOCAL_GGUF_ENGINES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| CgError::Engine("local understanding engine cache poisoned".to_string()))?;
+    if let Some(engine) = guard.get(path) {
+        return Ok(engine.clone());
+    }
+    let engine = Arc::new(
+        cg_local_llm::LlamaCppEngine::load_from_gguf(path).map_err(|err| {
+            CgError::Engine(format!("local understanding model load failed: {err}"))
+        })?,
+    );
+    guard.insert(path.to_path_buf(), engine.clone());
+    Ok(engine)
+}
+
+/// Run one understanding call in-process against the bundled GGUF model. The instruction+schema
+/// prompt is the harness-rendered text (`input_without_output_contract`); the output contract's
+/// JSON schema becomes the grammar so off-shape replies are structurally impossible. Temperature 0
+/// and an explicit context window are the local-runtime recipe; the achieved level (Native when a
+/// grammar was genuinely attached, Floor when it degraded) and the outcome come straight from the
+/// engine's observed reply and are mapped onto the shipped receipt.
+fn understand_local_gguf(
+    invocation: &ModelInvocation,
+    artifact_path: &Path,
+) -> context_graph::Result<context_graph::ModelReply> {
+    let engine = local_gguf_engine(artifact_path)?;
+    let contract = match invocation.request.output_contract() {
+        OutputContract::Schema(schema) => cg_local_llm::LocalOutputContract::Schema(schema),
+        OutputContract::Unconstrained => cg_local_llm::LocalOutputContract::Unconstrained,
+    };
+    let prompt = invocation.request.input_without_output_contract();
+    let params = cg_local_llm::GenerationParams::new(LOCAL_UNDERSTANDING_N_CTX)
+        .with_max_tokens(LOCAL_UNDERSTANDING_MAX_TOKENS)
+        .with_temperature(0.0);
+    let reply = engine
+        .understand(prompt, &contract, &params)
+        .map_err(|err| CgError::Engine(format!("local understanding failed: {err}")))?;
+
+    let level = match reply.receipt.level {
+        cg_local_llm::LocalEnforcementLevel::Native => EnforcementLevel::Native,
+        cg_local_llm::LocalEnforcementLevel::Floor => EnforcementLevel::Floor,
+    };
+    // Empty (refusal-shaped) content is surfaced as a Refusal so the caller does not treat an
+    // empty reply as a captured harvest; truncation and capture map straight across.
+    let outcome = match reply.receipt.outcome {
+        cg_local_llm::LocalOutcome::Captured => ModelCallOutcome::Captured,
+        cg_local_llm::LocalOutcome::Truncation => ModelCallOutcome::Truncation,
+        cg_local_llm::LocalOutcome::Empty => ModelCallOutcome::Refusal,
+    };
+    let phrasing = if outcome == ModelCallOutcome::Refusal {
+        String::new()
+    } else {
+        reply.text
+    };
+    Ok(context_graph::ModelReply {
+        marker: understanding_marker(&invocation.request),
+        phrasing,
+        advisory_flag: level == EnforcementLevel::Floor,
+        malformed: false,
+        usage: None,
+    }
+    .with_model_receipt(ModelCallReceipt {
+        reliability_level: level,
+        outcome,
+        structured_output_rejected: false,
+    }))
 }
 
 fn local_candle_artifact_proof(path: &Path) -> context_graph::Result<String> {
