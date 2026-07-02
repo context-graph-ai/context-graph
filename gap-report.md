@@ -14,6 +14,8 @@ Both engines receive the SAME single-source `SchemaDescriptor`, the SAME tuned e
 
 The recipe under test is the instruction block wrapping the single-source schema. `baseline` = the shipped `extraction_prompt` framing; `tuned` = baseline + a sharp anti-placeholder rule + a noise one-shot + a signal one-shot. The failure this targets: a 2B model emitting a grammar-valid junk string ("N/A"/"none") instead of `[]` on noise.
 
+_How to read this:_ the anti-placeholder rule works when `placeholder-string` is `no`. But `all-empty ✗` with `placeholder no` on the noise fixture means the model did not emit junk — it **invented plausible structure** (goals/observations about the tool activity) from pure noise. The recipe suppresses the junk-string failure; it does not, on its own, suppress invent-structure-from-noise. Empty-on-noise is therefore a structural miss for this 2B model, not a recipe gap.
+
 | fixture | recipe | parse_ok | all-empty | placeholder-string |
 |---|---|---|---|---|
 | pure_tool_noise | baseline | ✓ | ✗ (want ✓) | no |
@@ -103,6 +105,8 @@ Local is scored for AGREEMENT with hosted on real developer-session chunks (fuzz
 | observations | 3 | 0 | 0.00 |
 
 Entity-type agreement on name-matched entities: **2/7 = 0.29**. Local `file` over-types (teachable retype class): **4**.
+
+_Reading the two recall numbers:_ the per-chunk `recall` column is **pooled** — a hosted fact found anywhere in local's output, regardless of which field. The per-category aggregate above is lower because local often captures a fact but files it under a different category (a hosted goal recorded by local as a decision; an observation folded into a decision's text). So local recovers most of the *substance* (pooled recall) while its *category assignment* drifts — a schema-placement miss, distinct from a content miss. _Sampling note:_ the chunks in this run were drawn (deterministically, by the substantive-content filter) from a single long session; the per-row source + index make the sample reproducible, and a broader multi-session sweep would tighten the estimate.
 
 ### Grounding (shipped `is_grounded`: span present + verbatim in chunk)
 
