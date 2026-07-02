@@ -58,16 +58,19 @@ pub enum SkillEffectEnvelope {
         to_type: String,
     },
     /// Recategorize a decision's `decision_type` from a learned source category to a target category
-    /// when the decision matches (promoted from a `cg fix` on a decision's category).
+    /// when the decision matches. Applied post-harvest at drain time. Authored via `cg skills add`;
+    /// AUTO-PROMOTION from corrections is deferred (only `RetypeEntity` auto-promotes today).
     RecategorizeDecision {
         decision_matcher: String,
         from_category: String,
         to_category: String,
     },
     /// Drop a harvested item (goal / entity / decision / observation) whose text matches — the
-    /// "this shouldn't have been captured" repair (`cg drop`).
+    /// "this shouldn't have been captured" repair. Authored via `cg skills add`; auto-promotion
+    /// deferred. (Distinct from `cg drop`, which is an overlay read-view exclusion, not this effect.)
     DropItem { item_matcher: String },
-    /// Add a tag to a harvested decision whose text matches (`cg fix --tag`).
+    /// Add a tag to a harvested decision whose text matches. Authored via `cg skills add`;
+    /// auto-promotion deferred. (There is no `cg fix --tag` flag; a tag rule is hand-authored.)
     AddTag { item_matcher: String, tag: String },
 }
 

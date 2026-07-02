@@ -160,9 +160,13 @@ pub fn mark_structured(
         None => DbValue::Null,
     };
     let outcome = (|| -> Result<()> {
+        // Guard on `in_flight` (defense-in-depth, mirroring claim_digest/mark_failed): only a
+        // digest this worker has claimed transitions to structured, so a stray call can't flip an
+        // unclaimed row. The drain always calls this on a just-claimed digest, so the guard never
+        // changes the live flow — it only closes a robustness gap.
         db.execute_in_tx(
             tx,
-            "UPDATE cg_understanding_queue SET status = 'structured', updated_at = $updated_at WHERE digest_id = $digest_id",
+            "UPDATE cg_understanding_queue SET status = 'structured', updated_at = $updated_at WHERE digest_id = $digest_id AND status = 'in_flight'",
             &HashMap::from([
                 ("digest_id".to_string(), DbValue::Text(digest_text.clone())),
                 ("updated_at".to_string(), DbValue::TxId(tx)),

@@ -9,8 +9,8 @@
 
 use context_graph::tier0::{Tier0CaptureRequest, bump_touch, capture_tier0, queue_counts};
 use context_graph::understanding::{
-    MAX_UNDERSTANDING_ATTEMPTS, PendingDigest, claim_digest, list_pending_digests,
-    mark_failed, mark_structured,
+    MAX_UNDERSTANDING_ATTEMPTS, PendingDigest, claim_digest, list_pending_digests, mark_failed,
+    mark_structured,
 };
 use context_graph::{ContextId, DigestId, Store, StoreConfig};
 
