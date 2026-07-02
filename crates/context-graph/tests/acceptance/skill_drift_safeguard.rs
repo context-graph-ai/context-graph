@@ -526,6 +526,10 @@ fn drift_alert_never_auto_disables_the_skill() {
 }
 
 /// Insert an active, matching learned skill with a controllable description (test seeding).
+/// Insert a skill whose description matches the drift tests' capture chunk AND whose rule carries
+/// a real, derivable retype effect (the fold-seam withhold contract excludes an effect-less row
+/// from applying/firing regardless of matching strategy — a placeholder non-retype rule string
+/// would now be withheld, not fired, defeating these firing/drift tests' whole point).
 fn insert_matching_skill(store: &Store, id: &str, description: &str) {
     let db = store.sync_database();
     db.execute(
@@ -533,7 +537,12 @@ fn insert_matching_skill(store: &Store, id: &str, description: &str) {
         &HashMap::from([
             ("id".to_string(), DbValue::Text(id.to_string())),
             ("description".to_string(), DbValue::Text(description.to_string())),
-            ("rule".to_string(), DbValue::Text(format!("rule {id}"))),
+            (
+                "rule".to_string(),
+                DbValue::Text(
+                    "when an entity named context-graph is typed File → Repository".to_string(),
+                ),
+            ),
             ("provenance".to_string(), DbValue::Text("human-correction".to_string())),
             ("active".to_string(), DbValue::Bool(true)),
             ("held_for_review".to_string(), DbValue::Bool(false)),

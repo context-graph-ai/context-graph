@@ -1600,14 +1600,16 @@ fn skill_provenance_label(
     }
 }
 
-fn skill_apply_strategy_label(
-    strategy: &context_graph::skill_store::SkillApplyStrategy,
-) -> &'static str {
+fn skill_apply_strategy_label(strategy: &context_graph::skill_store::SkillApplyStrategy) -> String {
     match strategy {
-        context_graph::skill_store::SkillApplyStrategy::PostHarvestRetype => "post-harvest-retype",
-        context_graph::skill_store::SkillApplyStrategy::PreExtractionGuidance => {
-            "pre-extraction-guidance"
+        context_graph::skill_store::SkillApplyStrategy::PostHarvestRetype => {
+            "post-harvest-retype".to_string()
         }
+        context_graph::skill_store::SkillApplyStrategy::PreExtractionGuidance => {
+            "pre-extraction-guidance".to_string()
+        }
+        // Round-trip byte-for-byte: never rewritten to an implemented strategy string.
+        context_graph::skill_store::SkillApplyStrategy::Unknown(raw) => raw.clone(),
     }
 }
 
@@ -3458,6 +3460,7 @@ fn harness_report_json(harness: &CaptureHarnessReport) -> Value {
         "judge_call_count": harness.judge_call_count,
         "embeddings_generated": harness.embeddings_generated,
         "applied_skill_ids": harness.applied_skill_ids,
+        "withheld_skill_ids": harness.withheld_skill_ids,
         "receipt_leads_with_intention": harness.receipt_leads_with_intention,
         "harness_config_applied": harness.harness_config_applied,
         "stage3_resolution_verdicts": stage3_verdicts_json(harness),

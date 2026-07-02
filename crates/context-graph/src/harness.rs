@@ -565,6 +565,11 @@ pub struct CaptureHarnessReport {
     pub judge_candidate_set: Vec<String>,
     /// Learned skill ids applied during this capture.
     pub applied_skill_ids: Vec<String>,
+    /// Learned skill ids that matched this capture but were withheld — an apply strategy this
+    /// build does not implement, the reserved generation-time strategy, or an effect that could
+    /// not be derived from the row. Capture never fails on a withheld rule; this is the diagnostic
+    /// naming which rule was skipped.
+    pub withheld_skill_ids: Vec<String>,
     /// Whether the capture receipt leads with the intention section (it does).
     pub receipt_leads_with_intention: bool,
 }
@@ -922,6 +927,7 @@ pub fn run_capture(
         judge_call_count,
         judge_candidate_set,
         applied_skill_ids: skill_application.applied_skill_ids,
+        withheld_skill_ids: skill_application.withheld_skill_ids,
         receipt_leads_with_intention: true,
     };
     Ok((outcome.report, harness_report))

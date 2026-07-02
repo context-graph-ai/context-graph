@@ -513,8 +513,15 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
             &LearnedSkill {
                 id: unrelated_skill_id.clone(),
                 description: "context-graph unrelated note for co-firing guard".to_string(),
-                rule: "observe context-graph without changing any entity type".to_string(),
-                effect: None,
+                // A derivable effect whose source type ("Service") never matches the actual
+                // harvested type ("File") — same no-op-co-fire shape as `cofired_retype_skill_id`
+                // above: the skill is selected and fires (matches by description/scope) but never
+                // changes an entity, so it stays a real co-firing negative control. An
+                // effect-less rule would now be withheld under the fold-seam contract (an
+                // apply-strategy row whose effect cannot be derived never fires), which would
+                // defeat this fixture's whole point.
+                rule: "when an entity named context-graph is typed Service → Module".to_string(),
+                effect: Some(retype_effect("context-graph", "Service", "Module")),
                 apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanAuthored,
                 active: true,
