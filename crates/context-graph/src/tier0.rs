@@ -419,6 +419,89 @@ pub fn queue_counts(store: &Store, context_id: ContextId) -> Result<QueueCounts>
     Ok(counts)
 }
 
+/// Bump the retrieval-touch counter for one digest: increment `touch_count` and stamp
+/// `last_touched_at`, inserting the row at count 1 on first touch. This is the daily-loop signal
+/// that a captured memory actually answered a query — the priority hint the understanding worker
+/// reads to structure the memories a developer keeps reaching for first. Machine-local (the
+/// `cg_retrieval_touches` table never syncs — per-device firing stays local), and committed in its
+/// own transaction so a touch never rides inside a capture or retrieval read.
+pub fn bump_touch(store: &Store, context_id: ContextId, digest_id: DigestId) -> Result<()> {
+    let db = store.internal_db();
+    let tx = db.begin().map_err(map_engine)?;
+    let outcome = (|| -> Result<()> {
+        // The engine has no `col = col + 1` UPDATE form, so read the current count then upsert.
+        let current = retrieval_touch_count_in(store, digest_id)?;
+        let updated = db
+            .execute_in_tx(
+                tx,
+                "UPDATE cg_retrieval_touches SET touch_count = $touch_count, last_touched_at = $last_touched_at WHERE digest_id = $digest_id",
+                &HashMap::from([
+                    (
+                        "touch_count".to_string(),
+                        DbValue::Int64((current + 1) as i64),
+                    ),
+                    ("last_touched_at".to_string(), DbValue::TxId(tx)),
+                    (
+                        "digest_id".to_string(),
+                        DbValue::Text(digest_id.to_string()),
+                    ),
+                ]),
+            )
+            .map_err(map_engine)?;
+        if updated.rows_affected == 0 {
+            db.execute_in_tx(
+                tx,
+                "INSERT INTO cg_retrieval_touches (digest_id, context_id, touch_count, last_touched_at) VALUES ($digest_id, $context_id, $touch_count, $last_touched_at)",
+                &HashMap::from([
+                    (
+                        "digest_id".to_string(),
+                        DbValue::Text(digest_id.to_string()),
+                    ),
+                    (
+                        "context_id".to_string(),
+                        DbValue::Uuid(context_id.as_uuid()),
+                    ),
+                    ("touch_count".to_string(), DbValue::Int64(1)),
+                    ("last_touched_at".to_string(), DbValue::TxId(tx)),
+                ]),
+            )
+            .map_err(map_engine)?;
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => db.commit(tx).map_err(map_engine)?,
+        Err(err) => {
+            let _ = db.rollback(tx);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// The retrieval-touch count for one digest (0 if never touched).
+pub fn retrieval_touch_count(store: &Store, digest_id: DigestId) -> Result<u64> {
+    retrieval_touch_count_in(store, digest_id)
+}
+
+fn retrieval_touch_count_in(store: &Store, digest_id: DigestId) -> Result<u64> {
+    let result = store
+        .internal_db()
+        .execute(
+            "SELECT touch_count FROM cg_retrieval_touches WHERE digest_id = $digest_id",
+            &HashMap::from([(
+                "digest_id".to_string(),
+                DbValue::Text(digest_id.to_string()),
+            )]),
+        )
+        .map_err(map_engine)?;
+    let count = result.rows.first().and_then(|row| match row.first() {
+        Some(DbValue::Int64(count)) => Some((*count).max(0) as u64),
+        _ => None,
+    });
+    Ok(count.unwrap_or(0))
+}
+
 /// The `kind` marker on a digest (e.g. "verbatim" for a tier-0 digest), or `None` if absent.
 pub fn digest_kind(store: &Store, digest_id: DigestId) -> Result<Option<String>> {
     let result = store
