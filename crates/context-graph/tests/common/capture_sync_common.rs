@@ -1217,6 +1217,16 @@ fn expected_sync_table_policies() -> BTreeMap<&'static str, (SyncDirection, Conf
         ("cg_compensation_events", write_once),
         // Pending review items are local-only per owner (never synced).
         ("cg_pending_review_items", local_only),
+        // Tier-0 capture tables (schema v9). Raw source chunks are the NDA line and never leave the
+        // device; the understanding queue, retrieval touches, and local settings are per-device
+        // runtime state — all (None, InsertIfNotExists). Understanding completions are a write-once
+        // immutable marker that syncs so a machine already holding the structured output skips
+        // re-understanding: (Both, InsertIfNotExists).
+        ("cg_source_chunks", local_only),
+        ("cg_understanding_queue", local_only),
+        ("cg_retrieval_touches", local_only),
+        ("cg_local_settings", local_only),
+        ("cg_understanding_completions", write_once),
     ])
 }
 
