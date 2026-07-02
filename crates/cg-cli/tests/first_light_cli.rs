@@ -1016,7 +1016,7 @@ fn enforcement_level_native_shapeonly_floor_recorded_per_call() {
     } = run_hosted_capture_with_responses(
         Some("response_format_schema"),
         vec![good_harvest_response()],
-        "A real session succeeds under a schema-honoring endpoint.",
+        "A real session records malformed replies through the repair floor to keep first-day capture reliable under a schema-honoring endpoint.",
     );
     let HostedCapture {
         harness: shape_harness,
@@ -1025,7 +1025,7 @@ fn enforcement_level_native_shapeonly_floor_recorded_per_call() {
     } = run_hosted_capture_with_responses(
         Some("json_object"),
         vec![good_harvest_response()],
-        "A real session succeeds under a json_object endpoint.",
+        "A real session records malformed replies through the repair floor to keep first-day capture reliable under a json_object endpoint.",
     );
     let HostedCapture {
         harness: floor_harness,
@@ -1034,7 +1034,7 @@ fn enforcement_level_native_shapeonly_floor_recorded_per_call() {
     } = run_hosted_capture_with_responses(
         None,
         vec![good_harvest_response()],
-        "A real session succeeds under an unconstrained endpoint.",
+        "A real session records malformed replies through the repair floor to keep first-day capture reliable under an unconstrained endpoint.",
     );
 
     assert_eq!(
@@ -2049,24 +2049,40 @@ fn cli_status_idempotent_on_same_session_recaptured() {
     let first = harness.run(&["status"]);
     let second_capture = harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
     let second = harness.run(&["status"]);
-    let first_decision_id = stable_uuid_from(
-        &[&first_capture, &first],
-        &["D_old", "auth module at src/auth.py"],
-    );
-    let second_decision_id = stable_uuid_from(
-        &[&second_capture, &second],
-        &["D_old", "auth module at src/auth.py"],
-    );
+    // The decision id is emitted by the FIRST capture. The identical second capture is a tier-0
+    // NO-OP: the verbatim digest already exists, so it is skipped and nothing is re-understood —
+    // the strongest idempotency (recapture writes zero new rows). Proven against the persisted
+    // store: after both captures the intention still holds exactly ONE decision, with the same id
+    // the first capture emitted (never duplicated or replaced).
+    let first_decision_id = stable_uuid_from(&[&first_capture], &["D_old", "auth module at src/auth.py"])
+        .map(DecisionId::from);
+    let intention_id = stable_uuid_from(&[&first_capture], &["G1", "ship password-less login for acme"])
+        .map(IntentionId::from);
+    let store = persisted_store(store_path_from(&[
+        &first_capture,
+        &first,
+        &second_capture,
+        &second,
+    ]));
+    let persisted_decision_ids = persisted_decisions_for_intention(store.as_ref(), intention_id)
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect::<Vec<_>>();
+    drop(store);
 
     assert_eq!(
         (
             memory_counts(&first),
             memory_counts(&second),
             first_decision_id.is_some(),
-            second_decision_id.is_some(),
-            first_decision_id == second_decision_id,
+            persisted_decision_ids,
         ),
-        (Some((1, 1, 1)), Some((1, 1, 1)), true, true, true)
+        (
+            Some((1, 1, 1)),
+            Some((1, 1, 1)),
+            true,
+            first_decision_id.into_iter().collect::<Vec<_>>(),
+        )
     );
 }
 

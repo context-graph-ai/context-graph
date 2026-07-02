@@ -466,8 +466,14 @@ fn cli_import_claude_session_becomes_memory() {
             extracted_from_edges: 14,
         }
     );
+    // Tier-0 digests keep the cleaned session VERBATIM (turn newlines preserved), so compare on
+    // whitespace-collapsed text — the content and decoy-exclusion are what matter, not the
+    // newline formatting the old condensing path happened to flatten.
     assert_eq!(
-        persisted_text_values(store_path_ref, "digests", "summary"),
+        persisted_text_values(store_path_ref, "digests", "summary")
+            .iter()
+            .map(|summary| compact_expected_session(summary))
+            .collect::<Vec<_>>(),
         expected_digest_summaries
     );
     assert!(
@@ -618,30 +624,55 @@ fn cli_import_streams_large_jsonl_in_bounded_chunks() {
         "dry-run must stream the large JSONL into multiple bounded chunks: {}",
         dry_run.stdout
     );
+    // Tier-0 per-chunk reframe: a large session streams into N bounded source chunks, each kept as
+    // its OWN verbatim digest and understood in its own pass (no rolling condensation, so both ends
+    // survive with no decay). Bounded chunking and full content coverage are proven on the PERSISTED
+    // artifacts (the kept source chunks + per-chunk digests), not the model prompt text.
+    let store_path = store_path_from(&[&import]);
+    let import_chunks = import_json
+        .get("import_chunks")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
+    let kept_source_chunks =
+        persisted_text_values(store_path.as_deref(), "cg_source_chunks", "content");
+    let digest_summaries = persisted_text_values(store_path.as_deref(), "digests", "summary");
+    assert!(
+        import_chunks > 1,
+        "large import must stream into multiple bounded chunks: {}",
+        import.stdout
+    );
     assert_eq!(
-        (
-            completion_calls,
-            source_chunks.len(),
-            source_chunks
-                .iter()
-                .all(|chunk| chunk.len() <= 10_000 && !chunk.is_empty()),
-            compact_expected_session(&source_chunks.join("\n")),
-        ),
-        (
-            source_chunks.len(),
-            source_chunks.len(),
-            true,
-            compact_expected_session(&large_chunked_clean_session(line_count)),
-        ),
-        "large import must call the extractor once per bounded source chunk and reconstruct the imported transcript"
+        source_chunks.len() as u64,
+        import_chunks,
+        "the extractor is called once per bounded source chunk"
+    );
+    assert!(
+        completion_calls as u64 >= import_chunks,
+        "at least one model call per chunk (per-chunk understanding also classifies cross-chunk decisions): {completion_calls}"
+    );
+    assert_eq!(
+        persisted.digests as u64, import_chunks,
+        "N bounded source chunks -> N per-chunk digests (no rolling condensation): {persisted:?}"
+    );
+    assert!(
+        kept_source_chunks
+            .iter()
+            .all(|chunk| chunk.len() <= 10_000 && !chunk.is_empty()),
+        "every kept source chunk is bounded by the resolved 10000-char window"
+    );
+    assert!(
+        (0..line_count).all(|index| digest_summaries
+            .iter()
+            .any(|summary| summary.contains(&format!("Goal G{index}:")))),
+        "every chunk's content is captured and queryable across the per-chunk digests"
     );
     assert!(
         import_json
             .get("message")
             .and_then(JsonValue::as_str)
-            .is_some_and(|message| message.starts_with("captured import in ")
-                && message.contains("one condensed memory")),
-        "chunked import should report one condensed memory: {}",
+            .is_some_and(|message| message.starts_with("understood import in ")
+                && message.contains("per-chunk")),
+        "chunked import should report N per-chunk memories: {}",
         import.stdout
     );
     assert!(
@@ -650,11 +681,8 @@ fn cli_import_streams_large_jsonl_in_bounded_chunks() {
         import.stdout
     );
     assert!(
-        persisted.digests == 1
-            && persisted.intentions >= 18
-            && persisted.decisions >= 18
-            && persisted.observations >= 18,
-        "chunked import must persist one session memory with facts from multiple chunks: {persisted:?}"
+        persisted.intentions >= 18 && persisted.decisions >= 18 && persisted.observations >= 18,
+        "chunked import must persist facts from multiple chunks: {persisted:?}"
     );
 }
 
@@ -720,7 +748,6 @@ fn cli_import_rolls_plain_long_session_into_one_digest_without_label_markers() {
     let (jsonl, _clean) = plain_sentinel_session(16);
     write_file(&session, &jsonl);
 
-    let before_calls = harness.providers.completion_count();
     let import = harness.run(&[
         "import",
         "--understand-now",
@@ -728,31 +755,59 @@ fn cli_import_rolls_plain_long_session_into_one_digest_without_label_markers() {
         session.to_str().expect("utf8 path"),
     ]);
     let import_json = output_json(&import).expect("import json");
-    let source_chunks = source_chunks_after(&harness, before_calls);
     let store_path = store_path_from(&[&import]);
     let digest_summaries = persisted_text_values(store_path.as_deref(), "digests", "summary");
+    let kept_source_chunks =
+        persisted_text_values(store_path.as_deref(), "cg_source_chunks", "content");
+    let import_chunks = import_json
+        .get("import_chunks")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0);
 
     assert_eq!(import.code, 0, "import failed: {}", combined(&import));
+    // Tier-0 per-chunk reframe: a plain long session (no ontology labels) streams into N bounded
+    // per-chunk verbatim digests. Both ends of the session (SENTINEL_OPEN / SENTINEL_CLOSE) survive
+    // verbatim ACROSS those per-chunk digests — no rolling condensation, no decay — and no ontology
+    // label markers are injected into the unlabeled prose.
+    assert!(
+        import_chunks > 1,
+        "plain long session must stream into multiple bounded chunks: {}",
+        import.stdout
+    );
     assert_eq!(
-        (
-            import_json
-                .get("import_chunks")
-                .and_then(JsonValue::as_u64)
-                .is_some_and(|chunks| chunks > 1),
-            import_json
-                .get("resolved_chunk_window")
-                .and_then(JsonValue::as_u64),
-            source_chunks
-                .iter()
-                .all(|chunk| chunk.len() <= 2500 && !chunk.is_empty()),
-            persisted_counts(store_path.as_deref()).digests,
-            digest_summaries.len(),
-            digest_summaries
-                .first()
-                .is_some_and(|summary| summary.contains("SENTINEL_OPEN")
-                    && summary.contains("SENTINEL_CLOSE")),
-        ),
-        (true, Some(2500), true, 1, 1, true,)
+        import_json
+            .get("resolved_chunk_window")
+            .and_then(JsonValue::as_u64),
+        Some(2500)
+    );
+    assert_eq!(
+        persisted_counts(store_path.as_deref()).digests as u64,
+        import_chunks,
+        "N bounded source chunks -> N per-chunk digests (no rolling condensation)"
+    );
+    assert!(
+        kept_source_chunks
+            .iter()
+            .all(|chunk| chunk.len() <= 2500 && !chunk.is_empty()),
+        "every kept source chunk is bounded by the 2500-char window: {kept_source_chunks:?}"
+    );
+    assert!(
+        digest_summaries
+            .iter()
+            .any(|summary| summary.contains("SENTINEL_OPEN")),
+        "the session's opening survives verbatim in a per-chunk digest: {digest_summaries:?}"
+    );
+    assert!(
+        digest_summaries
+            .iter()
+            .any(|summary| summary.contains("SENTINEL_CLOSE")),
+        "the session's close survives verbatim in a per-chunk digest: {digest_summaries:?}"
+    );
+    assert!(
+        digest_summaries
+            .iter()
+            .all(|summary| !summary.contains("Goal G") && !summary.contains("Decision D")),
+        "no ontology label markers are injected into the unlabeled prose: {digest_summaries:?}"
     );
 }
 
@@ -954,8 +1009,12 @@ fn cli_record_is_clean_text_escape_hatch_not_a_parser() {
     let import_status = import_harness.run(&["status"]);
     let import_store_path = store_path_from(&[&import, &import_status]);
     let import_store_path_ref = import_store_path.as_deref();
-    let import_digest_summaries =
-        persisted_text_values(import_store_path_ref, "digests", "summary");
+    // Tier-0 digests keep the cleaned session VERBATIM (turn newlines preserved); compare on
+    // whitespace-collapsed text.
+    let import_digest_summaries = persisted_text_values(import_store_path_ref, "digests", "summary")
+        .iter()
+        .map(|summary| compact_expected_session(summary))
+        .collect::<Vec<_>>();
 
     let before_record = harness.run(&["status"]);
     let record = harness.run(&[
