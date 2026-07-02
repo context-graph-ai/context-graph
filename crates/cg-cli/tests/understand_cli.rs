@@ -284,3 +284,69 @@ fn budget_ceiling_stops_the_drain() {
         "a digest remains pending under the ceiling"
     );
 }
+
+const GENERATION_TIME_SKILL: &str = "# description: guidance about the ingest path\n## rule\nalways classify the ingest path decision as durable\n";
+
+#[test]
+fn generation_time_steering_reaches_the_extraction_prompt() {
+    let harness = connected_harness();
+    // Author a generation-time steering rule whose description matches the ingest transcript.
+    let skill_path = harness.data_root.path().join("ingest-steer.md");
+    fs::write(&skill_path, GENERATION_TIME_SKILL).expect("write skill file");
+    let add = harness.run(&[
+        "skills",
+        "add",
+        "--strategy",
+        "generation-time",
+        skill_path.to_str().unwrap(),
+    ]);
+    assert_eq!(add.code, 0, "skills add failed: {}", combined(&add));
+
+    harness.run_with_stdin(
+        &["record", "--no-kick", "--context", "loop"],
+        PARITY_TRANSCRIPT,
+    );
+    let understand = harness.run(&["understand", "--context", "loop"]);
+    assert_eq!(
+        understand.code,
+        0,
+        "understand failed: {}",
+        combined(&understand)
+    );
+
+    // The steering block was appended to the extraction prompt the model actually received.
+    let saw_steering = harness.providers.completion_records().iter().any(|record| {
+        record
+            .get("prompt")
+            .and_then(JsonValue::as_str)
+            .map(|prompt| {
+                prompt.contains("Apply these learned corrections")
+                    && prompt.contains("always classify the ingest path decision as durable")
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        saw_steering,
+        "the generation-time steering block reached the extraction prompt"
+    );
+}
+
+#[test]
+fn skills_add_rejects_an_unknown_strategy() {
+    let harness = CliHarness::new();
+    let skill_path = harness.data_root.path().join("steer.md");
+    fs::write(&skill_path, GENERATION_TIME_SKILL).expect("write skill file");
+    let add = harness.run(&[
+        "skills",
+        "add",
+        "--strategy",
+        "teleport",
+        skill_path.to_str().unwrap(),
+    ]);
+    assert_ne!(add.code, 0, "an unknown strategy is rejected loudly");
+    assert!(
+        combined(&add).contains("unknown --strategy"),
+        "the error names the unknown strategy: {}",
+        combined(&add)
+    );
+}
