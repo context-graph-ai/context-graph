@@ -44,14 +44,31 @@ pub enum SkillProvenance {
     HumanAuthored,
 }
 
+/// The value-level effect a learned post-generation-repair skill applies to a harvest. Serde-tagged
+/// so new kinds are additive (a new arm needs no migration; the fold seam is designed for this). Each
+/// kind is a deterministic repair a learned correction encodes; matching is literal-text keyed
+/// (identity-based matching is a named deferred item, not claimed here).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SkillEffectEnvelope {
+    /// Rename an entity's type when it is present with the learned source type.
     RetypeEntity {
         entity_name: String,
         from_type: String,
         to_type: String,
     },
+    /// Recategorize a decision's `decision_type` from a learned source category to a target category
+    /// when the decision matches (promoted from a `cg fix` on a decision's category).
+    RecategorizeDecision {
+        decision_matcher: String,
+        from_category: String,
+        to_category: String,
+    },
+    /// Drop a harvested item (goal / entity / decision / observation) whose text matches — the
+    /// "this shouldn't have been captured" repair (`cg drop`).
+    DropItem { item_matcher: String },
+    /// Add a tag to a harvested decision whose text matches (`cg fix --tag`).
+    AddTag { item_matcher: String, tag: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1522,7 +1539,7 @@ pub(crate) fn select_and_apply_learned_skills(
     let mut withheld_skill_ids = Vec::new();
     for skill in matched {
         let applicable = skill.apply_strategy == SkillApplyStrategy::PostHarvestRetype
-            && retype_effect_from_skill(&skill).is_some();
+            && (retype_effect_from_skill(&skill).is_some() || skill_has_general_effect(&skill));
         if applicable {
             selected.push(skill);
         } else {
@@ -1585,10 +1602,96 @@ pub(crate) fn select_and_apply_learned_skills(
         }
     }
 
+    // The generalized post-generation repairs (recategorize / drop / tag) apply after the entity
+    // retype write-back, over the final harvest. A retype-only skill carries none of these, so this
+    // pass is a no-op for the retype path.
+    apply_general_effects(&selected, harvest);
+
     SelectedSkillApplication {
         applied_skill_ids: selected.into_iter().map(|skill| skill.id).collect(),
         firing_records,
         withheld_skill_ids,
+    }
+}
+
+/// Whether a skill carries one of the generalized post-generation effect kinds (recategorize / drop /
+/// add-tag) this build applies alongside entity retype.
+fn skill_has_general_effect(skill: &LearnedSkill) -> bool {
+    matches!(
+        skill.effect,
+        Some(SkillEffectEnvelope::RecategorizeDecision { .. })
+            | Some(SkillEffectEnvelope::DropItem { .. })
+            | Some(SkillEffectEnvelope::AddTag { .. })
+    )
+}
+
+/// Whether a matcher matches a harvested item's text (literal, case-insensitive: exact or substring).
+fn matcher_hits(matcher: &str, text: &str) -> bool {
+    let matcher = matcher.trim().to_ascii_lowercase();
+    if matcher.is_empty() {
+        return false;
+    }
+    text.to_ascii_lowercase().contains(&matcher)
+}
+
+/// Apply the generalized post-generation repairs the selected skills encode, in place on the harvest:
+/// recategorize a matching decision's `decision_type`, drop a matching item, or tag a matching
+/// decision. Deterministic and model-free; a skill whose matcher hits nothing changes nothing.
+fn apply_general_effects(
+    selected: &[LearnedSkill],
+    harvest: &mut crate::ingest::StructuredHarvest,
+) {
+    for skill in selected {
+        match &skill.effect {
+            Some(SkillEffectEnvelope::RecategorizeDecision {
+                decision_matcher,
+                from_category,
+                to_category,
+            }) => {
+                for decision in &mut harvest.decisions {
+                    let current = decision
+                        .decision_type
+                        .as_ref()
+                        .map(|field| field.as_str().to_string())
+                        .unwrap_or_default();
+                    if matcher_hits(decision_matcher, &decision.text)
+                        && current.eq_ignore_ascii_case(from_category)
+                    {
+                        decision.decision_type = Some(crate::ingest::ModelExtractedField::from(
+                            to_category.as_str(),
+                        ));
+                    }
+                }
+            }
+            Some(SkillEffectEnvelope::AddTag { item_matcher, tag }) => {
+                let tag = tag.trim();
+                if tag.is_empty() {
+                    continue;
+                }
+                for decision in &mut harvest.decisions {
+                    if matcher_hits(item_matcher, &decision.text)
+                        && !decision.tags.iter().any(|existing| existing == tag)
+                    {
+                        decision.tags.push(tag.to_string());
+                    }
+                }
+            }
+            Some(SkillEffectEnvelope::DropItem { item_matcher }) => {
+                harvest
+                    .goals
+                    .retain(|goal| !matcher_hits(item_matcher, &goal.text));
+                harvest
+                    .entities
+                    .retain(|entity| !matcher_hits(item_matcher, &entity.name));
+                harvest
+                    .decisions
+                    .retain(|decision| !matcher_hits(item_matcher, &decision.text));
+                harvest
+                    .observations
+                    .retain(|observation| !matcher_hits(item_matcher, &observation.text));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1624,6 +1727,9 @@ fn retype_effect_from_skill(skill: &LearnedSkill) -> Option<SkillRetypeEffect> {
             from_type: from_type.clone(),
             to_type: to_type.clone(),
         }),
+        // A generalized (recategorize / drop / tag) effect carries no entity-retype effect; it is
+        // applied by the general-effects pass, not the retype pass.
+        Some(_) => None,
         None => parse_retype_effect(&skill.rule),
     }
 }

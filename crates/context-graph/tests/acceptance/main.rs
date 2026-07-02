@@ -19,6 +19,7 @@ mod evidence;
 mod fake_extractor;
 mod find_via_digests;
 mod full_ontology_extraction;
+mod general_effect_skills;
 mod graph_context_isolation;
 mod graph_entity_neighborhood;
 mod graph_intention_tree;
