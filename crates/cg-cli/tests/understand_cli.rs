@@ -9,9 +9,44 @@ mod support;
 
 use std::fs;
 
+use contextdb_core::Value;
+use contextdb_engine::Database;
 use fs4::fs_std::FileExt;
 use serde_json::Value as JsonValue;
 use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider};
+
+/// Read the structured graph a store persisted, as sorted description lists — the comparable shape
+/// modulo row ids. Used to prove `--understand-now` and tier-0-then-`cg understand` are ONE path.
+fn graph_snapshot(harness: &CliHarness, context: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let status = harness.run(&["status", "--context", context]);
+    let json = output_json(&status);
+    let db_path = json
+        .pointer("/store/db_path")
+        .or_else(|| json.pointer("/store_path"))
+        .or_else(|| json.pointer("/db_path"))
+        .and_then(JsonValue::as_str)
+        .expect("db path");
+    let db = Database::open(db_path).expect("open store");
+    let snapshot = db.snapshot();
+    let column = |table: &str, column: &str| -> Vec<String> {
+        let mut values = db
+            .scan(table, snapshot)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| match row.values.get(column) {
+                Some(Value::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        values.sort();
+        values
+    };
+    (
+        column("intentions", "description"),
+        column("decisions", "description"),
+        column("observations", "observation_type"),
+    )
+}
 
 fn combined(output: &CommandOutput) -> String {
     format!("{}\n{}", output.stdout, output.stderr)
@@ -348,5 +383,61 @@ fn skills_add_rejects_an_unknown_strategy() {
         combined(&add).contains("unknown --strategy"),
         "the error names the unknown strategy: {}",
         combined(&add)
+    );
+}
+
+const EQUIVALENCE_TRANSCRIPT: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py. Use JWT with 15-min access tokens for the login flow.";
+
+/// The convergence contract: understanding reaches the store through ONE implementation. Capturing
+/// input X with `--understand-now` (tier-0 capture + a FOREGROUND drain of the just-captured
+/// digests) produces the SAME structured graph as tier-0-capturing X and then running
+/// `cg understand` (the background/foreground drainer over the backlog) — same intentions,
+/// decisions, and observations, modulo row ids. If the two paths ever diverged, one of them would
+/// be a second, duplicate understanding pipeline.
+#[test]
+fn understand_now_and_tier0_then_understand_produce_the_same_graph() {
+    // Path A: `--understand-now` (tier-0 capture, then a blocking foreground drain).
+    let eager = connected_harness();
+    let eager_capture = eager.run_with_stdin(
+        &["record", "--understand-now", "--context", "loop"],
+        EQUIVALENCE_TRANSCRIPT,
+    );
+    assert_eq!(
+        eager_capture.code,
+        0,
+        "--understand-now failed: {}",
+        combined(&eager_capture)
+    );
+
+    // Path B: default tier-0 capture, then the `cg understand` drainer.
+    let deferred = connected_harness();
+    let deferred_capture = deferred.run_with_stdin(
+        &["record", "--no-kick", "--context", "loop"],
+        EQUIVALENCE_TRANSCRIPT,
+    );
+    assert_eq!(
+        deferred_capture.code,
+        0,
+        "tier-0 record failed: {}",
+        combined(&deferred_capture)
+    );
+    let understand = deferred.run(&["understand", "--context", "loop"]);
+    assert_eq!(
+        understand.code,
+        0,
+        "cg understand failed: {}",
+        combined(&understand)
+    );
+
+    let eager_graph = graph_snapshot(&eager, "loop");
+    let deferred_graph = graph_snapshot(&deferred, "loop");
+    assert!(
+        !eager_graph.0.is_empty() && !eager_graph.1.is_empty(),
+        "both paths must actually structure a graph, not silently no-op: {eager_graph:?}"
+    );
+    assert_eq!(
+        eager_graph, deferred_graph,
+        "--understand-now and tier-0 + cg understand must produce the SAME structured graph \
+         (one understanding path), modulo ids"
     );
 }
