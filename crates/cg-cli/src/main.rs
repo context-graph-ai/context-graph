@@ -621,7 +621,13 @@ fn extract_import_chunk_adaptive(
 }
 
 fn import_error_is_truncation(err: &CgError) -> bool {
-    matches!(err, CgError::Engine(message) if message.contains("Truncation"))
+    // `CgError` carries no typed truncation variant; `ConnectedModelExtractor::extract` above
+    // (the "model extraction ended with {:?}" / "model extraction repair ended with {:?}" sites)
+    // encodes the outcome into the opaque `CgError::Engine` message via `{:?}` Debug formatting.
+    // Match the exact Debug rendering of `ModelCallOutcome::Truncation` rather than a hand-typed
+    // literal, so a rename of the enum variant cannot silently desync detection from construction.
+    let marker = format!("{:?}", ModelCallOutcome::Truncation);
+    matches!(err, CgError::Engine(message) if message.contains(&marker))
 }
 
 fn split_import_chunk_for_retry(chunk: &str) -> Option<(&str, &str)> {
@@ -1425,7 +1431,8 @@ fn handle_skills(args: &[String]) -> i32 {
 
 /// `cg review [--uncertain | groupings | --skills]` — opt-in review surface rendering the four
 /// single-edge categories (uncertain items, grouping proposals, drift). A bare `cg review` shows the
-/// summary across categories and advances the local review cursor; the filtered lenses are read-only.
+/// summary across categories; every lens (bare or filtered) is read-only — visibility is act-on-based
+/// (`cg drop`/`cg keep` etc. via `act_on_item`), not cursor-based.
 fn handle_review(args: &[String]) -> i32 {
     let positionals = action_positionals(args);
     let lens = positionals.first().map(String::as_str);
@@ -1485,8 +1492,6 @@ fn handle_review(args: &[String]) -> i32 {
             summary.drift_count,
             summary.currency_flips_count
         ));
-        let mut cursor = cursor;
-        context_graph::review_surface::maybe_advance_cursor(&store, &mut cursor, true);
     }
 
     print_action_result(
@@ -1622,8 +1627,6 @@ fn skill_json(skill: &context_graph::skill_store::LearnedSkill) -> Value {
         "apply_strategy": skill_apply_strategy_label(&skill.apply_strategy),
         "provenance": skill_provenance_label(&skill.provenance),
         "active": skill.active,
-        "fire_right": skill.fire_right,
-        "fire_wrong": skill.fire_wrong,
     })
 }
 

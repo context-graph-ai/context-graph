@@ -144,10 +144,13 @@ pub struct PromotionResult {
     pub skill: Option<LearnedSkill>,
     /// The score achieved on the held-out set (for testing tie detection).
     pub heldout_score: f64,
-    /// How many times the held-out gate was evaluated to reach this verdict. A correct promotion
-    /// path measures generalization on the held-out slice, so this is > 0 on the learned path; a
-    /// stub that judges on training fit (never touching the held-out slice) leaves it 0. Plain
-    /// count on the result — no app-side global/atomic in `src/`.
+    /// How many times the held-out gate was evaluated to reach this verdict. This is threshold
+    /// promotion, not a generalization test: the grouped corrections a real capture feeds the gate
+    /// already agree with each other (`promotion_threshold` requires aligned labels before a
+    /// candidate is even proposed), so in practice the gate validates that N aligned corrections
+    /// were reached, not that the candidate generalizes to unseen disagreement. This field is a
+    /// plain count on the result — no app-side global/atomic in `src/` — present so a caller can
+    /// see the gate ran at all (> 0 on the learned path, 0 on a stub that skips it).
     pub heldout_gate_invocations: usize,
 }
 
@@ -1202,14 +1205,22 @@ fn teaching_event_from_row(values: &HashMap<String, contextdb_core::Value>) -> T
 }
 
 /// Record a ground-truth label for a firing (correct or incorrect).
+///
+/// Test-support seam: production corrections label a firing inside the shared correction
+/// transaction (`insert_correction_and_labels` → `record_firing_label_in_tx`); this entry point
+/// routes through that same `_in_tx` write, in its own transaction, so a test-set label is written
+/// exactly like a real correction's label — no separate non-transactional code path to drift.
 pub fn record_firing_label(store: &Store, firing_id: &str, correct: bool) -> bool {
     let db = store.sync_database();
-    db.execute(
-        "UPDATE cg_skill_firing_trace SET correct = $correct WHERE id = $id",
-        &firing_label_params(firing_id, correct),
-    )
-    .map(|result| result.rows_affected == 1)
-    .unwrap_or(false)
+    let Ok(tx) = db.begin() else {
+        return false;
+    };
+    if record_firing_label_in_tx(&db, tx, firing_id, correct) {
+        db.commit(tx).is_ok()
+    } else {
+        let _ = db.rollback(tx);
+        false
+    }
 }
 
 fn record_firing_label_in_tx(

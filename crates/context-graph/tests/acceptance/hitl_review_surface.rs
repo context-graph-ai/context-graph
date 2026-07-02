@@ -1,12 +1,14 @@
-// HITL review surface (9 acceptance tests).
+// HITL review surface (8 acceptance tests).
 //
 // Pure-logic tests (no store): assert function/struct contract.
 //   - five_message_kinds: placeholder returns 4 (missing DriftAlert)
 //   - capture_receipt_leads_with_intention: placeholder prefixes "Decisions:"
 //   - six_verbs_are_the_whole_action_surface: placeholder accepts unknown verbs
 //
-// Store-state tests: local-only cursor behavior, pending-item persistence, sync-policy.
-//   - review_cursor_is_local_only_bare_review_advances_it: placeholder always advances
+// Store-state tests: pending-item persistence, sync-policy. Visibility is act-on-based
+// (`cg_pending_review_items` + `act_on_item`); the cursor advance API this file used to exercise
+// (`advance_cursor`/`maybe_advance_cursor`/`is_cursor_local`) was dead — it mutated an in-memory
+// `ReviewCursor` built fresh and dropped every `cg review` call, read by nothing — and was deleted.
 //   - pending_item_persists_in_every_window_until_acted_on: placeholder returns empty
 //   - pending_item_persists_through_an_intervening_confident_capture: placeholder clears on advance
 //   - review_cursor_is_not_synced: placeholder policy is Both
@@ -18,7 +20,6 @@ use context_graph::ingest::{CaptureRequest, record_conversation_with_extractor};
 use context_graph::review_surface::{
     MessageKind, ReviewCategory, ReviewCursor, ReviewItem, ReviewVerb, act_on_item,
     build_review_summary_with_currency_category, emit_capture_receipt, gather_review_summary,
-    is_cursor_local, maybe_advance_cursor,
 };
 use context_graph::skill_store::REVIEW_CURSOR_TABLE;
 use context_graph::{ContextGraphSyncTablePolicy, Store, StoreConfig};
@@ -184,37 +185,6 @@ fn cg_review_summary_reports_true_per_category_counts() {
     );
 }
 
-// Test 6 (store-state): placeholder maybe_advance_cursor always advances (even for filtered
-// lens calls); is_cursor_local returns false instead of true. Test fails on the filtered-lens
-// no-advance assertion and the is_cursor_local assertion.
-#[test]
-fn review_cursor_is_local_only_bare_review_advances_it() {
-    let (_dir, store) = fresh_store("k_cursor_local");
-
-    let mut cursor = ReviewCursor {
-        position: 0,
-        is_local: false,
-    };
-
-    assert!(
-        is_cursor_local(&cursor),
-        "the review cursor must be local-only regardless of stored field defaults"
-    );
-
-    let position_before = cursor.position;
-    maybe_advance_cursor(&store, &mut cursor, false);
-    assert_eq!(
-        cursor.position, position_before,
-        "a filtered lens call (is_bare_review=false) must not advance the local cursor"
-    );
-
-    maybe_advance_cursor(&store, &mut cursor, true);
-    assert!(
-        cursor.position > position_before,
-        "a bare review call (is_bare_review=true) must advance the in-memory cursor"
-    );
-}
-
 // LIVE PATH: a flagged item produced by a REAL capture persists across review windows (gathered
 // from the STORE each time) until acted on — never ages out, and is NOT registered only on first
 // query. HEAD's store-gather returns empty (the capture flag is never registered as pending store
@@ -240,13 +210,13 @@ fn pending_item_persists_in_every_window_until_acted_on() {
     );
     let item_id = report.flagged_items[0].key.clone();
 
-    let mut cursor = ReviewCursor {
+    let cursor = ReviewCursor {
         position: 0,
         is_local: true,
     };
 
-    // Gather review TWICE (advancing the cursor) WITHOUT acting — the item must appear each window,
-    // gathered from store state (not registered-on-first-query). HEAD gathers empty → fails.
+    // Gather review TWICE WITHOUT acting — the item must appear each window, gathered from store
+    // state (not registered-on-first-query). HEAD gathers empty → fails.
     for window in 0..2 {
         let summary = gather_review_summary(&store, &cursor);
         assert!(
@@ -258,7 +228,6 @@ fn pending_item_persists_in_every_window_until_acted_on() {
              store-gathered review summary until acted on; HEAD gathers nothing. uncertain_items: {:?}",
             summary.uncertain_items
         );
-        maybe_advance_cursor(&store, &mut cursor, true);
     }
 
     // Act on it via the drop action seam; it must no longer appear.
@@ -294,12 +263,12 @@ fn pending_item_persists_through_an_intervening_confident_capture() {
     assert!(!report.flagged_items.is_empty(), "capture must flag item X");
     let item_id = report.flagged_items[0].key.clone();
 
-    let mut cursor = ReviewCursor {
+    let cursor = ReviewCursor {
         position: 0,
         is_local: true,
     };
 
-    // Run an intervening fully-confident (silent) capture and advance the cursor.
+    // Run an intervening fully-confident (silent) capture.
     let _ = record_conversation_with_extractor(
         &store,
         CaptureRequest {
@@ -310,7 +279,6 @@ fn pending_item_persists_through_an_intervening_confident_capture() {
         &SpanFaithfulExtractor,
     )
     .expect("confident capture must succeed");
-    maybe_advance_cursor(&store, &mut cursor, true);
 
     // X must STILL be surfaced by the store-gathered review (the confident capture did not age it
     // out). HEAD gathers empty → fails.
