@@ -273,12 +273,6 @@ fn large_chunked_session(lines: usize) -> String {
     session
 }
 
-fn large_chunked_clean_session(lines: usize) -> String {
-    (0..lines)
-        .map(|index| format!("User: {}\n", large_chunked_statement(index)))
-        .collect()
-}
-
 fn plain_sentinel_session(lines: usize) -> (String, String) {
     let mut session = String::new();
     let mut clean = String::new();
