@@ -9,8 +9,10 @@
 use std::collections::HashMap;
 
 use context_graph::skill_store::{
-    SkillProvenance, TeachingEventKind, acknowledge_skill, apply_correction, export_skill,
-    list_skills_in_store, parse_human_authored_skill, set_review_hold, set_skills_enabled,
+    LearnedSkill, SkillApplyStrategy, SkillEffectEnvelope, SkillProvenance, TeachingEventKind,
+    acknowledge_skill, apply_correction, export_skill, list_skills_in_store,
+    parse_human_authored_skill, persist_skill, select_pre_extraction_guidance_skills_for_chunk,
+    select_skills_for_chunk, set_review_hold, set_skills_enabled,
 };
 use context_graph::{Store, StoreConfig, TxId};
 use contextdb_core::Value as DbValue;
@@ -63,6 +65,14 @@ fn scan_skill_table(store: &Store) -> Vec<HashMap<String, DbValue>> {
         .into_iter()
         .map(|row| row.values)
         .collect()
+}
+
+fn retype_effect(entity_name: &str, from_type: &str, to_type: &str) -> SkillEffectEnvelope {
+    SkillEffectEnvelope::RetypeEntity {
+        entity_name: entity_name.to_string(),
+        from_type: from_type.to_string(),
+        to_type: to_type.to_string(),
+    }
 }
 
 // Test 1 (store-state): reads persisted rows; the placeholder returns an empty list.
@@ -118,6 +128,94 @@ fn learned_skill_is_inspectable_skill_md_shaped_row_with_provenance() {
     assert!(
         provenances.contains(&SkillProvenance::HumanAuthored),
         "must include HumanAuthored provenance"
+    );
+}
+
+#[test]
+fn legacy_skill_row_derives_effect_and_default_strategy_from_rule() {
+    let (_dir, store) = fresh_store();
+    insert_skill_row(
+        &store,
+        "sk-legacy-retype",
+        "retype context-graph file to repository",
+        "when an entity named context-graph is typed File → Repository",
+        "human-correction",
+        true,
+        false,
+    );
+
+    let skill = list_skills_in_store(&store)
+        .into_iter()
+        .find(|skill| skill.id == "sk-legacy-retype")
+        .expect("legacy skill row must load");
+    assert_eq!(
+        skill.effect,
+        Some(retype_effect("context-graph", "File", "Repository")),
+        "a legacy row without an effect envelope must derive the structured retype effect from rule"
+    );
+    assert_eq!(
+        skill.apply_strategy,
+        SkillApplyStrategy::PostHarvestRetype,
+        "a legacy row without an apply_strategy tag must default to the current post-harvest path"
+    );
+}
+
+#[test]
+fn pre_extraction_strategy_is_not_silently_applied_by_post_harvest_retype() {
+    use context_graph::harness::{CaptureHarnessConfig, run_capture};
+    use context_graph::ingest::CaptureRequest;
+
+    let (_dir, store) = fresh_store();
+    let transcript = "Goal G1: remember the project\nEntity E1: context-graph type=file\nDecision D1: keep one repo serves G1";
+    assert!(
+        persist_skill(
+            &store,
+            &LearnedSkill {
+                id: "sk-pre-extraction".to_string(),
+                description: "context-graph repository guidance".to_string(),
+                rule: "when an entity named context-graph is typed File → Repository".to_string(),
+                effect: Some(retype_effect("context-graph", "File", "Repository")),
+                apply_strategy: SkillApplyStrategy::PreExtractionGuidance,
+                provenance: SkillProvenance::LlmAuthored,
+                active: true,
+                held_for_review: false,
+                fire_right: 0,
+                fire_wrong: 0,
+            }
+        ),
+        "pre-extraction fixture skill must persist"
+    );
+
+    let pre = select_pre_extraction_guidance_skills_for_chunk(&store, transcript, true, false);
+    assert!(
+        pre.iter().any(|skill| skill.id == "sk-pre-extraction"),
+        "the pre-extraction selector must find the generation-time skill"
+    );
+    let post = select_skills_for_chunk(&store, transcript, true, false);
+    assert!(
+        post.iter().all(|skill| skill.id != "sk-pre-extraction"),
+        "the post-harvest selector must not silently apply a pre-extraction strategy skill"
+    );
+
+    let (_report, harness) = run_capture(
+        &store,
+        CaptureRequest {
+            context_label: "pre-extraction-fold".to_string(),
+            transcript: transcript.to_string(),
+            model_available: true,
+        },
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("capture with pre-extraction skill must still succeed");
+    assert!(
+        harness.applied_skill_ids.is_empty(),
+        "post-harvest capture must withhold the pre-extraction strategy skill"
+    );
+    assert_eq!(
+        entity_type_named(&store, "context-graph"),
+        Some(context_graph::EntityType::File),
+        "withholding the pre-extraction strategy must leave the post-harvest entity type unchanged"
     );
 }
 

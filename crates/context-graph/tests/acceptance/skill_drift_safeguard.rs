@@ -6,7 +6,6 @@
 // and check_drift always returns None, list_drift_alerts returns empty.
 //
 // Placeholder behaviors:
-//   - record_firing: returns a FiringTrace but does NOT persist a row
 //   - record_firing_label: does nothing (no row update)
 //   - check_drift: always returns None
 //   - list_drift_alerts: always returns empty
@@ -14,7 +13,8 @@
 use std::collections::HashMap;
 
 use context_graph::skill_store::{
-    FiringTrace, LearnedSkill, SkillProvenance, check_drift, list_drift_alerts, record_firing_label,
+    FiringTrace, LearnedSkill, SkillApplyStrategy, SkillProvenance, check_drift, list_drift_alerts,
+    record_firing_label,
 };
 use context_graph::{Store, StoreConfig, TxId};
 use contextdb_core::Value as DbValue;
@@ -115,6 +115,8 @@ fn make_skill(id: &str, provenance: SkillProvenance) -> LearnedSkill {
         id: id.to_string(),
         description: format!("skill {id}"),
         rule: format!("rule {id}"),
+        effect: None,
+        apply_strategy: SkillApplyStrategy::PostHarvestRetype,
         provenance,
         active: true,
         held_for_review: false,
@@ -379,6 +381,8 @@ fn skill_whose_record_turns_bad_is_flagged_once_for_any_provenance() {
             id: "sk-target".to_string(),
             description: "target skill".to_string(),
             rule: "rule".to_string(),
+            effect: None,
+            apply_strategy: SkillApplyStrategy::PostHarvestRetype,
             provenance: prov_enum.clone(),
             active: true,
             held_for_review: false,
