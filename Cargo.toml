@@ -6,6 +6,7 @@ members = [
     "crates/cg-catalog",
     "crates/cg-cli-conventions",
     "crates/cg-cli",
+    "crates/cg-local-llm",
 ]
 
 [workspace.package]
