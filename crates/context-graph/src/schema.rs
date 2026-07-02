@@ -169,7 +169,7 @@ pub const TABLES: &[TableSpec] = &[
     // Skill-loop tables (stubs — DDL present so sync round-trip tests can persist/sync rows).
     TableSpec {
         name: "cg_learned_skills",
-        ddl: "CREATE TABLE cg_learned_skills (id TEXT PRIMARY KEY, description TEXT NOT NULL, rule TEXT NOT NULL, provenance TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true, held_for_review BOOLEAN NOT NULL DEFAULT false, fire_right INTEGER NOT NULL DEFAULT 0, fire_wrong INTEGER NOT NULL DEFAULT 0, created_at TXID NOT NULL)",
+        ddl: "CREATE TABLE cg_learned_skills (id TEXT PRIMARY KEY, description TEXT NOT NULL, rule TEXT NOT NULL, effect TEXT, apply_strategy TEXT, provenance TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true, held_for_review BOOLEAN NOT NULL DEFAULT false, fire_right INTEGER NOT NULL DEFAULT 0, fire_wrong INTEGER NOT NULL DEFAULT 0, created_at TXID NOT NULL)",
     },
     TableSpec {
         name: "cg_teaching_events",

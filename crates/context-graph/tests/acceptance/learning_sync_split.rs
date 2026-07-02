@@ -12,7 +12,8 @@ use std::collections::HashMap;
 
 use context_graph::capture_sync_status::context_graph_sync_table_contract;
 use context_graph::skill_store::{
-    FIRING_TRACE_TABLE, REVIEW_CURSOR_TABLE, SKILL_TABLE, TEACHING_EVENT_TABLE,
+    FIRING_TRACE_TABLE, REVIEW_CURSOR_TABLE, SKILL_TABLE, SkillApplyStrategy, SkillEffectEnvelope,
+    TEACHING_EVENT_TABLE,
 };
 use context_graph::{ContextGraphSyncTablePolicy, Store, TxId};
 use contextdb_core::Value as DbValue;
@@ -47,6 +48,38 @@ fn insert_skill(store: &Store, id: &str, description: &str, rule: &str, provenan
         ]),
     )
     .expect("insert skill for sync test");
+}
+
+fn insert_structured_retype_skill(
+    store: &Store,
+    id: &str,
+    description: &str,
+    rule: &str,
+    provenance: &str,
+    effect_json: &str,
+    apply_strategy: &str,
+) {
+    let db = store.sync_database();
+    db.execute(
+        "INSERT INTO cg_learned_skills (id, description, rule, effect, apply_strategy, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $effect, $apply_strategy, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Text(id.to_string())),
+            ("description".to_string(), DbValue::Text(description.to_string())),
+            ("rule".to_string(), DbValue::Text(rule.to_string())),
+            ("effect".to_string(), DbValue::Text(effect_json.to_string())),
+            (
+                "apply_strategy".to_string(),
+                DbValue::Text(apply_strategy.to_string()),
+            ),
+            ("provenance".to_string(), DbValue::Text(provenance.to_string())),
+            ("active".to_string(), DbValue::Bool(true)),
+            ("held_for_review".to_string(), DbValue::Bool(false)),
+            ("fire_right".to_string(), DbValue::Int64(0)),
+            ("fire_wrong".to_string(), DbValue::Int64(0)),
+            ("created_at".to_string(), DbValue::TxId(TxId(1))),
+        ]),
+    )
+    .expect("insert structured skill for sync test");
 }
 
 fn insert_teaching_event(
@@ -114,15 +147,19 @@ fn skill_row_by_id(store: &Store, skill_id: &str) -> Option<HashMap<String, DbVa
 async fn skills_sync_tenant_wide_hub_arbitrated() {
     let fixture = real_sync_fixture("skills_sync_tenant_wide_hub_arbitrated").await;
 
-    let skill_desc = "detect technology_choice from library mentions";
-    let skill_rule = "when decision mentions a library → technology_choice";
-    let skill_prov = "human-correction";
-    insert_skill(
+    let skill_desc = "retype context-graph file entity to repository";
+    let skill_rule = "when an entity named context-graph is typed File → Repository";
+    let skill_effect = r#"{"type":"retype_entity","entity_name":"context-graph","from_type":"File","to_type":"Repository"}"#;
+    let skill_strategy = "post-harvest-retype";
+    let skill_prov = "llm-authored";
+    insert_structured_retype_skill(
         &fixture.edge1.store,
         "sk-sync-hub",
         skill_desc,
         skill_rule,
         skill_prov,
+        skill_effect,
+        skill_strategy,
     );
 
     push_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -153,6 +190,24 @@ async fn skills_sync_tenant_wide_hub_arbitrated() {
         "synced skill rule must be identical to edge1"
     );
 
+    let synced_effect = match row.get("effect") {
+        Some(DbValue::Text(t)) => t.clone(),
+        _ => panic!("effect must be a Text value on synced row"),
+    };
+    assert_eq!(
+        synced_effect, skill_effect,
+        "synced skill effect envelope must be identical to edge1"
+    );
+
+    let synced_strategy = match row.get("apply_strategy") {
+        Some(DbValue::Text(t)) => t.clone(),
+        _ => panic!("apply_strategy must be a Text value on synced row"),
+    };
+    assert_eq!(
+        synced_strategy, skill_strategy,
+        "synced skill apply_strategy tag must be identical to edge1"
+    );
+
     let synced_prov = match row.get("provenance") {
         Some(DbValue::Text(t)) => t.clone(),
         _ => panic!("provenance must be a Text value on synced row"),
@@ -176,6 +231,20 @@ async fn skills_sync_tenant_wide_hub_arbitrated() {
     assert_eq!(
         listed_skill.id, "sk-sync-hub",
         "listed skill id must match the synced row"
+    );
+    assert_eq!(
+        listed_skill.effect,
+        Some(SkillEffectEnvelope::RetypeEntity {
+            entity_name: "context-graph".to_string(),
+            from_type: "File".to_string(),
+            to_type: "Repository".to_string(),
+        }),
+        "list_skills_in_store must preserve the synced structured effect envelope"
+    );
+    assert_eq!(
+        listed_skill.apply_strategy,
+        SkillApplyStrategy::PostHarvestRetype,
+        "list_skills_in_store must preserve the synced strategy tag"
     );
 }
 

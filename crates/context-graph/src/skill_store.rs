@@ -44,11 +44,30 @@ pub enum SkillProvenance {
     HumanAuthored,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SkillEffectEnvelope {
+    RetypeEntity {
+        entity_name: String,
+        from_type: String,
+        to_type: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SkillApplyStrategy {
+    #[default]
+    PostHarvestRetype,
+    PreExtractionGuidance,
+}
+
 #[derive(Debug, Clone)]
 pub struct LearnedSkill {
     pub id: String,
     pub description: String,
     pub rule: String,
+    pub effect: Option<SkillEffectEnvelope>,
+    pub apply_strategy: SkillApplyStrategy,
     pub provenance: SkillProvenance,
     pub active: bool,
     pub held_for_review: bool,
@@ -200,6 +219,29 @@ fn provenance_to_str(provenance: &SkillProvenance) -> &'static str {
     }
 }
 
+fn apply_strategy_from_str(s: &str) -> SkillApplyStrategy {
+    match s {
+        "pre-extraction-guidance" => SkillApplyStrategy::PreExtractionGuidance,
+        "post-harvest-retype" => SkillApplyStrategy::PostHarvestRetype,
+        _ => SkillApplyStrategy::PostHarvestRetype,
+    }
+}
+
+fn apply_strategy_to_str(strategy: &SkillApplyStrategy) -> &'static str {
+    match strategy {
+        SkillApplyStrategy::PostHarvestRetype => "post-harvest-retype",
+        SkillApplyStrategy::PreExtractionGuidance => "pre-extraction-guidance",
+    }
+}
+
+fn skill_effect_from_json(raw: &str) -> Option<SkillEffectEnvelope> {
+    serde_json::from_str(raw).ok()
+}
+
+fn skill_effect_to_json(effect: &SkillEffectEnvelope) -> Option<String> {
+    serde_json::to_string(effect).ok()
+}
+
 fn kind_from_str(s: &str) -> TeachingEventKind {
     match s {
         "correction" => TeachingEventKind::Correction,
@@ -256,6 +298,19 @@ fn insert_skill_row(store: &Store, skill: &LearnedSkill) -> bool {
             contextdb_core::Value::Text(skill.rule.clone()),
         ),
         (
+            "effect".to_string(),
+            skill
+                .effect
+                .as_ref()
+                .and_then(skill_effect_to_json)
+                .map(contextdb_core::Value::Text)
+                .unwrap_or(contextdb_core::Value::Null),
+        ),
+        (
+            "apply_strategy".to_string(),
+            contextdb_core::Value::Text(apply_strategy_to_str(&skill.apply_strategy).to_string()),
+        ),
+        (
             "provenance".to_string(),
             contextdb_core::Value::Text(provenance_to_str(&skill.provenance).to_string()),
         ),
@@ -278,7 +333,7 @@ fn insert_skill_row(store: &Store, skill: &LearnedSkill) -> bool {
     ]);
     execute_with_live_txid(
         &db,
-        "INSERT INTO cg_learned_skills (id, description, rule, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
+        "INSERT INTO cg_learned_skills (id, description, rule, effect, apply_strategy, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $effect, $apply_strategy, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
         "created_at",
         params,
     )
@@ -297,6 +352,15 @@ fn skill_from_row(values: &HashMap<String, contextdb_core::Value>) -> LearnedSki
     let rule = match values.get("rule") {
         Some(Value::Text(s)) => s.clone(),
         _ => String::new(),
+    };
+    let effect = match values.get("effect") {
+        Some(Value::Text(s)) => skill_effect_from_json(s),
+        _ => None,
+    }
+    .or_else(|| parse_retype_effect(&rule).map(skill_effect_from_retype));
+    let apply_strategy = match values.get("apply_strategy") {
+        Some(Value::Text(s)) => apply_strategy_from_str(s),
+        _ => SkillApplyStrategy::PostHarvestRetype,
     };
     let provenance = match values.get("provenance") {
         Some(Value::Text(s)) => provenance_from_str(s),
@@ -324,6 +388,8 @@ fn skill_from_row(values: &HashMap<String, contextdb_core::Value>) -> LearnedSki
         id,
         description,
         rule,
+        effect,
+        apply_strategy,
         provenance,
         active,
         held_for_review,
@@ -381,6 +447,12 @@ fn retype_skill_from_key(store: &Store, key: &RetypeLessonKey) -> LearnedSkill {
             "when an entity named {} is typed {} → {}",
             key.entity_name, key.from_type, key.to_type
         ),
+        effect: Some(SkillEffectEnvelope::RetypeEntity {
+            entity_name: key.entity_name.clone(),
+            from_type: key.from_type.clone(),
+            to_type: key.to_type.clone(),
+        }),
+        apply_strategy: SkillApplyStrategy::PostHarvestRetype,
         provenance: SkillProvenance::HumanCorrection,
         active: true,
         held_for_review: review_hold_active(store),
@@ -410,6 +482,12 @@ fn llm_retype_skill_from_key(
         id: retype_skill_id(key),
         description: description.to_string(),
         rule: rule.to_string(),
+        effect: Some(SkillEffectEnvelope::RetypeEntity {
+            entity_name: effect.entity_name,
+            from_type: effect.from_type,
+            to_type: effect.to_type,
+        }),
+        apply_strategy: SkillApplyStrategy::PostHarvestRetype,
         provenance: SkillProvenance::LlmAuthored,
         active: true,
         held_for_review: review_hold_active(store),
@@ -631,7 +709,7 @@ fn incumbent_retype_skill(store: &Store, key: &RetypeLessonKey) -> Option<Learne
         if skill.id == expected_id {
             return true;
         }
-        parse_retype_effect(&skill.rule).is_some_and(|effect| {
+        retype_effect_from_skill(skill).is_some_and(|effect| {
             effect.entity_name.eq_ignore_ascii_case(&key.entity_name)
                 && effect.from_type.eq_ignore_ascii_case(&key.from_type)
                 && effect.to_type.eq_ignore_ascii_case(&key.to_type)
@@ -1184,7 +1262,7 @@ pub fn skill_description_matches_chunk(description: &str, chunk: &str) -> bool {
 }
 
 fn retype_skill_scope_matches_chunk(skill: &LearnedSkill, chunk: &str) -> bool {
-    let Some(effect) = parse_retype_effect(&skill.rule) else {
+    let Some(effect) = retype_effect_from_skill(skill) else {
         return true;
     };
     let entity_name = effect.entity_name.trim();
@@ -1205,11 +1283,12 @@ fn retype_skill_scope_matches_chunk(skill: &LearnedSkill, chunk: &str) -> bool {
             .all(|token| chunk_lower.contains(token.as_str()))
 }
 
-/// Select the learned skills that should APPLY to a capture of `chunk`, by DESCRIPTION match — the
-/// relevant few, never the whole corpus. A skill is selected only when it is active, its description
-/// matches the chunk, any parsed retype rule stays inside its learned entity scope, and it is not
-/// currently held for review under the review-hold gate. With the master switch off, nothing is
-/// selected. The result preserves store order so application is deterministic.
+/// Select the post-harvest learned skills that should apply to a capture of `chunk`, by DESCRIPTION
+/// match — the relevant few, never the whole corpus. A skill is selected only when it is active, its
+/// strategy is post-harvest retype, its description matches the chunk, any parsed retype rule stays
+/// inside its learned entity scope, and it is not currently held for review under the review-hold
+/// gate. With the master switch off, nothing is selected. The result preserves store order so
+/// application is deterministic.
 ///
 /// `review_mode` reflects the caller's `cg skills review` setting for this capture: when on, a skill
 /// flagged `held_for_review` is withheld (not applied) until acknowledged; when off, an active
@@ -1220,6 +1299,42 @@ pub fn select_skills_for_chunk(
     skills_on: bool,
     review_mode: bool,
 ) -> Vec<LearnedSkill> {
+    select_skills_for_chunk_with_strategy(
+        store,
+        chunk,
+        skills_on,
+        review_mode,
+        SkillApplyStrategy::PostHarvestRetype,
+    )
+}
+
+/// Select generation-time guidance skills for the pre-extraction dispatch path.
+///
+/// These skills are intentionally not applied by the post-harvest deterministic retype seam. A
+/// caller that owns prompt assembly can fetch them before extraction and decide how to expose them
+/// to the model without widening post-harvest behavior.
+pub fn select_pre_extraction_guidance_skills_for_chunk(
+    store: &Store,
+    chunk: &str,
+    skills_on: bool,
+    review_mode: bool,
+) -> Vec<LearnedSkill> {
+    select_skills_for_chunk_with_strategy(
+        store,
+        chunk,
+        skills_on,
+        review_mode,
+        SkillApplyStrategy::PreExtractionGuidance,
+    )
+}
+
+fn select_skills_for_chunk_with_strategy(
+    store: &Store,
+    chunk: &str,
+    skills_on: bool,
+    review_mode: bool,
+    strategy: SkillApplyStrategy,
+) -> Vec<LearnedSkill> {
     if !skills_on {
         return Vec::new();
     }
@@ -1227,6 +1342,7 @@ pub fn select_skills_for_chunk(
         .into_iter()
         .filter(|skill| skill.active)
         .filter(|skill| !(review_mode && skill.held_for_review))
+        .filter(|skill| skill.apply_strategy == strategy)
         .filter(|skill| skill_description_matches_chunk(&skill.description, chunk))
         .filter(|skill| retype_skill_scope_matches_chunk(skill, chunk))
         .collect()
@@ -1326,6 +1442,29 @@ pub struct SkillRetypeEffect {
     pub to_type: String,
 }
 
+fn skill_effect_from_retype(effect: SkillRetypeEffect) -> SkillEffectEnvelope {
+    SkillEffectEnvelope::RetypeEntity {
+        entity_name: effect.entity_name,
+        from_type: effect.from_type,
+        to_type: effect.to_type,
+    }
+}
+
+fn retype_effect_from_skill(skill: &LearnedSkill) -> Option<SkillRetypeEffect> {
+    match &skill.effect {
+        Some(SkillEffectEnvelope::RetypeEntity {
+            entity_name,
+            from_type,
+            to_type,
+        }) => Some(SkillRetypeEffect {
+            entity_name: entity_name.clone(),
+            from_type: from_type.clone(),
+            to_type: to_type.clone(),
+        }),
+        None => parse_retype_effect(&skill.rule),
+    }
+}
+
 /// Parse a learned skill's rule text into its retype effect, when the rule has the canonical retype
 /// shape `"when an entity named <name> is typed <Source> → <Target>"`. Returns `None` for any rule
 /// that does not encode a retype (such a skill carries no entity-retype effect on the capture path).
@@ -1386,7 +1525,7 @@ pub fn apply_retype_skills(
 ) -> Vec<AppliedSkillEffect> {
     let mut effects = Vec::new();
     for skill in skills {
-        let Some(effect) = parse_retype_effect(&skill.rule) else {
+        let Some(effect) = retype_effect_from_skill(skill) else {
             continue;
         };
         for (key, (name, type_label)) in entity_types_by_key.iter_mut() {
@@ -1524,13 +1663,9 @@ pub fn acknowledge_skill(store: &Store, skill_id: &str) {
         .into_iter()
         .find(|row| matches!(row.values.get("id"), Some(contextdb_core::Value::Text(id)) if id == skill_id));
     let Some(existing) = existing else { return };
-    let mut values = existing.values;
-    // Update the flags.
-    values.insert(
-        "held_for_review".to_string(),
-        contextdb_core::Value::Bool(false),
-    );
-    values.insert("active".to_string(), contextdb_core::Value::Bool(true));
+    let mut skill = skill_from_row(&existing.values);
+    skill.held_for_review = false;
+    skill.active = true;
 
     // Delete then re-insert.
     let del_params = HashMap::from([(
@@ -1538,62 +1673,7 @@ pub fn acknowledge_skill(store: &Store, skill_id: &str) {
         contextdb_core::Value::Text(skill_id.to_string()),
     )]);
     let _ = db.execute("DELETE FROM cg_learned_skills WHERE id = $id", &del_params);
-
-    // Reconstruct insert params.
-    let fire_right = match values.get("fire_right") {
-        Some(contextdb_core::Value::Int64(i)) => *i,
-        _ => 0,
-    };
-    let fire_wrong = match values.get("fire_wrong") {
-        Some(contextdb_core::Value::Int64(i)) => *i,
-        _ => 0,
-    };
-    let description = match values.get("description") {
-        Some(contextdb_core::Value::Text(s)) => s.clone(),
-        _ => String::new(),
-    };
-    let rule = match values.get("rule") {
-        Some(contextdb_core::Value::Text(s)) => s.clone(),
-        _ => String::new(),
-    };
-    let provenance = match values.get("provenance") {
-        Some(contextdb_core::Value::Text(s)) => s.clone(),
-        _ => "human-correction".to_string(),
-    };
-    let insert_params = HashMap::from([
-        (
-            "id".to_string(),
-            contextdb_core::Value::Text(skill_id.to_string()),
-        ),
-        (
-            "description".to_string(),
-            contextdb_core::Value::Text(description),
-        ),
-        ("rule".to_string(), contextdb_core::Value::Text(rule)),
-        (
-            "provenance".to_string(),
-            contextdb_core::Value::Text(provenance),
-        ),
-        ("active".to_string(), contextdb_core::Value::Bool(true)),
-        (
-            "held_for_review".to_string(),
-            contextdb_core::Value::Bool(false),
-        ),
-        (
-            "fire_right".to_string(),
-            contextdb_core::Value::Int64(fire_right),
-        ),
-        (
-            "fire_wrong".to_string(),
-            contextdb_core::Value::Int64(fire_wrong),
-        ),
-    ]);
-    let _ = execute_with_live_txid(
-        &db,
-        "INSERT INTO cg_learned_skills (id, description, rule, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
-        "created_at",
-        insert_params,
-    );
+    let _ = insert_skill_row(store, &skill);
 }
 
 /// Returns all drift alerts currently active.
@@ -1746,7 +1826,10 @@ pub fn evaluate_on_heldout(skill: &LearnedSkill, heldout: &[TeachingEvent]) -> H
     // Extract the classification value the candidate rule predicts.  If the rule
     // cannot be parsed (rare fallback form), the rule carries no extractable claim
     // and scores 0.0 — it cannot be verified, so it does not pass the gate.
-    let Some(predicted_value) = extract_rule_target(&skill.rule) else {
+    let Some(predicted_value) = retype_effect_from_skill(skill)
+        .map(|effect| effect.to_type)
+        .or_else(|| extract_rule_target(&skill.rule))
+    else {
         return HeldOutResult { score: 0.0 };
     };
 
@@ -1857,6 +1940,8 @@ pub fn parse_human_authored_skill(content: &str) -> ParseSkillResult {
     let skill = LearnedSkill {
         id: uuid::Uuid::new_v4().to_string(),
         description,
+        effect: parse_retype_effect(&rule).map(skill_effect_from_retype),
+        apply_strategy: SkillApplyStrategy::PostHarvestRetype,
         rule,
         provenance: SkillProvenance::HumanAuthored,
         active: true,

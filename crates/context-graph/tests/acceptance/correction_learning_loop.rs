@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, HashMap};
 use context_graph::harness::{CaptureHarnessConfig, run_capture};
 use context_graph::ingest::{CaptureReport, CaptureRequest};
 use context_graph::skill_store::{
-    LearnedSkill, SkillProvenance, apply_correction, list_drift_alerts, list_skills_in_store,
-    list_teaching_events_in_store, persist_skill, record_firing_label,
+    LearnedSkill, SkillApplyStrategy, SkillEffectEnvelope, SkillProvenance, apply_correction,
+    list_drift_alerts, list_skills_in_store, list_teaching_events_in_store, persist_skill,
+    record_firing_label,
 };
 use context_graph::{Entity, EntityType, ListEntityFilter, Store, StoreConfig};
 use contextdb_core::Value as DbValue;
@@ -26,6 +27,14 @@ fn fresh_store() -> (tempfile::TempDir, Store) {
         ..Default::default()
     });
     (dir, store)
+}
+
+fn retype_effect(entity_name: &str, from_type: &str, to_type: &str) -> SkillEffectEnvelope {
+    SkillEffectEnvelope::RetypeEntity {
+        entity_name: entity_name.to_string(),
+        from_type: from_type.to_string(),
+        to_type: to_type.to_string(),
+    }
 }
 
 fn repository_transcript() -> String {
@@ -371,6 +380,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 id: noop_skill_id.clone(),
                 description: "context-graph module to repository co-firing guard".to_string(),
                 rule: "when an entity named context-graph is typed Module → Repository".to_string(),
+                effect: Some(retype_effect("context-graph", "Module", "Repository")),
+                apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanCorrection,
                 active: true,
                 held_for_review: false,
@@ -431,6 +442,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 id: cofired_retype_skill_id.clone(),
                 description: "context-graph module to repository co-firing guard".to_string(),
                 rule: "when an entity named context-graph is typed Module → Repository".to_string(),
+                effect: Some(retype_effect("context-graph", "Module", "Repository")),
+                apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanCorrection,
                 active: true,
                 held_for_review: false,
@@ -448,6 +461,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 id: cofired_effectful_skill_id.clone(),
                 description: "ingest module co-firing guard".to_string(),
                 rule: "when an entity named ingest is typed File → Module".to_string(),
+                effect: Some(retype_effect("ingest", "File", "Module")),
+                apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanCorrection,
                 active: true,
                 held_for_review: false,
@@ -499,6 +514,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 id: unrelated_skill_id.clone(),
                 description: "context-graph unrelated note for co-firing guard".to_string(),
                 rule: "observe context-graph without changing any entity type".to_string(),
+                effect: None,
+                apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanAuthored,
                 active: true,
                 held_for_review: false,
@@ -1000,6 +1017,12 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 rule: format!(
                     "when an entity named {entity_name} is typed {starting_type} → {intermediate_type}"
                 ),
+                effect: Some(retype_effect(
+                    &entity_name,
+                    starting_type,
+                    intermediate_type
+                )),
+                apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanCorrection,
                 active: true,
                 held_for_review: false,
@@ -1018,6 +1041,8 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 rule: format!(
                     "when an entity named {entity_name} is typed {intermediate_type} → {final_type}"
                 ),
+                effect: Some(retype_effect(&entity_name, intermediate_type, final_type)),
+                apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanCorrection,
                 active: true,
                 held_for_review: false,
@@ -1036,6 +1061,8 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 rule: format!(
                     "when an entity named {entity_name} is typed {starting_type} → {branch_type}"
                 ),
+                effect: Some(retype_effect(&entity_name, starting_type, branch_type)),
+                apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanCorrection,
                 active: true,
                 held_for_review: false,
@@ -1054,6 +1081,12 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 rule: format!(
                     "when an entity named {other_entity_name} is typed {other_starting_type} → {other_final_type}"
                 ),
+                effect: Some(retype_effect(
+                    &other_entity_name,
+                    other_starting_type,
+                    other_final_type,
+                )),
+                apply_strategy: SkillApplyStrategy::PostHarvestRetype,
                 provenance: SkillProvenance::HumanCorrection,
                 active: true,
                 held_for_review: false,

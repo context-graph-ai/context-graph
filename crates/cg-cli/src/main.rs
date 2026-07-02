@@ -1600,11 +1600,24 @@ fn skill_provenance_label(
     }
 }
 
+fn skill_apply_strategy_label(
+    strategy: &context_graph::skill_store::SkillApplyStrategy,
+) -> &'static str {
+    match strategy {
+        context_graph::skill_store::SkillApplyStrategy::PostHarvestRetype => "post-harvest-retype",
+        context_graph::skill_store::SkillApplyStrategy::PreExtractionGuidance => {
+            "pre-extraction-guidance"
+        }
+    }
+}
+
 fn skill_json(skill: &context_graph::skill_store::LearnedSkill) -> Value {
     json!({
         "id": skill.id,
         "description": skill.description,
         "rule": skill.rule,
+        "effect": skill.effect,
+        "apply_strategy": skill_apply_strategy_label(&skill.apply_strategy),
         "provenance": skill_provenance_label(&skill.provenance),
         "active": skill.active,
         "fire_right": skill.fire_right,
@@ -1620,9 +1633,10 @@ fn render_skill_cards(skills: &[context_graph::skill_store::LearnedSkill]) -> St
         .iter()
         .map(|s| {
             format!(
-                "skill {} [{}]: {}",
+                "skill {} [{} {}]: {}",
                 s.id,
                 skill_provenance_label(&s.provenance),
+                skill_apply_strategy_label(&s.apply_strategy),
                 s.description
             )
         })
