@@ -1,0 +1,22 @@
+name: buried_signal
+description: One real decision-with-reasoning buried in a chunk that is mostly tool noise. Faithful extraction finds the HOSTED_TIMEOUT=45s decision and its rationale (cold-start + large-prompt floor, avoids silent-empty on big imports), and ignores the surrounding ls/cat/build noise. Tests recall under distraction — the anti-similarity-soup case.
+allow_empty: false
+decisions:
+  must_contain:
+    - "45s"
+    - "timeout"
+  must_not_contain:
+    - "list files"
+    - "build release"
+  reasoning_must_reference_any_of:
+    - "cold"
+    - "silent-empty"
+    - "large prompt"
+observations:
+  must_contain:
+    - "10s to 45s"
+entities:
+  must_contain:
+    - name: "HOSTED_TIMEOUT"
+      type_any_of: ["Config", "Constant", "Parameter", "Concept", "Component"]
+notes: "The decision's reasoning must capture WHY 45s (cold start / large prompt / silent-empty avoidance), not just THAT the value changed. A model that extracts the value but drops the rationale partially fails."

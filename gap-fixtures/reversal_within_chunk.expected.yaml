@@ -1,0 +1,17 @@
+name: reversal_within_chunk
+description: A decision is stated then reversed inside the same chunk. Faithful extraction records the FINAL decision (custom append-only segment file), not the abandoned one (RocksDB), or records RocksDB as superseded/rejected — never as the active choice.
+allow_empty: false
+decisions:
+  must_contain:
+    - "append-only segment file"
+    - "fsync per commit"
+  must_not_contain:
+    - "use RocksDB"          # recording RocksDB as the chosen backend is the trap
+  notes: "RocksDB may appear ONLY if marked rejected/superseded. A decision row whose description asserts RocksDB as the active WAL backend is a faithfulness failure."
+observations:
+  must_contain:
+    - "rotates at 128MB"
+entities:
+  must_contain:
+    - name: "segment file"
+      type_any_of: ["Component", "File", "Module", "Concept"]
