@@ -7,6 +7,7 @@ pub mod error;
 pub mod grounding;
 pub mod harness;
 pub mod ingest;
+pub mod injection;
 pub mod llm;
 pub mod messaging;
 pub mod overlay;
@@ -26,6 +27,10 @@ pub use embedder::{
     load_observer::{EmbedderLoadEvent, EmbedderLoadObserver},
 };
 pub use error::CgError;
+pub use injection::{
+    INJECTION_TOKEN_BUDGET, InjectionIndex, InjectionLine, InjectionTier,
+    VERBATIM_SIMILARITY_THRESHOLD, build_injection_index,
+};
 pub use llm::*;
 pub use messaging::{MessageBody, MismatchKind, OverrideFailureReason};
 pub use producer::CG_EDGE_SYSTEM_TAG;

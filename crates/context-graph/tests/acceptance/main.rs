@@ -31,6 +31,7 @@ mod impact_analysis;
 mod impact_cascade_consolidation;
 mod import_parser;
 mod ingest_batch;
+mod injection_index;
 mod invalidation_lifecycle;
 mod learned_skill_store;
 mod learning_sync_split;
