@@ -604,7 +604,12 @@ fn run_hosted_capture_with_responses(
         "--consent",
     ]);
     assert_eq!(connect.code, 0, "{}", combined(&connect));
-    let output = run_in_dir_with_stdin(&harness, cwd.path(), &["record"], transcript);
+    let output = run_in_dir_with_stdin(
+        &harness,
+        cwd.path(),
+        &["record", "--understand-now"],
+        transcript,
+    );
     HostedCapture {
         harness,
         output,
@@ -1091,7 +1096,7 @@ fn enforcement_level_native_shapeonly_floor_recorded_per_call() {
 fn installed_cli_default_path_records_floor_enforcement_level() {
     let harness = extraction_harness();
     let output = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "Goal G_installed: keep installed CLI capture reliable. Entity E_installed: capture receipt path=receipt.json. Decision D_installed: installed CLI default path lands memory serves G_installed based_on E_installed. Observation O_installed: installed CLI observation lane lands on E_installed.",
     );
 
@@ -1393,6 +1398,7 @@ fn assert_cli_import_estimate_makes_no_provider_calls(harness: &CliHarness, cwd:
         cwd,
         &[
             "import",
+            "--understand-now",
             session_path.to_str().expect("utf8 session path"),
             "--tenant-id",
             "owner-tenant",
@@ -1909,8 +1915,8 @@ fn no_resolution(output: &CommandOutput) -> bool {
 #[test]
 fn cli_record_observation_emits_invalidations() {
     let harness = extraction_harness();
-    let first = harness.run_with_stdin(&["record"], AUTH_INITIAL);
-    let output = harness.run_with_stdin(&["record"], AUTH_RENAME);
+    let first = harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
+    let output = harness.run_with_stdin(&["record", "--understand-now"], AUTH_RENAME);
     let store_path = store_path_from(&[&first, &output]);
     let store = persisted_store(store_path.clone());
     let context_id = context_id_from(&[&first, &output]);
@@ -1949,8 +1955,8 @@ fn cli_record_observation_emits_invalidations() {
 #[test]
 fn cli_query_via_digest() {
     let harness = extraction_harness();
-    let first = harness.run_with_stdin(&["record"], AUTH_INITIAL);
-    let second = harness.run_with_stdin(&["record"], AUTH_RENAME);
+    let first = harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
+    let second = harness.run_with_stdin(&["record", "--understand-now"], AUTH_RENAME);
     let store_path = store_path_from(&[&first, &second]);
     let store = persisted_store(store_path.clone());
     let context_id = context_id_from(&[&first, &second]);
@@ -2022,9 +2028,9 @@ fn cli_query_via_digest() {
 fn cli_status() {
     let harness = extraction_harness();
     let empty = harness.run(&["status"]);
-    harness.run_with_stdin(&["record"], AUTH_WITH_JWT);
+    harness.run_with_stdin(&["record", "--understand-now"], AUTH_WITH_JWT);
     let first = harness.run(&["status"]);
-    harness.run_with_stdin(&["record"], CI_PIPELINE_SESSION);
+    harness.run_with_stdin(&["record", "--understand-now"], CI_PIPELINE_SESSION);
     let second = harness.run(&["status"]);
 
     assert!(combined(&empty).contains("goals: 0"));
@@ -2039,9 +2045,9 @@ fn cli_status() {
 #[test]
 fn cli_status_idempotent_on_same_session_recaptured() {
     let harness = extraction_harness();
-    let first_capture = harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    let first_capture = harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
     let first = harness.run(&["status"]);
-    let second_capture = harness.run_with_stdin(&["record"], AUTH_INITIAL);
+    let second_capture = harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
     let second = harness.run(&["status"]);
     let first_decision_id = stable_uuid_from(
         &[&first_capture, &first],
@@ -2067,7 +2073,7 @@ fn cli_status_idempotent_on_same_session_recaptured() {
 #[test]
 fn cli_by_intention() {
     let harness = extraction_harness();
-    let capture = harness.run_with_stdin(&["record"], AUTH_CURRENT_WITH_JWT);
+    let capture = harness.run_with_stdin(&["record", "--understand-now"], AUTH_CURRENT_WITH_JWT);
     let intention_id = stable_id(&capture, &["ship password-less login for acme", "G1"]);
     let store_path = store_path_from(&[&capture]);
     let store = persisted_store(store_path.clone());
@@ -2119,8 +2125,8 @@ fn cli_by_intention() {
 #[test]
 fn cli_by_entity() {
     let harness = extraction_harness();
-    let first = harness.run_with_stdin(&["record"], AUTH_INITIAL);
-    let second = harness.run_with_stdin(&["record"], AUTH_RENAME);
+    let first = harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
+    let second = harness.run_with_stdin(&["record", "--understand-now"], AUTH_RENAME);
     let entity_id = stable_id(&first, &["auth module file", "E_auth_module"]);
     let store_path = store_path_from(&[&first, &second]);
     let store = persisted_store(store_path.clone());
@@ -2177,7 +2183,7 @@ fn cli_by_entity() {
 fn cli_by_entity_renders_non_auth_entity_history_from_stored_rows() {
     let harness = extraction_harness();
     let capture = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "Webhook ingestion must stay reliable. The webhook worker file is src/webhook.rs; route webhooks through the signed worker and note the worker path is src/webhook.rs.",
     );
     let entity_id =
@@ -2195,9 +2201,12 @@ fn cli_by_entity_renders_non_auth_entity_history_from_stored_rows() {
 #[test]
 fn cli_walk_verbs_do_not_cross_context_by_default() {
     let harness = extraction_harness();
-    let client_a = harness.run_with_stdin(&["record", "--context", "client-a"], AUTH_INITIAL);
+    let client_a = harness.run_with_stdin(
+        &["record", "--understand-now", "--context", "client-a"],
+        AUTH_INITIAL,
+    );
     harness.run_with_stdin(
-        &["record", "--context", "client-b"],
+        &["record", "--understand-now", "--context", "client-b"],
         "Client B memory must stay separate, so use isolated deploy notes.",
     );
     let intention_id = stable_id(&client_a, &["ship password-less login for acme", "G1"])
@@ -2214,8 +2223,8 @@ fn cli_walk_verbs_do_not_cross_context_by_default() {
 #[test]
 fn cli_impact_analysis() {
     let harness = extraction_harness();
-    harness.run_with_stdin(&["record"], AUTH_INITIAL);
-    harness.run_with_stdin(&["record"], AUTH_RENAME);
+    harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
+    harness.run_with_stdin(&["record", "--understand-now"], AUTH_RENAME);
     let output = harness.run(&["impact"]);
     let text = combined(&output);
 
@@ -2231,16 +2240,16 @@ fn cli_impact_analysis() {
 fn cli_impact_goal_still_served_when_another_decision_serves() {
     let harness = extraction_harness();
     harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "Rollout must stay available. The primary rollout basis is src/d1.py and fallback rollout basis is src/d2.py; D1 uses the primary basis and D2 uses the fallback basis.",
     );
     harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "The primary rollout basis moved from src/d1.py to src/d1_v2.py.",
     );
     let first = harness.run(&["impact"]);
     harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "The fallback rollout basis moved from src/d2.py to src/d2_v2.py.",
     );
     let second = harness.run(&["impact"]);
@@ -2253,8 +2262,8 @@ fn cli_impact_goal_still_served_when_another_decision_serves() {
 #[test]
 fn cli_invalidation_lifecycle() {
     let harness = extraction_harness();
-    harness.run_with_stdin(&["record"], AUTH_INITIAL);
-    harness.run_with_stdin(&["record"], AUTH_RENAME);
+    harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
+    harness.run_with_stdin(&["record", "--understand-now"], AUTH_RENAME);
     let output = harness.run(&["impact"]);
     let text = combined(&output);
 
@@ -2266,8 +2275,8 @@ fn cli_invalidation_lifecycle() {
 #[test]
 fn cli_changed_surfaces_cross_session_invalidation() {
     let harness = extraction_harness();
-    harness.run_with_stdin(&["record"], AUTH_INITIAL);
-    harness.run_with_stdin(&["record"], AUTH_RENAME);
+    harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
+    harness.run_with_stdin(&["record", "--understand-now"], AUTH_RENAME);
     let changed = harness.run(&["changed"]);
     let second = harness.run(&["changed"]);
 
@@ -2281,32 +2290,32 @@ fn cli_changed_surfaces_cross_session_invalidation() {
 fn impact_standing_set_vs_changed_recent_delta_are_distinct_observables() {
     let harness = extraction_harness();
     let before = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "Track the before file at src/before.py so the before path stays visible.",
     );
     let before_invalidation = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "The before file moved from src/before.py to src/before_v2.py.",
     );
     assert_record_contains(&before, "src/before.py");
     assert_record_text(&before_invalidation, "src/before_v2.py");
     let cut = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "Track the cut file at src/cut.py so the cut path stays visible.",
     );
     let cut_invalidation = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "The cut file moved from src/cut.py to src/cut_v2.py.",
     );
     assert_record_contains(&cut, "src/cut.py");
     assert_record_text(&cut_invalidation, "src/cut_v2.py");
     let cutoff_changed = harness.run(&["changed"]);
     let after = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "Track the after file at src/after.py so the after path stays visible.",
     );
     let after_invalidation = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "The after file moved from src/after.py to src/after_v2.py.",
     );
     assert_record_contains(&after, "src/after.py");
@@ -2377,8 +2386,8 @@ fn impact_standing_set_vs_changed_recent_delta_are_distinct_observables() {
 #[test]
 fn cli_query_and_impact_emit_stable_ids_consumed_by_walk_verbs() {
     let harness = extraction_harness();
-    let first = harness.run_with_stdin(&["record"], AUTH_INITIAL);
-    let second = harness.run_with_stdin(&["record"], AUTH_RENAME);
+    let first = harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
+    let second = harness.run_with_stdin(&["record", "--understand-now"], AUTH_RENAME);
     let query = harness.run(&["query", "where is the auth module"]);
     let impact = harness.run(&["impact"]);
     let intention_id = stable_id(&query, &["ship password-less login for acme", "G1"]);
@@ -2481,7 +2490,12 @@ fn hosted_record_usage_receipt_flows_through_connected_extractor() {
     ]);
     assert_eq!(connect.code, 0, "{}", combined(&connect));
 
-    let record = run_in_dir_with_stdin(&harness, cwd.path(), &["record"], transcript);
+    let record = run_in_dir_with_stdin(
+        &harness,
+        cwd.path(),
+        &["record", "--understand-now"],
+        transcript,
+    );
     let request = provider_requests
         .recv_timeout(Duration::from_secs(5))
         .expect("record must call the configured hosted provider through ConnectedModelExtractor");
@@ -2533,7 +2547,7 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
         CompletionBehavior::SleepThenExtractHarvest,
     );
     let progress = harness.run_with_stdin_observing_provider_before_exit(
-        &["record", "--tenant-id", "progress-tenant"],
+        &["record", "--understand-now", "--tenant-id", "progress-tenant"],
         "Goal G_progress: report shipped CLI progress. Entity E_progress: progress file path=progress.rs. Decision D_progress: CLI capture progress is visible serves G_progress based_on E_progress.",
         "capture progress: chunk 1/",
         Provider::Claude,
@@ -2560,7 +2574,7 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
     let first = run_in_dir_with_stdin(
         &harness,
         dir_x.path(),
-        &["record", "--tenant-id", "owner-tenant"],
+        &["record", "--understand-now", "--tenant-id", "owner-tenant"],
         "Goal G1: converge by tenant. Entity E1: auth module path=src/auth.py. Decision D1: tenant memory lands together serves G1 based_on E1.",
     );
     let first_provider_records = completion_records_since(&harness, completions_before_first);
@@ -2568,7 +2582,7 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
     let second = run_in_dir_with_stdin(
         &harness,
         dir_y.path(),
-        &["record", "--tenant-id", "owner-tenant"],
+        &["record", "--understand-now", "--tenant-id", "owner-tenant"],
         "Goal G2: converge by tenant again. Entity E2: config file path=config/app.toml. Decision D2: second tenant capture lands together serves G2 based_on E2.",
     );
     let second_provider_records = completion_records_since(&harness, completions_before_second);
@@ -2585,7 +2599,12 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
     let other_tenant = run_in_dir_with_stdin(
         &harness,
         dir_x.path(),
-        &["record", "--tenant-id", "other-owner-tenant"],
+        &[
+            "record",
+            "--understand-now",
+            "--tenant-id",
+            "other-owner-tenant",
+        ],
         "Goal G3: isolate other tenant. Entity E3: billing file path=billing.toml. Decision D3: other tenant stays separate serves G3 based_on E3.",
     );
     let explicit = run_in_dir_with_stdin(
@@ -2593,6 +2612,7 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
         dir_x.path(),
         &[
             "record",
+            "--understand-now",
             "--tenant-id",
             "owner-tenant",
             "--context",
@@ -2604,7 +2624,7 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
     let same_tenant_second_machine = run_in_dir_with_stdin(
         &second_machine,
         dir_z.path(),
-        &["record", "--tenant-id", "owner-tenant"],
+        &["record", "--understand-now", "--tenant-id", "owner-tenant"],
         "Goal G7: converge from another machine. Entity E7: other machine path=machine.rs. Decision D7: tenant CLI memory from a second machine lands in the same context serves G7 based_on E7.",
     );
     let second_machine_provider_records =
@@ -2681,7 +2701,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
     let offline_harness = extraction_harness();
     let offline_record = offline_harness.run_with_stdin(
         &[
-            "record",
+            "record", "--understand-now",
             "--remote-server",
             "nats://127.0.0.1:1",
             "--tenant-id",
@@ -2710,7 +2730,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
     let harness = extraction_harness();
     let record = harness.run_with_stdin(
         &[
-            "record",
+            "record", "--understand-now",
             "--remote-server",
             fixture.nats_url.as_str(),
             "--tenant-id",
@@ -2880,10 +2900,12 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
 #[test]
 fn cli_query_cross_context_isolation_default_and_opt_in() {
     let harness = extraction_harness();
-    let client_a =
-        harness.run_with_stdin(&["record", "--context", "client-a"], CLIENT_A_SOX_SESSION);
+    let client_a = harness.run_with_stdin(
+        &["record", "--understand-now", "--context", "client-a"],
+        CLIENT_A_SOX_SESSION,
+    );
     let client_b = harness.run_with_stdin(
-        &["record", "--context", "client-b"],
+        &["record", "--understand-now", "--context", "client-b"],
         CLIENT_B_PUBLISH_SESSION,
     );
     assert_record_contains(&client_a, "SOX approval required before promote");
@@ -2904,10 +2926,12 @@ fn cli_query_cross_context_isolation_default_and_opt_in() {
 #[test]
 fn cross_context_isolation_holds_on_explicit_context_in_shared_directory() {
     let harness = extraction_harness();
-    let client_a =
-        harness.run_with_stdin(&["record", "--context", "client-a"], CLIENT_A_SOX_SESSION);
+    let client_a = harness.run_with_stdin(
+        &["record", "--understand-now", "--context", "client-a"],
+        CLIENT_A_SOX_SESSION,
+    );
     let client_b = harness.run_with_stdin(
-        &["record", "--context", "client-b"],
+        &["record", "--understand-now", "--context", "client-b"],
         CLIENT_B_PUBLISH_SESSION,
     );
     assert_record_contains(&client_a, "SOX approval required before promote");
@@ -2953,8 +2977,8 @@ fn read_commands_do_not_create_missing_contexts() {
 #[test]
 fn cli_first_capture_load_is_observable_not_silent() {
     let harness = extraction_harness();
-    let first = harness.run_with_stdin(&["record"], "first auth capture");
-    let second = harness.run_with_stdin(&["record"], "second auth capture");
+    let first = harness.run_with_stdin(&["record", "--understand-now"], "first auth capture");
+    let second = harness.run_with_stdin(&["record", "--understand-now"], "second auth capture");
 
     assert!(combined(&first).contains("loading bundled text embedder"));
     assert!(!combined(&second).contains("loading bundled text embedder"));

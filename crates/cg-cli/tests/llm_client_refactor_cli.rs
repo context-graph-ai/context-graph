@@ -239,7 +239,7 @@ fn cli_capture_is_a_thin_caller_of_the_library_harness() {
     let harness = extraction_harness();
 
     // Binary run: `cg record` with the parity transcript, driven by the fake provider.
-    let record = harness.run_with_stdin(&["record"], PARITY_TRANSCRIPT);
+    let record = harness.run_with_stdin(&["record", "--understand-now"], PARITY_TRANSCRIPT);
     assert_eq!(
         record.code, 0,
         "cg record must succeed against the fake provider: {}",
@@ -354,7 +354,11 @@ fn cg_import_is_a_thin_caller_of_the_library_harness() {
     support::write_file(&session, &session_body);
 
     // Binary import.
-    let import = harness.run(&["import", session.to_str().expect("utf8 path")]);
+    let import = harness.run(&[
+        "import",
+        "--understand-now",
+        session.to_str().expect("utf8 path"),
+    ]);
     assert_eq!(
         import.code, 0,
         "cg import must succeed against the fake provider: {}",
@@ -424,13 +428,13 @@ fn cg_multi_chunk_import_applies_skills_and_carries_harness_report() {
     // to Repository when its description matches the chunk. Seed it under the default context db.
     // (Seed via the same data root by first creating the db with a throwaway record, then inserting.)
     let _ = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "Goal G0: warm the store\nDecision D0: warm serves G0",
     );
     let (seed_store, _seed_ctx) = open_recorded_store(
         &harness
             .run_with_stdin(
-                &["record"],
+                &["record", "--understand-now"],
                 "Goal G0b: warm again\nDecision D0b: warm serves G0b",
             )
             .stdout,
@@ -475,6 +479,7 @@ fn cg_multi_chunk_import_applies_skills_and_carries_harness_report() {
     // Import with a small chunk window to force >1 chunk.
     let import = harness.run(&[
         "import",
+        "--understand-now",
         "--chunk-tokens",
         "20",
         session.to_str().expect("utf8 path"),
@@ -559,7 +564,7 @@ fn cg_fix_promotes_llm_authored_skill_then_multi_chunk_import_applies_without_se
              Entity E{index}: context-graph type=file\n\
              Decision D{index}: treat context-graph as the repository root serves G{index} based_on E{index}"
         );
-        let record = harness.run_with_stdin(&["record"], &transcript);
+        let record = harness.run_with_stdin(&["record", "--understand-now"], &transcript);
         assert_eq!(
             record.code, 0,
             "training record {index} must succeed: {}",
@@ -698,6 +703,7 @@ fn cg_fix_promotes_llm_authored_skill_then_multi_chunk_import_applies_without_se
 
     let import = harness.run(&[
         "import",
+        "--understand-now",
         "--context=fresh-import",
         "--chunk-tokens",
         "80",
@@ -816,7 +822,7 @@ fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
     // review item, a grouping proposal, a skill card, a drift alert. Then `cg review` must render the
     // SPECIFIC seeded content for each. HEAD has no `cg review` content surface → RED.
     let harness = extraction_harness();
-    let record = harness.run_with_stdin(&["record"], PARITY_TRANSCRIPT);
+    let record = harness.run_with_stdin(&["record", "--understand-now"], PARITY_TRANSCRIPT);
     let (store, _ctx) = open_recorded_store(&record.stdout);
 
     // KNOWN, unique content strings the CLI must echo back for each kind. The grouping name is a
@@ -1021,7 +1027,7 @@ fn six_verbs_are_the_whole_action_surface() {
 
     let harness = extraction_harness();
     // Capture so there is something to act on.
-    let _ = harness.run_with_stdin(&["record"], PARITY_TRANSCRIPT);
+    let _ = harness.run_with_stdin(&["record", "--understand-now"], PARITY_TRANSCRIPT);
 
     // REAL store-effect assertions (a verb that exits 0 but no-ops fails too).
 
@@ -1107,7 +1113,7 @@ fn group_sub_actions_have_three_distinct_store_effects() {
 
     // --- group ok: links under name1 ---
     let h_ok = extraction_harness();
-    let _ = h_ok.run_with_stdin(&["record"], PARITY_TRANSCRIPT);
+    let _ = h_ok.run_with_stdin(&["record", "--understand-now"], PARITY_TRANSCRIPT);
     let _ = h_ok.run(&["group", "ok", "alpha-group-uniquename"]);
     let ok_names = rendered_grouping_names(&h_ok);
     assert!(
@@ -1119,7 +1125,7 @@ fn group_sub_actions_have_three_distinct_store_effects() {
 
     // --- group rename: must RETITLE (name2 present, name1 GONE) ---
     let h_rn = extraction_harness();
-    let _ = h_rn.run_with_stdin(&["record"], PARITY_TRANSCRIPT);
+    let _ = h_rn.run_with_stdin(&["record", "--understand-now"], PARITY_TRANSCRIPT);
     let _ = h_rn.run(&["group", "ok", "beta-old-uniquename"]);
     let _ = h_rn.run(&["group", "rename", "beta-new-uniquename"]);
     let rn_names = rendered_grouping_names(&h_rn);
@@ -1136,7 +1142,7 @@ fn group_sub_actions_have_three_distinct_store_effects() {
 
     // --- group no: must leave intentions UNGROUPED (no store-derived grouping under my name) ---
     let h_no = extraction_harness();
-    let _ = h_no.run_with_stdin(&["record"], PARITY_TRANSCRIPT);
+    let _ = h_no.run_with_stdin(&["record", "--understand-now"], PARITY_TRANSCRIPT);
     let _ = h_no.run(&["group", "no", "gamma-rejected-uniquename"]);
     let no_names = rendered_grouping_names(&h_no);
     assert!(
@@ -1218,13 +1224,13 @@ fn cg_record_default_context_is_tenant_not_cwd_hash() {
     let rec_a = run_record_in_dir(
         &harness,
         &dir_a,
-        &["record", "--tenant-id", "founder"],
+        &["record", "--understand-now", "--tenant-id", "founder"],
         PARITY_TRANSCRIPT,
     );
     let rec_b = run_record_in_dir(
         &harness,
         &dir_b,
-        &["record", "--tenant-id", "founder"],
+        &["record", "--understand-now", "--tenant-id", "founder"],
         PARITY_TRANSCRIPT,
     );
     assert_eq!(
@@ -1265,7 +1271,7 @@ fn cg_why_resolves_the_flagged_item_through_the_library_seam() {
     let harness = extraction_harness();
 
     // Warm the store (creates the db + a context) so we can seed a pending-review row into it.
-    let record = harness.run_with_stdin(&["record"], PARITY_TRANSCRIPT);
+    let record = harness.run_with_stdin(&["record", "--understand-now"], PARITY_TRANSCRIPT);
     assert_eq!(
         record.code, 0,
         "warm-up record must succeed: {}",
