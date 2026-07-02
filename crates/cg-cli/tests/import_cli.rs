@@ -357,9 +357,18 @@ fn cli_import_claude_session_becomes_memory() {
     write_file(&session, CLAUDE_SESSION);
 
     let before = harness.run(&["status"]);
-    let dry_run = harness.run(&["import", "--dry-run", session.to_str().expect("utf8 path")]);
+    let dry_run = harness.run(&[
+        "import",
+        "--understand-now",
+        "--dry-run",
+        session.to_str().expect("utf8 path"),
+    ]);
     let after_dry_run = harness.run(&["status"]);
-    let import = harness.run(&["import", session.to_str().expect("utf8 path")]);
+    let import = harness.run(&[
+        "import",
+        "--understand-now",
+        session.to_str().expect("utf8 path"),
+    ]);
     let status = harness.run(&["status"]);
     let query = harness.run(&["query", "auth module"]);
     let impact = harness.run(&["impact"]);
@@ -393,7 +402,11 @@ fn cli_import_claude_session_becomes_memory() {
     drop(store);
     let second_session = harness.data_root.path().join("session-two.jsonl");
     write_file(&second_session, SECOND_CLAUDE_SESSION);
-    let second_import = harness.run(&["import", second_session.to_str().expect("utf8 path")]);
+    let second_import = harness.run(&[
+        "import",
+        "--understand-now",
+        second_session.to_str().expect("utf8 path"),
+    ]);
     let second_status = harness.run(&["status"]);
     let second_query = harness.run(&["query", "checkout latency"]);
     let second_goal_id = stable_uuid_from(
@@ -565,6 +578,7 @@ fn cli_import_streams_large_jsonl_in_bounded_chunks() {
     let before_calls = harness.providers.completion_count();
     let dry_run = harness.run(&[
         "import",
+        "--understand-now",
         "--dry-run",
         "--chunk-tokens",
         "10000",
@@ -572,6 +586,7 @@ fn cli_import_streams_large_jsonl_in_bounded_chunks() {
     ]);
     let import = harness.run(&[
         "import",
+        "--understand-now",
         "--chunk-tokens",
         "10000",
         session.to_str().expect("utf8 path"),
@@ -653,8 +668,18 @@ fn cli_import_default_window_is_capped_for_real_provider_output_budget() {
     write_file(&session, &large_chunked_session(18));
 
     let before_calls = harness.providers.completion_count();
-    let dry_run = harness.run(&["import", "--dry-run", session.to_str().expect("utf8 path")]);
-    let estimate = harness.run(&["import", "--estimate", session.to_str().expect("utf8 path")]);
+    let dry_run = harness.run(&[
+        "import",
+        "--understand-now",
+        "--dry-run",
+        session.to_str().expect("utf8 path"),
+    ]);
+    let estimate = harness.run(&[
+        "import",
+        "--understand-now",
+        "--estimate",
+        session.to_str().expect("utf8 path"),
+    ]);
     let dry_run_json = output_json(&dry_run).expect("dry-run json");
     let estimate_json = output_json(&estimate).expect("estimate json");
 
@@ -698,6 +723,7 @@ fn cli_import_rolls_plain_long_session_into_one_digest_without_label_markers() {
     let before_calls = harness.providers.completion_count();
     let import = harness.run(&[
         "import",
+        "--understand-now",
         "--chunk-tokens=2500",
         session.to_str().expect("utf8 path"),
     ]);
@@ -738,12 +764,14 @@ fn cli_import_rejects_malformed_chunk_options_loudly() {
 
     let bad_tokens = harness.run(&[
         "import",
+        "--understand-now",
         "--chunk-tokens",
         "abc",
         session.to_str().expect("utf8 path"),
     ]);
     let bad_fraction = harness.run(&[
         "import",
+        "--understand-now",
         "--context-fraction=1.5",
         session.to_str().expect("utf8 path"),
     ]);
@@ -776,7 +804,11 @@ fn cli_import_without_model_is_verbatim_no_derived_graph() {
     let session = harness.data_root.path().join("session.jsonl");
     write_file(&session, CLAUDE_SESSION);
 
-    let import = harness.run(&["import", session.to_str().expect("utf8 path")]);
+    let import = harness.run(&[
+        "import",
+        "--understand-now",
+        session.to_str().expect("utf8 path"),
+    ]);
     let status = harness.run(&["status"]);
     let store_path = store_path_from(&[&import, &status]);
     let store_path_ref = store_path.as_deref();
@@ -817,7 +849,11 @@ fn cli_import_auth_replacement_uses_extractor_not_record_shorthand() {
     let session = harness.data_root.path().join("auth-replacement.jsonl");
     write_file(&session, AUTH_REPLACEMENT_CLAUDE_SESSION);
 
-    let import = harness.run(&["import", session.to_str().expect("utf8 path")]);
+    let import = harness.run(&[
+        "import",
+        "--understand-now",
+        session.to_str().expect("utf8 path"),
+    ]);
     let status = harness.run(&["status"]);
     let store_path = store_path_from(&[&import, &status]);
     let store_path_ref = store_path.as_deref();
@@ -852,7 +888,7 @@ fn cli_record_auth_replacement_uses_extractor_not_record_shorthand() {
     let harness = extraction_harness();
 
     let record = harness.run_with_stdin(
-        &["record"],
+        &["record", "--understand-now"],
         "We are migrating the auth handler this week. Replace the auth handler with src/authentication.py.",
     );
     let status = harness.run(&["status"]);
@@ -889,7 +925,11 @@ fn cli_import_rejects_bulk_single_file_only() {
     let harness = CliHarness::new();
     let bulk_dir = tempfile::tempdir().expect("bulk dir");
     let before = harness.run(&["status"]);
-    let output = harness.run(&["import", bulk_dir.path().to_str().expect("utf8 dir")]);
+    let output = harness.run(&[
+        "import",
+        "--understand-now",
+        bulk_dir.path().to_str().expect("utf8 dir"),
+    ]);
     let after = harness.run(&["status"]);
 
     assert_ne!(output.code, 0);
@@ -906,7 +946,11 @@ fn cli_record_is_clean_text_escape_hatch_not_a_parser() {
     let import_harness = extraction_harness();
     let import_session = import_harness.data_root.path().join("session.jsonl");
     write_file(&import_session, CLAUDE_SESSION);
-    let import = import_harness.run(&["import", import_session.to_str().expect("utf8 path")]);
+    let import = import_harness.run(&[
+        "import",
+        "--understand-now",
+        import_session.to_str().expect("utf8 path"),
+    ]);
     let import_status = import_harness.run(&["status"]);
     let import_store_path = store_path_from(&[&import, &import_status]);
     let import_store_path_ref = import_store_path.as_deref();
@@ -914,7 +958,11 @@ fn cli_record_is_clean_text_escape_hatch_not_a_parser() {
         persisted_text_values(import_store_path_ref, "digests", "summary");
 
     let before_record = harness.run(&["status"]);
-    let record = harness.run(&["record", session.to_str().expect("utf8 path")]);
+    let record = harness.run(&[
+        "record",
+        "--understand-now",
+        session.to_str().expect("utf8 path"),
+    ]);
     let after_record = harness.run(&["status"]);
     let record_store_path = store_path_from(&[&record, &after_record]);
     let record_store_path_ref = record_store_path.as_deref();
@@ -985,7 +1033,7 @@ fn cli_record_is_clean_text_escape_hatch_not_a_parser() {
 fn cli_import_missing_file_typed_error() {
     let harness = CliHarness::new();
     let before = harness.run(&["status"]);
-    let output = harness.run(&["import", "./does-not-exist.jsonl"]);
+    let output = harness.run(&["import", "--understand-now", "./does-not-exist.jsonl"]);
     let after = harness.run(&["status"]);
 
     assert_ne!(output.code, 0);
@@ -999,7 +1047,11 @@ fn cli_import_unknown_format_surfaces_typed_error_to_user() {
     let path = harness.data_root.path().join("session.unknownext");
     write_file(&path, "unknown format");
     let before = harness.run(&["status"]);
-    let output = harness.run(&["import", path.to_str().expect("utf8 path")]);
+    let output = harness.run(&[
+        "import",
+        "--understand-now",
+        path.to_str().expect("utf8 path"),
+    ]);
     let after = harness.run(&["status"]);
 
     assert_ne!(output.code, 0);

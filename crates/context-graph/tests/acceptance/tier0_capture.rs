@@ -8,8 +8,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use context_graph::ListEntityFilter;
 use context_graph::capture_sync_status::context_graph_sync_table_contract;
 use context_graph::embedder::mock::LexicalMockEmbedder;
+use context_graph::ingest::memory_counts;
 use context_graph::tier0::{
     self, ForgetSelector, Tier0CaptureRequest, capture_tier0, forget_raw, queue_counts,
     raw_footprint, salience_clean, set_raw_retention_days,
@@ -174,6 +176,50 @@ fn tier0_capture_makes_zero_model_calls() {
     .expect("capture");
     assert_eq!(report.model_calls, 0);
     assert!(report.digests_written >= 1);
+}
+
+#[test]
+fn tier0_default_writes_no_graph_rows_only_digest_chunk_queue() {
+    let (_dir, store) = fresh_store();
+    let report = capture_tier0(
+        &store,
+        request(
+            "User: adopt postgres for the primary datastore\nAssistant: agreed, postgres it is",
+            0,
+        ),
+    )
+    .expect("capture");
+    let ctx = context_id(&store);
+
+    // The default tier-0 path writes ONLY a digest + raw chunk + queue row — never structured graph.
+    assert!(report.digests_written >= 1, "a verbatim digest is written");
+    assert_eq!(
+        raw_footprint(&store, ctx).expect("footprint").chunk_count,
+        report.chunks_kept,
+        "the raw chunk is kept"
+    );
+    assert_eq!(
+        queue_counts(&store, ctx).expect("queue").pending,
+        report.digests_written,
+        "each digest is queued for understanding"
+    );
+
+    let counts = memory_counts(&store, ctx).expect("counts");
+    assert_eq!(
+        (counts.goals, counts.decisions, counts.observations),
+        (0, 0, 0),
+        "tier-0 default extracts NO intentions/decisions/observations — understanding is deferred"
+    );
+    assert!(
+        store
+            .list_entities(ListEntityFilter {
+                context_id: Some(ctx),
+                ..Default::default()
+            })
+            .expect("entities")
+            .is_empty(),
+        "tier-0 default extracts no entities"
+    );
 }
 
 #[test]
