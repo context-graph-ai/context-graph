@@ -764,7 +764,7 @@ fn context_by_label(store: &Store, label: &str) -> Result<Context> {
     })
 }
 
-fn map_engine(err: contextdb_core::Error) -> CgError {
+pub(crate) fn map_engine(err: contextdb_core::Error) -> CgError {
     CgError::Engine(format!("unexpected engine error: {err}"))
 }
 
