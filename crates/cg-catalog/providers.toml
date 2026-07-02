@@ -1,3 +1,16 @@
+# Local in-process understanding provider (style: local-gguf).
+#
+# The bundled understanding model (catalog id `gemma4-e2b-it-q4`) is NOT an HTTP or CLI provider:
+# it is a local catalog artifact (a single-file GGUF), dispatched IN-PROCESS by `cg-local-llm`
+# exactly like the bundled embedders are dispatched by candle — no binary, no endpoint, no server.
+# Its structured-output style is `local-gguf`: the capture schema is compiled to a llama.cpp GBNF
+# grammar and attached to the sampler, so the reply is structurally forced to shape and reported as
+# `Native`; on a schema that cannot be represented as a grammar it degrades to the prompt-block
+# floor and reports `Floor` (achieved-not-configured, finalized from the observed reply). Because
+# selection is by the local GGUF artifact rather than a provider connection, there is no
+# `[providers.local]` HTTP/CLI row here — the dispatch lives on the catalog local-artifact path
+# (`understand_local_gguf`), which is the same route the embedders take.
+
 [providers.claude]
 binary = "claude"
 structured_output = "none"
