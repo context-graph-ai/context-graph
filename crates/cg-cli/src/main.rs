@@ -20,15 +20,13 @@ use cg_cli_conventions::{
     model_byok_status_exit_code,
 };
 use context_graph::harness::{
-    CaptureHarnessConfig, CaptureHarnessReport, SchemaDescriptor, run_capture,
-    run_capture_into_digest, run_capture_verbatim,
+    CaptureHarnessConfig, CaptureHarnessReport, SchemaDescriptor, run_capture_into_digest,
 };
 use context_graph::ingest::{
     CaptureReport, CaptureRequest, ConversationExtractor, DecisionRelationClassification,
     DecisionRelationRequest, DecisionRelationSeed, ExtractionPriorDecision, ExtractionRequest,
-    HarvestCounts, ImportParser, RollingCaptureAccumulator, StructuredHarvest,
-    changed_since_context_cursor, digest_source_ids_for_context, memory_counts, parser_for_format,
-    record_conversation, standing_impact,
+    HarvestCounts, ImportParser, StructuredHarvest, changed_since_context_cursor,
+    digest_source_ids_for_context, memory_counts, parser_for_format, standing_impact,
 };
 use context_graph::tier0::{
     self, ForgetReport, ForgetSelector, Tier0CaptureReport, Tier0CaptureRequest, capture_tier0,
@@ -65,7 +63,6 @@ const INGESTION_EXPECTATION: &str = "automatic capture is ready for cg record an
 const DEFAULT_IMPORT_MODEL_CONTEXT_TOKENS: usize = 131_072;
 const DEFAULT_IMPORT_CONTEXT_FRACTION: f32 = 0.5;
 const DEFAULT_IMPORT_CHUNK_WINDOW: usize = 16_000;
-const MIN_ADAPTIVE_IMPORT_CHUNK_CHARS: usize = 2_000;
 const IMPORT_PROMPT_OVERHEAD_TOKENS: usize = 4_096;
 const IMPORT_OUTPUT_BUDGET_TOKENS: usize = 4_096;
 const IMPORT_RUNNING_STATE_CAP_TOKENS: usize = 4_096;
@@ -233,10 +230,12 @@ fn handle_record(args: &[String]) -> i32 {
         Ok(context) => context,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
-    // Eager opt-in (`--understand-now`): run the shipped synchronous model-capture pipeline — the
-    // hosted-quality/speed lever. This is the pre-tier-0 default behavior, now explicit.
+    // Eager opt-in (`--understand-now`): the SAME two-step understanding path the background worker
+    // runs, but in the foreground. First deterministic tier-0 capture (verbatim digest + kept chunk
+    // + queue row per chunk), THEN a blocking drain of exactly those just-captured digests through
+    // the queue drainer. There is ONE understanding implementation — no second, duplicate pipeline.
     if has_flag(args, "--understand-now") {
-        let progress_chunk_window = match record_progress_chunk_window(args) {
+        let chunk_window = match record_progress_chunk_window(args) {
             Ok(window) => window,
             Err(message) => {
                 return memory_failure(
@@ -248,41 +247,16 @@ fn handle_record(args: &[String]) -> i32 {
                 );
             }
         };
-        let request = CaptureRequest {
+        let request = Tier0CaptureRequest {
             context_label: context_label.clone(),
+            session_ref: capture_session_ref(args, None),
             transcript: input,
-            model_available: memory_capture_connection_name(&root).is_some(),
+            source: "cg-record".to_string(),
+            chunk_window,
         };
-        let progress_total_chunks =
-            approximate_capture_chunk_count(&request.transcript, progress_chunk_window);
-        let capture_config = cli_capture_harness_config(args, progress_chunk_window);
-        let descriptor = capture_config.schema_descriptor().unwrap_or_default();
-        let extractor =
-            ConnectedModelExtractor::for_context(&root, context.id, descriptor).map(|extractor| {
-                extractor.with_progress_timer(capture_progress_timer(progress_total_chunks))
-            });
-        let (report, harness_report) = match if let Some(extractor) = &extractor {
-            run_capture(&store, request, extractor, &capture_config)
-        } else {
-            record_conversation(&store, request)
-                .map(|report| (report, CaptureHarnessReport::default()))
-        } {
+        let tier0 = match capture_tier0(&store, request) {
             Ok(report) => report,
-            Err(err) => {
-                if let Some(extractor) = &extractor {
-                    let usage = extractor.drain_model_usage();
-                    if !usage.is_empty() {
-                        return cg_failure_with_usage(
-                            err,
-                            &db_path,
-                            &context_label,
-                            context.id,
-                            usage,
-                        );
-                    }
-                }
-                return cg_failure(err, &db_path, &context_label);
-            }
+            Err(err) => return cg_failure(err, &db_path, &context_label),
         };
         write_last_record_tx(
             &root,
@@ -292,14 +266,31 @@ fn handle_record(args: &[String]) -> i32 {
         if first_load {
             mark_first_capture_loaded(&root);
         }
-        print_capture_report_with_harness(
-            &report,
-            Some(&harness_report),
-            &db_path,
+        if memory_capture_connection_name(&root).is_none() {
+            // No connected model: tier-0 kept the verbatim digest; there is nothing to understand.
+            print_understand_now_no_graph(
+                &store,
+                context.id,
+                "model-free capture: kept verbatim tier-0 digest, no derived graph",
+                None,
+                None,
+                None,
+                &db_path,
+                &context_label,
+            );
+            return 0;
+        }
+        return understand_now_foreground(
+            &root,
+            &store,
             &context_label,
             context.id,
+            &tier0.digest_ids,
+            None,
+            None,
+            None,
+            &db_path,
         );
-        return 0;
     }
     // Tier-0 deterministic capture is the DEFAULT front door: a verbatim digest + local embedding +
     // kept raw chunk + durable understanding-queue row per chunk, in one atomic transaction, with
@@ -472,19 +463,62 @@ fn handle_import(args: &[String]) -> i32 {
         Ok(context) => context,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
-    // Eager opt-in (`--understand-now`): run the shipped synchronous model-capture pipeline over the
-    // reconstructed session — the hosted-quality/speed lever, the pre-tier-0 import behavior.
+    // Eager opt-in (`--understand-now`): the SAME two-step understanding path the background worker
+    // runs, in the foreground. Deterministic tier-0 capture of the reconstructed session (N per-chunk
+    // verbatim digests + queue rows), THEN a blocking drain of exactly those digests through the
+    // queue drainer. One understanding implementation; no duplicate synchronous pipeline. Multi-chunk
+    // imports now keep N per-chunk digests each understood in its own pass — no rolling condensation,
+    // so both ends survive with no decay.
     if has_flag(args, "--understand-now") {
-        return import_understand_now(
+        let source_chunks = match collect_import_source_chunks(&path, parser.as_ref(), chunk_options)
+        {
+            Ok(chunks) => chunks,
+            Err(err) => return cg_failure(err, &db_path, &context_label),
+        };
+        let transcript = source_chunks.join("\n");
+        let request = Tier0CaptureRequest {
+            context_label: context_label.clone(),
+            session_ref: capture_session_ref(args, Some(&path)),
+            transcript,
+            source: "cg-import".to_string(),
+            chunk_window: chunk_options.max_chars,
+        };
+        let tier0 = match capture_tier0(&store, request) {
+            Ok(report) => report,
+            Err(err) => return cg_failure(err, &db_path, &context_label),
+        };
+        write_last_record_tx(
+            &root,
+            context.id,
+            max_pending_invalidation_tx(&store, context.id),
+        );
+        let import_chunks = Some(tier0.digest_ids.len().max(1));
+        let resolved_chunk_window = Some(chunk_options.resolved_chunk_window);
+        let model_context_tokens = Some(chunk_options.model_context_tokens);
+        if memory_capture_connection_name(&root).is_none() {
+            // No connected model: tier-0 kept the verbatim digests; nothing to understand.
+            print_understand_now_no_graph(
+                &store,
+                context.id,
+                "model-free capture: kept verbatim tier-0 digests, no derived graph",
+                import_chunks,
+                resolved_chunk_window,
+                model_context_tokens,
+                &db_path,
+                &context_label,
+            );
+            return 0;
+        }
+        return understand_now_foreground(
             &root,
             &store,
-            &path,
-            parser.as_ref(),
-            chunk_options,
-            args,
-            &db_path,
             &context_label,
             context.id,
+            &tier0.digest_ids,
+            import_chunks,
+            resolved_chunk_window,
+            model_context_tokens,
+            &db_path,
         );
     }
     // `cg import` is a thin caller of the tier-0 library capture path, exactly like `cg record`. It
@@ -519,96 +553,6 @@ fn handle_import(args: &[String]) -> i32 {
     );
     print_tier0_report(&report, elapsed, &db_path, &context_label, context.id);
     maybe_kick_understanding_worker(args);
-    0
-}
-
-/// The eager (`--understand-now`) import path: the shipped synchronous model-capture pipeline over
-/// the reconstructed session. This is the pre-tier-0 default behavior, now reached explicitly.
-#[allow(clippy::too_many_arguments)]
-fn import_understand_now(
-    root: &Path,
-    store: &Store,
-    path: &Path,
-    parser: &dyn ImportParser,
-    chunk_options: ImportChunkOptions,
-    args: &[String],
-    db_path: &Path,
-    context_label: &str,
-    context_id: ContextId,
-) -> i32 {
-    let source_chunks = match collect_import_source_chunks(path, parser, chunk_options) {
-        Ok(chunks) => chunks,
-        Err(err) => return cg_failure(err, db_path, context_label),
-    };
-    let import_total_chunks = source_chunks.len().max(1);
-    let capture_config = CaptureHarnessConfig {
-        chunk_window: Some(chunk_options.resolved_chunk_window.max(1)),
-        skills_enabled: !has_flag(args, "--no-skills"),
-        ..CaptureHarnessConfig::default()
-    };
-    let descriptor = capture_config.schema_descriptor().unwrap_or_default();
-    let extractor =
-        ConnectedModelExtractor::for_context(root, context_id, descriptor).map(|extractor| {
-            extractor.with_progress_timer(capture_progress_timer(import_total_chunks))
-        });
-
-    // No model: roll the whole verbatim session into one condensed memory. Model, one source chunk:
-    // a single capture through run_capture. Model, many chunks: per-chunk extraction rolled into one
-    // condensed memory through the library accumulator + terminal capture.
-    let (mut report, harness_report) = match extractor.as_ref() {
-        None => {
-            let transcript = source_chunks.join("\n");
-            let request = CaptureRequest {
-                context_label: context_label.to_string(),
-                transcript,
-                model_available: false,
-            };
-            match run_capture_verbatim(store, request, &capture_config) {
-                Ok(result) => result,
-                Err(err) => return cg_failure(err, db_path, context_label),
-            }
-        }
-        Some(extractor) if source_chunks.len() <= 1 => {
-            let transcript = source_chunks.into_iter().next().unwrap_or_default();
-            let request = CaptureRequest {
-                context_label: context_label.to_string(),
-                transcript,
-                model_available: true,
-            };
-            match run_capture(store, request, extractor, &capture_config) {
-                Ok(result) => result,
-                Err(err) => return cg_failure(err, db_path, context_label),
-            }
-        }
-        Some(extractor) => match import_rolling_capture(
-            store,
-            context_label,
-            &source_chunks,
-            extractor,
-            chunk_options.resolved_chunk_window,
-            capture_config.skills_enabled,
-        ) {
-            Ok(result) => result,
-            Err(err) => return cg_failure(err, db_path, context_label),
-        },
-    };
-    if report.import_chunks.is_none() {
-        report.import_chunks = Some(import_total_chunks);
-    }
-    report.resolved_chunk_window = Some(chunk_options.resolved_chunk_window);
-    report.model_context_tokens = Some(chunk_options.model_context_tokens);
-    write_last_record_tx(
-        root,
-        context_id,
-        max_pending_invalidation_tx(store, context_id),
-    );
-    print_capture_report_with_harness(
-        &report,
-        Some(&harness_report),
-        db_path,
-        context_label,
-        context_id,
-    );
     0
 }
 
@@ -915,6 +859,9 @@ fn drain_context_queue(
     };
     // Snapshot the pending set once; retries land on a later drain, never an in-run loop.
     let pending = list_pending_digests(store, context_id, None)?;
+    // How many chunks this drain will understand — the denominator for the live progress line the
+    // foreground `--understand-now` path streams (the Capability-A wedged-vs-slow liveness signal).
+    let progress_total = only.map(|set| set.len()).unwrap_or(pending.len()).max(1);
     for pending_digest in pending {
         if let Some(only) = only {
             if !only.contains(&pending_digest.digest_id) {
@@ -941,6 +888,15 @@ fn drain_context_queue(
         let descriptor = config.schema_descriptor().unwrap_or_default();
         let Some(extractor) = ConnectedModelExtractor::for_context(root, context_id, descriptor)
             .map(|extractor| extractor.with_steering(steering))
+            .map(|extractor| {
+                // Foreground drains (`cg understand`, `--understand-now`) stream a live per-call
+                // progress line during the model call; the silent background worker does not.
+                if progress {
+                    extractor.with_progress_timer(capture_progress_timer(progress_total))
+                } else {
+                    extractor
+                }
+            })
         else {
             // Model connection vanished mid-drain; leave the claim to time out on a later run.
             counts.claim_skipped += 1;
@@ -1009,6 +965,197 @@ fn drain_context_queue(
         }
     }
     Ok(DrainOutcome { counts, reports })
+}
+
+/// The eager (`--understand-now`) foreground path, shared by `cg record` and `cg import`. Tier-0
+/// deterministic capture has ALREADY written the digests + queue rows; this drains EXACTLY those
+/// just-captured digests through the SAME queue drainer the background worker uses — blocking until
+/// they are understood on the connected model — then prints ONE aggregated capture receipt with the
+/// Capability-A cost/time lane. This is the single understanding path: there is no second, duplicate
+/// CLI capture pipeline. Requires a connected model (the caller handles the model-free case).
+#[allow(clippy::too_many_arguments)]
+fn understand_now_foreground(
+    root: &Path,
+    store: &Store,
+    context_label: &str,
+    context_id: ContextId,
+    digest_ids: &[DigestId],
+    import_chunks: Option<usize>,
+    resolved_chunk_window: Option<usize>,
+    model_context_tokens: Option<usize>,
+    db_path: &Path,
+) -> i32 {
+    let targets: std::collections::HashSet<DigestId> = digest_ids.iter().copied().collect();
+    let budget = DrainBudget::default();
+    let mut spent: Vec<ModelCallUsage> = Vec::new();
+    let started = Instant::now();
+    let outcome = match drain_context_queue(
+        root,
+        store,
+        context_label,
+        context_id,
+        &budget,
+        &mut spent,
+        true,
+        Some(&targets),
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => return cg_failure(err, db_path, context_label),
+    };
+    // Record the foreground drain on the last-run understanding lane so `cg status` reflects it,
+    // exactly like the background worker and plain `cg understand`.
+    let summary = DrainSummary {
+        counts: outcome.counts,
+        spent,
+        elapsed: started.elapsed(),
+        pending_after: queue_counts(store, context_id)
+            .map(|counts| counts.pending)
+            .unwrap_or(0),
+    };
+    persist_last_understanding_run(store, &summary);
+
+    match aggregate_capture_reports(
+        outcome.reports,
+        import_chunks,
+        resolved_chunk_window,
+        model_context_tokens,
+    ) {
+        Some((report, harness)) => {
+            print_capture_report_with_harness(
+                &report,
+                Some(&harness),
+                db_path,
+                context_label,
+                context_id,
+            );
+        }
+        None => {
+            // The just-captured digests understood to nothing (empty harvest, or nothing to drain):
+            // the tier-0 verbatim digests are kept, but no structured graph was derived.
+            print_understand_now_no_graph(
+                store,
+                context_id,
+                "model completed: no structured graph derived from this capture",
+                import_chunks,
+                resolved_chunk_window,
+                model_context_tokens,
+                db_path,
+                context_label,
+            );
+        }
+    }
+    0
+}
+
+/// Fold the per-digest capture reports a foreground drain produced into ONE capture receipt: sum the
+/// captured harvest counts, concatenate the usage / provenance / invalidation / stable-id lanes,
+/// keep the final store totals from the last chunk, union the applied/withheld skills, and stamp the
+/// import framing. Returns `None` when no digest was understood (empty backlog or every target
+/// skipped) so the caller prints an honest no-derived-graph receipt.
+fn aggregate_capture_reports(
+    reports: Vec<(CaptureReport, CaptureHarnessReport)>,
+    import_chunks: Option<usize>,
+    resolved_chunk_window: Option<usize>,
+    model_context_tokens: Option<usize>,
+) -> Option<(CaptureReport, CaptureHarnessReport)> {
+    if reports.is_empty() {
+        return None;
+    }
+    let chunk_count = reports.len();
+    // Base the aggregate on the LAST chunk's report (its `total_harvest` is the final store total
+    // and its `mode` is valid), then rebuild every accumulating lane from all chunks.
+    let (mut report, mut harness) = reports.last().cloned().unwrap();
+    report.last_harvest = HarvestCounts::default();
+    report.model_usage = Vec::new();
+    report.invalidations = Vec::new();
+    report.provenance_edges = Vec::new();
+    report.derived_items = Vec::new();
+    report.dedup_events = Vec::new();
+    report.stable_ids = std::collections::BTreeMap::new();
+    harness.applied_skill_ids = Vec::new();
+    harness.withheld_skill_ids = Vec::new();
+    harness.stage3_resolution_verdicts = Vec::new();
+    harness.judge_call_count = 0;
+    harness.embeddings_generated = 0;
+    for (r, h) in &reports {
+        report.last_harvest.goals += r.last_harvest.goals;
+        report.last_harvest.decisions += r.last_harvest.decisions;
+        report.last_harvest.observations += r.last_harvest.observations;
+        report.model_usage.extend(r.model_usage.iter().cloned());
+        report.invalidations.extend(r.invalidations.iter().cloned());
+        report
+            .provenance_edges
+            .extend(r.provenance_edges.iter().cloned());
+        report.derived_items.extend(r.derived_items.iter().cloned());
+        report.dedup_events.extend(r.dedup_events.iter().cloned());
+        for (key, value) in &r.stable_ids {
+            report.stable_ids.insert(key.clone(), value.clone());
+        }
+        harness
+            .applied_skill_ids
+            .extend(h.applied_skill_ids.iter().cloned());
+        harness
+            .withheld_skill_ids
+            .extend(h.withheld_skill_ids.iter().cloned());
+        harness
+            .stage3_resolution_verdicts
+            .extend(h.stage3_resolution_verdicts.iter().cloned());
+        harness.judge_call_count += h.judge_call_count;
+        harness.embeddings_generated += h.embeddings_generated;
+    }
+    harness.applied_skill_ids.sort();
+    harness.applied_skill_ids.dedup();
+    harness.withheld_skill_ids.sort();
+    harness.withheld_skill_ids.dedup();
+    report.import_chunks = import_chunks.or(Some(chunk_count));
+    report.resolved_chunk_window = resolved_chunk_window;
+    report.model_context_tokens = model_context_tokens;
+    // Multi-chunk import is now N per-chunk tier-0 digests each understood in its own pass — no
+    // rolling condensation, so both ends survive with no decay. (Single-chunk keeps the terminal
+    // path's own "captured structured memory" message.)
+    if report.import_chunks.is_some_and(|chunks| chunks > 1) {
+        let chunks = report.import_chunks.unwrap();
+        report.message = format!(
+            "understood import in {chunks} chunks as {chunks} per-chunk memories (one digest per chunk, no condensation decay)"
+        );
+        report.digest_summary = format!("tier-0 per-chunk import: {chunks} chunks");
+    }
+    Some((report, harness))
+}
+
+/// Print an honest capture receipt for the `--understand-now` path when no structured graph was
+/// derived: the model-free case (tier-0 kept the verbatim digests, no model to understand them) or a
+/// model run that harvested nothing. Carries the store totals, an empty captured/stable-id lane, and
+/// the import framing, so a caller reading `/totals` / locators still finds them.
+#[allow(clippy::too_many_arguments)]
+fn print_understand_now_no_graph(
+    store: &Store,
+    context_id: ContextId,
+    message: &str,
+    import_chunks: Option<usize>,
+    resolved_chunk_window: Option<usize>,
+    model_context_tokens: Option<usize>,
+    db_path: &Path,
+    context_label: &str,
+) {
+    let totals = memory_counts(store, context_id).unwrap_or_default();
+    print_memory_json(
+        json!({
+            "ok": true,
+            "captured": counts_json(&HarvestCounts::default()),
+            "totals": counts_json(&totals),
+            "message": message,
+            "digest_summary": "",
+            "stable_ids": {},
+            "import_chunks": import_chunks,
+            "resolved_chunk_window": resolved_chunk_window,
+            "model_context_tokens": model_context_tokens,
+            "rendered": message,
+        }),
+        db_path,
+        context_label,
+        Some(context_id),
+    );
 }
 
 /// Acquire the exclusive per-data-root understanding-worker lock. Returns the held file (the flock
@@ -1206,199 +1353,11 @@ fn print_forget_report(
     );
 }
 
-// ---- Eager (`--understand-now`) synchronous model-capture path -------------------------------
-// Restored for the opt-in eager capture flag. The DEFAULT capture path is deterministic tier-0;
-// `--understand-now` routes `cg record`/`cg import` through this shipped synchronous model pipeline
-// (the hosted-quality/speed lever). WP2 will re-express this as tier-0 capture + a foreground queue
-// drain so there is ONE understanding implementation.
-
-/// Build the capture-harness config from the CLI flags. The chunk window threads through so a long
-/// session windows into multiple Stage-1 extraction calls; the rest take their library defaults.
-fn cli_capture_harness_config(args: &[String], chunk_window: usize) -> CaptureHarnessConfig {
-    CaptureHarnessConfig {
-        chunk_window: Some(chunk_window.max(1)),
-        skills_enabled: !has_flag(args, "--no-skills"),
-        ..CaptureHarnessConfig::default()
-    }
-}
-
-/// Roll a multi-chunk import into one condensed memory through the library rolling accumulator and
-/// the SHARED terminal capture path. Each bounded source chunk is extracted on its own model call
-/// (so both the early and late ends survive condensation); the accreted harvest is then handed to
-/// the library `run_capture` — the same terminal path `cg record` and single-chunk import use — so a
-/// promoted learned skill is selected and applied here too, and the import receipt carries the same
-/// real `CaptureHarnessReport` markers. The pass-through extractor returns the already-merged harvest
-/// and delegates decision-relation classification + usage accounting to the real connected model.
-fn import_rolling_capture(
-    store: &Store,
-    context_label: &str,
-    source_chunks: &[String],
-    extractor: &ConnectedModelExtractor,
-    resolved_chunk_window: usize,
-    skills_enabled: bool,
-) -> context_graph::Result<(CaptureReport, CaptureHarnessReport)> {
-    let mut chunks = 0;
-    let mut rolling = RollingCaptureAccumulator::new(IMPORT_RUNNING_STATE_CAP_TOKENS);
-    for chunk in source_chunks {
-        extract_import_chunk_adaptive(context_label, chunk, extractor, &mut rolling, &mut chunks)?;
-    }
-    let merged = rolling.into_harvest();
-    // The transcript handed to the shared terminal path is the whole session text, so learned-skill
-    // selection (which matches a skill's description against the capture text) sees the real tokens
-    // of every chunk — not just a condensed summary.
-    let transcript = source_chunks.join("\n");
-    let pass_through = MergedHarvestExtractor {
-        harvest: merged,
-        relation_classifier: extractor,
-    };
-    // The per-chunk windowing already ran above; the shared terminal path drives the merged harvest
-    // in one pass (chunk_window = None), honoring the `--no-skills` switch.
-    let config = CaptureHarnessConfig {
-        skills_enabled,
-        ..CaptureHarnessConfig::default()
-    };
-    let (mut report, harness_report) = run_capture(
-        store,
-        CaptureRequest {
-            context_label: context_label.to_string(),
-            transcript,
-            model_available: true,
-        },
-        &pass_through,
-        &config,
-    )?;
-    report.import_chunks = Some(chunks);
-    report.message = format!(
-        "captured import in {chunks} chunks as one condensed memory; resolved chunk window {resolved_chunk_window} tokens"
-    );
-    report.digest_summary = format!("rolling import: {chunks} chunks");
-    Ok((report, harness_report))
-}
-
-fn extract_import_chunk_adaptive(
-    context_label: &str,
-    chunk: &str,
-    extractor: &ConnectedModelExtractor,
-    rolling: &mut RollingCaptureAccumulator,
-    successful_chunks: &mut usize,
-) -> context_graph::Result<()> {
-    let transcript = rolling.chunk_prompt(chunk);
-    match extractor.extract(ExtractionRequest {
-        context_label,
-        transcript: &transcript,
-        prior_decisions: &[],
-    }) {
-        Ok(harvest) => {
-            rolling.push_harvest(harvest);
-            *successful_chunks += 1;
-            Ok(())
-        }
-        Err(err) if import_error_is_truncation(&err) => {
-            let Some((left, right)) = split_import_chunk_for_retry(chunk) else {
-                return Err(err);
-            };
-            eprintln!(
-                "import chunk hit model output truncation; retrying as smaller source chunks"
-            );
-            extract_import_chunk_adaptive(
-                context_label,
-                left,
-                extractor,
-                rolling,
-                successful_chunks,
-            )?;
-            extract_import_chunk_adaptive(
-                context_label,
-                right,
-                extractor,
-                rolling,
-                successful_chunks,
-            )
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn import_error_is_truncation(err: &CgError) -> bool {
-    // `CgError` carries no typed truncation variant; `ConnectedModelExtractor::extract` above
-    // (the "model extraction ended with {:?}" / "model extraction repair ended with {:?}" sites)
-    // encodes the outcome into the opaque `CgError::Engine` message via `{:?}` Debug formatting.
-    // Match the exact Debug rendering of `ModelCallOutcome::Truncation` rather than a hand-typed
-    // literal, so a rename of the enum variant cannot silently desync detection from construction.
-    let marker = format!("{:?}", ModelCallOutcome::Truncation);
-    matches!(err, CgError::Engine(message) if message.contains(&marker))
-}
-
-fn split_import_chunk_for_retry(chunk: &str) -> Option<(&str, &str)> {
-    if chunk.len() <= MIN_ADAPTIVE_IMPORT_CHUNK_CHARS {
-        return None;
-    }
-    let midpoint = nearest_char_boundary_at_or_before(chunk, chunk.len() / 2);
-    let split = chunk
-        .char_indices()
-        .find(|(index, ch)| *index >= midpoint && ch.is_whitespace())
-        .map(|(index, ch)| index + ch.len_utf8())
-        .or_else(|| {
-            chunk[..midpoint]
-                .char_indices()
-                .rev()
-                .find(|(_, ch)| ch.is_whitespace())
-                .map(|(index, ch)| index + ch.len_utf8())
-        })
-        .unwrap_or(midpoint);
-    if split == 0 || split >= chunk.len() {
-        return None;
-    }
-    let (left, right) = chunk.split_at(split);
-    if left.trim().is_empty() || right.trim().is_empty() {
-        return None;
-    }
-    Some((left, right))
-}
-
-fn nearest_char_boundary_at_or_before(text: &str, mut index: usize) -> usize {
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-/// A `ConversationExtractor` that returns an already-merged rolling harvest from `extract` (the
-/// per-chunk extraction already ran) and delegates decision-relation classification and usage
-/// accounting to the real connected model, so the SHARED `run_capture` terminal path can drive the
-/// merged harvest through grounding, identity resolution, skill application, and the atomic commit.
-struct MergedHarvestExtractor<'a> {
-    harvest: StructuredHarvest,
-    relation_classifier: &'a ConnectedModelExtractor,
-}
-
-impl ConversationExtractor for MergedHarvestExtractor<'_> {
-    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
-        Ok(self.harvest.clone())
-    }
-
-    fn classify_decision_relation(
-        &self,
-        request: DecisionRelationRequest<'_>,
-    ) -> context_graph::Result<Option<DecisionRelationSeed>> {
-        self.relation_classifier.classify_decision_relation(request)
-    }
-
-    fn drain_model_usage(&self) -> Vec<ModelCallUsage> {
-        self.relation_classifier.drain_model_usage()
-    }
-}
-
 fn record_progress_chunk_window(args: &[String]) -> Result<usize, String> {
     flag_value(args, "--chunk-tokens")
         .map(|raw| parse_positive_usize_flag("--chunk-tokens", &raw))
         .transpose()
         .map(|value| value.unwrap_or(16_000).max(1))
-}
-
-fn approximate_capture_chunk_count(text: &str, chunk_window: usize) -> usize {
-    let window = chunk_window.max(1);
-    text.len().div_ceil(window).max(1)
 }
 
 fn capture_progress_timer(total_chunks: usize) -> ModelProgressTimer {
@@ -1520,33 +1479,6 @@ fn harness_report_json(harness: &CaptureHarnessReport) -> Value {
         "harness_config_applied": harness.harness_config_applied,
         "stage3_resolution_verdicts": stage3_verdicts_json(harness),
     })
-}
-
-fn cg_failure_with_usage(
-    err: context_graph::CgError,
-    db_path: &Path,
-    context_label: &str,
-    context_id: ContextId,
-    model_usage: Vec<ModelCallUsage>,
-) -> i32 {
-    let receipt = usage_receipt_from_calls(
-        model_usage,
-        CapturePricing::FlatSubscription,
-        Duration::ZERO,
-    );
-    print_memory_json(
-        json!({
-            "ok": false,
-            "condition": "ContextGraphError",
-            "bucket": "memory",
-            "message": format!("{err:?}"),
-            "usage": usage_receipt_json(&receipt),
-        }),
-        db_path,
-        context_label,
-        Some(context_id),
-    );
-    1
 }
 
 fn render_capture_summary(report: &CaptureReport) -> String {
