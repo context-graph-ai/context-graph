@@ -425,6 +425,11 @@ pub fn queue_counts(store: &Store, context_id: ContextId) -> Result<QueueCounts>
 /// reads to structure the memories a developer keeps reaching for first. Machine-local (the
 /// `cg_retrieval_touches` table never syncs — per-device firing stays local), and committed in its
 /// own transaction so a touch never rides inside a capture or retrieval read.
+///
+/// This is a read-then-increment, not an atomic bump: two concurrent hooks on the same data root
+/// could both read N and write N+1 (a lost update). That is deliberately acceptable — the touch
+/// count is only a drain-PRIORITY hint, never a correctness input, and it never syncs, so a
+/// occasional under-count only slightly reorders which memory is structured first.
 pub fn bump_touch(store: &Store, context_id: ContextId, digest_id: DigestId) -> Result<()> {
     let db = store.internal_db();
     let tx = db.begin().map_err(map_engine)?;
