@@ -627,6 +627,7 @@ dependencies = [
  "candle-core",
  "candle-embeddinggemma",
  "cg-cli-conventions",
+ "cg-local-llm",
  "chrono",
  "context-graph",
  "contextdb-core",
