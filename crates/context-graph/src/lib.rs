@@ -17,6 +17,7 @@ pub mod skill_store;
 pub mod store;
 pub mod tier0;
 pub mod types;
+pub mod understanding;
 
 pub use capture_sync_status::*;
 pub use contextdb_core::TxId;
