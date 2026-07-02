@@ -308,10 +308,12 @@ pub fn is_cursor_local(_cursor: &ReviewCursor) -> bool {
     true
 }
 
-/// Advance the review cursor past the current position and persist the new position.
-pub fn advance_cursor(store: &Store, cursor: &mut ReviewCursor) {
+/// Advance the in-memory review cursor past the current position.
+///
+/// The cursor is local-only and is not persisted or synced; pending review items stay visible until
+/// the owner acts on them.
+pub fn advance_cursor(_store: &Store, cursor: &mut ReviewCursor) {
     cursor.position += 1;
-    persist_cursor(store, cursor);
 }
 
 /// Advance cursor only for a bare (unfiltered) review call. Filtered-lens calls
@@ -319,48 +321,6 @@ pub fn advance_cursor(store: &Store, cursor: &mut ReviewCursor) {
 pub fn maybe_advance_cursor(store: &Store, cursor: &mut ReviewCursor, is_bare_review: bool) {
     if is_bare_review {
         advance_cursor(store, cursor);
-    }
-}
-
-fn persist_cursor(store: &Store, cursor: &ReviewCursor) {
-    let db = store.sync_database();
-    let params = HashMap::from([
-        (
-            "id".to_string(),
-            contextdb_core::Value::Text("main".to_string()),
-        ),
-        (
-            "position".to_string(),
-            contextdb_core::Value::Int64(cursor.position as i64),
-        ),
-        (
-            "is_local".to_string(),
-            contextdb_core::Value::Bool(cursor.is_local),
-        ),
-    ]);
-    // Try UPDATE first; fall back to INSERT if no row exists. Each statement
-    // runs in its own transaction so `updated_at` is a live tx id, not genesis.
-    let updated = match db.begin() {
-        Ok(tx) => {
-            let mut p = params.clone();
-            p.insert("updated_at".to_string(), contextdb_core::Value::TxId(tx));
-            let result = db.execute_in_tx(
-                tx,
-                "UPDATE cg_review_cursor SET position = $position, is_local = $is_local, updated_at = $updated_at WHERE id = $id",
-                &p,
-            );
-            let _ = db.commit(tx);
-            result.map(|r| !r.rows.is_empty()).unwrap_or(false)
-        }
-        Err(_) => false,
-    };
-    if !updated {
-        let _ = execute_with_live_txid(
-            &db,
-            "INSERT INTO cg_review_cursor (id, position, is_local, updated_at) VALUES ($id, $position, $is_local, $updated_at)",
-            "updated_at",
-            params,
-        );
     }
 }
 

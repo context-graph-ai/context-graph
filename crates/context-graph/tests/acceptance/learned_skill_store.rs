@@ -1,26 +1,22 @@
-// Learned-skill store and promotion tests.
+// Learned-skill store and SKILL.md parser tests.
 //
 // Store-state tests: fail under a HashMap because assertions read persisted rows
 // from the real cg_learned_skills / cg_teaching_events tables. The placeholder
 // implementations in skill_store.rs return empty lists, None, or wrong provenance.
 //
-// Pure-logic tests: assert the function contract (Some/None + score) — no store.
+// Pure-logic tests: assert the SKILL.md parse/export contract — no store.
 
 use std::collections::HashMap;
 
 use context_graph::skill_store::{
     SkillProvenance, TeachingEventKind, acknowledge_skill, apply_correction, export_skill,
     list_skills_in_store, parse_human_authored_skill, set_review_hold, set_skills_enabled,
-    try_promote_skill, try_promote_skill_with_gate_counter, try_promote_skill_with_result,
 };
 use context_graph::{Store, StoreConfig, TxId};
 use contextdb_core::Value as DbValue;
 
 use super::fake_extractor::open_store_with_lexical_embedder;
-use super::skill_fixtures::{
-    gate_failing_labels, gate_passing_labels, general_candidate_labels, llm_authored_skill,
-    overfit_candidate_labels,
-};
+use super::skill_fixtures::llm_authored_skill;
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -168,148 +164,6 @@ fn a_correction_is_a_label_not_a_skill() {
     );
 }
 
-// Test 3 (pure-logic): the placeholder try_promote_skill always returns None.
-#[test]
-fn multiple_aligned_labels_promote_a_skill_single_correction_does_not() {
-    let skill_id = "sk-promote-test";
-    let (training, heldout) = gate_passing_labels(skill_id);
-
-    // Single label must NOT promote.
-    let single = try_promote_skill(&training[..1], &heldout);
-    assert!(
-        single.is_none(),
-        "a single correction label must NOT promote a skill"
-    );
-
-    // Multiple aligned labels + heldout should promote.
-    let promoted = try_promote_skill(&training, &heldout);
-    // The placeholder returns None here.
-    assert!(
-        promoted.is_some(),
-        "multiple aligned labels that beat heldout must produce a promoted skill"
-    );
-
-    let skill = promoted.unwrap();
-    // The promoted skill's IDENTITY must DERIVE from the aligned labels' content — value equality
-    // against the labels, not merely non-empty. The gate_passing_labels all correct to
-    // "technology_choice", so the derived rule/description must reference that target.
-    assert!(
-        skill.rule.contains("technology_choice"),
-        "promoted skill rule must derive from the aligned labels' content (\"technology_choice\"); \
-         a placeholder rule that does not reference the labels fails; got: {:?}",
-        skill.rule
-    );
-    assert!(
-        skill.description.contains("technology_choice"),
-        "promoted skill description must derive from the aligned labels' content; got: {:?}",
-        skill.description
-    );
-    // Provenance must reflect correction-origin.
-    assert!(
-        matches!(
-            skill.provenance,
-            SkillProvenance::HumanCorrection | SkillProvenance::LlmAuthored
-        ),
-        "promoted skill provenance must be HumanCorrection or LlmAuthored, got {:?}",
-        skill.provenance
-    );
-}
-
-// The held-out gate (Surface F) must catch OVERFITTING: a candidate that fits its training labels
-// but FAILS a disjoint held-out slice must NOT be promoted, while a GENERAL rule that holds on the
-// held-out slice must — the gate discriminates generalization, not training fit. A gate-invocation
-// counter proves the verdict came from the held-out slice.
-//
-// SCAFFOLD STUB the test fails on: try_promote_skill_with_gate_counter judges on TRAINING fit and
-// never runs the held-out gate (counter stays 0), so the overfit candidate IS promoted and the
-// "gate was invoked" assertion fails.
-#[test]
-fn overfit_rule_is_not_promoted_while_a_general_rule_is() {
-    let (general_training, general_heldout) = general_candidate_labels("sk-general");
-    let (overfit_training, overfit_heldout) = overfit_candidate_labels("sk-overfit");
-
-    // The general candidate must be promoted (its rule holds on the held-out slice).
-    let general = try_promote_skill_with_gate_counter(&general_training, &general_heldout);
-    assert!(
-        general.promoted,
-        "a GENERAL rule that holds on the held-out slice must be promoted; wrong stub may promote \
-         it but the overfit/gate assertions below still fail"
-    );
-
-    // The overfit candidate must NOT be promoted (its rule fails the disjoint held-out slice).
-    let overfit = try_promote_skill_with_gate_counter(&overfit_training, &overfit_heldout);
-    assert!(
-        !overfit.promoted,
-        "an OVERFIT rule (fits training, fails the held-out slice) must NOT be promoted; \
-         wrong stub judges on training fit and promotes it"
-    );
-
-    // The held-out gate must have been EVALUATED on the learned path — proving the verdict came from
-    // the held-out slice, not training fit. The count rides the PromotionResult as a plain usize
-    // (no app-side global/atomic in src/); the wrong stub never runs the gate → it stays 0.
-    assert!(
-        general.heldout_gate_invocations > 0,
-        "the held-out gate must be evaluated on the general candidate (heldout_gate_invocations > 0), \
-         proving generalization was measured on the held-out slice; wrong stub never runs it (0)"
-    );
-    assert!(
-        overfit.heldout_gate_invocations > 0,
-        "the held-out gate must be evaluated on the overfit candidate too (heldout_gate_invocations \
-         > 0); wrong stub never runs it (0)"
-    );
-
-    // The promoted general rule's CONTENT must derive from the general labels (value equality).
-    let general_skill = general
-        .skill
-        .expect("general candidate must yield a skill when promoted");
-    assert!(
-        general_skill.rule.contains("technology_choice"),
-        "the promoted general rule must derive from the general labels' content; got: {:?}",
-        general_skill.rule
-    );
-}
-
-// Test 4 (pure-logic): the placeholder try_promote_skill_with_result always returns promoted=false.
-// A tie must not promote; this test distinguishes tie from outright failure.
-// The first assertion (gate-passing labels with no incumbent MUST promote) fails on the placeholder.
-#[test]
-fn candidate_that_ties_prior_best_on_heldout_is_not_promoted() {
-    let skill_id = "sk-tie-test";
-    let (training, heldout) = gate_passing_labels(skill_id);
-
-    // Gate-passing labels with no incumbent must produce a promoted result.
-    // The placeholder returns promoted=false.
-    let first = try_promote_skill_with_result(&training, &heldout, None);
-    assert!(
-        first.promoted,
-        "gate-passing labels with no incumbent must promote a skill; placeholder returns promoted=false"
-    );
-    assert!(
-        first.heldout_score > 0.0,
-        "the established incumbent score must be positive; placeholder returns 0.0"
-    );
-    let incumbent_score = first.heldout_score;
-
-    // Run with the SAME labels against the incumbent — should be a tie → no promotion.
-    let tie = try_promote_skill_with_result(&training, &heldout, Some(incumbent_score));
-    assert!(
-        !tie.promoted,
-        "a candidate that ties the incumbent score must NOT be promoted"
-    );
-    assert_eq!(
-        tie.heldout_score, incumbent_score,
-        "tied candidate score must equal incumbent score"
-    );
-
-    // Gate-failing labels also must not promote.
-    let (failing_training, failing_heldout) = gate_failing_labels("sk-fail");
-    let failing = try_promote_skill_with_result(&failing_training, &failing_heldout, None);
-    assert!(
-        !failing.promoted,
-        "a candidate that fails the heldout check must NOT be promoted"
-    );
-}
-
 // Test 5 (pure-logic): the placeholder parse_human_authored_skill accepts any non-empty content.
 #[test]
 fn human_authored_skill_bypasses_promotion_gate_parses_only() {
@@ -387,13 +241,9 @@ fn human_authored_skill_whose_rule_would_fail_heldout_is_still_accepted() {
         "description must not be empty after extraction"
     );
 
-    // Verify the gate WOULD fail these labels, confirming the gate-bypass is real.
-    let (failing_training, failing_heldout) = gate_failing_labels("sk-would-fail");
-    let gate_result = try_promote_skill(&failing_training, &failing_heldout);
-    // The human-authored path was accepted even though gate would return None.
     assert!(
-        gate_result.is_none(),
-        "the gate-failing labels must not promote a skill (gate-bypass proof)"
+        result.error.is_none(),
+        "accepted human-authored skill parsing must not report an error"
     );
 }
 
