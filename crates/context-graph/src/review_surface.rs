@@ -295,33 +295,17 @@ pub fn gather_review_summary(store: &Store, _cursor: &ReviewCursor) -> ReviewSum
     }
 }
 
+// The review cursor's position is never read by any gather/list path below (each takes `_cursor`
+// and ignores it) — visibility is act-on-based: a pending item stays visible until `act_on_item`
+// resolves it (see `cg_pending_review_items` below), never by cursor position. A prior cursor
+// "advance" API (`advance_cursor`/`maybe_advance_cursor`/`is_cursor_local`) mutated an in-memory
+// `ReviewCursor` that was constructed fresh and dropped at the end of every `cg review` call — a
+// build-increment-drop with no persistence and no reader. Deleted; do not reintroduce a cursor
+// advance without a persisted, read consumer.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewCursor {
     pub position: usize,
     pub is_local: bool,
-}
-
-/// Returns true when the cursor is local-only. The review cursor is always local to
-/// the owner device and is never synced — this always returns true regardless of the
-/// field value (the field may be initialized to false as a placeholder default).
-pub fn is_cursor_local(_cursor: &ReviewCursor) -> bool {
-    true
-}
-
-/// Advance the in-memory review cursor past the current position.
-///
-/// The cursor is local-only and is not persisted or synced; pending review items stay visible until
-/// the owner acts on them.
-pub fn advance_cursor(_store: &Store, cursor: &mut ReviewCursor) {
-    cursor.position += 1;
-}
-
-/// Advance cursor only for a bare (unfiltered) review call. Filtered-lens calls
-/// read the current state but do not advance the cursor mark.
-pub fn maybe_advance_cursor(store: &Store, cursor: &mut ReviewCursor, is_bare_review: bool) {
-    if is_bare_review {
-        advance_cursor(store, cursor);
-    }
 }
 
 // ─── Pending item persistence ────────────────────────────────────────────────
