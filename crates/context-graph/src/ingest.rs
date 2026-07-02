@@ -2196,9 +2196,12 @@ pub(crate) fn capture_structured_harvest(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| compact_summary(transcript));
     // The understanding-queue drainer passes the id of the digest it is understanding: the
-    // structured graph anchors onto that existing tier-0 digest instead of minting a second one,
-    // so a chunk yields exactly ONE digest that transitions verbatim -> structured. Every other
-    // caller passes `None` and gets a fresh digest as before.
+    // structured graph anchors onto that existing tier-0 verbatim digest instead of minting a
+    // second one, so a chunk stays exactly ONE (immutable) digest — it is provenance, kept verbatim,
+    // with the structured Intention/Decision/Observation graph now attached via EXTRACTED_FROM. The
+    // digest's own summary/vector are its verbatim source text, which in real capture contains the
+    // content the graph is derived from (so `cg query` still finds it). Every other caller passes
+    // `None` and gets a fresh digest whose summary IS the harvest summary.
     let digest_id = match reuse_digest {
         Some(id) => id,
         None => tx.create_text_digest(context_id, &summary, &summary)?.id,

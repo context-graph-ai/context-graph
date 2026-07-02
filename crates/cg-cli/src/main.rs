@@ -1006,7 +1006,7 @@ fn understand_now_foreground(
     // exactly like the background worker and plain `cg understand`.
     let summary = DrainSummary {
         counts: outcome.counts,
-        spent,
+        spent: spent.clone(),
         elapsed: started.elapsed(),
         pending_after: queue_counts(store, context_id)
             .map(|counts| counts.pending)
@@ -1014,37 +1014,75 @@ fn understand_now_foreground(
     };
     persist_last_understanding_run(store, &summary);
 
-    match aggregate_capture_reports(
+    if let Some((report, harness)) = aggregate_capture_reports(
         outcome.reports,
         import_chunks,
         resolved_chunk_window,
         model_context_tokens,
     ) {
-        Some((report, harness)) => {
-            print_capture_report_with_harness(
-                &report,
-                Some(&harness),
-                db_path,
-                context_label,
-                context_id,
-            );
-        }
-        None => {
-            // The just-captured digests understood to nothing (empty harvest, or nothing to drain):
-            // the tier-0 verbatim digests are kept, but no structured graph was derived.
-            print_understand_now_no_graph(
-                store,
-                context_id,
-                "model completed: no structured graph derived from this capture",
-                import_chunks,
-                resolved_chunk_window,
-                model_context_tokens,
-                db_path,
-                context_label,
-            );
-        }
+        print_capture_report_with_harness(&report, Some(&harness), db_path, context_label, context_id);
+        return 0;
     }
+    // No digest was understood. If the model was actually called and FAILED (a refused, truncated,
+    // or floor-exhausted reply), surface it WITH the usage receipt (reliability + outcome) and a
+    // non-zero exit — never a silent empty success; the verbatim tier-0 digests are kept for a
+    // later retry. If nothing was even attempted, print the honest no-derived-graph receipt.
+    if !spent.is_empty() {
+        return understand_now_failure_with_usage(
+            spent,
+            import_chunks,
+            resolved_chunk_window,
+            model_context_tokens,
+            db_path,
+            context_label,
+            context_id,
+        );
+    }
+    print_understand_now_no_graph(
+        store,
+        context_id,
+        "model completed: no structured graph derived from this capture",
+        import_chunks,
+        resolved_chunk_window,
+        model_context_tokens,
+        db_path,
+        context_label,
+    );
     0
+}
+
+/// Surface a foreground `--understand-now` drain that spent model budget but understood nothing (a
+/// refused / truncated / floor-exhausted reply): a non-zero receipt carrying the Capability-A usage
+/// lane (per-call reliability level + outcome), so the failure is observable and never a silent
+/// empty success. The verbatim tier-0 digests remain queued for a later retry.
+#[allow(clippy::too_many_arguments)]
+fn understand_now_failure_with_usage(
+    spent: Vec<ModelCallUsage>,
+    import_chunks: Option<usize>,
+    resolved_chunk_window: Option<usize>,
+    model_context_tokens: Option<usize>,
+    db_path: &Path,
+    context_label: &str,
+    context_id: ContextId,
+) -> i32 {
+    let receipt = usage_receipt_from_calls(spent, CapturePricing::FlatSubscription, Duration::ZERO);
+    print_memory_json(
+        json!({
+            "ok": false,
+            "condition": "UnderstandingFailed",
+            "bucket": "memory",
+            "captured": counts_json(&HarvestCounts::default()),
+            "message": "understanding failed on the connected model; the verbatim tier-0 digests are kept for a later retry",
+            "usage": usage_receipt_json(&receipt),
+            "import_chunks": import_chunks,
+            "resolved_chunk_window": resolved_chunk_window,
+            "model_context_tokens": model_context_tokens,
+        }),
+        db_path,
+        context_label,
+        Some(context_id),
+    );
+    1
 }
 
 /// Fold the per-digest capture reports a foreground drain produced into ONE capture receipt: sum the
