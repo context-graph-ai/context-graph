@@ -33,6 +33,10 @@ use context_graph::tier0::{
     self, ForgetReport, ForgetSelector, Tier0CaptureReport, Tier0CaptureRequest, capture_tier0,
     forget_raw, queue_counts, raw_footprint,
 };
+use context_graph::understanding::{
+    MAX_UNDERSTANDING_ATTEMPTS, claim_digest, list_pending_digests, mark_failed, mark_structured,
+};
+use fs4::fs_std::FileExt;
 use context_graph::{
     CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
     CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestSearchFilter,
@@ -690,10 +694,340 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// The hidden understanding worker entry point. WP2 fills in the queue drainer; today it is a
-/// no-op that exits 0 so the capture-path kick has a real subcommand to spawn.
-fn handle_understand(_args: &[String]) -> i32 {
+const LAST_UNDERSTANDING_RUN_KEY: &str = "last_understanding_run";
+
+/// The understanding worker: drain the deferred tier-0 backlog through the connected model, turning
+/// verbatim digests into structured Intention / Decision / Entity / Observation memory. This is the
+/// "overnight the queue structures what you touched" contract — capture stays free and instant; the
+/// cost (the connected model's tokens/time) is paid here, on the user's schedule, stopping at the
+/// budget ceiling.
+///
+/// Two shapes share one drain implementation:
+/// - `cg understand [--budget N] [--context C]` — a foreground run the user invokes; prints a receipt.
+/// - `cg understand --worker` — the detached post-capture kick: one worker per data root (lockfile),
+///   silent, drains every context's backlog until empty / budget / no model, then exits 0.
+fn handle_understand(args: &[String]) -> i32 {
+    if has_flag(args, "--worker") {
+        return understand_worker(args);
+    }
+    let root = data_root();
+    let db_path = memory_db_path(&root);
+    let context_label = memory_context_label(args);
+    let budget = match parse_understand_budget(args) {
+        Ok(budget) => budget,
+        Err(message) => return usage_error(&message),
+    };
+    if memory_capture_connection_name(&root).is_none() {
+        return memory_failure(
+            4,
+            "NotConnected",
+            &db_path,
+            &context_label,
+            "cg understand needs a connected model; run cg model connect or cg model auth login",
+        );
+    }
+    let store = match open_memory_store(&root) {
+        Ok(store) => store,
+        Err(err) => return memory_error(err, &db_path, &context_label),
+    };
+    let context = match ensure_cli_context(&store, &context_label) {
+        Ok(context) => context,
+        Err(err) => return cg_failure(err, &db_path, &context_label),
+    };
+    let mut spent: Vec<ModelCallUsage> = Vec::new();
+    let started = Instant::now();
+    let counts = match drain_context_queue(
+        &root,
+        &store,
+        &context_label,
+        context.id,
+        &budget,
+        &mut spent,
+        true,
+    ) {
+        Ok(counts) => counts,
+        Err(err) => return cg_failure(err, &db_path, &context_label),
+    };
+    let pending_after = queue_counts(&store, context.id)
+        .map(|counts| counts.pending)
+        .unwrap_or(0);
+    let summary = DrainSummary {
+        counts,
+        spent,
+        elapsed: started.elapsed(),
+        pending_after,
+    };
+    persist_last_understanding_run(&store, &summary);
+    print_understand_report(&summary, &db_path, &context_label, context.id);
     0
+}
+
+/// The detached one-per-data-root worker the capture path kicks. Acquires an exclusive lockfile
+/// (a second concurrent worker exits 0 without draining), then drains every context's backlog until
+/// the queue is empty, the budget ceiling is hit, or no model is connected — all silently.
+fn understand_worker(args: &[String]) -> i32 {
+    let root = data_root();
+    let Some(_lock) = acquire_worker_lock(&root) else {
+        // Another worker already holds the drain lock; exactly one drains at a time.
+        return 0;
+    };
+    // No connected model: understanding is a silent no-op (tier-0 capture already succeeded).
+    if memory_capture_connection_name(&root).is_none() {
+        return 0;
+    }
+    let Ok(store) = open_memory_store(&root) else {
+        return 0;
+    };
+    let budget = parse_understand_budget(args).unwrap_or_default();
+    let contexts = store.list_contexts().unwrap_or_default();
+    let mut spent: Vec<ModelCallUsage> = Vec::new();
+    let started = Instant::now();
+    let mut agg = DrainCounts::default();
+    for context in contexts {
+        if budget.exhausted(&spent) {
+            break;
+        }
+        if let Ok(counts) = drain_context_queue(
+            &root,
+            &store,
+            &context.name,
+            context.id,
+            &budget,
+            &mut spent,
+            false,
+        ) {
+            agg.understood += counts.understood;
+            agg.failed += counts.failed;
+            agg.claim_skipped += counts.claim_skipped;
+        }
+    }
+    let summary = DrainSummary {
+        counts: agg,
+        spent,
+        elapsed: started.elapsed(),
+        pending_after: 0,
+    };
+    persist_last_understanding_run(&store, &summary);
+    0
+}
+
+/// The token ceiling a drain stops at. Token-based today (the Capability-A receipt lane counts
+/// tokens on every path; dollars are only meaningful on a per-token-priced BYOK endpoint and are
+/// derived from the same lane). `None` drains the whole backlog.
+#[derive(Debug, Clone, Copy, Default)]
+struct DrainBudget {
+    max_tokens: Option<u64>,
+}
+
+impl DrainBudget {
+    /// Whether the running spend has reached the ceiling. A run whose usage is unavailable (no
+    /// token counts) never trips the ceiling — the drain is bounded by the backlog instead.
+    fn exhausted(&self, spent: &[ModelCallUsage]) -> bool {
+        let Some(max) = self.max_tokens else {
+            return false;
+        };
+        spent_total_tokens(spent).is_some_and(|tokens| tokens >= max)
+    }
+}
+
+fn parse_understand_budget(args: &[String]) -> Result<DrainBudget, String> {
+    match flag_value(args, "--budget") {
+        Some(raw) => {
+            let tokens = parse_positive_usize_flag("--budget", &raw)?;
+            Ok(DrainBudget {
+                max_tokens: Some(tokens as u64),
+            })
+        }
+        None => Ok(DrainBudget::default()),
+    }
+}
+
+fn spent_total_tokens(spent: &[ModelCallUsage]) -> Option<u64> {
+    let receipt =
+        usage_receipt_from_calls(spent.to_vec(), CapturePricing::FlatSubscription, Duration::ZERO);
+    receipt.total_tokens
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DrainCounts {
+    understood: usize,
+    failed: usize,
+    claim_skipped: usize,
+}
+
+struct DrainSummary {
+    counts: DrainCounts,
+    spent: Vec<ModelCallUsage>,
+    elapsed: Duration,
+    pending_after: usize,
+}
+
+/// Drain one context's pending understanding backlog in priority order. Each digest: claim it
+/// atomically (skip if another worker already took it), run the SAME `run_capture` terminal path
+/// capture uses over the stored raw chunk, then record the outcome (structured + completion on
+/// success, attempt-with-cap on model failure). Accumulates spend into `spent` so a caller draining
+/// several contexts shares one budget. Returns per-context counts.
+#[allow(clippy::too_many_arguments)]
+fn drain_context_queue(
+    root: &Path,
+    store: &Store,
+    context_label: &str,
+    context_id: ContextId,
+    budget: &DrainBudget,
+    spent: &mut Vec<ModelCallUsage>,
+    progress: bool,
+) -> context_graph::Result<DrainCounts> {
+    let mut counts = DrainCounts::default();
+    let model_name = memory_capture_connection_name(root).unwrap_or_default();
+    let descriptor = CaptureHarnessConfig::default()
+        .schema_descriptor()
+        .unwrap_or_default();
+    let Some(extractor) = ConnectedModelExtractor::for_context(root, context_id, descriptor) else {
+        return Ok(counts);
+    };
+    let config = CaptureHarnessConfig {
+        chunk_window: None,
+        skills_enabled: true,
+        ..CaptureHarnessConfig::default()
+    };
+    // Snapshot the pending set once; retries land on a later drain, never an in-run loop.
+    let pending = list_pending_digests(store, context_id, None)?;
+    for pending_digest in pending {
+        if budget.exhausted(spent) {
+            break;
+        }
+        if !claim_digest(store, pending_digest.digest_id)? {
+            // Another worker claimed it between the list and the claim; skip.
+            counts.claim_skipped += 1;
+            continue;
+        }
+        let request = CaptureRequest {
+            context_label: context_label.to_string(),
+            transcript: pending_digest.chunk_text.clone(),
+            model_available: true,
+        };
+        match run_capture(store, request, &extractor, &config) {
+            Ok((report, _harness)) => {
+                let receipt = usage_receipt_from_calls(
+                    report.model_usage.clone(),
+                    CapturePricing::FlatSubscription,
+                    Duration::ZERO,
+                );
+                let receipt_json = usage_receipt_json(&receipt).to_string();
+                mark_structured(
+                    store,
+                    context_id,
+                    pending_digest.digest_id,
+                    &model_name,
+                    Some(&receipt_json),
+                )?;
+                spent.extend(report.model_usage);
+                counts.understood += 1;
+                if progress {
+                    eprintln!(
+                        "understood digest {} ({} understood, {} failed)",
+                        pending_digest.digest_id.as_uuid(),
+                        counts.understood,
+                        counts.failed
+                    );
+                }
+            }
+            Err(err) => {
+                // Capture the usage the failed attempt still spent, then record the failure.
+                spent.extend(extractor.drain_model_usage());
+                let outcome = mark_failed(
+                    store,
+                    pending_digest.digest_id,
+                    &format!("{err:?}"),
+                    MAX_UNDERSTANDING_ATTEMPTS,
+                )?;
+                counts.failed += 1;
+                if progress {
+                    eprintln!(
+                        "understanding failed for digest {} (attempt {}{}): {err:?}",
+                        pending_digest.digest_id.as_uuid(),
+                        outcome.attempts,
+                        if outcome.terminal { ", terminal" } else { "" },
+                    );
+                }
+            }
+        }
+    }
+    Ok(counts)
+}
+
+/// Acquire the exclusive per-data-root understanding-worker lock. Returns the held file (the flock
+/// releases when it drops or the process exits — no stale lock to clean up) or `None` when another
+/// worker holds it or the lock file cannot be opened.
+fn acquire_worker_lock(root: &Path) -> Option<fs::File> {
+    let path = root.join("understand-worker.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .ok()?;
+    match file.try_lock_exclusive() {
+        Ok(true) => Some(file),
+        _ => None,
+    }
+}
+
+/// Persist a compact last-run understanding summary to the machine-local settings lane so
+/// `cg status` can show the most recent drain's spend without re-running anything.
+fn persist_last_understanding_run(store: &Store, summary: &DrainSummary) {
+    let receipt = usage_receipt_from_calls(
+        summary.spent.clone(),
+        CapturePricing::FlatSubscription,
+        summary.elapsed,
+    );
+    let value = json!({
+        "understood": summary.counts.understood,
+        "failed": summary.counts.failed,
+        "total_tokens": receipt.total_tokens,
+        "elapsed_ms": receipt.elapsed.as_millis() as u64,
+    });
+    let _ = tier0::set_local_setting(store, LAST_UNDERSTANDING_RUN_KEY, &value.to_string());
+}
+
+fn print_understand_report(
+    summary: &DrainSummary,
+    db_path: &Path,
+    context_label: &str,
+    context_id: ContextId,
+) {
+    let receipt = usage_receipt_from_calls(
+        summary.spent.clone(),
+        CapturePricing::FlatSubscription,
+        summary.elapsed,
+    );
+    let rendered = format!(
+        "understood {} digests ({} failed) — {} pending remaining, {} tokens, {}ms",
+        summary.counts.understood,
+        summary.counts.failed,
+        summary.pending_after,
+        receipt
+            .total_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        receipt.elapsed.as_millis(),
+    );
+    print_memory_json(
+        json!({
+            "ok": true,
+            "understood": summary.counts.understood,
+            "failed": summary.counts.failed,
+            "claim_skipped": summary.counts.claim_skipped,
+            "pending_after": summary.pending_after,
+            "receipt": usage_receipt_json(&receipt),
+            "message": "drained the understanding queue through the connected model",
+            "rendered": rendered,
+        }),
+        db_path,
+        context_label,
+        Some(context_id),
+    );
 }
 
 /// `cg forget` — the raw-purge path. Raw source chunks are the local understanding substrate and
@@ -2834,6 +3168,7 @@ struct MemoryStatusSnapshot {
     queue: tier0::QueueCounts,
     raw: tier0::RawFootprint,
     raw_retention_days: Option<u64>,
+    last_understanding_run: Option<Value>,
     summary: String,
 }
 
@@ -2845,8 +3180,13 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
     let mut queue = tier0::QueueCounts::default();
     let mut raw = tier0::RawFootprint::default();
     let mut raw_retention_days = None;
+    let mut last_understanding_run = None;
     if let Ok(store) = open_memory_store(root) {
         raw_retention_days = tier0::raw_retention_days(&store).unwrap_or(None);
+        last_understanding_run = tier0::get_local_setting(&store, LAST_UNDERSTANDING_RUN_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
         if let Ok(contexts) = store.list_contexts()
             && let Some(context) = contexts
                 .into_iter()
@@ -2875,6 +3215,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
         queue,
         raw,
         raw_retention_days,
+        last_understanding_run,
         summary,
     }
 }
@@ -2923,6 +3264,9 @@ fn add_memory_status_fields(value: &mut Value, snapshot: &MemoryStatusSnapshot) 
                 "retention_days": snapshot.raw_retention_days,
             }),
         );
+        if let Some(last_run) = &snapshot.last_understanding_run {
+            object.insert("last_understanding_run".to_string(), last_run.clone());
+        }
         object.insert("summary".to_string(), json!(snapshot.summary));
     }
 }

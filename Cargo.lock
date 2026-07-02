@@ -814,6 +814,7 @@ dependencies = [
  "contextdb-core",
  "contextdb-engine",
  "contextdb-server",
+ "fs4",
  "serde",
  "serde_json",
  "tempfile",
