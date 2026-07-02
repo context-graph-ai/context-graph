@@ -32,7 +32,12 @@ fn connected_harness() -> CliHarness {
         CompletionBehavior::Succeed,
     );
     let login = harness.run(&[
-        "model", "auth", "login", "--connection", "claude", "--consent",
+        "model",
+        "auth",
+        "login",
+        "--connection",
+        "claude",
+        "--consent",
     ]);
     assert_eq!(login.code, 0, "fake host login failed: {}", login.stderr);
     harness
@@ -41,8 +46,7 @@ fn connected_harness() -> CliHarness {
     harness
 }
 
-const PARITY_TRANSCRIPT: &str =
-    "Goal G1: keep the ingest path tracked. Entity E1: src/ingest.rs path=src/ingest.rs. Decision D1: keep ingest at src/ingest.rs serves G1 based_on E1.";
+const PARITY_TRANSCRIPT: &str = "Goal G1: keep the ingest path tracked. Entity E1: src/ingest.rs path=src/ingest.rs. Decision D1: keep ingest at src/ingest.rs serves G1 based_on E1.";
 
 fn status_json(harness: &CliHarness, context: &str) -> JsonValue {
     let output = harness.run(&["status", "--context", context]);
@@ -50,7 +54,10 @@ fn status_json(harness: &CliHarness, context: &str) -> JsonValue {
 }
 
 fn goals(status: &JsonValue) -> u64 {
-    status.pointer("/goals").and_then(JsonValue::as_u64).unwrap_or(0)
+    status
+        .pointer("/goals")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(0)
 }
 
 fn pending(status: &JsonValue) -> u64 {
@@ -74,23 +81,36 @@ fn record_then_understand_structures_the_graph() {
         &["record", "--no-kick", "--context", "loop"],
         PARITY_TRANSCRIPT,
     );
-    assert_eq!(record.code, 0, "tier-0 record failed: {}", combined(&record));
+    assert_eq!(
+        record.code,
+        0,
+        "tier-0 record failed: {}",
+        combined(&record)
+    );
 
     // Tier-0 capture wrote zero graph and left a pending backlog.
     let before = status_json(&harness, "loop");
     assert_eq!(goals(&before), 0, "tier-0 capture writes no graph");
-    assert!(pending(&before) >= 1, "the digest is queued for understanding");
+    assert!(
+        pending(&before) >= 1,
+        "the digest is queued for understanding"
+    );
 
     // Drain the backlog through the connected model.
     let understand = harness.run(&["understand", "--context", "loop"]);
     assert_eq!(
-        understand.code, 0,
+        understand.code,
+        0,
         "understand failed: {}",
         combined(&understand)
     );
     let drained = output_json(&understand);
     assert!(
-        drained.pointer("/understood").and_then(JsonValue::as_u64).unwrap_or(0) >= 1,
+        drained
+            .pointer("/understood")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0)
+            >= 1,
         "understand structured at least one digest: {}",
         understand.stdout
     );
@@ -99,11 +119,18 @@ fn record_then_understand_structures_the_graph() {
     let after = status_json(&harness, "loop");
     assert!(goals(&after) >= 1, "understanding produced a goal: {after}");
     assert!(
-        after.pointer("/decisions").and_then(JsonValue::as_u64).unwrap_or(0) >= 1,
+        after
+            .pointer("/decisions")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0)
+            >= 1,
         "understanding produced a decision: {after}"
     );
     assert_eq!(pending(&after), 0, "the backlog is drained");
-    assert!(structured(&after) >= 1, "the queue row is marked structured");
+    assert!(
+        structured(&after) >= 1,
+        "the queue row is marked structured"
+    );
 }
 
 #[test]
@@ -140,7 +167,12 @@ fn worker_is_a_silent_noop_without_a_model() {
         &["record", "--no-kick", "--context", "loop"],
         PARITY_TRANSCRIPT,
     );
-    assert_eq!(record.code, 0, "tier-0 record failed: {}", combined(&record));
+    assert_eq!(
+        record.code,
+        0,
+        "tier-0 record failed: {}",
+        combined(&record)
+    );
     let pending_before = pending(&status_json(&harness, "loop"));
     assert!(pending_before >= 1);
 
@@ -172,6 +204,7 @@ fn worker_lock_is_exclusive() {
     let lock_path = harness.data_root.path().join("understand-worker.lock");
     let lock = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -208,18 +241,37 @@ fn budget_ceiling_stops_the_drain() {
     let harness = connected_harness();
     // Two distinct sessions → two pending digests.
     harness.run_with_stdin(
-        &["record", "--no-kick", "--context", "loop", "--session", "s1"],
+        &[
+            "record",
+            "--no-kick",
+            "--context",
+            "loop",
+            "--session",
+            "s1",
+        ],
         PARITY_TRANSCRIPT,
     );
     harness.run_with_stdin(
-        &["record", "--no-kick", "--context", "loop", "--session", "s2"],
+        &[
+            "record",
+            "--no-kick",
+            "--context",
+            "loop",
+            "--session",
+            "s2",
+        ],
         "Goal G2: keep the auth path tracked. Decision D2: keep auth at src/auth.py serves G2.",
     );
     assert!(pending(&status_json(&harness, "loop")) >= 2);
 
     // A 1-token ceiling: the first digest runs (spend starts at zero), then the ceiling trips.
     let understand = harness.run(&["understand", "--context", "loop", "--budget", "1"]);
-    assert_eq!(understand.code, 0, "understand failed: {}", combined(&understand));
+    assert_eq!(
+        understand.code,
+        0,
+        "understand failed: {}",
+        combined(&understand)
+    );
     let drained = output_json(&understand);
     assert_eq!(
         drained.pointer("/understood").and_then(JsonValue::as_u64),

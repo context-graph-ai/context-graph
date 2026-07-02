@@ -146,8 +146,13 @@ fn failed_increments_attempts_and_caps() {
     let mut last_attempts = 0;
     for expected in 1..MAX_UNDERSTANDING_ATTEMPTS {
         assert!(claim_digest(&store, digest).expect("claim"));
-        let outcome = mark_failed(&store, digest, "model timed out", MAX_UNDERSTANDING_ATTEMPTS)
-            .expect("mark failed");
+        let outcome = mark_failed(
+            &store,
+            digest,
+            "model timed out",
+            MAX_UNDERSTANDING_ATTEMPTS,
+        )
+        .expect("mark failed");
         assert_eq!(outcome.attempts, expected);
         assert!(!outcome.terminal, "not terminal below the cap");
         last_attempts = outcome.attempts;
@@ -159,10 +164,18 @@ fn failed_increments_attempts_and_caps() {
     }
     // The capping failure marks it terminally failed and it is no longer drained.
     assert!(claim_digest(&store, digest).expect("claim"));
-    let terminal = mark_failed(&store, digest, "model timed out", MAX_UNDERSTANDING_ATTEMPTS)
-        .expect("mark failed");
+    let terminal = mark_failed(
+        &store,
+        digest,
+        "model timed out",
+        MAX_UNDERSTANDING_ATTEMPTS,
+    )
+    .expect("mark failed");
     assert_eq!(terminal.attempts, last_attempts + 1);
-    assert!(terminal.terminal, "at the cap the digest is terminally failed");
+    assert!(
+        terminal.terminal,
+        "at the cap the digest is terminally failed"
+    );
     let counts = queue_counts(&store, ctx).expect("counts");
     assert_eq!(counts.failed, 1);
     assert!(
