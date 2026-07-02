@@ -19,28 +19,27 @@ use cg_cli_conventions::{
     host_session_selftest_failure_exit_code, model_byok_selftest_failure_exit_code,
     model_byok_status_exit_code,
 };
-use context_graph::harness::{
-    CaptureHarnessConfig, CaptureHarnessReport, SchemaDescriptor, run_capture, run_capture_verbatim,
-};
+use context_graph::harness::SchemaDescriptor;
 use context_graph::ingest::{
-    CaptureReport, CaptureRequest, ConversationExtractor, DecisionRelationClassification,
-    DecisionRelationRequest, DecisionRelationSeed, ExtractionPriorDecision, ExtractionRequest,
-    HarvestCounts, ImportParser, RollingCaptureAccumulator, StructuredHarvest,
-    changed_since_context_cursor, digest_source_ids_for_context, memory_counts, parser_for_format,
-    record_conversation, standing_impact,
+    ConversationExtractor, DecisionRelationClassification, DecisionRelationRequest,
+    DecisionRelationSeed, ExtractionPriorDecision, ExtractionRequest, HarvestCounts, ImportParser,
+    StructuredHarvest, changed_since_context_cursor, digest_source_ids_for_context, memory_counts,
+    parser_for_format, standing_impact,
+};
+use context_graph::tier0::{
+    self, ForgetReport, ForgetSelector, Tier0CaptureReport, Tier0CaptureRequest, capture_tier0,
+    forget_raw, queue_counts, raw_footprint,
 };
 use context_graph::{
-    CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
-    CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestSearchFilter,
-    DiscoveryFilter, Embedder, EmbedderRegistration, EnforcementLevel, Entity, EntityId,
-    EntitySnapshot, Invalidation, InvalidationStatus, LlmClient, ModelCallOutcome,
-    ModelCallReceipt, ModelCallUsage, ModelInvocation, ModelReply, OutputContract, ProviderUsage,
-    Store, StoreConfig, SyncDrainFuture, SyncProbeFuture, SyncPullBoundary, SyncPushBoundary,
-    SyncStatusBoundary, SyncStatusReport, UnderstandingConsumer, UnderstandingRequest,
-    UsageReportState, context_graph_pending_push_change_count,
-    context_graph_sync_conflict_policies, drain_sync_pull, drain_sync_push,
-    register_context_graph_sync_client, sync_status_report, usage_receipt_from_calls,
-    usage_receipt_json,
+    CG_SCHEMA_VERSION, CgError, ContextGraphSyncRegistration, ContextId, CreateContext, Decision,
+    DecisionId, DecisionStatus, DeploymentSurface, DigestSearchFilter, DiscoveryFilter, Embedder,
+    EmbedderRegistration, EnforcementLevel, Entity, EntityId, EntitySnapshot, Invalidation,
+    InvalidationStatus, LlmClient, ModelCallOutcome, ModelCallReceipt, ModelCallUsage,
+    ModelInvocation, ModelReply, OutputContract, ProviderUsage, Store, StoreConfig,
+    SyncDrainFuture, SyncProbeFuture, SyncPullBoundary, SyncPushBoundary, SyncStatusBoundary,
+    SyncStatusReport, UnderstandingConsumer, UnderstandingRequest, UsageReportState,
+    context_graph_pending_push_change_count, context_graph_sync_conflict_policies, drain_sync_pull,
+    drain_sync_push, register_context_graph_sync_client, sync_status_report,
 };
 use contextdb_core::{Lsn, Value as DbValue};
 use contextdb_engine::{
@@ -55,7 +54,6 @@ const INGESTION_EXPECTATION: &str = "automatic capture is ready for cg record an
 const DEFAULT_IMPORT_MODEL_CONTEXT_TOKENS: usize = 131_072;
 const DEFAULT_IMPORT_CONTEXT_FRACTION: f32 = 0.5;
 const DEFAULT_IMPORT_CHUNK_WINDOW: usize = 16_000;
-const MIN_ADAPTIVE_IMPORT_CHUNK_CHARS: usize = 2_000;
 const IMPORT_PROMPT_OVERHEAD_TOKENS: usize = 4_096;
 const IMPORT_OUTPUT_BUDGET_TOKENS: usize = 4_096;
 const IMPORT_RUNNING_STATE_CAP_TOKENS: usize = 4_096;
@@ -137,6 +135,8 @@ fn run(args: Vec<String>) -> i32 {
         Some("model") => handle_model(&args[1..]),
         Some("record") => handle_record(&args[1..]),
         Some("import") => handle_import(&args[1..]),
+        Some("forget") => handle_forget(&args[1..]),
+        Some("understand") => handle_understand(&args[1..]),
         Some("query") => handle_query(&args[1..]),
         Some("sync") => handle_sync(&args[1..]),
         Some("impact") => handle_impact(&args[1..]),
@@ -221,54 +221,23 @@ fn handle_record(args: &[String]) -> i32 {
         Ok(context) => context,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
-    let progress_chunk_window = match record_progress_chunk_window(args) {
-        Ok(window) => window,
-        Err(message) => {
-            return memory_failure(
-                2,
-                "InvalidRecordChunking",
-                &db_path,
-                &context_label,
-                &message,
-            );
-        }
-    };
-    let request = CaptureRequest {
+    // Tier-0 deterministic capture is the DEFAULT front door: a verbatim digest + local embedding +
+    // kept raw chunk + durable understanding-queue row per chunk, in one atomic transaction, with
+    // ZERO model calls even when a model is connected. Understanding (structuring a chunk into the
+    // ontology) is deferred to the background worker that drains the queue.
+    let started = Instant::now();
+    let request = Tier0CaptureRequest {
         context_label: context_label.clone(),
+        session_ref: capture_session_ref(args, None),
         transcript: input,
-        model_available: memory_capture_connection_name(&root).is_some(),
+        source: "cg-record".to_string(),
+        chunk_window: 0,
     };
-    let progress_total_chunks =
-        approximate_capture_chunk_count(&request.transcript, progress_chunk_window);
-    // One config drives both halves of the thin-caller path: the extractor's outgoing prompt is
-    // rendered from this config's single-source schema descriptor, and `run_capture` is handed the
-    // same config — so the prompt the CLI sends and the parser the library uses cannot drift.
-    let capture_config = cli_capture_harness_config(args, progress_chunk_window);
-    let descriptor = capture_config.schema_descriptor().unwrap_or_default();
-    let extractor =
-        ConnectedModelExtractor::for_context(&root, context.id, descriptor).map(|extractor| {
-            extractor.with_progress_timer(capture_progress_timer(progress_total_chunks))
-        });
-    // The CLI is a thin caller of the library capture harness: when a model is connected, capture
-    // routes through `run_capture` (the single-source schema descriptor driving the four-stage
-    // pipeline), and the resulting `CaptureHarnessReport` is surfaced on the receipt. Without a
-    // model, the honest verbatim path is used.
-    let (report, harness_report) = match if let Some(extractor) = &extractor {
-        run_capture(&store, request, extractor, &capture_config)
-    } else {
-        record_conversation(&store, request).map(|report| (report, CaptureHarnessReport::default()))
-    } {
+    let report = match capture_tier0(&store, request) {
         Ok(report) => report,
-        Err(err) => {
-            if let Some(extractor) = &extractor {
-                let usage = extractor.drain_model_usage();
-                if !usage.is_empty() {
-                    return cg_failure_with_usage(err, &db_path, &context_label, context.id, usage);
-                }
-            }
-            return cg_failure(err, &db_path, &context_label);
-        }
+        Err(err) => return cg_failure(err, &db_path, &context_label),
     };
+    let elapsed = started.elapsed();
     write_last_record_tx(
         &root,
         context.id,
@@ -277,24 +246,9 @@ fn handle_record(args: &[String]) -> i32 {
     if first_load {
         mark_first_capture_loaded(&root);
     }
-    print_capture_report_with_harness(
-        &report,
-        Some(&harness_report),
-        &db_path,
-        &context_label,
-        context.id,
-    );
+    print_tier0_report(&report, elapsed, &db_path, &context_label, context.id);
+    maybe_kick_understanding_worker(args);
     0
-}
-
-/// Build the capture-harness config from the CLI flags. The chunk window threads through so a long
-/// session windows into multiple Stage-1 extraction calls; the rest take their library defaults.
-fn cli_capture_harness_config(args: &[String], chunk_window: usize) -> CaptureHarnessConfig {
-    CaptureHarnessConfig {
-        chunk_window: Some(chunk_window.max(1)),
-        skills_enabled: !has_flag(args, "--no-skills"),
-        ..CaptureHarnessConfig::default()
-    }
 }
 
 fn handle_import(args: &[String]) -> i32 {
@@ -360,28 +314,37 @@ fn handle_import(args: &[String]) -> i32 {
         }
     };
     if has_flag(args, "--estimate") {
-        let chunks = match stream_import_chunks(&path, parser.as_ref(), chunk_options, |_| Ok(())) {
-            Ok(chunks) => chunks,
-            Err(err) => return cg_failure(err, &db_path, &context_label),
-        };
-        let projected_tokens = chunks as u64 * 1290;
-        let projected_elapsed = Duration::from_millis(750) * chunks.max(1) as u32;
+        // Tier-0 capture is deterministic and free — the estimate is zero-outbound and reports the
+        // tier-0 truth: zero model calls, zero dollars, N chunks/digests, raw bytes kept.
+        let mut chunks = 0usize;
+        let mut raw_bytes = 0u64;
+        if let Err(err) = stream_import_chunks(&path, parser.as_ref(), chunk_options, |chunk| {
+            chunks += 1;
+            raw_bytes += chunk.len() as u64;
+            Ok(())
+        }) {
+            return cg_failure(err, &db_path, &context_label);
+        }
         print_memory_json(
             json!({
                 "ok": true,
+                "tier": "tier-0",
                 "estimate": {
                     "chunks": chunks,
+                    "digests": chunks,
                     "resolved_chunk_window": chunk_options.resolved_chunk_window,
                     "model_context_tokens": chunk_options.model_context_tokens,
                     "context_fraction": chunk_options.context_fraction,
-                    "provider_calls": 0,
-                    "projected_tokens": projected_tokens,
-                    "elapsed_ms": projected_elapsed.as_millis() as u64,
+                    "model_calls": 0,
+                    "cost_usd": 0.0,
+                    "raw_bytes": raw_bytes,
                 },
                 "captured": counts_json(&HarvestCounts::default()),
                 "totals": counts_json(&HarvestCounts::default()),
-                "message": "estimate: no writes and no provider calls",
-                "rendered": format!("import estimate: {chunks} chunks, zero provider calls"),
+                "message": "estimate: deterministic tier-0 capture — zero model calls, $0",
+                "rendered": format!(
+                    "import estimate: {chunks} chunks / {chunks} digests, 0 model calls, $0"
+                ),
             }),
             &db_path,
             &context_label,
@@ -421,90 +384,250 @@ fn handle_import(args: &[String]) -> i32 {
         Ok(context) => context,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
-    // `cg import` is a thin caller of the library capture harness, exactly like `cg record`. It
-    // streams the session file into bounded source chunks (clean word-boundary splits at the
-    // resolved chunk window), then drives the library capture path — never a CLI-resident pipeline.
-    // The single-source schema descriptor builds the model prompt, and the `CaptureHarnessReport`
-    // the library produces is surfaced on the receipt.
+    // `cg import` is a thin caller of the tier-0 library capture path, exactly like `cg record`. It
+    // reconstructs the session into bounded source chunks (clean word-boundary splits at the
+    // resolved chunk window), joins them into the capture transcript, and drives deterministic
+    // tier-0 capture: a verbatim digest + raw chunk + queue row per chunk, one atomic transaction,
+    // ZERO model calls even when a model is connected. Understanding is deferred to the queue
+    // drainer, so a whole session imports free and instantly.
     let source_chunks = match collect_import_source_chunks(&path, parser.as_ref(), chunk_options) {
         Ok(chunks) => chunks,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
-    let import_total_chunks = source_chunks.len().max(1);
-    let capture_config = CaptureHarnessConfig {
-        chunk_window: Some(chunk_options.resolved_chunk_window.max(1)),
-        skills_enabled: !has_flag(args, "--no-skills"),
-        ..CaptureHarnessConfig::default()
+    let started = Instant::now();
+    let transcript = source_chunks.join("\n");
+    let session_ref = capture_session_ref(args, Some(&path));
+    let request = Tier0CaptureRequest {
+        context_label: context_label.clone(),
+        session_ref,
+        transcript,
+        source: "cg-import".to_string(),
+        chunk_window: chunk_options.max_chars,
     };
-    let descriptor = capture_config.schema_descriptor().unwrap_or_default();
-    let extractor =
-        ConnectedModelExtractor::for_context(&root, context.id, descriptor).map(|extractor| {
-            extractor.with_progress_timer(capture_progress_timer(import_total_chunks))
-        });
-
-    // Drive the library capture path:
-    //   - No model: roll the whole verbatim session into one condensed memory (honest verbatim
-    //     storage, no derived graph) through the library `run_capture_verbatim`.
-    //   - Model, one source chunk: a single capture straight through `run_capture`, so the
-    //     import-produced graph is byte-identical to a `run_capture` over the whole transcript and
-    //     the receipt carries the four-stage `CaptureHarnessReport`.
-    //   - Model, many source chunks: each bounded source chunk is extracted on its own model call
-    //     and rolled into one condensed memory through the library accumulator + terminal capture.
-    let (mut report, harness_report) = match extractor.as_ref() {
-        None => {
-            let transcript = source_chunks.join("\n");
-            let request = CaptureRequest {
-                context_label: context_label.clone(),
-                transcript,
-                model_available: false,
-            };
-            match run_capture_verbatim(&store, request, &capture_config) {
-                Ok(result) => result,
-                Err(err) => return cg_failure(err, &db_path, &context_label),
-            }
-        }
-        Some(extractor) if source_chunks.len() <= 1 => {
-            let transcript = source_chunks.into_iter().next().unwrap_or_default();
-            let request = CaptureRequest {
-                context_label: context_label.clone(),
-                transcript,
-                model_available: true,
-            };
-            match run_capture(&store, request, extractor, &capture_config) {
-                Ok(result) => result,
-                Err(err) => return cg_failure(err, &db_path, &context_label),
-            }
-        }
-        Some(extractor) => match import_rolling_capture(
-            &store,
-            &context_label,
-            &source_chunks,
-            extractor,
-            chunk_options.resolved_chunk_window,
-            capture_config.skills_enabled,
-        ) {
-            Ok(result) => result,
-            Err(err) => return cg_failure(err, &db_path, &context_label),
-        },
+    let report = match capture_tier0(&store, request) {
+        Ok(report) => report,
+        Err(err) => return cg_failure(err, &db_path, &context_label),
     };
-    if report.import_chunks.is_none() {
-        report.import_chunks = Some(import_total_chunks);
-    }
-    report.resolved_chunk_window = Some(chunk_options.resolved_chunk_window);
-    report.model_context_tokens = Some(chunk_options.model_context_tokens);
+    let elapsed = started.elapsed();
     write_last_record_tx(
         &root,
         context.id,
         max_pending_invalidation_tx(&store, context.id),
     );
-    print_capture_report_with_harness(
-        &report,
-        Some(&harness_report),
-        &db_path,
-        &context_label,
-        context.id,
-    );
+    print_tier0_report(&report, elapsed, &db_path, &context_label, context.id);
+    maybe_kick_understanding_worker(args);
     0
+}
+
+/// Derive the session handle for a capture: an explicit `--session` wins; otherwise an import uses
+/// the source file's stem, and `cg record` falls back to a stable label. The session groups a run's
+/// digests and anchors deterministic re-capture (re-running the same input under the same session is
+/// idempotent).
+fn capture_session_ref(args: &[String], path: Option<&Path>) -> String {
+    if let Some(session) = flag_value(args, "--session").filter(|value| !value.trim().is_empty()) {
+        return session;
+    }
+    if let Some(stem) = path
+        .and_then(|path| path.file_stem())
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+    {
+        return stem.to_string();
+    }
+    "cg-record".to_string()
+}
+
+/// Print the tier-0 capture receipt (the Capability-A cost/time lane): zero model calls, zero
+/// dollars, wall-clock, digests written, raw chunks kept, and the pending understanding count.
+fn print_tier0_report(
+    report: &Tier0CaptureReport,
+    elapsed: Duration,
+    db_path: &Path,
+    context_label: &str,
+    context_id: ContextId,
+) {
+    let rendered = format!(
+        "captured {} digests ({} raw chunks kept, {} already present) — 0 model calls, $0, {} pending understanding",
+        report.digests_written, report.chunks_kept, report.skipped_existing, report.pending_after,
+    );
+    print_memory_json(
+        json!({
+            "ok": true,
+            "tier": "tier-0",
+            "session_ref": report.session_ref,
+            "receipt": {
+                "model_calls": report.model_calls,
+                "cost_usd": 0.0,
+                "elapsed_ms": elapsed.as_millis() as u64,
+                "digests": report.digests_written,
+                "chunks_kept": report.chunks_kept,
+                "skipped_existing": report.skipped_existing,
+                "skipped_noise": report.skipped_noise,
+                "raw_bytes": report.raw_bytes,
+                "pending": report.pending_after,
+            },
+            "captured": counts_json(&HarvestCounts::default()),
+            "totals": counts_json(&HarvestCounts::default()),
+            "message": "deterministic tier-0 capture: verbatim digests queued for understanding, 0 model calls",
+            "rendered": rendered,
+        }),
+        db_path,
+        context_label,
+        Some(context_id),
+    );
+}
+
+/// After a successful capture, best-effort kick the detached background understanding worker
+/// (`cg understand --worker`) so the queue drains without blocking capture. Never waits, is a silent
+/// no-op on failure, and is suppressed by `--no-kick` or `CG_NO_UNDERSTAND_KICK=1` (used by tests).
+fn maybe_kick_understanding_worker(args: &[String]) {
+    if has_flag(args, "--no-kick") || env::var_os("CG_NO_UNDERSTAND_KICK").is_some() {
+        return;
+    }
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .args(["understand", "--worker"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Current wall-clock time in unix epoch milliseconds, for the retention window comparison.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The hidden understanding worker entry point. WP2 fills in the queue drainer; today it is a
+/// no-op that exits 0 so the capture-path kick has a real subcommand to spawn.
+fn handle_understand(_args: &[String]) -> i32 {
+    0
+}
+
+/// `cg forget` — the raw-purge path. Raw source chunks are the local understanding substrate and
+/// never sync, so deleting them here is COMPLETE on this machine. Digests and derived graph rows are
+/// the synced, durable memory and are intentionally left in place. Also sets the raw-retention
+/// window (`--set-retention-days`), which `--expired` reads to purge raw older than the window.
+fn handle_forget(args: &[String]) -> i32 {
+    let root = data_root();
+    let db_path = memory_db_path(&root);
+    let context_label = memory_context_label(args);
+
+    if let Some(raw) = flag_value(args, "--set-retention-days") {
+        let days = match raw.trim().parse::<u64>() {
+            Ok(days) => days,
+            Err(_) => {
+                return memory_failure(
+                    2,
+                    "InvalidRetentionDays",
+                    &db_path,
+                    &context_label,
+                    "--set-retention-days requires a non-negative whole number of days",
+                );
+            }
+        };
+        let store = match open_memory_store(&root) {
+            Ok(store) => store,
+            Err(err) => return memory_error(err, &db_path, &context_label),
+        };
+        if let Err(err) = tier0::set_raw_retention_days(&store, days) {
+            return cg_failure(err, &db_path, &context_label);
+        }
+        print_memory_json(
+            json!({
+                "ok": true,
+                "raw_retention_days": days,
+                "message": format!("raw retention set to {days} days"),
+                "rendered": format!("raw retention set to {days} days"),
+            }),
+            &db_path,
+            &context_label,
+            None,
+        );
+        return 0;
+    }
+
+    let store = match open_memory_store(&root) {
+        Ok(store) => store,
+        Err(err) => return memory_error(err, &db_path, &context_label),
+    };
+    let context = match ensure_cli_context(&store, &context_label) {
+        Ok(context) => context,
+        Err(err) => return cg_failure(err, &db_path, &context_label),
+    };
+
+    let selector = if let Some(raw) = flag_value(args, "--digest") {
+        match uuid::Uuid::parse_str(raw.trim()) {
+            Ok(uuid) => ForgetSelector::Digest(context_graph::DigestId::from(uuid)),
+            Err(_) => {
+                return memory_failure(
+                    2,
+                    "InvalidDigestId",
+                    &db_path,
+                    &context_label,
+                    "--digest requires a digest UUID",
+                );
+            }
+        }
+    } else if let Some(session) = flag_value(args, "--session") {
+        ForgetSelector::Session(session)
+    } else if has_flag(args, "--all-raw") {
+        ForgetSelector::AllRaw
+    } else if has_flag(args, "--expired") {
+        let retention_days = match tier0::raw_retention_days(&store) {
+            Ok(days) => days,
+            Err(err) => return cg_failure(err, &db_path, &context_label),
+        };
+        ForgetSelector::Expired {
+            retention_days,
+            now_ms: now_millis(),
+        }
+    } else if has_flag(args, "--context") || flag_value(args, "--context").is_some() {
+        ForgetSelector::Context
+    } else {
+        return usage_error(
+            "forget requires one of --digest <id>, --session <ref>, --context, --expired, or --all-raw",
+        );
+    };
+
+    let report = match forget_raw(&store, Some(context.id), selector) {
+        Ok(report) => report,
+        Err(err) => return cg_failure(err, &db_path, &context_label),
+    };
+    print_forget_report(&report, &db_path, &context_label, context.id);
+    0
+}
+
+fn print_forget_report(
+    report: &ForgetReport,
+    db_path: &Path,
+    context_label: &str,
+    context_id: ContextId,
+) {
+    let rendered = format!(
+        "forgot {} raw chunks ({} bytes); {} pending queue rows marked skipped",
+        report.chunks_purged, report.bytes_purged, report.queue_rows_skipped,
+    );
+    print_memory_json(
+        json!({
+            "ok": true,
+            "forget": {
+                "chunks_purged": report.chunks_purged,
+                "bytes_purged": report.bytes_purged,
+                "queue_rows_skipped": report.queue_rows_skipped,
+            },
+            "message": "purged raw source chunks; synced digests and graph rows are retained",
+            "rendered": rendered,
+        }),
+        db_path,
+        context_label,
+        Some(context_id),
+    );
 }
 
 /// Stream a session file into bounded source chunks using the import parser, splitting at clean
@@ -521,173 +644,6 @@ fn collect_import_source_chunks(
         Ok(())
     })?;
     Ok(chunks)
-}
-
-/// Roll a multi-chunk import into one condensed memory through the library rolling accumulator and
-/// the SHARED terminal capture path. Each bounded source chunk is extracted on its own model call
-/// (so both the early and late ends survive condensation); the accreted harvest is then handed to
-/// the library `run_capture` — the same terminal path `cg record` and single-chunk import use — so a
-/// promoted learned skill is selected and applied here too, and the import receipt carries the same
-/// real `CaptureHarnessReport` markers. The pass-through extractor returns the already-merged harvest
-/// and delegates decision-relation classification + usage accounting to the real connected model.
-fn import_rolling_capture(
-    store: &Store,
-    context_label: &str,
-    source_chunks: &[String],
-    extractor: &ConnectedModelExtractor,
-    resolved_chunk_window: usize,
-    skills_enabled: bool,
-) -> context_graph::Result<(CaptureReport, CaptureHarnessReport)> {
-    let mut chunks = 0;
-    let mut rolling = RollingCaptureAccumulator::new(IMPORT_RUNNING_STATE_CAP_TOKENS);
-    for chunk in source_chunks {
-        extract_import_chunk_adaptive(context_label, chunk, extractor, &mut rolling, &mut chunks)?;
-    }
-    let merged = rolling.into_harvest();
-    // The transcript handed to the shared terminal path is the whole session text, so learned-skill
-    // selection (which matches a skill's description against the capture text) sees the real tokens
-    // of every chunk — not just a condensed summary.
-    let transcript = source_chunks.join("\n");
-    let pass_through = MergedHarvestExtractor {
-        harvest: merged,
-        relation_classifier: extractor,
-    };
-    // The per-chunk windowing already ran above; the shared terminal path drives the merged harvest
-    // in one pass (chunk_window = None), honoring the `--no-skills` switch.
-    let config = CaptureHarnessConfig {
-        skills_enabled,
-        ..CaptureHarnessConfig::default()
-    };
-    let (mut report, harness_report) = run_capture(
-        store,
-        CaptureRequest {
-            context_label: context_label.to_string(),
-            transcript,
-            model_available: true,
-        },
-        &pass_through,
-        &config,
-    )?;
-    report.import_chunks = Some(chunks);
-    report.message = format!(
-        "captured import in {chunks} chunks as one condensed memory; resolved chunk window {resolved_chunk_window} tokens"
-    );
-    report.digest_summary = format!("rolling import: {chunks} chunks");
-    Ok((report, harness_report))
-}
-
-fn extract_import_chunk_adaptive(
-    context_label: &str,
-    chunk: &str,
-    extractor: &ConnectedModelExtractor,
-    rolling: &mut RollingCaptureAccumulator,
-    successful_chunks: &mut usize,
-) -> context_graph::Result<()> {
-    let transcript = rolling.chunk_prompt(chunk);
-    match extractor.extract(ExtractionRequest {
-        context_label,
-        transcript: &transcript,
-        prior_decisions: &[],
-    }) {
-        Ok(harvest) => {
-            rolling.push_harvest(harvest);
-            *successful_chunks += 1;
-            Ok(())
-        }
-        Err(err) if import_error_is_truncation(&err) => {
-            let Some((left, right)) = split_import_chunk_for_retry(chunk) else {
-                return Err(err);
-            };
-            eprintln!(
-                "import chunk hit model output truncation; retrying as smaller source chunks"
-            );
-            extract_import_chunk_adaptive(
-                context_label,
-                left,
-                extractor,
-                rolling,
-                successful_chunks,
-            )?;
-            extract_import_chunk_adaptive(
-                context_label,
-                right,
-                extractor,
-                rolling,
-                successful_chunks,
-            )
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn import_error_is_truncation(err: &CgError) -> bool {
-    // `CgError` carries no typed truncation variant; `ConnectedModelExtractor::extract` above
-    // (the "model extraction ended with {:?}" / "model extraction repair ended with {:?}" sites)
-    // encodes the outcome into the opaque `CgError::Engine` message via `{:?}` Debug formatting.
-    // Match the exact Debug rendering of `ModelCallOutcome::Truncation` rather than a hand-typed
-    // literal, so a rename of the enum variant cannot silently desync detection from construction.
-    let marker = format!("{:?}", ModelCallOutcome::Truncation);
-    matches!(err, CgError::Engine(message) if message.contains(&marker))
-}
-
-fn split_import_chunk_for_retry(chunk: &str) -> Option<(&str, &str)> {
-    if chunk.len() <= MIN_ADAPTIVE_IMPORT_CHUNK_CHARS {
-        return None;
-    }
-    let midpoint = nearest_char_boundary_at_or_before(chunk, chunk.len() / 2);
-    let split = chunk
-        .char_indices()
-        .find(|(index, ch)| *index >= midpoint && ch.is_whitespace())
-        .map(|(index, ch)| index + ch.len_utf8())
-        .or_else(|| {
-            chunk[..midpoint]
-                .char_indices()
-                .rev()
-                .find(|(_, ch)| ch.is_whitespace())
-                .map(|(index, ch)| index + ch.len_utf8())
-        })
-        .unwrap_or(midpoint);
-    if split == 0 || split >= chunk.len() {
-        return None;
-    }
-    let (left, right) = chunk.split_at(split);
-    if left.trim().is_empty() || right.trim().is_empty() {
-        return None;
-    }
-    Some((left, right))
-}
-
-fn nearest_char_boundary_at_or_before(text: &str, mut index: usize) -> usize {
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
-/// A `ConversationExtractor` that returns an already-merged rolling harvest from `extract` (the
-/// per-chunk extraction already ran) and delegates decision-relation classification and usage
-/// accounting to the real connected model, so the SHARED `run_capture` terminal path can drive the
-/// merged harvest through grounding, identity resolution, skill application, and the atomic commit.
-struct MergedHarvestExtractor<'a> {
-    harvest: StructuredHarvest,
-    relation_classifier: &'a ConnectedModelExtractor,
-}
-
-impl ConversationExtractor for MergedHarvestExtractor<'_> {
-    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
-        Ok(self.harvest.clone())
-    }
-
-    fn classify_decision_relation(
-        &self,
-        request: DecisionRelationRequest<'_>,
-    ) -> context_graph::Result<Option<DecisionRelationSeed>> {
-        self.relation_classifier.classify_decision_relation(request)
-    }
-
-    fn drain_model_usage(&self) -> Vec<ModelCallUsage> {
-        self.relation_classifier.drain_model_usage()
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -724,33 +680,6 @@ fn import_chunk_options(args: &[String], root: &Path) -> Result<ImportChunkOptio
         resolved_chunk_window,
         model_context_tokens,
         context_fraction,
-    })
-}
-
-fn record_progress_chunk_window(args: &[String]) -> Result<usize, String> {
-    flag_value(args, "--chunk-tokens")
-        .map(|raw| parse_positive_usize_flag("--chunk-tokens", &raw))
-        .transpose()
-        .map(|value| value.unwrap_or(16_000).max(1))
-}
-
-fn approximate_capture_chunk_count(text: &str, chunk_window: usize) -> usize {
-    let window = chunk_window.max(1);
-    text.len().div_ceil(window).max(1)
-}
-
-fn capture_progress_timer(total_chunks: usize) -> ModelProgressTimer {
-    let total_chunks = total_chunks.max(1);
-    Arc::new(move |call_index, elapsed| {
-        let chunk_index = call_index.min(total_chunks);
-        let remaining_chunks = total_chunks.saturating_sub(chunk_index) + 1;
-        eprintln!(
-            "capture progress: chunk {}/{} elapsed_ms={} remaining_ms={}",
-            chunk_index,
-            total_chunks,
-            elapsed.as_millis(),
-            remaining_chunks as u128 * 100,
-        );
     })
 }
 
@@ -2361,6 +2290,9 @@ struct MemoryStatusSnapshot {
     context_label: String,
     context_id: Option<ContextId>,
     counts: HarvestCounts,
+    queue: tier0::QueueCounts,
+    raw: tier0::RawFootprint,
+    raw_retention_days: Option<u64>,
     summary: String,
 }
 
@@ -2369,24 +2301,39 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
     let context_label = memory_context_label(args);
     let mut context_id = None;
     let mut counts = HarvestCounts::default();
-    if let Ok(store) = open_memory_store(root)
-        && let Ok(contexts) = store.list_contexts()
-        && let Some(context) = contexts
-            .into_iter()
-            .find(|context| context.name == context_label)
-    {
-        context_id = Some(context.id);
-        counts = memory_counts(&store, context.id).unwrap_or_default();
+    let mut queue = tier0::QueueCounts::default();
+    let mut raw = tier0::RawFootprint::default();
+    let mut raw_retention_days = None;
+    if let Ok(store) = open_memory_store(root) {
+        raw_retention_days = tier0::raw_retention_days(&store).unwrap_or(None);
+        if let Ok(contexts) = store.list_contexts()
+            && let Some(context) = contexts
+                .into_iter()
+                .find(|context| context.name == context_label)
+        {
+            context_id = Some(context.id);
+            counts = memory_counts(&store, context.id).unwrap_or_default();
+            queue = queue_counts(&store, context.id).unwrap_or_default();
+            raw = raw_footprint(&store, context.id).unwrap_or_default();
+        }
     }
     let summary = format!(
-        "context: {context_label} goals: {} decisions: {} observations: {}",
-        counts.goals, counts.decisions, counts.observations
+        "context: {context_label} goals: {} decisions: {} observations: {} | pending understanding: {} | raw kept: {} chunks / {} bytes",
+        counts.goals,
+        counts.decisions,
+        counts.observations,
+        queue.pending,
+        raw.chunk_count,
+        raw.bytes,
     );
     MemoryStatusSnapshot {
         db_path,
         context_label,
         context_id,
         counts,
+        queue,
+        raw,
+        raw_retention_days,
         summary,
     }
 }
@@ -2416,6 +2363,24 @@ fn add_memory_status_fields(value: &mut Value, snapshot: &MemoryStatusSnapshot) 
         object.insert(
             "store_path".to_string(),
             json!(snapshot.db_path.display().to_string()),
+        );
+        object.insert(
+            "understanding_queue".to_string(),
+            json!({
+                "pending": snapshot.queue.pending,
+                "in_flight": snapshot.queue.in_flight,
+                "structured": snapshot.queue.structured,
+                "failed": snapshot.queue.failed,
+                "skipped": snapshot.queue.skipped,
+            }),
+        );
+        object.insert(
+            "raw_footprint".to_string(),
+            json!({
+                "chunks": snapshot.raw.chunk_count,
+                "bytes": snapshot.raw.bytes,
+                "retention_days": snapshot.raw_retention_days,
+            }),
         );
         object.insert("summary".to_string(), json!(snapshot.summary));
     }
@@ -2695,11 +2660,6 @@ impl ConnectedModelExtractor {
             structured_output_rejected: Arc::new(Mutex::new(false)),
             progress_timer: None,
         })
-    }
-
-    fn with_progress_timer(mut self, progress_timer: ModelProgressTimer) -> Self {
-        self.progress_timer = Some(progress_timer);
-        self
     }
 
     fn call_model(
@@ -3364,112 +3324,6 @@ fn model_proof_to_cg_error(err: ModelProofError) -> CgError {
     ))
 }
 
-/// Render a capture receipt JSON. When a `CaptureHarnessReport` is supplied (the library-harness
-/// path) its introspection markers — `context_id_source` and the per-item `stage3_resolution_verdicts`
-/// — are surfaced on the receipt, proving the CLI routed through `run_capture` rather than a parallel
-/// pipeline. The CLI adds no capture field the library lacks; these markers come straight from the
-/// library report.
-fn print_capture_report_with_harness(
-    report: &CaptureReport,
-    harness: Option<&CaptureHarnessReport>,
-    db_path: &Path,
-    context_label: &str,
-    context_id: ContextId,
-) {
-    let invalidations = report
-        .invalidations
-        .iter()
-        .map(notice_json)
-        .collect::<Vec<_>>();
-    let mut value = json!({
-            "ok": true,
-            "mode": format!("{:?}", report.mode),
-            "captured": counts_json(&report.last_harvest),
-            "totals": counts_json(&report.total_harvest),
-            "message": report.message,
-            "digest_summary": report.digest_summary,
-            "stable_ids": report.stable_ids,
-            "invalidations": invalidations,
-            "provenance_edges": report.provenance_edges.iter().map(|edge| {
-                json!({
-                    "item_id": edge.item_id,
-                    "digest_id": edge.digest_id.as_uuid().to_string(),
-                    "relationship": edge.relationship,
-                })
-            }).collect::<Vec<_>>(),
-            "import_chunks": report.import_chunks,
-            "resolved_chunk_window": report.resolved_chunk_window,
-            "model_context_tokens": report.model_context_tokens,
-            "rendered": render_capture_summary(report),
-    });
-    if !report.model_usage.is_empty()
-        && let Some(object) = value.as_object_mut()
-    {
-        let receipt = usage_receipt_from_calls(
-            report.model_usage.clone(),
-            CapturePricing::FlatSubscription,
-            Duration::ZERO,
-        );
-        object.insert("usage".to_string(), usage_receipt_json(&receipt));
-    }
-    if let Some(harness) = harness
-        && let Some(object) = value.as_object_mut()
-    {
-        object.insert("harness".to_string(), harness_report_json(harness));
-        object.insert(
-            "context_id_source".to_string(),
-            json!(context_id_source_label(harness)),
-        );
-        object.insert(
-            "stage3_resolution_verdicts".to_string(),
-            stage3_verdicts_json(harness),
-        );
-    }
-    print_memory_json(value, db_path, context_label, Some(context_id));
-}
-
-/// The capture-context source label from the library harness report — always the capture context
-/// (a model-emitted `context_id`, even a valid other tenant's, is ignored per Invariant 7).
-fn context_id_source_label(harness: &CaptureHarnessReport) -> &'static str {
-    match harness.context_id_source {
-        context_graph::harness::ContextIdSource::CaptureContext => "capture_context",
-        context_graph::harness::ContextIdSource::ModelEmitted => "model_emitted",
-    }
-}
-
-/// Render the Stage-3 resolution verdicts (one per resolved entity / intention / decision) the
-/// library harness produced, for the capture receipt.
-fn stage3_verdicts_json(harness: &CaptureHarnessReport) -> Value {
-    json!(
-        harness
-            .stage3_resolution_verdicts
-            .iter()
-            .map(|v| json!({
-                "item_key": v.item_key,
-                "kind": format!("{:?}", v.kind),
-                "verdict": format!("{:?}", v.verdict),
-                "decision_relation": v.decision_relation.as_ref().map(|r| format!("{r:?}")),
-            }))
-            .collect::<Vec<_>>()
-    )
-}
-
-/// Render the full library harness report for the capture receipt's `harness` block.
-fn harness_report_json(harness: &CaptureHarnessReport) -> Value {
-    json!({
-        "context_id_source": context_id_source_label(harness),
-        "stage1_received_prior_store_memory": harness.stage1_received_prior_store_memory,
-        "stage2_model_calls": harness.stage2_model_calls,
-        "judge_call_count": harness.judge_call_count,
-        "embeddings_generated": harness.embeddings_generated,
-        "applied_skill_ids": harness.applied_skill_ids,
-        "withheld_skill_ids": harness.withheld_skill_ids,
-        "receipt_leads_with_intention": harness.receipt_leads_with_intention,
-        "harness_config_applied": harness.harness_config_applied,
-        "stage3_resolution_verdicts": stage3_verdicts_json(harness),
-    })
-}
-
 fn print_memory_json(
     mut value: Value,
     db_path: &Path,
@@ -3579,44 +3433,6 @@ fn memory_error(err: MemoryCliError, db_path: &Path, context_label: &str) -> i32
 fn cg_failure(err: context_graph::CgError, db_path: &Path, context_label: &str) -> i32 {
     let message = format!("{err:?}");
     memory_failure(1, "ContextGraphError", db_path, context_label, &message)
-}
-
-fn cg_failure_with_usage(
-    err: context_graph::CgError,
-    db_path: &Path,
-    context_label: &str,
-    context_id: ContextId,
-    model_usage: Vec<ModelCallUsage>,
-) -> i32 {
-    let receipt = usage_receipt_from_calls(
-        model_usage,
-        CapturePricing::FlatSubscription,
-        Duration::ZERO,
-    );
-    print_memory_json(
-        json!({
-            "ok": false,
-            "condition": "ContextGraphError",
-            "bucket": "memory",
-            "message": format!("{err:?}"),
-            "usage": usage_receipt_json(&receipt),
-        }),
-        db_path,
-        context_label,
-        Some(context_id),
-    );
-    1
-}
-
-fn render_capture_summary(report: &CaptureReport) -> String {
-    let mut lines = vec![report.message.clone()];
-    for notice in &report.invalidations {
-        lines.push(format!(
-            "newly INVALIDATED: {} served goal: {} {}",
-            notice.decision_text, notice.served_goal, notice.basis_line
-        ));
-    }
-    lines.join("\n")
 }
 
 fn hit_json(hit: &context_graph::DigestSearchHit) -> Value {
