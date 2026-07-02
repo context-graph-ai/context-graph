@@ -110,7 +110,8 @@ pub fn list_pending_digests(
     Ok(out)
 }
 
-/// Atomically claim a pending digest for understanding (`pending → in_flight`). Returns `true` when
+/// Claim a pending digest for understanding in one transaction (`pending → in_flight`). Returns
+/// `true` when
 /// this call won the claim, `false` when the digest was not pending (already claimed by another
 /// worker, already structured, or purged) — the guard on `status = 'pending'` makes the claim safe
 /// against a concurrent second worker.
