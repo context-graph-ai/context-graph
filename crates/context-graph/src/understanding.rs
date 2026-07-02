@@ -316,23 +316,6 @@ fn current_attempts(store: &Store, digest_text: &str) -> Result<u32> {
         .unwrap_or(0))
 }
 
-fn context_id_for_digest(store: &Store, digest_text: &str) -> Result<Option<ContextId>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT context_id FROM cg_understanding_queue WHERE digest_id = $digest_id",
-            &HashMap::from([(
-                "digest_id".to_string(),
-                DbValue::Text(digest_text.to_string()),
-            )]),
-        )
-        .map_err(map_engine)?;
-    Ok(result.rows.first().and_then(|row| match row.first() {
-        Some(DbValue::Uuid(id)) => Some(ContextId::from(*id)),
-        _ => None,
-    }))
-}
-
 fn parse_digest_id(digest_text: &str) -> Option<DigestId> {
     uuid::Uuid::parse_str(digest_text).ok().map(DigestId::from)
 }

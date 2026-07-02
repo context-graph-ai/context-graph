@@ -2054,10 +2054,14 @@ fn cli_status_idempotent_on_same_session_recaptured() {
     // the strongest idempotency (recapture writes zero new rows). Proven against the persisted
     // store: after both captures the intention still holds exactly ONE decision, with the same id
     // the first capture emitted (never duplicated or replaced).
-    let first_decision_id = stable_uuid_from(&[&first_capture], &["D_old", "auth module at src/auth.py"])
-        .map(DecisionId::from);
-    let intention_id = stable_uuid_from(&[&first_capture], &["G1", "ship password-less login for acme"])
-        .map(IntentionId::from);
+    let first_decision_id =
+        stable_uuid_from(&[&first_capture], &["D_old", "auth module at src/auth.py"])
+            .map(DecisionId::from);
+    let intention_id = stable_uuid_from(
+        &[&first_capture],
+        &["G1", "ship password-less login for acme"],
+    )
+    .map(IntentionId::from);
     let store = persisted_store(store_path_from(&[
         &first_capture,
         &first,
