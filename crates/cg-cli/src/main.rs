@@ -863,10 +863,10 @@ fn drain_context_queue(
     // foreground `--understand-now` path streams (the Capability-A wedged-vs-slow liveness signal).
     let progress_total = only.map(|set| set.len()).unwrap_or(pending.len()).max(1);
     for pending_digest in pending {
-        if let Some(only) = only {
-            if !only.contains(&pending_digest.digest_id) {
-                continue;
-            }
+        if let Some(only) = only
+            && !only.contains(&pending_digest.digest_id)
+        {
+            continue;
         }
         if budget.exhausted(spent) {
             break;
