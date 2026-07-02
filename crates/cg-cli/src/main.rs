@@ -4035,7 +4035,11 @@ to the cache is seeded without re-downloading."
         // Disclose what will be fetched, with sizes, before downloading.
         if format == OutputFormat::Text {
             println!("fetching defaults:");
-            println!("  {} (embedder)\t{}", embedder.id, format_bytes(embedder.byte_size));
+            println!(
+                "  {} (embedder)\t{}",
+                embedder.id,
+                format_bytes(embedder.byte_size)
+            );
             println!(
                 "  {} (understanding)\t{}",
                 understanding.id,
@@ -4043,7 +4047,27 @@ to the cache is seeded without re-downloading."
             );
         }
         return match catalog.prefetch_defaults() {
-            Ok(summary) => {
+            Ok(mut summary) => {
+                // prefetch_defaults seeds the understanding model from a staged copy but never
+                // downloads; the explicit fetch verb does the network download on a fresh machine.
+                if !catalog.understanding_model_cached() {
+                    match catalog.fetch_understanding_default() {
+                        Ok(_) => {
+                            summary
+                                .skipped
+                                .retain(|entry| entry.model_id != understanding.id);
+                            summary.fetched.push(cg_catalog::FetchedEntry {
+                                model_id: understanding.id.clone(),
+                                artifact_sha: String::new(),
+                            });
+                        }
+                        Err(err) => {
+                            if format == OutputFormat::Text {
+                                eprintln!("WARN understanding model fetch failed: {err:?}");
+                            }
+                        }
+                    }
+                }
                 if format == OutputFormat::Text {
                     for fetched in &summary.fetched {
                         println!("fetched\t{}\t{}", fetched.model_id, fetched.artifact_sha);
@@ -4082,13 +4106,19 @@ to the cache is seeded without re-downloading."
                 format_bytes(understanding.byte_size)
             );
         }
-        (understanding.byte_size, catalog.fetch_understanding_default())
+        (
+            understanding.byte_size,
+            catalog.fetch_understanding_default(),
+        )
     } else {
         let bytes = catalog.show(&id).map(|entry| entry.byte_size).unwrap_or(0);
         if format == OutputFormat::Text {
             println!("fetching\t{id}\t{}", format_bytes(bytes));
         }
-        (bytes, catalog.fetch(None, &id, cg_catalog::OutputMode::Headless))
+        (
+            bytes,
+            catalog.fetch(None, &id, cg_catalog::OutputMode::Headless),
+        )
     };
     match fetch_result {
         Ok(result) => {
