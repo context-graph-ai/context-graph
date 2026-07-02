@@ -39,9 +39,8 @@ use context_graph::understanding::{
 use context_graph::{
     CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
     CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestId,
-    DigestSearchFilter,
-    DiscoveryFilter, Embedder, EmbedderRegistration, EnforcementLevel, Entity, EntityId,
-    EntitySnapshot, Invalidation, InvalidationStatus, LlmClient, ModelCallOutcome,
+    DigestSearchFilter, DiscoveryFilter, Embedder, EmbedderRegistration, EnforcementLevel, Entity,
+    EntityId, EntitySnapshot, Invalidation, InvalidationStatus, LlmClient, ModelCallOutcome,
     ModelCallReceipt, ModelCallUsage, ModelInvocation, ModelReply, OutputContract, ProviderUsage,
     Store, StoreConfig, SyncDrainFuture, SyncProbeFuture, SyncPullBoundary, SyncPushBoundary,
     SyncStatusBoundary, SyncStatusReport, UnderstandingConsumer, UnderstandingRequest,
@@ -472,11 +471,11 @@ fn handle_import(args: &[String]) -> i32 {
     // imports now keep N per-chunk digests each understood in its own pass — no rolling condensation,
     // so both ends survive with no decay.
     if has_flag(args, "--understand-now") {
-        let source_chunks = match collect_import_source_chunks(&path, parser.as_ref(), chunk_options)
-        {
-            Ok(chunks) => chunks,
-            Err(err) => return cg_failure(err, &db_path, &context_label),
-        };
+        let source_chunks =
+            match collect_import_source_chunks(&path, parser.as_ref(), chunk_options) {
+                Ok(chunks) => chunks,
+                Err(err) => return cg_failure(err, &db_path, &context_label),
+            };
         let transcript = source_chunks.join("\n");
         let request = Tier0CaptureRequest {
             context_label: context_label.clone(),
@@ -1022,7 +1021,13 @@ fn understand_now_foreground(
         resolved_chunk_window,
         model_context_tokens,
     ) {
-        print_capture_report_with_harness(&report, Some(&harness), db_path, context_label, context_id);
+        print_capture_report_with_harness(
+            &report,
+            Some(&harness),
+            db_path,
+            context_label,
+            context_id,
+        );
         return 0;
     }
     // No digest was understood. If the model was actually called and FAILED (a refused, truncated,

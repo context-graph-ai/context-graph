@@ -1005,10 +1005,11 @@ fn cli_record_is_clean_text_escape_hatch_not_a_parser() {
     let import_store_path_ref = import_store_path.as_deref();
     // Tier-0 digests keep the cleaned session VERBATIM (turn newlines preserved); compare on
     // whitespace-collapsed text.
-    let import_digest_summaries = persisted_text_values(import_store_path_ref, "digests", "summary")
-        .iter()
-        .map(|summary| compact_expected_session(summary))
-        .collect::<Vec<_>>();
+    let import_digest_summaries =
+        persisted_text_values(import_store_path_ref, "digests", "summary")
+            .iter()
+            .map(|summary| compact_expected_session(summary))
+            .collect::<Vec<_>>();
 
     let before_record = harness.run(&["status"]);
     let record = harness.run(&[
