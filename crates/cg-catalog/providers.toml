@@ -106,7 +106,7 @@ base_url = "https://openrouter.ai/api/v1"
 dialect = "openai-chat-completions"
 reply_path = "/choices/0/message/content"
 structured_output = "response_format_schema"
-timeout_ms = 10000
+timeout_ms = 120000
 consent_required = true
 
 [providers.local-vllm]

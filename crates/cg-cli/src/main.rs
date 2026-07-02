@@ -33,13 +33,14 @@ use context_graph::{
     CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
     CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestSearchFilter,
     DiscoveryFilter, Embedder, EmbedderRegistration, EnforcementLevel, Entity, EntityId,
-    EntitySnapshot, Invalidation, InvalidationStatus, ModelCallOutcome, ModelCallReceipt,
-    ModelCallUsage, OutputContract, ProviderUsage, Store, StoreConfig, SyncDrainFuture,
-    SyncProbeFuture, SyncPullBoundary, SyncPushBoundary, SyncStatusBoundary, SyncStatusReport,
-    UnderstandingConsumer, UnderstandingRequest, UsageReportState,
-    context_graph_pending_push_change_count, context_graph_sync_conflict_policies, drain_sync_pull,
-    drain_sync_push, register_context_graph_sync_client, sync_status_report,
-    usage_receipt_from_calls, usage_receipt_json,
+    EntitySnapshot, Invalidation, InvalidationStatus, LlmClient, ModelCallOutcome,
+    ModelCallReceipt, ModelCallUsage, ModelInvocation, ModelReply, OutputContract, ProviderUsage,
+    Store, StoreConfig, SyncDrainFuture, SyncProbeFuture, SyncPullBoundary, SyncPushBoundary,
+    SyncStatusBoundary, SyncStatusReport, UnderstandingConsumer, UnderstandingRequest,
+    UsageReportState, context_graph_pending_push_change_count,
+    context_graph_sync_conflict_policies, drain_sync_pull, drain_sync_push,
+    register_context_graph_sync_client, sync_status_report, usage_receipt_from_calls,
+    usage_receipt_json,
 };
 use contextdb_core::{Lsn, Value as DbValue};
 use contextdb_engine::{
@@ -53,6 +54,8 @@ use serde_json::{Value, json};
 const INGESTION_EXPECTATION: &str = "automatic capture is ready for cg record and cg import";
 const DEFAULT_IMPORT_MODEL_CONTEXT_TOKENS: usize = 131_072;
 const DEFAULT_IMPORT_CONTEXT_FRACTION: f32 = 0.5;
+const DEFAULT_IMPORT_CHUNK_WINDOW: usize = 16_000;
+const MIN_ADAPTIVE_IMPORT_CHUNK_CHARS: usize = 2_000;
 const IMPORT_PROMPT_OVERHEAD_TOKENS: usize = 4_096;
 const IMPORT_OUTPUT_BUDGET_TOKENS: usize = 4_096;
 const IMPORT_RUNNING_STATE_CAP_TOKENS: usize = 4_096;
@@ -484,7 +487,9 @@ fn handle_import(args: &[String]) -> i32 {
             Err(err) => return cg_failure(err, &db_path, &context_label),
         },
     };
-    report.import_chunks = Some(import_total_chunks);
+    if report.import_chunks.is_none() {
+        report.import_chunks = Some(import_total_chunks);
+    }
     report.resolved_chunk_window = Some(chunk_options.resolved_chunk_window);
     report.model_context_tokens = Some(chunk_options.model_context_tokens);
     write_last_record_tx(
@@ -533,16 +538,10 @@ fn import_rolling_capture(
     resolved_chunk_window: usize,
     skills_enabled: bool,
 ) -> context_graph::Result<(CaptureReport, CaptureHarnessReport)> {
-    let chunks = source_chunks.len();
+    let mut chunks = 0;
     let mut rolling = RollingCaptureAccumulator::new(IMPORT_RUNNING_STATE_CAP_TOKENS);
     for chunk in source_chunks {
-        let transcript = rolling.chunk_prompt(chunk);
-        let harvest = extractor.extract(ExtractionRequest {
-            context_label,
-            transcript: &transcript,
-            prior_decisions: &[],
-        })?;
-        rolling.push_harvest(harvest);
+        extract_import_chunk_adaptive(context_label, chunk, extractor, &mut rolling, &mut chunks)?;
     }
     let merged = rolling.into_harvest();
     // The transcript handed to the shared terminal path is the whole session text, so learned-skill
@@ -575,6 +574,88 @@ fn import_rolling_capture(
     );
     report.digest_summary = format!("rolling import: {chunks} chunks");
     Ok((report, harness_report))
+}
+
+fn extract_import_chunk_adaptive(
+    context_label: &str,
+    chunk: &str,
+    extractor: &ConnectedModelExtractor,
+    rolling: &mut RollingCaptureAccumulator,
+    successful_chunks: &mut usize,
+) -> context_graph::Result<()> {
+    let transcript = rolling.chunk_prompt(chunk);
+    match extractor.extract(ExtractionRequest {
+        context_label,
+        transcript: &transcript,
+        prior_decisions: &[],
+    }) {
+        Ok(harvest) => {
+            rolling.push_harvest(harvest);
+            *successful_chunks += 1;
+            Ok(())
+        }
+        Err(err) if import_error_is_truncation(&err) => {
+            let Some((left, right)) = split_import_chunk_for_retry(chunk) else {
+                return Err(err);
+            };
+            eprintln!(
+                "import chunk hit model output truncation; retrying as smaller source chunks"
+            );
+            extract_import_chunk_adaptive(
+                context_label,
+                left,
+                extractor,
+                rolling,
+                successful_chunks,
+            )?;
+            extract_import_chunk_adaptive(
+                context_label,
+                right,
+                extractor,
+                rolling,
+                successful_chunks,
+            )
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn import_error_is_truncation(err: &CgError) -> bool {
+    matches!(err, CgError::Engine(message) if message.contains("Truncation"))
+}
+
+fn split_import_chunk_for_retry(chunk: &str) -> Option<(&str, &str)> {
+    if chunk.len() <= MIN_ADAPTIVE_IMPORT_CHUNK_CHARS {
+        return None;
+    }
+    let midpoint = nearest_char_boundary_at_or_before(chunk, chunk.len() / 2);
+    let split = chunk
+        .char_indices()
+        .find(|(index, ch)| *index >= midpoint && ch.is_whitespace())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .or_else(|| {
+            chunk[..midpoint]
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| ch.is_whitespace())
+                .map(|(index, ch)| index + ch.len_utf8())
+        })
+        .unwrap_or(midpoint);
+    if split == 0 || split >= chunk.len() {
+        return None;
+    }
+    let (left, right) = chunk.split_at(split);
+    if left.trim().is_empty() || right.trim().is_empty() {
+        return None;
+    }
+    Some((left, right))
+}
+
+fn nearest_char_boundary_at_or_before(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 /// A `ConversationExtractor` that returns an already-merged rolling harvest from `extract` (the
@@ -628,7 +709,9 @@ fn import_chunk_options(args: &[String], root: &Path) -> Result<ImportChunkOptio
                 + IMPORT_RUNNING_STATE_CAP_TOKENS,
         );
         let fractional = (model_context_tokens as f32 * context_fraction).floor() as usize;
-        additive.min(fractional).max(1)
+        additive
+            .min(fractional)
+            .clamp(1, DEFAULT_IMPORT_CHUNK_WINDOW)
     });
     Ok(ImportChunkOptions {
         max_chars: resolved_chunk_window.max(1),
@@ -1004,10 +1087,19 @@ fn handle_fix(args: &[String]) -> i32 {
     let Some(item_id) = resolve_item_handle(&store, context_id, handle) else {
         return usage_error(&format!("no item matches handle `{handle}`"));
     };
-    // A correction is filed as a lesson (teaching event), not a skill — the learning loop promotes a
-    // skill only after enough aligned labels beat a held-out check. No skill is created here.
-    let correction =
-        context_graph::skill_store::apply_correction(&store, &item_id, &new_value, None);
+    // A correction is filed as a lesson (teaching event). Promotion is allowed only after enough
+    // aligned labels beat a held-out check; when a model is configured, that candidate is authored
+    // through the LLM skill-proposal path.
+    let root = data_root();
+    let model_client = context_id.and_then(|ctx| {
+        ConnectedModelExtractor::for_context(&root, ctx, SchemaDescriptor::default())
+    });
+    let correction = match (context_id, model_client.as_ref()) {
+        (Some(ctx), Some(client)) => context_graph::skill_store::apply_correction_with_llm_client(
+            &store, &item_id, &new_value, None, ctx, client,
+        ),
+        _ => context_graph::skill_store::apply_correction(&store, &item_id, &new_value, None),
+    };
     if !correction.applied {
         return memory_failure(
             1,
@@ -1028,6 +1120,11 @@ fn handle_fix(args: &[String]) -> i32 {
             "item_id": item_id,
             "overlay_id": overlay.id,
             "value": new_value,
+            "new_skill_created": correction.new_skill_created,
+            "heldout_gate_invocations": correction.heldout_gate_invocations,
+            "skill_proposal_model_available": model_client.is_some(),
+            "skill_proposal_model_invoked": correction.skill_proposal_model_invocations > 0,
+            "skill_proposal_model_invocations": correction.skill_proposal_model_invocations,
             "rendered": message.content,
         }),
         &db_path,
@@ -1485,7 +1582,10 @@ fn drift_alerts_from_record(store: &Store) -> Vec<(String, String)> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for alert in context_graph::skill_store::list_drift_alerts(store) {
         if seen.insert(alert.skill_id.clone()) {
-            out.push((alert.skill_id.clone(), format!("{:?}", alert.provenance)));
+            out.push((
+                alert.skill_id.clone(),
+                skill_provenance_label(&alert.provenance).to_string(),
+            ));
         }
     }
     for skill in context_graph::skill_store::list_skills_in_store(store) {
@@ -1495,10 +1595,23 @@ fn drift_alerts_from_record(store: &Store) -> Vec<(String, String)> {
             && skill.fire_wrong > skill.fire_right
             && seen.insert(skill.id.clone())
         {
-            out.push((skill.id.clone(), format!("{:?}", skill.provenance)));
+            out.push((
+                skill.id.clone(),
+                skill_provenance_label(&skill.provenance).to_string(),
+            ));
         }
     }
     out
+}
+
+fn skill_provenance_label(
+    provenance: &context_graph::skill_store::SkillProvenance,
+) -> &'static str {
+    match provenance {
+        context_graph::skill_store::SkillProvenance::HumanCorrection => "human-correction",
+        context_graph::skill_store::SkillProvenance::LlmAuthored => "llm-authored",
+        context_graph::skill_store::SkillProvenance::HumanAuthored => "human-authored",
+    }
 }
 
 fn skill_json(skill: &context_graph::skill_store::LearnedSkill) -> Value {
@@ -1506,7 +1619,7 @@ fn skill_json(skill: &context_graph::skill_store::LearnedSkill) -> Value {
         "id": skill.id,
         "description": skill.description,
         "rule": skill.rule,
-        "provenance": format!("{:?}", skill.provenance),
+        "provenance": skill_provenance_label(&skill.provenance),
         "active": skill.active,
         "fire_right": skill.fire_right,
         "fire_wrong": skill.fire_wrong,
@@ -1521,8 +1634,12 @@ fn render_skill_cards(skills: &[context_graph::skill_store::LearnedSkill]) -> St
         .iter()
         .map(|s| {
             format!(
-                "skill {} [{:?}] right={} wrong={}: {}",
-                s.id, s.provenance, s.fire_right, s.fire_wrong, s.description
+                "skill {} [{}] right={} wrong={}: {}",
+                s.id,
+                skill_provenance_label(&s.provenance),
+                s.fire_right,
+                s.fire_wrong,
+                s.description
             )
         })
         .collect::<Vec<_>>()
@@ -2587,6 +2704,19 @@ impl ConnectedModelExtractor {
         prompt: String,
         output_schema: Option<&str>,
     ) -> context_graph::Result<ConnectedModelReply> {
+        self.call_model_for_consumer(
+            prompt,
+            output_schema,
+            UnderstandingConsumer::ConversationCondensation,
+        )
+    }
+
+    fn call_model_for_consumer(
+        &self,
+        prompt: String,
+        output_schema: Option<&str>,
+        consumer: UnderstandingConsumer,
+    ) -> context_graph::Result<ConnectedModelReply> {
         let started = Instant::now();
         let catalog = ModelConnectionCatalog::open(&self.root);
         if let Some(error) = catalog.load_error() {
@@ -2627,7 +2757,7 @@ impl ConnectedModelExtractor {
                     .understand_with_receipt(
                         UnderstandingRequest {
                             context_id: self.context_id,
-                            consumer: UnderstandingConsumer::ConversationCondensation,
+                            consumer,
                             deployment: DeploymentSurface::Edge,
                             input: prompt,
                             paid: true,
@@ -2639,17 +2769,17 @@ impl ConnectedModelExtractor {
                     self.mark_structured_output_rejected();
                 }
                 let elapsed = started.elapsed().max(Duration::from_millis(1));
-                if !outcome.model_invoked {
-                    self.record_usage(outcome.usage.clone(), elapsed, receipt);
-                    return Err(CgError::Engine(
-                        "model extraction failed: runtime did not invoke model".to_string(),
-                    ));
-                }
                 if let Some(bucket) = outcome.failure_bucket {
                     self.record_usage(outcome.usage.clone(), elapsed, receipt);
                     return Err(CgError::Engine(format!(
                         "model extraction failed: runtime degraded before extraction: {bucket:?}"
                     )));
+                }
+                if !outcome.model_invoked {
+                    self.record_usage(outcome.usage.clone(), elapsed, receipt);
+                    return Err(CgError::Engine(
+                        "model extraction failed: runtime did not invoke model".to_string(),
+                    ));
                 }
                 ConnectedModelReply {
                     text: outcome.phrasing.unwrap_or(outcome.marker),
@@ -2810,6 +2940,39 @@ Candidate entity: {}\n\
 Existing active memory:\n{}",
             request.context_label, request.candidate_decision, goal, entity, prior_memory
         )
+    }
+}
+
+impl LlmClient for ConnectedModelExtractor {
+    async fn understand(&self, invocation: &ModelInvocation) -> context_graph::Result<ModelReply> {
+        self.understand_native(invocation)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn understand_native(&self, invocation: &ModelInvocation) -> context_graph::Result<ModelReply> {
+        let output_schema = match invocation.request.output_contract() {
+            OutputContract::Schema(schema) => Some(schema),
+            OutputContract::Unconstrained => None,
+        };
+        let reply = self.call_model_for_consumer(
+            invocation
+                .request
+                .input_without_output_contract()
+                .to_string(),
+            output_schema.as_deref(),
+            invocation.request.consumer.clone(),
+        )?;
+        Ok(ModelReply {
+            marker: format!(
+                "skill-proposal:{}",
+                invocation.request.input_without_output_contract()
+            ),
+            phrasing: reply.text,
+            advisory_flag: false,
+            malformed: !matches!(reply.receipt.outcome, ModelCallOutcome::Captured),
+            usage: reply.usage,
+        }
+        .with_model_receipt(reply.receipt))
     }
 }
 
@@ -3749,6 +3912,7 @@ fn entity_walk_json(entity: &Entity, current_snapshot: Option<&EntitySnapshot>) 
     json!({
         "id": entity.id.as_uuid().to_string(),
         "name": entity.name,
+        "entity_type": format!("{:?}", entity.entity_type),
         "properties": current_snapshot
             .map(|snapshot| &snapshot.properties)
             .unwrap_or(&entity.properties),

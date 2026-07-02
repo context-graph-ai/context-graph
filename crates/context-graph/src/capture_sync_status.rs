@@ -344,8 +344,13 @@ pub fn capture_with_progress_observer(
             ProgressKind::Completed,
         ));
     }
-    let mut report =
-        rolling.finish_capture(store, &request.context_label, total_chunks, extractor)?;
+    let mut report = rolling.finish_capture(
+        store,
+        &request.context_label,
+        total_chunks,
+        extractor,
+        &request.transcript,
+    )?;
     // Replace the model_usage that finish_capture produced (from its inner
     // record_conversation call) with the per-chunk records collected above.
     // Those records carry the loop-authoritative chunk_index and the raw

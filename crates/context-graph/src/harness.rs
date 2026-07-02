@@ -725,7 +725,7 @@ pub fn run_capture(
     // selected skill's retype effect is applied to the harvested entity types in place. The shared
     // capture transaction records firing traces keyed to the digest the user can later correct with
     // `cg fix`.
-    let skill_application = select_and_apply_learned_skills(
+    let skill_application = crate::skill_store::select_and_apply_learned_skills(
         store,
         &mut harvest,
         &request.transcript,
@@ -1015,98 +1015,6 @@ fn resolve_decision_relation(
         prior_decision_id: prior.id.as_uuid().to_string(),
         classification: seed.classification,
     })
-}
-
-struct SelectedSkillApplication {
-    applied_skill_ids: Vec<String>,
-    firing_records: Vec<crate::skill_store::SkillFiringRecord>,
-}
-
-/// Select the learned skills whose description matches this capture and apply them.
-///
-/// The store-level master switch (`cg skills off`) stops all application; the review-hold gate
-/// (`cg skills review`) withholds a freshly promoted skill until acknowledged. Each selected skill's
-/// retype effect is applied to the harvested entity types IN PLACE (the deterministic, model-free
-/// retype the learned rule encodes), so the change is reflected in the stored entity. Returns the ids
-/// of every selected skill for the receipt plus the capture-time firing records the shared capture
-/// transaction writes once the digest exists.
-fn select_and_apply_learned_skills(
-    store: &Store,
-    harvest: &mut crate::ingest::StructuredHarvest,
-    chunk: &str,
-    config_skills_enabled: bool,
-    config_review_mode: bool,
-) -> SelectedSkillApplication {
-    let skills_on = config_skills_enabled && crate::skill_store::skills_enabled(store);
-    let review_mode = config_review_mode || crate::skill_store::review_hold_active(store);
-    let selected =
-        crate::skill_store::select_skills_for_chunk(store, chunk, skills_on, review_mode);
-    if selected.is_empty() {
-        return SelectedSkillApplication {
-            applied_skill_ids: Vec::new(),
-            firing_records: Vec::new(),
-        };
-    }
-
-    // Build the harvest's entity types keyed by seed key, so a retype effect can rewrite them in
-    // place. The retype rule names a source type LABEL (e.g. "File"); the stored seed carries the
-    // typed variant, so we round-trip through the label form.
-    let mut entity_types_by_key: std::collections::HashMap<String, (String, String)> = harvest
-        .entities
-        .iter()
-        .map(|seed| {
-            let entity_type: EntityType = seed.entity_type.into();
-            (
-                seed.key.clone(),
-                (seed.name.clone(), format!("{entity_type:?}")),
-            )
-        })
-        .collect();
-
-    let effects = crate::skill_store::apply_retype_skills(&selected, &mut entity_types_by_key);
-    let mut effects_by_skill: std::collections::BTreeMap<
-        String,
-        Vec<crate::skill_store::SkillFiringEffect>,
-    > = std::collections::BTreeMap::new();
-    for applied in effects {
-        effects_by_skill
-            .entry(applied.skill_id)
-            .or_default()
-            .push(applied.effect);
-    }
-
-    let mut firing_records = Vec::new();
-    for skill in &selected {
-        match effects_by_skill.remove(&skill.id) {
-            Some(effects) => {
-                for effect in effects {
-                    firing_records.push(crate::skill_store::SkillFiringRecord {
-                        skill_id: skill.id.clone(),
-                        effect: Some(effect),
-                    });
-                }
-            }
-            None => firing_records.push(crate::skill_store::SkillFiringRecord {
-                skill_id: skill.id.clone(),
-                effect: None,
-            }),
-        }
-    }
-
-    // Write any retyped labels back onto the harvest entity seeds so the new type is what gets
-    // stored. A label the conversion does not recognize leaves the seed unchanged.
-    for seed in &mut harvest.entities {
-        if let Some((_, type_label)) = entity_types_by_key.get(&seed.key)
-            && let Some(resolved) = crate::store::convert::entity_type_from_label(type_label)
-        {
-            seed.entity_type = crate::ingest::extracted_entity_type_from(resolved);
-        }
-    }
-
-    SelectedSkillApplication {
-        applied_skill_ids: selected.into_iter().map(|skill| skill.id).collect(),
-        firing_records,
-    }
 }
 
 /// Render the config knobs honored on this capture, for the report's introspection field.

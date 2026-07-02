@@ -746,7 +746,7 @@ def completion_usage(reply):
 def expected_completion_usage(prompt):
     behavior = read("completion_behavior", "succeed")
     if behavior in ("extract-harvest", "sleep-then-extract-harvest"):
-        return completion_usage(harvest_json(prompt))
+        return completion_usage(skill_proposal_json(prompt) or harvest_json(prompt))
     if behavior in ("succeed", "sleep-then-succeed"):
         return completion_usage(proof(read("secret", "secret"), prompt))
     return None
@@ -784,8 +784,14 @@ def capture_transcript(prompt):
         end = "\n</cg_transcript>"
         if start in transcript and end in transcript:
             transcript = transcript.split(start, 1)[1].split(end, 1)[0]
-        return transcript
-    return prompt
+        return capture_next_session_chunk(transcript)
+    return capture_next_session_chunk(prompt)
+
+def capture_next_session_chunk(text):
+    marker = "Next session chunk:\n"
+    if marker in text:
+        return text.rsplit(marker, 1)[1]
+    return text
 
 def clean_statement(statement):
     statement = statement.strip().strip(".")
@@ -829,6 +835,11 @@ def entity_type(path):
         return "file"
     return "service"
 
+def explicit_entity_type(text):
+    if "type=" not in text:
+        return None
+    return text.split("type=", 1)[1].split()[0].rstrip(",").lower()
+
 def entity_seed(key, text):
     path = path_from_text(text)
     if not path:
@@ -844,7 +855,7 @@ def entity_seed(key, text):
         name = "redis config"
     else:
         name = text.split(" path=", 1)[0].strip().strip(",")
-    return {"key": key, "name": name, "path": path, "entity_type": entity_type(path)}
+    return {"key": key, "name": name.split(" type=", 1)[0].strip(), "path": path, "entity_type": explicit_entity_type(text) or entity_type(path)}
 
 def decision_seed(key, text, entities):
     decision_text = text.split(" serves ", 1)[0].strip()
@@ -905,6 +916,20 @@ def infer_entities(harvest):
 
 def compact(text):
     return " ".join(text.split())
+
+def skill_proposal_json(prompt):
+    lower = prompt.lower()
+    if "skill proposal task" not in lower:
+        return None
+    if "entity name: context-graph" in lower and "source type: file" in lower and "target type: repository" in lower:
+        return json.dumps({
+            "description": "retype context-graph from File to Repository when future captures mention this entity",
+            "rule": "when an entity named context-graph is typed File -> Repository",
+        }, sort_keys=True)
+    return json.dumps({
+        "description": "retype the corrected entity when future captures mention it",
+        "rule": "when an entity named context-graph is typed File -> Repository",
+    }, sort_keys=True)
 
 def harvest_json(prompt):
     transcript = capture_transcript(prompt)
@@ -997,6 +1022,29 @@ def harvest_json(prompt):
             "goals": [{"key":"G_project","text":"keep project x memory local"}],
             "entities": [],
             "decisions": [{"key":"D_project","text":"use local context store","goal_key":"G_project","entity_key":None}],
+            "observations": [],
+        }, sort_keys=True)
+    if "context-graph" in lower and "type=file" in lower:
+        goal_key = "G_context_graph"
+        entity_key = "E_context_graph"
+        decision_key = "D_context_graph"
+        for token in transcript.replace(":", " ").split():
+            if token.startswith("G_") or token.startswith("G"):
+                goal_key = token.strip(",.")
+                break
+        for token in transcript.replace(":", " ").split():
+            if token.startswith("E_") or token.startswith("E"):
+                entity_key = token.strip(",.")
+                break
+        for token in transcript.replace(":", " ").split():
+            if token.startswith("D_") or token.startswith("D"):
+                decision_key = token.strip(",.")
+                break
+        return json.dumps({
+            "summary": compact(transcript),
+            "goals": [{"key": goal_key, "text": "keep the context-graph repository classified"}],
+            "entities": [{"key": entity_key, "name": "context-graph", "path": "context-graph", "entity_type": "file"}],
+            "decisions": [{"key": decision_key, "text": "treat context-graph as the repository root", "goal_key": goal_key, "entity_key": entity_key}],
             "observations": [],
         }, sort_keys=True)
     if "webhook ingestion" in lower and "signed worker" in lower:
@@ -1249,7 +1297,7 @@ if behavior == "empty":
     sys.exit(0)
 
 if behavior in ("extract-harvest", "sleep-then-extract-harvest"):
-    reply = harvest_json(prompt)
+    reply = skill_proposal_json(prompt) or harvest_json(prompt)
     mark("completion_exited")
     if provider == "claude":
         print(json.dumps(claude_envelope(reply)))

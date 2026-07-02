@@ -6760,6 +6760,9 @@ fn understanding_marker(request: &UnderstandingRequest) -> String {
         context_graph::UnderstandingConsumer::SignatureSemanticJudgment => {
             format!("signature-judgment:{input}")
         }
+        context_graph::UnderstandingConsumer::SkillProposal => {
+            format!("skill-proposal:{input}")
+        }
     }
 }
 

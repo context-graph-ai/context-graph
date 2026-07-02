@@ -8,6 +8,7 @@ mod connected_by_default_context;
 mod context_default_is_tenant;
 mod context_isolation;
 mod correction_learning_loop;
+mod correction_promotion_production;
 mod crud;
 mod digest_capture;
 mod discovery;
