@@ -100,7 +100,10 @@ pub fn list_pending_digests(
 
     // Priority: touch_count DESC, then oldest enqueued first (enqueue order ASC) within equal touch.
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let mut out: Vec<PendingDigest> = candidates.into_iter().map(|(_, _, pending)| pending).collect();
+    let mut out: Vec<PendingDigest> = candidates
+        .into_iter()
+        .map(|(_, _, pending)| pending)
+        .collect();
     if let Some(limit) = limit {
         out.truncate(limit);
     }
@@ -310,7 +313,10 @@ fn chunk_text_for_digest(store: &Store, digest_text: &str) -> Result<Option<Stri
         .internal_db()
         .execute(
             "SELECT content FROM cg_source_chunks WHERE digest_id = $digest_id",
-            &HashMap::from([("digest_id".to_string(), DbValue::Text(digest_text.to_string()))]),
+            &HashMap::from([(
+                "digest_id".to_string(),
+                DbValue::Text(digest_text.to_string()),
+            )]),
         )
         .map_err(map_engine)?;
     Ok(result.rows.first().and_then(|row| match row.first() {
@@ -324,7 +330,10 @@ fn touch_count_for_digest(store: &Store, digest_text: &str) -> Result<u64> {
         .internal_db()
         .execute(
             "SELECT touch_count FROM cg_retrieval_touches WHERE digest_id = $digest_id",
-            &HashMap::from([("digest_id".to_string(), DbValue::Text(digest_text.to_string()))]),
+            &HashMap::from([(
+                "digest_id".to_string(),
+                DbValue::Text(digest_text.to_string()),
+            )]),
         )
         .map_err(map_engine)?;
     Ok(result
@@ -342,7 +351,10 @@ fn current_attempts(store: &Store, digest_text: &str) -> Result<u32> {
         .internal_db()
         .execute(
             "SELECT attempts FROM cg_understanding_queue WHERE digest_id = $digest_id",
-            &HashMap::from([("digest_id".to_string(), DbValue::Text(digest_text.to_string()))]),
+            &HashMap::from([(
+                "digest_id".to_string(),
+                DbValue::Text(digest_text.to_string()),
+            )]),
         )
         .map_err(map_engine)?;
     Ok(result
@@ -360,7 +372,10 @@ fn context_id_for_digest(store: &Store, digest_text: &str) -> Result<Option<Cont
         .internal_db()
         .execute(
             "SELECT context_id FROM cg_understanding_queue WHERE digest_id = $digest_id",
-            &HashMap::from([("digest_id".to_string(), DbValue::Text(digest_text.to_string()))]),
+            &HashMap::from([(
+                "digest_id".to_string(),
+                DbValue::Text(digest_text.to_string()),
+            )]),
         )
         .map_err(map_engine)?;
     Ok(result.rows.first().and_then(|row| match row.first() {

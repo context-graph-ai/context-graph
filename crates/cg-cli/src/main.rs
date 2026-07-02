@@ -36,7 +36,6 @@ use context_graph::tier0::{
 use context_graph::understanding::{
     MAX_UNDERSTANDING_ATTEMPTS, claim_digest, list_pending_digests, mark_failed, mark_structured,
 };
-use fs4::fs_std::FileExt;
 use context_graph::{
     CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
     CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestSearchFilter,
@@ -56,6 +55,7 @@ use contextdb_engine::{
     sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection},
 };
 use contextdb_server::SyncClient;
+use fs4::fs_std::FileExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -843,8 +843,11 @@ fn parse_understand_budget(args: &[String]) -> Result<DrainBudget, String> {
 }
 
 fn spent_total_tokens(spent: &[ModelCallUsage]) -> Option<u64> {
-    let receipt =
-        usage_receipt_from_calls(spent.to_vec(), CapturePricing::FlatSubscription, Duration::ZERO);
+    let receipt = usage_receipt_from_calls(
+        spent.to_vec(),
+        CapturePricing::FlatSubscription,
+        Duration::ZERO,
+    );
     receipt.total_tokens
 }
 
