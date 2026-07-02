@@ -39,6 +39,7 @@ mod llm_runtime;
 mod local_entity_face_match_override;
 mod model_connection;
 mod nomic_loads;
+mod pre_extraction_steering;
 mod producer_lineage_audit_render;
 #[path = "../common/refactor_extractor.rs"]
 mod refactor_extractor;

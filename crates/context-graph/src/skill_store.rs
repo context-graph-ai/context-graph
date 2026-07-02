@@ -1350,6 +1350,107 @@ pub fn select_pre_extraction_guidance_skills_for_chunk(
     )
 }
 
+/// The hard cap on generation-time steering items appended to one extraction prompt. An oversized
+/// injected corpus decays extraction quality (the documented context-pollution failure mode), so the
+/// steering block keeps only the relevant few: matched guidance rules plus retrieved examples, capped
+/// and deduped.
+pub const MAX_STEERING_ITEMS: usize = 5;
+
+/// Which apply layer a teaching event is acted on by. The deterministic router sends structural /
+/// type corrections to the post-generation repair layer (layer 1) and omission / judgment-class
+/// events to the generation-time steering layer (layer 2, few-shot example retrieval). Pure over the
+/// event kind — finer identity-based matching is a named deferred item, not claimed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyLayer {
+    /// Deterministic post-generation repair (the learned-skill retype/recategorize seam).
+    PostGeneration,
+    /// Generation-time steering: the correction becomes a few-shot example in the extraction prompt.
+    GenerationTime,
+}
+
+/// Route a teaching event to the apply layer that can act on it, from its kind alone.
+///
+/// - A `WrongTypeCorrection` is a structural type fix a deterministic rule can replay → post-generation.
+/// - A `Reversal` / `GroupingReversal` is an undo signal reconciled elsewhere, not a steering example
+///   → post-generation.
+/// - A generic `Correction` is the omission / judgment class a deterministic rule cannot encode; it
+///   steers the model as a few-shot example → generation-time.
+pub fn route_teaching_event(kind: &TeachingEventKind) -> ApplyLayer {
+    match kind {
+        TeachingEventKind::WrongTypeCorrection
+        | TeachingEventKind::Reversal
+        | TeachingEventKind::GroupingReversal => ApplyLayer::PostGeneration,
+        TeachingEventKind::Correction => ApplyLayer::GenerationTime,
+    }
+}
+
+/// Assemble the generation-time steering block for a capture of `chunk`: matched
+/// `PreExtractionGuidance` rules first, then retrieved few-shot examples from teaching events the
+/// router sends to generation-time whose content is relevant to the chunk. Hard-capped to
+/// [`MAX_STEERING_ITEMS`] and deduped (the injected-corpus-decay guard). Returns `None` when the
+/// skills master switch is off or nothing relevant matches, so the caller appends nothing.
+///
+/// This is prompt-assembly the drain call site appends to the extraction prompt; it is pure library
+/// logic (no model, no engine mutation) and never runs on the tier-0 default path.
+pub fn assemble_pre_extraction_steering(
+    store: &Store,
+    chunk: &str,
+    skills_on: bool,
+    review_mode: bool,
+) -> Option<String> {
+    if !(skills_on && skills_enabled(store)) {
+        return None;
+    }
+    let mut items: Vec<String> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    // Matched generation-time guidance rules first (the human/LLM-authored steering).
+    for skill in
+        select_pre_extraction_guidance_skills_for_chunk(store, chunk, skills_on, review_mode)
+    {
+        let text = skill.rule.trim().to_string();
+        if text.is_empty() || !seen.insert(text.to_ascii_lowercase()) {
+            continue;
+        }
+        items.push(format!("Guidance: {text}"));
+        if items.len() >= MAX_STEERING_ITEMS {
+            break;
+        }
+    }
+
+    // Then retrieved few-shot correction examples routed to generation-time and relevant to the chunk.
+    if items.len() < MAX_STEERING_ITEMS {
+        for event in list_teaching_events_in_store(store) {
+            if route_teaching_event(&event.kind) != ApplyLayer::GenerationTime {
+                continue;
+            }
+            let content = event.content.trim();
+            if content.is_empty() || !skill_description_matches_chunk(content, chunk) {
+                continue;
+            }
+            if !seen.insert(content.to_ascii_lowercase()) {
+                continue;
+            }
+            items.push(format!("Example correction: {content}"));
+            if items.len() >= MAX_STEERING_ITEMS {
+                break;
+            }
+        }
+    }
+
+    if items.is_empty() {
+        return None;
+    }
+    let mut block = String::from(
+        "Apply these learned corrections when extracting (use them to guide your output; do not restate them):",
+    );
+    for item in items {
+        block.push_str("\n- ");
+        block.push_str(&item);
+    }
+    Some(block)
+}
+
 /// The base match: active, not held under the review gate, description matches the chunk, and any
 /// parsed retype rule stays inside its learned entity scope — irrespective of apply strategy. Both
 /// the strategy-scoped public selectors and the withhold-aware capture-path seam share this so a
