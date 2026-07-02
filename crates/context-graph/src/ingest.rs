@@ -931,21 +931,46 @@ fn record_conversation_internal(
     request: CaptureRequest,
     extractor: Option<&dyn ConversationExtractor>,
 ) -> Result<CaptureReport> {
-    let raw_text = request.transcript.as_str();
-    let text = raw_text.trim();
+    let transcript = request.transcript;
+    let text = transcript.trim();
+    record_conversation_internal_with_stored_text(
+        store,
+        &request.context_label,
+        text,
+        request.model_available,
+        extractor,
+        text,
+    )
+}
+
+fn record_conversation_internal_with_stored_text(
+    store: &Store,
+    context_label: &str,
+    analysis_text: &str,
+    model_available: bool,
+    extractor: Option<&dyn ConversationExtractor>,
+    stored_text: &str,
+) -> Result<CaptureReport> {
+    let text = analysis_text.trim();
     if text.is_empty() {
         return Ok(CaptureReport::empty(
             CaptureMode::Condensed,
             "nothing to capture: empty import",
         ));
     }
-
-    let context = context_by_label(store, &request.context_label)?;
-    let Some(extractor) = extractor else {
-        return capture_raw(store, context.id, &request.context_label, text);
+    let stored_text = stored_text.trim();
+    let stored_text = if stored_text.is_empty() {
+        text
+    } else {
+        stored_text
     };
-    if !request.model_available {
-        return capture_raw(store, context.id, &request.context_label, text);
+
+    let context = context_by_label(store, context_label)?;
+    let Some(extractor) = extractor else {
+        return capture_raw(store, context.id, context_label, stored_text);
+    };
+    if !model_available {
+        return capture_raw(store, context.id, context_label, stored_text);
     }
     let prior_decisions = extraction_prior_decisions(store, context.id)?;
     // Wrap the extractor to tag each call's usage records with the originating
@@ -954,7 +979,7 @@ fn record_conversation_internal(
     // record is synthesized so the usage lane always has a measurement.
     let tagger = FlowTaggingWrapper::new(extractor);
     let mut harvest = tagger.extract(ExtractionRequest {
-        context_label: &request.context_label,
+        context_label,
         transcript: text,
         prior_decisions: &prior_decisions,
     })?;
@@ -964,11 +989,13 @@ fn record_conversation_internal(
     prepare_harvest_for_capture(
         store,
         context.id,
-        &request.context_label,
+        context_label,
         &mut harvest,
         &prior_decisions,
         &tagger,
     )?;
+    let skill_application =
+        crate::skill_store::select_and_apply_learned_skills(store, &mut harvest, text, true, false);
     // Run the deterministic grounding check over every value class before consuming the harvest,
     // plus the Stage-3 empty-candidate-set flag for a decision that needed a candidate and found none.
     flagged_items.extend(grounding_check_harvest(&harvest, text));
@@ -976,10 +1003,10 @@ fn record_conversation_internal(
     let mut report = capture_structured_harvest(
         store,
         context.id,
-        &request.context_label,
-        text,
+        context_label,
+        stored_text,
         harvest,
-        &[],
+        &skill_application.firing_records,
     )?
     .report;
     report.model_usage = tagger.drain_model_usage();
@@ -1089,7 +1116,8 @@ pub fn capture_rolling_conversation_with_extractor(
         rolling.push_harvest(harvest);
         Ok(())
     })?;
-    let mut report = rolling.finish_capture(store, &request.context_label, chunks, extractor)?;
+    let mut report =
+        rolling.finish_capture(store, &request.context_label, chunks, extractor, text)?;
     report.resolved_chunk_window = Some(chunk_window);
     report.model_context_tokens = request.model_context_tokens;
     Ok(report)
@@ -1273,6 +1301,7 @@ impl RollingCaptureAccumulator {
         context_label: &str,
         chunks: usize,
         relation_classifier: &dyn ConversationExtractor,
+        source_transcript: &str,
     ) -> Result<CaptureReport> {
         if chunks == 0 {
             let mut report =
@@ -1286,14 +1315,13 @@ impl RollingCaptureAccumulator {
             harvest: final_harvest,
             relation_classifier,
         };
-        let mut report = record_conversation_with_extractor(
+        let mut report = record_conversation_internal_with_stored_text(
             store,
-            CaptureRequest {
-                context_label: context_label.to_string(),
-                transcript: digest_text,
-                model_available: true,
-            },
-            &one_shot,
+            context_label,
+            source_transcript,
+            true,
+            Some(&one_shot),
+            &digest_text,
         )?;
         if chunks > 1 {
             report.message = format!("captured import in {chunks} chunks as one condensed memory");

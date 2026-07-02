@@ -644,6 +644,51 @@ fn cli_import_streams_large_jsonl_in_bounded_chunks() {
 }
 
 #[test]
+fn cli_import_default_window_is_capped_for_real_provider_output_budget() {
+    let harness = extraction_harness();
+    let session = harness
+        .data_root
+        .path()
+        .join("default-window-session.jsonl");
+    write_file(&session, &large_chunked_session(18));
+
+    let before_calls = harness.providers.completion_count();
+    let dry_run = harness.run(&["import", "--dry-run", session.to_str().expect("utf8 path")]);
+    let estimate = harness.run(&["import", "--estimate", session.to_str().expect("utf8 path")]);
+    let dry_run_json = output_json(&dry_run).expect("dry-run json");
+    let estimate_json = output_json(&estimate).expect("estimate json");
+
+    assert_eq!(dry_run.code, 0, "dry run failed: {}", combined(&dry_run));
+    assert_eq!(estimate.code, 0, "estimate failed: {}", combined(&estimate));
+    assert_eq!(
+        harness.providers.completion_count(),
+        before_calls,
+        "dry-run and estimate must not call the provider"
+    );
+    assert_eq!(
+        (
+            dry_run_json
+                .get("resolved_chunk_window")
+                .and_then(JsonValue::as_u64),
+            estimate_json
+                .pointer("/estimate/resolved_chunk_window")
+                .and_then(JsonValue::as_u64),
+        ),
+        (Some(16_000), Some(16_000)),
+        "the default import window must stay below the hosted-model output budget; \
+         explicit --chunk-tokens can still opt into larger windows"
+    );
+    assert!(
+        dry_run_json
+            .get("chunks")
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|chunks| chunks > 1),
+        "default import should split a large JSONL into multiple bounded chunks: {}",
+        dry_run.stdout
+    );
+}
+
+#[test]
 fn cli_import_rolls_plain_long_session_into_one_digest_without_label_markers() {
     let harness = extraction_harness();
     let session = harness.data_root.path().join("plain-long-session.jsonl");

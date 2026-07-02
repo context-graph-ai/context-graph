@@ -36,6 +36,7 @@ fn expected_marker(consumer: &UnderstandingConsumer, input: &str) -> String {
         UnderstandingConsumer::BlueprintNormalization => format!("blueprint:{input}"),
         UnderstandingConsumer::WebhookEntityResolution => format!("entity:{input}"),
         UnderstandingConsumer::SignatureSemanticJudgment => format!("signature-judgment:{input}"),
+        UnderstandingConsumer::SkillProposal => format!("skill-proposal:{input}"),
     }
 }
 
@@ -1343,9 +1344,9 @@ fn model_understanding_never_gates_whether_an_invalidation_flag_fires() {
     );
 }
 
-// Use case: condensation, blueprint matching, webhook resolution, and signature judgment should all use one connected model rather than feature-specific keys.
+// Use case: condensation, blueprint matching, webhook resolution, signature judgment, and skill proposal should all use one connected model rather than feature-specific keys.
 #[test]
-fn one_connected_model_serves_all_four_understanding_consumers_without_a_per_feature_key() {
+fn one_connected_model_serves_all_understanding_consumers_without_a_per_feature_key() {
     let _feature_env_guard = scoped_feature_envs(FeatureEnvMode::Poisoned);
     let client = Arc::new(RecordingClient::input_derived());
     let (mut runtime, context_id) = connected_hosted_runtime(true, client.clone());
@@ -1354,7 +1355,9 @@ fn one_connected_model_serves_all_four_understanding_consumers_without_a_per_fea
         UnderstandingConsumer::BlueprintNormalization,
         UnderstandingConsumer::WebhookEntityResolution,
         UnderstandingConsumer::SignatureSemanticJudgment,
+        UnderstandingConsumer::SkillProposal,
     ];
+    let expected_consumer_count = consumers.len();
     let mut resolved = BTreeSet::new();
     let mut markers = BTreeSet::new();
 
@@ -1386,7 +1389,7 @@ fn one_connected_model_serves_all_four_understanding_consumers_without_a_per_fea
     );
     assert_eq!(
         client.call_count(),
-        4,
+        expected_consumer_count,
         "each consumer should route through the shared model invocation seam"
     );
     assert_eq!(

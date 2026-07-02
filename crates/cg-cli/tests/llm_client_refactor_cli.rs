@@ -27,6 +27,7 @@ use context_graph::ingest::{
     CaptureRequest, ConversationExtractor, ExtractionRequest, StructuredHarvest,
 };
 use context_graph::review_surface::{MessageKind, all_message_kinds, parse_verb};
+use context_graph::skill_store::{SkillProvenance, list_skills_in_store, parse_retype_effect};
 use context_graph::{
     EntityType, HostedProviderBoundary, HostedProviderReply, ListEntityFilter, Store, StoreConfig,
 };
@@ -503,6 +504,7 @@ fn cg_multi_chunk_import_applies_skills_and_carries_harness_report() {
     // accumulator path skips select_and_apply_learned_skills, so both are absent → RED.
     let applied_ids = receipt
         .get("applied_skill_ids")
+        .or_else(|| receipt.pointer("/harness/applied_skill_ids"))
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
@@ -543,6 +545,241 @@ fn cg_multi_chunk_import_applies_skills_and_carries_harness_report() {
         "the multi-chunk import receipt must surface a run_capture CaptureHarnessReport marker; HEAD's \
          accumulator path returns a near-default harness report and emits none. receipt keys: {:?}",
         receipt.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
+}
+
+#[test]
+fn cg_fix_promotes_llm_authored_skill_then_multi_chunk_import_applies_without_seeded_skill() {
+    let harness = extraction_harness();
+    let mut last_record_stdout = String::new();
+
+    for index in 0..3 {
+        let transcript = format!(
+            "Goal G{index}: keep the context-graph repository classified\n\
+             Entity E{index}: context-graph type=file\n\
+             Decision D{index}: treat context-graph as the repository root serves G{index} based_on E{index}"
+        );
+        let record = harness.run_with_stdin(&["record"], &transcript);
+        assert_eq!(
+            record.code, 0,
+            "training record {index} must succeed: {}",
+            record.stderr
+        );
+        last_record_stdout = record.stdout.clone();
+
+        let fix = harness.run(&["fix", "@1", "Repository", "context-graph"]);
+        assert_eq!(
+            fix.code, 0,
+            "training fix {index} must succeed: stdout={:?} stderr={:?}",
+            fix.stdout, fix.stderr
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_str(&fix.stdout).expect("cg fix must emit JSON");
+        assert_eq!(
+            receipt
+                .get("skill_proposal_model_available")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "cg fix must find the connected model-backed correction path"
+        );
+        if index == 2 {
+            assert_eq!(
+                receipt
+                    .get("skill_proposal_model_invoked")
+                    .and_then(|v| v.as_bool()),
+                Some(true),
+                "the threshold-crossing cg fix must invoke the connected model skill proposal path"
+            );
+            assert!(
+                receipt
+                    .get("skill_proposal_model_invocations")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    > 0,
+                "the threshold-crossing cg fix must report the model skill proposal call"
+            );
+            assert_eq!(
+                receipt.get("new_skill_created").and_then(|v| v.as_bool()),
+                Some(true),
+                "the third aligned correction should promote a skill"
+            );
+            assert!(
+                receipt
+                    .get("heldout_gate_invocations")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    > 0,
+                "promotion from cg fix must run the held-out gate"
+            );
+        } else {
+            assert_eq!(
+                receipt
+                    .get("skill_proposal_model_invoked")
+                    .and_then(|v| v.as_bool()),
+                Some(false),
+                "pre-threshold cg fix has a model available but must not claim a proposal call ran"
+            );
+        }
+    }
+
+    let records = harness.providers.completion_records();
+    assert!(
+        records.iter().any(|record| {
+            record
+                .get("prompt")
+                .and_then(|prompt| prompt.as_str())
+                .is_some_and(|prompt| prompt.contains("Skill proposal task"))
+        }),
+        "the fake provider must have received a skill-proposal prompt from cg fix"
+    );
+
+    let (store, _ctx) = open_recorded_store(&last_record_stdout);
+    let skills = list_skills_in_store(&store);
+    let skill = skills
+        .iter()
+        .find(|skill| {
+            let text = format!("{} {}", skill.description, skill.rule).to_ascii_lowercase();
+            skill.provenance == SkillProvenance::LlmAuthored
+                && text.contains("context-graph")
+                && text.contains("repository")
+        })
+        .expect("cg fix must persist an LLM-authored context-graph retype skill")
+        .clone();
+    assert!(
+        parse_retype_effect(&skill.rule).is_some(),
+        "the LLM-authored skill must carry a parseable retype rule, got {:?}",
+        skill.rule
+    );
+    drop(store);
+
+    let listed = harness.run(&["skills"]);
+    assert_eq!(
+        listed.code, 0,
+        "cg skills must list promoted skills: stdout={:?} stderr={:?}",
+        listed.stdout, listed.stderr
+    );
+    let listed_json: serde_json::Value =
+        serde_json::from_str(&listed.stdout).expect("cg skills must emit JSON");
+    let listed_skill = listed_json
+        .get("skills")
+        .and_then(|value| value.as_array())
+        .and_then(|skills| {
+            skills
+                .iter()
+                .find(|listed| listed.get("id").and_then(|value| value.as_str()) == Some(&skill.id))
+        })
+        .expect("promoted skill must be listed by id");
+    assert_eq!(
+        listed_skill
+            .get("provenance")
+            .and_then(|value| value.as_str()),
+        Some("llm-authored"),
+        "cg skills JSON must expose canonical provenance, not the Rust enum name"
+    );
+
+    let session = harness
+        .data_root
+        .path()
+        .join("llm-authored-multi-chunk-session.jsonl");
+    let statements = [
+        "Goal G_import: keep the context-graph repo classified\nEntity E_import: context-graph type=file\nDecision D_import: keep context-graph indexed serves G_import based_on E_import",
+        "Extra discussion repeats enough operational context to force more than one import chunk while staying unrelated to the learned retype rule. The team reviews release notes, migration logs, test plans, handoff details, and deployment reminders without changing the repository classification.",
+        "More unrelated import text pads the session so the importer exercises its multi-chunk capture route rather than the single-chunk shortcut. The discussion continues through validation notes, rollout timing, monitoring expectations, and follow-up scheduling.",
+    ];
+    let mut body = String::new();
+    for statement in statements {
+        let encoded = serde_json::to_string(statement).expect("json string");
+        body.push_str(&format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"text","text":{encoded}}}]}}}}"#
+        ));
+        body.push('\n');
+    }
+    support::write_file(&session, &body);
+
+    let import = harness.run(&[
+        "import",
+        "--context=fresh-import",
+        "--chunk-tokens",
+        "80",
+        session.to_str().expect("utf8 path"),
+    ]);
+    assert_eq!(
+        import.code, 0,
+        "multi-chunk import must succeed: stdout={:?} stderr={:?}",
+        import.stdout, import.stderr
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_str(&import.stdout).expect("cg import must emit JSON");
+    assert!(
+        receipt
+            .get("import_chunks")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            > 1,
+        "the smoke import must exercise the multi-chunk route"
+    );
+    let applied_skill_ids = receipt
+        .pointer("/harness/applied_skill_ids")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let (store, ctx_label) = open_recorded_store(&import.stdout);
+    assert_eq!(
+        ctx_label, "fresh-import",
+        "the final import must run in the fresh smoke context"
+    );
+    assert!(
+        store
+            .list_contexts()
+            .expect("list contexts")
+            .iter()
+            .any(|ctx| ctx.name == ctx_label),
+        "the fresh smoke context must exist in the store"
+    );
+    let (entities, _decisions) = graph_projection(&store, &ctx_label);
+    let firing_effects = {
+        let db = store.sync_database();
+        db.scan("cg_skill_firing_trace", db.snapshot())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                let skill_matches = matches!(
+                    row.values.get("skill_id"),
+                    Some(contextdb_core::Value::Text(value)) if value == &skill.id
+                );
+                if !skill_matches {
+                    return None;
+                }
+                Some(format!(
+                    "{:?}->{:?} name={:?}",
+                    row.values.get("effect_from_type"),
+                    row.values.get("effect_to_type"),
+                    row.values.get("effect_entity_name")
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        applied_skill_ids.iter().any(|id| id == &skill.id),
+        "multi-chunk import must select the LLM-authored skill {}; applied_skill_ids={applied_skill_ids:?} firing_effects={firing_effects:?}",
+        skill.id
+    );
+    assert!(
+        entities.iter().any(|(name, entity_type)| {
+            name == "context-graph" && *entity_type == EntityType::Repository
+        }),
+        "the LLM-authored skill must retype context-graph to Repository on multi-chunk import; applied_skill_ids={applied_skill_ids:?} firing_effects={firing_effects:?} entities={entities:?}"
+    );
+    assert!(
+        !firing_effects.is_empty(),
+        "multi-chunk import must persist a firing trace for the LLM-authored skill {}",
+        skill.id
     );
 }
 

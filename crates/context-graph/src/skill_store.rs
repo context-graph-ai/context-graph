@@ -126,6 +126,29 @@ pub struct PromotionResult {
     pub heldout_gate_invocations: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+struct StorePromotionResult {
+    created: bool,
+    heldout_gate_invocations: usize,
+    skill_proposal_model_invocations: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmSkillProposal {
+    description: String,
+    rule: String,
+}
+
+const SKILL_PROPOSAL_OUTPUT_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "description": {"type": "string"},
+    "rule": {"type": "string"}
+  },
+  "required": ["description", "rule"]
+}"#;
+
 /// A parse-only result for a human-authored skill file.
 #[derive(Debug, Clone)]
 pub struct ParseSkillResult {
@@ -145,6 +168,10 @@ pub struct CorrectionResult {
     pub teaching_event: Option<TeachingEvent>,
     /// Whether a new auto-applying skill was created. A single correction never promotes.
     pub new_skill_created: bool,
+    /// How many times the held-out promotion gate ran while accepting this correction.
+    pub heldout_gate_invocations: usize,
+    /// How many model-backed skill proposal calls ran while accepting this correction.
+    pub skill_proposal_model_invocations: usize,
 }
 
 // ─── Table name constants ─────────────────────────────────────────────────────
@@ -362,6 +389,35 @@ fn retype_skill_from_key(store: &Store, key: &RetypeLessonKey) -> LearnedSkill {
     }
 }
 
+fn llm_retype_skill_from_key(
+    store: &Store,
+    key: &RetypeLessonKey,
+    proposal: LlmSkillProposal,
+) -> Option<LearnedSkill> {
+    let description = proposal.description.trim();
+    let rule = proposal.rule.trim();
+    if description.is_empty() || rule.is_empty() {
+        return None;
+    }
+    let effect = parse_retype_effect(rule)?;
+    if !effect.entity_name.eq_ignore_ascii_case(&key.entity_name)
+        || !effect.from_type.eq_ignore_ascii_case(&key.from_type)
+        || !effect.to_type.eq_ignore_ascii_case(&key.to_type)
+    {
+        return None;
+    }
+    Some(LearnedSkill {
+        id: retype_skill_id(key),
+        description: description.to_string(),
+        rule: rule.to_string(),
+        provenance: SkillProvenance::LlmAuthored,
+        active: true,
+        held_for_review: review_hold_active(store),
+        fire_right: 0,
+        fire_wrong: 0,
+    })
+}
+
 fn entity_type_label_for_skill(entity_type: crate::EntityType) -> &'static str {
     match entity_type {
         crate::EntityType::Service => "Service",
@@ -485,26 +541,178 @@ fn retype_lesson_from_event(store: &Store, event: &TeachingEvent) -> Option<Rety
     })
 }
 
-fn promote_skills_from_teaching_events(store: &Store) -> bool {
-    let mut grouped: BTreeMap<RetypeLessonKey, usize> = BTreeMap::new();
+fn render_skill_proposal_prompt(key: &RetypeLessonKey, training: &[TeachingEvent]) -> String {
+    let labels = training
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            format!(
+                "{}. corrected_item_id={} correction={}",
+                index + 1,
+                event.corrected_item_id,
+                event.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Skill proposal task\n\
+         Generalize the aligned correction labels into one learned retype skill.\n\
+         Entity name: {}\n\
+         Source type: {}\n\
+         Target type: {}\n\
+         Training labels:\n{}\n\
+         Return only JSON with string fields description and rule. The rule must have this shape: \
+         when an entity named <name> is typed <Source> -> <Target>",
+        key.entity_name, key.from_type, key.to_type, labels
+    )
+}
+
+fn propose_llm_retype_skill<C: crate::LlmClient>(
+    store: &Store,
+    key: &RetypeLessonKey,
+    training: &[TeachingEvent],
+    context_id: crate::ContextId,
+    client: &C,
+) -> Option<LearnedSkill> {
+    let request = crate::llm::UnderstandingRequest {
+        context_id,
+        consumer: crate::llm::UnderstandingConsumer::SkillProposal,
+        deployment: crate::llm::DeploymentSurface::Edge,
+        input: render_skill_proposal_prompt(key, training),
+        paid: true,
+    }
+    .with_output_contract(crate::llm::OutputContract::Schema(
+        SKILL_PROPOSAL_OUTPUT_SCHEMA.to_string(),
+    ));
+    // SAFETY: this path does not discover or forge a model connection. The caller has supplied an
+    // already-authorized `LlmClient` for this correction, so the invocation carries no credential or
+    // hosted endpoint fields and is only a typed request envelope for that explicit client.
+    let invocation = unsafe {
+        crate::llm::ModelInvocation::from_authorized_runtime_parts(
+            crate::llm::AuthorizedModelInvocationParts {
+                request,
+                resolved_connection: None,
+                resolved_credential: None,
+                hosted_endpoint: None,
+                provider_config: None,
+                cache_path: None,
+                local_artifacts: Vec::new(),
+                local_catalog_authorized: true,
+            },
+        )
+    };
+    let reply = pollster::block_on(client.understand(&invocation)).ok()?;
+    if reply.malformed {
+        return None;
+    }
+    let proposal = parse_llm_skill_proposal_reply(&reply.phrasing)?;
+    llm_retype_skill_from_key(store, key, proposal)
+}
+
+fn parse_llm_skill_proposal_reply(reply: &str) -> Option<LlmSkillProposal> {
+    serde_json::from_str::<LlmSkillProposal>(reply)
+        .ok()
+        .or_else(|| {
+            let trimmed = reply.trim();
+            let unfenced = trimmed
+                .strip_prefix("```json")
+                .or_else(|| trimmed.strip_prefix("```"))?
+                .trim()
+                .strip_suffix("```")?
+                .trim();
+            serde_json::from_str::<LlmSkillProposal>(unfenced).ok()
+        })
+}
+
+fn incumbent_retype_skill(store: &Store, key: &RetypeLessonKey) -> Option<LearnedSkill> {
+    let expected_id = retype_skill_id(key);
+    list_skills_in_store(store).into_iter().find(|skill| {
+        if skill.id == expected_id {
+            return true;
+        }
+        parse_retype_effect(&skill.rule).is_some_and(|effect| {
+            effect.entity_name.eq_ignore_ascii_case(&key.entity_name)
+                && effect.from_type.eq_ignore_ascii_case(&key.from_type)
+                && effect.to_type.eq_ignore_ascii_case(&key.to_type)
+        })
+    })
+}
+
+fn run_heldout_promotion_gate(
+    store: &Store,
+    key: &RetypeLessonKey,
+    candidate: LearnedSkill,
+    heldout: &[TeachingEvent],
+) -> PromotionResult {
+    let candidate_score = evaluate_on_heldout(&candidate, heldout).score;
+    let incumbent_score =
+        incumbent_retype_skill(store, key).map(|skill| evaluate_on_heldout(&skill, heldout).score);
+    let baseline = incumbent_score.unwrap_or(0.5);
+    let promoted = candidate_score > baseline;
+    PromotionResult {
+        promoted,
+        skill: if promoted { Some(candidate) } else { None },
+        heldout_score: candidate_score,
+        heldout_gate_invocations: 1,
+    }
+}
+
+fn promote_skills_from_teaching_events_with_candidate<F>(
+    store: &Store,
+    mut candidate_for: F,
+) -> StorePromotionResult
+where
+    F: FnMut(&Store, &RetypeLessonKey, &[TeachingEvent]) -> Option<LearnedSkill>,
+{
+    let mut grouped: BTreeMap<RetypeLessonKey, Vec<TeachingEvent>> = BTreeMap::new();
     for event in list_teaching_events_in_store(store) {
         if !event.skill_id.is_empty() {
             continue;
         }
         if let Some(key) = retype_lesson_from_event(store, &event) {
-            *grouped.entry(key).or_default() += 1;
+            grouped.entry(key).or_default().push(event);
         }
     }
 
-    let mut created = false;
-    for (key, count) in grouped {
-        if count < promotion_threshold() {
+    let mut result = StorePromotionResult::default();
+    for (key, events) in grouped {
+        if events.len() < promotion_threshold() {
             continue;
         }
-        let skill = retype_skill_from_key(store, &key);
-        created |= persist_skill(store, &skill);
+        let split_at = events.len() - 1;
+        let (training, heldout) = events.split_at(split_at);
+        let Some(candidate) = candidate_for(store, &key, training) else {
+            continue;
+        };
+        let gate = run_heldout_promotion_gate(store, &key, candidate, heldout);
+        result.heldout_gate_invocations += gate.heldout_gate_invocations;
+        if let Some(skill) = gate.skill {
+            result.created |= persist_skill(store, &skill);
+        }
     }
-    created
+    result
+}
+
+fn promote_skills_from_teaching_events(store: &Store) -> StorePromotionResult {
+    promote_skills_from_teaching_events_with_candidate(store, |store, key, _training| {
+        Some(retype_skill_from_key(store, key))
+    })
+}
+
+fn promote_skills_from_teaching_events_with_llm_client<C: crate::LlmClient>(
+    store: &Store,
+    context_id: crate::ContextId,
+    client: &C,
+) -> StorePromotionResult {
+    let mut proposal_invocations = 0;
+    let mut result =
+        promote_skills_from_teaching_events_with_candidate(store, |store, key, training| {
+            proposal_invocations += 1;
+            propose_llm_retype_skill(store, key, training, context_id, client)
+        });
+    result.skill_proposal_model_invocations = proposal_invocations;
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -680,6 +888,21 @@ pub fn apply_correction(
     new_value: &str,
     skill_id: Option<&str>,
 ) -> CorrectionResult {
+    apply_correction_internal(store, item_id, new_value, skill_id, |_| {
+        promote_skills_from_teaching_events(store)
+    })
+}
+
+fn apply_correction_internal<F>(
+    store: &Store,
+    item_id: &str,
+    new_value: &str,
+    skill_id: Option<&str>,
+    promote: F,
+) -> CorrectionResult
+where
+    F: FnOnce(&Store) -> StorePromotionResult,
+{
     let event_id = uuid::Uuid::new_v4().to_string();
     let skill_id_str = skill_id.unwrap_or("").to_string();
     let db = store.sync_database();
@@ -690,6 +913,8 @@ pub fn apply_correction(
             applied: false,
             teaching_event: None,
             new_skill_created: false,
+            heldout_gate_invocations: 0,
+            skill_proposal_model_invocations: 0,
         };
     };
 
@@ -705,6 +930,8 @@ pub fn apply_correction(
             applied: false,
             teaching_event: None,
             new_skill_created: false,
+            heldout_gate_invocations: 0,
+            skill_proposal_model_invocations: 0,
         };
     }
 
@@ -715,17 +942,33 @@ pub fn apply_correction(
         kind: TeachingEventKind::Correction,
         content: new_value.to_string(),
     };
-    let new_skill_created = if skill_id.is_none() {
-        promote_skills_from_teaching_events(store)
+    let promotion = if skill_id.is_none() {
+        promote(store)
     } else {
-        false
+        StorePromotionResult::default()
     };
 
     CorrectionResult {
         applied: true,
         teaching_event: Some(teaching_event),
-        new_skill_created,
+        new_skill_created: promotion.created,
+        heldout_gate_invocations: promotion.heldout_gate_invocations,
+        skill_proposal_model_invocations: promotion.skill_proposal_model_invocations,
     }
+}
+
+/// Apply a correction with a model available for skill proposal.
+pub fn apply_correction_with_llm_client<C: crate::LlmClient>(
+    store: &Store,
+    item_id: &str,
+    new_value: &str,
+    skill_id: Option<&str>,
+    context_id: crate::ContextId,
+    client: &C,
+) -> CorrectionResult {
+    apply_correction_internal(store, item_id, new_value, skill_id, |_| {
+        promote_skills_from_teaching_events_with_llm_client(store, context_id, client)
+    })
 }
 
 fn insert_correction_and_labels(
@@ -970,11 +1213,33 @@ pub fn skill_description_matches_chunk(description: &str, chunk: &str) -> bool {
     desc.intersection(&chunk_tokens).next().is_some()
 }
 
+fn retype_skill_scope_matches_chunk(skill: &LearnedSkill, chunk: &str) -> bool {
+    let Some(effect) = parse_retype_effect(&skill.rule) else {
+        return true;
+    };
+    let entity_name = effect.entity_name.trim();
+    if entity_name.is_empty() {
+        return false;
+    }
+
+    let chunk_lower = chunk.to_ascii_lowercase();
+    let entity_lower = entity_name.to_ascii_lowercase();
+    if chunk_lower.contains(&entity_lower) {
+        return true;
+    }
+
+    let entity_tokens = skill_match_tokens(entity_name);
+    !entity_tokens.is_empty()
+        && entity_tokens
+            .iter()
+            .all(|token| chunk_lower.contains(token.as_str()))
+}
+
 /// Select the learned skills that should APPLY to a capture of `chunk`, by DESCRIPTION match — the
 /// relevant few, never the whole corpus. A skill is selected only when it is active, its description
-/// matches the chunk, and it is not currently held for review under the review-hold gate. With the
-/// master switch off, nothing is selected. The result preserves store order so application is
-/// deterministic.
+/// matches the chunk, any parsed retype rule stays inside its learned entity scope, and it is not
+/// currently held for review under the review-hold gate. With the master switch off, nothing is
+/// selected. The result preserves store order so application is deterministic.
 ///
 /// `review_mode` reflects the caller's `cg skills review` setting for this capture: when on, a skill
 /// flagged `held_for_review` is withheld (not applied) until acknowledged; when off, an active
@@ -993,7 +1258,89 @@ pub fn select_skills_for_chunk(
         .filter(|skill| skill.active)
         .filter(|skill| !(review_mode && skill.held_for_review))
         .filter(|skill| skill_description_matches_chunk(&skill.description, chunk))
+        .filter(|skill| retype_skill_scope_matches_chunk(skill, chunk))
         .collect()
+}
+
+pub(crate) struct SelectedSkillApplication {
+    pub applied_skill_ids: Vec<String>,
+    pub firing_records: Vec<SkillFiringRecord>,
+}
+
+/// Select the learned skills whose description matches this capture and apply them.
+///
+/// The store-level master switch (`cg skills off`) stops all application; the review-hold gate
+/// (`cg skills review`) withholds a freshly promoted skill until acknowledged. Each selected skill's
+/// retype effect is applied to the harvested entity types in place, so both public capture
+/// entrypoints store the same value-level result and the same firing trace.
+pub(crate) fn select_and_apply_learned_skills(
+    store: &Store,
+    harvest: &mut crate::ingest::StructuredHarvest,
+    chunk: &str,
+    config_skills_enabled: bool,
+    config_review_mode: bool,
+) -> SelectedSkillApplication {
+    let skills_on = config_skills_enabled && skills_enabled(store);
+    let review_mode = config_review_mode || review_hold_active(store);
+    let selected = select_skills_for_chunk(store, chunk, skills_on, review_mode);
+    if selected.is_empty() {
+        return SelectedSkillApplication {
+            applied_skill_ids: Vec::new(),
+            firing_records: Vec::new(),
+        };
+    }
+
+    let mut entity_types_by_key: HashMap<String, (String, String)> = harvest
+        .entities
+        .iter()
+        .map(|seed| {
+            let entity_type: crate::EntityType = seed.entity_type.into();
+            (
+                seed.key.clone(),
+                (seed.name.clone(), format!("{entity_type:?}")),
+            )
+        })
+        .collect();
+
+    let effects = apply_retype_skills(&selected, &mut entity_types_by_key);
+    let mut effects_by_skill: BTreeMap<String, Vec<SkillFiringEffect>> = BTreeMap::new();
+    for applied in effects {
+        effects_by_skill
+            .entry(applied.skill_id)
+            .or_default()
+            .push(applied.effect);
+    }
+
+    let mut firing_records = Vec::new();
+    for skill in &selected {
+        match effects_by_skill.remove(&skill.id) {
+            Some(effects) => {
+                for effect in effects {
+                    firing_records.push(SkillFiringRecord {
+                        skill_id: skill.id.clone(),
+                        effect: Some(effect),
+                    });
+                }
+            }
+            None => firing_records.push(SkillFiringRecord {
+                skill_id: skill.id.clone(),
+                effect: None,
+            }),
+        }
+    }
+
+    for seed in &mut harvest.entities {
+        if let Some((_, type_label)) = entity_types_by_key.get(&seed.key)
+            && let Some(resolved) = crate::store::convert::entity_type_from_label(type_label)
+        {
+            seed.entity_type = crate::ingest::extracted_entity_type_from(resolved);
+        }
+    }
+
+    SelectedSkillApplication {
+        applied_skill_ids: selected.into_iter().map(|skill| skill.id).collect(),
+        firing_records,
+    }
 }
 
 /// The effect a learned retype skill carries: rename the source entity type to a target type when an
@@ -1375,12 +1722,19 @@ fn traces_record_gone_bad(traces: &[FiringTrace]) -> bool {
 ///
 /// Returns `None` for rules whose format cannot be parsed (e.g. the fallback
 /// `"correction-derived rule"` string produced when no training corrections exist).
-fn extract_rule_target(rule: &str) -> Option<&str> {
+fn extract_rule_target(rule: &str) -> Option<String> {
+    if let Some(effect) = parse_retype_effect(rule) {
+        return Some(effect.to_type);
+    }
     // The canonical separator produced by `derive_rule_from_labels`.
     const MARKER: &str = "classify as ";
     let pos = rule.find(MARKER)?;
     let value = rule[pos + MARKER.len()..].trim();
-    if value.is_empty() { None } else { Some(value) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// Apply a candidate rule to a single held-out teaching event and decide whether
@@ -1401,7 +1755,9 @@ fn extract_rule_target(rule: &str) -> Option<&str> {
 /// boolean, with no external state.
 fn rule_predicts_event_correctly(predicted_value: &str, event: &TeachingEvent) -> bool {
     match event.kind {
-        TeachingEventKind::Correction => event.content.trim() == predicted_value,
+        TeachingEventKind::Correction => parse_retype_correction_content(&event.content)
+            .map(|(target_label, _)| target_label.eq_ignore_ascii_case(predicted_value))
+            .unwrap_or_else(|| event.content.trim() == predicted_value),
         // A reversal means the skill fired when it should not have — the rule
         // failed on this item even though the label set contains a reversal.
         TeachingEventKind::Reversal
@@ -1435,7 +1791,7 @@ pub fn evaluate_on_heldout(skill: &LearnedSkill, heldout: &[TeachingEvent]) -> H
 
     let correct = heldout
         .iter()
-        .filter(|ev| rule_predicts_event_correctly(predicted_value, ev))
+        .filter(|ev| rule_predicts_event_correctly(&predicted_value, ev))
         .count();
 
     HeldOutResult {

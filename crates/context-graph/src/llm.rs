@@ -17,6 +17,7 @@ pub enum UnderstandingConsumer {
     BlueprintNormalization,
     WebhookEntityResolution,
     SignatureSemanticJudgment,
+    SkillProposal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

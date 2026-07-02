@@ -2162,6 +2162,14 @@ fn cli_by_entity() {
     assert!(text.contains("auth module at src/auth.py [invalidated"));
     assert!(text.contains("E_auth_module path changed src/auth.py -> src/authentication.py"));
     assert!(!text.contains("Redis"));
+    let walk_json: Value = serde_json::from_str(&walk.stdout).expect("by-entity JSON");
+    assert_eq!(
+        walk_json
+            .pointer("/entity/entity_type")
+            .and_then(Value::as_str),
+        Some("File"),
+        "by-entity must expose the stored entity type for live smoke assertions"
+    );
     assert!(no_resolution(&wrong));
 }
 

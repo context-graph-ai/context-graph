@@ -53,7 +53,7 @@ fn cg_skills_add_file_persists_human_authored_skill_and_export_round_trips_skill
         .expect("listed skill must carry id");
     assert_eq!(
         added.get("provenance").and_then(Value::as_str),
-        Some("HumanAuthored"),
+        Some("human-authored"),
         "skills added from a file must carry human-authored provenance"
     );
 
