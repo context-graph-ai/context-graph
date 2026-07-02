@@ -1060,7 +1060,7 @@ pub struct AuditFilter {
     pub after: Option<AuditId>,
 }
 
-pub const CG_SCHEMA_VERSION: u32 = 8;
+pub const CG_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreConfig {

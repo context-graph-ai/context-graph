@@ -822,6 +822,16 @@ fn sync_policy_for_table(table: &str) -> (SyncDirection, ConflictPolicy) {
         // Overlay corrections + compensation/reversal events: append-only, propagate tenant-wide.
         "cg_overlay_entries" => write_once,
         "cg_compensation_events" => write_once,
+        // Tier-0 capture tables (schema v9). Raw source chunks, the understanding queue, retrieval
+        // touches, and local settings are all machine-local runtime state that NEVER leaves the
+        // device — raw is the NDA line, and the queue/touches/settings are per-device. Understanding
+        // completions are a write-once immutable marker that DOES sync so a machine that already has
+        // the structured output does not re-understand the digest.
+        "cg_source_chunks" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
+        "cg_understanding_queue" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
+        "cg_retrieval_touches" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
+        "cg_local_settings" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
+        "cg_understanding_completions" => write_once,
         _ => write_once,
     }
 }

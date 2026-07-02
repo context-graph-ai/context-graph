@@ -15,6 +15,7 @@ pub mod review_surface;
 pub mod schema;
 pub mod skill_store;
 pub mod store;
+pub mod tier0;
 pub mod types;
 
 pub use capture_sync_status::*;
