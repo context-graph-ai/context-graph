@@ -7,9 +7,9 @@
 //! A digest that already carries a completion row (a synced-in completion from another machine) is
 //! skipped. Touch bumps and queue state survive a store reopen.
 
-use context_graph::tier0::{Tier0CaptureRequest, capture_tier0, queue_counts};
+use context_graph::tier0::{Tier0CaptureRequest, bump_touch, capture_tier0, queue_counts};
 use context_graph::understanding::{
-    MAX_UNDERSTANDING_ATTEMPTS, PendingDigest, bump_touch, claim_digest, list_pending_digests,
+    MAX_UNDERSTANDING_ATTEMPTS, PendingDigest, claim_digest, list_pending_digests,
     mark_failed, mark_structured,
 };
 use context_graph::{ContextId, DigestId, Store, StoreConfig};
@@ -67,9 +67,9 @@ fn pending_digests_ordered_by_touch_then_age() {
     let ctx = context_id(&store);
 
     // Touch priority: second is touched twice, third once, first never.
-    bump_touch(&store, second).expect("bump second");
-    bump_touch(&store, second).expect("bump second again");
-    bump_touch(&store, third).expect("bump third");
+    bump_touch(&store, ctx, second).expect("bump second");
+    bump_touch(&store, ctx, second).expect("bump second again");
+    bump_touch(&store, ctx, third).expect("bump third");
 
     let pending = list_pending_digests(&store, ctx, None).expect("list pending");
     let order: Vec<DigestId> = pending.iter().map(|p| p.digest_id).collect();
@@ -214,8 +214,8 @@ fn touches_and_queue_survive_reopen() {
         let store = fresh_store(dir.path());
         digest = capture_one(&store, "s1", "User: we chose sqlite for the local cache");
         ctx = context_id(&store);
-        bump_touch(&store, digest).expect("bump");
-        bump_touch(&store, digest).expect("bump");
+        bump_touch(&store, ctx, digest).expect("bump");
+        bump_touch(&store, ctx, digest).expect("bump");
     }
     // Reopen from disk: the pending row, its touch count, and its raw chunk are all durable.
     let store = fresh_store(dir.path());
