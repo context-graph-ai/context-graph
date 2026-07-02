@@ -130,6 +130,12 @@ fn gemini_config(home: &Path) -> PathBuf {
     home.join(".gemini/settings.json")
 }
 
+/// The REAL Claude Code settings path the `cg` binary installs injection hooks into (structured
+/// JSON), replacing the old placeholder `agent-config/claude-code/settings.json`.
+fn real_claude_settings(home: &Path) -> PathBuf {
+    home.join(".claude/settings.json")
+}
+
 fn create_dot_cg_projects(home: &Path) -> Vec<PathBuf> {
     ["a", "b", "c"]
         .into_iter()
@@ -337,35 +343,34 @@ fn disconnect_command_removes_single_agent_hook_other_connections_untouched() {
 }
 
 #[test]
-fn connect_remove_all_command_removes_all_hooks_for_one_agent_kind_across_every_agent_config() {
+fn connect_remove_all_removes_cg_injection_hooks_from_real_settings_without_touching_other_agents()
+{
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let prefix = temp.path().join("prefix");
     fs::create_dir_all(&home).expect("home created");
-    let claude_paths = [
-        home.join("agent-config/claude-code/settings.json"),
-        home.join("work/one/agent-config/claude-code/settings.json"),
-        home.join("work/two/agent-config/claude-code/settings.json"),
-    ];
-    for path in &claude_paths {
-        write_agent_config(path, CLAUDE_AGENT, 1);
-    }
     write_agent_config(&cursor_config(&home), CURSOR_AGENT, 1);
     let cursor_before = fs::read(cursor_config(&home)).expect("cursor config readable");
     let install = run_install(&home, &prefix, &[]);
     assert_success(&install, "install");
 
+    // cg installs its injection hooks into the REAL ~/.claude/settings.json (structured JSON).
+    let connect = run_cg(&home, &prefix, &["connect", CLAUDE_AGENT]);
+    assert_success(&connect, "cg connect claude-code");
+    let installed =
+        fs::read_to_string(real_claude_settings(&home)).expect("claude settings written");
+    assert!(
+        installed.contains("cg hook claude-code"),
+        "connect installs cg injection hooks in ~/.claude/settings.json: {installed}"
+    );
+
     let remove_all = run_cg(&home, &prefix, &["connect", CLAUDE_AGENT, "--remove-all"]);
     assert_success(&remove_all, "cg connect claude-code --remove-all");
-
-    for path in &claude_paths {
-        let content = fs::read_to_string(path).expect("claude config readable");
-        assert!(
-            !content.contains("cg observe --agent claude-code"),
-            "--remove-all should remove every claude-code cg hook in {}",
-            path.display()
-        );
-    }
+    let after = fs::read_to_string(real_claude_settings(&home)).expect("claude settings readable");
+    assert!(
+        !after.contains("cg hook claude-code"),
+        "--remove-all clears cg injection hooks from the real settings: {after}"
+    );
     assert_eq!(
         fs::read(cursor_config(&home)).expect("cursor config readable"),
         cursor_before,
@@ -381,35 +386,28 @@ fn uninstall_lattice_three_levels_compose_disconnect_then_remove_all_then_uninst
     let prefix = temp.path().join("prefix");
     fs::create_dir_all(&home).expect("home created");
     let dot_cg_dirs = create_dot_cg_projects(&home);
-    write_agent_config(&claude_config(&home), CLAUDE_AGENT, 1);
-    write_agent_config(
-        &home.join("work/other/agent-config/claude-code/settings.json"),
-        CLAUDE_AGENT,
-        1,
-    );
     write_agent_config(&cursor_config(&home), CURSOR_AGENT, 1);
     let install = run_install(&home, &prefix, &[]);
     assert_success(&install, "install");
 
+    let connect = run_cg(&home, &prefix, &["connect", CLAUDE_AGENT]);
+    assert_success(&connect, "cg connect claude-code");
+
+    // Level 1: disconnect removes cg's injection hooks from the real settings file.
     let disconnect = run_cg(&home, &prefix, &["disconnect", CLAUDE_AGENT]);
     assert_success(&disconnect, "cg disconnect claude-code");
     let claude_after_disconnect =
-        fs::read_to_string(claude_config(&home)).expect("claude config readable");
+        fs::read_to_string(real_claude_settings(&home)).expect("claude settings readable");
     assert!(
-        !claude_after_disconnect.contains("cg observe --agent claude-code"),
-        "level 1 disconnect should remove the selected agent hook"
+        !claude_after_disconnect.contains("cg hook claude-code"),
+        "level 1 disconnect should remove cg's injection hooks"
     );
 
+    // Level 2: remove-all is idempotent after disconnect (nothing left to remove) and still legal.
     let remove_all = run_cg(&home, &prefix, &["connect", CLAUDE_AGENT, "--remove-all"]);
     assert_success(&remove_all, "cg connect claude-code --remove-all");
-    let other_claude =
-        fs::read_to_string(home.join("work/other/agent-config/claude-code/settings.json"))
-            .expect("config readable");
-    assert!(
-        !other_claude.contains("cg observe --agent claude-code"),
-        "level 2 remove-all should clear remaining claude-code hooks"
-    );
 
+    // Level 3: uninstall removes the binary and preserves project .cg directories.
     let uninstall = run_uninstall(&home, &prefix, &[]);
     assert_success(&uninstall, "uninstall");
     assert!(
