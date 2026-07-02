@@ -29,9 +29,10 @@ use context_graph::ingest::{
     changed_since_context_cursor, digest_source_ids_for_context, memory_counts, parser_for_format,
     record_conversation, standing_impact,
 };
+use context_graph::injection::{INJECTION_TOKEN_BUDGET, build_injection_index};
 use context_graph::tier0::{
-    self, ForgetReport, ForgetSelector, Tier0CaptureReport, Tier0CaptureRequest, capture_tier0,
-    forget_raw, queue_counts, raw_footprint,
+    self, ForgetReport, ForgetSelector, Tier0CaptureReport, Tier0CaptureRequest, bump_touch,
+    capture_tier0, forget_raw, queue_counts, raw_footprint,
 };
 use context_graph::{
     CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
@@ -153,7 +154,8 @@ fn run(args: Vec<String>) -> i32 {
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::HostSessionLegacy),
         Some("doctor") => handle_doctor(&args[1..]),
         Some("disconnect") => handle_disconnect(&args[1..]),
-        Some("connect") => handle_connect_cleanup(&args[1..]),
+        Some("connect") => handle_connect(&args[1..]),
+        Some("hook") => handle_hook(&args[1..]),
         // The six item-action verbs + the review/why lenses (additive to the retrieval/capture
         // commands above; the action surface is exactly these, an unknown token rejected).
         Some("fix") => handle_fix(&args[1..]),
@@ -2834,6 +2836,7 @@ struct MemoryStatusSnapshot {
     queue: tier0::QueueCounts,
     raw: tier0::RawFootprint,
     raw_retention_days: Option<u64>,
+    last_injection: Option<Value>,
     summary: String,
 }
 
@@ -2845,6 +2848,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
     let mut queue = tier0::QueueCounts::default();
     let mut raw = tier0::RawFootprint::default();
     let mut raw_retention_days = None;
+    let last_injection = read_last_injection(root);
     if let Ok(store) = open_memory_store(root) {
         raw_retention_days = tier0::raw_retention_days(&store).unwrap_or(None);
         if let Ok(contexts) = store.list_contexts()
@@ -2858,8 +2862,32 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
             raw = raw_footprint(&store, context.id).unwrap_or_default();
         }
     }
+    let injection_summary = last_injection
+        .as_ref()
+        .map(|injection| {
+            format!(
+                " | last injection: {} structured / {} verbatim, {}/{} tokens",
+                injection
+                    .get("structured")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                injection
+                    .get("verbatim")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                injection
+                    .get("tokens_used")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                injection
+                    .get("token_budget")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or_default();
     let summary = format!(
-        "context: {context_label} goals: {} decisions: {} observations: {} | pending understanding: {} | raw kept: {} chunks / {} bytes",
+        "context: {context_label} goals: {} decisions: {} observations: {} | pending understanding: {} | raw kept: {} chunks / {} bytes{injection_summary}",
         counts.goals,
         counts.decisions,
         counts.observations,
@@ -2875,6 +2903,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
         queue,
         raw,
         raw_retention_days,
+        last_injection,
         summary,
     }
 }
@@ -2922,6 +2951,10 @@ fn add_memory_status_fields(value: &mut Value, snapshot: &MemoryStatusSnapshot) 
                 "bytes": snapshot.raw.bytes,
                 "retention_days": snapshot.raw_retention_days,
             }),
+        );
+        object.insert(
+            "last_injection".to_string(),
+            snapshot.last_injection.clone().unwrap_or(Value::Null),
         );
         object.insert("summary".to_string(), json!(snapshot.summary));
     }
@@ -5511,75 +5544,362 @@ fn print_doctor_text(report: &cg_cli::DoctorReport) {
     }
 }
 
+/// The Claude Code hook events cg installs. INJECTION ONLY — cg installs no capture hook (the
+/// auto-capture connector is cut from this slice); these two hooks only read memory back into the
+/// working session and bump retrieval-touch counts.
+const CLAUDE_CODE_HOOK_EVENTS: [&str; 2] = ["SessionStart", "UserPromptSubmit"];
+/// The stable identifier that marks a hook command as cg's, for idempotent install and clean
+/// uninstall. A user's own hooks (any command not containing this) are always preserved.
+const CLAUDE_CODE_HOOK_MARKER: &str = "hook claude-code";
+/// How many digest candidates the injection hook retrieves before the budget cut.
+const HOOK_RETRIEVAL_LIMIT: usize = 20;
+
+fn claude_code_settings_path() -> PathBuf {
+    home_dir().join(".claude").join("settings.json")
+}
+
+fn claude_code_hook_command(event: &str) -> String {
+    format!("cg hook claude-code {event}")
+}
+
+fn is_cg_hook_command(command: &str) -> bool {
+    command.contains(CLAUDE_CODE_HOOK_MARKER)
+}
+
+/// One command entry inside a Claude Code hook group is cg's.
+fn hook_entry_is_cg(entry: &Value) -> bool {
+    entry
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(is_cg_hook_command)
+}
+
+/// A matcher/command group already carries a cg command for this event (idempotency check).
+fn group_has_cg_command(group: &Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| entries.iter().any(hook_entry_is_cg))
+}
+
+enum SettingsRead {
+    Missing,
+    Value(Value),
+    Unreadable(String),
+}
+
+fn read_settings(path: &Path) -> SettingsRead {
+    match fs::read_to_string(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => SettingsRead::Missing,
+        Err(err) => SettingsRead::Unreadable(err.to_string()),
+        Ok(text) if text.trim().is_empty() => SettingsRead::Value(json!({})),
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(value) => SettingsRead::Value(value),
+            Err(err) => SettingsRead::Unreadable(err.to_string()),
+        },
+    }
+}
+
+fn write_settings(path: &Path, value: &Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string());
+    fs::write(path, format!("{serialized}\n"))
+}
+
+fn handle_connect(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg connect <agent>\n\nInstall cg's injection hooks (SessionStart, UserPromptSubmit) into the agent's settings.\n\nCommands:\n  cg connect claude-code             Install cg injection hooks into ~/.claude/settings.json\n  cg connect list                    List the injection hooks cg installed\n  cg connect claude-code --remove-all  Remove cg's injection hooks\n\nExamples:\n  cg connect claude-code\n  cg connect list"
+        );
+        return 0;
+    }
+    match args.first().map(String::as_str) {
+        None => usage_error("missing agent for connect (try `cg connect claude-code`)"),
+        Some("list") => list_cg_connections(),
+        Some("claude-code") if has_flag(args, "--remove-all") => disconnect_claude_code(),
+        Some("claude-code") => connect_claude_code(),
+        Some(agent) if has_flag(args, "--remove-all") => {
+            for path in legacy_agent_paths(agent) {
+                legacy_clean_hooks(agent, &path);
+            }
+            0
+        }
+        Some(agent) => usage_error(&format!(
+            "cg connect does not support agent `{agent}`; only claude-code installs injection hooks"
+        )),
+    }
+}
+
 fn handle_disconnect(args: &[String]) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
-        println!(
-            "Usage: cg disconnect <agent>\n\nExamples:\n  cg disconnect claude-code\n  cg disconnect cursor"
-        );
+        println!("Usage: cg disconnect <agent>\n\nExamples:\n  cg disconnect claude-code");
         return 0;
     }
-    let Some(agent) = args.first() else {
-        return usage_error("missing agent for disconnect");
-    };
-    for path in agent_paths(agent, false) {
-        clean_hooks(agent, &path);
+    match args.first().map(String::as_str) {
+        None => usage_error("missing agent for disconnect (try `cg disconnect claude-code`)"),
+        Some("claude-code") => disconnect_claude_code(),
+        Some(agent) => {
+            for path in legacy_agent_paths(agent) {
+                legacy_clean_hooks(agent, &path);
+            }
+            0
+        }
     }
+}
+
+/// Install cg's injection hooks into the REAL Claude Code settings file (`~/.claude/settings.json`),
+/// which is structured JSON — not a comment-marker block and not the old placeholder path. Idempotent:
+/// re-running adds no duplicate entries. Any hooks the user already configured are preserved.
+fn connect_claude_code() -> i32 {
+    let path = claude_code_settings_path();
+    let mut value = match read_settings(&path) {
+        SettingsRead::Missing => json!({}),
+        SettingsRead::Value(value) => value,
+        SettingsRead::Unreadable(err) => {
+            return failure(
+                3,
+                "settings_unreadable",
+                "connect",
+                &format!(
+                    "{} is not readable JSON; refusing to modify it: {err}",
+                    path.display()
+                ),
+            );
+        }
+    };
+    let Some(object) = value.as_object_mut() else {
+        return failure(
+            3,
+            "settings_not_object",
+            "connect",
+            &format!(
+                "{} is not a JSON object; refusing to modify it",
+                path.display()
+            ),
+        );
+    };
+    let hooks = object
+        .entry("hooks".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(hooks_object) = hooks.as_object_mut() else {
+        return failure(
+            3,
+            "hooks_not_object",
+            "connect",
+            &format!(
+                "{} has a non-object `hooks` field; refusing to modify it",
+                path.display()
+            ),
+        );
+    };
+    let mut installed = Vec::new();
+    let mut already_present = Vec::new();
+    for event in CLAUDE_CODE_HOOK_EVENTS {
+        let array = hooks_object
+            .entry(event.to_string())
+            .or_insert_with(|| json!([]));
+        let Some(groups) = array.as_array_mut() else {
+            return failure(
+                3,
+                "hook_event_not_array",
+                "connect",
+                &format!(
+                    "{} has a non-array `hooks.{event}`; refusing to modify it",
+                    path.display()
+                ),
+            );
+        };
+        if groups.iter().any(group_has_cg_command) {
+            already_present.push(event);
+            continue;
+        }
+        groups.push(json!({
+            "hooks": [
+                { "type": "command", "command": claude_code_hook_command(event) }
+            ]
+        }));
+        installed.push(event);
+    }
+    if let Err(err) = write_settings(&path, &value) {
+        return failure(
+            3,
+            "settings_write_failed",
+            "connect",
+            &format!("could not write {}: {err}", path.display()),
+        );
+    }
+    let message = if installed.is_empty() {
+        "cg injection hooks already installed; nothing to do".to_string()
+    } else {
+        format!("installed cg injection hooks: {}", installed.join(", "))
+    };
+    print_json(&json!({
+        "ok": true,
+        "agent": "claude-code",
+        "settings_path": path.display().to_string(),
+        "installed": installed,
+        "already_present": already_present,
+        "events": CLAUDE_CODE_HOOK_EVENTS,
+        "injection_only": true,
+        "message": message,
+    }));
     0
 }
 
-fn handle_connect_cleanup(args: &[String]) -> i32 {
-    if has_flag(args, "--help") || has_flag(args, "-h") {
-        println!(
-            "Usage: cg connect <agent> --remove-all\n\nExamples:\n  cg connect claude-code --remove-all"
-        );
-        return 0;
-    }
-    let Some(agent) = args.first() else {
-        return usage_error("missing agent for connect");
+/// Remove exactly cg's injection hooks from `~/.claude/settings.json`, leaving the user's own hooks
+/// untouched. Prunes any now-empty containers cg created so a clean uninstall returns the file to its
+/// pre-install shape (modulo cg's entries). Idempotent and never errors on a missing file.
+fn disconnect_claude_code() -> i32 {
+    let path = claude_code_settings_path();
+    let mut value = match read_settings(&path) {
+        SettingsRead::Missing => {
+            print_json(&json!({
+                "ok": true,
+                "agent": "claude-code",
+                "settings_path": path.display().to_string(),
+                "removed": 0,
+                "message": "no Claude Code settings file; nothing to remove",
+            }));
+            return 0;
+        }
+        SettingsRead::Value(value) => value,
+        SettingsRead::Unreadable(err) => {
+            return failure(
+                3,
+                "settings_unreadable",
+                "disconnect",
+                &format!(
+                    "{} is not readable JSON; refusing to modify it: {err}",
+                    path.display()
+                ),
+            );
+        }
     };
-    if args.get(1).map(String::as_str) != Some("--remove-all") {
-        return usage_error("cg connect cleanup requires --remove-all");
+    let removed = strip_cg_hooks(&mut value);
+    if let Err(err) = write_settings(&path, &value) {
+        return failure(
+            3,
+            "settings_write_failed",
+            "disconnect",
+            &format!("could not write {}: {err}", path.display()),
+        );
     }
-    for path in agent_paths(agent, true) {
-        clean_hooks(agent, &path);
-    }
+    print_json(&json!({
+        "ok": true,
+        "agent": "claude-code",
+        "settings_path": path.display().to_string(),
+        "removed": removed,
+        "message": format!("removed {removed} cg injection hook entr{}", if removed == 1 { "y" } else { "ies" }),
+    }));
     0
 }
 
-fn agent_paths(agent: &str, all: bool) -> Vec<PathBuf> {
+/// Remove every cg command entry from a settings value, pruning now-empty groups, event arrays, and
+/// the `hooks` object. Returns how many cg command entries were removed. User hooks are preserved.
+fn strip_cg_hooks(value: &mut Value) -> usize {
+    let Some(object) = value.as_object_mut() else {
+        return 0;
+    };
+    let Some(hooks_object) = object.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    let mut removed = 0;
+    let event_keys: Vec<String> = hooks_object.keys().cloned().collect();
+    for event in event_keys {
+        let Some(groups) = hooks_object.get_mut(&event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            if let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = entries.len();
+                entries.retain(|entry| !hook_entry_is_cg(entry));
+                removed += before - entries.len();
+            }
+        }
+        // Drop groups whose command list cg emptied; drop the event when no groups remain.
+        groups.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .map(|entries| !entries.is_empty())
+                .unwrap_or(true)
+        });
+        if groups.is_empty() {
+            hooks_object.remove(&event);
+        }
+    }
+    if hooks_object.is_empty() {
+        object.remove("hooks");
+    }
+    removed
+}
+
+/// `cg connect list` — enumerate the injection hooks cg installed in `~/.claude/settings.json`.
+fn list_cg_connections() -> i32 {
+    let path = claude_code_settings_path();
+    let value = match read_settings(&path) {
+        SettingsRead::Missing => json!({}),
+        SettingsRead::Value(value) => value,
+        SettingsRead::Unreadable(err) => {
+            return failure(
+                3,
+                "settings_unreadable",
+                "connect",
+                &format!("{} is not readable JSON: {err}", path.display()),
+            );
+        }
+    };
+    let mut hooks = Vec::new();
+    if let Some(hooks_object) = value.get("hooks").and_then(Value::as_object) {
+        for (event, groups) in hooks_object {
+            let Some(groups) = groups.as_array() else {
+                continue;
+            };
+            for group in groups {
+                let Some(entries) = group.get("hooks").and_then(Value::as_array) else {
+                    continue;
+                };
+                for entry in entries {
+                    if let Some(command) = entry.get("command").and_then(Value::as_str)
+                        && is_cg_hook_command(command)
+                    {
+                        hooks.push(json!({ "event": event, "command": command }));
+                    }
+                }
+            }
+        }
+    }
+    let count = hooks.len();
+    print_json(&json!({
+        "ok": true,
+        "agent": "claude-code",
+        "settings_path": path.display().to_string(),
+        "connected": count > 0,
+        "hooks": hooks,
+        "count": count,
+        "message": if count > 0 {
+            format!("{count} cg injection hook(s) installed")
+        } else {
+            "no cg injection hooks installed".to_string()
+        },
+    }));
+    0
+}
+
+/// Legacy per-agent hook paths for non-claude-code agents (cursor / gemini-cli), kept so their
+/// disconnect still works. claude-code is handled by the structured settings.json path above.
+fn legacy_agent_paths(agent: &str) -> Vec<PathBuf> {
     let home = home_dir();
     match agent {
-        "claude-code" if all => {
-            let mut out = Vec::new();
-            collect_matching_files(
-                &home,
-                Path::new("agent-config/claude-code/settings.json"),
-                &mut out,
-            );
-            out
-        }
-        "claude-code" => vec![home.join("agent-config/claude-code/settings.json")],
         "cursor" => vec![home.join(".cursor/hooks.json")],
         "gemini-cli" => vec![home.join(".gemini/settings.json")],
         _ => Vec::new(),
     }
 }
 
-fn collect_matching_files(root: &Path, suffix: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_matching_files(&path, suffix, out);
-        } else if path.ends_with(suffix) {
-            out.push(path);
-        }
-    }
-}
-
-fn clean_hooks(agent: &str, path: &Path) {
+fn legacy_clean_hooks(agent: &str, path: &Path) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
@@ -5589,32 +5909,138 @@ fn clean_hooks(agent: &str, path: &Path) {
     let Some(hooks) = value.get_mut("hooks").and_then(Value::as_array_mut) else {
         return;
     };
-    let begin = format!("# BEGIN cg-injected-hook-{agent}");
-    let end = format!("# END cg-injected-hook-{agent}");
     let observe = format!("cg observe --agent {agent}");
-    let mut out = Vec::new();
-    let mut skipping = false;
-    for hook in hooks.iter() {
-        let text = hook.as_str().unwrap_or_default();
-        if text.starts_with(&begin) {
-            skipping = true;
-            continue;
-        }
-        if skipping {
-            if text.starts_with(&end) {
-                skipping = false;
-            }
-            continue;
-        }
-        if text == observe {
-            continue;
-        }
-        out.push(hook.clone());
-    }
-    *hooks = out;
+    hooks.retain(|hook| hook.as_str() != Some(observe.as_str()));
     if let Ok(serialized) = serde_json::to_string_pretty(&value) {
         let _ = fs::write(path, format!("{serialized}\n"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// `cg hook claude-code <event>` — the injection runtime. Reads the Claude Code hook event JSON on
+// stdin, retrieves invalidation-aware memory for the prompt/session, and prints a
+// `hookSpecificOutput.additionalContext` block Claude Code injects ahead of the model. Silent
+// degradation is the contract: no store / no hits / no embedder → print nothing, exit 0, NEVER block.
+// The hook never writes memory to the store — it only bumps retrieval-touch counters.
+// ---------------------------------------------------------------------------
+
+fn handle_hook(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("claude-code") => handle_hook_claude_code(&args[1..]),
+        // Unknown agent: degrade silently, never block the session.
+        _ => 0,
+    }
+}
+
+fn handle_hook_claude_code(args: &[String]) -> i32 {
+    let Some(event) = args.first().cloned() else {
+        return 0;
+    };
+    let mut stdin_text = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin_text);
+    let event_json = serde_json::from_str::<Value>(&stdin_text).unwrap_or(Value::Null);
+    let Some(query) = hook_query_for_event(&event, &event_json) else {
+        return 0;
+    };
+    if query.trim().is_empty() {
+        return 0;
+    }
+    let root = data_root();
+    let Ok(store) = open_memory_store(&root) else {
+        return 0;
+    };
+    let context_label = memory_context_label(args);
+    let context_id = match lookup_cli_context(&store, &context_label) {
+        Ok(Some(context)) => context.id,
+        _ => return 0,
+    };
+    let hits = match store.find_via_digests(
+        &query,
+        DigestSearchFilter {
+            context_id: Some(context_id),
+            // Surface stale (invalidated/superseded) decisions rather than hiding them — the index
+            // marks their status so they are never injected as current.
+            include_inactive: true,
+            limit: Some(HOOK_RETRIEVAL_LIMIT),
+            ..Default::default()
+        },
+    ) {
+        Ok(hits) => hits,
+        // Any retrieval error (e.g. no embedder) degrades silently.
+        Err(_) => return 0,
+    };
+    let index = build_injection_index(&hits, INJECTION_TOKEN_BUDGET);
+    if index.is_empty() {
+        return 0;
+    }
+    // Every hit that answered bumps its retrieval-touch counter (best-effort — a bump failure never
+    // blocks injection).
+    for digest_id in &index.touched_digest_ids {
+        let _ = bump_touch(&store, context_id, *digest_id);
+    }
+    write_last_injection(&root, &event, &index);
+    let output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": index.render(),
+        }
+    });
+    println!("{}", serde_json::to_string(&output).unwrap_or_default());
+    // Best-effort detached worker kick so the understanding queue drains without blocking the hook.
+    maybe_kick_understanding_worker(args);
+    0
+}
+
+/// Derive the retrieval query from the hook event. UserPromptSubmit uses the prompt text; SessionStart
+/// (no prompt) uses a light default derived from the working-directory name so the prime is at least
+/// project-relevant. Any other event, or a missing field, yields None (silent degradation).
+fn hook_query_for_event(event: &str, event_json: &Value) -> Option<String> {
+    match event {
+        "UserPromptSubmit" => event_json
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        "SessionStart" => {
+            let cwd = event_json.get("cwd").and_then(Value::as_str)?;
+            let basename = Path::new(cwd).file_name().and_then(|name| name.to_str())?;
+            // Split the project directory name into words so the light default is embeddable.
+            let words = basename
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if words.trim().is_empty() {
+                None
+            } else {
+                Some(words)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn last_injection_path(root: &Path) -> PathBuf {
+    root.join("last-injection.json")
+}
+
+fn write_last_injection(root: &Path, event: &str, index: &context_graph::InjectionIndex) {
+    let path = last_injection_path(root);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let payload = json!({
+        "event": event,
+        "structured": index.structured_count,
+        "verbatim": index.verbatim_count,
+        "tokens_used": index.tokens_used,
+        "token_budget": index.token_budget,
+    });
+    let _ = fs::write(path, serde_json::to_string(&payload).unwrap_or_default());
+}
+
+fn read_last_injection(root: &Path) -> Option<Value> {
+    let text = fs::read_to_string(last_injection_path(root)).ok()?;
+    serde_json::from_str::<Value>(&text).ok()
 }
 
 fn no_host_session_failure() -> i32 {
