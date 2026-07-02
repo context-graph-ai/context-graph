@@ -55,6 +55,7 @@ mod structured_harvest_parser;
 mod subscriptions;
 mod sync_status_reporting;
 mod temporal;
+mod tier0_capture;
 mod two_layer_reversibility;
 mod usage_is_non_basis;
 mod usage_lane_determinism;
