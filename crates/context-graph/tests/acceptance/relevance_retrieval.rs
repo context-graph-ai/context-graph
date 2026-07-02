@@ -23,7 +23,9 @@ use super::refactor_extractor::{
     CountingExtractor, DecisionRelationExtractor, SpanFaithfulExtractor,
 };
 
-/// Insert a learned skill row directly into `cg_learned_skills` (test seeding).
+/// Insert a learned skill row directly into `cg_learned_skills` (test seeding). The rule text is a
+/// non-retype placeholder — fine here because these rows are only used as description-match
+/// distractors that must never be selected in the first place.
 fn seed_skill(store: &Store, id: &str, description: &str) {
     let db = store.sync_database();
     db.execute(
@@ -41,6 +43,36 @@ fn seed_skill(store: &Store, id: &str, description: &str) {
         ]),
     )
     .expect("seed learned skill");
+}
+
+/// Insert a learned skill row that is meant to be SELECTED (unlike `seed_skill`'s distractors): a
+/// real, derivable retype rule naming `entity_name`, so the fold-seam withhold contract (an
+/// effect-less row never applies) does not withhold it. `entity_name` never appears as a harvested
+/// entity in this file's fixtures, so the retype never actually fires — it is a scope-matching,
+/// selectable, no-op skill, exactly what these relevance tests need to prove selection narrows to
+/// the relevant few by description, not by which skills happen to change a value.
+fn seed_retype_skill(store: &Store, id: &str, description: &str, entity_name: &str) {
+    let db = store.sync_database();
+    db.execute(
+        "INSERT INTO cg_learned_skills (id, description, rule, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Text(id.to_string())),
+            ("description".to_string(), DbValue::Text(description.to_string())),
+            (
+                "rule".to_string(),
+                DbValue::Text(format!(
+                    "when an entity named {entity_name} is typed Service → Cache"
+                )),
+            ),
+            ("provenance".to_string(), DbValue::Text("human-correction".to_string())),
+            ("active".to_string(), DbValue::Bool(true)),
+            ("held_for_review".to_string(), DbValue::Bool(false)),
+            ("fire_right".to_string(), DbValue::Int64(0)),
+            ("fire_wrong".to_string(), DbValue::Int64(0)),
+            ("created_at".to_string(), DbValue::TxId(TxId(1))),
+        ]),
+    )
+    .expect("seed retype-capable learned skill");
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +454,18 @@ fn skill_selection_retrieves_the_relevant_few_not_the_whole_corpus() {
     // Seed 20 learned skills with VARYING descriptions. Only the two "redis cache" skills match the
     // captured chunk below; the other 18 are on unrelated topics.
     let matching = ["sk-redis-ttl", "sk-redis-evict"];
-    seed_skill(&store, matching[0], "tune the redis cache TTL for hot keys");
-    seed_skill(&store, matching[1], "set the redis cache eviction policy");
+    seed_retype_skill(
+        &store,
+        matching[0],
+        "tune the redis cache TTL for hot keys",
+        "redis",
+    );
+    seed_retype_skill(
+        &store,
+        matching[1],
+        "set the redis cache eviction policy",
+        "redis",
+    );
     let unrelated_topics = [
         "rotate the tls certificate",
         "schedule nightly database backups",

@@ -59,6 +59,12 @@ pub enum SkillApplyStrategy {
     #[default]
     PostHarvestRetype,
     PreExtractionGuidance,
+    /// An apply-strategy string this build does not implement, held verbatim. Forward
+    /// compatibility: an older edge must be able to store and relay a newer edge's rule without
+    /// corrupting it, so an unrecognized string is never coerced to an implemented strategy. A
+    /// skill carrying this variant is withheld on the capture path (never applied, never counted
+    /// as applied) and surfaces as a diagnostic instead.
+    Unknown(String),
 }
 
 #[derive(Debug, Clone)]
@@ -223,14 +229,19 @@ fn apply_strategy_from_str(s: &str) -> SkillApplyStrategy {
     match s {
         "pre-extraction-guidance" => SkillApplyStrategy::PreExtractionGuidance,
         "post-harvest-retype" => SkillApplyStrategy::PostHarvestRetype,
-        _ => SkillApplyStrategy::PostHarvestRetype,
+        // Preserve verbatim: a string this build does not implement is not this edge's to judge.
+        other => SkillApplyStrategy::Unknown(other.to_string()),
     }
 }
 
-fn apply_strategy_to_str(strategy: &SkillApplyStrategy) -> &'static str {
+fn apply_strategy_to_str(strategy: &SkillApplyStrategy) -> std::borrow::Cow<'static, str> {
     match strategy {
-        SkillApplyStrategy::PostHarvestRetype => "post-harvest-retype",
-        SkillApplyStrategy::PreExtractionGuidance => "pre-extraction-guidance",
+        SkillApplyStrategy::PostHarvestRetype => std::borrow::Cow::Borrowed("post-harvest-retype"),
+        SkillApplyStrategy::PreExtractionGuidance => {
+            std::borrow::Cow::Borrowed("pre-extraction-guidance")
+        }
+        // Round-trip byte-for-byte: never rewritten to an implemented strategy string.
+        SkillApplyStrategy::Unknown(raw) => std::borrow::Cow::Owned(raw.clone()),
     }
 }
 
@@ -308,7 +319,7 @@ fn insert_skill_row(store: &Store, skill: &LearnedSkill) -> bool {
         ),
         (
             "apply_strategy".to_string(),
-            contextdb_core::Value::Text(apply_strategy_to_str(&skill.apply_strategy).to_string()),
+            contextdb_core::Value::Text(apply_strategy_to_str(&skill.apply_strategy).into_owned()),
         ),
         (
             "provenance".to_string(),
@@ -1328,12 +1339,15 @@ pub fn select_pre_extraction_guidance_skills_for_chunk(
     )
 }
 
-fn select_skills_for_chunk_with_strategy(
+/// The base match: active, not held under the review gate, description matches the chunk, and any
+/// parsed retype rule stays inside its learned entity scope — irrespective of apply strategy. Both
+/// the strategy-scoped public selectors and the withhold-aware capture-path seam share this so a
+/// skill's matching semantics never diverge from its withholding semantics.
+fn base_matching_skills_for_chunk(
     store: &Store,
     chunk: &str,
     skills_on: bool,
     review_mode: bool,
-    strategy: SkillApplyStrategy,
 ) -> Vec<LearnedSkill> {
     if !skills_on {
         return Vec::new();
@@ -1342,15 +1356,32 @@ fn select_skills_for_chunk_with_strategy(
         .into_iter()
         .filter(|skill| skill.active)
         .filter(|skill| !(review_mode && skill.held_for_review))
-        .filter(|skill| skill.apply_strategy == strategy)
         .filter(|skill| skill_description_matches_chunk(&skill.description, chunk))
         .filter(|skill| retype_skill_scope_matches_chunk(skill, chunk))
+        .collect()
+}
+
+fn select_skills_for_chunk_with_strategy(
+    store: &Store,
+    chunk: &str,
+    skills_on: bool,
+    review_mode: bool,
+    strategy: SkillApplyStrategy,
+) -> Vec<LearnedSkill> {
+    base_matching_skills_for_chunk(store, chunk, skills_on, review_mode)
+        .into_iter()
+        .filter(|skill| skill.apply_strategy == strategy)
         .collect()
 }
 
 pub(crate) struct SelectedSkillApplication {
     pub applied_skill_ids: Vec<String>,
     pub firing_records: Vec<SkillFiringRecord>,
+    /// Matched skills that were NOT applied: an apply strategy this build does not implement, the
+    /// reserved `pre-extraction-guidance` strategy (a generation-time seam, not this post-harvest
+    /// one), or a post-harvest-retype row whose effect could not be derived. Capture still succeeds;
+    /// this is the diagnostic naming which rule was skipped and why capture cannot silently drop it.
+    pub withheld_skill_ids: Vec<String>,
 }
 
 /// Select the learned skills whose description matches this capture and apply them.
@@ -1359,6 +1390,11 @@ pub(crate) struct SelectedSkillApplication {
 /// (`cg skills review`) withholds a freshly promoted skill until acknowledged. Each selected skill's
 /// retype effect is applied to the harvested entity types in place, so both public capture
 /// entrypoints store the same value-level result and the same firing trace.
+///
+/// A matching skill this build cannot apply — an unsupported apply strategy, the reserved
+/// generation-time strategy, or a post-harvest-retype row with no derivable effect — is withheld,
+/// never applied and never counted as applied; capture proceeds and the withheld id is returned so
+/// the caller can surface it as a diagnostic (never a silent drop).
 pub(crate) fn select_and_apply_learned_skills(
     store: &Store,
     harvest: &mut crate::ingest::StructuredHarvest,
@@ -1368,11 +1404,25 @@ pub(crate) fn select_and_apply_learned_skills(
 ) -> SelectedSkillApplication {
     let skills_on = config_skills_enabled && skills_enabled(store);
     let review_mode = config_review_mode || review_hold_active(store);
-    let selected = select_skills_for_chunk(store, chunk, skills_on, review_mode);
+    let matched = base_matching_skills_for_chunk(store, chunk, skills_on, review_mode);
+
+    let mut selected = Vec::new();
+    let mut withheld_skill_ids = Vec::new();
+    for skill in matched {
+        let applicable = skill.apply_strategy == SkillApplyStrategy::PostHarvestRetype
+            && retype_effect_from_skill(&skill).is_some();
+        if applicable {
+            selected.push(skill);
+        } else {
+            withheld_skill_ids.push(skill.id);
+        }
+    }
+
     if selected.is_empty() {
         return SelectedSkillApplication {
             applied_skill_ids: Vec::new(),
             firing_records: Vec::new(),
+            withheld_skill_ids,
         };
     }
 
@@ -1426,6 +1476,7 @@ pub(crate) fn select_and_apply_learned_skills(
     SelectedSkillApplication {
         applied_skill_ids: selected.into_iter().map(|skill| skill.id).collect(),
         firing_records,
+        withheld_skill_ids,
     }
 }
 

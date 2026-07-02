@@ -57,6 +57,24 @@ fn insert_skill_row(
     .expect("insert skill row");
 }
 
+/// Set a skill row's `apply_strategy` column directly to an arbitrary raw string, exactly as an
+/// older edge would see it after syncing a newer edge's row that names a strategy this build does
+/// not implement. Call after `insert_skill_row`.
+fn set_apply_strategy_raw(store: &Store, id: &str, apply_strategy: &str) {
+    let db = store.sync_database();
+    db.execute(
+        "UPDATE cg_learned_skills SET apply_strategy = $apply_strategy WHERE id = $id",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Text(id.to_string())),
+            (
+                "apply_strategy".to_string(),
+                DbValue::Text(apply_strategy.to_string()),
+            ),
+        ]),
+    )
+    .expect("set apply_strategy on skill row");
+}
+
 fn scan_skill_table(store: &Store) -> Vec<HashMap<String, DbValue>> {
     let db = store.sync_database();
     let snapshot = db.snapshot();
@@ -216,6 +234,83 @@ fn pre_extraction_strategy_is_not_silently_applied_by_post_harvest_retype() {
         entity_type_named(&store, "context-graph"),
         Some(context_graph::EntityType::File),
         "withholding the pre-extraction strategy must leave the post-harvest entity type unchanged"
+    );
+}
+
+// RED (fold-seam withhold contract): a stored row whose apply_strategy is a string this build does
+// not implement (as an older edge would see after syncing a newer edge's rule) must never be
+// coerced to an implemented strategy, must never apply, must never be counted in
+// `applied_skill_ids`, and must surface as a named diagnostic on the capture harness report so
+// capture never silently drops it.
+#[test]
+fn unknown_apply_strategy_is_withheld_not_applied_and_surfaces_diagnostic() {
+    use context_graph::harness::{CaptureHarnessConfig, run_capture};
+    use context_graph::ingest::CaptureRequest;
+
+    let (_dir, store) = fresh_store();
+    let transcript = "Goal G1: remember the project\nEntity E1: context-graph type=file\nDecision D1: keep one repo serves G1";
+
+    insert_skill_row(
+        &store,
+        "sk-future-strategy",
+        "retype a context-graph file entity to a repository",
+        "when an entity named context-graph is typed File → Repository",
+        "human-correction",
+        true,
+        false,
+    );
+    set_apply_strategy_raw(&store, "sk-future-strategy", "future-strategy");
+
+    // Store round-trip: the raw strategy string must survive a read exactly, never coerced.
+    let reloaded = list_skills_in_store(&store)
+        .into_iter()
+        .find(|skill| skill.id == "sk-future-strategy")
+        .expect("row with an unsupported apply_strategy must still be readable");
+    assert_eq!(
+        reloaded.apply_strategy,
+        SkillApplyStrategy::Unknown("future-strategy".to_string()),
+        "an unknown apply_strategy string must be preserved verbatim on read, never coerced to an \
+         implemented strategy; got {:?}",
+        reloaded.apply_strategy
+    );
+
+    let (report, harness) = run_capture(
+        &store,
+        CaptureRequest {
+            context_label: "future-strategy-fold".to_string(),
+            transcript: transcript.to_string(),
+            model_available: true,
+        },
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("capture must succeed even though the matching rule carries an unsupported strategy");
+
+    assert!(
+        harness
+            .applied_skill_ids
+            .iter()
+            .all(|id| id != "sk-future-strategy"),
+        "an unsupported apply strategy must never be applied; applied_skill_ids={:?}",
+        harness.applied_skill_ids
+    );
+    assert!(
+        harness
+            .withheld_skill_ids
+            .iter()
+            .any(|id| id == "sk-future-strategy"),
+        "an unsupported apply strategy must surface as a withheld diagnostic naming the skill id; \
+         withheld_skill_ids={:?}",
+        harness.withheld_skill_ids
+    );
+    assert_eq!(
+        entity_type_named(&store, "context-graph"),
+        Some(context_graph::EntityType::File),
+        "withholding an unsupported-strategy rule must leave the harvested entity type unchanged"
+    );
+    assert!(
+        report.wrote_digest || !report.stable_ids.is_empty(),
+        "capture must never fail because of a withheld rule"
     );
 }
 
