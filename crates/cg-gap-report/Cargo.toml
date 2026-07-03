@@ -2,6 +2,7 @@
 name = "cg-gap-report"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 publish = false
 
 # Measurement harness only (NOT a shipped product surface): runs the prompted-SLM gap report that
