@@ -89,6 +89,7 @@ const RELATION_OUTPUT_SCHEMA: &str = r#"{
 }"#;
 const HOST_SESSION_SPEND_KIND: &str = "subscription quota";
 const BYOK_HTTP_SPEND_KIND: &str = "provider API call";
+const LOCAL_SPEND_KIND: &str = "local in-process ($0)";
 const MODEL_SELFTEST_PROMPT: &str =
     "Reply with exactly this text and nothing else: cg-host-session-proof";
 
@@ -339,13 +340,19 @@ fn handle_import(args: &[String]) -> i32 {
             "single file only - bulk import is a later capability (Plan 22)",
         );
     }
-    if path.is_dir() || path.to_string_lossy().contains('*') {
+    if path.is_dir() {
+        // Directory sweep: import every *.jsonl under the folder at tier-0 (deterministic, $0). The
+        // daily-loop front door for a whole session folder — one aggregate receipt, understanding
+        // deferred to the queue.
+        return handle_import_directory(args, &root, &db_path, &context_label, &path);
+    }
+    if path.to_string_lossy().contains('*') {
         return memory_failure(
             2,
-            "ImportSingleFileOnly",
+            "ImportGlobUnsupported",
             &db_path,
             &context_label,
-            "single file only - bulk import is a later capability (Plan 22)",
+            "glob patterns are not supported - pass a single file or a directory to sweep",
         );
     }
     if !path.exists() {
@@ -553,6 +560,214 @@ fn handle_import(args: &[String]) -> i32 {
         max_pending_invalidation_tx(&store, context.id),
     );
     print_tier0_report(&report, elapsed, &db_path, &context_label, context.id);
+    maybe_kick_understanding_worker(args);
+    0
+}
+
+/// Recursively collect every `*.jsonl` file under `dir`, sorted for deterministic sweep order.
+fn collect_jsonl_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Sweep a whole session folder at tier-0: import every `*.jsonl` under the directory through the
+/// SAME deterministic capture path a single file uses, aggregating one receipt. Zero model calls,
+/// $0, idempotent (the per-file content-hash dedup means a re-sweep writes nothing new).
+/// `--estimate` sums the per-file zero-outbound projection. Understanding is deferred to the queue,
+/// so a `cg import <dir>` is followed by `cg understand`.
+fn handle_import_directory(
+    args: &[String],
+    root: &Path,
+    db_path: &Path,
+    context_label: &str,
+    dir: &Path,
+) -> i32 {
+    let parser = match parser_for_format("jsonl") {
+        Ok(parser) => parser,
+        Err(err) => {
+            return memory_failure(
+                2,
+                "UnsupportedImportFormat",
+                db_path,
+                context_label,
+                &format!("UnsupportedImportFormat: {err:?}"),
+            );
+        }
+    };
+    let chunk_options = match import_chunk_options(args, root) {
+        Ok(options) => options,
+        Err(message) => {
+            return memory_failure(2, "InvalidImportChunking", db_path, context_label, &message);
+        }
+    };
+    let files = match collect_jsonl_files(dir) {
+        Ok(files) => files,
+        Err(err) => {
+            return memory_failure(
+                2,
+                "ImportDirUnreadable",
+                db_path,
+                context_label,
+                &format!("could not read directory {}: {err}", dir.display()),
+            );
+        }
+    };
+    if files.is_empty() {
+        return memory_failure(
+            2,
+            "ImportDirNoSessions",
+            db_path,
+            context_label,
+            &format!("no .jsonl session files found under {}", dir.display()),
+        );
+    }
+
+    if has_flag(args, "--estimate") {
+        // Zero-outbound: sum each file's chunk/byte projection. Tier-0 sweep is always $0.
+        let mut files_counted = 0usize;
+        let mut chunks = 0usize;
+        let mut raw_bytes = 0u64;
+        for file in &files {
+            if let Err(err) = stream_import_chunks(file, parser.as_ref(), chunk_options, |chunk| {
+                chunks += 1;
+                raw_bytes += chunk.len() as u64;
+                Ok(())
+            }) {
+                return cg_failure(err, db_path, context_label);
+            }
+            files_counted += 1;
+        }
+        let projected_tokens = chunks as u64 * 1290;
+        let projected_elapsed = Duration::from_millis(750) * chunks.max(1) as u32;
+        print_memory_json(
+            json!({
+                "ok": true,
+                "tier": "tier-0",
+                "directory": dir.display().to_string(),
+                "estimate": {
+                    "files": files_counted,
+                    "chunks": chunks,
+                    "digests": chunks,
+                    "resolved_chunk_window": chunk_options.resolved_chunk_window,
+                    "model_context_tokens": chunk_options.model_context_tokens,
+                    "context_fraction": chunk_options.context_fraction,
+                    "model_calls": 0,
+                    "provider_calls": 0,
+                    "cost_usd": 0.0,
+                    "raw_bytes": raw_bytes,
+                    "projected_tokens": projected_tokens,
+                    "elapsed_ms": projected_elapsed.as_millis() as u64,
+                },
+                "captured": counts_json(&HarvestCounts::default()),
+                "totals": counts_json(&HarvestCounts::default()),
+                "message": "estimate: default tier-0 directory sweep is zero model calls / $0; projected fields preview the eager cost",
+                "rendered": format!(
+                    "import estimate: {files_counted} files / {chunks} chunks / {chunks} digests, 0 model calls, $0"
+                ),
+            }),
+            db_path,
+            context_label,
+            None,
+        );
+        return 0;
+    }
+
+    let store = match open_memory_store(root) {
+        Ok(store) => store,
+        Err(err) => return memory_error(err, db_path, context_label),
+    };
+    let context = match ensure_cli_context(&store, context_label) {
+        Ok(context) => context,
+        Err(err) => return cg_failure(err, db_path, context_label),
+    };
+    let started = Instant::now();
+    let mut files_imported = 0usize;
+    let mut digests_written = 0usize;
+    let mut chunks_kept = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut skipped_noise = 0usize;
+    let mut raw_bytes = 0usize;
+    let mut pending_after = 0usize;
+    for file in &files {
+        let source_chunks = match collect_import_source_chunks(file, parser.as_ref(), chunk_options)
+        {
+            Ok(chunks) => chunks,
+            Err(err) => return cg_failure(err, db_path, context_label),
+        };
+        let transcript = source_chunks.join("\n");
+        let request = Tier0CaptureRequest {
+            context_label: context_label.to_string(),
+            session_ref: capture_session_ref(args, Some(file)),
+            transcript,
+            source: "cg-import".to_string(),
+            chunk_window: chunk_options.max_chars,
+        };
+        let report = match capture_tier0(&store, request) {
+            Ok(report) => report,
+            Err(err) => return cg_failure(err, db_path, context_label),
+        };
+        files_imported += 1;
+        digests_written += report.digests_written;
+        chunks_kept += report.chunks_kept;
+        skipped_existing += report.skipped_existing;
+        skipped_noise += report.skipped_noise;
+        raw_bytes += report.raw_bytes;
+        pending_after = report.pending_after;
+    }
+    let elapsed = started.elapsed();
+    write_last_record_tx(
+        root,
+        context.id,
+        max_pending_invalidation_tx(&store, context.id),
+    );
+    let rendered = format!(
+        "swept {files_imported} session files: captured {digests_written} digests ({chunks_kept} raw chunks kept, {skipped_existing} already present) — 0 model calls, $0, {pending_after} pending understanding"
+    );
+    print_memory_json(
+        json!({
+            "ok": true,
+            "tier": "tier-0",
+            "directory": dir.display().to_string(),
+            "receipt": {
+                "files": files_imported,
+                "model_calls": 0,
+                "cost_usd": 0.0,
+                "elapsed_ms": elapsed.as_millis() as u64,
+                "digests": digests_written,
+                "chunks_kept": chunks_kept,
+                "skipped_existing": skipped_existing,
+                "skipped_noise": skipped_noise,
+                "raw_bytes": raw_bytes,
+                "pending": pending_after,
+            },
+            "captured": counts_json(&HarvestCounts::default()),
+            "totals": counts_json(&HarvestCounts::default()),
+            "message": "deterministic tier-0 directory sweep: verbatim digests queued for understanding, 0 model calls",
+            "rendered": rendered,
+        }),
+        db_path,
+        context_label,
+        Some(context.id),
+    );
     maybe_kick_understanding_worker(args);
     0
 }
@@ -4794,11 +5009,12 @@ fn handle_model(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("--help") | Some("-h") => {
             println!(
-                "Usage: cg model <command>\n\nCommands:\n  connect       Register a named OpenAI-compatible BYOK endpoint\n  status        Show model connection status\n  selftest      Spend one consented proof call\n  auth login    Connect cg to an existing model host session\n  list          List registered models\n  show <id>     Show model metadata\n\nExamples:\n  cg model connect openai --endpoint https://api.openai.com/v1 --api-key sk-... --consent\n  cg model status openai\n  cg model selftest openai"
+                "Usage: cg model <command>\n\nCommands:\n  connect       Register a named OpenAI-compatible BYOK endpoint\n  use           Select a fetched local model as the $0 in-process understanding worker\n  status        Show model connection status\n  selftest      Spend one consented proof call\n  auth login    Connect cg to an existing model host session\n  list          List registered models\n  show <id>     Show model metadata\n  fetch         Prefetch model artifacts into the local cache\n\nExamples:\n  cg model fetch --defaults\n  cg model use --local\n  cg model connect openai --endpoint https://api.openai.com/v1 --api-key sk-... --consent\n  cg model status openai\n  cg model selftest openai"
             );
             0
         }
         Some("connect") => handle_model_connect(&args[1..]),
+        Some("use") => handle_model_use(&args[1..]),
         Some("status") => handle_status(&args[1..], StatusSurface::ModelByok),
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::ModelByok),
         Some("list") => handle_model_list(&args[1..]),
@@ -4809,7 +5025,7 @@ fn handle_model(args: &[String]) -> i32 {
         }
         Some("auth") => usage_error("expected `cg model auth login`"),
         _ => usage_error(
-            "expected `cg model connect`, `cg model status`, `cg model selftest`, `cg model list`, `cg model show`, `cg model fetch`, or `cg model auth login`",
+            "expected `cg model connect`, `cg model use`, `cg model status`, `cg model selftest`, `cg model list`, `cg model show`, `cg model fetch`, or `cg model auth login`",
         ),
     }
 }
@@ -5138,6 +5354,62 @@ fn handle_model_connect(args: &[String]) -> i32 {
     0
 }
 
+/// `cg model use <model-id>` / `cg model use --local` — select a fetched local model as the active
+/// understanding worker. It runs fully in-process at $0 (no server, no tokens, no quota), so this is
+/// what makes the daily-loop local path walkable after `cg model fetch --defaults`.
+fn handle_model_use(args: &[String]) -> i32 {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        println!(
+            "Usage: cg model use [<model-id> | --local] [--format json|text]\n\n\
+Select a fetched local model as the active understanding worker. It runs fully in-process at $0 \
+(no server, no tokens, no quota). `--local` is shorthand for the bundled understanding default.\n\n\
+Fetch it first with `cg model fetch --defaults`.\n\nExamples:\n  cg model use --local\n  cg model use gemma4-e2b-it-q4"
+        );
+        return 0;
+    }
+    let format = output_format(args);
+    let root = data_root();
+    let model_id = if has_flag(args, "--local") {
+        cg_catalog::UNDERSTANDING_DEFAULT_ID.to_string()
+    } else if let Some(id) = positional_arg(args) {
+        id
+    } else {
+        return usage_error("expected `cg model use <model-id>` or `cg model use --local`");
+    };
+    let mut catalog = ModelConnectionCatalog::open(&root);
+    if let Some(error) = catalog.load_error().map(str::to_string) {
+        return unreadable_connections_file(&error);
+    }
+    match catalog.connect_local_model(&model_id) {
+        Ok(connection) => {
+            if format == OutputFormat::Text {
+                println!("connection: {}", connection.name);
+                println!("model: {model_id}");
+                println!("worker: local in-process ($0, no tokens, no quota)");
+                println!("active: true");
+                println!("consent_recorded: {}", connection.consent_recorded);
+                return 0;
+            }
+            print_json(&json!({
+                "ok": true,
+                "connection": connection.name,
+                "model": model_id,
+                "active": true,
+                "local": true,
+                "spend_kind": "local in-process ($0)",
+                "consent_recorded": connection.consent_recorded,
+                "message": format!(
+                    "{model_id} is now the active understanding worker; it runs in-process at $0"
+                ),
+            }));
+            0
+        }
+        // Not cached / not a local model: the library error already names the fix
+        // (`run cg model fetch --defaults first`). Exit non-zero so scripts can branch.
+        Err(err) => failure(1, "local_model_unavailable", "config", &err),
+    }
+}
+
 fn handle_model_list(args: &[String]) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
@@ -5430,15 +5702,23 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     let endpoint = model
         .as_ref()
         .and_then(|model| model.hosted_endpoint.as_ref());
+    // A local model (a fetched GGUF with a cache_path) runs fully in-process — no hosted endpoint
+    // and no host tool. Render it as a $0 in-process worker, not a missing host tool.
+    let local_model_id = model
+        .as_ref()
+        .filter(|model| model.cache_path.is_some())
+        .map(|model| model.id.clone());
+    let is_local = local_model_id.is_some();
     let (fallback_provider, account) = provider_account(&connection);
     let provider = endpoint
         .map(|endpoint| endpoint.provider.clone())
         .unwrap_or(fallback_provider);
-    let tool_condition = if endpoint.is_none() && !provider_tool_available(&root, &provider) {
-        json!("host_tool_missing")
-    } else {
-        Value::Null
-    };
+    let tool_condition =
+        if endpoint.is_none() && !is_local && !provider_tool_available(&root, &provider) {
+            json!("host_tool_missing")
+        } else {
+            Value::Null
+        };
     let consent_status_error = if effective_surface == StatusSurface::ModelByok
         && endpoint.is_some()
         && !connection.consent_recorded
@@ -5463,7 +5743,9 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     } else {
         connection.spend_owner.clone()
     };
-    let spend_kind = if endpoint.is_some() {
+    let spend_kind = if is_local {
+        LOCAL_SPEND_KIND
+    } else if endpoint.is_some() {
         BYOK_HTTP_SPEND_KIND
     } else {
         HOST_SESSION_SPEND_KIND
@@ -5488,6 +5770,9 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
         if let Some(endpoint) = endpoint {
             println!("model: {}", endpoint.provider_model);
             println!("endpoint: {}", endpoint.base_url);
+        } else if let Some(local_model_id) = &local_model_id {
+            println!("model: {local_model_id}");
+            println!("worker: {LOCAL_SPEND_KIND}");
         }
         println!("state: {state}");
         println!("degraded: {}", last_error.is_some());
@@ -5521,6 +5806,8 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
         "host_tool_missing: provider tool is gone"
     } else if degraded {
         "last selftest failed"
+    } else if is_local {
+        "local model active; understanding runs in-process at $0 (no tokens, no quota)"
     } else if connection_works {
         "live proof passed; automatic capture is ready"
     } else {
@@ -5531,8 +5818,12 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     let mut value = json!({
         "connection": connection_name,
         "provider": provider,
-        "model": endpoint.map(|endpoint| endpoint.provider_model.clone()),
+        "model": endpoint
+            .map(|endpoint| endpoint.provider_model.clone())
+            .or_else(|| local_model_id.clone()),
         "endpoint": endpoint.map(|endpoint| endpoint.base_url.clone()),
+        "local": is_local,
+        "local_model": local_model_id,
         "state": state,
         "condition": condition,
         "bucket": bucket,
