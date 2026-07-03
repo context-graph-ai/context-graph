@@ -365,7 +365,7 @@ fn entity_type_vocabulary_covers_animal_and_vehicle() {
         let created = site
             .store
             .create_entity(CreateEntity {
-                entity_type: entity_type.clone(),
+                entity_type,
                 name: name.to_string(),
                 properties: BTreeMap::new(),
                 tags: Vec::new(),
