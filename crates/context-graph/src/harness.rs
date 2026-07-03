@@ -170,6 +170,10 @@ pub struct CaptureHarnessConfig {
     /// code"). When unset, the 13 built-in types. Feeds schema + prompt + grounding from this
     /// one source — the first slice of cg-open-entity-vocabulary.
     pub entity_vocabulary: Option<Vec<String>>,
+    /// Staged extraction (C4): run focused entities/decisions passes alongside the full pass
+    /// and merge deterministically. Opt-in config; the default is the shipped single pass —
+    /// the bench measures both as levers before any default flips.
+    pub staged_extraction: bool,
 }
 
 impl Default for CaptureHarnessConfig {
@@ -184,6 +188,7 @@ impl Default for CaptureHarnessConfig {
             tier: None,
             item_caps: None,
             entity_vocabulary: None,
+            staged_extraction: false,
         }
     }
 }
@@ -209,6 +214,7 @@ struct CaptureTomlSection {
     prompt_override: Option<String>,
     entity_vocabulary: Option<Vec<String>>,
     item_caps: Option<ItemCapsToml>,
+    staged_extraction: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -244,6 +250,9 @@ impl CaptureHarnessConfig {
                 observations: caps.observations,
             }),
             entity_vocabulary: section.entity_vocabulary,
+            staged_extraction: section
+                .staged_extraction
+                .unwrap_or(defaults.staged_extraction),
         })
     }
 

@@ -534,8 +534,31 @@ pub enum EntityIdentityVerdict {
     Separate,
 }
 
+/// Which extraction pass a staged capture is requesting (criterion C4, criteria commit
+/// 99d99ee). `Full` is the shipped single-pass behavior; the focused passes are the probe-2
+/// staged recipe as production behavior; `SessionIntention` is the session-level goal
+/// reconciliation pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionPass {
+    Full,
+    EntitiesOnly,
+    DecisionsOnly,
+    SessionIntention,
+}
+
 pub trait ConversationExtractor {
     fn extract(&self, request: ExtractionRequest<'_>) -> Result<StructuredHarvest>;
+
+    /// Staged extraction seam (C4): a focused pass over the same transcript. The default
+    /// delegates to `extract`, so every existing extractor and test double keeps working; the
+    /// connected extractor overrides it to render a pass-specific prompt.
+    fn extract_pass(
+        &self,
+        request: ExtractionRequest<'_>,
+        _pass: ExtractionPass,
+    ) -> Result<StructuredHarvest> {
+        self.extract(request)
+    }
 
     fn classify_decision_relation(
         &self,
@@ -926,6 +949,31 @@ fn engaged_result_lines(
         }
     }
     kept
+}
+
+/// Result of the session-level goal reconciliation pass (criterion C4): per-chunk duplicate
+/// goals merged ADDITIVELY into canonical session intentions (variants absorbed via the shipped
+/// dedup classification — superseded/refined, never deleted), and decisions that cannot attach
+/// to any goal surfaced for review, never silently unattached.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReconcileSummary {
+    pub canonical_intentions: Vec<crate::IntentionId>,
+    pub merged_goals: usize,
+    pub flagged_unattached: usize,
+}
+
+/// Session-level goal reconciliation over a context's captured intentions (criterion C4): the
+/// intention is a session-level object the per-chunk pipeline structurally fragments; this pass
+/// runs the SAME identity judgment the capture dedup uses, across the chunks' goals, and applies
+/// the merges additively. Runs after a session's digests are understood (the drain calls it);
+/// judgment rides the extractor seam so tests use deterministic doubles.
+pub fn reconcile_session_goals(
+    _store: &Store,
+    _context_label: &str,
+    _extractor: &dyn ConversationExtractor,
+    _config: &crate::harness::CaptureHarnessConfig,
+) -> Result<ReconcileSummary> {
+    todo!("cg-correctness C4: session-level goal reconciliation not implemented yet")
 }
 
 pub trait ImportParser: Send + Sync {
