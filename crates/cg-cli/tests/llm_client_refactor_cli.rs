@@ -1285,7 +1285,11 @@ fn cg_why_resolves_the_flagged_item_through_the_library_seam() {
         .iter()
         .map(|t| format!("{t:?}"))
         .collect();
-    assert_eq!(legal_names.len(), 13, "sanity: 13 legal entity types");
+    assert_eq!(
+        legal_names.len(),
+        context_graph::EntityType::ALL.len(),
+        "sanity: the legal vocabulary is the full canonical set"
+    );
 
     // Seed a GENUINELY-FLAGGED closed-vocab pending-review item carrying its legal_vocab, so the
     // library seam resolves it BY ID and returns Some(list).
