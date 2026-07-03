@@ -289,6 +289,49 @@ impl Store {
         Ok(())
     }
 
+    /// Remove ALL of an entity's enrolled reference vectors (every space, every
+    /// per-dimension table), including their vector-index entries, in one
+    /// transaction. Returns the number of references removed; idempotent. This
+    /// is the deletion half of enrollment: a removed entity stops matching
+    /// immediately, and its biometric vectors are gone from the store. The
+    /// enrollment HANDLE rows are deliberately kept — they are the immutable
+    /// provenance layer (ids and producer only, no vector) recording that an
+    /// enrollment happened.
+    pub fn remove_entity_references(&self, entity_id: EntityId) -> Result<usize> {
+        let snapshot = self.db.snapshot();
+        let mut reference_rows: Vec<(String, contextdb_core::RowId)> = Vec::new();
+        for table in self
+            .db
+            .table_names()
+            .into_iter()
+            .filter(|table| table.starts_with("entity_reference_embeddings_"))
+        {
+            for row in self.db.scan(&table, snapshot).map_err(map_engine_err)? {
+                if row.values.get("entity_id") == Some(&Value::Uuid(entity_id.as_uuid())) {
+                    reference_rows.push((table.clone(), row.row_id));
+                }
+            }
+        }
+        if reference_rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.begin_tx()?;
+        let rollback_on = |err: EngineError| {
+            let _ = self.db.rollback(tx);
+            map_engine_err(err)
+        };
+        for (table, row_id) in &reference_rows {
+            self.db
+                .delete_vector(tx, VectorIndexRef::new(table, "vector"), *row_id)
+                .map_err(rollback_on)?;
+            self.db
+                .delete_row(tx, table, *row_id)
+                .map_err(rollback_on)?;
+        }
+        self.db.commit(tx).map_err(map_engine_err)?;
+        Ok(reference_rows.len())
+    }
+
     pub fn list_entity_reference_embeddings_for_entity(
         &self,
         entity_id: EntityId,
