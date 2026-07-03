@@ -9,6 +9,7 @@ members = [
     "crates/cg-local-llm",
     "crates/cg-gap-report",
     "crates/cg-vision-embedder",
+    "crates/cg-bench",
 ]
 
 [workspace.package]
