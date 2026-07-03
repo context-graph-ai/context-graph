@@ -70,13 +70,13 @@ pub struct GoldOutcome {
 }
 
 /// Parse a gold session from its YAML form.
-pub fn load_gold_str(_yaml: &str) -> Result<GoldSession, String> {
-    todo!("cg-correctness C1: gold format parsing not implemented yet")
+pub fn load_gold_str(yaml: &str) -> Result<GoldSession, String> {
+    serde_yaml_ng::from_str(yaml).map_err(|e| format!("gold YAML parse error: {e}"))
 }
 
 /// Render a gold session back to YAML (roundtrip surface for draft → review → approve).
-pub fn to_yaml(_gold: &GoldSession) -> Result<String, String> {
-    todo!("cg-correctness C1: gold format rendering not implemented yet")
+pub fn to_yaml(gold: &GoldSession) -> Result<String, String> {
+    serde_yaml_ng::to_string(gold).map_err(|e| format!("gold YAML render error: {e}"))
 }
 
 /// An omission training pair: the chunk input plus the COMPLETE corrected harvest — the artifact
@@ -87,10 +87,10 @@ pub struct OmissionTrainingPair {
     pub corrected_harvest: serde_json::Value,
 }
 
-pub fn omission_pair_to_json(_pair: &OmissionTrainingPair) -> Result<String, String> {
-    todo!("cg-correctness C8: omission training pair rendering not implemented yet")
+pub fn omission_pair_to_json(pair: &OmissionTrainingPair) -> Result<String, String> {
+    serde_json::to_string_pretty(pair).map_err(|e| format!("omission pair render error: {e}"))
 }
 
-pub fn omission_pair_from_json(_json: &str) -> Result<OmissionTrainingPair, String> {
-    todo!("cg-correctness C8: omission training pair parsing not implemented yet")
+pub fn omission_pair_from_json(json: &str) -> Result<OmissionTrainingPair, String> {
+    serde_json::from_str(json).map_err(|e| format!("omission pair parse error: {e}"))
 }
