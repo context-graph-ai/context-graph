@@ -867,6 +867,34 @@ pub fn run_capture(
     run_capture_into_digest(store, request, extractor, config, None)
 }
 
+/// Deterministic staged-harvest merge (criteria C4/C6): focused-pass items JOIN the full pass's
+/// harvest (deduped by normalized text/name); nothing is ever removed, so a lazy-empty focused
+/// pass cannot erase full-pass findings — the probe-2 relocated-lazy-empty failure is
+/// structurally impossible here.
+fn merge_staged_harvests(
+    full: &mut crate::ingest::StructuredHarvest,
+    entities_pass: crate::ingest::StructuredHarvest,
+    decisions_pass: crate::ingest::StructuredHarvest,
+) {
+    fn normalized(text: &str) -> String {
+        text.trim().to_ascii_lowercase()
+    }
+    let known_entities: std::collections::HashSet<String> =
+        full.entities.iter().map(|e| normalized(&e.name)).collect();
+    for entity in entities_pass.entities {
+        if !known_entities.contains(&normalized(&entity.name)) {
+            full.entities.push(entity);
+        }
+    }
+    let known_decisions: std::collections::HashSet<String> =
+        full.decisions.iter().map(|d| normalized(&d.text)).collect();
+    for decision in decisions_pass.decisions {
+        if !known_decisions.contains(&normalized(&decision.text)) {
+            full.decisions.push(decision);
+        }
+    }
+}
+
 /// Run the same terminal capture path as [`run_capture`], but anchor the structured graph onto an
 /// existing digest (`reuse_digest`) instead of minting a new one. The understanding-queue drainer
 /// passes the id of the tier-0 digest it is understanding, so a chunk yields exactly ONE digest
@@ -907,6 +935,36 @@ pub fn run_capture_into_digest(
         config.chunk_window,
         schema_prompt_block.as_deref(),
     )?;
+
+    // Staged extraction (criterion C4): opt-in focused passes over the same transcript, merged
+    // deterministically. C6 cross-pass consistency is structural here: an empty focused pass
+    // never erases what the full pass found (merge only ADDS).
+    if config.staged_extraction && request.model_available {
+        let entities_pass = extractor.extract_pass(
+            ExtractionRequest {
+                context_label: &request.context_label,
+                transcript: &request.transcript,
+                prior_decisions: &[],
+            },
+            crate::ingest::ExtractionPass::EntitiesOnly,
+        )?;
+        let decisions_pass = extractor.extract_pass(
+            ExtractionRequest {
+                context_label: &request.context_label,
+                transcript: &request.transcript,
+                prior_decisions: &[],
+            },
+            crate::ingest::ExtractionPass::DecisionsOnly,
+        )?;
+        merge_staged_harvests(&mut harvest, entities_pass, decisions_pass);
+    }
+
+    // Goal-key backfill (C4 silent-loss fix): the capture writer SKIPS a decision that resolves
+    // to no goal — on this harness path a goal-less decision in a goal-less chunk was silently
+    // DROPPED (the legacy record path already backfilled; this path did not). Backfill attaches
+    // it to the synthetic fallback goal so it is stored and retrievable; the session
+    // reconciliation pass then surfaces synthetic-only attachments for review.
+    crate::ingest::ensure_goal_keys_for_decisions(&mut harvest, &request.context_label);
 
     // Resolve any raw model-emitted entity-type strings to their typed variant before grounding,
     // skill application, and structural fill; an out-of-vocab raw string is flagged below against
