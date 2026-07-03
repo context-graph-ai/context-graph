@@ -13,6 +13,7 @@ mod crud;
 mod digest_capture;
 mod discovery;
 mod edge_sync_convergence;
+mod entity_reference_match;
 mod edge_sync_offline_and_merge;
 mod evidence;
 #[path = "../common/fake_extractor.rs"]
