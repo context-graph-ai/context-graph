@@ -89,7 +89,9 @@
               "pipeline",
               "database",
               "team",
-              "document"
+              "document",
+              "animal",
+              "vehicle"
             ]
           }
         },
