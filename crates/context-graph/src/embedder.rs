@@ -15,13 +15,19 @@ const NOMIC_DEFAULT_REVISION: &str = "e9b6763023c676ca8431644204f50c2b100d9aab";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EmbeddingInput {
     Text(String),
-    ImageFrame { uri: String },
+    ImageFrame {
+        uri: String,
+    },
     /// An in-memory image (encoded or raw bytes, embedder-defined). The input path for
     /// consumers that embed on a hot path and hold the image in memory — no temp-file
     /// URI detour. Maps to `EvidenceKind::ImageFrame`.
     ImageBytes(Vec<u8>),
-    AudioSegment { uri: String },
-    VideoSegment { uri: String },
+    AudioSegment {
+        uri: String,
+    },
+    VideoSegment {
+        uri: String,
+    },
     StructuredSignal(serde_json::Value),
 }
 
