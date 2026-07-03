@@ -65,6 +65,36 @@ impl BenchReport {
 
     /// Render the report: bars, every variant row (per-lever history), verdict per row.
     pub fn render_markdown(&self) -> String {
-        todo!("cg-correctness C7: bench report rendering not implemented yet")
+        let mut out = format!(
+            "# cg-correctness bench — {}\n\nBars (criteria commit 99d99ee, owner-ratified): \
+             intention ≥ {BAR_INTENTION_FIDELITY:.2}, attachment ≥ {BAR_ATTACHMENT:.2}, \
+             decision recall ≥ {BAR_DECISION_RECALL:.2}, decision precision ≥ \
+             {BAR_DECISION_PRECISION:.2}, entity recall ≥ {BAR_ENTITY_RECALL:.2}, entity type \
+             ≥ {BAR_ENTITY_TYPE_ACCURACY:.2}; observations reported, not gated.\n\n\
+             | variant | model | sessions | intention | attach | dec-recall | dec-prec | \
+             ent-recall | ent-type | obs | dup | verdict |\n\
+             |---|---|---|---|---|---|---|---|---|---|---|---|\n",
+            self.title
+        );
+        for row in &self.rows {
+            let n = &row.numbers;
+            let verdict = if n.passes_bars() { "PASS" } else { "FAIL" };
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {} |\n",
+                row.label,
+                row.model,
+                n.sessions,
+                n.intention_fidelity,
+                n.attachment,
+                n.decision_recall,
+                n.decision_precision,
+                n.entity_recall,
+                n.entity_type_accuracy,
+                n.observation_recall,
+                n.duplication_rate,
+                verdict,
+            ));
+        }
+        out
     }
 }
