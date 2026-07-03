@@ -72,6 +72,9 @@ fn run_cg(cg: &str, work_root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new(cg)
         .args(args)
         .env("CG_DATA_ROOT", work_root)
+        // The bench's own foreground `cg understand` is the only understander: suppress the
+        // capture-kicked detached worker, which would otherwise hold the store lock against us.
+        .env("CG_NO_UNDERSTAND_KICK", "1")
         .output()
         .map_err(|e| format!("spawn {cg} failed: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
