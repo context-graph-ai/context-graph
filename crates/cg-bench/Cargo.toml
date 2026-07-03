@@ -11,6 +11,10 @@ publish = false
 # are that registration; changing them is a product-frame change, not engineering.
 
 [dependencies]
+context-graph = { path = "../context-graph" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

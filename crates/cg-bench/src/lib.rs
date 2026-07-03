@@ -5,5 +5,7 @@
 //! held fixed across every recipe/model/chunking variant so the per-lever numbers stay
 //! comparable. Changing them is a product-frame change requiring an owner decision.
 
+pub mod driver;
 pub mod gold;
+pub mod report;
 pub mod scoring;
