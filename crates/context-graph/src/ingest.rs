@@ -794,6 +794,35 @@ fn resolve_intention_grouping(
     }
 }
 
+/// One vendor-neutral transcript item: dialogue, or a tool event a vendor parser extracted.
+/// Vendor parsers (Claude jsonl today; Codex/Gemini connectors and Plan-22 formats later) emit
+/// these; the SHARED selection/rendering policy (`render_import_transcript`) decides what
+/// survives — the "what is decision-bearing" rule lives once, vendor-independently.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscriptItem {
+    Dialogue { role: String, text: String },
+    Tool(ToolEvent),
+}
+
+/// A tool invocation + its textual result, as extracted by a vendor parser.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolEvent {
+    pub tool_name: String,
+    /// The human-readable object of the call: a file path, a command, a pattern.
+    pub target: String,
+    pub result_text: String,
+}
+
+/// The ONE deterministic, model-free selection + rendering policy (criterion C2, criteria
+/// commit 99d99ee): every tool event keeps a one-line prose header naming what was done;
+/// result content survives only where the following assistant dialogue actually engages with
+/// it; kept content is rendered as plain prose, never re-wrapped in tool tags (tag-wrapped
+/// content would be stripped from the digest the retrieval embedding is built from — kept yet
+/// unfindable).
+pub fn render_import_transcript(_items: &[TranscriptItem]) -> String {
+    todo!("cg-correctness C2: shared import selection/rendering policy not implemented yet")
+}
+
 pub trait ImportParser: Send + Sync {
     fn parse(&self, raw: &[u8]) -> std::result::Result<String, CgError>;
     fn parse_line(&self, line: &str) -> std::result::Result<Option<String>, CgError> {
