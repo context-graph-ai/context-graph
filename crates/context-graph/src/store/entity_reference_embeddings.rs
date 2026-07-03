@@ -52,8 +52,93 @@ impl Store {
         query_vector: &[f32],
         options: EntityReferenceMatchOptions,
     ) -> Result<Vec<EntityMatch>> {
-        let _ = (embedding_space_id, query_vector, options);
-        todo!("stub for RED verification; implemented in the next commit")
+        let space = self
+            .embedding_space_for_id(embedding_space_id)
+            .map_err(|_| CgError::UnknownEmbeddingSpace {
+                id: embedding_space_id.to_string(),
+            })?;
+        if query_vector.len() != space.dimension {
+            return Err(CgError::EmbeddingDimensionMismatch {
+                space_id: embedding_space_id.to_string(),
+                expected: space.dimension as u32,
+                found: query_vector.len() as u32,
+            });
+        }
+        let table = format!("entity_reference_embeddings_{}", space.dimension);
+        let top_k = options.top_k.unwrap_or(10).max(1);
+        // Over-fetch reference rows so several references of one entity cannot
+        // crowd other entities out of the deduplicated result.
+        let fetch_limit = top_k.saturating_mul(8).clamp(top_k, 256);
+        let mut params = std::collections::HashMap::from([
+            (
+                "query".to_string(),
+                Value::Vector(query_vector.to_vec()),
+            ),
+            (
+                "embedding_space_id".to_string(),
+                Value::Text(embedding_space_id.to_string()),
+            ),
+        ]);
+        let sql = match options.context_id {
+            Some(context_id) => {
+                params.insert("context_id".to_string(), Value::Uuid(context_id.as_uuid()));
+                format!(
+                    "SELECT entity_id, label, score FROM {table} WHERE context_id = $context_id AND embedding_space_id = $embedding_space_id ORDER BY vector <=> $query LIMIT {fetch_limit}"
+                )
+            }
+            None => format!(
+                "SELECT entity_id, label, score FROM {table} WHERE embedding_space_id = $embedding_space_id ORDER BY vector <=> $query LIMIT {fetch_limit}"
+            ),
+        };
+        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let column = |name: &str| result.columns.iter().position(|c| c == name);
+        let (Some(entity_column), Some(label_column), Some(score_column)) =
+            (column("entity_id"), column("label"), column("score"))
+        else {
+            return Err(CgError::Engine(
+                "entity reference match row lookup missing a column".to_string(),
+            ));
+        };
+        let mut scored: Vec<EntityMatch> = Vec::new();
+        for row in &result.rows {
+            let Some(Value::Uuid(entity_id)) = row.get(entity_column) else {
+                continue;
+            };
+            let label = match row.get(label_column) {
+                Some(Value::Text(label)) => Some(label.clone()),
+                _ => None,
+            };
+            let score = match row.get(score_column) {
+                Some(Value::Float64(score)) => *score as f32,
+                _ => continue,
+            };
+            scored.push(EntityMatch {
+                entity_id: EntityId::from(*entity_id),
+                label,
+                score,
+            });
+        }
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut seen = std::collections::HashSet::new();
+        let mut matches: Vec<EntityMatch> = Vec::new();
+        for candidate in scored {
+            if let Some(min_score) = options.min_score
+                && candidate.score < min_score
+            {
+                continue;
+            }
+            if seen.insert(candidate.entity_id) {
+                matches.push(candidate);
+            }
+            if matches.len() == top_k {
+                break;
+            }
+        }
+        Ok(matches)
     }
 
     pub fn enroll_entity_reference(
