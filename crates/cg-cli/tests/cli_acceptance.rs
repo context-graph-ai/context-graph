@@ -5,7 +5,7 @@ use std::process::Command;
 
 use cg_catalog::{
     CacheStatus, Capability, Catalog, CatalogEntry, License, ModelConnectionCatalog, ModelKind,
-    PrincipalAwareConfig, Source,
+    PrincipalAwareConfig, Source, UNDERSTANDING_DEFAULT_ID,
 };
 use cg_cli::{
     Classification, ProviderOverride, classify_provider_reply, construct_claude_invocation,
@@ -534,6 +534,76 @@ fn cli_model_list() {
     assert!(
         !text.contains("discovered-marketplace"),
         "model list must contain only registered entries"
+    );
+}
+
+#[test]
+fn cli_model_use_local_selects_in_process_worker() {
+    let harness = CliHarness::new();
+    // Seed a fetched local understanding model: a stand-in cache dir + artifact (no real 3.1GB GGUF).
+    let model_dir = harness.data_root.path().join(UNDERSTANDING_DEFAULT_ID);
+    fs::create_dir_all(&model_dir).expect("model dir");
+    fs::write(model_dir.join("model.gguf"), b"fake-gguf").expect("artifact");
+    let mut catalog = ModelConnectionCatalog::open(harness.data_root.path());
+    catalog.register_local_model(UNDERSTANDING_DEFAULT_ID, ModelKind::LlmClient, &model_dir);
+
+    // `cg model use --local` selects it as the active understanding worker.
+    let used = harness.run(&["model", "use", "--local"]);
+    assert_eq!(
+        used.code, 0,
+        "model use --local must succeed: {}",
+        used.stderr
+    );
+    let used_json = parse_single_json(&used.stdout).unwrap_or(Value::Null);
+    assert_eq!(
+        (
+            used_json.get("model").and_then(Value::as_str),
+            used_json.get("local").and_then(Value::as_bool),
+            used_json.get("active").and_then(Value::as_bool),
+            used_json.get("consent_recorded").and_then(Value::as_bool),
+        ),
+        (
+            Some(UNDERSTANDING_DEFAULT_ID),
+            Some(true),
+            Some(true),
+            Some(true)
+        ),
+        "consent is auto-recorded for a zero-spend local worker"
+    );
+
+    // The persisted catalog resolves the local model as the active understanding worker.
+    let reopened = ModelConnectionCatalog::open(harness.data_root.path());
+    assert_eq!(
+        reopened.active_model_id().as_deref(),
+        Some(UNDERSTANDING_DEFAULT_ID)
+    );
+
+    // `cg status` shows it as an active $0 in-process local worker.
+    let status = harness.run(&["status"]);
+    let status_json = parse_single_json(&status.stdout).unwrap_or(Value::Null);
+    assert_eq!(
+        (
+            status_json.get("local").and_then(Value::as_bool),
+            status_json.get("local_model").and_then(Value::as_str),
+            status_json
+                .get("spend_kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.contains("$0")),
+        ),
+        (Some(true), Some(UNDERSTANDING_DEFAULT_ID), true),
+        "status must render the active local worker as $0 in-process"
+    );
+}
+
+#[test]
+fn cli_model_use_uncached_local_default_guides_to_fetch() {
+    let harness = CliHarness::new();
+    let output = harness.run(&["model", "use", "--local"]);
+    assert_ne!(output.code, 0, "an unfetched local default cannot be used");
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    assert!(
+        combined.contains("cg model fetch"),
+        "the error must guide the user to fetch first: {combined}"
     );
 }
 

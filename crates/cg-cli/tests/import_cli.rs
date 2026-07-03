@@ -970,19 +970,92 @@ fn cli_record_auth_replacement_uses_extractor_not_record_shorthand() {
 }
 
 #[test]
-fn cli_import_rejects_bulk_single_file_only() {
+fn cli_import_directory_sweeps_all_jsonl_at_tier0() {
     let harness = CliHarness::new();
-    let bulk_dir = tempfile::tempdir().expect("bulk dir");
+    let dir = harness.data_root.path().join("sessions");
+    std::fs::create_dir_all(&dir).expect("sessions dir");
+    write_file(dir.join("a.jsonl"), CLAUDE_SESSION);
+    write_file(dir.join("b.jsonl"), SECOND_CLAUDE_SESSION);
+
+    // A whole folder imports at tier-0: deterministic, $0, understanding deferred to the queue.
+    let sweep = harness.run(&["import", dir.to_str().expect("utf8 dir")]);
+    let status = harness.run(&["status"]);
+    let store_path = store_path_from(&[&sweep, &status]);
+    let after_first = persisted_counts(store_path.as_deref());
+    let sweep_json = output_json(&sweep).expect("sweep json");
+
+    assert_eq!(sweep.code, 0, "dir sweep failed: {}", combined(&sweep));
+    assert_eq!(
+        (
+            sweep_json
+                .pointer("/receipt/files")
+                .and_then(JsonValue::as_u64),
+            sweep_json
+                .pointer("/receipt/model_calls")
+                .and_then(JsonValue::as_u64),
+            sweep_json
+                .pointer("/receipt/cost_usd")
+                .and_then(JsonValue::as_f64),
+            sweep_json
+                .pointer("/receipt/digests")
+                .and_then(JsonValue::as_u64),
+            memory_counts(&status),
+            after_first.digests,
+        ),
+        (Some(2), Some(0), Some(0.0), Some(2), Some((0, 0, 0)), 2),
+        "two files sweep into two tier-0 digests, no derived graph, 0 model calls"
+    );
+
+    // Idempotent: a second sweep of the same folder writes nothing new.
+    let second = harness.run(&["import", dir.to_str().expect("utf8 dir")]);
+    let second_json = output_json(&second).expect("second sweep json");
+    let after_second = persisted_counts(store_path.as_deref());
+    assert_eq!(second.code, 0, "re-sweep failed: {}", combined(&second));
+    assert_eq!(
+        (
+            second_json
+                .pointer("/receipt/digests")
+                .and_then(JsonValue::as_u64),
+            second_json
+                .pointer("/receipt/skipped_existing")
+                .and_then(JsonValue::as_u64),
+            after_second == after_first,
+        ),
+        (Some(0), Some(2), true),
+        "re-sweep is idempotent: no new digests, both files skipped as already present"
+    );
+
+    // Estimate sums the per-file zero-outbound projection.
+    let estimate = harness.run(&["import", "--estimate", dir.to_str().expect("utf8 dir")]);
+    let estimate_json = output_json(&estimate).expect("estimate json");
+    assert_eq!(estimate.code, 0, "estimate failed: {}", combined(&estimate));
+    assert_eq!(
+        (
+            estimate_json
+                .pointer("/estimate/files")
+                .and_then(JsonValue::as_u64),
+            estimate_json
+                .pointer("/estimate/model_calls")
+                .and_then(JsonValue::as_u64),
+            estimate_json
+                .pointer("/estimate/chunks")
+                .and_then(JsonValue::as_u64),
+        ),
+        (Some(2), Some(0), Some(2)),
+    );
+}
+
+#[test]
+fn cli_import_empty_directory_is_a_typed_error() {
+    let harness = CliHarness::new();
+    let empty = harness.data_root.path().join("empty-sessions");
+    std::fs::create_dir_all(&empty).expect("empty dir");
     let before = harness.run(&["status"]);
-    let output = harness.run(&[
-        "import",
-        "--understand-now",
-        bulk_dir.path().to_str().expect("utf8 dir"),
-    ]);
+    let output = harness.run(&["import", empty.to_str().expect("utf8 dir")]);
     let after = harness.run(&["status"]);
 
     assert_ne!(output.code, 0);
-    assert!(combined(&output).contains("single file only"));
+    assert!(combined(&output).contains("no .jsonl session files"));
     assert_eq!(combined(&before), combined(&after));
 }
 

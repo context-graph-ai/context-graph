@@ -30,6 +30,10 @@ use crate::{
     Source,
 };
 
+/// A resolved local model's on-disk cache directory plus its artifact filenames and per-file
+/// sha256s (the metadata `connect_local_model` needs to register a fetched GGUF as a worker).
+type LocalModelCache = (PathBuf, Vec<String>, Vec<(String, String)>);
+
 pub const DEGRADED_MARKER: &str = "running without a connected model";
 const HOSTED_TIMEOUT: Duration = Duration::from_secs(45);
 const HOSTED_BODY_LIMIT: u64 = 1024 * 1024;
@@ -4097,6 +4101,121 @@ impl ModelConnectionCatalog {
         model
     }
 
+    /// Select a fetched local model (a bundled GGUF, e.g. the understanding default) as the active
+    /// understanding worker. Unlike `connect_env_var` / `connect_host_session_*`, this needs no
+    /// credential: a local model runs fully in-process, so it is wired to a `NoAuth` connection.
+    ///
+    /// The daily-loop $0-local path this makes walkable: `cg model fetch --defaults` caches the GGUF,
+    /// then `cg model use --local` calls this so the understanding-queue drain routes to the
+    /// in-process model at zero token/dollar cost.
+    pub fn connect_local_model(
+        &mut self,
+        model_id: &str,
+    ) -> std::result::Result<ConnectionRead, String> {
+        let name = model_id.to_string();
+
+        // Resolve the on-disk artifact directory. Prefer an already-registered local model's
+        // cache path; otherwise resolve a fetched-but-unregistered artifact (the bundled
+        // understanding default after `cg model fetch`) from the catalog manifest.
+        let existing = self.read_model(model_id);
+        let (cache_path, artifact_filenames, per_file_sha256) =
+            match existing.as_ref().and_then(|model| model.cache_path.clone()) {
+                Some(path) => (
+                    path,
+                    existing
+                        .as_ref()
+                        .map(|model| model.artifact_filenames.clone())
+                        .unwrap_or_default(),
+                    existing
+                        .as_ref()
+                        .map(|model| model.per_file_sha256.clone())
+                        .unwrap_or_default(),
+                ),
+                None => self.local_model_cache(model_id)?,
+            };
+
+        // Register the model as a LocalPath LlmClient. `connection_name` is `None` in the catalog
+        // registration on purpose: the catalog entry source must stay `LocalPath` (the in-process
+        // dispatch requires it), and `NamedConnection` would shadow it.
+        let registration_model = ModelRead {
+            id: name.clone(),
+            kind: ModelKind::LlmClient,
+            connection_name: None,
+            welded_auth_env_var: None,
+            exposed_secret: None,
+            cache_path: Some(cache_path.clone()),
+            hosted_endpoint: None,
+            artifact_filenames,
+            per_file_sha256,
+        };
+        if !self.upsert_shipped_catalog_entry(&registration_model) {
+            return Err(format!(
+                "failed to register local model {model_id} as the active understanding worker"
+            ));
+        }
+        // The in-memory model record points its `connection_name` at the connection so
+        // `model_for_connection` / `active_model_id` resolve the local GGUF once it is active.
+        let mut resolved = registration_model;
+        resolved.connection_name = Some(name.clone());
+        self.models.insert(name.clone(), resolved);
+
+        // Consent auto-recorded is a deliberate product decision: the consent gate exists only to
+        // stop cg from silently burning a paid chat subscription / provider quota. A local
+        // in-process model has ZERO token/quota spend, so that concern is moot here — the act of
+        // running `cg model use` IS the opt-in. `spend_owner` is "local" to make the $0 lane honest.
+        let read = ConnectionRead {
+            name: name.clone(),
+            credential_reference: CredentialReference::no_auth(),
+            exposed_secret: None,
+            consent_recorded: true,
+            spend_owner: "local".to_string(),
+        };
+        self.connections.insert(name.clone(), read.clone());
+        self.active_connection_name = Some(name.clone());
+        // A prior failure on a reused connection name would gate memory capture off; clear it so the
+        // freshly-selected local worker starts clean.
+        let _ = self.clear_connection_last_error_result(&name);
+        self.persist();
+        Ok(read)
+    }
+
+    /// Resolve a fetched local model's cache directory and artifact metadata from the catalog
+    /// manifest, or a clear "fetch it first" error. Used when the model is not yet registered as a
+    /// local connection model (e.g. right after `cg model fetch --defaults`).
+    fn local_model_cache(&self, model_id: &str) -> std::result::Result<LocalModelCache, String> {
+        if self.root.as_os_str().is_empty() {
+            return Err(self.local_model_missing_message(model_id));
+        }
+        let catalog = Catalog::open_with_scope_against_root(&self.root, CONNECTION_CATALOG_SCOPE)
+            .map_err(|err| format!("local model catalog open failed: {err}"))?;
+        let Ok(entry) = catalog.show(model_id) else {
+            return Err(self.local_model_missing_message(model_id));
+        };
+        if !matches!(entry.source, Source::LocalPath { .. }) {
+            return Err(format!(
+                "model {model_id} is not a local model; `cg model use` selects a fetched local model (use `cg model connect` for an HTTP endpoint)"
+            ));
+        }
+        if entry.cache_status != CacheStatus::Cached {
+            return Err(self.local_model_missing_message(model_id));
+        }
+        let cache_path = entry
+            .local_path
+            .clone()
+            .ok_or_else(|| self.local_model_missing_message(model_id))?;
+        Ok((cache_path, entry.artifact_filenames, entry.per_file_sha256))
+    }
+
+    fn local_model_missing_message(&self, model_id: &str) -> String {
+        if model_id == crate::UNDERSTANDING_DEFAULT_ID {
+            format!(
+                "local understanding model `{model_id}` is not cached; run `cg model fetch --defaults` first"
+            )
+        } else {
+            format!("local model `{model_id}` is not cached; run `cg model fetch {model_id}` first")
+        }
+    }
+
     pub fn register_legacy_hosted_model_with_welded_env_var(
         &mut self,
         id: impl Into<String>,
@@ -4360,7 +4479,9 @@ impl ModelConnectionCatalog {
             .find(|model| model.connection_name.as_deref() == Some(connection_name))
     }
 
-    fn active_model_id(&self) -> Option<String> {
+    /// The model id resolved by the active connection — i.e. the current understanding worker.
+    /// Public so `cg status` and other callers can report which model would run a capture drain.
+    pub fn active_model_id(&self) -> Option<String> {
         let active = self.active_connection_name.as_deref()?;
         self.model_for_connection(active).map(|model| model.id)
     }
