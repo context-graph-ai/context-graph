@@ -350,10 +350,15 @@ fn cli_help_root() {
         "bare cg must show help text, got {:?}",
         bare.stdout
     );
-    let invalid_cleanup = harness.run(&["connect", "claude-code"]);
+    // STALE-CONTRACT FIX (cg-correctness run, 2026-07-03, own commit): this assertion predated
+    // cg-daily-loop, which made `cg connect claude-code` the real injection-hook installer
+    // (exit 0, hooks written into the harness-isolated HOME). The daily-loop ship documented
+    // this failure as a known baseline instead of updating it; updated here to the shipped,
+    // owner-accepted contract.
+    let install = harness.run(&["connect", "claude-code"]);
     assert_eq!(
-        invalid_cleanup.code, 2,
-        "cleanup connect without --remove-all must be usage, not a no-op"
+        install.code, 0,
+        "connect claude-code installs the injection hooks (daily-loop shipped contract)"
     );
 }
 
