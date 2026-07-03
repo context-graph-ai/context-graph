@@ -240,8 +240,7 @@ impl Store {
         // embedder for it) are not "extra" declarations and are left alone.
         for registration in registrations.iter().take(explicit_registration_count) {
             let space_id = &registration.space.embedding_space_id;
-            let is_builtin_default =
-                *space_id == default_text_embedding_space().embedding_space_id;
+            let is_builtin_default = *space_id == default_text_embedding_space().embedding_space_id;
             let already_declared = config
                 .extra_embedding_spaces
                 .iter()
