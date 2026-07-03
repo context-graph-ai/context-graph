@@ -29,7 +29,7 @@ fn store(name: &str) -> Store {
             model_family: "vision".to_string(),
             model_name: "joint-image-text".to_string(),
             model_version: "1".to_string(),
-            supported_evidence_kinds: Vec::new(),
+            supported_evidence_kinds: vec![context_graph::EvidenceKind::ImageFrame],
             default_for_evidence_kind: None,
             bindings: Vec::new(),
         }],

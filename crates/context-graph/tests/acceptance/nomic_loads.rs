@@ -230,9 +230,11 @@ impl Embedder for DeterministicSiblingTextEmbedder {
                 },
                 vector: self.vector.clone(),
             }),
-            EmbeddingInput::ImageFrame { .. } => Err(CgError::UnsupportedEvidenceKind {
-                kind: EvidenceKind::ImageFrame,
-            }),
+            EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
+                Err(CgError::UnsupportedEvidenceKind {
+                    kind: EvidenceKind::ImageFrame,
+                })
+            }
             EmbeddingInput::AudioSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
                 kind: EvidenceKind::AudioSegment,
             }),
