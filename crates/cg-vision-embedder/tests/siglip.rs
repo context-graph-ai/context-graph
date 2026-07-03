@@ -170,7 +170,7 @@ fn weight_backed_registration_and_match_round_trip_through_the_store() {
             space: context_graph::EmbeddingSpaceDecl {
                 embedding_space_id: space.embedding_space_id.clone(),
                 dimension: space.dimension,
-                metric: space.metric.clone(),
+                metric: space.metric,
                 model_family: space.model_family.clone(),
                 model_name: space.model_name.clone(),
                 model_version: space.model_version.clone(),
