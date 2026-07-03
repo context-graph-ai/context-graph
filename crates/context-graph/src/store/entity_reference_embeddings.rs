@@ -67,8 +67,10 @@ impl Store {
         let table = format!("entity_reference_embeddings_{}", space.dimension);
         let top_k = options.top_k.unwrap_or(10).max(1);
         // Over-fetch reference rows so several references of one entity cannot
-        // crowd other entities out of the deduplicated result.
-        let fetch_limit = top_k.saturating_mul(8).clamp(top_k, 256);
+        // crowd other entities out of the deduplicated result. The cap bounds
+        // the over-fetch, never the caller's top_k: fetch at least top_k rows,
+        // at most max(256, top_k).
+        let fetch_limit = top_k.saturating_mul(8).min(256.max(top_k));
         let mut params = std::collections::HashMap::from([
             ("query".to_string(), Value::Vector(query_vector.to_vec())),
             (
