@@ -27,6 +27,7 @@ mod engine_probes {
 mod capture_pipeline;
 #[cfg(context_graph_internal_test_support)]
 mod explain_introspection;
+mod extraction_prompt_config;
 mod impact_analysis_engine_capabilities;
 mod impact_cascade_probes;
 mod import_tool_output;

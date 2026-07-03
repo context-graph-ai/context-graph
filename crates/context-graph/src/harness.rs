@@ -110,6 +110,40 @@ pub fn default_capture_context(tenant_id: &str, _cwd: &str) -> String {
 // CaptureHarnessConfig
 // ---------------------------------------------------------------------------
 
+/// Per-chunk item caps rendered into the extraction prompt (criterion C5, criteria commit
+/// 99d99ee): configuration, not compile-time constants — a live recall clip when set too low
+/// (the hosted ceiling probe sat exactly at the old hardcoded decision cap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemCaps {
+    pub goals: usize,
+    pub entities: usize,
+    pub decisions: usize,
+    pub observations: usize,
+}
+
+impl Default for ItemCaps {
+    fn default() -> Self {
+        Self {
+            goals: 3,
+            entities: 6,
+            decisions: 6,
+            observations: 6,
+        }
+    }
+}
+
+/// Invocation inputs to the library prompt assembly (criterion C3): everything the caller
+/// supplies per call; everything recipe-shaped comes from `CaptureHarnessConfig` instead.
+#[derive(Debug, Clone)]
+pub struct ExtractionPromptInputs<'a> {
+    pub context_label: &'a str,
+    pub transcript: &'a str,
+    /// Pre-rendered "existing active memory" block.
+    pub prior_memory_block: &'a str,
+    /// Pre-assembled generation-time steering block, when any.
+    pub steering_block: Option<&'a str>,
+}
+
 /// Configuration passed to the harness capture entry point. Every knob is data the harness
 /// honors during capture.
 #[derive(Debug, Clone)]
@@ -120,6 +154,8 @@ pub struct CaptureHarnessConfig {
     /// Chunk window size in tokens for rolling capture. When unset the capture uses its
     /// internal default.
     pub chunk_window: Option<usize>,
+    /// Overlap between consecutive chunks. When unset, no overlap (the shipped behavior).
+    pub chunk_overlap: Option<usize>,
     /// Whether learned skills are applied during capture.
     pub skills_enabled: bool,
     /// Whether newly promoted skills are held for review before auto-applying.
@@ -128,6 +164,12 @@ pub struct CaptureHarnessConfig {
     pub prompt_override: Option<String>,
     /// Model tier (e.g. "haiku", "sonnet").
     pub tier: Option<String>,
+    /// Per-chunk item caps rendered into the prompt. When unset, `ItemCaps::default()`.
+    pub item_caps: Option<ItemCaps>,
+    /// USER-SUPPLIED entity vocabulary (owner decision 2026-07-03: "user supplied, never in
+    /// code"). When unset, the 13 built-in types. Feeds schema + prompt + grounding from this
+    /// one source — the first slice of cg-open-entity-vocabulary.
+    pub entity_vocabulary: Option<Vec<String>>,
 }
 
 impl Default for CaptureHarnessConfig {
@@ -135,11 +177,30 @@ impl Default for CaptureHarnessConfig {
         Self {
             recall_limit: None,
             chunk_window: None,
+            chunk_overlap: None,
             skills_enabled: true,
             review_mode: false,
             prompt_override: None,
             tier: None,
+            item_caps: None,
+            entity_vocabulary: None,
         }
+    }
+}
+
+impl CaptureHarnessConfig {
+    /// Parse operator configuration from `<data_root>/cg/capture.toml` content (the file READ
+    /// stays in the caller — the core library holds no filesystem access). An empty document is
+    /// the defaults; a malformed document is a loud error, never a silent fallback.
+    pub fn from_toml_str(_toml_text: &str) -> std::result::Result<Self, String> {
+        todo!("cg-correctness C5: operator capture.toml parsing not implemented yet")
+    }
+
+    /// The ONE production prompt assembly (criterion C3): framing + recipe + schema block +
+    /// caps + shape guidance, rendered from this config. cg-cli and the bench both call THIS,
+    /// so they cannot drift.
+    pub fn render_extraction_prompt(&self, _inputs: &ExtractionPromptInputs<'_>) -> String {
+        todo!("cg-correctness C3: library extraction prompt assembly not implemented yet")
     }
 }
 
