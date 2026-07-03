@@ -231,13 +231,15 @@ impl Store {
         let mut config = config;
         let mut registrations = registrations;
         let explicit_registration_count = registrations.len();
-        // An explicit registration DECLARES its embedding space: fold each
-        // registration's space decl into the declared-space list so the space is
-        // validated, seeded, and its per-dimension reference table created —
-        // a consumer never has to duplicate the declaration in
-        // `extra_embedding_spaces`. A same-id entry already in the config wins,
-        // and registrations for the built-in default text space (e.g. a reindex
-        // embedder for it) are not "extra" declarations and are left alone.
+        // An explicit registration of a BINDING-FREE space DECLARES that space:
+        // fold its decl into the declared-space list so the space is validated,
+        // seeded, and its per-dimension reference table created — a consumer
+        // never has to duplicate the declaration in `extra_embedding_spaces`.
+        // Left alone: a same-id entry already in the config (it wins), the
+        // built-in default text space (a reindex embedder for it is not an
+        // "extra" declaration), and any decl carrying table BINDINGS — bound
+        // spaces target existing vector columns with exact-dimension contracts
+        // and stay on the explicit `extra_embedding_spaces` path.
         for registration in registrations.iter().take(explicit_registration_count) {
             let space_id = &registration.space.embedding_space_id;
             let is_builtin_default = *space_id == default_text_embedding_space().embedding_space_id;
@@ -245,7 +247,7 @@ impl Store {
                 .extra_embedding_spaces
                 .iter()
                 .any(|decl| decl.embedding_space_id == *space_id);
-            if !is_builtin_default && !already_declared {
+            if !is_builtin_default && !already_declared && registration.space.bindings.is_empty() {
                 config
                     .extra_embedding_spaces
                     .push(registration.space.clone());

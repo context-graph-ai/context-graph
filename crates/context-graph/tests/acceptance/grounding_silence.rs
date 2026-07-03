@@ -461,8 +461,9 @@ fn flagged_closed_vocab_item_exposes_legal_type_list_via_cg_why() {
         "a genuinely-flagged closed-vocab item must still resolve to its legal list by id"
     );
 
-    // The single vocabulary source must itself enumerate 13 (kept as a sanity check on the source).
-    assert_eq!(legal_entity_type_names().len(), 13);
+    // The single vocabulary source must itself enumerate the full canonical
+    // vocabulary (kept as a sanity check on the source).
+    assert_eq!(legal_entity_type_names().len(), EntityType::ALL.len());
     let _ = why_flagged_closed_vocab; // retained import; the item-keyed path is the contract now
 }
 
