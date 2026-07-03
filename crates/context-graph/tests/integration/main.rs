@@ -36,6 +36,7 @@ mod ingest_core_streaming;
 mod intra_space_modality_agnostic;
 mod invalidation_audit_log;
 mod invalidation_concurrency;
+mod pass_focus;
 mod precomputed_embedding_edge_cases;
 mod precomputed_embedding_ingest;
 mod producer_diagnostic;
