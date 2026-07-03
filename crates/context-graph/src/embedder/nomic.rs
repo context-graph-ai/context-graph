@@ -303,7 +303,7 @@ impl Embedder for NomicTextEmbedder {
     fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput> {
         let text = match input {
             EmbeddingInput::Text(text) => text,
-            EmbeddingInput::ImageFrame { .. } => {
+            EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
                 return Err(CgError::UnsupportedEvidenceKind {
                     kind: EvidenceKind::ImageFrame,
                 });

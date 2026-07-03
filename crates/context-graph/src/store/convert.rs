@@ -221,6 +221,8 @@ pub(super) fn entity_type_str(et: EntityType) -> &'static str {
         EntityType::Database => "DATABASE",
         EntityType::Team => "TEAM",
         EntityType::Document => "DOCUMENT",
+        EntityType::Animal => "ANIMAL",
+        EntityType::Vehicle => "VEHICLE",
     }
 }
 
@@ -248,6 +250,8 @@ pub(super) fn entity_type_from_str(s: &str) -> Result<EntityType> {
         "DATABASE" => Ok(EntityType::Database),
         "TEAM" => Ok(EntityType::Team),
         "DOCUMENT" => Ok(EntityType::Document),
+        "ANIMAL" => Ok(EntityType::Animal),
+        "VEHICLE" => Ok(EntityType::Vehicle),
         other => Err(CgError::Engine(format!("unknown entity type: {other}"))),
     }
 }

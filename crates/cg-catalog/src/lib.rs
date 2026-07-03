@@ -561,9 +561,11 @@ impl Embedder for CatalogTextEmbedder {
                     Err(other) => Err(CgError::Engine(format!("{other:?}"))),
                 }
             }
-            EmbeddingInput::ImageFrame { .. } => Err(CgError::UnsupportedEvidenceKind {
-                kind: EvidenceKind::ImageFrame,
-            }),
+            EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
+                Err(CgError::UnsupportedEvidenceKind {
+                    kind: EvidenceKind::ImageFrame,
+                })
+            }
             EmbeddingInput::AudioSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
                 kind: EvidenceKind::AudioSegment,
             }),
