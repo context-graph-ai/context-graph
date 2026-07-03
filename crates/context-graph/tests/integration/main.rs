@@ -29,6 +29,7 @@ mod capture_pipeline;
 mod explain_introspection;
 mod impact_analysis_engine_capabilities;
 mod impact_cascade_probes;
+mod import_tool_output;
 mod ingest_core_streaming;
 #[cfg(context_graph_internal_test_support)]
 mod intra_space_modality_agnostic;
