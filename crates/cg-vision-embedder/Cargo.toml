@@ -1,0 +1,26 @@
+[package]
+name = "cg-vision-embedder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+context-graph = { path = "../context-graph", default-features = false }
+# Pure-Rust gemm CPU path by default; the model implementation ships upstream in
+# candle-transformers (siglip).
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+tokenizers = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde_json = { workspace = true }
+
+[features]
+# GPU is a backend flag on the same code path: with `cuda` enabled and an NVIDIA
+# device present, the same call site selects the CUDA device; otherwise CPU.
+# (Building with `cuda` requires nvcc at build time — a separate build artifact,
+# not a code change.)
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }
