@@ -813,14 +813,119 @@ pub struct ToolEvent {
     pub result_text: String,
 }
 
+/// Per-event byte cap on kept tool-result content: keeps a single verbose-but-discussed result
+/// from dominating a chunk while leaving room for the decision-bearing lines.
+const TOOL_RESULT_KEEP_CAP: usize = 2_000;
+/// How many FOLLOWING assistant dialogue turns count as "the assistant then discussed it".
+const FOLLOWING_DIALOGUE_WINDOW: usize = 3;
+/// Minimum token length for the engagement test — shorter tokens are too common to signal that
+/// the dialogue is actually about the tool output.
+const ENGAGEMENT_TOKEN_MIN_LEN: usize = 5;
+/// Common ≥5-char English words excluded from the engagement test (they co-occur by chance).
+const ENGAGEMENT_STOPWORDS: &[&str] = &[
+    "about", "above", "actually", "after", "again", "against", "always", "because", "before",
+    "being", "below", "between", "cannot", "could", "doing", "during", "every", "further", "going",
+    "having", "little", "maybe", "might", "never", "other", "ought", "really", "right", "should",
+    "since", "still", "their", "theirs", "there", "these", "thing", "things", "think", "those",
+    "through", "under", "until", "where", "which", "while", "within", "without", "would",
+];
+
 /// The ONE deterministic, model-free selection + rendering policy (criterion C2, criteria
 /// commit 99d99ee): every tool event keeps a one-line prose header naming what was done;
 /// result content survives only where the following assistant dialogue actually engages with
-/// it; kept content is rendered as plain prose, never re-wrapped in tool tags (tag-wrapped
-/// content would be stripped from the digest the retrieval embedding is built from — kept yet
-/// unfindable).
-pub fn render_import_transcript(_items: &[TranscriptItem]) -> String {
-    todo!("cg-correctness C2: shared import selection/rendering policy not implemented yet")
+/// it (per-line rare-token overlap with the next few assistant turns, capped per event); kept
+/// content is rendered as plain prose, never re-wrapped in tool tags (tag-wrapped content would
+/// be stripped from the digest the retrieval embedding is built from — kept yet unfindable).
+pub fn render_import_transcript(items: &[TranscriptItem]) -> String {
+    let mut out = String::new();
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            TranscriptItem::Dialogue { role, text } => {
+                let label = if role == "user" { "User" } else { "Assistant" };
+                out.push_str(label);
+                out.push_str(": ");
+                out.push_str(text);
+                out.push('\n');
+            }
+            TranscriptItem::Tool(event) => {
+                if event.target.trim().is_empty() {
+                    out.push_str(&format!("Assistant used {}.", event.tool_name));
+                } else {
+                    out.push_str(&format!(
+                        "Assistant used {} on {}.",
+                        event.tool_name,
+                        event.target.trim()
+                    ));
+                }
+                let kept = engaged_result_lines(event, &following_assistant_tokens(items, index));
+                if kept.is_empty() {
+                    out.push('\n');
+                } else {
+                    out.push_str(" It returned: ");
+                    out.push_str(&kept);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Rare-token vocabulary of the next few assistant dialogue turns after `index`.
+fn following_assistant_tokens(
+    items: &[TranscriptItem],
+    index: usize,
+) -> std::collections::HashSet<String> {
+    let mut tokens = std::collections::HashSet::new();
+    let mut dialogues_seen = 0usize;
+    for item in items.iter().skip(index + 1) {
+        if let TranscriptItem::Dialogue { role, text } = item
+            && role == "assistant"
+        {
+            for token in engagement_tokens(text) {
+                tokens.insert(token);
+            }
+            dialogues_seen += 1;
+            if dialogues_seen >= FOLLOWING_DIALOGUE_WINDOW {
+                break;
+            }
+        }
+    }
+    tokens
+}
+
+/// Deterministic engagement tokenization: lowercase, split on non-alphanumerics, length-filtered,
+/// stopword-filtered.
+fn engagement_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= ENGAGEMENT_TOKEN_MIN_LEN)
+        .map(|t| t.to_ascii_lowercase())
+        .filter(|t| !ENGAGEMENT_STOPWORDS.contains(&t.as_str()))
+}
+
+/// The result lines the following dialogue engages with, joined, capped at
+/// `TOOL_RESULT_KEEP_CAP` bytes per event.
+fn engaged_result_lines(
+    event: &ToolEvent,
+    following: &std::collections::HashSet<String>,
+) -> String {
+    if following.is_empty() {
+        return String::new();
+    }
+    let mut kept = String::new();
+    for line in event.result_text.lines() {
+        if engagement_tokens(line).any(|token| following.contains(&token)) {
+            let addition = line.trim();
+            if kept.len() + addition.len() + 1 > TOOL_RESULT_KEEP_CAP {
+                break;
+            }
+            if !kept.is_empty() {
+                kept.push('\n');
+            }
+            kept.push_str(addition);
+        }
+    }
+    kept
 }
 
 pub trait ImportParser: Send + Sync {
@@ -835,16 +940,33 @@ pub trait ImportParser: Send + Sync {
 #[derive(Debug, Default)]
 pub struct ClaudeJsonlParser;
 
+impl ClaudeJsonlParser {
+    /// Phase 1 of import parse: extract vendor-neutral items — dialogue AND tool events —
+    /// from Claude session jsonl. Tool events are emitted at their RESULT's position (the
+    /// selection policy's "assistant then discussed it" lookahead reads forward from there);
+    /// a `tool_use` whose result never arrives is emitted header-only at the end.
+    pub fn parse_items(&self, raw: &[u8]) -> Vec<TranscriptItem> {
+        let input = String::from_utf8_lossy(raw);
+        let mut items = Vec::new();
+        // (tool_use id, tool name, target) awaiting their result, in stream order.
+        let mut pending: Vec<(Option<String>, String, String)> = Vec::new();
+        for line in input.lines() {
+            claude_line_into_items(line, &mut items, &mut pending);
+        }
+        for (_, tool_name, target) in pending {
+            items.push(TranscriptItem::Tool(ToolEvent {
+                tool_name,
+                target,
+                result_text: String::new(),
+            }));
+        }
+        items
+    }
+}
+
 impl ImportParser for ClaudeJsonlParser {
     fn parse(&self, raw: &[u8]) -> std::result::Result<String, CgError> {
-        let input = String::from_utf8_lossy(raw);
-        let mut out = String::new();
-        for line in input.lines() {
-            if let Some(parsed) = self.parse_line(line)? {
-                out.push_str(&parsed);
-            }
-        }
-        Ok(out)
+        Ok(render_import_transcript(&self.parse_items(raw)))
     }
 
     fn parse_line(&self, line: &str) -> std::result::Result<Option<String>, CgError> {
@@ -853,6 +975,142 @@ impl ImportParser for ClaudeJsonlParser {
 
     fn format_name(&self) -> &'static str {
         "claude-jsonl"
+    }
+}
+
+/// Parse one Claude jsonl line into items. Text blocks join into one dialogue turn (noise
+/// stripped exactly as the legacy line path did); `tool_use` blocks queue as pending;
+/// `tool_result` blocks resolve their pending `tool_use` (by id, else oldest) into a ToolEvent.
+fn claude_line_into_items(
+    line: &str,
+    items: &mut Vec<TranscriptItem>,
+    pending: &mut Vec<(Option<String>, String, String)>,
+) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<JsonValue>(line) else {
+        return;
+    };
+    let Some(message) = value.get("message").and_then(JsonValue::as_object) else {
+        return;
+    };
+    let Some(role) = message.get("role").and_then(JsonValue::as_str).or_else(|| {
+        value
+            .get("type")
+            .and_then(JsonValue::as_str)
+            .filter(|role| *role == "user" || *role == "assistant")
+    }) else {
+        return;
+    };
+    if role != "user" && role != "assistant" {
+        return;
+    }
+    let mut text_parts: Vec<&str> = Vec::new();
+    match message.get("content") {
+        Some(JsonValue::String(text)) => text_parts.push(text),
+        Some(JsonValue::Array(blocks)) => {
+            for block in blocks {
+                match block.get("type").and_then(JsonValue::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(JsonValue::as_str) {
+                            text_parts.push(text);
+                        }
+                    }
+                    Some("tool_use") => {
+                        let id = block
+                            .get("id")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string);
+                        let name = block
+                            .get("name")
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or("tool")
+                            .to_string();
+                        let target = tool_target_from_input(block.get("input"));
+                        pending.push((id, name, target));
+                    }
+                    Some("tool_result") => {
+                        let result_text = tool_result_text(block.get("content"));
+                        let result_id = block.get("tool_use_id").and_then(JsonValue::as_str);
+                        let position = result_id
+                            .and_then(|rid| {
+                                pending
+                                    .iter()
+                                    .position(|(id, _, _)| id.as_deref() == Some(rid))
+                            })
+                            .or_else(|| (!pending.is_empty()).then_some(0));
+                        let (tool_name, target) = match position {
+                            Some(at) => {
+                                let (_, name, target) = pending.remove(at);
+                                (name, target)
+                            }
+                            None => ("tool".to_string(), String::new()),
+                        };
+                        items.push(TranscriptItem::Tool(ToolEvent {
+                            tool_name,
+                            target,
+                            result_text,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    if !text_parts.is_empty() {
+        let joined = text_parts.join("\n");
+        let text = strip_embedded_noise(&joined).trim().to_string();
+        if !is_noise(&text) {
+            items.push(TranscriptItem::Dialogue {
+                role: role.to_string(),
+                text,
+            });
+        }
+    }
+}
+
+/// The human-readable object of a tool call, from its input object: well-known keys first,
+/// else the first string value (serde_json preserves insertion order), else empty.
+fn tool_target_from_input(input: Option<&JsonValue>) -> String {
+    let Some(JsonValue::Object(map)) = input else {
+        return String::new();
+    };
+    for key in [
+        "file_path",
+        "command",
+        "pattern",
+        "path",
+        "url",
+        "query",
+        "prompt",
+        "description",
+    ] {
+        if let Some(JsonValue::String(v)) = map.get(key) {
+            return v.clone();
+        }
+    }
+    map.values()
+        .find_map(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Textual content of a tool_result block: plain string, or the concatenated text blocks.
+fn tool_result_text(content: Option<&JsonValue>) -> String {
+    match content {
+        Some(JsonValue::String(text)) => text.clone(),
+        Some(JsonValue::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| {
+                (block.get("type").and_then(JsonValue::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(JsonValue::as_str))
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 

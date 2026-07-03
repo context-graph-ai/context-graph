@@ -1868,22 +1868,23 @@ fn stream_import_chunks<F>(
 where
     F: FnMut(&str) -> context_graph::Result<()>,
 {
-    let file = fs::File::open(path)
-        .map_err(|err| CgError::Engine(format!("import open failed: {err}")))?;
-    let reader = std::io::BufReader::new(file);
+    // Whole-file two-phase parse (cg-correctness C2): the selection policy needs lookahead —
+    // tool-result content survives only where the FOLLOWING assistant dialogue engages with it —
+    // which a per-line stream cannot express. Per-file memory is bounded by session size (MBs);
+    // directory imports remain file-at-a-time.
+    let raw =
+        fs::read(path).map_err(|err| CgError::Engine(format!("import read failed: {err}")))?;
+    let transcript = parser.parse(&raw)?;
     let mut buffer = String::new();
     let mut chunks = 0;
-    for line in reader.lines() {
-        let line = line.map_err(|err| CgError::Engine(format!("import read failed: {err}")))?;
-        if let Some(segment) = parser.parse_line(&line)? {
-            append_import_segment(
-                &mut buffer,
-                &segment,
-                options.max_chars,
-                &mut chunks,
-                &mut on_chunk,
-            )?;
-        }
+    for segment in transcript.split_inclusive('\n') {
+        append_import_segment(
+            &mut buffer,
+            segment,
+            options.max_chars,
+            &mut chunks,
+            &mut on_chunk,
+        )?;
     }
     flush_import_chunk(&mut buffer, &mut chunks, &mut on_chunk)?;
     Ok(chunks)
