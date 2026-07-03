@@ -65,6 +65,10 @@ impl Embedder for RoutingProbeEmbedder {
                 self.image_calls.fetch_add(1, Ordering::SeqCst);
                 ("image", uri, 512)
             }
+            EmbeddingInput::ImageBytes(bytes) => {
+                self.image_calls.fetch_add(1, Ordering::SeqCst);
+                ("image", format!("bytes:{}", bytes.len()), 512)
+            }
             EmbeddingInput::AudioSegment { .. } => {
                 return Err(CgError::UnsupportedEvidenceKind {
                     kind: EvidenceKind::AudioSegment,

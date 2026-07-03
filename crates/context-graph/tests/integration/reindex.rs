@@ -70,7 +70,7 @@ impl Embedder for RecordingReindexEmbedder {
                     vector: expected_reindexed_vector(&text),
                 })
             }
-            EmbeddingInput::ImageFrame { .. } => Err(CgError::UnsupportedEvidenceKind {
+            EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => Err(CgError::UnsupportedEvidenceKind {
                 kind: EvidenceKind::ImageFrame,
             }),
             EmbeddingInput::AudioSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
