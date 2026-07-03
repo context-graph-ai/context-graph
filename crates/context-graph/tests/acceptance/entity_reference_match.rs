@@ -524,3 +524,30 @@ fn removing_an_entitys_references_removes_it_from_matching() {
         .expect("second removal runs");
     assert_eq!(repeat, 0, "removal is idempotent");
 }
+
+#[test]
+fn match_entity_reference_survives_a_large_top_k() {
+    // A top_k larger than the internal over-fetch cap must return results,
+    // never panic (Ord::clamp aborts when min > max).
+    let site = site("erm-large-top-k");
+    let entity = enrolled_entity(
+        &site,
+        "enrolled person",
+        EntityType::Person,
+        "front",
+        axis_vector(0),
+    );
+    let matches = site
+        .store
+        .match_entity_reference(
+            VISION_SPACE,
+            &axis_vector(0),
+            EntityReferenceMatchOptions {
+                context_id: Some(site.context_id),
+                top_k: Some(1000),
+                ..Default::default()
+            },
+        )
+        .expect("a large top_k is valid input");
+    assert_eq!(matches.first().map(|m| m.entity_id), Some(entity));
+}
