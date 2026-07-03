@@ -471,3 +471,56 @@ fn public_surface_adds_no_free_text_search_reexport() {
         }
     }
 }
+
+#[test]
+fn removing_an_entitys_references_removes_it_from_matching() {
+    // The deletion promise: forgetting an enrolled entity removes its reference
+    // vectors, so later probes of the same subject honestly match nothing.
+    let site = site("erm-remove");
+    let entity = enrolled_entity(
+        &site,
+        "forgotten person",
+        EntityType::Person,
+        "front",
+        axis_vector(0),
+    );
+    site.store
+        .enroll_entity_reference(
+            entity,
+            VISION_SPACE,
+            Some("side".to_string()),
+            near_axis_vector(0, 3),
+            producer(),
+        )
+        .expect("second reference");
+
+    let before = site
+        .store
+        .match_entity_reference(VISION_SPACE, &axis_vector(0), match_options(&site))
+        .expect("match before removal");
+    assert!(
+        before.iter().any(|m| m.entity_id == entity),
+        "the enrolled entity matches before removal"
+    );
+
+    let removed = site
+        .store
+        .remove_entity_references(entity)
+        .expect("removal runs");
+    assert_eq!(removed, 2, "both enrolled references are removed");
+
+    let after = site
+        .store
+        .match_entity_reference(VISION_SPACE, &axis_vector(0), match_options(&site))
+        .expect("match after removal");
+    assert!(
+        after.iter().all(|m| m.entity_id != entity),
+        "a removed entity never matches again, got {after:?}"
+    );
+
+    let repeat = site
+        .store
+        .remove_entity_references(entity)
+        .expect("second removal runs");
+    assert_eq!(repeat, 0, "removal is idempotent");
+}
