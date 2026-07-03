@@ -228,8 +228,25 @@ impl Store {
         plugin: Option<Arc<dyn DatabasePlugin>>,
         registrations: Vec<EmbedderRegistration>,
     ) -> Result<Self> {
+        let mut config = config;
         let mut registrations = registrations;
         let explicit_registration_count = registrations.len();
+        // An explicit registration DECLARES its embedding space: fold each
+        // registration's space decl into the declared-space list so the space is
+        // validated, seeded, and its per-dimension reference table created —
+        // a consumer never has to duplicate the declaration in
+        // `extra_embedding_spaces`. A same-id entry already in the config wins.
+        for registration in registrations.iter().take(explicit_registration_count) {
+            let already_declared = config
+                .extra_embedding_spaces
+                .iter()
+                .any(|decl| decl.embedding_space_id == registration.space.embedding_space_id);
+            if !already_declared {
+                config
+                    .extra_embedding_spaces
+                    .push(registration.space.clone());
+            }
+        }
         maybe_register_default_text_embedder(&config, &mut registrations)?;
         validate_embedder_registrations(&registrations)?;
         let db_path = config.db_path.clone();
