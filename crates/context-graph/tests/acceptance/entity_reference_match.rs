@@ -338,17 +338,17 @@ fn match_entity_reference_validates_space_and_dimension() {
         axis_vector(0),
     );
 
-    let unknown_space = site
-        .store
-        .match_entity_reference("no_such_space", &axis_vector(0), match_options(&site));
+    let unknown_space =
+        site.store
+            .match_entity_reference("no_such_space", &axis_vector(0), match_options(&site));
     assert!(
         matches!(unknown_space, Err(CgError::UnknownEmbeddingSpace { .. })),
         "an unregistered space is refused with the typed error, got {unknown_space:?}"
     );
 
-    let wrong_dim = site
-        .store
-        .match_entity_reference(VISION_SPACE, &[1.0, 0.0, 0.0], match_options(&site));
+    let wrong_dim =
+        site.store
+            .match_entity_reference(VISION_SPACE, &[1.0, 0.0, 0.0], match_options(&site));
     assert!(
         matches!(wrong_dim, Err(CgError::EmbeddingDimensionMismatch { .. })),
         "a wrong-dimension probe is refused with the typed error, got {wrong_dim:?}"
@@ -395,7 +395,10 @@ fn embedder_input_supports_in_memory_image_bytes() {
     // through the one shared trait — no temp-file URI detour on a hot path.
     struct ByteFaithfulEmbedder;
     impl context_graph::Embedder for ByteFaithfulEmbedder {
-        fn embed(&self, input: EmbeddingInput) -> context_graph::Result<context_graph::EmbeddingOutput> {
+        fn embed(
+            &self,
+            input: EmbeddingInput,
+        ) -> context_graph::Result<context_graph::EmbeddingOutput> {
             let bytes = match input {
                 EmbeddingInput::ImageBytes(bytes) => bytes,
                 other => panic!("this embedder only handles in-memory images, got {other:?}"),
@@ -433,16 +436,11 @@ fn embedder_input_supports_in_memory_image_bytes() {
     }
 
     let embedder = ByteFaithfulEmbedder;
-    let a = context_graph::Embedder::embed(
-        &embedder,
-        EmbeddingInput::ImageBytes(vec![7u8; 4096]),
-    )
-    .expect("embeds in-memory bytes");
-    let b = context_graph::Embedder::embed(
-        &embedder,
-        EmbeddingInput::ImageBytes(vec![250u8; 4096]),
-    )
-    .expect("embeds different bytes");
+    let a = context_graph::Embedder::embed(&embedder, EmbeddingInput::ImageBytes(vec![7u8; 4096]))
+        .expect("embeds in-memory bytes");
+    let b =
+        context_graph::Embedder::embed(&embedder, EmbeddingInput::ImageBytes(vec![250u8; 4096]))
+            .expect("embeds different bytes");
     assert_eq!(a.vector.len(), DIM);
     assert_ne!(
         a.vector, b.vector,

@@ -70,10 +70,7 @@ impl Store {
         // crowd other entities out of the deduplicated result.
         let fetch_limit = top_k.saturating_mul(8).clamp(top_k, 256);
         let mut params = std::collections::HashMap::from([
-            (
-                "query".to_string(),
-                Value::Vector(query_vector.to_vec()),
-            ),
+            ("query".to_string(), Value::Vector(query_vector.to_vec())),
             (
                 "embedding_space_id".to_string(),
                 Value::Text(embedding_space_id.to_string()),
