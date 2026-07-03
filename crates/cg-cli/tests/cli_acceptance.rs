@@ -607,6 +607,75 @@ fn cli_model_use_uncached_local_default_guides_to_fetch() {
     );
 }
 
+const E4B_ID: &str = "gemma4-e4b-it-q4";
+
+#[test]
+fn cli_model_use_selects_e4b_escalation_tier() {
+    let harness = CliHarness::new();
+    // Seed a fetched e4b tier: a stand-in cache dir + artifact (no real 4.98GB GGUF).
+    let model_dir = harness.data_root.path().join(E4B_ID);
+    fs::create_dir_all(&model_dir).expect("model dir");
+    fs::write(model_dir.join("model.gguf"), b"fake-e4b-gguf").expect("artifact");
+    let mut catalog = ModelConnectionCatalog::open(harness.data_root.path());
+    catalog.register_local_model(E4B_ID, ModelKind::LlmClient, &model_dir);
+
+    // `cg model use gemma4-e4b-it-q4` selects it as the active understanding worker.
+    let used = harness.run(&["model", "use", E4B_ID]);
+    assert_eq!(used.code, 0, "model use e4b must succeed: {}", used.stderr);
+    let used_json = parse_single_json(&used.stdout).unwrap_or(Value::Null);
+    assert_eq!(used_json.get("model").and_then(Value::as_str), Some(E4B_ID));
+    assert_eq!(used_json.get("local").and_then(Value::as_bool), Some(true));
+
+    // `cg status` shows e4b (not e2b) as the active $0 in-process local worker.
+    let status = harness.run(&["status"]);
+    let status_json = parse_single_json(&status.stdout).unwrap_or(Value::Null);
+    assert_eq!(
+        status_json.get("local_model").and_then(Value::as_str),
+        Some(E4B_ID),
+        "status must render which tier is active"
+    );
+
+    // `cg model list` shows e4b active and e2b not cached / not active.
+    let list = harness.run(&["model", "list"]);
+    let rows = parse_single_json(&list.stdout).unwrap_or(Value::Null);
+    let rows = rows.as_array().expect("model list is a JSON array");
+    let e4b = rows
+        .iter()
+        .find(|row| row.get("id").and_then(Value::as_str) == Some(E4B_ID))
+        .expect("e4b listed");
+    assert_eq!(e4b.get("active").and_then(Value::as_bool), Some(true));
+    let e2b = rows
+        .iter()
+        .find(|row| row.get("id").and_then(Value::as_str) == Some(UNDERSTANDING_DEFAULT_ID))
+        .expect("e2b listed");
+    assert_eq!(e2b.get("cached").and_then(Value::as_bool), Some(false));
+    assert_eq!(e2b.get("active").and_then(Value::as_bool), Some(false));
+}
+
+#[test]
+fn cli_model_use_unknown_id_lists_valid_ids() {
+    let harness = CliHarness::new();
+    let output = harness.run(&["model", "use", "gemma4-e8b-it-q4"]);
+    assert_ne!(output.code, 0, "an unknown local model id is rejected");
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    assert!(
+        combined.contains(UNDERSTANDING_DEFAULT_ID) && combined.contains(E4B_ID),
+        "the error must list the valid tier ids: {combined}"
+    );
+}
+
+#[test]
+fn cli_model_use_uncached_e4b_guides_to_fetch_that_id() {
+    let harness = CliHarness::new();
+    let output = harness.run(&["model", "use", E4B_ID]);
+    assert_ne!(output.code, 0, "an unfetched e4b cannot be used");
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    assert!(
+        combined.contains(&format!("cg model fetch {E4B_ID}")),
+        "the error must guide the user to fetch that specific tier: {combined}"
+    );
+}
+
 #[test]
 fn cli_model_show() {
     let harness = CliHarness::new();

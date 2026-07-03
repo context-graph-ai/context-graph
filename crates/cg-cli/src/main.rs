@@ -5045,11 +5045,14 @@ fn format_bytes(bytes: u64) -> String {
 fn handle_model_fetch(args: &[String]) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
-            "Usage: cg model fetch [--defaults | <id>] [--format json|text]\n\n\
+            "Usage: cg model fetch [--defaults | --all-understanding | <id>] [--format json|text]\n\n\
 Prefetches model artifacts into the local cache with honest size disclosure.\n\
-  cg model fetch --defaults   Fetch the default embedder AND the local understanding model.\n\
-  cg model fetch <id>         Fetch one model by catalog id.\n\n\
-The local understanding model runs fully in-process (no server, no ollama); a staged copy next \
+  cg model fetch --defaults            Fetch the default embedder AND the default (e2b) understanding model.\n\
+  cg model fetch --all-understanding   Fetch every understanding tier (e2b ~3.1GB + e4b ~4.98GB).\n\
+  cg model fetch gemma4-e2b-it-q4      Fetch the default (e2b) understanding tier.\n\
+  cg model fetch gemma4-e4b-it-q4      Fetch the larger (e4b) understanding escalation tier.\n\
+  cg model fetch <id>                  Fetch one model by catalog id.\n\n\
+The local understanding models run fully in-process (no server, no ollama); a staged copy next \
 to the cache is seeded without re-downloading."
         );
         return 0;
@@ -5063,11 +5066,46 @@ to the cache is seeded without re-downloading."
 
     let embedder = cg_catalog::embedder_default_disclosure();
     let understanding = cg_catalog::understanding_default_disclosure();
+    let understanding_all = cg_catalog::understanding_disclosures();
     let target = positional_arg(args);
+    let all_understanding = has_flag(args, "--all-understanding");
+
+    // `cg model fetch --all-understanding` is a convenience that fetches every bundled
+    // understanding tier (e2b default + e4b escalation) in one go.
+    if all_understanding {
+        if format == OutputFormat::Text {
+            println!("fetching all understanding tiers:");
+            for tier in &understanding_all {
+                println!("  {}\t{}", tier.id, format_bytes(tier.byte_size));
+            }
+        }
+        let mut results = Vec::new();
+        for tier in &understanding_all {
+            match catalog.fetch_understanding(&tier.id) {
+                Ok(result) => {
+                    if format == OutputFormat::Text {
+                        println!("result\t{}\t{result:?}", tier.id);
+                    }
+                    results.push(json!({
+                        "id": tier.id, "bytes": tier.byte_size,
+                        "size": format_bytes(tier.byte_size), "result": format!("{result:?}"),
+                    }));
+                }
+                Err(err) => return failure(1, "fetch_failed", "network", &format!("{err:?}")),
+            }
+        }
+        if format == OutputFormat::Json {
+            print_json(&json!({ "fetched": results }));
+        }
+        return 0;
+    }
+
     let defaults = has_flag(args, "--defaults") || target.is_none();
 
     if defaults {
-        // Disclose what will be fetched, with sizes, before downloading.
+        // Disclose what will be fetched, with sizes, before downloading. `--defaults` fetches the
+        // embedder + the DEFAULT (e2b) understanding tier; the larger e4b escalation tier is listed
+        // as available so the ~4.98GB size is honest up front, fetched on demand via its id.
         if format == OutputFormat::Text {
             println!("fetching defaults:");
             println!(
@@ -5076,16 +5114,26 @@ to the cache is seeded without re-downloading."
                 format_bytes(embedder.byte_size)
             );
             println!(
-                "  {} (understanding)\t{}",
+                "  {} (understanding, default)\t{}",
                 understanding.id,
                 format_bytes(understanding.byte_size)
             );
+            for tier in &understanding_all {
+                if tier.id != understanding.id {
+                    println!(
+                        "  {} (understanding, optional — fetch with `cg model fetch {}`)\t{}",
+                        tier.id,
+                        tier.id,
+                        format_bytes(tier.byte_size)
+                    );
+                }
+            }
         }
         return match catalog.prefetch_defaults() {
             Ok(mut summary) => {
                 // prefetch_defaults seeds the understanding model from a staged copy but never
                 // downloads; the explicit fetch verb does the network download on a fresh machine.
-                if !catalog.understanding_model_cached() {
+                if !catalog.understanding_model_cached(&understanding.id) {
                     match catalog.fetch_understanding_default() {
                         Ok(_) => {
                             summary
@@ -5111,6 +5159,17 @@ to the cache is seeded without re-downloading."
                         println!("skipped\t{}\t{:?}", skipped.model_id, skipped.reason);
                     }
                 } else {
+                    let mut disclosed = vec![json!({
+                        "id": embedder.id, "bytes": embedder.byte_size,
+                        "size": format_bytes(embedder.byte_size),
+                    })];
+                    for tier in &understanding_all {
+                        disclosed.push(json!({
+                            "id": tier.id, "bytes": tier.byte_size,
+                            "size": format_bytes(tier.byte_size),
+                            "default": tier.id == understanding.id,
+                        }));
+                    }
                     print_json(&json!({
                         "fetched": summary.fetched.iter().map(|entry| json!({
                             "id": entry.model_id, "sha": entry.artifact_sha,
@@ -5118,10 +5177,7 @@ to the cache is seeded without re-downloading."
                         "skipped": summary.skipped.iter().map(|entry| json!({
                             "id": entry.model_id, "reason": format!("{:?}", entry.reason),
                         })).collect::<Vec<_>>(),
-                        "disclosed": [
-                            json!({"id": embedder.id, "bytes": embedder.byte_size, "size": format_bytes(embedder.byte_size)}),
-                            json!({"id": understanding.id, "bytes": understanding.byte_size, "size": format_bytes(understanding.byte_size)}),
-                        ],
+                        "disclosed": disclosed,
                     }));
                 }
                 0
@@ -5133,28 +5189,24 @@ to the cache is seeded without re-downloading."
     let Some(id) = target else {
         return usage_error("expected `cg model fetch --defaults` or `cg model fetch <id>`");
     };
-    let (disclosed_bytes, fetch_result) = if id == cg_catalog::UNDERSTANDING_DEFAULT_ID {
-        if format == OutputFormat::Text {
-            println!(
-                "fetching\t{}\t{}",
-                understanding.id,
-                format_bytes(understanding.byte_size)
-            );
-        }
-        (
-            understanding.byte_size,
-            catalog.fetch_understanding_default(),
-        )
-    } else {
-        let bytes = catalog.show(&id).map(|entry| entry.byte_size).unwrap_or(0);
-        if format == OutputFormat::Text {
-            println!("fetching\t{id}\t{}", format_bytes(bytes));
-        }
-        (
-            bytes,
-            catalog.fetch(None, &id, cg_catalog::OutputMode::Headless),
-        )
-    };
+    let (disclosed_bytes, fetch_result) =
+        if let Some(tier) = cg_catalog::understanding_model_disclosure(&id) {
+            // Any bundled understanding tier (e2b default or e4b escalation): seed-from-staging is
+            // preferred over download, with the same honest size disclosure.
+            if format == OutputFormat::Text {
+                println!("fetching\t{}\t{}", tier.id, format_bytes(tier.byte_size));
+            }
+            (tier.byte_size, catalog.fetch_understanding(&id))
+        } else {
+            let bytes = catalog.show(&id).map(|entry| entry.byte_size).unwrap_or(0);
+            if format == OutputFormat::Text {
+                println!("fetching\t{id}\t{}", format_bytes(bytes));
+            }
+            (
+                bytes,
+                catalog.fetch(None, &id, cg_catalog::OutputMode::Headless),
+            )
+        };
     match fetch_result {
         Ok(result) => {
             if format == OutputFormat::Text {
@@ -5361,9 +5413,11 @@ fn handle_model_use(args: &[String]) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
             "Usage: cg model use [<model-id> | --local] [--format json|text]\n\n\
-Select a fetched local model as the active understanding worker. It runs fully in-process at $0 \
-(no server, no tokens, no quota). `--local` is shorthand for the bundled understanding default.\n\n\
-Fetch it first with `cg model fetch --defaults`.\n\nExamples:\n  cg model use --local\n  cg model use gemma4-e2b-it-q4"
+Select a fetched local understanding tier as the active worker. It runs fully in-process at $0 \
+(no server, no tokens, no quota). `--local` is shorthand for the bundled default (e2b).\n\n\
+Valid ids: gemma4-e2b-it-q4 (default), gemma4-e4b-it-q4 (larger escalation tier). Fetch it first \
+with `cg model fetch --defaults` (e2b) or `cg model fetch gemma4-e4b-it-q4` (e4b).\n\n\
+Examples:\n  cg model use --local\n  cg model use gemma4-e2b-it-q4\n  cg model use gemma4-e4b-it-q4"
         );
         return 0;
     }
@@ -5376,6 +5430,20 @@ Fetch it first with `cg model fetch --defaults`.\n\nExamples:\n  cg model use --
     } else {
         return usage_error("expected `cg model use <model-id>` or `cg model use --local`");
     };
+    // `cg model use` selects a local $0 understanding worker; the valid targets are the bundled
+    // understanding tiers. Reject anything else up front with the valid-id list so the user is not
+    // left with a bare "not cached" when they simply typo'd or named a hosted model.
+    if cg_catalog::understanding_model_spec(&model_id).is_none() {
+        let valid = cg_catalog::understanding_model_ids().join(", ");
+        return failure(
+            2,
+            "unknown_local_model",
+            "config",
+            &format!(
+                "`{model_id}` is not a bundled understanding model; valid ids are: {valid} (use `cg model connect` for a hosted BYOK endpoint)"
+            ),
+        );
+    }
     let mut catalog = ModelConnectionCatalog::open(&root);
     if let Some(error) = catalog.load_error().map(str::to_string) {
         return unreadable_connections_file(&error);
@@ -5421,13 +5489,31 @@ fn handle_model_list(args: &[String]) -> i32 {
     if has_log_info(args) {
         eprintln!("INFO listing registered model connection catalog entries");
     }
-    let catalog = ModelConnectionCatalog::open(data_root());
+    let root = data_root();
+    let catalog = ModelConnectionCatalog::open(&root);
     if let Some(error) = catalog.load_error() {
         return unreadable_connections_file(error);
     }
     let models = catalog.list_models();
+
+    // The bundled local understanding tiers (e2b default + e4b escalation) are listed with
+    // cached/not-cached status and which one is the active worker, whether or not they are already
+    // registered as a connection model. Cached status comes from the on-disk catalog.
+    let active_model_id = catalog.active_model_id();
+    let disk_catalog = Catalog::open_with_scope_against_root(&root, CONNECTION_SCOPE).ok();
+    let understanding: Vec<(String, bool, bool)> = cg_catalog::understanding_model_ids()
+        .into_iter()
+        .map(|id| {
+            let cached = disk_catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.understanding_model_cached(id));
+            let active = active_model_id.as_deref() == Some(id);
+            (id.to_string(), cached, active)
+        })
+        .collect();
+
     if format == OutputFormat::Text {
-        for model in models {
+        for model in &models {
             let connected = model
                 .connection_name
                 .as_deref()
@@ -5451,10 +5537,16 @@ fn handle_model_list(args: &[String]) -> i32 {
                     .unwrap_or("")
             );
         }
+        for (id, cached, active) in &understanding {
+            let default = *id == cg_catalog::UNDERSTANDING_DEFAULT_ID;
+            println!(
+                "{id}\tunderstanding\tcached={cached}\tactive={active}\tdefault={default}\tworker=local in-process ($0)"
+            );
+        }
         return 0;
     }
-    let rows = models
-        .into_iter()
+    let mut rows = models
+        .iter()
         .map(|model| {
             let connected = model
                 .connection_name
@@ -5476,6 +5568,32 @@ fn handle_model_list(args: &[String]) -> i32 {
             })
         })
         .collect::<Vec<_>>();
+    // Annotate an already-registered understanding row with cached/active/understanding, or append
+    // a fresh row for a tier that is not yet registered (e.g. an uncached e4b).
+    for (id, cached, active) in &understanding {
+        let default = *id == cg_catalog::UNDERSTANDING_DEFAULT_ID;
+        if let Some(existing) = rows
+            .iter_mut()
+            .find(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            && let Some(object) = existing.as_object_mut()
+        {
+            object.insert("understanding".to_string(), json!(true));
+            object.insert("cached".to_string(), json!(cached));
+            object.insert("active".to_string(), json!(active));
+            object.insert("default".to_string(), json!(default));
+        } else {
+            rows.push(json!({
+                "id": id,
+                "kind": "LlmClient",
+                "understanding": true,
+                "cached": cached,
+                "active": active,
+                "default": default,
+                "connected": active,
+                "worker": "local in-process ($0)",
+            }));
+        }
+    }
     print_json(&json!(rows));
     0
 }
