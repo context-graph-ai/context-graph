@@ -2,6 +2,7 @@
 name = "cg-vision-embedder"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 context-graph = { path = "../context-graph", default-features = false }

@@ -235,13 +235,18 @@ impl Store {
         // registration's space decl into the declared-space list so the space is
         // validated, seeded, and its per-dimension reference table created —
         // a consumer never has to duplicate the declaration in
-        // `extra_embedding_spaces`. A same-id entry already in the config wins.
+        // `extra_embedding_spaces`. A same-id entry already in the config wins,
+        // and registrations for the built-in default text space (e.g. a reindex
+        // embedder for it) are not "extra" declarations and are left alone.
         for registration in registrations.iter().take(explicit_registration_count) {
+            let space_id = &registration.space.embedding_space_id;
+            let is_builtin_default =
+                *space_id == default_text_embedding_space().embedding_space_id;
             let already_declared = config
                 .extra_embedding_spaces
                 .iter()
-                .any(|decl| decl.embedding_space_id == registration.space.embedding_space_id);
-            if !already_declared {
+                .any(|decl| decl.embedding_space_id == *space_id);
+            if !is_builtin_default && !already_declared {
                 config
                     .extra_embedding_spaces
                     .push(registration.space.clone());
