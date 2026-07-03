@@ -1275,8 +1275,11 @@ fn record_conversation_internal_with_stored_text(
         prior_decisions: &prior_decisions,
     })?;
     // Resolve any raw model-emitted entity-type strings to their typed variant before grounding and
-    // structural fill; an out-of-vocab raw string is flagged here (never silently coerced).
-    let mut flagged_items = resolve_raw_entity_types(&mut harvest);
+    // structural fill; an out-of-vocab raw string is flagged here (never silently coerced). This
+    // legacy path runs under the default vocabulary; the production drain path threads the
+    // operator-configured vocabulary through the harness (C5).
+    let default_vocab = crate::harness::CaptureHarnessConfig::default().allowed_entity_type_names();
+    let mut flagged_items = resolve_raw_entity_types(&mut harvest, &default_vocab);
     prepare_harvest_for_capture(
         store,
         context.id,
@@ -1289,7 +1292,7 @@ fn record_conversation_internal_with_stored_text(
         crate::skill_store::select_and_apply_learned_skills(store, &mut harvest, text, true, false);
     // Run the deterministic grounding check over every value class before consuming the harvest,
     // plus the Stage-3 empty-candidate-set flag for a decision that needed a candidate and found none.
-    flagged_items.extend(grounding_check_harvest(&harvest, text));
+    flagged_items.extend(grounding_check_harvest(&harvest, text, &default_vocab));
     flagged_items.extend(flag_empty_candidate_decisions(&harvest, &prior_decisions));
     let mut report = capture_structured_harvest(
         store,
@@ -2273,7 +2276,16 @@ pub(crate) fn default_decision_type_vocabulary() -> &'static [&'static str] {
 /// has its typed `entity_type` set to the resolved variant; one whose raw string is out of vocabulary
 /// is left at its default and reported here so the caller can flag it (never silently coerced). Runs
 /// before grounding and structural fill so the resolved type is what gets stored.
-pub(crate) fn resolve_raw_entity_types(harvest: &mut StructuredHarvest) -> Vec<FlaggedItem> {
+///
+/// `legal_vocab` is the CONFIGURED vocabulary (criterion C5 — user-supplied, one source with the
+/// schema/prompt): a value in the configured list but outside the built-in enum is flagged with an
+/// honest distinct reason (typed storage for custom vocabularies is cg-open-entity-vocabulary's
+/// remaining scope), and every flag carries the configured legal list, so `cg why` shows the
+/// user's own nouns.
+pub(crate) fn resolve_raw_entity_types(
+    harvest: &mut StructuredHarvest,
+    legal_vocab: &[String],
+) -> Vec<FlaggedItem> {
     let mut flagged = Vec::new();
     for seed in &mut harvest.entities {
         let Some(raw) = seed.entity_type_raw.as_ref().map(|s| s.trim().to_string()) else {
@@ -2287,15 +2299,30 @@ pub(crate) fn resolve_raw_entity_types(harvest: &mut StructuredHarvest) -> Vec<F
                 seed.entity_type = extracted_entity_type_from(resolved);
             }
             None => {
-                flagged.push(FlaggedItem {
-                    key: seed.key.clone(),
-                    reason: format!(
-                        "{:?}: entity '{}' raw type '{}' is not in the closed entity-type vocabulary",
+                let in_configured_vocabulary = legal_vocab
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(&raw));
+                let reason = if in_configured_vocabulary {
+                    format!(
+                        "{:?}: entity '{}' type '{}' is in the configured vocabulary; typed \
+                         storage for custom vocabularies is cg-open-entity-vocabulary's remaining \
+                         scope — flagged for review, never coerced",
                         grounding::FlagReason::OutOfVocab,
                         seed.name,
                         raw
-                    ),
-                    legal_vocab: Some(grounding::legal_entity_type_names()),
+                    )
+                } else {
+                    format!(
+                        "{:?}: entity '{}' raw type '{}' is not in the configured entity-type vocabulary",
+                        grounding::FlagReason::OutOfVocab,
+                        seed.name,
+                        raw
+                    )
+                };
+                flagged.push(FlaggedItem {
+                    key: seed.key.clone(),
+                    reason,
+                    legal_vocab: Some(legal_vocab.to_vec()),
                 });
             }
         }
@@ -2333,10 +2360,11 @@ pub(crate) fn extracted_entity_type_from(entity_type: EntityType) -> ExtractedEn
 pub(crate) fn grounding_check_harvest(
     harvest: &StructuredHarvest,
     transcript: &str,
+    legal_vocab: &[String],
 ) -> Vec<FlaggedItem> {
     let mut flagged = Vec::new();
 
-    // Entities (name + chosen type), as before.
+    // Entities (name + chosen type), as before. Flags carry the CONFIGURED vocabulary (C5).
     for seed in &harvest.entities {
         if seed.key.trim().is_empty() || seed.name.trim().is_empty() {
             continue;
@@ -2347,7 +2375,7 @@ pub(crate) fn grounding_check_harvest(
             flagged.push(FlaggedItem {
                 key: seed.key.clone(),
                 reason: format!("{reason:?}: entity '{}' (type={})", seed.name, type_name),
-                legal_vocab: Some(grounding::legal_entity_type_names()),
+                legal_vocab: Some(legal_vocab.to_vec()),
             });
         }
     }
