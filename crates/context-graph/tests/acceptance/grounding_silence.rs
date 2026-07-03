@@ -408,8 +408,8 @@ fn flagged_closed_vocab_item_exposes_legal_type_list_via_cg_why() {
     let legal_types = legal.expect("a flagged closed-vocab item must expose its legal vocabulary");
     assert_eq!(
         legal_types.len(),
-        13,
-        "the legal entity type list reached through the flagged item must contain all 13 variants, got: {:?}",
+        EntityType::ALL.len(),
+        "the legal entity type list reached through the flagged item must contain every variant of the canonical vocabulary, got: {:?}",
         legal_types
     );
     for variant in EntityType::ALL.iter() {
