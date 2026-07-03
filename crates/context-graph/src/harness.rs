@@ -963,6 +963,33 @@ pub fn run_capture_into_digest(
         merge_staged_harvests(&mut harvest, entities_pass, decisions_pass);
     }
 
+    // Reliability wrapper (criterion C6): grammar guarantees shape, not effort — zero entities
+    // on a big, content-rich chunk is the observed lazy-empty failure, not a plausible reading.
+    // ONE deterministic re-ask through the focused entities pass (never a loop), recorded
+    // visibly on the report. Skipped when staging already ran its own entities pass.
+    let mut reliability_actions: Vec<String> = Vec::new();
+    const SUSPICIOUS_EMPTY_MIN_CHUNK_BYTES: usize = 8_000;
+    if request.model_available
+        && !config.staged_extraction
+        && harvest.entities.is_empty()
+        && request.transcript.len() >= SUSPICIOUS_EMPTY_MIN_CHUNK_BYTES
+    {
+        reliability_actions.push("reask:entities".to_string());
+        let reask = extractor.extract_pass(
+            ExtractionRequest {
+                context_label: &request.context_label,
+                transcript: &request.transcript,
+                prior_decisions: &[],
+            },
+            crate::ingest::ExtractionPass::EntitiesOnly,
+        )?;
+        merge_staged_harvests(
+            &mut harvest,
+            reask,
+            crate::ingest::StructuredHarvest::default(),
+        );
+    }
+
     // Goal-key backfill (C4 silent-loss fix): the capture writer SKIPS a decision that resolves
     // to no goal — on this harness path a goal-less decision in a goal-less chunk was silently
     // DROPPED (the legacy record path already backfilled; this path did not). Backfill attaches
@@ -1183,7 +1210,7 @@ pub fn run_capture_into_digest(
         applied_skill_ids: skill_application.applied_skill_ids,
         withheld_skill_ids: skill_application.withheld_skill_ids,
         receipt_leads_with_intention: true,
-        reliability_actions: Vec::new(),
+        reliability_actions,
     };
     Ok((outcome.report, harness_report))
 }
