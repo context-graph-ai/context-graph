@@ -66,7 +66,9 @@ fn weight_backed_dimension_and_normalized_distinct_vectors() {
     );
 
     let a = embedder.embed_image_bytes(&png_bytes(1)).expect("embed a");
-    let b = embedder.embed_image_bytes(&png_bytes(200)).expect("embed b");
+    let b = embedder
+        .embed_image_bytes(&png_bytes(200))
+        .expect("embed b");
     assert_eq!(a.len(), embedder.dimension());
     assert_eq!(b.len(), embedder.dimension());
     let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -77,7 +79,9 @@ fn weight_backed_dimension_and_normalized_distinct_vectors() {
     );
     assert_ne!(a, b, "different images produce different vectors");
 
-    let a_again = embedder.embed_image_bytes(&png_bytes(1)).expect("embed a again");
+    let a_again = embedder
+        .embed_image_bytes(&png_bytes(1))
+        .expect("embed a again");
     assert_eq!(a, a_again, "embedding is deterministic for identical input");
 }
 
@@ -196,7 +200,9 @@ fn weight_backed_registration_and_match_round_trip_through_the_store() {
         })
         .expect("entity");
 
-    let reference = embedder.embed_image_bytes(&png_bytes(9)).expect("reference vector");
+    let reference = embedder
+        .embed_image_bytes(&png_bytes(9))
+        .expect("reference vector");
     store
         .enroll_entity_reference(
             entity.id,
@@ -212,7 +218,9 @@ fn weight_backed_registration_and_match_round_trip_through_the_store() {
         )
         .expect("enroll");
 
-    let probe = embedder.embed_image_bytes(&png_bytes(9)).expect("probe vector");
+    let probe = embedder
+        .embed_image_bytes(&png_bytes(9))
+        .expect("probe vector");
     let matches = store
         .match_entity_reference(
             &space.embedding_space_id,
