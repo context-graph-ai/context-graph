@@ -1,6 +1,11 @@
 use context_graph::CgError;
 use context_graph::ingest::{ClaudeJsonlParser, ImportParser, parser_for_format};
 
+// EXPECTATION CHANGE (2026-07-03, cg-correctness criterion C2, criteria commit 99d99ee):
+// the original "clean conversation" contract asserted tool blocks vanish WITHOUT TRACE — the
+// exact behavior that deleted decision-bearing tool output at import. The ratified contract:
+// every tool event keeps a one-line prose header; result content survives only where the
+// following assistant dialogue engages with it (here: nothing follows, so header only).
 const CLAUDE_JSONL: &str = r#"{"type":"system","content":"noise"}
 {"type":"user","message":{"content":[{"type":"text","text":"Where is auth?"}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","name":"grep"},{"type":"text","text":"Auth is at src/auth.py"}]}}
@@ -16,7 +21,7 @@ fn claude_jsonl_parses_to_clean_conversation() {
 
     assert_eq!(
         clean,
-        "User: Where is auth?\nAssistant: Auth is at src/auth.py\n"
+        "User: Where is auth?\nAssistant: Auth is at src/auth.py\nAssistant used grep.\n"
     );
 }
 
@@ -46,7 +51,7 @@ fn import_parser_is_dyn_safe_and_unknown_format_errors_typed() {
             "claude-jsonl",
             1,
             1,
-            "User: Where is auth?\nAssistant: Auth is at src/auth.py\n",
+            "User: Where is auth?\nAssistant: Auth is at src/auth.py\nAssistant used grep.\n",
             "gemini-bulk",
         )
     );
