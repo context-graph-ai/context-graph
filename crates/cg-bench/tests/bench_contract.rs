@@ -2,10 +2,13 @@
 //! in the run working doc names these). Authored and committed BEFORE implementation; the
 //! implementation commit may not touch this file.
 
-use cg_bench::gold::{load_gold_str, omission_pair_from_json, omission_pair_to_json, to_yaml, MadeIn, OmissionTrainingPair};
+use cg_bench::gold::{
+    MadeIn, OmissionTrainingPair, load_gold_str, omission_pair_from_json, omission_pair_to_json,
+    to_yaml,
+};
 use cg_bench::scoring::{
-    band, score_session, ExtractedDecision, ExtractedEntity, ExtractedSession, MatchBand,
-    SimilarityProvider, AUTO_MATCH_THRESHOLD, AUTO_NON_MATCH_THRESHOLD,
+    AUTO_MATCH_THRESHOLD, AUTO_NON_MATCH_THRESHOLD, ExtractedDecision, ExtractedEntity,
+    ExtractedSession, MatchBand, SimilarityProvider, band, score_session,
 };
 
 /// Deterministic similarity double: identical strings are 1.0; listed pairs get their listed
@@ -143,10 +146,10 @@ fn scoring_routes_gray_zone_out_instead_of_deciding() {
     let score = score_session(&gold, &extracted, &sim);
     assert_eq!(score.decisions.matched, 0, "gray zone is not an auto-match");
     assert!(
-        !score
-            .decisions
-            .missed
-            .contains(&"Production promotion must route through the held-out gate, not a count threshold".to_string()),
+        !score.decisions.missed.contains(
+            &"Production promotion must route through the held-out gate, not a count threshold"
+                .to_string()
+        ),
         "gray zone is not an auto-miss either"
     );
     assert_eq!(score.gray_zone.len(), 1);
@@ -184,19 +187,23 @@ fn scoring_dedupes_cross_chunk_duplicates_before_recall() {
         observations: vec![],
     };
     let sim = TableSim {
-        pairs: vec![
-            (
-                "Promotion routes through the held-out gate rather than a threshold",
-                "Production promotion must route through the held-out gate, not a count threshold",
-                0.90,
-            ),
-        ],
+        pairs: vec![(
+            "Promotion routes through the held-out gate rather than a threshold",
+            "Production promotion must route through the held-out gate, not a count threshold",
+            0.90,
+        )],
     };
     let score = score_session(&gold, &extracted, &sim);
     assert_eq!(score.decisions.matched, 1, "one gold decision hit, not two");
-    assert_eq!(score.decision_groups, 1, "two variants collapse to one group");
+    assert_eq!(
+        score.decision_groups, 1,
+        "two variants collapse to one group"
+    );
     assert_eq!(score.decision_noise_groups, 0);
-    assert!((score.duplication_rate - 0.5).abs() < f32::EPSILON, "1 of 2 items was a duplicate");
+    assert!(
+        (score.duplication_rate - 0.5).abs() < f32::EPSILON,
+        "1 of 2 items was a duplicate"
+    );
 }
 
 #[test]
@@ -224,9 +231,18 @@ fn attachment_scored_only_over_matched_decisions() {
         observations: vec![],
     };
     let score = score_session(&gold, &extracted, &TableSim { pairs: vec![] });
-    assert_eq!(score.attachment_total, 1, "only the matched decision is attachment-eligible");
-    assert_eq!(score.attachment_correct, 0, "wrong-goal attachment is wrong");
-    assert_eq!(score.decision_noise_groups, 1, "the unmatched decision is noise");
+    assert_eq!(
+        score.attachment_total, 1,
+        "only the matched decision is attachment-eligible"
+    );
+    assert_eq!(
+        score.attachment_correct, 0,
+        "wrong-goal attachment is wrong"
+    );
+    assert_eq!(
+        score.decision_noise_groups, 1,
+        "the unmatched decision is noise"
+    );
 }
 
 #[test]
@@ -247,7 +263,10 @@ fn intention_scored_at_session_level() {
         )],
     };
     let score = score_session(&gold, &procedural, &sim);
-    assert!(!score.intention_captured, "a procedural restatement is not the intention");
+    assert!(
+        !score.intention_captured,
+        "a procedural restatement is not the intention"
+    );
 
     let real = ExtractedSession {
         intentions: vec![
@@ -284,7 +303,10 @@ fn entity_matching_uses_aliases_and_scores_types_over_matched() {
     let score = score_session(&gold, &extracted, &TableSim { pairs: vec![] });
     assert_eq!(score.entities.matched, 2);
     assert_eq!(score.entities.missed.len(), 0);
-    assert_eq!(score.entity_type_correct, 1, "type accuracy is over matched entities");
+    assert_eq!(
+        score.entity_type_correct, 1,
+        "type accuracy is over matched entities"
+    );
 }
 
 #[test]
