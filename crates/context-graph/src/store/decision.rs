@@ -685,6 +685,78 @@ impl Store {
         self.decode_discovery_decisions_at_read(&result.columns, &result.rows, snapshot)
     }
 
+    /// Additive SERVES routing (criterion C4 — the reconciliation writer seam): attach an
+    /// existing decision to an intention it serves. Idempotent; writes an edge, never edits or
+    /// deletes rows. The session-goal reconciliation pass writes through this; the future
+    /// cg-server-core runner reuses the same seam.
+    pub fn route_decision_to_intention(
+        &self,
+        decision_id: DecisionId,
+        intention_id: IntentionId,
+    ) -> Result<()> {
+        if self.decision_targets_intention(decision_id, RelationshipType::Serves, intention_id)? {
+            return Ok(());
+        }
+        let params: HashMap<String, Value> =
+            [("id".to_string(), Value::Uuid(decision_id.as_uuid()))]
+                .into_iter()
+                .collect();
+        let result = self
+            .db
+            .execute("SELECT context_id FROM decisions WHERE id = $id", &params)
+            .map_err(map_engine_err)?;
+        let Some(row) = result.rows.first() else {
+            return Err(CgError::DecisionNotFound { id: decision_id });
+        };
+        let context_id = match row.first() {
+            Some(Value::Uuid(context)) => ContextId::from(*context),
+            other => {
+                return Err(CgError::Engine(format!(
+                    "decision context lookup returned invalid row {other:?}"
+                )));
+            }
+        };
+        let tx = self.begin_tx()?;
+        if let Err(e) = self.insert_edge_in_tx(
+            tx,
+            decision_id.as_uuid(),
+            intention_id.as_uuid(),
+            "SERVES",
+            context_id,
+            None,
+        ) {
+            let _ = self.db.rollback(tx);
+            return Err(e);
+        }
+        self.db.commit(tx).map_err(map_engine_err)?;
+        Ok(())
+    }
+
+    /// Active decisions in a context with NO SERVES edge — the "unattached" set the session
+    /// reconciliation pass must link or surface for review (criterion C4: an unattached
+    /// decision cannot participate in currency or impact analysis and is never left silent).
+    pub fn decisions_without_serves_in_context(
+        &self,
+        context_id: ContextId,
+    ) -> Result<Vec<Decision>> {
+        let snapshot = self.db.snapshot();
+        let params: HashMap<String, Value> =
+            [("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]
+                .into_iter()
+                .collect();
+        let sql = "SELECT d.id, d.decision_type, d.description, d.reasoning, d.confidence, d.status, d.agent_id, d.context_id, d.properties, d.tags, d.created_at
+            FROM decisions d
+            WHERE d.context_id = $context_id
+              AND d.status = 'active'
+              AND d.id NOT IN (SELECT source_id FROM edges WHERE edge_type = 'SERVES')
+            ORDER BY d.created_at ASC, d.id ASC";
+        let result = self
+            .db
+            .execute_at_snapshot(sql, &params, snapshot)
+            .map_err(map_engine_err)?;
+        self.decode_discovery_decisions_at_read(&result.columns, &result.rows, snapshot)
+    }
+
     pub fn by_entity_decisions(
         &self,
         entity_id: EntityId,

@@ -968,12 +968,113 @@ pub struct ReconcileSummary {
 /// the merges additively. Runs after a session's digests are understood (the drain calls it);
 /// judgment rides the extractor seam so tests use deterministic doubles.
 pub fn reconcile_session_goals(
-    _store: &Store,
-    _context_label: &str,
-    _extractor: &dyn ConversationExtractor,
+    store: &Store,
+    context_label: &str,
+    extractor: &dyn ConversationExtractor,
     _config: &crate::harness::CaptureHarnessConfig,
 ) -> Result<ReconcileSummary> {
-    todo!("cg-correctness C4: session-level goal reconciliation not implemented yet")
+    let context = context_by_label(store, context_label)?;
+
+    // Pass 1 — merge duplicate goals. Walk the context's intentions in creation order; each is
+    // judged against the accumulated canonicals through the SAME classification seam capture's
+    // dedup uses (real model in prod, deterministic double in tests). An ExactDuplicate verdict
+    // routes the variant's serving decisions to the canonical (additive SERVES edges) and marks
+    // the variant superseded — never deleted.
+    let intentions = store.list_intentions_in_context(context.id)?;
+    let mut canonical: Vec<(crate::IntentionId, String)> = Vec::new();
+    let mut merged_goals = 0usize;
+    for intention in intentions
+        .iter()
+        .filter(|i| i.status == crate::IntentionStatus::Active)
+    {
+        // Request-carrier only: the classification seam speaks ExtractionPriorDecision; the id
+        // ferries the canonical intention's uuid through the judgment and is never persisted.
+        let priors: Vec<ExtractionPriorDecision> = canonical
+            .iter()
+            .map(|(id, text)| ExtractionPriorDecision {
+                id: crate::DecisionId::from(id.as_uuid()),
+                text: text.clone(),
+                goals: Vec::new(),
+                entities: Vec::new(),
+            })
+            .collect();
+        let verdict = if priors.is_empty() {
+            None
+        } else {
+            extractor.classify_decision_relation(DecisionRelationRequest {
+                context_label,
+                candidate_decision: &intention.description,
+                candidate_goal: None,
+                candidate_entity_name: None,
+                candidate_entity_path: None,
+                prior_decisions: &priors,
+            })?
+        };
+        let duplicate_of = match verdict {
+            Some(seed) if seed.classification == DecisionRelationClassification::ExactDuplicate => {
+                canonical
+                    .iter()
+                    .find(|(id, _)| id.as_uuid().to_string() == seed.prior_decision_id)
+                    .map(|(id, _)| *id)
+            }
+            _ => None,
+        };
+        match duplicate_of {
+            Some(target) => {
+                for decision in
+                    store.by_intention(intention.id, crate::DiscoveryFilter::default())?
+                {
+                    store.route_decision_to_intention(decision.id, target)?;
+                }
+                store.update_intention(
+                    intention.id,
+                    crate::IntentionPatch {
+                        status: Some(crate::IntentionStatus::Superseded),
+                        ..Default::default()
+                    },
+                )?;
+                merged_goals += 1;
+            }
+            None => canonical.push((intention.id, intention.description.clone())),
+        }
+    }
+
+    // Pass 2 — unattached decisions are surfaced for review, never left silent: an unattached
+    // decision cannot participate in currency or impact analysis at all. "Unattached" includes
+    // decisions whose ONLY attachment is the capture backfill's SYNTHETIC fallback goal — the
+    // hollow-intention shape is not real attachment (recognized via the single-sourced marker,
+    // so backfill and reconciliation cannot drift).
+    let mut unattached = store.decisions_without_serves_in_context(context.id)?;
+    let fallback_text = fallback_goal_text(context_label);
+    for intention in intentions
+        .iter()
+        .filter(|i| i.description == fallback_text && i.status == crate::IntentionStatus::Active)
+    {
+        for decision in store.by_intention(intention.id, crate::DiscoveryFilter::default())? {
+            if !unattached.iter().any(|d| d.id == decision.id) {
+                unattached.push(decision);
+            }
+        }
+    }
+    let flagged: Vec<FlaggedItem> = unattached
+        .iter()
+        .map(|decision| FlaggedItem {
+            key: decision.id.to_string(),
+            reason: format!(
+                "unattached decision: '{}' serves no real intention — attach it to the goal it \
+                 serves or review it",
+                decision.description
+            ),
+            legal_vocab: None,
+        })
+        .collect();
+    crate::review_surface::register_flagged_items(store, &flagged);
+
+    Ok(ReconcileSummary {
+        canonical_intentions: canonical.iter().map(|(id, _)| *id).collect(),
+        merged_goals,
+        flagged_unattached: flagged.len(),
+    })
 }
 
 pub trait ImportParser: Send + Sync {
@@ -2064,14 +2165,24 @@ fn reuse_prior_goals_for_entity_decisions(
     }
 }
 
-fn ensure_goal_keys_for_decisions(harvest: &mut StructuredHarvest, context_label: &str) {
+/// Key and text of the SYNTHETIC fallback goal the backfill fabricates when a harvest carries
+/// decisions but no goals. Single-sourced so the session reconciliation pass can recognize its
+/// own marker: a decision serving ONLY this synthetic goal is "unattached" for review purposes
+/// (the hollow-intention shape is a trunk failure, not real attachment — criterion C4).
+pub(crate) const FALLBACK_GOAL_KEY: &str = "G_context";
+
+pub(crate) fn fallback_goal_text(context_label: &str) -> String {
+    format!("track durable decisions for {context_label}")
+}
+
+pub(crate) fn ensure_goal_keys_for_decisions(harvest: &mut StructuredHarvest, context_label: &str) {
     if harvest.decisions.is_empty() {
         return;
     }
     if harvest.goals.is_empty() {
         harvest.goals.push(GoalSeed {
-            key: "G_context".to_string(),
-            text: format!("track durable decisions for {context_label}"),
+            key: FALLBACK_GOAL_KEY.to_string(),
+            text: fallback_goal_text(context_label),
             context_id: None,
         });
     }
