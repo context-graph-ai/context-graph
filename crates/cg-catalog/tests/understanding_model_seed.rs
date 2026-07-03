@@ -42,16 +42,16 @@ fn seed_from_path_produces_cached_local_entry() {
         .expect("catalog opens");
 
     assert!(
-        !catalog.understanding_model_cached(),
+        !catalog.understanding_model_cached(UNDERSTANDING_DEFAULT_ID),
         "fresh cache should not report the model as cached"
     );
 
     catalog
-        .seed_understanding_model_from_path(&gguf)
+        .seed_understanding_model_from_path(UNDERSTANDING_DEFAULT_ID, &gguf)
         .expect("seed from staged GGUF succeeds");
 
     assert!(
-        catalog.understanding_model_cached(),
+        catalog.understanding_model_cached(UNDERSTANDING_DEFAULT_ID),
         "after seeding, the model is cached with the pinned sha"
     );
 
@@ -75,6 +75,6 @@ fn seed_from_path_produces_cached_local_entry() {
 
     // Seeding again is idempotent (already-in-place copy is skipped, sha re-verified).
     catalog
-        .seed_understanding_model_from_path(&gguf)
+        .seed_understanding_model_from_path(UNDERSTANDING_DEFAULT_ID, &gguf)
         .expect("re-seed is idempotent");
 }

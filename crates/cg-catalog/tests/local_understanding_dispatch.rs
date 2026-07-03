@@ -46,7 +46,7 @@ fn local_gguf_understanding_runs_in_process_native() {
     let catalog =
         Catalog::open_with_scope_against_root(root, "connection-substrate").expect("catalog");
     catalog
-        .seed_understanding_model_from_path(&gguf)
+        .seed_understanding_model_from_path(UNDERSTANDING_DEFAULT_ID, &gguf)
         .expect("seed model");
 
     // Register the local GGUF as an LlmClient model and bind it as the understanding model for a
