@@ -545,6 +545,8 @@ fn entity_type_label_for_skill(entity_type: crate::EntityType) -> &'static str {
         crate::EntityType::Database => "Database",
         crate::EntityType::Team => "Team",
         crate::EntityType::Document => "Document",
+        crate::EntityType::Animal => "Animal",
+        crate::EntityType::Vehicle => "Vehicle",
     }
 }
 
@@ -568,6 +570,8 @@ fn entity_type_from_correction_label(label: &str) -> Option<(crate::EntityType, 
         "database" | "db" => crate::EntityType::Database,
         "team" => crate::EntityType::Team,
         "document" | "doc" => crate::EntityType::Document,
+        "animal" | "pet" => crate::EntityType::Animal,
+        "vehicle" | "car" | "truck" => crate::EntityType::Vehicle,
         _ => return None,
     };
     Some((entity_type, entity_type_label_for_skill(entity_type)))

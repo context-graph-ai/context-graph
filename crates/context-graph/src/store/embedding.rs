@@ -2014,9 +2014,11 @@ mod tests {
                     dimension: self.vector.len(),
                     producer: producer(),
                 }),
-                EmbeddingInput::ImageFrame { .. } => Err(CgError::UnsupportedEvidenceKind {
-                    kind: EvidenceKind::ImageFrame,
-                }),
+                EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
+                    Err(CgError::UnsupportedEvidenceKind {
+                        kind: EvidenceKind::ImageFrame,
+                    })
+                }
                 EmbeddingInput::AudioSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
                     kind: EvidenceKind::AudioSegment,
                 }),

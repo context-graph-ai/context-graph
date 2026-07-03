@@ -291,6 +291,8 @@ pub enum ExtractedEntityType {
     Database,
     Team,
     Document,
+    Animal,
+    Vehicle,
 }
 
 fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
@@ -326,6 +328,8 @@ impl From<ExtractedEntityType> for EntityType {
             ExtractedEntityType::Database => EntityType::Database,
             ExtractedEntityType::Team => EntityType::Team,
             ExtractedEntityType::Document => EntityType::Document,
+            ExtractedEntityType::Animal => EntityType::Animal,
+            ExtractedEntityType::Vehicle => EntityType::Vehicle,
         }
     }
 }
@@ -2030,6 +2034,8 @@ pub(crate) fn extracted_entity_type_from(entity_type: EntityType) -> ExtractedEn
         EntityType::Database => ExtractedEntityType::Database,
         EntityType::Team => ExtractedEntityType::Team,
         EntityType::Document => ExtractedEntityType::Document,
+        EntityType::Animal => ExtractedEntityType::Animal,
+        EntityType::Vehicle => ExtractedEntityType::Vehicle,
     }
 }
 
@@ -4728,6 +4734,8 @@ fn entity_type_label(entity_type: EntityType) -> &'static str {
         EntityType::Database => "DATABASE",
         EntityType::Team => "TEAM",
         EntityType::Document => "DOCUMENT",
+        EntityType::Animal => "ANIMAL",
+        EntityType::Vehicle => "VEHICLE",
     }
 }
 
@@ -4746,6 +4754,8 @@ fn entity_type_from_label(label: &str) -> Result<EntityType> {
         "DATABASE" => Ok(EntityType::Database),
         "TEAM" => Ok(EntityType::Team),
         "DOCUMENT" => Ok(EntityType::Document),
+        "ANIMAL" => Ok(EntityType::Animal),
+        "VEHICLE" => Ok(EntityType::Vehicle),
         other => Err(CgError::Engine(format!("unknown entity type: {other}"))),
     }
 }

@@ -33,7 +33,7 @@ impl Embedder for MockEmbedder {
     fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput> {
         let value = match input {
             EmbeddingInput::Text(text) => text,
-            EmbeddingInput::ImageFrame { .. } => {
+            EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
                 return Err(CgError::UnsupportedEvidenceKind {
                     kind: EvidenceKind::ImageFrame,
                 });
@@ -109,7 +109,7 @@ impl Embedder for LexicalMockEmbedder {
     fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput> {
         let value = match input {
             EmbeddingInput::Text(text) => text,
-            EmbeddingInput::ImageFrame { .. } => {
+            EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
                 return Err(CgError::UnsupportedEvidenceKind {
                     kind: EvidenceKind::ImageFrame,
                 });

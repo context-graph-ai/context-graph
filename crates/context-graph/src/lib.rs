@@ -36,8 +36,8 @@ pub use llm::*;
 pub use messaging::{MessageBody, MismatchKind, OverrideFailureReason};
 pub use producer::CG_EDGE_SYSTEM_TAG;
 pub use store::{
-    DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit, ReindexEvent, ReindexOptions,
-    Store,
+    DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit, EntityMatch,
+    EntityReferenceMatchOptions, ReindexEvent, ReindexOptions, Store,
 };
 pub use types::*;
 

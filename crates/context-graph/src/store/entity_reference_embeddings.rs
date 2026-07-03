@@ -19,7 +19,43 @@ pub struct EntityReferenceEmbeddingRow {
     pub created_at: crate::TxId,
 }
 
+/// One ranked open-set match: an enrolled entity whose reference vector is close
+/// to the caller's probe, with the best-matching reference's label and the cosine
+/// similarity score. The lean public result for consumers that already hold a
+/// vector — internal search machinery stays private.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityMatch {
+    pub entity_id: EntityId,
+    pub label: Option<String>,
+    pub score: f32,
+}
+
+/// Options for [`Store::match_entity_reference`]. `context_id` scopes the match to
+/// one context (a site); `top_k` bounds the number of entities returned (default
+/// 10); `min_score` drops matches below a cosine-similarity floor so an unenrolled
+/// subject honestly matches nothing.
+#[derive(Debug, Clone, Default)]
+pub struct EntityReferenceMatchOptions {
+    pub context_id: Option<ContextId>,
+    pub top_k: Option<usize>,
+    pub min_score: Option<f32>,
+}
+
 impl Store {
+    /// Open-set entity-reference match: given a probe vector in a registered
+    /// embedding space, return the enrolled entities ranked by cosine similarity,
+    /// deduplicated to the best reference per entity. The caller already holds a
+    /// vector — this surface accepts no text.
+    pub fn match_entity_reference(
+        &self,
+        embedding_space_id: &str,
+        query_vector: &[f32],
+        options: EntityReferenceMatchOptions,
+    ) -> Result<Vec<EntityMatch>> {
+        let _ = (embedding_space_id, query_vector, options);
+        todo!("stub for RED verification; implemented in the next commit")
+    }
+
     pub fn enroll_entity_reference(
         &self,
         entity_id: EntityId,

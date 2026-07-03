@@ -163,10 +163,12 @@ pub enum EntityType {
     Database,
     Team,
     Document,
+    Animal,
+    Vehicle,
 }
 
 impl EntityType {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Service,
         Self::Person,
         Self::Device,
@@ -180,6 +182,8 @@ impl EntityType {
         Self::Database,
         Self::Team,
         Self::Document,
+        Self::Animal,
+        Self::Vehicle,
     ];
 }
 

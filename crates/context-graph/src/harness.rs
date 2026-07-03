@@ -969,7 +969,11 @@ fn entity_type_is_name_unique(entity_type: EntityType) -> bool {
         | EntityType::Location
         | EntityType::Document
         | EntityType::Team => true,
-        EntityType::Service | EntityType::Person | EntityType::Device => false,
+        EntityType::Service
+        | EntityType::Person
+        | EntityType::Device
+        | EntityType::Animal
+        | EntityType::Vehicle => false,
     }
 }
 
