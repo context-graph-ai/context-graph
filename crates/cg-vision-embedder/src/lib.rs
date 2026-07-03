@@ -96,25 +96,26 @@ impl SiglipVisionEmbedder {
         };
         // Prefer the full joint model; fall back to the vision tower alone when
         // the checkpoint's text encoder does not match (crop path unaffected).
-        let (backbone, tokenizer) =
-            match siglip::Model::new(&model_config, var_builder().map_err(|e| engine_err("mmap", e))?)
-            {
-                Ok(model) => {
-                    let tokenizer =
-                        Tokenizer::from_file(config.weights_dir.join("tokenizer.json")).ok();
-                    (Backbone::Full(Box::new(model)), tokenizer)
-                }
-                Err(_) => {
-                    let vb = var_builder().map_err(|e| engine_err("mmap", e))?;
-                    let vision = siglip::VisionModel::new(
-                        &model_config.vision_config,
-                        true,
-                        vb.pp("vision_model"),
-                    )
-                    .map_err(|e| engine_err("load vision tower", e))?;
-                    (Backbone::VisionOnly(Box::new(vision)), None)
-                }
-            };
+        let (backbone, tokenizer) = match siglip::Model::new(
+            &model_config,
+            var_builder().map_err(|e| engine_err("mmap", e))?,
+        ) {
+            Ok(model) => {
+                let tokenizer =
+                    Tokenizer::from_file(config.weights_dir.join("tokenizer.json")).ok();
+                (Backbone::Full(Box::new(model)), tokenizer)
+            }
+            Err(_) => {
+                let vb = var_builder().map_err(|e| engine_err("mmap", e))?;
+                let vision = siglip::VisionModel::new(
+                    &model_config.vision_config,
+                    true,
+                    vb.pp("vision_model"),
+                )
+                .map_err(|e| engine_err("load vision tower", e))?;
+                (Backbone::VisionOnly(Box::new(vision)), None)
+            }
+        };
         Ok(Self {
             backbone,
             tokenizer,
@@ -243,9 +244,7 @@ fn l2_normalize(vector: Vec<f32>) -> Vec<f32> {
 impl context_graph::Embedder for SiglipVisionEmbedder {
     fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput> {
         match input {
-            EmbeddingInput::ImageBytes(bytes) => {
-                Ok(self.output(self.embed_image_bytes(&bytes)?))
-            }
+            EmbeddingInput::ImageBytes(bytes) => Ok(self.output(self.embed_image_bytes(&bytes)?)),
             EmbeddingInput::ImageFrame { uri } => {
                 let path = uri.strip_prefix("file://").unwrap_or(&uri);
                 Ok(self.output(self.embed_image_path(Path::new(path))?))
