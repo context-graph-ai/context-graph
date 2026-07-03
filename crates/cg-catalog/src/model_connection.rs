@@ -5730,8 +5730,12 @@ fn understand_local_single_file(
 /// unset window truncates). Sized well above a normal capture chunk; a prompt that overruns it
 /// fails loudly (`ContextTooSmall`) rather than being silently cut.
 const LOCAL_UNDERSTANDING_N_CTX: u32 = 8192;
-/// Generation budget for one in-process understanding call.
-const LOCAL_UNDERSTANDING_MAX_TOKENS: u32 = 2048;
+/// Generation budget for one in-process understanding call. A full-ontology extraction of a
+/// decision-rich chunk emits verbose JSON — each decision carries decision_type, a reasoning array,
+/// tags, properties, and spans — so at production item caps (3/6/6/6) the object routinely exceeds
+/// 2048 tokens and truncates before it closes, yielding zero memory. Sized to fit a full extraction
+/// within the 8192 context window (prompt ~3k + generation ~4k). Higher = more wall-clock on CPU.
+const LOCAL_UNDERSTANDING_MAX_TOKENS: u32 = 4096;
 
 /// Process-global cache of loaded in-process engines, keyed by GGUF artifact path, so a 3.1GB
 /// model is loaded once per process rather than per capture chunk.

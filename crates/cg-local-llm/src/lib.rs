@@ -184,8 +184,17 @@ impl GenerationParams {
     /// loudly on a zero window rather than letting llama.cpp fall back to its silent default.
     fn to_context_params(&self) -> Result<LlamaContextParams, LocalLlmError> {
         let n_ctx = NonZeroU32::new(self.n_ctx).ok_or(LocalLlmError::ContextWindowZero)?;
+        // n_batch must be >= the prompt length or llama.cpp aborts with
+        // `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` when a single decode submits the whole
+        // prompt at once. The full-ontology extraction prompt (schema block + instruction +
+        // one-shots + chunk) is several thousand tokens — larger than llama.cpp's default n_batch
+        // (512) — so size the batch to the full context window: anything that fits in context
+        // fits in one batch. (Only surfaces on the real understand path; short-prompt tests don't
+        // hit it.)
         Ok(LlamaContextParams::default()
             .with_n_ctx(Some(n_ctx))
+            .with_n_batch(self.n_ctx)
+            .with_n_ubatch(self.n_ctx)
             .with_n_threads(self.n_threads)
             .with_n_threads_batch(self.n_threads))
     }
