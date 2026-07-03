@@ -260,19 +260,56 @@ impl CaptureHarnessConfig {
     /// entities-only; decisions+goals (the trunk stays attachable) — never the full re-ask.
     pub fn schema_descriptor_for_pass(
         &self,
-        _pass: crate::ingest::ExtractionPass,
+        pass: crate::ingest::ExtractionPass,
     ) -> Option<SchemaDescriptor> {
-        todo!("cg-correctness C4 pass focus: descriptor filtering not implemented yet")
+        use crate::ingest::ExtractionPass;
+        let mut descriptor = self.schema_descriptor()?;
+        let keep: &[&str] = match pass {
+            ExtractionPass::Full => return Some(descriptor),
+            ExtractionPass::EntitiesOnly => &["entities"],
+            // Decisions attach to goals (the trunk) — the pass keeps goals attachable.
+            ExtractionPass::DecisionsOnly => &["goals", "decisions"],
+            ExtractionPass::SessionIntention => &["goals"],
+        };
+        descriptor
+            .fields
+            .retain(|field| keep.contains(&field.name.as_str()));
+        Some(descriptor)
     }
 
     /// Pass-focused prompt assembly (C4): Full renders byte-identically to
     /// `render_extraction_prompt`; focused passes render the filtered contract.
     pub fn render_extraction_prompt_for_pass(
         &self,
-        _inputs: &ExtractionPromptInputs<'_>,
-        _pass: crate::ingest::ExtractionPass,
+        inputs: &ExtractionPromptInputs<'_>,
+        pass: crate::ingest::ExtractionPass,
     ) -> String {
-        todo!("cg-correctness C4 pass focus: focused prompt assembly not implemented yet")
+        if pass == crate::ingest::ExtractionPass::Full {
+            return self.render_extraction_prompt(inputs);
+        }
+        let descriptor = self
+            .schema_descriptor_for_pass(pass)
+            .expect("schema descriptor is always constructible");
+        let base = self.render_extraction_prompt(inputs);
+        let full_descriptor = self
+            .schema_descriptor()
+            .expect("schema descriptor is always constructible");
+        // Focused pass = the same framing with the FILTERED contract substituted: schema block,
+        // shape guidance, and one focus instruction. Substitution keeps Full byte-identical and
+        // gives every pass the identical guard/recipe framing.
+        let focused = base
+            .replace(
+                &full_descriptor.render_prompt_schema_block(),
+                &descriptor.render_prompt_schema_block(),
+            )
+            .replace(
+                &full_descriptor.render_prompt_shape_guidance(),
+                &descriptor.render_prompt_shape_guidance(),
+            );
+        format!(
+            "{focused}\nThis is a FOCUSED pass: extract ONLY the fields in the schema above, \
+exhaustively; leave every other category out."
+        )
     }
 
     /// The ONE production prompt assembly (criterion C3): framing, tuned recipe, schema block,

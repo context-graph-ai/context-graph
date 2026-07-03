@@ -3855,6 +3855,9 @@ struct ConnectedModelExtractor {
     /// correction examples assembled at the drain call site and appended to the extraction prompt.
     /// `None` on the capture path (no steering) and whenever nothing relevant matches.
     steering: Option<String>,
+    /// Which extraction pass this instance renders (C4 pass focus): `Full` for the shipped
+    /// single-pass contract; the harness's staged orchestration clones per-pass variants.
+    pass: context_graph::ingest::ExtractionPass,
 }
 
 type ModelProgressTimer = Arc<dyn Fn(usize, Duration) + Send + Sync>;
@@ -3882,6 +3885,7 @@ impl ConnectedModelExtractor {
             structured_output_rejected: Arc::new(Mutex::new(false)),
             progress_timer: None,
             steering: None,
+            pass: context_graph::ingest::ExtractionPass::Full,
         })
     }
 
@@ -4166,6 +4170,27 @@ impl LlmClient for ConnectedModelExtractor {
 }
 
 impl ConversationExtractor for ConnectedModelExtractor {
+    /// Pass-focused extraction (C4): a per-pass variant shares the usage/receipt accumulators
+    /// (same Arcs) but renders the FILTERED contract — descriptor, prompt, provider schema, and
+    /// parse targets all derive from the pass descriptor, so a focused pass is a genuinely
+    /// focused ask, never the full re-ask the trait default would run.
+    fn extract_pass(
+        &self,
+        request: ExtractionRequest<'_>,
+        pass: context_graph::ingest::ExtractionPass,
+    ) -> context_graph::Result<StructuredHarvest> {
+        if pass == context_graph::ingest::ExtractionPass::Full {
+            return self.extract(request);
+        }
+        let mut variant = self.clone();
+        variant.pass = pass;
+        variant.descriptor = variant
+            .config
+            .schema_descriptor_for_pass(pass)
+            .unwrap_or_default();
+        variant.extract(request)
+    }
+
     fn extract(&self, request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
         let prompt = self.extraction_prompt(
             request.context_label,
