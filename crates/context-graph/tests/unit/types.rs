@@ -84,11 +84,12 @@ fn test_relationship_type_variants() {
     );
 }
 
-// Locks the r3 §3 EntityType vocabulary to the canonical 13 kinds in declaration order.
+// Locks the r3 §3 EntityType vocabulary (documented extensible) to the canonical
+// kinds in declaration order.
 #[test]
 fn test_entity_type_variants() {
     let variants = EntityType::ALL;
-    assert_eq!(variants.len(), 13);
+    assert_eq!(variants.len(), 15);
     assert_eq!(
         &variants[..],
         &[
@@ -105,6 +106,8 @@ fn test_entity_type_variants() {
             EntityType::Database,
             EntityType::Team,
             EntityType::Document,
+            EntityType::Animal,
+            EntityType::Vehicle,
         ],
     );
 }
