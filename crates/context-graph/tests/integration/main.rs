@@ -43,6 +43,7 @@ mod registry_edge_cases;
 mod reindex;
 #[cfg(context_graph_internal_test_support)]
 mod reindex_concurrency;
+mod reliability_wrappers;
 mod schema;
 mod staged_extraction;
 #[cfg(context_graph_internal_test_support)]

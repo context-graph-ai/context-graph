@@ -744,6 +744,10 @@ pub struct CaptureHarnessReport {
     pub withheld_skill_ids: Vec<String>,
     /// Whether the capture receipt leads with the intention section (it does).
     pub receipt_leads_with_intention: bool,
+    /// Deterministic reliability-wrapper actions taken this capture (criterion C6), e.g.
+    /// `"reask:entities"`. Visible by contract — a silent recovery would read as "the model did
+    /// fine". Empty when no wrapper ran.
+    pub reliability_actions: Vec<String>,
 }
 
 /// Source of the `context_id` assigned to captured rows.
@@ -1179,6 +1183,7 @@ pub fn run_capture_into_digest(
         applied_skill_ids: skill_application.applied_skill_ids,
         withheld_skill_ids: skill_application.withheld_skill_ids,
         receipt_leads_with_intention: true,
+        reliability_actions: Vec::new(),
     };
     Ok((outcome.report, harness_report))
 }
