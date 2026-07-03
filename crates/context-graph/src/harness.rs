@@ -256,6 +256,25 @@ impl CaptureHarnessConfig {
         })
     }
 
+    /// Pass-focused descriptor (C4): the focused passes ask for a SUBSET of the ontology —
+    /// entities-only; decisions+goals (the trunk stays attachable) — never the full re-ask.
+    pub fn schema_descriptor_for_pass(
+        &self,
+        _pass: crate::ingest::ExtractionPass,
+    ) -> Option<SchemaDescriptor> {
+        todo!("cg-correctness C4 pass focus: descriptor filtering not implemented yet")
+    }
+
+    /// Pass-focused prompt assembly (C4): Full renders byte-identically to
+    /// `render_extraction_prompt`; focused passes render the filtered contract.
+    pub fn render_extraction_prompt_for_pass(
+        &self,
+        _inputs: &ExtractionPromptInputs<'_>,
+        _pass: crate::ingest::ExtractionPass,
+    ) -> String {
+        todo!("cg-correctness C4 pass focus: focused prompt assembly not implemented yet")
+    }
+
     /// The ONE production prompt assembly (criterion C3): framing, tuned recipe, schema block,
     /// caps, and shape guidance, rendered from this config. cg-cli and the bench both call THIS,
     /// so they cannot drift. The tuned rules are the gap-report recipe that probe 2 proved
