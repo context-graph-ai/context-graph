@@ -233,7 +233,11 @@ const CLAUDE_SESSION: &str = r#"{"type":"system","content":"Goal: raw system dec
 {"type":"assistant","message":{"content":[{"type":"text","text":"Current facts: the auth module file is observed at src/auth.py, auth tests cover password-less login, JWT refresh token TTL remains 7 days, and the audit trail lives in docs/auth-migration.md."}]}}
 "#;
 
-const EXPECTED_CLEAN_CLAUDE_SESSION: &str = "User: For Acme, we need password-less login to ship this sprint, and we need an audit trail for every auth migration.\nAssistant: I found the current auth module at src/auth.py.\nAssistant: Let's use JWT with 15-min access tokens for the login flow.\nAssistant: Write the auth migration notes to docs/auth-migration.md so reviewers can audit the change.\nAssistant: Current facts: the auth module file is observed at src/auth.py, auth tests cover password-less login, JWT refresh token TTL remains 7 days, and the audit trail lives in docs/auth-migration.md.\n";
+// EXPECTATION CHANGE (2026-07-04, cg-correctness criterion C2, same rationale as the
+// import_parser change): tool events now leave a one-line prose HEADER (tool name + sanitized
+// artifact target only — free-content keys like this fixture's decoy `query` are never
+// rendered, preserving the decoy contract). The old constant pinned "vanish without trace".
+const EXPECTED_CLEAN_CLAUDE_SESSION: &str = "User: For Acme, we need password-less login to ship this sprint, and we need an audit trail for every auth migration.\nAssistant: I found the current auth module at src/auth.py.\nAssistant used grep.\nAssistant: Let's use JWT with 15-min access tokens for the login flow.\nAssistant: Write the auth migration notes to docs/auth-migration.md so reviewers can audit the change.\nAssistant: Current facts: the auth module file is observed at src/auth.py, auth tests cover password-less login, JWT refresh token TTL remains 7 days, and the audit trail lives in docs/auth-migration.md.\n";
 
 const SECOND_CLAUDE_SESSION: &str = r#"{"type":"user","message":{"content":[{"type":"text","text":"Checkout is slow; the goal is to reduce checkout latency before the next launch."}]}}
 {"type":"assistant","message":{"content":[{"type":"text","text":"We should cache the product catalog in memory for the checkout service."}]}}
