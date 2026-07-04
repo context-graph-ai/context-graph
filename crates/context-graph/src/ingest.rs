@@ -213,13 +213,42 @@ pub struct StructuredHarvest {
     pub outcomes: Vec<OutcomeSeed>,
 }
 
+/// A USER-SUPPLIED vocabulary (C5) means the model can legitimately emit an entity_type
+/// outside the built-in enum (e.g. `"lead"`). The typed field would hard-error the WHOLE
+/// harvest parse — so any entity_type string the enum does not recognize is routed into
+/// `entity_type_raw` BEFORE typed deserialization, where `resolve_raw_entity_types` applies
+/// the configured-vocabulary review flag ("flags for review, never coerced"). Recognition is
+/// by attempting the enum deserialization itself — no second vocabulary list to drift.
+fn route_unknown_entity_types_to_raw(value: &mut JsonValue) {
+    let Some(entities) = value.get_mut("entities").and_then(JsonValue::as_array_mut) else {
+        return;
+    };
+    for entity in entities {
+        let Some(map) = entity.as_object_mut() else {
+            continue;
+        };
+        let Some(type_value) = map.get("entity_type") else {
+            continue;
+        };
+        if serde_json::from_value::<ExtractedEntityType>(type_value.clone()).is_ok() {
+            continue;
+        }
+        if let Some(raw) = type_value.as_str().map(str::to_string) {
+            map.entry("entity_type_raw")
+                .or_insert(JsonValue::String(raw));
+        }
+        map.remove("entity_type");
+    }
+}
+
 impl StructuredHarvest {
     pub fn from_json_str(raw: &str) -> Result<Self> {
-        let value = serde_json::from_str::<JsonValue>(raw).map_err(|err| {
+        let mut value = serde_json::from_str::<JsonValue>(raw).map_err(|err| {
             CgError::Engine(format!(
                 "extractor returned invalid structured harvest JSON: {err}"
             ))
         })?;
+        route_unknown_entity_types_to_raw(&mut value);
         serde_json::from_value(value).map_err(|err| {
             CgError::Engine(format!(
                 "extractor returned invalid structured harvest JSON: {err}"
