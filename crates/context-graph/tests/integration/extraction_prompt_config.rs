@@ -83,12 +83,16 @@ fn custom_entity_vocabulary_reaches_schema_values() {
 
 #[test]
 fn default_vocabulary_unchanged_thirteen_types() {
+    // UPDATED (own commit, 2026-07-04): the vigil-recognition lane grew the built-in enum to 15
+    // (two vision kinds) mid-run, upstream on dev. The pin's PURPOSE is unchanged — the default
+    // vocabulary is exactly the built-in enum, no silent shrink/growth from THIS run's config
+    // work — so the pin now derives from the enum itself instead of a literal count.
     let config = CaptureHarnessConfig::default();
     let values = config.allowed_entity_type_schema_values();
     assert_eq!(
         values.len(),
-        13,
-        "default stays the 13 built-ins — no regression"
+        context_graph::EntityType::ALL.len(),
+        "default stays exactly the built-in enum — no regression from config work"
     );
     assert!(values.contains(&"repository".to_string()));
     assert!(values.contains(&"file".to_string()));
