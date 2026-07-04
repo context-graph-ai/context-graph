@@ -25,6 +25,7 @@ mod engine_probes {
     pub mod embedder_concurrency;
 }
 mod capture_pipeline;
+mod custom_vocab_parse;
 #[cfg(context_graph_internal_test_support)]
 mod explain_introspection;
 mod extraction_prompt_config;
