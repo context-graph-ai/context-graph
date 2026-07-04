@@ -47,6 +47,7 @@ mod reindex_concurrency;
 mod reliability_wrappers;
 mod schema;
 mod staged_extraction;
+mod staged_merge_dedupe;
 #[cfg(context_graph_internal_test_support)]
 mod store_open_runtime_config;
 mod subscriptions_engine_capabilities;
