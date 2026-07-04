@@ -1192,12 +1192,23 @@ fn drain_context_queue(
         && let Some(extractor) =
             ConnectedModelExtractor::for_context(root, context_id, config.clone())
     {
-        match context_graph::ingest::reconcile_session_goals(
+        let reconcile_result = context_graph::ingest::reconcile_session_goals(
             store,
             context_label,
             &extractor,
             &config,
-        ) {
+        );
+        // Capability-A honesty: the reconciliation's judge calls ride THIS extractor — their
+        // usage must join EVERY receipt lane like any other provider call (a receipt that
+        // undercounts calls is a lying receipt; the first-light receipt test enforces this).
+        // Two lanes: `spent` feeds the understand-side receipts; the last capture report's
+        // model_usage feeds the record command's own usage.calls array.
+        let reconcile_usage = extractor.drain_model_usage();
+        spent.extend(reconcile_usage.iter().cloned());
+        if let Some((last_report, _)) = reports.last_mut() {
+            last_report.model_usage.extend(reconcile_usage);
+        }
+        match reconcile_result {
             Ok(summary) => {
                 if progress && (summary.merged_goals > 0 || summary.flagged_unattached > 0) {
                     eprintln!(
