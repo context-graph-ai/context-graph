@@ -1221,29 +1221,26 @@ fn claude_line_into_items(
     }
 }
 
-/// The human-readable object of a tool call, from its input object: well-known keys first,
-/// else the first string value (serde_json preserves insertion order), else empty.
+/// The human-readable object of a tool call, rendered into the prose header — taken ONLY from
+/// artifact-reference keys (paths, urls, commands), never from free-content keys (`pattern`,
+/// `query`, `prompt`) or an arbitrary first string: those can carry injected prose (the
+/// first-light decoy contract — a tool-use payload saying "Decision: …" must never surface
+/// where extraction mines it). Length-capped so a command cannot smuggle a paragraph.
 fn tool_target_from_input(input: Option<&JsonValue>) -> String {
+    const TARGET_CAP: usize = 120;
     let Some(JsonValue::Object(map)) = input else {
         return String::new();
     };
-    for key in [
-        "file_path",
-        "command",
-        "pattern",
-        "path",
-        "url",
-        "query",
-        "prompt",
-        "description",
-    ] {
+    for key in ["file_path", "path", "url", "command"] {
         if let Some(JsonValue::String(v)) = map.get(key) {
-            return v.clone();
+            let mut end = v.len().min(TARGET_CAP);
+            while !v.is_char_boundary(end) {
+                end -= 1;
+            }
+            return v[..end].to_string();
         }
     }
-    map.values()
-        .find_map(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
+    String::new()
 }
 
 /// Textual content of a tool_result block: plain string, or the concatenated text blocks.
