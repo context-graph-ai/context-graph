@@ -1183,6 +1183,34 @@ fn drain_context_queue(
             }
         }
     }
+    // Session-level goal reconciliation (C4): after this drain structured digests, merge
+    // per-chunk duplicate goals into canonical session intentions and surface unattached
+    // decisions for review. Runs through the SAME classification seam capture uses; additive
+    // writes only. Config-disable via capture.toml `session_reconciliation = false`.
+    if config.session_reconciliation
+        && counts.understood > 0
+        && let Some(extractor) =
+            ConnectedModelExtractor::for_context(root, context_id, config.clone())
+    {
+        match context_graph::ingest::reconcile_session_goals(
+            store,
+            context_label,
+            &extractor,
+            &config,
+        ) {
+            Ok(summary) => {
+                if progress && (summary.merged_goals > 0 || summary.flagged_unattached > 0) {
+                    eprintln!(
+                        "session reconciliation: merged {} duplicate goal(s), flagged {} unattached decision(s) for review",
+                        summary.merged_goals, summary.flagged_unattached
+                    );
+                }
+            }
+            // Reconciliation is an additive post-pass: its failure never fails the drain —
+            // the structured memory is already committed. Loud, not fatal.
+            Err(err) => eprintln!("session reconciliation skipped on error: {err:?}"),
+        }
+    }
     Ok(DrainOutcome { counts, reports })
 }
 
@@ -1774,6 +1802,9 @@ fn collect_import_source_chunks(
 #[derive(Clone, Copy, Debug)]
 struct ImportChunkOptions {
     max_chars: usize,
+    /// Bytes of the previous chunk's tail carried into the next chunk (cg-correctness C5:
+    /// operator config via capture.toml `chunk_overlap`; 0 = the shipped no-overlap behavior).
+    overlap_chars: usize,
     resolved_chunk_window: usize,
     model_context_tokens: usize,
     context_fraction: f32,
@@ -1800,8 +1831,19 @@ fn import_chunk_options(args: &[String], root: &Path) -> Result<ImportChunkOptio
             .min(fractional)
             .clamp(1, DEFAULT_IMPORT_CHUNK_WINDOW)
     });
+    // Operator capture config (cg-correctness C5): capture.toml chunk_window applies when no
+    // explicit --chunk-tokens flag was given; chunk_overlap comes only from config. Overlap is
+    // clamped to a quarter-window so a misconfigured overlap can never stall chunk progress.
+    let capture_config = load_capture_config(root)?;
+    let resolved_chunk_window = match (explicit, capture_config.chunk_window) {
+        (None, Some(configured)) => configured.max(1),
+        _ => resolved_chunk_window,
+    };
+    let max_chars = resolved_chunk_window.max(1);
+    let overlap_chars = capture_config.chunk_overlap.unwrap_or(0).min(max_chars / 4);
     Ok(ImportChunkOptions {
-        max_chars: resolved_chunk_window.max(1),
+        max_chars,
+        overlap_chars,
         resolved_chunk_window,
         model_context_tokens,
         context_fraction,
@@ -1899,10 +1941,12 @@ where
             &mut buffer,
             segment,
             options.max_chars,
+            options.overlap_chars,
             &mut chunks,
             &mut on_chunk,
         )?;
     }
+    // The terminal flush never retains a tail — there is no next chunk.
     flush_import_chunk(&mut buffer, &mut chunks, &mut on_chunk)?;
     Ok(chunks)
 }
@@ -1911,6 +1955,7 @@ fn append_import_segment<F>(
     buffer: &mut String,
     segment: &str,
     max_chars: usize,
+    overlap_chars: usize,
     chunks: &mut usize,
     on_chunk: &mut F,
 ) -> context_graph::Result<()>
@@ -1920,7 +1965,7 @@ where
     let mut rest = segment;
     while !rest.is_empty() {
         if buffer.len() >= max_chars {
-            flush_import_chunk(buffer, chunks, on_chunk)?;
+            flush_import_chunk_with_overlap(buffer, chunks, on_chunk, overlap_chars)?;
             continue;
         }
         let remaining = max_chars - buffer.len();
@@ -1930,11 +1975,11 @@ where
         }
         let split = import_chunk_boundary(rest, remaining);
         if split == 0 {
-            flush_import_chunk(buffer, chunks, on_chunk)?;
+            flush_import_chunk_with_overlap(buffer, chunks, on_chunk, overlap_chars)?;
             continue;
         }
         buffer.push_str(&rest[..split]);
-        flush_import_chunk(buffer, chunks, on_chunk)?;
+        flush_import_chunk_with_overlap(buffer, chunks, on_chunk, overlap_chars)?;
         rest = &rest[split..];
     }
     Ok(())
@@ -1948,6 +1993,21 @@ fn flush_import_chunk<F>(
 where
     F: FnMut(&str) -> context_graph::Result<()>,
 {
+    flush_import_chunk_with_overlap(buffer, chunks, on_chunk, 0)
+}
+
+/// Flush the buffer as one chunk; when `overlap_chars > 0`, the flushed chunk's tail (aligned
+/// to a line start) is retained as the next buffer's head, so a decision spanning a chunk
+/// boundary appears whole in one of the two chunks (the registered chunking lever).
+fn flush_import_chunk_with_overlap<F>(
+    buffer: &mut String,
+    chunks: &mut usize,
+    on_chunk: &mut F,
+    overlap_chars: usize,
+) -> context_graph::Result<()>
+where
+    F: FnMut(&str) -> context_graph::Result<()>,
+{
     let chunk = buffer.trim();
     if chunk.is_empty() {
         buffer.clear();
@@ -1956,6 +2016,20 @@ where
     *chunks += 1;
     let owned = chunk.to_string();
     buffer.clear();
+    if overlap_chars > 0 && owned.len() > overlap_chars {
+        // Retain the flushed chunk's tail, aligned forward to a char boundary and then to the
+        // next line start where one exists, as the next buffer's head.
+        let mut start = owned.len() - overlap_chars;
+        while !owned.is_char_boundary(start) {
+            start += 1;
+        }
+        let tail = &owned[start..];
+        let aligned = tail.find('\n').map(|i| &tail[i + 1..]).unwrap_or(tail);
+        if !aligned.trim().is_empty() {
+            buffer.push_str(aligned);
+            buffer.push('\n');
+        }
+    }
     on_chunk(&owned)
 }
 

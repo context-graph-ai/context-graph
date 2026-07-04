@@ -211,7 +211,15 @@ fn main() {
         model: model_name,
         numbers,
     });
-    let rendered = report.render_markdown();
+    let mut rendered = report.render_markdown();
+    rendered.push_str(
+        "\nNOTES (reading rules, frozen method): this table is LOWER-BOUND diagnostics — \
+         auto-matches (cosine >= 0.75) only; gray-zone pairs are routed to the adjudication \
+         file and NOT counted here; no verdict is final before adjudication + the owner \
+         sample. `attach` is structurally 0 until adjudicated intention equivalence is applied \
+         (it requires the intention to auto-match first). `obs` is UNSCORED in this run (the \
+         column renders 0.00), pending observation adjudication.\n",
+    );
     match report_path {
         Some(path) => {
             let mut existing = std::fs::read_to_string(&path).unwrap_or_default();

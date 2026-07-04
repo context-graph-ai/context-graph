@@ -174,6 +174,10 @@ pub struct CaptureHarnessConfig {
     /// and merge deterministically. Opt-in config; the default is the shipped single pass —
     /// the bench measures both as levers before any default flips.
     pub staged_extraction: bool,
+    /// Session-level goal reconciliation after a drain (C4): merges per-chunk duplicate goals
+    /// into one canonical intention and flags unattached decisions. Default ON (additive,
+    /// judgment-improving); `session_reconciliation = false` in capture.toml disables.
+    pub session_reconciliation: bool,
 }
 
 impl Default for CaptureHarnessConfig {
@@ -189,6 +193,7 @@ impl Default for CaptureHarnessConfig {
             item_caps: None,
             entity_vocabulary: None,
             staged_extraction: false,
+            session_reconciliation: true,
         }
     }
 }
@@ -215,6 +220,7 @@ struct CaptureTomlSection {
     entity_vocabulary: Option<Vec<String>>,
     item_caps: Option<ItemCapsToml>,
     staged_extraction: Option<bool>,
+    session_reconciliation: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -253,6 +259,9 @@ impl CaptureHarnessConfig {
             staged_extraction: section
                 .staged_extraction
                 .unwrap_or(defaults.staged_extraction),
+            session_reconciliation: section
+                .session_reconciliation
+                .unwrap_or(defaults.session_reconciliation),
         })
     }
 
@@ -939,17 +948,17 @@ fn merge_staged_harvests(
     fn normalized(text: &str) -> String {
         text.trim().to_ascii_lowercase()
     }
-    let known_entities: std::collections::HashSet<String> =
+    let mut known_entities: std::collections::HashSet<String> =
         full.entities.iter().map(|e| normalized(&e.name)).collect();
     for entity in entities_pass.entities {
-        if !known_entities.contains(&normalized(&entity.name)) {
+        if known_entities.insert(normalized(&entity.name)) {
             full.entities.push(entity);
         }
     }
-    let known_decisions: std::collections::HashSet<String> =
+    let mut known_decisions: std::collections::HashSet<String> =
         full.decisions.iter().map(|d| normalized(&d.text)).collect();
     for decision in decisions_pass.decisions {
-        if !known_decisions.contains(&normalized(&decision.text)) {
+        if known_decisions.insert(normalized(&decision.text)) {
             full.decisions.push(decision);
         }
     }
