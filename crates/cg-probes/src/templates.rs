@@ -10,9 +10,11 @@ pub const DECISION_TEMPLATES: &[&str] = &[
     "The speaker committed to a specific course of action.",
 ];
 
-/// Attachment hypothesis; `{goal}` is replaced with the intention statement.
-pub const ATTACHMENT_TEMPLATE: &str =
-    "This was decided in order to achieve the following goal: {goal}";
+/// Attachment hypothesis; `{goal}` is replaced with the intention statement. FROZEN on the
+/// calibration split 2026-07-07 (working-doc D9): the bare goal statement as hypothesis, with
+/// the structural-context premise, separated every calibration gold pair from every distractor
+/// (pairwise 1.000 on deberta-zeroshot); the round-1 phrasing was degenerate.
+pub const ATTACHMENT_TEMPLATE: &str = "{goal}";
 
 pub fn attachment_hypothesis(intention_statement: &str) -> String {
     ATTACHMENT_TEMPLATE.replace("{goal}", intention_statement)
