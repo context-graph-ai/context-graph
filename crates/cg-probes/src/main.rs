@@ -5,11 +5,14 @@
 
 use cg_probes::accretion::{cluster_by_threshold, first_session_of_cluster, pre_existing_fraction};
 use cg_probes::corpus::{SessionRecord, load_dev_corpus, load_plain_corpus};
-use cg_probes::items::{basis_items, decision_judgment_items};
-use cg_probes::pairs::attachment_pairs;
+use cg_probes::items::{
+    basis_items, decision_judgment_items, segmentation_failures, window_gold_flags,
+};
+use cg_probes::pairs::{attachment_pairs, score_known_attachment};
 use cg_probes::scoring::{pick_operating_point, point_at, sweep};
 use cg_probes::templates::{DECISION_TEMPLATES, JUDGE_MODEL, JUDGE_PROMPT, attachment_hypothesis};
 use cg_probes::verifier::TrunkVerifier;
+use cg_probes::windows::enumerate_windows;
 use context_graph::embedder::{Embedder, EmbedderConfig, EmbeddingInput};
 use std::collections::HashMap;
 use std::io::Write;
@@ -48,6 +51,10 @@ fn main() {
         Some("selftest-verifiers") => cmd_selftest(&args[1..]),
         Some("p0") => cmd_p0(&args[1..]),
         Some("p1") => cmd_p1(&args[1..]),
+        Some("p2") => cmd_p2(&args[1..]),
+        Some("p2-report") => cmd_p2_report(&args[1..]),
+        Some("p3-known") => cmd_p3_known(&args[1..]),
+        Some("p3-new") => cmd_p3_new(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
         Some("judge") => cmd_judge(&args[1..]),
         _ => Err(usage()),
@@ -679,4 +686,389 @@ fn cmd_judge(args: &[String]) -> Result<(), String> {
         out_rows.len().saturating_sub(1)
     );
     Ok(())
+}
+
+// ----------------------------------------------------------------------------------------- P2
+
+fn cmd_p2(args: &[String]) -> Result<(), String> {
+    let corpora = load_corpora(args)?;
+    let dir = out_dir(args)?;
+    let model_names = flag(args, "--models").ok_or("--models a[,b] is required")?;
+    let max_span: usize = flag(args, "--max-span")
+        .unwrap_or_else(|| "3".to_string())
+        .parse()
+        .map_err(|e| format!("bad --max-span: {e}"))?;
+    let sim = NomicSim::new();
+
+    let mut corpora_list: Vec<(&str, &Vec<SessionRecord>)> = vec![("nondev", &corpora.nondev)];
+    if let Some(dev) = &corpora.dev {
+        corpora_list.push(("dev", dev));
+    }
+
+    for model_name in model_names.split(',') {
+        let mut verifier = load_verifier(model_name)?;
+        for (corpus_name, sessions) in &corpora_list {
+            let mut window_rows = Vec::new();
+            let mut span_rows = Vec::new();
+            // Template embedding centroid for the measured pre-filter arm (reported with AND
+            // without; never load-bearing on its own).
+            for session in sessions.iter() {
+                let windows = enumerate_windows(&session.turns, max_span);
+                let gold_quotes: Vec<String> = session
+                    .gold
+                    .decisions
+                    .iter()
+                    .filter_map(|d| d.evidence_quote.clone())
+                    .collect();
+                let flags = window_gold_flags(&windows, &gold_quotes);
+                let lane = format!("p2 {corpus_name} {model_name} {}", session.id);
+                let started = Instant::now();
+                let mut scores = Vec::with_capacity(windows.len());
+                for (index, window) in windows.iter().enumerate() {
+                    let mut best = 0.0f32;
+                    for template in DECISION_TEMPLATES {
+                        best = best.max(verifier.entail(&window.text, template)?);
+                    }
+                    scores.push(best);
+                    progress(&lane, index + 1, windows.len(), &started);
+                }
+                for ((window, &gold), &score) in windows.iter().zip(&flags).zip(&scores) {
+                    // Pre-filter feature: best cosine of the window against the template set,
+                    // on the production embedder.
+                    let mut cosine = -1.0f32;
+                    for template in DECISION_TEMPLATES {
+                        cosine = cosine.max(sim.similarity(&window.text, template)?);
+                    }
+                    window_rows.push(format!(
+                        "{corpus_name}\t{}\t{}\twin:{}-{}\t{}\t{score:.4}\t{cosine:.4}",
+                        session.id, session.calibration, window.start, window.end, gold
+                    ));
+                }
+                for (span_index, quote) in gold_quotes.iter().enumerate() {
+                    let containing: Vec<String> = windows
+                        .iter()
+                        .zip(&scores)
+                        .filter(|(w, _)| cg_probes::windows::window_contains(w, quote))
+                        .map(|(w, s)| format!("{}-{}:{s:.4}", w.start, w.end))
+                        .collect();
+                    span_rows.push(format!(
+                        "{corpus_name}\t{}\t{}\t{span_index}\t{}",
+                        session.id,
+                        session.calibration,
+                        containing.join(",")
+                    ));
+                }
+                let seg = segmentation_failures(&windows, &gold_quotes);
+                if !seg.is_empty() {
+                    eprintln!(
+                        "[p2 {corpus_name} {model_name} {}] SEGMENTATION failures: spans {seg:?}",
+                        session.id
+                    );
+                }
+            }
+            write_tsv(
+                &dir.join(format!("p2-windows-{corpus_name}-{model_name}.tsv")),
+                "corpus\tsession\tcalibration\tlabel\tgold\tscore\tprefilter_cos",
+                &window_rows,
+            )?;
+            write_tsv(
+                &dir.join(format!("p2-spans-{corpus_name}-{model_name}.tsv")),
+                "corpus\tsession\tcalibration\tspan\twindows",
+                &span_rows,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_p2_report(args: &[String]) -> Result<(), String> {
+    let windows_path = flag(args, "--windows").ok_or("--windows TSV is required")?;
+    let spans_path = flag(args, "--spans").ok_or("--spans TSV is required")?;
+    let floor: f32 = flag(args, "--precision-floor")
+        .unwrap_or_else(|| "0.75".to_string())
+        .parse()
+        .map_err(|e| format!("bad floor: {e}"))?;
+    let recall_bar: f32 = flag(args, "--recall-bar")
+        .unwrap_or_else(|| "0.54".to_string())
+        .parse()
+        .map_err(|e| format!("bad recall bar: {e}"))?;
+    let keep: Option<f32> = flag(args, "--prefilter-keep")
+        .map(|v| v.parse().map_err(|e| format!("bad keep fraction: {e}")))
+        .transpose()?;
+
+    let text =
+        std::fs::read_to_string(&windows_path).map_err(|e| format!("read {windows_path}: {e}"))?;
+    struct Row {
+        calibration: bool,
+        gold: bool,
+        score: f32,
+        cosine: f32,
+    }
+    let mut rows = Vec::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 7 {
+            continue;
+        }
+        rows.push(Row {
+            calibration: cols[2] == "true",
+            gold: cols[4] == "true",
+            score: cols[5].parse().map_err(|e| format!("bad score: {e}"))?,
+            cosine: cols[6].parse().map_err(|e| format!("bad cosine: {e}"))?,
+        });
+    }
+    let cutoff = keep.map(|fraction| {
+        let mut cosines: Vec<f32> = rows.iter().map(|r| r.cosine).collect();
+        cosines.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let index =
+            ((cosines.len() as f32 * fraction) as usize).min(cosines.len().saturating_sub(1));
+        cosines[index]
+    });
+    let arms: Vec<(&str, Option<f32>)> = match cutoff {
+        Some(c) => vec![("full", None), ("prefilter", Some(c))],
+        None => vec![("full", None)],
+    };
+    for (arm, arm_cutoff) in arms {
+        let kept = |row: &Row| arm_cutoff.is_none_or(|c| row.cosine >= c);
+        let calibration: Vec<(f32, bool)> = rows
+            .iter()
+            .filter(|r| r.calibration && kept(r))
+            .map(|r| (r.score, r.gold))
+            .collect();
+        let verdict: Vec<(f32, bool)> = rows
+            .iter()
+            .filter(|r| !r.calibration && kept(r))
+            .map(|r| (r.score, r.gold))
+            .collect();
+        let Some(threshold) = pick_operating_point(&calibration, floor) else {
+            println!("[{arm}] VERDICT-ROW: no calibration threshold clears precision {floor}");
+            continue;
+        };
+        let point = point_at(&verdict, threshold);
+        // Span recall on the verdict split: a span is recalled iff any of its windows (kept in
+        // this arm — the span file has no cosine, so prefilter recall uses all listed windows'
+        // scores; the prefilter arm's recall is therefore an upper bound and is labelled so).
+        let span_text =
+            std::fs::read_to_string(&spans_path).map_err(|e| format!("read {spans_path}: {e}"))?;
+        let (mut recalled, mut total, mut segmentation) = (0usize, 0usize, 0usize);
+        for line in span_text.lines().skip(1) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() < 5 || cols[2] == "true" {
+                continue; // calibration spans don't grade the verdict
+            }
+            total += 1;
+            let windows = cols[4].trim();
+            if windows.is_empty() {
+                segmentation += 1;
+                continue;
+            }
+            let hit = windows.split(',').any(|entry| {
+                entry
+                    .rsplit(':')
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .is_some_and(|s| s >= threshold)
+            });
+            if hit {
+                recalled += 1;
+            }
+        }
+        let recall = if total == 0 {
+            0.0
+        } else {
+            recalled as f32 / total as f32
+        };
+        println!(
+            "[{arm}] VERDICT-ROW: t={threshold:.4} window_precision={:.3} span_recall={recall:.3} \
+             ({recalled}/{total}) segmentation_failures={segmentation} {}",
+            point.precision,
+            if recall >= recall_bar && point.precision >= floor {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        );
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------- P3
+
+fn cmd_p3_known(args: &[String]) -> Result<(), String> {
+    let input = flag(args, "--p1b").ok_or("--p1b TSV is required")?;
+    let threshold: f32 = flag(args, "--threshold")
+        .ok_or("--threshold (frozen from p1b calibration) is required")?
+        .parse()
+        .map_err(|e| format!("bad threshold: {e}"))?;
+    let text = std::fs::read_to_string(&input).map_err(|e| format!("read {input}: {e}"))?;
+    // Group verdict-split rows by (session, decision index) from label "pair:<idx>:<key>".
+    #[derive(Default)]
+    struct Group {
+        best: Option<(String, f32)>,
+        gold: Option<String>,
+    }
+    let mut groups: std::collections::BTreeMap<(String, usize), Group> =
+        std::collections::BTreeMap::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 6 || cols[2] == "true" {
+            continue;
+        }
+        let Some(rest) = cols[3].strip_prefix("pair:") else {
+            continue;
+        };
+        let Some((index_text, key)) = rest.split_once(':') else {
+            continue;
+        };
+        let Ok(decision_index) = index_text.parse::<usize>() else {
+            continue;
+        };
+        let score: f32 = cols[5].parse().map_err(|e| format!("bad score: {e}"))?;
+        let entry = groups
+            .entry((cols[1].to_string(), decision_index))
+            .or_default();
+        if entry.best.as_ref().is_none_or(|(_, s)| score > *s) {
+            entry.best = Some((key.to_string(), score));
+        }
+        if cols[4] == "true" {
+            entry.gold = Some(key.to_string());
+        }
+    }
+    let choices: Vec<(Option<String>, Option<String>)> = groups
+        .values()
+        .map(|g| {
+            let chosen = g
+                .best
+                .as_ref()
+                .filter(|(_, s)| *s >= threshold)
+                .map(|(k, _)| k.clone());
+            (chosen, g.gold.clone())
+        })
+        .collect();
+    let accuracy = score_known_attachment(&choices);
+    let abstain_cases = choices.iter().filter(|(_, g)| g.is_none()).count();
+    println!(
+        "P3-known: accuracy={accuracy:.3} decisions={} none-fits-cases={abstain_cases} t={threshold}",
+        choices.len()
+    );
+    Ok(())
+}
+
+fn cmd_p3_new(args: &[String]) -> Result<(), String> {
+    let corpora = load_corpora(args)?;
+    let dir = out_dir(args)?;
+    let arm = flag(args, "--arm").ok_or("--arm local|hosted is required")?;
+    let new_prompt = |spans: &str| {
+        format!(
+            "These decisions were made in one work session:\n{spans}\n\nState, in one \
+             sentence, the underlying goal these decisions serve. Answer with only that sentence."
+        )
+    };
+    // New-intention sessions in the verdict split: authored corpus = established_here on a
+    // non-calibration session; dev = --dev-new-sessions ids (from the judged P0 accretion).
+    let dev_new: Vec<String> = flag(args, "--dev-new-sessions")
+        .map(|s| s.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
+    let mut cases: Vec<(String, String, String, String)> = Vec::new(); // corpus, session, spans, gold statement
+    for session in &corpora.nondev {
+        if session.calibration {
+            continue;
+        }
+        for intention in &session.gold.intentions {
+            if intention.established_here {
+                cases.push((
+                    "nondev".to_string(),
+                    session.id.clone(),
+                    cg_probes::items::oracle_packet(session),
+                    intention.statement.clone(),
+                ));
+            }
+        }
+    }
+    if let Some(dev) = &corpora.dev {
+        for session in dev {
+            if !dev_new.contains(&session.id) {
+                continue;
+            }
+            for intention in &session.gold.intentions {
+                cases.push((
+                    "dev".to_string(),
+                    session.id.clone(),
+                    cg_probes::items::oracle_packet(session),
+                    intention.statement.clone(),
+                ));
+            }
+        }
+    }
+    eprintln!("[p3-new {arm}] {} cases", cases.len());
+    let sim = NomicSim::new();
+    let mut rows = Vec::new();
+    for (corpus, session, spans, gold) in &cases {
+        let prompt = new_prompt(spans);
+        let generated = match arm.as_str() {
+            "local" => {
+                use cg_local_llm::LocalUnderstandingEngine;
+                let gguf = flag(args, "--gguf").ok_or("--gguf PATH is required for local arm")?;
+                let engine = cg_local_llm::LlamaCppEngine::load_from_gguf(&gguf)
+                    .map_err(|e| format!("load gguf: {e}"))?;
+                let params = cg_local_llm::GenerationParams::new(8192)
+                    .with_max_tokens(64)
+                    .with_temperature(0.0);
+                engine
+                    .understand(
+                        &prompt,
+                        &cg_local_llm::LocalOutputContract::Unconstrained,
+                        &params,
+                    )
+                    .map_err(|e| format!("local generate: {e}"))?
+                    .text
+            }
+            "hosted" => hosted_one_shot(&prompt)?,
+            other => return Err(format!("unknown arm {other:?}")),
+        };
+        let generated = generated.trim().to_string();
+        let similarity = sim.similarity(&generated, gold)?;
+        rows.push(format!(
+            "{corpus}\t{session}\t{arm}\t{similarity:.4}\t{}\t{}",
+            generated.replace('\t', " "),
+            gold.replace('\t', " ")
+        ));
+        eprintln!("[p3-new {arm}] {session} sim={similarity:.3}");
+    }
+    write_tsv(
+        &dir.join(format!("p3-new-{arm}.tsv")),
+        "corpus\tsession\tarm\tsimilarity\tgenerated\tgold",
+        &rows,
+    )?;
+    Ok(())
+}
+
+fn hosted_one_shot(prompt: &str) -> Result<String, String> {
+    let key = std::env::var("OPENROUTER_API_KEY")
+        .map_err(|_| "OPENROUTER_API_KEY is not set".to_string())?;
+    let body = serde_json::json!({
+        "model": JUDGE_MODEL,
+        "temperature": 0,
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": prompt}],
+    });
+    let mut response = ureq::post("https://openrouter.ai/api/v1/chat/completions")
+        .header("Authorization", &format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .map_err(|e| format!("hosted call: {e}"))?;
+    let mut payload = String::new();
+    {
+        use std::io::Read;
+        let mut reader = response.body_mut().with_config().limit(1 << 20).reader();
+        reader
+            .read_to_string(&mut payload)
+            .map_err(|e| format!("hosted read: {e}"))?;
+    }
+    let reply: serde_json::Value =
+        serde_json::from_str(&payload).map_err(|e| format!("hosted parse: {e}"))?;
+    Ok(reply["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string())
 }

@@ -732,6 +732,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "cg-bench",
+ "cg-local-llm",
  "context-graph",
  "serde",
  "serde_json",

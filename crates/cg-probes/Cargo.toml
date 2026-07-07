@@ -15,6 +15,7 @@ publish = false
 [dependencies]
 context-graph = { path = "../context-graph" }
 cg-bench = { path = "../cg-bench" }
+cg-local-llm = { path = "../cg-local-llm" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
