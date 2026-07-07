@@ -92,7 +92,7 @@ fn session(
     }
 }
 
-const TRANSCRIPT: &str = "User: opening chatter about the weather\nAssistant: what should we do about the gate rule\nUser: lock the gate every night from now on\nAssistant: so the rule is lock the gate every night\n";
+const TRANSCRIPT: &str = "User: opening chatter about the weather\nAssistant: what should we do about the gate rule\nUser: lock the gate every night from now on\nAssistant: the rule is lock the gate every night\n";
 
 #[test]
 fn judgment_premise_is_turn_plus_predecessor() {
@@ -119,7 +119,7 @@ fn decision_items_are_exhaustive_and_labelled() {
         false,
         TRANSCRIPT,
         vec![decision(
-            "Lock the gate nightly.",
+            "Lock the gate every night.",
             Some("k1"),
             "lock the gate every night",
         )],
@@ -155,7 +155,7 @@ fn decision_items_are_exhaustive_and_labelled() {
     assert!(
         !negatives
             .iter()
-            .any(|n| n.premise.contains("so the rule is"))
+            .any(|n| n.premise.contains("the rule is lock"))
     );
     assert_eq!(report.restatement_negatives_excluded, 1);
     // Every item carries the session + calibration tag for the split.
@@ -176,7 +176,7 @@ fn oracle_packet_joins_gold_spans() {
         TRANSCRIPT,
         vec![
             decision("A.", Some("k1"), "lock the gate every night"),
-            decision("B.", None, "so the rule is lock the gate every night"),
+            decision("B.", None, "the rule is lock the gate every night"),
         ],
         Vec::new(),
         Vec::new(),
@@ -184,7 +184,7 @@ fn oracle_packet_joins_gold_spans() {
     // The packet is the distinct CONTAINING turns (gold-anchored context), not bare quotes.
     assert_eq!(
         oracle_packet(&s),
-        "User: lock the gate every night from now on\nAssistant: so the rule is lock the gate every night"
+        "User: lock the gate every night from now on\nAssistant: the rule is lock the gate every night"
     );
     // A quote found in no turn falls back to the quote itself.
     let mut orphan = s.clone();
