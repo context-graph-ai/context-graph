@@ -95,10 +95,10 @@ cg_run() {  # cg_run <argv...>  -> LAST_OUT / LAST_RC
 }
 cg_record() {  # cg_record <context-args...> <text-as-last-arg>
   local text="${!#}"; set -- "${@:1:$(($#-1))}"
-  printf '\n$ printf <session> | cg record %s\n' "$*"
+  printf '\n$ printf <session> | cg record --understand-now %s\n' "$*"
   local tmp
   tmp="$(mktemp /tmp/cg-smoke-cg-record.XXXXXX)"
-  printf '%s' "$text" | "$CG" record "$@" 2>&1 | tee "$tmp"
+  printf '%s' "$text" | "$CG" record --understand-now "$@" 2>&1 | tee "$tmp"
   LAST_RC=${PIPESTATUS[1]}
   LAST_OUT="$(cat "$tmp")"
   rm -f "$tmp"
@@ -299,7 +299,7 @@ else
     "$([[ $LAST_RC -eq 0 ]] && jq -e '.estimate.provider_calls == 0' <<<"$(json_first_obj "$REAL_ESTIMATE_OUT")" >/dev/null 2>&1 && echo 0 || echo 1)"
   check "owner-feel real JSONL default import window is bounded for hosted output budget" \
     "$(jq -e '.estimate.resolved_chunk_window <= 16000 and .estimate.chunks > 1' <<<"$(json_first_obj "$REAL_ESTIMATE_OUT")" >/dev/null 2>&1 && echo 0 || echo 1)"
-  cg_run import "$REAL_JSONL" --context owner-feel
+  cg_run import --understand-now "$REAL_JSONL" --context owner-feel
   REAL_IMPORT_OUT="$LAST_OUT"
   REAL_IMPORT_OBJ="$(json_first_obj "$REAL_IMPORT_OUT")"
   check "owner-feel real JSONL import succeeds on the default window" \
@@ -468,7 +468,7 @@ if verb_available skills && verb_available fix; then
   printf '%s\n' '{"type":"user","message":{"content":[{"type":"text","text":"Goal G_import: classify the source artifact named context-graph. Entity E_import: context-graph type=file path=context-graph. Decision D_import: treat context-graph as a file artifact for indexing serves G_import based_on E_import."}]}}' >> "$IMPORT_FILE"
   printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Additional import discussion pads the session across chunks while staying about validation notes, rollout timing, monitoring, and handoff details."}]}}' >> "$IMPORT_FILE"
   printf '%s\n' '{"type":"user","message":{"content":[{"type":"text","text":"More unrelated import text forces the multi-chunk route under a small chunk window without changing the context-graph classification."}]}}' >> "$IMPORT_FILE"
-  cg_run import --context skillz-import --chunk-tokens 80 "$IMPORT_FILE"
+  cg_run import --understand-now --context skillz-import --chunk-tokens 80 "$IMPORT_FILE"
   IMPORT_OUT="$LAST_OUT"
   check "later real .jsonl cg import succeeded" "$([[ $LAST_RC -eq 0 ]] && echo 0 || echo 1)"
   check "later real .jsonl cg import exercised the multi-chunk route" \
