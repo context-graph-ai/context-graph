@@ -315,8 +315,8 @@ fi
 # ---------------------------------------------------------------------------
 section "STEP 5 — §L connected-by-default (tenant context, not cwd-hash)"
 mkdir -p /tmp/cg-cwd-A /tmp/cg-cwd-B /tmp/cg-cwd-C
-( cd /tmp/cg-cwd-A && printf '%s' "We decided to adopt Rust for the new ingest worker." | "$CG" record --tenant-id "$TENANT" >/dev/null 2>&1 )
-( cd /tmp/cg-cwd-B && printf '%s' "We decided to deploy the ingest worker on Kubernetes." | "$CG" record --tenant-id "$TENANT" >/dev/null 2>&1 )
+( cd /tmp/cg-cwd-A && printf '%s' "We decided to adopt Rust for the new ingest worker." | "$CG" record --understand-now --tenant-id "$TENANT" >/dev/null 2>&1 )
+( cd /tmp/cg-cwd-B && printf '%s' "We decided to deploy the ingest worker on Kubernetes." | "$CG" record --understand-now --tenant-id "$TENANT" >/dev/null 2>&1 )
 printf '\n$ (from a THIRD cwd) cg status --tenant-id %s\n' "$TENANT"
 LAST_OUT="$( cd /tmp/cg-cwd-C && "$CG" status --tenant-id "$TENANT" 2>&1 )"; printf '%s\n' "$LAST_OUT"
 check "captures from two different working dirs both land under the tenant context" \
