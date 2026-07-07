@@ -50,7 +50,9 @@ impl DebertaNliVerifier {
             )
         }
         .map_err(|e| format!("load model.safetensors: {e}"))?;
-        let model = DebertaV2SeqClassificationModel::load(vb, &config, None)
+        // The HF checkpoint prefixes the encoder tensors with `deberta.`; candle's pooler and
+        // classifier resolve from the VarBuilder ROOT, so the encoder prefix goes here.
+        let model = DebertaV2SeqClassificationModel::load(vb.pp("deberta"), &config, None)
             .map_err(|e| format!("build DeBERTa classifier: {e}"))?;
         Ok(Self {
             name: name.to_string(),

@@ -465,12 +465,13 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
                     let hypothesis = attachment_hypothesis(&pair.intention_statement);
                     let score = verifier.entail(&premise, &hypothesis)?;
                     rows.push(format!(
-                        "{corpus_name}\t{}\t{}\tpair:{}\t{}\t{score:.4}",
+                        "{corpus_name}\t{}\t{}\tpair:{}:{}\t{}\t{score:.4}",
                         pair.session_id,
                         calibration_by_session
                             .get(pair.session_id.as_str())
                             .copied()
                             .unwrap_or(false),
+                        pair.decision_index,
                         pair.intention_key,
                         pair.is_gold
                     ));
