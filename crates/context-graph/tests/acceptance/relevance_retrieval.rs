@@ -491,7 +491,7 @@ fn skill_selection_retrieves_the_relevant_few_not_the_whole_corpus() {
     }
 
     // Capture a chunk matching ONLY the two redis-cache skills.
-    let (_report, harness_report) = run_capture(
+    let (_report, _harness_report) = run_capture(
         &store,
         request(
             "skill-selection-context",
