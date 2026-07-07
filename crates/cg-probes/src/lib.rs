@@ -14,6 +14,7 @@
 
 pub mod accretion;
 pub mod corpus;
+pub mod items;
 pub mod pairs;
 pub mod scoring;
 pub mod verdict;

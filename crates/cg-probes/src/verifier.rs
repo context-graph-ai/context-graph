@@ -12,3 +12,25 @@ pub trait TrunkVerifier {
     fn name(&self) -> String;
     fn entail(&mut self, premise: &str, hypothesis: &str) -> Result<f32, String>;
 }
+
+/// The entailment class index from a model config's id2label map. Exact (case-insensitive)
+/// match on "entailment" only — "not_entailment" contains the substring and must never match.
+pub fn entailment_label_index(
+    id2label: &std::collections::HashMap<String, String>,
+) -> Result<usize, String> {
+    let _ = id2label;
+    todo!("verifier runtime impl commit")
+}
+
+/// Numerically stable two-way softmax over (a, b), returning (p_a, p_b).
+pub fn softmax2(a: f32, b: f32) -> (f32, f32) {
+    let _ = (a, b);
+    todo!("verifier runtime impl commit")
+}
+
+/// The MiniCheck wire format from the authors' published inference code:
+/// `"predict: " + doc + "</s>" + claim`.
+pub fn minicheck_input(doc: &str, claim: &str) -> String {
+    let _ = (doc, claim);
+    todo!("verifier runtime impl commit")
+}
