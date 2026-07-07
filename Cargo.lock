@@ -728,12 +728,17 @@ dependencies = [
 name = "cg-probes"
 version = "0.1.0"
 dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
  "cg-bench",
  "context-graph",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
+ "tokenizers 0.23.1",
+ "ureq",
 ]
 
 [[package]]

@@ -18,19 +18,28 @@ pub trait TrunkVerifier {
 pub fn entailment_label_index(
     id2label: &std::collections::HashMap<String, String>,
 ) -> Result<usize, String> {
-    let _ = id2label;
-    todo!("verifier runtime impl commit")
+    let mut found: Option<usize> = None;
+    for (id, label) in id2label {
+        if label.eq_ignore_ascii_case("entailment") {
+            let index = id
+                .parse::<usize>()
+                .map_err(|e| format!("non-numeric label id {id:?}: {e}"))?;
+            found = Some(index);
+        }
+    }
+    found.ok_or_else(|| format!("no 'entailment' label in id2label: {id2label:?}"))
 }
 
 /// Numerically stable two-way softmax over (a, b), returning (p_a, p_b).
 pub fn softmax2(a: f32, b: f32) -> (f32, f32) {
-    let _ = (a, b);
-    todo!("verifier runtime impl commit")
+    let m = a.max(b);
+    let (ea, eb) = ((a - m).exp(), (b - m).exp());
+    let sum = ea + eb;
+    (ea / sum, eb / sum)
 }
 
 /// The MiniCheck wire format from the authors' published inference code:
 /// `"predict: " + doc + "</s>" + claim`.
 pub fn minicheck_input(doc: &str, claim: &str) -> String {
-    let _ = (doc, claim);
-    todo!("verifier runtime impl commit")
+    format!("predict: {doc}</s>{claim}")
 }

@@ -14,9 +14,13 @@
 
 pub mod accretion;
 pub mod corpus;
+pub mod fetch;
 pub mod items;
+pub mod minicheck_t5;
+pub mod nli_deberta;
 pub mod pairs;
 pub mod scoring;
+pub mod templates;
 pub mod verdict;
 pub mod verifier;
 pub mod windows;
