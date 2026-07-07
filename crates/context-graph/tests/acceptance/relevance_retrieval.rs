@@ -502,16 +502,27 @@ fn skill_selection_retrieves_the_relevant_few_not_the_whole_corpus() {
     )
     .expect("skill-selection capture");
 
-    // EXACTLY the two matching skills (by id) must be selected/applied — not 20 (selecting all
-    // active skills fails), and not a different 2 (selecting by anything but description match
-    // fails). HEAD never selects any → applied_skill_ids is empty → this fails.
-    let mut applied = harness_report.applied_skill_ids.clone();
-    applied.sort();
+    // EXACTLY the two matching skills (by id) must be SELECTED — not 20 (selecting all active
+    // skills fails), and not a different 2 (selecting by anything but description match fails).
+    // Selection is proven by the persisted firing trace: applied_skill_ids reports only skills
+    // whose effect actually landed (receipt honesty), which is not this test's subject.
+    let db = store.sync_database();
+    let mut fired: Vec<String> = db
+        .scan("cg_skill_firing_trace", db.snapshot())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|row| match row.values.get("skill_id") {
+            Some(DbValue::Text(value)) => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
+    fired.sort();
+    fired.dedup();
     let mut expected: Vec<String> = matching.iter().map(|s| s.to_string()).collect();
     expected.sort();
     assert_eq!(
-        applied, expected,
-        "skill selection must apply EXACTLY the two description-matching skills by id ({expected:?}); \
-         got {applied:?} — HEAD's run_capture selects/applies no skills (empty)"
+        fired, expected,
+        "skill selection must fire EXACTLY the two description-matching skills by id ({expected:?}); \
+         got {fired:?}"
     );
 }

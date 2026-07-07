@@ -403,11 +403,9 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
     )
     .expect("co-fired no-op capture must succeed");
     assert!(
-        noop_harness
-            .applied_skill_ids
-            .iter()
-            .any(|id| id == &noop_skill_id),
-        "the co-fired retype skill must be selected so the negative-control trace is real; applied_skill_ids={:?}",
+        !firing_trace_ids_for_skill(&noop_store, &noop_skill_id).is_empty(),
+        "the co-fired retype skill must be selected (firing trace present) so the negative-control \
+         trace is real; applied_skill_ids={:?}",
         noop_harness.applied_skill_ids
     );
     let noop_entity = entity_named_in_context(&noop_store, "cofired-retype-noop", "context-graph");
@@ -1138,12 +1136,18 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
             harness.applied_skill_ids
         );
         assert!(
+            !firing_trace_ids_for_skill(&store, &unapplied_branch_skill_id).is_empty(),
+            "the branch skill must be selected (firing trace present) on the same digest so \
+             digest-wide blame cannot pass; applied_skill_ids={:?}",
+            harness.applied_skill_ids
+        );
+        assert!(
             harness
                 .applied_skill_ids
                 .iter()
-                .any(|id| id == &unapplied_branch_skill_id),
-            "the branch skill must be selected on the same digest so digest-wide blame cannot pass; \
-             applied_skill_ids={:?}",
+                .all(|id| id != &unapplied_branch_skill_id),
+            "receipt honesty: the branch skill changed no value, so it must NOT be reported \
+             applied; applied_skill_ids={:?}",
             harness.applied_skill_ids
         );
         assert!(
