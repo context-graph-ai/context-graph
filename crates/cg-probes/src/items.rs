@@ -52,24 +52,161 @@ pub fn decision_judgment_items(
     sessions: &[SessionRecord],
     sim: &dyn SimilarityProvider,
 ) -> DecisionItems {
-    let _ = (sessions, sim);
-    todo!("D8/D10 corrective impl commit")
+    use crate::windows::normalize_ws;
+    use cg_bench::scoring::{MatchBand, band};
+    let mut items = Vec::new();
+    let (mut restatement_excluded, mut gray_excluded) = (0usize, 0usize);
+    for session in sessions {
+        let normalized_turns: Vec<String> = session
+            .turns
+            .iter()
+            .map(|t| normalize_ws(&t.rendered()))
+            .collect();
+        let containing_turn = |quote: &str| -> Option<usize> {
+            let quote = normalize_ws(quote);
+            if quote.is_empty() {
+                return None;
+            }
+            normalized_turns.iter().position(|t| t.contains(&quote))
+        };
+        let mut used_turns: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for decision in &session.gold.decisions {
+            let Some(quote) = &decision.evidence_quote else {
+                continue;
+            };
+            let (premise, label) = match containing_turn(quote) {
+                Some(idx) => {
+                    used_turns.insert(idx);
+                    (judgment_premise(&session.turns, idx), "gold-span")
+                }
+                None => (quote.clone(), "gold-span-fallback"),
+            };
+            items.push(JudgmentItem {
+                session_id: session.id.clone(),
+                calibration: session.calibration,
+                premise,
+                positive: true,
+                label: label.to_string(),
+            });
+        }
+        for negative in &session.gold.non_decisions {
+            let (premise, label) = match containing_turn(&negative.quote) {
+                Some(idx) => {
+                    used_turns.insert(idx);
+                    (judgment_premise(&session.turns, idx), "non-decision")
+                }
+                None => (negative.quote.clone(), "non-decision-fallback"),
+            };
+            items.push(JudgmentItem {
+                session_id: session.id.clone(),
+                calibration: session.calibration,
+                premise,
+                positive: false,
+                label: label.to_string(),
+            });
+        }
+        for (idx, turn) in session.turns.iter().enumerate() {
+            if used_turns.contains(&idx) {
+                continue;
+            }
+            // Restatement exclusion (D8): a turn that statement-matches any gold decision on
+            // the frozen band is a dedup event, never a negative; gray-band turns are excluded
+            // from items entirely and counted.
+            let best_band = session
+                .gold
+                .decisions
+                .iter()
+                .map(|d| band(sim.similarity(&turn.text, &d.statement)))
+                .fold(MatchBand::NonMatch, |acc, b| match (acc, b) {
+                    (MatchBand::Match, _) | (_, MatchBand::Match) => MatchBand::Match,
+                    (MatchBand::GrayZone, _) | (_, MatchBand::GrayZone) => MatchBand::GrayZone,
+                    _ => MatchBand::NonMatch,
+                });
+            match best_band {
+                MatchBand::Match => {
+                    restatement_excluded += 1;
+                    continue;
+                }
+                MatchBand::GrayZone => {
+                    gray_excluded += 1;
+                    continue;
+                }
+                MatchBand::NonMatch => {}
+            }
+            items.push(JudgmentItem {
+                session_id: session.id.clone(),
+                calibration: session.calibration,
+                premise: judgment_premise(&session.turns, idx),
+                positive: false,
+                label: "turn".to_string(),
+            });
+        }
+    }
+    DecisionItems {
+        items,
+        restatement_negatives_excluded: restatement_excluded,
+        gray_negatives_excluded: gray_excluded,
+    }
 }
 
 /// The session's oracle evidence packet: the DISTINCT turns containing the gold decision
 /// spans, in turn order (gold-anchored context — still no retrieval, no scanning); a span found
 /// in no turn contributes the bare quote (working-doc D10).
 pub fn oracle_packet(session: &SessionRecord) -> String {
-    let _ = session;
-    todo!("D8/D10 corrective impl commit")
+    use crate::windows::normalize_ws;
+    let normalized_turns: Vec<String> = session
+        .turns
+        .iter()
+        .map(|t| normalize_ws(&t.rendered()))
+        .collect();
+    let mut turn_indices: Vec<usize> = Vec::new();
+    let mut orphan_quotes: Vec<&str> = Vec::new();
+    for decision in &session.gold.decisions {
+        let Some(quote) = decision.evidence_quote.as_deref() else {
+            continue;
+        };
+        let needle = normalize_ws(quote);
+        match normalized_turns
+            .iter()
+            .position(|t| !needle.is_empty() && t.contains(&needle))
+        {
+            Some(idx) => {
+                if !turn_indices.contains(&idx) {
+                    turn_indices.push(idx);
+                }
+            }
+            None => orphan_quotes.push(quote),
+        }
+    }
+    turn_indices.sort_unstable();
+    let mut parts: Vec<String> = turn_indices
+        .into_iter()
+        .map(|idx| session.turns[idx].rendered())
+        .collect();
+    parts.extend(orphan_quotes.into_iter().map(str::to_string));
+    parts.join("\n")
 }
 
 /// The attachment premise for a decision: the same structural-context rule as P1-a (containing
 /// turn + predecessor, working-doc D7/D9); unlocatable evidence falls back to the quote, a
 /// decision with no quote falls back to its statement.
 pub fn attachment_premise(session: &SessionRecord, decision_index: usize) -> String {
-    let _ = (session, decision_index);
-    todo!("D8/D10 corrective impl commit")
+    use crate::windows::normalize_ws;
+    let Some(decision) = session.gold.decisions.get(decision_index) else {
+        return String::new();
+    };
+    let Some(quote) = decision.evidence_quote.as_deref() else {
+        return decision.statement.clone();
+    };
+    let needle = normalize_ws(quote);
+    let containing = session
+        .turns
+        .iter()
+        .position(|t| !needle.is_empty() && normalize_ws(&t.rendered()).contains(&needle));
+    match containing {
+        Some(idx) => judgment_premise(&session.turns, idx),
+        None => quote.to_string(),
+    }
 }
 
 /// One basis-support judgment item: is `claim` supported by `doc` (the oracle packet)?
