@@ -422,9 +422,13 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
     let model_names = flag(args, "--models").ok_or("--models a,b is required")?;
     let judgments = flag(args, "--judgments").unwrap_or_else(|| "p1a,p1b,p1c".to_string());
 
+    let only = flag(args, "--only");
     let mut corpora_list: Vec<(&str, &Vec<SessionRecord>)> = vec![("nondev", &corpora.nondev)];
     if let Some(dev) = &corpora.dev {
         corpora_list.push(("dev", dev));
+    }
+    if let Some(only) = &only {
+        corpora_list.retain(|(name, _)| name == only);
     }
 
     for model_name in model_names.split(',') {
@@ -700,9 +704,13 @@ fn cmd_p2(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("bad --max-span: {e}"))?;
     let sim = NomicSim::new();
 
+    let only = flag(args, "--only");
     let mut corpora_list: Vec<(&str, &Vec<SessionRecord>)> = vec![("nondev", &corpora.nondev)];
     if let Some(dev) = &corpora.dev {
         corpora_list.push(("dev", dev));
+    }
+    if let Some(only) = &only {
+        corpora_list.retain(|(name, _)| name == only);
     }
 
     for model_name in model_names.split(',') {
