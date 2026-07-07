@@ -10,7 +10,7 @@ use cg_probes::items::{
 };
 use cg_probes::pairs::{attachment_pairs, score_known_attachment};
 use cg_probes::scoring::{pick_operating_point, point_at, sweep};
-use cg_probes::templates::{DECISION_TEMPLATES, JUDGE_MODEL, JUDGE_PROMPT, attachment_hypothesis};
+use cg_probes::templates::{DECISION_TEMPLATES, JUDGE_MODEL, JUDGE_PROMPT};
 use cg_probes::verifier::TrunkVerifier;
 use cg_probes::windows::enumerate_windows;
 use context_graph::embedder::{Embedder, EmbedderConfig, EmbeddingInput};
@@ -428,6 +428,19 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
     let sim = NomicSim::new();
     let model_names = flag(args, "--models").ok_or("--models a,b is required")?;
     let judgments = flag(args, "--judgments").unwrap_or_else(|| "p1a,p1b,p1c".to_string());
+    // --split calibration|verdict|all: calibration-only runs are the template-iteration lane —
+    // framing is tuned on calibration ONLY and frozen before the verdict split is scored.
+    let split = flag(args, "--split").unwrap_or_else(|| "all".to_string());
+    let keep = |calibration: bool| match split.as_str() {
+        "calibration" => calibration,
+        "verdict" => !calibration,
+        _ => true,
+    };
+    let attachment_template = flag(args, "--attachment-template")
+        .unwrap_or_else(|| cg_probes::templates::ATTACHMENT_TEMPLATE.to_string());
+    let tag = flag(args, "--tag")
+        .map(|t| format!("-{t}"))
+        .unwrap_or_default();
 
     let only = flag(args, "--only");
     let mut corpora_list: Vec<(&str, &Vec<SessionRecord>)> = vec![("nondev", &corpora.nondev)];
@@ -448,7 +461,11 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
                     "[p1a {corpus_name}] restatement-excluded={} gray-excluded={}",
                     report.restatement_negatives_excluded, report.gray_negatives_excluded
                 );
-                let items = report.items;
+                let items: Vec<_> = report
+                    .items
+                    .into_iter()
+                    .filter(|i| keep(i.calibration))
+                    .collect();
                 let lane = format!("p1a {corpus_name} {model_name}");
                 let started = Instant::now();
                 let mut rows = Vec::new();
@@ -464,7 +481,7 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
                     progress(&lane, index + 1, items.len(), &started);
                 }
                 write_tsv(
-                    &dir.join(format!("p1a-{corpus_name}-{model_name}.tsv")),
+                    &dir.join(format!("p1a-{corpus_name}-{model_name}{tag}.tsv")),
                     "corpus\tsession\tcalibration\tlabel\tgold\tscore",
                     &rows,
                 )?;
@@ -473,6 +490,21 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
             // P1-b: attachment over exhaustive pairs.
             if judgments.contains("p1b") {
                 let pairs = attachment_pairs(sessions);
+                let session_calibration: HashMap<&str, bool> = sessions
+                    .iter()
+                    .map(|s| (s.id.as_str(), s.calibration))
+                    .collect();
+                let pairs: Vec<_> = pairs
+                    .into_iter()
+                    .filter(|p| {
+                        keep(
+                            session_calibration
+                                .get(p.session_id.as_str())
+                                .copied()
+                                .unwrap_or(false),
+                        )
+                    })
+                    .collect();
                 let calibration_by_session: HashMap<&str, bool> = sessions
                     .iter()
                     .map(|s| (s.id.as_str(), s.calibration))
@@ -487,7 +519,8 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
                         .get(pair.session_id.as_str())
                         .map(|s| cg_probes::items::attachment_premise(s, pair.decision_index))
                         .unwrap_or_else(|| pair.decision_statement.clone());
-                    let hypothesis = attachment_hypothesis(&pair.intention_statement);
+                    let hypothesis =
+                        attachment_template.replace("{goal}", &pair.intention_statement);
                     let score = verifier.entail(&premise, &hypothesis)?;
                     rows.push(format!(
                         "{corpus_name}\t{}\t{}\tpair:{}:{}\t{}\t{score:.4}",
@@ -503,7 +536,7 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
                     progress(&lane, index + 1, pairs.len(), &started);
                 }
                 write_tsv(
-                    &dir.join(format!("p1b-{corpus_name}-{model_name}.tsv")),
+                    &dir.join(format!("p1b-{corpus_name}-{model_name}{tag}.tsv")),
                     "corpus\tsession\tcalibration\tlabel\tgold\tscore",
                     &rows,
                 )?;
@@ -511,7 +544,10 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
 
             // P1-c: basis support against the oracle packet.
             if judgments.contains("p1c") {
-                let items = basis_items(sessions);
+                let items: Vec<_> = basis_items(sessions)
+                    .into_iter()
+                    .filter(|i| keep(i.calibration))
+                    .collect();
                 let lane = format!("p1c {corpus_name} {model_name}");
                 let started = Instant::now();
                 let mut rows = Vec::new();
@@ -524,7 +560,7 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
                     progress(&lane, index + 1, items.len(), &started);
                 }
                 write_tsv(
-                    &dir.join(format!("p1c-{corpus_name}-{model_name}.tsv")),
+                    &dir.join(format!("p1c-{corpus_name}-{model_name}{tag}.tsv")),
                     "corpus\tsession\tcalibration\tlabel\tgold\tscore",
                     &rows,
                 )?;
