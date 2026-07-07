@@ -1582,6 +1582,9 @@ pub(crate) fn select_and_apply_learned_skills(
             .or_default()
             .push(applied.effect);
     }
+    // "Applied" is earned by a persisted effect, never by selection alone —
+    // a receipt claiming an application the store cannot show is a lie.
+    let mut effective_skill_ids: Vec<String> = effects_by_skill.keys().cloned().collect();
 
     let mut firing_records = Vec::new();
     for skill in &selected {
@@ -1612,10 +1615,21 @@ pub(crate) fn select_and_apply_learned_skills(
     // The generalized post-generation repairs (recategorize / drop / tag) apply after the entity
     // retype write-back, over the final harvest. A retype-only skill carries none of these, so this
     // pass is a no-op for the retype path.
-    apply_general_effects(&selected, harvest);
+    for id in apply_general_effects(&selected, harvest) {
+        if !effective_skill_ids.contains(&id) {
+            effective_skill_ids.push(id);
+        }
+    }
+
+    // Preserve the selection order in the reported ids.
+    let applied_skill_ids = selected
+        .iter()
+        .map(|skill| skill.id.clone())
+        .filter(|id| effective_skill_ids.contains(id))
+        .collect();
 
     SelectedSkillApplication {
-        applied_skill_ids: selected.into_iter().map(|skill| skill.id).collect(),
+        applied_skill_ids,
         firing_records,
         withheld_skill_ids,
     }
@@ -1644,11 +1658,16 @@ fn matcher_hits(matcher: &str, text: &str) -> bool {
 /// Apply the generalized post-generation repairs the selected skills encode, in place on the harvest:
 /// recategorize a matching decision's `decision_type`, drop a matching item, or tag a matching
 /// decision. Deterministic and model-free; a skill whose matcher hits nothing changes nothing.
+/// Applies the generalized post-generation effects and returns the ids of the
+/// skills that actually CHANGED the harvest — "applied" in a receipt means a
+/// persisted effect, never mere selection.
 fn apply_general_effects(
     selected: &[LearnedSkill],
     harvest: &mut crate::ingest::StructuredHarvest,
-) {
+) -> Vec<String> {
+    let mut effective = Vec::new();
     for skill in selected {
+        let mut changed = false;
         match &skill.effect {
             Some(SkillEffectEnvelope::RecategorizeDecision {
                 decision_matcher,
@@ -1667,6 +1686,7 @@ fn apply_general_effects(
                         decision.decision_type = Some(crate::ingest::ModelExtractedField::from(
                             to_category.as_str(),
                         ));
+                        changed = true;
                     }
                 }
             }
@@ -1680,10 +1700,15 @@ fn apply_general_effects(
                         && !decision.tags.iter().any(|existing| existing == tag)
                     {
                         decision.tags.push(tag.to_string());
+                        changed = true;
                     }
                 }
             }
             Some(SkillEffectEnvelope::DropItem { item_matcher }) => {
+                let before = harvest.goals.len()
+                    + harvest.entities.len()
+                    + harvest.decisions.len()
+                    + harvest.observations.len();
                 harvest
                     .goals
                     .retain(|goal| !matcher_hits(item_matcher, &goal.text));
@@ -1696,10 +1721,19 @@ fn apply_general_effects(
                 harvest
                     .observations
                     .retain(|observation| !matcher_hits(item_matcher, &observation.text));
+                let after = harvest.goals.len()
+                    + harvest.entities.len()
+                    + harvest.decisions.len()
+                    + harvest.observations.len();
+                changed = after < before;
             }
             _ => {}
         }
+        if changed {
+            effective.push(skill.id.clone());
+        }
     }
+    effective
 }
 
 /// The effect a learned retype skill carries: rename the source entity type to a target type when an
