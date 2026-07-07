@@ -21,7 +21,7 @@ cg-cli-conventions.workspace = true
 context-graph = { path = "../context-graph" }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
-contextdb-server = { path = "../../../contextdb/crates/contextdb-server" }
+contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["nats"] }
 fs4.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
