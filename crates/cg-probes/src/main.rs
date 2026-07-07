@@ -51,6 +51,8 @@ fn main() {
         Some("selftest-verifiers") => cmd_selftest(&args[1..]),
         Some("p0") => cmd_p0(&args[1..]),
         Some("p1") => cmd_p1(&args[1..]),
+        Some("p1-dump") => cmd_p1_dump(&args[1..]),
+        Some("map-session") => cmd_map_session(&args[1..]),
         Some("p2") => cmd_p2(&args[1..]),
         Some("p2-report") => cmd_p2_report(&args[1..]),
         Some("p3-known") => cmd_p3_known(&args[1..]),
@@ -1129,4 +1131,180 @@ fn hosted_one_shot(prompt: &str) -> Result<String, String> {
         .as_str()
         .unwrap_or("")
         .to_string())
+}
+
+/// Dump the P1-a judgment items WITH premise text, in scoring order — the eyeball/join surface
+/// (row order matches the p1a score TSVs produced from the same corpus + code).
+fn cmd_p1_dump(args: &[String]) -> Result<(), String> {
+    let corpora = load_corpora(args)?;
+    let sim = NomicSim::new();
+    let report = decision_judgment_items(&corpora.nondev, &sim);
+    println!("index\tsession\tcalibration\tlabel\tgold\tpremise");
+    for (index, item) in report.items.iter().enumerate() {
+        println!(
+            "{index}\t{}\t{}\t{}\t{}\t{}",
+            item.session_id,
+            item.calibration,
+            item.label,
+            item.positive,
+            item.premise.replace('\t', " ").replace('\n', " ⏎ ")
+        );
+    }
+    eprintln!(
+        "excluded: restatement={} gray={}",
+        report.restatement_negatives_excluded, report.gray_negatives_excluded
+    );
+    Ok(())
+}
+
+/// The owner-facing side-by-side: ONE real session mapped through the verifier trunk
+/// (windows → decision detection → attachment to the session's intention roster), printed next
+/// to the approved gold key. The product view of the probes, not a metric.
+fn cmd_map_session(args: &[String]) -> Result<(), String> {
+    let session_path = flag(args, "--session").ok_or("--session JSONL is required")?;
+    let gold_path = flag(args, "--gold").ok_or("--gold YAML is required")?;
+    let model_name = flag(args, "--model").unwrap_or_else(|| "deberta-zeroshot".to_string());
+    let threshold: f32 = flag(args, "--threshold")
+        .unwrap_or_else(|| "0.60".to_string())
+        .parse()
+        .map_err(|e| format!("bad threshold: {e}"))?;
+    let max_span: usize = flag(args, "--max-span")
+        .unwrap_or_else(|| "2".to_string())
+        .parse()
+        .map_err(|e| format!("bad span: {e}"))?;
+
+    let raw = std::fs::read(&session_path).map_err(|e| format!("read session: {e}"))?;
+    let turns = cg_probes::corpus::dev_session_turns(&raw);
+    let gold_text = std::fs::read_to_string(&gold_path).map_err(|e| format!("read gold: {e}"))?;
+    let bench_gold = cg_bench::gold::load_gold_str(&gold_text)?;
+    let stem = std::path::Path::new(&gold_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session")
+        .to_string();
+    let gold = cg_probes::corpus::probe_gold_from_dev(&stem, &bench_gold);
+
+    println!("================ GOLD (owner-approved key: {stem}) ================");
+    for intention in &gold.intentions {
+        println!("INTENTION {}: {}", intention.key, intention.statement);
+    }
+    for (index, decision) in gold.decisions.iter().enumerate() {
+        println!(
+            "  gold-decision {index} [serves {}]: {}",
+            decision.serves.as_deref().unwrap_or("-"),
+            decision.statement
+        );
+    }
+
+    let mut verifier = load_verifier(&model_name)?;
+    let windows = enumerate_windows(&turns, max_span);
+    eprintln!(
+        "[map] {} turns, {} windows, scoring with {model_name}…",
+        turns.len(),
+        windows.len()
+    );
+    let started = Instant::now();
+    let mut scored: Vec<(usize, f32)> = Vec::new();
+    for (index, window) in windows.iter().enumerate() {
+        let mut best = 0.0f32;
+        for template in DECISION_TEMPLATES {
+            best = best.max(verifier.entail(&window.text, template)?);
+        }
+        scored.push((index, best));
+        progress("map", index + 1, windows.len(), &started);
+    }
+
+    // Greedy non-overlapping selection of above-threshold windows, best first.
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut kept: Vec<(usize, f32)> = Vec::new();
+    for &(index, score) in &scored {
+        if score < threshold {
+            break;
+        }
+        let w = &windows[index];
+        if kept
+            .iter()
+            .all(|&(k, _)| windows[k].end < w.start || windows[k].start > w.end)
+        {
+            kept.push((index, score));
+        }
+    }
+    kept.sort_by_key(|&(index, _)| windows[index].start);
+
+    let sim = NomicSim::new();
+    use cg_bench::scoring::{MatchBand, band};
+    println!(
+        "\n================ VERIFIER-TRUNK MAPPING ({model_name}, t={threshold}) ================"
+    );
+    let mut covered: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (index, score) in &kept {
+        let window = &windows[*index];
+        // Attachment: argmax over the session's intention roster (frozen bare-goal template).
+        let mut best_intention: Option<(&str, f32)> = None;
+        for intention in &gold.intentions {
+            let s = verifier.entail(&window.text, &intention.statement)?;
+            if best_intention.is_none_or(|(_, bs)| s > bs) {
+                best_intention = Some((&intention.key, s));
+            }
+        }
+        // Which gold decision does this window carry? (containment or statement-match band)
+        let mut matched: Vec<usize> = Vec::new();
+        for (gi, decision) in gold.decisions.iter().enumerate() {
+            let contains = decision
+                .evidence_quote
+                .as_deref()
+                .is_some_and(|q| cg_probes::windows::window_contains(window, q));
+            let matches = band(cg_bench::scoring::SimilarityProvider::similarity(
+                &sim,
+                &window.text,
+                &decision.statement,
+            )) == MatchBand::Match;
+            if contains || matches {
+                matched.push(gi);
+                covered.insert(gi);
+            }
+        }
+        let excerpt: String = window.text.chars().take(160).collect();
+        println!(
+            "\nDETECTED (score {score:.2}, turns {}-{}) → attach {} ({:.2}) | gold match: {}",
+            window.start,
+            window.end,
+            best_intention.map(|(k, _)| k).unwrap_or("-"),
+            best_intention.map(|(_, s)| s).unwrap_or(0.0),
+            if matched.is_empty() {
+                "NONE (spurious or unlabeled)".to_string()
+            } else {
+                format!("{matched:?}")
+            }
+        );
+        println!("  {}", excerpt.replace('\n', " ⏎ "));
+    }
+    println!(
+        "\n================ SUMMARY ================\ngold decisions covered: {}/{} | detected blocks: {} | spurious/unlabeled blocks: {}",
+        covered.len(),
+        gold.decisions.len(),
+        kept.len(),
+        kept.len()
+            - kept
+                .iter()
+                .filter(|(i, _)| {
+                    gold.decisions.iter().enumerate().any(|(_gi, d)| {
+                        d.evidence_quote
+                            .as_deref()
+                            .is_some_and(|q| cg_probes::windows::window_contains(&windows[*i], q))
+                            || band(cg_bench::scoring::SimilarityProvider::similarity(
+                                &sim,
+                                &windows[*i].text,
+                                &d.statement,
+                            )) == MatchBand::Match
+                    })
+                })
+                .count()
+    );
+    for (gi, decision) in gold.decisions.iter().enumerate() {
+        if !covered.contains(&gi) {
+            println!("MISSED gold decision {gi}: {}", decision.statement);
+        }
+    }
+    Ok(())
 }
