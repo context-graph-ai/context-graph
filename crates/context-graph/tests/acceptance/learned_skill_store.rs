@@ -482,6 +482,50 @@ fn exported_edited_skill_pushed_back_becomes_human_authored() {
     );
 }
 
+// RED (receipt honesty, cg ledger DL-CG-1, found by the owner's live smoke): "applied" must mean
+// an actual persisted effect. A promoted skill that MATCHES the chunk but whose harvest contains
+// nothing its retype can touch (extraction yielded no such entity) must NOT be reported in
+// applied_skill_ids — the receipt was claiming an effect that never landed, so the follow-up
+// "is the entity now a Repository?" check found no entity at all. The firing trace may keep the
+// fired-without-effect record; the RECEIPT must tell the truth.
+#[test]
+fn matched_but_effectless_skill_is_not_reported_applied() {
+    use context_graph::harness::{CaptureHarnessConfig, run_capture};
+    use context_graph::ingest::CaptureRequest;
+
+    let (_dir, store) = fresh_store();
+    insert_skill_row(
+        &store,
+        "sk-effectless",
+        "retype a context-graph file entity to a repository",
+        "when an entity named context-graph is typed File → Repository",
+        "human-correction",
+        true,
+        false,
+    );
+
+    // The transcript mentions context-graph (so the skill matches and is selected) but declares
+    // NO entity — there is nothing for the retype to change.
+    let transcript = "Goal G1: track the context-graph rollout\nDecision D1: document the context-graph release notes serves G1";
+    let (_report, harness) = run_capture(
+        &store,
+        CaptureRequest {
+            context_label: "effectless-ctx".to_string(),
+            transcript: transcript.to_string(),
+            model_available: true,
+        },
+        &super::refactor_extractor::SpanFaithfulExtractor,
+        &CaptureHarnessConfig::default(),
+    )
+    .expect("capture with a matched-but-effectless skill must still succeed");
+
+    assert!(
+        harness.applied_skill_ids.is_empty(),
+        "a skill that produced no persisted effect must not be reported as applied, got {:?}",
+        harness.applied_skill_ids
+    );
+}
+
 // Test 8 (store-state): a promoted skill must auto-apply on a REAL matching capture, changing the
 // captured result, with no approval step. The proof is a DIFF against a no-skill baseline capture
 // of the same transcript: the two results must differ exactly by the skill's effect.
