@@ -24,7 +24,15 @@ const BANNED_CRATES: &[&str] = &[
     "cudnn",
     "tensorrt",
 ];
-const ALLOWED_ADVISORY_IGNORES: &[&str] = &["RUSTSEC-2024-0436", "RUSTSEC-2025-0141"];
+const ALLOWED_ADVISORY_IGNORES: &[&str] = &[
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2025-0141",
+    // atomic-polyfill (unmaintained): embedded-target-only, reachable solely
+    // via the dial-by-key sync transport's relay wire codec (iroh-relay ->
+    // postcard -> heapless 0.7); never compiled for shipped targets; no safe
+    // upgrade until postcard moves to heapless 0.8.
+    "RUSTSEC-2023-0089",
+];
 const CARGO_AUDIT_ALIASES: &[&str] = &["deny", "expand"];
 const COMMAND_LOOKUP_ENV_KEYS: &[&str] = &["PATH", "BASH_ENV", "ENV", "SHELLOPTS", "IFS"];
 const AUDIT_TOOL_PATH_MARKERS: &[&str] = &[
@@ -1666,10 +1674,30 @@ fn deny_toml_exists_at_workspace_root_with_bans_licenses_advisories_sources_sect
                         .collect::<std::collections::BTreeSet<_>>(),
                     "candle-embeddinggemma may be allowed only as a direct cg-catalog dependency"
                 );
+            } else if raw_name == "reqwest" {
+                // The dial-by-key sync transport (iroh, via contextdb-server)
+                // uses reqwest internally for relay/net plumbing. cg's own
+                // code stays banned from it; the wrapper scope admits it ONLY
+                // as the transport crates' dependency.
+                let wrappers = entry
+                    .get("wrappers")
+                    .and_then(toml::Value::as_array)
+                    .expect("reqwest ban should have transport-scoped wrappers");
+                let wrappers = wrappers
+                    .iter()
+                    .map(|wrapper| wrapper.as_str().expect("wrapper crate name"))
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    wrappers,
+                    ["iroh", "iroh-relay"]
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    "reqwest may be allowed only as the sync transport's internal dependency"
+                );
             } else {
                 assert!(
                     !entry.contains_key("wrappers"),
-                    "{raw_name} must not use cargo-deny wrapper exceptions; only candle-embeddinggemma may be scoped to cg-catalog"
+                    "{raw_name} must not use cargo-deny wrapper exceptions; only candle-embeddinggemma (cg-catalog) and reqwest (the sync transport) may be scoped"
                 );
             }
             raw_name.to_string()
@@ -1702,6 +1730,10 @@ fn deny_toml_exists_at_workspace_root_with_bans_licenses_advisories_sources_sect
         "ISC",
         "MIT",
         "Unicode-3.0",
+        // Public-domain-equivalent; entered the graph via the dial-by-key
+        // sync transport's wasm-target deps — never compiled for shipped
+        // targets.
+        "Unlicense",
         "Zlib",
     ]
     .into_iter()
