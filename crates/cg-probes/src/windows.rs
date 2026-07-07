@@ -17,27 +17,45 @@ pub struct Window {
 
 /// All contiguous spans of 1..=max_span turns, in (start, span-length) order.
 pub fn enumerate_windows(turns: &[Turn], max_span: usize) -> Vec<Window> {
-    let _ = (turns, max_span);
-    todo!("probe impl commit")
+    let mut windows = Vec::new();
+    for start in 0..turns.len() {
+        let longest = max_span.min(turns.len() - start);
+        for span in 1..=longest {
+            let end = start + span - 1;
+            let text = turns[start..=end]
+                .iter()
+                .map(Turn::rendered)
+                .collect::<Vec<_>>()
+                .join("\n");
+            windows.push(Window { start, end, text });
+        }
+    }
+    windows
 }
 
 /// Whitespace-normalized form used for quote containment: collapse all whitespace runs to one
 /// space, trim.
 pub fn normalize_ws(s: &str) -> String {
-    let _ = s;
-    todo!("probe impl commit")
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Does the window contain the quote, after whitespace normalization of both sides?
 pub fn window_contains(window: &Window, quote: &str) -> bool {
-    let _ = (window, quote);
-    todo!("probe impl commit")
+    let quote = normalize_ws(quote);
+    if quote.is_empty() {
+        return false;
+    }
+    normalize_ws(&window.text).contains(&quote)
 }
 
 /// Indices of windows containing the quote — the P2 diagnostic split's segmentation check
 /// (a gold span never isolated into any scoreable window is a segmentation failure, not a
 /// judgment failure).
 pub fn windows_containing(windows: &[Window], quote: &str) -> Vec<usize> {
-    let _ = (windows, quote);
-    todo!("probe impl commit")
+    windows
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| window_contains(w, quote))
+        .map(|(i, _)| i)
+        .collect()
 }
