@@ -725,6 +725,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cg-probes"
+version = "0.1.0"
+dependencies = [
+ "cg-bench",
+ "context-graph",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+]
+
+[[package]]
 name = "cg-vision-embedder"
 version = "0.1.0"
 dependencies = [

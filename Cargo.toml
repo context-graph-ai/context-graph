@@ -10,6 +10,7 @@ members = [
     "crates/cg-gap-report",
     "crates/cg-vision-embedder",
     "crates/cg-bench",
+    "crates/cg-probes",
 ]
 
 [workspace.package]

@@ -1,0 +1,23 @@
+[package]
+name = "cg-probes"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+# Verifier-trunk probe machinery (NOT a shipped product surface): measures whether extractive
+# capture + small CPU-only verifier (entailment) models can render cg's trunk judgments at the
+# pre-registered bars (criteria: plans-area cg-verifier-probes-criteria.md, content checksum
+# f401c2db94e75fff). Measurement-only by construction: this crate never opens a Store and never
+# writes a cg data root. Scoring thresholds and the calibration/verdict split are that
+# registration; changing them is a product-frame change, not engineering.
+
+[dependencies]
+context-graph = { path = "../context-graph" }
+cg-bench = { path = "../cg-bench" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
