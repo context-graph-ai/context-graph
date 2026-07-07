@@ -260,6 +260,12 @@ impl NomicSim {
     }
 }
 
+impl cg_bench::scoring::SimilarityProvider for NomicSim {
+    fn similarity(&self, a: &str, b: &str) -> f32 {
+        NomicSim::similarity(self, a, b).expect("nomic similarity")
+    }
+}
+
 fn cmd_p0(args: &[String]) -> Result<(), String> {
     let corpora = load_corpora(args)?;
     let dir = out_dir(args)?;
@@ -419,6 +425,7 @@ fn progress(lane: &str, done: usize, total: usize, started: &Instant) {
 fn cmd_p1(args: &[String]) -> Result<(), String> {
     let corpora = load_corpora(args)?;
     let dir = out_dir(args)?;
+    let sim = NomicSim::new();
     let model_names = flag(args, "--models").ok_or("--models a,b is required")?;
     let judgments = flag(args, "--judgments").unwrap_or_else(|| "p1a,p1b,p1c".to_string());
 
@@ -436,7 +443,12 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
         for (corpus_name, sessions) in &corpora_list {
             // P1-a: decision-vs-discussion. Score = max over the frozen template set.
             if judgments.contains("p1a") {
-                let items = decision_judgment_items(sessions);
+                let report = decision_judgment_items(sessions, &sim);
+                eprintln!(
+                    "[p1a {corpus_name}] restatement-excluded={} gray-excluded={}",
+                    report.restatement_negatives_excluded, report.gray_negatives_excluded
+                );
+                let items = report.items;
                 let lane = format!("p1a {corpus_name} {model_name}");
                 let started = Instant::now();
                 let mut rows = Vec::new();
@@ -468,10 +480,12 @@ fn cmd_p1(args: &[String]) -> Result<(), String> {
                 let lane = format!("p1b {corpus_name} {model_name}");
                 let started = Instant::now();
                 let mut rows = Vec::new();
+                let session_by_id: HashMap<&str, &SessionRecord> =
+                    sessions.iter().map(|s| (s.id.as_str(), s)).collect();
                 for (index, pair) in pairs.iter().enumerate() {
-                    let premise = pair
-                        .decision_evidence
-                        .clone()
+                    let premise = session_by_id
+                        .get(pair.session_id.as_str())
+                        .map(|s| cg_probes::items::attachment_premise(s, pair.decision_index))
                         .unwrap_or_else(|| pair.decision_statement.clone());
                     let hypothesis = attachment_hypothesis(&pair.intention_statement);
                     let score = verifier.entail(&premise, &hypothesis)?;

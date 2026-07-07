@@ -8,6 +8,7 @@
 
 use crate::corpus::{SessionRecord, Turn};
 use crate::windows::Window;
+use cg_bench::scoring::SimilarityProvider;
 
 /// One decision-vs-discussion judgment item.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,86 +34,42 @@ pub fn judgment_premise(turns: &[Turn], index: usize) -> String {
     }
 }
 
-/// Exhaustive decision-vs-discussion items over a corpus: one positive per gold decision span,
-/// one negative per authored non-decision, one negative per turn containing neither a gold span
-/// nor an authored negative quote.
-pub fn decision_judgment_items(sessions: &[SessionRecord]) -> Vec<JudgmentItem> {
-    use crate::windows::normalize_ws;
-    let mut items = Vec::new();
-    for session in sessions {
-        let normalized_turns: Vec<String> = session
-            .turns
-            .iter()
-            .map(|t| normalize_ws(&t.rendered()))
-            .collect();
-        let containing_turn = |quote: &str| -> Option<usize> {
-            let quote = normalize_ws(quote);
-            if quote.is_empty() {
-                return None;
-            }
-            normalized_turns.iter().position(|t| t.contains(&quote))
-        };
-        let mut used_turns: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for decision in &session.gold.decisions {
-            let Some(quote) = &decision.evidence_quote else {
-                continue;
-            };
-            let (premise, label) = match containing_turn(quote) {
-                Some(idx) => {
-                    used_turns.insert(idx);
-                    (judgment_premise(&session.turns, idx), "gold-span")
-                }
-                None => (quote.clone(), "gold-span-fallback"),
-            };
-            items.push(JudgmentItem {
-                session_id: session.id.clone(),
-                calibration: session.calibration,
-                premise,
-                positive: true,
-                label: label.to_string(),
-            });
-        }
-        for negative in &session.gold.non_decisions {
-            let (premise, label) = match containing_turn(&negative.quote) {
-                Some(idx) => {
-                    used_turns.insert(idx);
-                    (judgment_premise(&session.turns, idx), "non-decision")
-                }
-                None => (negative.quote.clone(), "non-decision-fallback"),
-            };
-            items.push(JudgmentItem {
-                session_id: session.id.clone(),
-                calibration: session.calibration,
-                premise,
-                positive: false,
-                label: label.to_string(),
-            });
-        }
-        for idx in 0..session.turns.len() {
-            if used_turns.contains(&idx) {
-                continue;
-            }
-            items.push(JudgmentItem {
-                session_id: session.id.clone(),
-                calibration: session.calibration,
-                premise: judgment_premise(&session.turns, idx),
-                positive: false,
-                label: "turn".to_string(),
-            });
-        }
-    }
-    items
+/// Item construction report: the items plus what the restatement exclusion removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionItems {
+    pub items: Vec<JudgmentItem>,
+    /// Turns excluded from negatives because they statement-match (frozen band, Match) a gold
+    /// decision — assistant restatements are dedup events, not false positives (working-doc D8).
+    pub restatement_negatives_excluded: usize,
+    /// Turns in the gray band against some gold decision: excluded from items entirely.
+    pub gray_negatives_excluded: usize,
 }
 
-/// The session's oracle evidence packet: every gold decision's evidence span, joined.
+/// Exhaustive decision-vs-discussion items over a corpus: one positive per gold decision span,
+/// one negative per authored non-decision, one negative per turn containing no gold span AND
+/// not statement-matching any gold decision (the frozen matcher decides; no cue rules).
+pub fn decision_judgment_items(
+    sessions: &[SessionRecord],
+    sim: &dyn SimilarityProvider,
+) -> DecisionItems {
+    let _ = (sessions, sim);
+    todo!("D8/D10 corrective impl commit")
+}
+
+/// The session's oracle evidence packet: the DISTINCT turns containing the gold decision
+/// spans, in turn order (gold-anchored context — still no retrieval, no scanning); a span found
+/// in no turn contributes the bare quote (working-doc D10).
 pub fn oracle_packet(session: &SessionRecord) -> String {
-    session
-        .gold
-        .decisions
-        .iter()
-        .filter_map(|d| d.evidence_quote.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let _ = session;
+    todo!("D8/D10 corrective impl commit")
+}
+
+/// The attachment premise for a decision: the same structural-context rule as P1-a (containing
+/// turn + predecessor, working-doc D7/D9); unlocatable evidence falls back to the quote, a
+/// decision with no quote falls back to its statement.
+pub fn attachment_premise(session: &SessionRecord, decision_index: usize) -> String {
+    let _ = (session, decision_index);
+    todo!("D8/D10 corrective impl commit")
 }
 
 /// One basis-support judgment item: is `claim` supported by `doc` (the oracle packet)?
