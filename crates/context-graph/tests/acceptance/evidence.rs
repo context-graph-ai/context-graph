@@ -6479,13 +6479,18 @@ fn store_initialize_fresh_against_non_empty_path_drops_all_rows_and_reseeds_defa
 fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_filesystem_source_ref_dereference_path()
  {
     let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = crate_dir
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("workspace root");
-    let lock = std::fs::read_to_string(workspace_root.join("Cargo.lock")).expect("lockfile");
     let manifest = std::fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest");
-    let dependency_tree_text = format!("{manifest}\n{lock}");
+    // The promise is about THIS library crate's own resolved dependency
+    // graph: a workspace-lock scan would also trip on sibling BINARIES'
+    // transitives (the cg CLI legitimately carries the dial-by-key sync
+    // transport, whose internals use an HTTP client). Resolve the library's
+    // real production graph instead, through the allowlisted dependency-audit
+    // helper.
+    let library_graph = crate::cg_main_dep_audit::default_build_tree("context-graph");
+    assert!(
+        library_graph.contains("contextdb-engine"),
+        "library graph resolution must actually list dependencies"
+    );
 
     for dep in [
         ["req", "west"].concat(),
@@ -6496,8 +6501,7 @@ fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_file
         ["tonic-", "web"].concat(),
     ] {
         assert!(
-            !dependency_tree_text.contains(&format!("name = \"{dep}\""))
-                && !manifest.contains(&dep),
+            !library_graph.contains(&format!("{dep} v")) && !manifest.contains(&dep),
             "outbound dependency present: {dep}"
         );
     }

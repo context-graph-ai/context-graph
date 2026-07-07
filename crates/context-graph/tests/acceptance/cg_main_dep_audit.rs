@@ -120,7 +120,7 @@ fn default_build_dependency_names(manifest_path: &str) -> Vec<String> {
     dependencies
 }
 
-fn default_build_tree(package: &str) -> String {
+pub(crate) fn default_build_tree(package: &str) -> String {
     let output = Command::new("cargo")
         .args(["tree", "-p", package, "--edges", "normal,build"])
         .current_dir(workspace_root())
