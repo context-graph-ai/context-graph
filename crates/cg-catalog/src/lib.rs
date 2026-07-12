@@ -96,6 +96,10 @@ pub struct LocalUnderstandingModel {
     pub byte_size: u64,
     /// Pinned sha256 of the GGUF, verified after fetch/seed before it is trusted.
     pub sha: &'static str,
+    /// SPDX-style license label disclosed at fetch time.
+    pub license_spdx: &'static str,
+    /// License terms URL disclosed at fetch time.
+    pub license_url: &'static str,
 }
 
 /// Catalog id for the DEFAULT bundled local understanding model (the e2b tier). This stays the
@@ -105,7 +109,7 @@ pub const UNDERSTANDING_DEFAULT_ID: &str = "gemma4-e2b-it-q4";
 /// The registered bundled local understanding models. `[0]` is the e2b default; `[1]` is the e4b
 /// escalation rung. Each pin was computed from the fetched copy and verified to load and run
 /// in-process (a grammar-constrained extraction) before it was trusted.
-pub const UNDERSTANDING_MODELS: [LocalUnderstandingModel; 2] = [
+pub const UNDERSTANDING_MODELS: [LocalUnderstandingModel; 3] = [
     LocalUnderstandingModel {
         id: "gemma4-e2b-it-q4",
         repo: "unsloth/gemma-4-E2B-it-GGUF",
@@ -113,6 +117,8 @@ pub const UNDERSTANDING_MODELS: [LocalUnderstandingModel; 2] = [
         revision: "main",
         byte_size: 3_106_736_256,
         sha: "9378bc471710229ef165709b62e34bfb62231420ddaf6d729e727305b5b8672d",
+        license_spdx: "Gemma",
+        license_url: "https://ai.google.dev/gemma/terms",
     },
     LocalUnderstandingModel {
         id: "gemma4-e4b-it-q4",
@@ -121,10 +127,20 @@ pub const UNDERSTANDING_MODELS: [LocalUnderstandingModel; 2] = [
         revision: "main",
         byte_size: 4_977_169_568,
         sha: "519b9793ed6ce0ff530f1b7c96e848e08e49e7af4d57bb97f76215963a54146d",
+        license_spdx: "Gemma",
+        license_url: "https://ai.google.dev/gemma/terms",
+    },
+    LocalUnderstandingModel {
+        id: "qwen3-14b-it-q4",
+        repo: "unsloth/Qwen3-14B-GGUF",
+        file: "Qwen3-14B-Q4_K_M.gguf",
+        revision: "main",
+        byte_size: 9_001_753_984,
+        sha: "5eaa0870bd81ed3b58a630a271234cfa604e43ffb3a19cd68e54a80dd9d52a66",
+        license_spdx: "Apache-2.0",
+        license_url: "https://huggingface.co/Qwen/Qwen3-14B/blob/main/LICENSE",
     },
 ];
-const UNDERSTANDING_LICENSE_SPDX: &str = "Gemma";
-const UNDERSTANDING_LICENSE_URL: &str = "https://ai.google.dev/gemma/terms";
 
 /// Look up a bundled understanding-model spec by catalog id. `None` for any id that is not a
 /// registered understanding tier.
@@ -1009,11 +1025,11 @@ impl Catalog {
         );
         table.insert(
             "license_spdx".to_string(),
-            toml::Value::String(UNDERSTANDING_LICENSE_SPDX.to_string()),
+            toml::Value::String(spec.license_spdx.to_string()),
         );
         table.insert(
             "license_url".to_string(),
-            toml::Value::String(UNDERSTANDING_LICENSE_URL.to_string()),
+            toml::Value::String(spec.license_url.to_string()),
         );
         table.insert(
             "source_kind".to_string(),
