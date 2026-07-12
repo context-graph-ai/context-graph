@@ -10,6 +10,8 @@ edition = "2024"
 [features]
 default = []
 embeddinggemma-test-support = []
+# NVIDIA acceleration for the bundled local understanding engine; off by default.
+cuda = ["cg-local-llm/cuda"]
 
 [lib]
 name = "cg_catalog"
