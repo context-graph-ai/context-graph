@@ -1,6 +1,6 @@
 use chrono::Utc;
 use contextdb_core::{Value as DbValue, VectorIndexRef};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value as JsonValue, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -196,7 +196,7 @@ pub struct CaptureRequest {
     pub model_available: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct StructuredHarvest {
     #[serde(default)]
     pub summary: Option<String>,
@@ -264,7 +264,7 @@ impl StructuredHarvest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GoalSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
@@ -277,7 +277,7 @@ pub struct GoalSeed {
     pub context_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EntitySeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
@@ -303,7 +303,7 @@ pub struct EntitySeed {
     pub context_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractedEntityType {
     Service,
@@ -368,7 +368,7 @@ impl From<ExtractedEntityType> for EntityType {
 /// model-extracted value can never be passed where a basis input (an `EvidenceRef` source) is
 /// expected — the deterministic core is never seeded from non-deterministic model output. Read the
 /// text out explicitly with [`ModelExtractedField::into_value`] when storing it as a plain value.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ModelExtractedField(String);
 
@@ -396,7 +396,7 @@ impl From<&str> for ModelExtractedField {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct DecisionSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
@@ -451,7 +451,7 @@ pub struct DecisionSeed {
     pub context_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionRelationSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub prior_decision_id: String,
@@ -459,7 +459,7 @@ pub struct DecisionRelationSeed {
     pub classification: DecisionRelationClassification,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionRelationClassification {
     #[default]
@@ -470,7 +470,7 @@ pub enum DecisionRelationClassification {
     SupersedesExisting,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ObservationSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
@@ -505,7 +505,7 @@ pub struct ObservationSeed {
 }
 
 /// An outcome extracted from the model.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct OutcomeSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub key: String,
@@ -529,7 +529,7 @@ pub struct OutcomeSeed {
 }
 
 /// A verbatim supporting span emitted by the model alongside an extracted value.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ExtractedSpan {
     #[serde(default)]
     pub text: Option<String>,

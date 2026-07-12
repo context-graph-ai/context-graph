@@ -1295,6 +1295,63 @@ pub fn run_capture_into_digest_with_completion(
     Ok((outcome.report, harness_report))
 }
 
+/// Apply a pre-extracted structured harvest — a remote worker's recorded result payload — onto an
+/// existing digest, MODEL-FREE. No extraction runs and no identity/relation judge is consulted: the
+/// worker already did the understanding, so re-running a model on the submitter would be both wasteful
+/// and dishonest (it would discard the worker's output entirely). Only the deterministic tail runs —
+/// goal-key backfill, raw entity-type resolution against the configured vocabulary, and the
+/// scope-entity anchor — before the shared structural commit, which writes the graph AND the
+/// write-once completion marker in ONE transaction (a crash can never leave the graph applied but the
+/// marker missing). This is the honest distributed apply: the worker's structured output BECOMES
+/// memory on the submitter without a model call there.
+pub fn apply_harvest_into_digest_with_completion(
+    store: &Store,
+    request: CaptureRequest,
+    mut harvest: crate::ingest::StructuredHarvest,
+    config: &CaptureHarnessConfig,
+    reuse_digest: Option<DigestId>,
+    completion: Option<crate::ingest::CaptureCompletionMarker<'_>>,
+) -> Result<CaptureReport> {
+    let context = resolve_capture_context(store, &request.context_label)?;
+    let context_id = context.id;
+
+    // Deterministic (model-free) preprocessing — the same steps the live capture path runs AFTER
+    // extraction, minus every model-consulting stage (no Stage-1 extraction, no Stage-3 identity or
+    // decision-relation judge).
+    crate::ingest::ensure_goal_keys_for_decisions(&mut harvest, &request.context_label);
+    let configured_vocab = config.allowed_entity_type_names();
+    let mut flagged_items =
+        crate::ingest::resolve_raw_entity_types(&mut harvest, &configured_vocab);
+    if harvest.entities.is_empty() && (!harvest.goals.is_empty() || !harvest.decisions.is_empty()) {
+        harvest.entities.push(EntitySeed {
+            key: "scope".to_string(),
+            name: request.context_label.clone(),
+            path: request.context_label.clone(),
+            entity_type: ExtractedEntityType::Document,
+            entity_type_raw: None,
+            context_id: None,
+        });
+    }
+    flagged_items.extend(crate::ingest::grounding_check_harvest(
+        &harvest,
+        &request.transcript,
+        &configured_vocab,
+    ));
+
+    let mut outcome = capture_structured_harvest(
+        store,
+        context_id,
+        &request.context_label,
+        &request.transcript,
+        harvest,
+        &[],
+        reuse_digest,
+        completion,
+    )?;
+    outcome.report.flagged_items = flagged_items;
+    Ok(outcome.report)
+}
+
 /// Whether a name uniquely identifies one entity of this type within a context.
 ///
 /// Structural and locational artifacts — a repository, module, file, configuration, database,

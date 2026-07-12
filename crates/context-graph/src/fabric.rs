@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use contextdb_engine::work_ledger;
 
+use crate::capture_sync_status::{ModelCallUsage, UsageReportState};
 use crate::harness::run_capture_into_digest_with_completion;
 use crate::ingest::{CaptureRequest, ConversationExtractor};
 use crate::tier0::{
@@ -306,6 +307,17 @@ fn apply_result_inner(
     let Some(digest_id) = resolve_anchor_digest(store, job_id)? else {
         return Ok(ApplyOutcome::AnchorMissing);
     };
+    // Honest fast path: apply the WORKER's recorded structured output onto the anchor, model-free. The
+    // distributed promise is that a worker's understanding becomes the submitter's memory WITHOUT
+    // re-running a model on the submitter, so whenever a `work_results` payload exists we deserialize
+    // and commit THAT — never re-extract.
+    if let Some(outcome) = apply_recorded_result(store, digest_id, fault)? {
+        return Ok(outcome);
+    }
+    // Fallback: no worker result was recorded for this job — a single-node or out-of-band apply that
+    // names the work directly, before any executor ran. Understand locally over the kept chunk through
+    // the extractor. The write-once apply marker (LOCAL, never synced) commits in the SAME transaction
+    // as the structured graph write, so a crash can never leave the graph applied but the marker missing.
     if store.get_digest(digest_id)?.is_none() {
         return Ok(ApplyOutcome::AnchorMissing);
     }
@@ -320,9 +332,7 @@ fn apply_result_inner(
         // The raw understanding substrate is gone (purged) — nothing to apply onto the anchor.
         return Ok(ApplyOutcome::AnchorMissing);
     };
-    // The write-once apply marker (LOCAL, never synced) now commits in the SAME transaction as the
-    // structured graph write, so a crash can never leave the graph applied but the marker missing.
-    crate::harness::run_capture_into_digest_with_completion(
+    run_capture_into_digest_with_completion(
         store,
         CaptureRequest {
             context_label,
@@ -340,6 +350,92 @@ fn apply_result_inner(
         }),
     )?;
     Ok(ApplyOutcome::Applied(digest_id))
+}
+
+/// Commit a job's RECORDED worker result (the structured harvest the executor produced and pushed on
+/// the `work_results` row) onto its anchor digest, MODEL-FREE — the honest distributed apply. Returns:
+///   * `Ok(None)` when the job has no deserializable worker result yet, so the caller may fall back to
+///     local extraction. (The single-node drain sentinel output is not a harvest, but a locally-drained
+///     job already carries its completion marker and short-circuits to `AlreadyApplied` first.)
+///   * `Ok(Some(AnchorMissing))` when the anchor digest is absent — never captured, or `cg forget`-purged.
+///   * `Ok(Some(AlreadyApplied))` when the write-once completion marker already holds.
+///   * `Ok(Some(Applied(_)))` when the worker's payload was committed onto the anchor.
+fn apply_recorded_result(
+    store: &Store,
+    digest_id: DigestId,
+    fault: Option<&dyn CaptureFault>,
+) -> Result<Option<ApplyOutcome>> {
+    if store.get_digest(digest_id)?.is_none() {
+        return Ok(Some(ApplyOutcome::AnchorMissing));
+    }
+    let digest_text = digest_id.to_string();
+    if completion_exists_local(store, &digest_text)? {
+        return Ok(Some(ApplyOutcome::AlreadyApplied));
+    }
+    let Some(harvest) = worker_result_harvest(store, &understanding_job_id(digest_id))? else {
+        return Ok(None);
+    };
+    let Some((context_id, context_label)) = digest_context(store, digest_id)? else {
+        return Ok(Some(ApplyOutcome::AnchorMissing));
+    };
+    let Some(chunk) = chunk_text_for_digest(store, &digest_text)? else {
+        return Ok(Some(ApplyOutcome::AnchorMissing));
+    };
+    crate::harness::apply_harvest_into_digest_with_completion(
+        store,
+        CaptureRequest {
+            context_label,
+            transcript: chunk,
+            model_available: true,
+        },
+        harvest,
+        &crate::harness::CaptureHarnessConfig::default(),
+        Some(digest_id),
+        Some(crate::ingest::CaptureCompletionMarker {
+            context_id,
+            digest_id,
+            model: "fabric-apply",
+            fault,
+        }),
+    )?;
+    Ok(Some(ApplyOutcome::Applied(digest_id)))
+}
+
+/// Deserialize a completed job's recorded structured output into a harvest, or `None` when the job has
+/// no result row yet or its output is not a structured harvest (e.g. the single-node drain sentinel,
+/// whose memory was already applied inline and is guarded by its completion marker).
+fn worker_result_harvest(
+    store: &Store,
+    job_id: &str,
+) -> Result<Option<crate::ingest::StructuredHarvest>> {
+    let Some(result) = work_ledger::job_result(store.internal_db(), job_id).map_err(map_engine)?
+    else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_slice::<crate::ingest::StructuredHarvest>(&result.output).ok())
+}
+
+/// After a `cg sync pull`, materialize every remote worker result that has arrived. For each local
+/// anchor digest whose understanding job now has a landed `work_results` row (`done`) but whose
+/// completion marker is absent, deserialize the worker's structured output and commit it onto the
+/// digest — model-free, idempotent under the write-once marker, and dropped when the anchor digest was
+/// `cg forget`-purged. This is the seam the CLI's `cg sync pull` calls so a pulled result actually
+/// BECOMES memory rather than only flipping status to `done`. Returns the digests newly materialized.
+pub fn apply_pulled_results(store: &Store) -> Result<Vec<DigestId>> {
+    let mut applied = Vec::new();
+    for context in store.list_contexts()? {
+        for (digest_id, _order) in context_digests(store, context.id)? {
+            let job_id = understanding_job_id(digest_id);
+            if !job_exists(store, &job_id)? {
+                continue;
+            }
+            if let Some(ApplyOutcome::Applied(id)) = apply_recorded_result(store, digest_id, None)?
+            {
+                applied.push(id);
+            }
+        }
+    }
+    Ok(applied)
 }
 
 /// Map a ledger job id back to its anchor digest. A real understanding job id encodes the digest
@@ -498,7 +594,7 @@ pub fn drain_local_worker(
         // ORIGINAL digest — the executor's structuring and the owner's apply collapse on one node.
         // The write-once apply marker joins the SAME transaction as the graph write (a crash can
         // never leave the graph applied but the marker missing).
-        run_capture_into_digest_with_completion(
+        let (report, _harness) = run_capture_into_digest_with_completion(
             store,
             CaptureRequest {
                 context_label,
@@ -517,10 +613,12 @@ pub fn drain_local_worker(
         )?;
         // Record the exactly-once result (executor = this node). This is the worker-plane receipt,
         // deliberately a separate append-only ledger write from the owner-plane apply marker above.
+        // Its tokens and wall-clock are the model's REAL reported usage for this understanding (read
+        // from the capture report's usage), never the input byte length or a zero clock.
         let receipt = FabricExecutionReceipt {
             executor_node_id: node_id.to_string(),
-            total_tokens: candidate.chunk_text.len() as u64,
-            wall_clock_ms: 0,
+            total_tokens: total_usage_tokens(&report.model_usage),
+            wall_clock_ms: total_usage_elapsed_ms(&report.model_usage),
         };
         work_ledger::record_result(
             store.internal_db(),
@@ -768,20 +866,19 @@ impl<E: ConversationExtractor + Sync> contextdb_server::work_ledger::WorkExecuto
             Ok(harvest) => harvest,
             Err(err) => return ExecutionVerdict::Failed(err.to_string()),
         };
-        // The output is the structured result the owner applies; the receipt carries THIS node's id
-        // and its own token count verbatim (the owner never reconstructs it).
-        let output = serde_json::to_vec(&serde_json::json!({
-            "goals": harvest.goals.len(),
-            "entities": harvest.entities.len(),
-            "decisions": harvest.decisions.len(),
-            "observations": harvest.observations.len(),
-        }))
-        .unwrap_or_default();
+        // The worker's REAL spend for this job: the model's own reported token usage and the measured
+        // per-call wall-clock, read from the SAME `drain_model_usage` source the worker's stderr line
+        // reports — never the input byte length, never a zero clock. The owner reads this receipt
+        // verbatim off `work_results`; it is never reconstructed on the submitter.
+        let usage = self.extractor.drain_model_usage();
         let receipt = FabricExecutionReceipt {
             executor_node_id: self.node_id.clone(),
-            total_tokens: transcript.len() as u64,
-            wall_clock_ms: 0,
+            total_tokens: total_usage_tokens(&usage),
+            wall_clock_ms: total_usage_elapsed_ms(&usage),
         };
+        // The output is the worker's full STRUCTURED HARVEST — the owner applies THIS payload onto the
+        // anchor digest without re-running a model. Serialized verbatim; the owner deserializes it.
+        let output = serde_json::to_vec(&harvest).unwrap_or_default();
         ExecutionVerdict::Completed(ExecutionOutput {
             output,
             receipt: receipt.to_properties_value(),
@@ -962,4 +1059,49 @@ impl FabricExecutionReceipt {
             "wall_clock_ms": self.wall_clock_ms,
         })
     }
+
+    /// Parse a receipt back from the operational-lane value a worker recorded — the inverse of
+    /// [`FabricExecutionReceipt::to_properties_value`]. `None` when the value is missing a field.
+    pub fn from_properties_value(value: &Value) -> Option<Self> {
+        Some(Self {
+            executor_node_id: value.get("executor_node_id")?.as_str()?.to_string(),
+            total_tokens: value.get("total_tokens")?.as_u64()?,
+            wall_clock_ms: value.get("wall_clock_ms")?.as_u64()?,
+        })
+    }
+}
+
+/// The recorded execution receipt for a job, or `None` when no result has landed yet. Read straight
+/// from the `work_results` row — the executor's own numbers, never reconstructed. The `cg worker` loop
+/// reads it for its stderr/budget so the log line and the stored receipt report the SAME real tokens
+/// and wall-clock (one source of truth).
+pub fn recorded_receipt(store: &Store, job_id: &str) -> Result<Option<FabricExecutionReceipt>> {
+    let Some(result) = work_ledger::job_result(store.internal_db(), job_id).map_err(map_engine)?
+    else {
+        return Ok(None);
+    };
+    Ok(FabricExecutionReceipt::from_properties_value(
+        &result.receipt,
+    ))
+}
+
+/// Sum the model-reported total tokens across a run's usage records — the real provider token count,
+/// zero when a run reported no usage. Never the input byte length.
+fn total_usage_tokens(usage: &[ModelCallUsage]) -> u64 {
+    usage
+        .iter()
+        .map(|call| match &call.usage {
+            UsageReportState::Tokens(provider) => provider.total_tokens,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Sum the measured per-call wall-clock across a run's usage records, in milliseconds — the real time
+/// the model calls took, the same figure the worker's stderr line reports.
+fn total_usage_elapsed_ms(usage: &[ModelCallUsage]) -> u64 {
+    usage
+        .iter()
+        .map(|call| call.elapsed.as_millis() as u64)
+        .sum()
 }

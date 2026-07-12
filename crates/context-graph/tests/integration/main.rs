@@ -8,10 +8,12 @@ mod invalidation_fixtures;
 mod refactor_extractor;
 
 mod fabric_apply_atomicity;
+mod fabric_apply_materializes;
 mod fabric_capture;
 mod fabric_exactly_once;
 mod fabric_migration;
 mod fabric_privacy;
+mod fabric_receipt_honesty;
 mod fabric_retention;
 mod fabric_sharing_push_set;
 mod fabric_status;

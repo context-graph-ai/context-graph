@@ -1178,13 +1178,13 @@ fn handle_worker(args: &[String]) -> i32 {
         poll_interval.as_millis()
     );
 
-    let mut spent: Vec<ModelCallUsage> = Vec::new();
+    let mut spent_tokens: u64 = 0;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             eprintln!("cg worker: shutdown requested; no new jobs taken.");
             break;
         }
-        if budget.exhausted(&spent) {
+        if budget.exhausted_tokens(spent_tokens) {
             eprintln!("cg worker: budget ceiling reached; stopping.");
             break;
         }
@@ -1193,20 +1193,26 @@ fn handle_worker(args: &[String]) -> i32 {
         // poll, then push the result back — so this remote node actually sees peers' jobs and delivers
         // its outcomes, rather than scanning only its own local db (the two-root rehearsal defect).
         let outcome = run_worker_poll(&client, &store, &extractor, &worker_config, now_millis());
-        // Fold this poll's model spend into the running total the budget ceiling is measured against.
-        let usage = extractor.drain_model_usage();
-        let tokens = spent_total_tokens(&usage).unwrap_or(0);
-        spent.extend(usage);
         match outcome {
             Ok(FabricPollOutcome::Executed { job_id }) => {
-                eprintln!(
-                    "worker: job {job_id} executed tokens={tokens} elapsed_ms={}",
-                    started.elapsed().as_millis()
-                );
+                // The executor recorded the REAL receipt (its model's own tokens and measured
+                // wall-clock) on the `work_results` row. Read it back so the log line and the stored
+                // receipt report ONE source of truth — the executor drained the usage to build the
+                // receipt, so re-draining the extractor here would report zero.
+                let receipt = context_graph::fabric::recorded_receipt(&store, &job_id)
+                    .ok()
+                    .flatten();
+                let tokens = receipt.as_ref().map(|r| r.total_tokens).unwrap_or(0);
+                let elapsed_ms = receipt
+                    .as_ref()
+                    .map(|r| r.wall_clock_ms)
+                    .unwrap_or_else(|| started.elapsed().as_millis() as u64);
+                spent_tokens = spent_tokens.saturating_add(tokens);
+                eprintln!("worker: job {job_id} executed tokens={tokens} elapsed_ms={elapsed_ms}");
             }
             Ok(FabricPollOutcome::Applied { digest }) => {
                 eprintln!(
-                    "worker: job applied digest={digest} tokens={tokens} elapsed_ms={}",
+                    "worker: job applied digest={digest} tokens=0 elapsed_ms={}",
                     started.elapsed().as_millis()
                 );
             }
@@ -1352,6 +1358,13 @@ impl DrainBudget {
             return false;
         };
         spent_total_tokens(spent).is_some_and(|tokens| tokens >= max)
+    }
+
+    /// Whether a directly-tracked running token spend (e.g. summed from recorded execution receipts,
+    /// as the `cg worker` loop does) has reached the ceiling. A run with no configured budget never
+    /// trips — the drain is bounded by the backlog instead.
+    fn exhausted_tokens(&self, spent_tokens: u64) -> bool {
+        self.max_tokens.is_some_and(|max| spent_tokens >= max)
     }
 }
 
@@ -3351,6 +3364,16 @@ fn handle_sync(args: &[String]) -> i32 {
                     context_graph::skill_store::reconcile_skills_from_teaching_events(
                         stores.admin.sync_database().as_ref(),
                     );
+                    // Materialize every remote worker result that just arrived: a done job's structured
+                    // payload becomes local memory here, model-free and idempotent under the write-once
+                    // completion marker. Without this a pulled result flipped `cg status` to done while
+                    // the submitter's graph stayed empty (the two-root rehearsal defect).
+                    if let Err(err) = context_graph::fabric::apply_pulled_results(&stores.admin) {
+                        eprintln!(
+                            "cg sync pull: applied synced rows, but materializing arrived worker \
+                             results failed: {err:?}"
+                        );
+                    }
                     let status = sync_status_report(
                         store,
                         Some(&remote_url),
