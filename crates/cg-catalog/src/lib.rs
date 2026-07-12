@@ -1,3 +1,4 @@
+pub mod acceleration;
 mod error;
 mod model_connection;
 

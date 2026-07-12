@@ -130,6 +130,7 @@ impl ConversationExtractor for FlowTaggedUsageExtractor {
             outcome: ModelCallOutcome::Captured,
             flow_tag: None,
             model_id: None,
+            runtime: None,
         });
         let mut harvest = StructuredHarvest::default();
         harvest.goals.push(GoalSeed {
@@ -168,6 +169,7 @@ impl ConversationExtractor for FlowTaggedUsageExtractor {
             outcome: ModelCallOutcome::Captured,
             flow_tag: None,
             model_id: None,
+            runtime: None,
         });
         Ok(None)
     }

@@ -9,6 +9,7 @@ mod generic_llm_endpoint;
 mod install_uninstall;
 mod license_gate;
 mod list_show;
+mod local_gguf_usage;
 mod prefetch_first_touch;
 mod swap;
 mod sync_arrival;

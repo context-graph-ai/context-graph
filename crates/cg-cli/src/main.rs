@@ -4147,6 +4147,7 @@ impl ConnectedModelExtractor {
                 outcome: receipt.outcome,
                 flow_tag: None,
                 model_id: None,
+                runtime: None,
             });
         }
     }

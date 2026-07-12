@@ -37,6 +37,20 @@ pub enum UsageReportState {
     Zero,
 }
 
+/// Local-understanding runtime facts riding the SAME call record as its usage — the operational
+/// join test 1.4 (`local_gguf_run_receipt_carries_usage_and_backend_from_same_run`) depends on.
+/// Deliberately primitive-only (no `cg-local-llm` / `cg-catalog` types): `context-graph` must not
+/// depend on those crates, so the caller (cg-catalog) renders its typed backend report down to
+/// these plain strings/numbers before attaching it to a `ModelCallUsage`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRuntimeReceipt {
+    pub binary_capability: String,
+    pub configured_backend: String,
+    pub active_backend: String,
+    pub gpu_layers: Option<i32>,
+    pub fallback_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCallUsage {
     pub chunk_index: usize,
@@ -49,6 +63,10 @@ pub struct ModelCallUsage {
     pub flow_tag: Option<String>,
     /// The model id when the record is flow-tagged; `None` on the raw cost-receipt path.
     pub model_id: Option<String>,
+    /// Local-understanding backend/runtime facts for THIS call, when it ran through the local
+    /// GGUF route. `None` for hosted calls and for local calls that predate this field.
+    /// Operational metadata only — never a decision-basis lane.
+    pub runtime: Option<LocalRuntimeReceipt>,
 }
 
 impl ModelCallUsage {
@@ -329,6 +347,7 @@ pub fn capture_with_progress_observer(
                 outcome: ModelCallOutcome::Captured,
                 flow_tag: None,
                 model_id: None,
+                runtime: None,
             });
         } else {
             for record in &mut drained {
@@ -690,13 +709,15 @@ fn model_call_usage_json(call: &ModelCallUsage) -> Value {
     let receipt = call.model_receipt();
     let reliability_level = receipt.reliability_level.as_receipt_str();
     let outcome = receipt.outcome.as_receipt_str();
-    match &call.usage {
+    let mut value = match &call.usage {
         UsageReportState::Tokens(usage) => json!({
             "chunk_index": call.chunk_index,
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
+            "generated_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
             "elapsed_ms": call.elapsed.as_millis() as u64,
+            "wall_clock_ms": call.elapsed.as_millis() as u64,
             "reliability_level": reliability_level,
             "outcome": outcome,
         }),
@@ -704,8 +725,10 @@ fn model_call_usage_json(call: &ModelCallUsage) -> Value {
             "chunk_index": call.chunk_index,
             "prompt_tokens": 0,
             "completion_tokens": 0,
+            "generated_tokens": 0,
             "total_tokens": 0,
             "elapsed_ms": call.elapsed.as_millis() as u64,
+            "wall_clock_ms": call.elapsed.as_millis() as u64,
             "reliability_level": reliability_level,
             "outcome": outcome,
         }),
@@ -713,10 +736,32 @@ fn model_call_usage_json(call: &ModelCallUsage) -> Value {
             "chunk_index": call.chunk_index,
             "usage": null,
             "elapsed_ms": call.elapsed.as_millis() as u64,
+            "wall_clock_ms": call.elapsed.as_millis() as u64,
             "reliability_level": reliability_level,
             "outcome": outcome,
         }),
+    };
+    // Fold local-understanding runtime facts into the SAME call record (test 1.4's "same run"
+    // requirement) — additive keys only, never replacing the usage fields above.
+    if let Some(runtime) = &call.runtime
+        && let Some(obj) = value.as_object_mut()
+    {
+        obj.insert(
+            "binary_capability".to_string(),
+            json!(runtime.binary_capability),
+        );
+        obj.insert(
+            "configured_backend".to_string(),
+            json!(runtime.configured_backend),
+        );
+        obj.insert("active_backend".to_string(), json!(runtime.active_backend));
+        obj.insert("gpu_layers".to_string(), json!(runtime.gpu_layers));
+        obj.insert(
+            "fallback_reason".to_string(),
+            json!(runtime.fallback_reason),
+        );
     }
+    value
 }
 
 fn progress_event(

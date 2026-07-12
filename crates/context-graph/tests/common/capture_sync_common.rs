@@ -149,6 +149,7 @@ pub fn provider_with_unique_usage_for_chunks(
             outcome: ModelCallOutcome::Captured,
             flow_tag: None,
             model_id: None,
+            runtime: None,
         })
         .collect::<Vec<_>>();
     (
@@ -352,6 +353,7 @@ impl<'a> ProviderBackedExtractor<'a> {
             outcome: ModelCallOutcome::Captured,
             flow_tag: None,
             model_id: None,
+            runtime: None,
         });
     }
 }

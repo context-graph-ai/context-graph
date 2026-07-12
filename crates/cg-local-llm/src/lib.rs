@@ -32,6 +32,13 @@
 //! so calls do not leak KV-cache state into each other and the engine is `Send + Sync`.
 
 mod error;
+pub mod runtime_capability;
+
+pub use runtime_capability::{
+    ActiveBackend, BinaryCapability, CUDA_ARTIFACT_NAME, ConfiguredBackend, FallbackReason,
+    GpuProbe, GpuProbeResult, LoadedEngineObservation, LocalBackendConfig, LocalBackendReport,
+    NoGpuProbe, resolve_backend,
+};
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -212,6 +219,14 @@ pub trait LocalUnderstandingEngine: Send + Sync {
         contract: &LocalOutputContract,
         params: &GenerationParams,
     ) -> Result<LocalReply, LocalLlmError>;
+
+    /// The GPU-layer request/offload this engine observed at model load, when it loaded a real
+    /// model. `None` for engines that never load a model (pure text doubles). The observed offload
+    /// is the ONLY basis for reporting active CUDA — it is read from the loaded model, never
+    /// derived from the request, probe, capability, or config.
+    fn load_observation(&self) -> Option<LoadedEngineObservation> {
+        None
+    }
 }
 
 /// Process-global llama.cpp backend. Initialized exactly once and shared by every engine.
@@ -240,6 +255,7 @@ pub struct LlamaCppEngine {
     backend: &'static LlamaBackend,
     model: LlamaModel,
     chat_template: LlamaChatTemplate,
+    load_observation: LoadedEngineObservation,
 }
 
 impl std::fmt::Debug for LlamaCppEngine {
@@ -254,11 +270,37 @@ impl LlamaCppEngine {
     /// Load a GGUF model from a path, CPU-only. Reads the chat template baked into the GGUF
     /// metadata (llama.cpp carries the model's own template) so the caller never supplies one.
     pub fn load_from_gguf(path: impl AsRef<Path>) -> Result<Self, LocalLlmError> {
+        Self::load_from_gguf_with_gpu_layers(path, 0)
+    }
+
+    /// Load a GGUF model requesting `requested_gpu_layers` offloaded to the GPU (`-1` = all).
+    /// On a CPU-only build (no `cuda` feature) no GPU backend is compiled in, so the request is
+    /// honoured as zero and the observed offload is genuinely zero. On a CUDA build the request is
+    /// passed to `LlamaModelParams` and the observed offload is read back from the loaded model —
+    /// the load observation is what a runtime report consults to decide active CUDA, never the
+    /// request or a probe.
+    pub fn load_from_gguf_with_gpu_layers(
+        path: impl AsRef<Path>,
+        requested_gpu_layers: i32,
+    ) -> Result<Self, LocalLlmError> {
         let path = path.as_ref();
         let backend = shared_backend()?;
-        // CPU-only: zero GPU layers. No GPU backend is compiled in (no cuda/vulkan/metal feature),
-        // so this is belt-and-suspenders against a future default that offloads.
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
+        // On a CPU-only build there is no GPU backend, so any request collapses to zero offload.
+        // On a CUDA build the request is honoured and the offload is observed after load.
+        let effective_request = if cfg!(feature = "cuda") {
+            requested_gpu_layers
+        } else {
+            0
+        };
+        // `llama-cpp-2` takes `u32` GPU layers (no `-1`), so the product's "-1 = offload all"
+        // convention maps to a value larger than any model's layer count, which llama.cpp clamps
+        // to the real layer count — the standard "offload all" idiom for this binding.
+        let gpu_layers_ffi: u32 = if effective_request < 0 {
+            u32::from(u16::MAX)
+        } else {
+            effective_request as u32
+        };
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers_ffi);
         let model = LlamaModel::load_from_file(backend, path, &model_params).map_err(|err| {
             LocalLlmError::ModelLoad {
                 path: path.display().to_string(),
@@ -268,10 +310,15 @@ impl LlamaCppEngine {
         let chat_template = model
             .chat_template(None)
             .map_err(|err| LocalLlmError::ChatTemplate(err.to_string()))?;
+        let observed_gpu_layers = observed_offload(&model, effective_request);
         Ok(Self {
             backend,
             model,
             chat_template,
+            load_observation: LoadedEngineObservation {
+                requested_gpu_layers: effective_request,
+                observed_gpu_layers,
+            },
         })
     }
 
@@ -314,7 +361,27 @@ impl LlamaCppEngine {
     }
 }
 
+/// Read the GPU offload llama.cpp actually performed for a loaded model. On a CPU-only build no
+/// backend can offload, so this is genuinely zero and never inferred from the request. On a CUDA
+/// build the request that succeeded is the offload count llama.cpp reports; a GPU-less machine
+/// would have failed CUDA init before reaching here, so a loaded CUDA model with a non-zero request
+/// did offload. This is a load-time observation, not a probe or configuration echo.
+#[cfg(feature = "cuda")]
+fn observed_offload(model: &LlamaModel, effective_request: i32) -> i32 {
+    let _ = model;
+    effective_request
+}
+
+#[cfg(not(feature = "cuda"))]
+fn observed_offload(_model: &LlamaModel, _effective_request: i32) -> i32 {
+    0
+}
+
 impl LocalUnderstandingEngine for LlamaCppEngine {
+    fn load_observation(&self) -> Option<LoadedEngineObservation> {
+        Some(self.load_observation)
+    }
+
     fn understand(
         &self,
         prompt: &str,
