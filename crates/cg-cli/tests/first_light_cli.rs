@@ -1566,7 +1566,7 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
     let server = Arc::new(SyncServer::new(
         Arc::clone(&hub_db),
         &nats.nats_url,
-        &tenant_id,
+        contextdb_core::TenantId::from(&tenant_id),
         context_graph_sync_conflict_policies(),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1590,7 +1590,11 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
 }
 
 fn cli_expected_pending_push_change_count(store: &Store, nats_url: &str, tenant_id: &str) -> usize {
-    let client = SyncClient::new(store.sync_database(), nats_url, tenant_id);
+    let client = SyncClient::new(
+        store.sync_database(),
+        nats_url,
+        contextdb_core::TenantId::from(tenant_id),
+    );
     context_graph_pending_push_change_count(client.db(), client.push_watermark())
 }
 

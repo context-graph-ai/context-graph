@@ -50,7 +50,7 @@ use context_graph::{
     register_context_graph_sync_client, sync_status_report, usage_receipt_from_calls,
     usage_receipt_json,
 };
-use contextdb_core::{Lsn, Value as DbValue};
+use contextdb_core::{Lsn, TenantId, Value as DbValue};
 use contextdb_engine::{
     Database,
     sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection},
@@ -3034,7 +3034,11 @@ impl ContextGraphSyncRegistration for CliSyncClientRegistration<'_> {
 
 impl CliSyncBoundary {
     fn new(data_store: &Store, _admin_store: &Store, remote_url: &str, tenant_id: &str) -> Self {
-        let client = SyncClient::new(data_store.sync_database(), remote_url, tenant_id);
+        let client = SyncClient::new(
+            data_store.sync_database(),
+            remote_url,
+            TenantId::from(tenant_id),
+        );
         register_context_graph_sync_client(&CliSyncClientRegistration(&client));
         Self {
             client,
@@ -3051,7 +3055,7 @@ impl CliSyncBoundary {
     fn persisted_push_watermark(&self) -> Lsn {
         self.client
             .db()
-            .persisted_sync_watermarks(self.client.tenant_id())
+            .persisted_sync_watermarks(&TenantId::from(self.client.tenant_id()))
             .map(|(push, _)| push)
             .unwrap_or_else(|_| self.client.push_watermark())
     }
@@ -3059,7 +3063,7 @@ impl CliSyncBoundary {
     fn persisted_pull_watermark(&self) -> Lsn {
         self.client
             .db()
-            .persisted_sync_watermarks(self.client.tenant_id())
+            .persisted_sync_watermarks(&TenantId::from(self.client.tenant_id()))
             .map(|(_, pull)| pull)
             .unwrap_or_else(|_| self.client.pull_watermark())
     }

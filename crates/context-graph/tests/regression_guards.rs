@@ -404,7 +404,7 @@ async fn sync_transport_and_restore_still_round_trips_after_refactor() {
     let restored_client = contextdb_server::SyncClient::new(
         restored_edge.store.sync_database(),
         &fixture.nats_url,
-        &fixture.tenant_id,
+        contextdb_core::TenantId::from(&fixture.tenant_id),
     );
     register_cg_sync_tables(&restored_client);
     assert_eq!(

@@ -22,7 +22,7 @@ use context_graph::{
     context_graph_sync_conflict_policies, context_graph_sync_table_contract,
     provider_usage_from_str, register_context_graph_sync_client,
 };
-use contextdb_core::{Lsn, Value as DbValue};
+use contextdb_core::{Lsn, TenantId, Value as DbValue};
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
 use contextdb_server::{SyncClient, SyncServer};
 use tempfile::TempDir;
@@ -809,12 +809,12 @@ impl PreClientSyncFixture {
         let edge1_client = SyncClient::new(
             self.edge1.store.sync_database(),
             &self.nats_url,
-            &self.tenant_id,
+            TenantId::from(&self.tenant_id),
         );
         let edge2_client = SyncClient::new(
             self.edge2.store.sync_database(),
             &self.nats_url,
-            &self.tenant_id,
+            TenantId::from(&self.tenant_id),
         );
         register_cg_sync_tables(&edge1_client);
         register_cg_sync_tables(&edge2_client);
@@ -855,7 +855,7 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
     let server = Arc::new(SyncServer::new(
         Arc::clone(&hub_db),
         &nats.nats_url,
-        &tenant_id,
+        TenantId::from(&tenant_id),
         policies.clone(),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -870,8 +870,16 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
 
     let edge1 = TestStore::new(&format!("{test_name}_edge1"));
     let edge2 = TestStore::new(&format!("{test_name}_edge2"));
-    let edge1_client = SyncClient::new(edge1.store.sync_database(), &nats.nats_url, &tenant_id);
-    let edge2_client = SyncClient::new(edge2.store.sync_database(), &nats.nats_url, &tenant_id);
+    let edge1_client = SyncClient::new(
+        edge1.store.sync_database(),
+        &nats.nats_url,
+        TenantId::from(&tenant_id),
+    );
+    let edge2_client = SyncClient::new(
+        edge2.store.sync_database(),
+        &nats.nats_url,
+        TenantId::from(&tenant_id),
+    );
     register_cg_sync_tables(&edge1_client);
     register_cg_sync_tables(&edge2_client);
     let nats_url = nats.nats_url.clone();
@@ -898,7 +906,7 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
     let server = Arc::new(SyncServer::new(
         Arc::clone(&shared_db),
         &nats.nats_url,
-        &tenant_id,
+        TenantId::from(&tenant_id),
         policies,
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -910,7 +918,11 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
         })
     };
     wait_for_nats(&nats.nats_url).await;
-    let client = SyncClient::new(node.store.sync_database(), &nats.nats_url, &tenant_id);
+    let client = SyncClient::new(
+        node.store.sync_database(),
+        &nats.nats_url,
+        TenantId::from(&tenant_id),
+    );
     register_cg_sync_tables(&client);
     SelfEchoSyncFixture {
         _nats: nats,
@@ -930,7 +942,7 @@ pub async fn pre_client_sync_fixture(test_name: &str) -> PreClientSyncFixture {
     let server = Arc::new(SyncServer::new(
         Arc::clone(&hub_db),
         &nats.nats_url,
-        &tenant_id,
+        TenantId::from(&tenant_id),
         policies.clone(),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));

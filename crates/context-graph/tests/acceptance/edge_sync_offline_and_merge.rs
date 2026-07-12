@@ -13,7 +13,7 @@ async fn capture_succeeds_offline_and_syncs_on_reconnect() {
     let down_client = contextdb_server::SyncClient::new(
         fixture.edge1.store.sync_database(),
         "nats://127.0.0.1:1",
-        &fixture.tenant_id,
+        contextdb_core::TenantId::from(&fixture.tenant_id),
     );
     let push_while_down = down_client.push().await;
 
