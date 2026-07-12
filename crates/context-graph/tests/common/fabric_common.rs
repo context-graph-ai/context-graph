@@ -225,6 +225,28 @@ impl ConversationExtractor for CountingExtractor {
     }
 }
 
+/// An extractor double that never produces a result — every call fails at the model boundary. A
+/// worker running it records a `work_failures` row per attempt and no `work_results` row, so the job
+/// leases-then-fails instead of completing. This is what the status tests that assert
+/// leased-then-reclaimable and attempt-ceiling-reached-becomes-failed require: their stated intent is
+/// a non-completing executor, which a succeeding extractor cannot exercise.
+#[derive(Debug, Default)]
+pub struct FailingExtractor;
+
+impl FailingExtractor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ConversationExtractor for FailingExtractor {
+    fn extract(&self, _request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
+        Err(context_graph::CgError::Engine(
+            "fabric executor produced no result".to_string(),
+        ))
+    }
+}
+
 /// A capture fault seam that fails on demand, forcing the capture transaction to roll back after the
 /// digest write.
 #[derive(Debug, Default)]

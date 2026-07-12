@@ -7,7 +7,8 @@
 use context_graph::fabric::{self, FabricCapture, FabricPollOutcome, FabricWorkerConfig};
 
 use crate::fabric_common::{
-    CountingExtractor, FabricNode, context_id, fabric_fixture, push_then_pull, tier0_request,
+    CountingExtractor, FabricNode, FailingExtractor, context_id, fabric_fixture, push_then_pull,
+    tier0_request,
 };
 
 const SESSION: &str = "User: Goal G1: run understanding remotely. Assistant: Decision D1: keep the auth module at src/auth.py.";
@@ -27,7 +28,7 @@ async fn expired_lease_job_not_shown_as_running() {
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
 
     // Edge2 claims (leases) the job at t=1000, then produces no result.
-    let extractor = CountingExtractor::new();
+    let extractor = FailingExtractor::new();
     let config = FabricWorkerConfig::for_node("edge-2");
     let _ = fabric::run_worker_once(
         &fixture.edge2_client,
@@ -146,7 +147,7 @@ async fn attempt_ceiling_reached_marks_terminal_failed_visible_in_status() {
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
 
     // Exhaust the attempt ceiling with failing polls (injected clock advancing past each lease).
-    let extractor = CountingExtractor::new();
+    let extractor = FailingExtractor::new();
     let config = FabricWorkerConfig::for_node("edge-2");
     for attempt in 0..5 {
         let now = 1_000 + attempt * (config.lease_ms + 1);
