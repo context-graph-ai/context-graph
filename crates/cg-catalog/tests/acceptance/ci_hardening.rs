@@ -32,6 +32,12 @@ const ALLOWED_ADVISORY_IGNORES: &[&str] = &[
     // postcard -> heapless 0.7); never compiled for shipped targets; no safe
     // upgrade until postcard moves to heapless 0.8.
     "RUSTSEC-2023-0089",
+    // proc-macro-error (unmaintained): build-time proc-macro helper reached
+    // solely via the dial-by-key sync transport's blob plane (iroh-blobs ->
+    // bao-tree -> genawaiter -> genawaiter-proc-macro); compiled only on the
+    // host at build time, never linked into a shipped artifact; no upgrade path
+    // until bao-tree/genawaiter drop it.
+    "RUSTSEC-2024-0370",
 ];
 const CARGO_AUDIT_ALIASES: &[&str] = &["deny", "expand"];
 const COMMAND_LOOKUP_ENV_KEYS: &[&str] = &["PATH", "BASH_ENV", "ENV", "SHELLOPTS", "IFS"];
