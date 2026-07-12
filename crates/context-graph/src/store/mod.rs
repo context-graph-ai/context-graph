@@ -689,6 +689,11 @@ fn existing_shared_database(db_path: &Path) -> Option<Arc<Database>> {
 }
 
 fn initialize_schema(db: &Database) -> Result<()> {
+    // Install the shipped work-ledger schema (the seven append-only fabric tables) alongside cg's
+    // own schema at store open. Idempotent — creates only missing tables — so reads of work_* hit an
+    // empty table rather than erroring on a missing one. The fabric slice consumes this ledger; the
+    // tables are inert on a single-node install.
+    contextdb_engine::work_ledger::install_work_ledger_schema(db).map_err(map_engine_err)?;
     for table in TABLES {
         if db.table_meta(table.name).is_some() {
             continue;

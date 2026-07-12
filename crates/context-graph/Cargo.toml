@@ -29,6 +29,8 @@ candle-transformers = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
+contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["nats"] }
+fs4.workspace = true
 pollster.workspace = true
 safetensors = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }

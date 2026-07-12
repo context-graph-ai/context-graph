@@ -39,6 +39,15 @@ fn usage_is_not_a_basis_input_compile_fail() {
 }
 
 #[test]
+fn fabric_receipt_cannot_become_decision_basis() {
+    // RED at scaffold: the receipt type still carries a `From<_> for serde_json::Value`, so the
+    // .rs COMPILES and trybuild reports the expected-compile-fail did not trigger. The impl removes
+    // that `From` (installing the operational barrier), flipping this case green.
+    let trybuild = trybuild::TestCases::new();
+    trybuild.compile_fail("tests/compile-fail/fabric_receipt_not_basis.rs");
+}
+
+#[test]
 fn bare_store_invalidation_op_does_not_compile() {
     let trybuild = trybuild::TestCases::new();
     trybuild.compile_fail("tests/compile_fail/invalidation_requires_principal.rs");

@@ -16,6 +16,7 @@ mod edge_sync_convergence;
 mod edge_sync_offline_and_merge;
 mod entity_reference_match;
 mod evidence;
+mod fabric_frozen_rules;
 #[path = "../common/fake_extractor.rs"]
 mod fake_extractor;
 mod find_via_digests;

@@ -1,9 +1,18 @@
+#[path = "../common/fabric_common.rs"]
+mod fabric_common;
 #[path = "../common/fake_extractor.rs"]
 mod fake_extractor;
 #[path = "../common/invalidation_fixtures.rs"]
 mod invalidation_fixtures;
 #[path = "../common/refactor_extractor.rs"]
 mod refactor_extractor;
+
+mod fabric_capture;
+mod fabric_exactly_once;
+mod fabric_migration;
+mod fabric_privacy;
+mod fabric_retention;
+mod fabric_status;
 
 mod cluster_aggregate_substrate;
 #[cfg(context_graph_internal_test_support)]

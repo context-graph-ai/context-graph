@@ -1163,6 +1163,7 @@ dependencies = [
  "contextdb-tx",
  "contextdb-vector",
  "criterion",
+ "fs4",
  "pollster",
  "safetensors 0.7.0",
  "serde",

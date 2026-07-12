@@ -4,6 +4,7 @@ pub mod embedder;
 pub mod embedding_space;
 pub mod embedding_target;
 pub mod error;
+pub mod fabric;
 pub mod grounding;
 pub mod harness;
 pub mod ingest;
