@@ -199,19 +199,17 @@ pub const TABLES: &[TableSpec] = &[
         name: "cg_pending_review_items",
         ddl: "CREATE TABLE cg_pending_review_items (id TEXT PRIMARY KEY, acted_on BOOLEAN NOT NULL DEFAULT false, content TEXT, legal_vocab TEXT, created_at TXID NOT NULL)",
     },
-    // Tier-0 deterministic-capture tables (schema v9). Raw source chunks are the local
+    // Tier-0 deterministic-capture tables (schema v10). Raw source chunks are the local
     // understanding substrate and NEVER sync (SyncDirection::None) — the graph is the durable synced
-    // asset. The understanding queue + retrieval touches + local settings are per-device runtime
-    // state (None). Understanding completions are a write-once immutable marker that DOES sync
-    // (Both/InsertIfNotExists), so a second machine that already has the structured output does not
-    // re-understand a digest. See `capture_sync_status::sync_policy_for_table`.
+    // asset. Retrieval touches + local settings are per-device runtime state (None). The private
+    // understanding queue is retired: the shipped work ledger's computed job state
+    // (work_jobs/work_claims/work_failures/work_cancellations) subsumes it. Understanding completions
+    // are a LOCAL write-once apply marker (this node already applied a result onto its digest) and do
+    // NOT sync — the structured graph rows sync, not the apply guard. See
+    // `capture_sync_status::sync_policy_for_table`.
     TableSpec {
         name: "cg_source_chunks",
         ddl: "CREATE TABLE cg_source_chunks (id TEXT PRIMARY KEY, digest_id TEXT NOT NULL, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), seq INTEGER NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, byte_len INTEGER NOT NULL, created_at TXID NOT NULL, created_at_ms INTEGER NOT NULL)",
-    },
-    TableSpec {
-        name: "cg_understanding_queue",
-        ddl: "CREATE TABLE cg_understanding_queue (digest_id TEXT PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, enqueued_at TXID NOT NULL, updated_at TXID NOT NULL)",
     },
     TableSpec {
         name: "cg_retrieval_touches",

@@ -1,0 +1,17 @@
+error[E0277]: the trait bound `serde_json::value::Value: From<FabricExecutionReceipt>` is not satisfied
+  --> tests/compile-fail/fabric_receipt_not_basis.rs:17:72
+   |
+17 |     state_delta.insert("fabric.total_tokens".to_string(), Some(receipt.into()));
+   |                                                                        ^^^^ the trait `From<FabricExecutionReceipt>` is not implemented for `serde_json::value::Value`
+   |
+   = help: the following other types implement trait `From<T>`:
+             `serde_json::value::Value` implements `From<&[T]>`
+             `serde_json::value::Value` implements `From<&str>`
+             `serde_json::value::Value` implements `From<()>`
+             `serde_json::value::Value` implements `From<Cow<'_, str>>`
+             `serde_json::value::Value` implements `From<Option<T>>`
+             `serde_json::value::Value` implements `From<String>`
+             `serde_json::value::Value` implements `From<Vec<T>>`
+             `serde_json::value::Value` implements `From<[T; N]>`
+           and $N others
+   = note: required for `FabricExecutionReceipt` to implement `Into<serde_json::value::Value>`

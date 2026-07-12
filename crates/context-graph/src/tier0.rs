@@ -1,11 +1,12 @@
 //! Tier-0 deterministic capture: the default `cg record` / `cg import` front door.
 //!
 //! Tier-0 capture writes a verbatim digest, its local embedding, the kept raw source chunk, and a
-//! durable understanding-queue row — all in ONE atomic transaction, with ZERO model calls. The
-//! model never runs on this path; understanding (structuring a chunk into the ontology) is deferred
-//! to a later worker that drains the queue. This is the "day one import everything free; overnight
-//! structure locally" contract: capture is instant and costless, so a developer can fill cg with a
-//! session's history without paying a token or waiting on a provider.
+//! durable understanding job on the shipped work ledger (`work_jobs` + its copied `work_inputs`) —
+//! all in ONE atomic transaction, with ZERO model calls. The model never runs on this path;
+//! understanding (structuring a chunk into the ontology) is deferred to a later worker that drains the
+//! ledger. This is the "day one import everything free; overnight structure locally" contract:
+//! capture is instant and costless, so a developer can fill cg with a session's history without
+//! paying a token or waiting on a provider.
 //!
 //! Raw source chunks NEVER leave the machine (`cg_source_chunks` syncs `None`) — the graph is the
 //! durable, synced asset; raw is local understanding substrate. Because raw is kept, this module
@@ -16,14 +17,28 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use contextdb_core::{Value as DbValue, VectorIndexRef};
+use contextdb_engine::work_ledger::{
+    self, InputRef, JobSpec, add_job_input_in_tx, job_state, submit_job_in_tx,
+};
 use sha2::{Digest as _, Sha256};
 
 use crate::embedding_space::BuiltinSpaceRegistry;
+use crate::fabric::CaptureFault;
 use crate::ingest::split_transcript_into_windows;
+use crate::understanding::MAX_UNDERSTANDING_ATTEMPTS;
 use crate::{
     CgError, Context, ContextId, CreateContext, DigestId, EmbeddingId, EvidenceProducer, Result,
     Store,
 };
+
+/// The work-ledger class every tier-0 understanding job is submitted under. A worker advertises this
+/// as a requirement tag to become eligible.
+pub(crate) const UNDERSTANDING_WORK_CLASS: &str = "cg.understanding";
+/// The requirement tag a capable understanding worker must advertise to claim an understanding job.
+pub(crate) const UNDERSTANDING_REQUIREMENT_TAG: &str = "class:cg.understanding";
+/// The stable local submitter/executor node id for a single-node install (submitter, worker, and
+/// digest owner are the same machine). Multi-machine ids arrive with enrollment (a later slice).
+pub(crate) const LOCAL_NODE_ID: &str = "cg-local";
 
 /// Default byte window a tier-0 capture splits a transcript into when the caller does not resolve
 /// one. Each window becomes one verbatim digest (the retrieval granularity).
@@ -72,7 +87,7 @@ pub struct Tier0CaptureReport {
     pub skipped_noise: usize,
     /// Raw bytes kept this capture.
     pub raw_bytes: usize,
-    /// Pending understanding-queue rows in the capture context after this capture.
+    /// Pending understanding jobs in the capture context after this capture (ledger job state).
     pub pending_after: usize,
     /// Always zero — tier-0 never calls a model.
     pub model_calls: usize,
@@ -82,7 +97,7 @@ pub struct Tier0CaptureReport {
     pub digest_ids: Vec<DigestId>,
 }
 
-/// Understanding-queue counts for one context, by state.
+/// Understanding-job counts for one context, by state (computed over the work ledger).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueCounts {
     pub pending: usize,
@@ -146,11 +161,24 @@ pub fn salience_clean(raw: &str) -> String {
     collapse_blank_lines(&without_local)
 }
 
-/// Capture a conversation deterministically: verbatim digest + embedding + raw chunk + queue row
-/// per chunk, all committed in ONE atomic transaction, ZERO model calls. Re-running the same
-/// capture is idempotent — a chunk whose deterministic digest already exists is skipped, writing no
-/// new rows.
+/// Capture a conversation deterministically: verbatim digest + embedding + raw chunk + one ledger
+/// understanding job per chunk, all committed in ONE atomic transaction, ZERO model calls. Re-running
+/// the same capture is idempotent — a chunk whose deterministic digest already exists is skipped,
+/// writing no new rows.
 pub fn capture_tier0(store: &Store, request: Tier0CaptureRequest) -> Result<Tier0CaptureReport> {
+    capture_tier0_inner(store, request, false, None)
+}
+
+/// The fabric-aware tier-0 capture entry point. `source_opt_out` keeps this source's understanding
+/// input local (submitted as an `InputRef::local_path` with no copied `work_inputs` row); `fault` is a
+/// test-only seam that aborts the capture transaction after the digest write to prove all-or-nothing
+/// rollback. Production callers pass `false` / `None`.
+pub(crate) fn capture_tier0_inner(
+    store: &Store,
+    request: Tier0CaptureRequest,
+    source_opt_out: bool,
+    fault: Option<&dyn CaptureFault>,
+) -> Result<Tier0CaptureReport> {
     let transcript = request.transcript.trim();
     let context = context_by_label(store, &request.context_label)?;
     let mut report = Tier0CaptureReport {
@@ -170,7 +198,16 @@ pub fn capture_tier0(store: &Store, request: Tier0CaptureRequest) -> Result<Tier
 
     let db = store.internal_db();
     let tx = db.begin().map_err(map_engine)?;
-    let outcome = write_tier0_chunks(store, tx, context.id, &request, &chunks, &mut report);
+    let outcome = write_tier0_chunks(
+        store,
+        tx,
+        context.id,
+        &request,
+        &chunks,
+        source_opt_out,
+        fault,
+        &mut report,
+    );
     match outcome {
         Ok(()) => {
             db.commit(tx).map_err(map_engine)?;
@@ -186,12 +223,15 @@ pub fn capture_tier0(store: &Store, request: Tier0CaptureRequest) -> Result<Tier
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_tier0_chunks(
     store: &Store,
     tx: crate::TxId,
     context_id: ContextId,
     request: &Tier0CaptureRequest,
     chunks: &[String],
+    source_opt_out: bool,
+    fault: Option<&dyn CaptureFault>,
     report: &mut Tier0CaptureReport,
 ) -> Result<()> {
     let now_ms = Utc::now().timestamp_millis();
@@ -230,7 +270,20 @@ fn write_tier0_chunks(
             &content_hash,
             now_ms,
         )?;
-        write_queue_row(store, tx, context_id, digest_id)?;
+        // Test-only rollback seam: fire after the digest/raw write, before the ledger job/input
+        // writes, so an abort here leaves NOTHING behind — the whole capture transaction rolls back.
+        if let Some(fault) = fault {
+            fault.fail_after_digest()?;
+        }
+        submit_understanding_job(
+            store,
+            tx,
+            context_id,
+            digest_id,
+            chunk,
+            source_opt_out,
+            now_ms,
+        )?;
         report.digests_written += 1;
         report.chunks_kept += 1;
         report.raw_bytes += chunk.len();
@@ -357,66 +410,147 @@ fn write_source_chunk(
     Ok(())
 }
 
-fn write_queue_row(
+/// The deterministic 1:1 ledger job id for a tier-0 digest. Re-importing identical content yields the
+/// same digest and thus the same job id, so `work_jobs`' insert-if-not-exists dedups the resubmit.
+pub(crate) fn understanding_job_id(digest_id: DigestId) -> String {
+    format!("cg.understanding.{}", digest_id.as_uuid())
+}
+
+/// Submit one chunk's understanding as a work-ledger job on the caller's OPEN capture transaction, so
+/// the job (and its ephemeral input copy) commits atomically with the verbatim digest — one $0
+/// model-free transaction, no second commit. The requirement tags carry the worker capability
+/// contract; priority is the digest's local, never-synced retrieval-touch count. The job's
+/// `output_schema` is left unset here — wiring the typed understanding schema onto the job is deferred
+/// with the `llm.rs` output-contract sentinel retirement (the worker/model slice).
+///
+/// Per-source opt-out is a ref-kind swap, not a policy language: an opted-out source submits its input
+/// as `InputRef::local_path` (no copied `work_inputs` row), which the shipped movement policy refuses
+/// for any non-submitter regardless of the global sharing knob. A default source submits
+/// `InputRef::ledger_input` and copies the verbatim chunk into `work_inputs` — the only thing a remote
+/// worker reads. Either way the job row references its input by id and never inlines the bytes.
+fn submit_understanding_job(
     store: &Store,
     tx: crate::TxId,
     context_id: ContextId,
     digest_id: DigestId,
+    chunk: &str,
+    source_opt_out: bool,
+    now_ms: i64,
 ) -> Result<()> {
-    store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "INSERT INTO cg_understanding_queue (digest_id, context_id, status, attempts, last_error, enqueued_at, updated_at) VALUES ($digest_id, $context_id, $status, $attempts, $last_error, $enqueued_at, $updated_at)",
-            &HashMap::from([
-                (
-                    "digest_id".to_string(),
-                    DbValue::Text(digest_id.to_string()),
-                ),
-                (
-                    "context_id".to_string(),
-                    DbValue::Uuid(context_id.as_uuid()),
-                ),
-                ("status".to_string(), DbValue::Text("pending".to_string())),
-                ("attempts".to_string(), DbValue::Int64(0)),
-                ("last_error".to_string(), DbValue::Null),
-                ("enqueued_at".to_string(), DbValue::TxId(tx)),
-                ("updated_at".to_string(), DbValue::TxId(tx)),
-            ]),
-        )
-        .map_err(map_engine)?;
+    let job_id = understanding_job_id(digest_id);
+    let priority = retrieval_touch_count_in(store, digest_id)? as i64;
+    let input_ref = if source_opt_out {
+        InputRef::local_path(&format!("cg_source_chunks/{digest_id}"))
+    } else {
+        InputRef::ledger_input()
+    };
+    let spec = JobSpec::builder(
+        job_id.clone(),
+        UNDERSTANDING_WORK_CLASS,
+        "understand",
+        LOCAL_NODE_ID,
+    )
+    .requirement_tags(vec![UNDERSTANDING_REQUIREMENT_TAG.to_string()])
+    .input_refs(vec![input_ref])
+    .priority(priority)
+    .max_attempts(i64::from(MAX_UNDERSTANDING_ATTEMPTS))
+    .provenance(Some(
+        serde_json::json!({ "context_id": context_id.as_uuid() }),
+    ))
+    .submitted_at_ms(now_ms)
+    .build();
+    submit_job_in_tx(store.internal_db(), tx, &spec).map_err(map_engine)?;
+    if !source_opt_out {
+        // The understanding input: the verbatim chunk text, referenced from the job — never inlined.
+        add_job_input_in_tx(store.internal_db(), tx, &job_id, 0, chunk.as_bytes())
+            .map_err(map_engine)?;
+    }
     Ok(())
 }
 
-/// Count understanding-queue rows in one context, by state.
+/// Count understanding jobs in one context, by state, over the work ledger (the ledger's computed job
+/// state subsumes the retired private queue). A digest carrying a write-once completion is
+/// `structured` regardless of the underlying ledger rows; otherwise the ledger's `job_state` maps
+/// pending/leased/failed/cancelled to pending/in_flight/failed/skipped.
 pub fn queue_counts(store: &Store, context_id: ContextId) -> Result<QueueCounts> {
-    // The engine has no GROUP BY / aggregate support, so tally the status column in Rust.
+    let mut counts = QueueCounts::default();
+    let db = store.internal_db();
+    for (digest_id, _order) in context_digests(store, context_id)? {
+        let digest_text = digest_id.to_string();
+        let job_id = understanding_job_id(digest_id);
+        if !job_exists(store, &job_id)? {
+            continue;
+        }
+        if completion_exists_local(store, &digest_text)? {
+            counts.structured += 1;
+            continue;
+        }
+        match job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)? {
+            work_ledger::JobState::Pending => counts.pending += 1,
+            work_ledger::JobState::Leased { .. } => counts.in_flight += 1,
+            work_ledger::JobState::Done => counts.structured += 1,
+            work_ledger::JobState::Failed => counts.failed += 1,
+            work_ledger::JobState::Cancelled => counts.skipped += 1,
+        }
+    }
+    Ok(counts)
+}
+
+/// The advisory wall-clock the local single-node claim model reads. Local claims take an unexpiring
+/// lease (`i64::MAX`), so any finite clock keeps them live; the fabric worker (a later slice) injects a
+/// real clock for lease-expiry honesty.
+pub(crate) fn ledger_clock_ms() -> i64 {
+    0
+}
+
+/// The digests in a context, each with a monotonic ordering key (the digest's `created_at` TxId), so
+/// callers can order by capture age deterministically.
+pub(crate) fn context_digests(
+    store: &Store,
+    context_id: ContextId,
+) -> Result<Vec<(DigestId, i128)>> {
     let result = store
         .internal_db()
         .execute(
-            "SELECT status FROM cg_understanding_queue WHERE context_id = $context_id",
+            "SELECT id, created_at FROM digests WHERE context_id = $context_id",
             &HashMap::from([(
                 "context_id".to_string(),
                 DbValue::Uuid(context_id.as_uuid()),
             )]),
         )
         .map_err(map_engine)?;
-    let mut counts = QueueCounts::default();
-    for row in &result.rows {
-        let status = match row.first() {
-            Some(DbValue::Text(status)) => status.as_str(),
-            _ => continue,
-        };
-        match status {
-            "pending" => counts.pending += 1,
-            "in_flight" => counts.in_flight += 1,
-            "structured" => counts.structured += 1,
-            "failed" => counts.failed += 1,
-            "skipped" => counts.skipped += 1,
-            _ => {}
-        }
-    }
-    Ok(counts)
+    Ok(result
+        .rows
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(DbValue::Uuid(id)) => {
+                Some((DigestId::from(*id), row.get(1).map(order_key).unwrap_or(0)))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+pub(crate) fn job_exists(store: &Store, job_id: &str) -> Result<bool> {
+    let result = store
+        .internal_db()
+        .execute(
+            "SELECT job_id FROM work_jobs WHERE job_id = $job_id",
+            &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
+        )
+        .map_err(map_engine)?;
+    Ok(!result.rows.is_empty())
+}
+
+pub(crate) fn completion_exists_local(store: &Store, digest_text: &str) -> Result<bool> {
+    let result = store
+        .internal_db()
+        .execute(
+            "SELECT id FROM cg_understanding_completions WHERE id = $id",
+            &HashMap::from([("id".to_string(), DbValue::Text(digest_text.to_string()))]),
+        )
+        .map_err(map_engine)?;
+    Ok(!result.rows.is_empty())
 }
 
 /// Bump the retrieval-touch counter for one digest: increment `touch_count` and stamp
@@ -560,6 +694,7 @@ pub fn forget_raw(
     }
     let db = store.internal_db();
     let tx = db.begin().map_err(map_engine)?;
+    let now_ms = Utc::now().timestamp_millis();
     let outcome = (|| -> Result<()> {
         for target in &targets {
             db.execute_in_tx(
@@ -570,20 +705,42 @@ pub fn forget_raw(
             .map_err(map_engine)?;
             report.chunks_purged += 1;
             report.bytes_purged += target.byte_len;
-            let updated = db
-                .execute_in_tx(
-                    tx,
-                    "UPDATE cg_understanding_queue SET status = 'skipped', updated_at = $updated_at WHERE digest_id = $digest_id AND status = 'pending'",
-                    &HashMap::from([
-                        (
-                            "digest_id".to_string(),
-                            DbValue::Text(target.digest_id.clone()),
-                        ),
-                        ("updated_at".to_string(), DbValue::TxId(tx)),
-                    ]),
-                )
-                .map_err(map_engine)?;
-            report.queue_rows_skipped += updated.rows_affected as usize;
+            // Purging the raw makes an un-understood job un-runnable, so cancel it on the ledger —
+            // the cancellation is the retired queue's `skipped` state. Only a still-pending job is
+            // cancelled (a completed job keeps its result); a re-purge is a no-op.
+            let Some(digest_id) = parse_digest_uuid(&target.digest_id) else {
+                continue;
+            };
+            let job_id = understanding_job_id(DigestId::from(digest_id));
+            if !job_exists(store, &job_id)? {
+                continue;
+            }
+            if completion_exists_local(store, &target.digest_id)? {
+                continue;
+            }
+            if job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)?
+                != work_ledger::JobState::Pending
+            {
+                continue;
+            }
+            db.execute_in_tx(
+                tx,
+                "INSERT INTO work_cancellations (job_id, requested_by, reason, cancelled_at) VALUES ($job_id, $requested_by, $reason, $cancelled_at)",
+                &HashMap::from([
+                    ("job_id".to_string(), DbValue::Text(job_id.clone())),
+                    (
+                        "requested_by".to_string(),
+                        DbValue::Text(LOCAL_NODE_ID.to_string()),
+                    ),
+                    (
+                        "reason".to_string(),
+                        DbValue::Text("raw purged by cg forget".to_string()),
+                    ),
+                    ("cancelled_at".to_string(), DbValue::Timestamp(now_ms)),
+                ]),
+            )
+            .map_err(map_engine)?;
+            report.queue_rows_skipped += 1;
         }
         Ok(())
     })();
@@ -830,6 +987,20 @@ fn digest_exists(store: &Store, context_id: ContextId, digest_uuid: uuid::Uuid) 
         )
         .map_err(map_engine)?;
     Ok(!result.rows.is_empty())
+}
+
+fn parse_digest_uuid(digest_text: &str) -> Option<uuid::Uuid> {
+    uuid::Uuid::parse_str(digest_text).ok()
+}
+
+/// A monotonic ordering key from a row's `created_at`/`enqueued_at` column (a strictly-increasing
+/// TxId per committed capture), so callers can order by capture age deterministically.
+fn order_key(value: &DbValue) -> i128 {
+    match value {
+        DbValue::TxId(tx) => i128::from(tx.0),
+        DbValue::Int64(value) => i128::from(*value),
+        _ => 0,
+    }
 }
 
 fn hex_sha256(value: &str) -> String {

@@ -1,23 +1,33 @@
-//! Understanding-queue drain accessors: the store-level seam a worker uses to turn the durable
-//! tier-0 backlog into structured memory.
+//! Understanding drain accessors: the store-level seam a worker uses to turn the durable tier-0
+//! backlog into structured memory.
 //!
-//! Tier-0 capture is deterministic and free; it leaves one `pending` row per digest in
-//! `cg_understanding_queue` plus the raw source chunk in `cg_source_chunks`. A worker later drains
-//! that backlog through a real model: it lists the pending digests by PRIORITY (most-retrieved
-//! first, oldest first within equal touch), CLAIMS each one atomically (`pending → in_flight`) so
-//! two concurrent workers never understand the same digest twice, runs extraction over the stored
-//! raw chunk, then records the outcome — `structured` plus a write-once completion on success, or an
-//! attempt increment with a terminal cap on model failure.
+//! Tier-0 capture is deterministic and free; it submits one understanding job onto the shipped work
+//! ledger per digest (state `pending`) plus the raw source chunk in `cg_source_chunks`. A worker
+//! later drains that backlog through a real model: it lists the pending digests by PRIORITY
+//! (most-retrieved first, oldest first within equal touch), CLAIMS each one atomically (a ledger
+//! claim, `pending → leased`) so two concurrent workers never understand the same digest twice, runs
+//! extraction over the stored raw chunk, then records the outcome — a write-once completion on
+//! success (the ledger job's computed state reads `structured`), or a recorded failure that re-queues
+//! below the attempt cap and turns the job terminally `failed` at the cap.
 //!
-//! These are pure store accessors: no model, no filesystem, no process control. The worker loop, the
-//! lockfile, and the connected-model extractor live in the CLI (the surface caller); vigil, which
-//! embeds cg as a library, can drive the same drain in-process by calling these directly.
+//! The private `cg_understanding_queue` table is retired: the ledger's computed job state
+//! (`work_jobs`/`work_claims`/`work_failures`/`work_cancellations`, plus the retained write-once
+//! `cg_understanding_completions` marker) subsumes the queue's pending/in_flight/attempts/status role,
+//! so there is no second source of truth to rot. These are pure store accessors: no model, no
+//! filesystem, no process control. The worker loop, the lockfile, and the connected-model extractor
+//! live in the CLI (the surface caller); vigil, which embeds cg as a library, can drive the same
+//! drain in-process by calling these directly.
 
 use std::collections::HashMap;
 
 use contextdb_core::Value as DbValue;
+use contextdb_engine::work_ledger::{
+    ClaimInsert, JobState, insert_claim, job_state, next_attempt, record_failure,
+};
 
-use crate::tier0::map_engine;
+use crate::tier0::{
+    LOCAL_NODE_ID, context_digests, job_exists, ledger_clock_ms, map_engine, understanding_job_id,
+};
 use crate::{ContextId, DigestId, Result, Store};
 
 /// The default cap on model attempts per digest. After this many failures a digest stays `failed`
@@ -45,9 +55,9 @@ pub struct QueueFailure {
 }
 
 /// List the pending digests for one context in drain PRIORITY order: highest `touch_count` first,
-/// then oldest enqueued first within equal touch. Each row carries the stored raw chunk text. A
+/// then oldest captured first within equal touch. Each row carries the stored raw chunk text. A
 /// digest that already has a completion row (a synced-in completion from another machine, or a local
-/// success) is skipped even if its local queue row still reads `pending`. `limit` caps how many are
+/// success) is skipped even if the ledger job would otherwise read pending. `limit` caps how many are
 /// returned (the full backlog when `None`).
 pub fn list_pending_digests(
     store: &Store,
@@ -55,40 +65,27 @@ pub fn list_pending_digests(
     limit: Option<usize>,
 ) -> Result<Vec<PendingDigest>> {
     let db = store.internal_db();
-    let rows = db
-        .execute(
-            "SELECT digest_id, enqueued_at FROM cg_understanding_queue WHERE context_id = $context_id AND status = $status",
-            &HashMap::from([
-                (
-                    "context_id".to_string(),
-                    DbValue::Uuid(context_id.as_uuid()),
-                ),
-                ("status".to_string(), DbValue::Text("pending".to_string())),
-            ]),
-        )
-        .map_err(map_engine)?;
-
     let mut candidates: Vec<(i128, u64, PendingDigest)> = Vec::new();
-    for row in &rows.rows {
-        let digest_text = match row.first() {
-            Some(DbValue::Text(id)) => id.clone(),
-            _ => continue,
-        };
-        let enqueued_order = row.get(1).map(order_key).unwrap_or(0);
+    for (digest_id, capture_order) in context_digests(store, context_id)? {
+        let digest_text = digest_id.to_string();
+        let job_id = understanding_job_id(digest_id);
+        // Only digests captured onto the ledger and still in the pending state are drainable.
+        if !job_exists(store, &job_id)? {
+            continue;
+        }
         if completion_exists(store, &digest_text)? {
+            continue;
+        }
+        if job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)? != JobState::Pending {
             continue;
         }
         let Some(chunk_text) = chunk_text_for_digest(store, &digest_text)? else {
             // No raw chunk kept (e.g. purged by `cg forget`): nothing to understand.
             continue;
         };
-        let digest_id = match parse_digest_id(&digest_text) {
-            Some(id) => id,
-            None => continue,
-        };
         let touch_count = touch_count_for_digest(store, &digest_text)?;
         candidates.push((
-            enqueued_order,
+            capture_order,
             touch_count,
             PendingDigest {
                 digest_id,
@@ -98,7 +95,7 @@ pub fn list_pending_digests(
         ));
     }
 
-    // Priority: touch_count DESC, then oldest enqueued first (enqueue order ASC) within equal touch.
+    // Priority: touch_count DESC, then oldest captured first (capture order ASC) within equal touch.
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut out: Vec<PendingDigest> = candidates
         .into_iter()
@@ -110,41 +107,43 @@ pub fn list_pending_digests(
     Ok(out)
 }
 
-/// Claim a pending digest for understanding in one transaction (`pending → in_flight`). Returns
-/// `true` when
-/// this call won the claim, `false` when the digest was not pending (already claimed by another
-/// worker, already structured, or purged) — the guard on `status = 'pending'` makes the claim safe
-/// against a concurrent second worker.
+/// Claim a pending digest for understanding via a ledger claim (`pending → leased`). Returns `true`
+/// when this call won the claim, `false` when the digest was not pending (already claimed by another
+/// worker, already structured, failed, or purged) — the ledger's claim primary key makes the claim
+/// safe against a concurrent second worker.
 pub fn claim_digest(store: &Store, digest_id: DigestId) -> Result<bool> {
     let db = store.internal_db();
-    let tx = db.begin().map_err(map_engine)?;
-    let outcome = db.execute_in_tx(
-        tx,
-        "UPDATE cg_understanding_queue SET status = 'in_flight', updated_at = $updated_at WHERE digest_id = $digest_id AND status = 'pending'",
-        &HashMap::from([
-            (
-                "digest_id".to_string(),
-                DbValue::Text(digest_id.to_string()),
-            ),
-            ("updated_at".to_string(), DbValue::TxId(tx)),
-        ]),
-    );
-    match outcome {
-        Ok(result) => {
-            db.commit(tx).map_err(map_engine)?;
-            Ok(result.rows_affected == 1)
-        }
-        Err(err) => {
-            let _ = db.rollback(tx);
-            Err(map_engine(err))
-        }
+    let job_id = understanding_job_id(digest_id);
+    if !job_exists(store, &job_id)? {
+        return Ok(false);
+    }
+    // Only a pending job is claimable — a leased (already in-flight), done, failed, or cancelled job
+    // is refused, so a second concurrent worker never re-claims work in flight.
+    if job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)? != JobState::Pending {
+        return Ok(false);
+    }
+    let attempt = next_attempt(db, &job_id).map_err(map_engine)?;
+    // The local claim takes an unexpiring lease: the single-node claim is sticky until the worker
+    // records success or failure (the fabric worker slice injects a real lease clock for expiry).
+    match insert_claim(
+        db,
+        &job_id,
+        attempt,
+        LOCAL_NODE_ID,
+        i64::MAX,
+        ledger_clock_ms(),
+    )
+    .map_err(map_engine)?
+    {
+        ClaimInsert::Inserted => Ok(true),
+        ClaimInsert::AlreadyHeld { .. } => Ok(false),
     }
 }
 
-/// Record a successful understanding of a claimed digest: flip the queue row to `structured` and
-/// write the write-once completion row (keyed by digest id, so a re-run or a synced-in peer
-/// completion never double-inserts). The completion syncs (`InsertIfNotExists`), so every edge learns
-/// this digest is understood and skips it.
+/// Record a successful understanding of a claimed digest: write the write-once completion row (keyed
+/// by digest id, so a re-run or a synced-in peer completion never double-inserts). Once it exists the
+/// ledger job's computed state reads `structured`. The completion is a LOCAL apply marker (it does not
+/// sync — the structured graph rows are what sync); it guards against re-applying the same result.
 pub fn mark_structured(
     store: &Store,
     context_id: ContextId,
@@ -160,20 +159,10 @@ pub fn mark_structured(
         None => DbValue::Null,
     };
     let outcome = (|| -> Result<()> {
-        // Guard on `in_flight` (defense-in-depth, mirroring claim_digest/mark_failed): only a
-        // digest this worker has claimed transitions to structured, so a stray call can't flip an
-        // unclaimed row. The drain always calls this on a just-claimed digest, so the guard never
-        // changes the live flow — it only closes a robustness gap.
-        db.execute_in_tx(
-            tx,
-            "UPDATE cg_understanding_queue SET status = 'structured', updated_at = $updated_at WHERE digest_id = $digest_id AND status = 'in_flight'",
-            &HashMap::from([
-                ("digest_id".to_string(), DbValue::Text(digest_text.clone())),
-                ("updated_at".to_string(), DbValue::TxId(tx)),
-            ]),
-        )
-        .map_err(map_engine)?;
         // Write-once: only insert the completion when one does not already exist for this digest.
+        // The completion is the durable, synced apply-guard; the ledger job's computed state reads
+        // `structured` once this row exists (a synced-in completion or a local success), so a peer
+        // that already understood the digest skips it.
         if !completion_exists(store, &digest_text)? {
             db.execute_in_tx(
                 tx,
@@ -213,36 +202,61 @@ pub fn mark_failed(
     max_attempts: u32,
 ) -> Result<QueueFailure> {
     let db = store.internal_db();
-    let digest_text = digest_id.to_string();
-    let attempts = current_attempts(store, &digest_text)?;
-    let new_attempts = attempts.saturating_add(1);
+    let job_id = understanding_job_id(digest_id);
+    // Record the failure against the attempt this worker holds (the highest claim attempt). The
+    // failure row releases the lease: below the cap the job's computed state falls back to `pending`
+    // for a retry; at the cap (`failures >= max_attempts`) it turns terminally `failed`.
+    let attempt = highest_claim_attempt(store, &job_id)?;
+    record_failure(
+        db,
+        &job_id,
+        attempt,
+        LOCAL_NODE_ID,
+        error,
+        ledger_clock_ms(),
+    )
+    .map_err(map_engine)?;
+    let new_attempts = failure_count(store, &job_id)?;
     let terminal = new_attempts >= max_attempts.max(1);
-    let status = if terminal { "failed" } else { "pending" };
-    let tx = db.begin().map_err(map_engine)?;
-    let outcome = db.execute_in_tx(
-        tx,
-        "UPDATE cg_understanding_queue SET status = $status, attempts = $attempts, last_error = $last_error, updated_at = $updated_at WHERE digest_id = $digest_id AND status = 'in_flight'",
-        &HashMap::from([
-            ("status".to_string(), DbValue::Text(status.to_string())),
-            ("attempts".to_string(), DbValue::Int64(i64::from(new_attempts))),
-            ("last_error".to_string(), DbValue::Text(error.to_string())),
-            ("updated_at".to_string(), DbValue::TxId(tx)),
-            ("digest_id".to_string(), DbValue::Text(digest_text)),
-        ]),
-    );
-    match outcome {
-        Ok(_) => {
-            db.commit(tx).map_err(map_engine)?;
-            Ok(QueueFailure {
-                attempts: new_attempts,
-                terminal,
-            })
-        }
-        Err(err) => {
-            let _ = db.rollback(tx);
-            Err(map_engine(err))
-        }
-    }
+    Ok(QueueFailure {
+        attempts: new_attempts,
+        terminal,
+    })
+}
+
+/// The highest attempt number any claim row records for a job — the attempt a just-claimed worker
+/// currently holds.
+fn highest_claim_attempt(store: &Store, job_id: &str) -> Result<i64> {
+    let result = store
+        .internal_db()
+        .execute(
+            "SELECT attempt FROM work_claims WHERE job_id = $job_id",
+            &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
+        )
+        .map_err(map_engine)?;
+    Ok(result
+        .rows
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(DbValue::Int64(attempt)) => Some(*attempt),
+            Some(DbValue::Timestamp(attempt)) => Some(*attempt),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(1))
+}
+
+/// How many failures have been recorded for a job — the attempt count the retired queue tracked in
+/// its `attempts` column.
+fn failure_count(store: &Store, job_id: &str) -> Result<u32> {
+    let result = store
+        .internal_db()
+        .execute(
+            "SELECT attempt FROM work_failures WHERE job_id = $job_id",
+            &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
+        )
+        .map_err(map_engine)?;
+    Ok(result.rows.len() as u32)
 }
 
 // Retrieval-touch bumping is owned by `tier0::bump_touch` (the injection/query path calls it); this
@@ -297,37 +311,4 @@ fn touch_count_for_digest(store: &Store, digest_text: &str) -> Result<u64> {
             _ => None,
         })
         .unwrap_or(0))
-}
-
-fn current_attempts(store: &Store, digest_text: &str) -> Result<u32> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT attempts FROM cg_understanding_queue WHERE digest_id = $digest_id",
-            &HashMap::from([(
-                "digest_id".to_string(),
-                DbValue::Text(digest_text.to_string()),
-            )]),
-        )
-        .map_err(map_engine)?;
-    Ok(result
-        .rows
-        .first()
-        .and_then(|row| match row.first() {
-            Some(DbValue::Int64(attempts)) => Some((*attempts).max(0) as u32),
-            _ => None,
-        })
-        .unwrap_or(0))
-}
-
-fn parse_digest_id(digest_text: &str) -> Option<DigestId> {
-    uuid::Uuid::parse_str(digest_text).ok().map(DigestId::from)
-}
-
-fn order_key(value: &DbValue) -> i128 {
-    match value {
-        DbValue::TxId(tx) => i128::from(tx.0),
-        DbValue::Int64(value) => i128::from(*value),
-        _ => 0,
-    }
 }

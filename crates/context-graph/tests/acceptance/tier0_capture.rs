@@ -429,10 +429,10 @@ fn sync_contract_registers_new_tables() {
             .find(|policy| policy.table == table)
             .map(|policy| (policy.direction, policy.conflict_policy))
     };
-    // Raw and per-device runtime state never leave the machine.
+    // Raw and per-device runtime state never leave the machine. The private understanding queue is
+    // retired at schema v10 (the work ledger's computed job state subsumes it).
     for table in [
         "cg_source_chunks",
-        "cg_understanding_queue",
         "cg_retrieval_touches",
         "cg_local_settings",
     ] {
@@ -442,11 +442,12 @@ fn sync_contract_registers_new_tables() {
             "{table} must be local-only (SyncDirection::None)"
         );
     }
-    // The write-once understanding-completion marker syncs so a peer skips re-understanding.
+    // The understanding-completion marker is a LOCAL write-once apply guard (this node already
+    // applied a result onto its digest); the structured graph rows are what sync, not the guard.
     assert_eq!(
         policy("cg_understanding_completions"),
-        Some((SyncDirection::Both, ConflictPolicy::InsertIfNotExists)),
-        "cg_understanding_completions must sync write-once (Both, InsertIfNotExists)"
+        Some((SyncDirection::None, ConflictPolicy::InsertIfNotExists)),
+        "cg_understanding_completions is a local apply marker (None, InsertIfNotExists)"
     );
 }
 

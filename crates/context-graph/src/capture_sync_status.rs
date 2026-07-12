@@ -8,6 +8,7 @@ use chrono::Utc;
 use contextdb_core::Lsn;
 use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection};
+use contextdb_engine::work_ledger;
 use serde_json::Value;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -511,6 +512,11 @@ pub fn context_graph_sync_conflict_policies() -> ConflictPolicies {
     for table in LOCAL_ONLY_RUNTIME_SYNC_TABLES {
         per_table.insert(table.to_string(), ConflictPolicy::InsertIfNotExists);
     }
+    // The seven work-ledger fabric tables carry the shipped ledger's own per-table conflict contract
+    // verbatim — the ledger owns that arbitration; cg never re-derives it.
+    for (table, policy) in work_ledger::work_ledger_conflict_policy_entries() {
+        per_table.insert(table.to_string(), policy);
+    }
     ConflictPolicies {
         per_table,
         default: ConflictPolicy::ServerWins,
@@ -533,6 +539,13 @@ pub fn register_context_graph_sync_client(client: &impl ContextGraphSyncRegistra
         client.set_table_direction(table, SyncDirection::None);
         client.set_conflict_policy(table, ConflictPolicy::InsertIfNotExists);
     }
+    // The work-ledger fabric tables sync tenant-wide (both directions) under the shipped ledger's own
+    // conflict contract, so a submitter's job, a worker's claim/result, and the ephemeral input copy
+    // converge across the tenant's machines.
+    for (table, policy) in work_ledger::work_ledger_conflict_policy_entries() {
+        client.set_table_direction(table, SyncDirection::Both);
+        client.set_conflict_policy(table, policy);
+    }
 }
 
 pub fn context_graph_pending_push_change_count(db: &Database, since: Lsn) -> usize {
@@ -542,6 +555,9 @@ pub fn context_graph_pending_push_change_count(db: &Database, since: Lsn) -> usi
         .collect::<std::collections::HashMap<_, _>>();
     for table in LOCAL_ONLY_RUNTIME_SYNC_TABLES {
         directions.insert(table.to_string(), SyncDirection::None);
+    }
+    for (table, _) in work_ledger::work_ledger_conflict_policy_entries() {
+        directions.insert(table.to_string(), SyncDirection::Both);
     }
     let changes = db
         .changes_since(since)
@@ -867,16 +883,17 @@ fn sync_policy_for_table(table: &str) -> (SyncDirection, ConflictPolicy) {
         // Overlay corrections + compensation/reversal events: append-only, propagate tenant-wide.
         "cg_overlay_entries" => write_once,
         "cg_compensation_events" => write_once,
-        // Tier-0 capture tables (schema v9). Raw source chunks, the understanding queue, retrieval
-        // touches, and local settings are all machine-local runtime state that NEVER leaves the
-        // device — raw is the NDA line, and the queue/touches/settings are per-device. Understanding
-        // completions are a write-once immutable marker that DOES sync so a machine that already has
-        // the structured output does not re-understand the digest.
+        // Tier-0 capture tables (schema v10). Raw source chunks, retrieval touches, and local
+        // settings are all machine-local runtime state that NEVER leaves the device — raw is the NDA
+        // line, and the touches/settings are per-device. The private understanding queue is retired
+        // (the work ledger's computed job state subsumes it). The understanding completion is a
+        // write-once LOCAL apply marker: it records that THIS node already applied a result onto its
+        // digest, so it stays machine-local (`None`) — the structured graph rows are what sync, not
+        // the apply guard.
         "cg_source_chunks" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        "cg_understanding_queue" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
         "cg_retrieval_touches" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
         "cg_local_settings" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        "cg_understanding_completions" => write_once,
+        "cg_understanding_completions" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
         _ => write_once,
     }
 }

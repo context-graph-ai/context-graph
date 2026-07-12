@@ -11,10 +11,11 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use contextdb_engine::work_ledger;
 use contextdb_server::SyncClient;
 
 use crate::ingest::ConversationExtractor;
-use crate::tier0::{Tier0CaptureReport, Tier0CaptureRequest, capture_tier0};
+use crate::tier0::{Tier0CaptureReport, Tier0CaptureRequest, capture_tier0_inner};
 use crate::{ContextId, DigestId, Result, Store};
 
 /// The default per-node fabric config file, next to the memory db under `<data_root>/cg/`.
@@ -156,20 +157,29 @@ pub trait CaptureFault {
 
 /// Capture a conversation onto the fabric: tier-0 verbatim digest + local embedding + kept raw
 /// chunk, and — in the SAME atomic $0 transaction — a ledger understanding-job row plus its copied
-/// input rows.
-///
-/// SCAFFOLD STUB: submission is not yet wired; this falls through to plain tier-0 capture, so no
-/// ledger job or input rows are written and the abort fault seam is inert.
+/// input rows. A source named in the node's `per_source_opt_out` list, or flagged `source_opt_out`
+/// on this capture, keeps its understanding input local (an `InputRef::local_path`, no copied
+/// `work_inputs` row). Submission is model-free: the executor runs the model later, elsewhere.
 pub fn capture(store: &Store, capture: FabricCapture<'_>) -> Result<Tier0CaptureReport> {
-    let _ = (&capture.config, capture.source_opt_out, &capture.fault);
-    capture_tier0(store, capture.request)
+    let opt_out = capture.source_opt_out
+        || capture
+            .config
+            .map(|config| {
+                config
+                    .per_source_opt_out
+                    .iter()
+                    .any(|source| source == &capture.request.source)
+            })
+            .unwrap_or(false);
+    capture_tier0_inner(store, capture.request, opt_out, capture.fault)
 }
 
 /// Derive the ledger job id for a tier-0 digest — a deterministic 1:1 function of the `DigestId`.
 /// Re-importing identical content yields the same digest and thus the same job id, so the ledger's
-/// insert-if-not-exists dedups the resubmit and apply maps the job id back to its digest.
+/// insert-if-not-exists dedups the resubmit and apply maps the job id back to its digest. This is the
+/// same derivation the submission path uses, kept single-sourced in `tier0`.
 pub fn job_id_for_digest(digest: DigestId) -> String {
-    format!("cg.understanding.{}", digest.as_uuid())
+    crate::tier0::understanding_job_id(digest)
 }
 
 /// A job's user-visible state, mapped from the ledger's computed state.
@@ -233,21 +243,38 @@ pub enum MovementDecision {
     Refused,
 }
 
-/// Decide whether an input reference of a given kind may move.
-///
-/// SCAFFOLD STUB: opens the gate for every kind (the deliberately-wrong default the fail-closed and
-/// opt-out tests must reject).
+/// Decide whether an input reference of a given kind may move, mirroring the shipped ledger's
+/// `MovementPolicy::permits_input_read` as a three-way outcome. The submitter's own material may
+/// always move; for anyone else a movable kind (`ledger_input` / `blob_ref`) moves only when sharing
+/// is on. A `local_path` ref never leaves its node. An unrecognized/future kind is refused
+/// (default-deny) — never admitted because it "isn't recognized as local."
 pub fn movement_decision(ref_kind: &str, sharing_on: bool, is_submitter: bool) -> MovementDecision {
-    let _ = (ref_kind, sharing_on, is_submitter);
-    MovementDecision::MayMove
+    match ref_kind {
+        work_ledger::REF_KIND_LEDGER_INPUT | work_ledger::REF_KIND_BLOB_REF => {
+            if sharing_on || is_submitter {
+                MovementDecision::MayMove
+            } else {
+                MovementDecision::LocalOnly
+            }
+        }
+        work_ledger::REF_KIND_LOCAL_PATH => MovementDecision::LocalOnly,
+        _ => MovementDecision::Refused,
+    }
 }
 
-/// Count the input copies that would enter this node's outbound push set under `config`.
-///
-/// SCAFFOLD STUB: returns zero.
+/// Count the input copies that would enter this node's outbound push set under `config`. With sharing
+/// off, the OFF switch dominates — nothing leaves the machine — so the count is zero regardless of
+/// any copied material. Otherwise it is the number of ephemeral `work_inputs` copies (opted-out
+/// sources never copied a row, so they never count).
 pub fn input_material_in_push_set(store: &Store, config: &FabricConfig) -> Result<usize> {
-    let _ = (store, config);
-    Ok(0)
+    if !config.sharing {
+        return Ok(0);
+    }
+    let db = store.sync_database();
+    let rows = db
+        .scan("work_inputs", db.snapshot())
+        .map_err(crate::tier0::map_engine)?;
+    Ok(rows.len())
 }
 
 /// Drain and locally execute pending understanding jobs for this node, applying each result onto
@@ -332,9 +359,9 @@ pub fn run_input_retention(store: &Store, now_ms: i64, grace_ms: i64) -> Result<
 /// produced. It lands on the operational `observations.properties` lane and is structurally barred
 /// from a decision-basis input.
 ///
-/// SCAFFOLD STUB: carries a deliberately-wrong `From<_> for serde_json::Value` so the compile-fail
-/// barrier test does NOT yet trigger. The implementation removes that `From` to install the barrier
-/// (mirroring `CapturedUsage`), which flips the trybuild case from red to green.
+/// It carries NO `From<_> for serde_json::Value` (mirroring `CapturedUsage`): the operational
+/// receipt is structurally barred from flowing into a decision-basis lane. Render it explicitly via
+/// [`FabricExecutionReceipt::to_properties_value`] onto the `observations.properties` lane instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FabricExecutionReceipt {
     /// The node that executed the job.
@@ -353,14 +380,5 @@ impl FabricExecutionReceipt {
             "total_tokens": self.total_tokens,
             "wall_clock_ms": self.wall_clock_ms,
         })
-    }
-}
-
-// SCAFFOLD-ONLY deliberately-wrong stub: this `From` lets a receipt flow into a basis lane, which is
-// exactly the anti-pattern the barrier forbids. The implementation DELETES this impl so `.into()`
-// stops compiling and `fabric_receipt_cannot_become_decision_basis` turns green.
-impl From<FabricExecutionReceipt> for Value {
-    fn from(receipt: FabricExecutionReceipt) -> Self {
-        receipt.to_properties_value()
     }
 }
