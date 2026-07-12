@@ -22,7 +22,7 @@ use cg_cli_conventions::{
 };
 use context_graph::fabric::{
     FABRIC_CONFIG_FILE, FabricCapture, FabricConfig, FabricPollOutcome, FabricWorkerConfig,
-    run_worker_once,
+    run_worker_poll,
 };
 use context_graph::harness::{
     CaptureHarnessConfig, CaptureHarnessReport, ExtractionPromptInputs, SchemaDescriptor,
@@ -1019,13 +1019,14 @@ fn understand_worker(args: &[String]) -> i32 {
 /// different NODE ROLES. `cg understand --worker` is the single-node detached queue drain: no hub,
 /// silent, one-shot until this machine's OWN backlog empties. `cg worker` is a long-running FABRIC
 /// executor: it dials the configured hub, advertises its understanding capability, and loops
-/// `fabric::run_worker_once` claiming and executing jobs OTHER nodes submitted. Overloading one flag
-/// onto both roles would conflate "drain my own queue" with "execute the fabric's queue", so each
-/// role keeps its own verb and its own per-data-root lockfile.
+/// `fabric::run_worker_poll` — pull the hub, claim and execute jobs OTHER nodes submitted, push the
+/// result back. Overloading one flag onto both roles would conflate "drain my own queue" with
+/// "execute the fabric's queue", so each role keeps its own verb and its own per-data-root lockfile.
 ///
 /// The CLI stays a pure caller: every claim / lease / matching decision lives in
-/// `fabric::run_worker_once`. This function only loads config + identity, builds the `SyncClient`,
-/// enforces the single-worker lock and budget/poll knobs, and renders per-job receipts.
+/// `fabric::run_worker_poll` (and the inner `run_worker_once` it wraps). This function only loads
+/// config + identity, builds the `SyncClient`, enforces the single-worker lock and budget/poll knobs,
+/// and renders per-job receipts.
 fn handle_worker(args: &[String]) -> i32 {
     let root = data_root();
     let fabric_path = root.join("cg").join(FABRIC_CONFIG_FILE);
@@ -1166,7 +1167,7 @@ fn handle_worker(args: &[String]) -> i32 {
     let mut worker_config = FabricWorkerConfig::for_node(&node_id);
     worker_config.sharing = config.sharing;
 
-    // Clean Ctrl-C: finish the in-flight job, take no new ones. run_worker_once is synchronous and
+    // Clean Ctrl-C: finish the in-flight job, take no new ones. run_worker_poll is synchronous and
     // returns only BETWEEN jobs, so a flag checked at the top of the loop lets the current job finish
     // and then stops before the next claim.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1188,7 +1189,10 @@ fn handle_worker(args: &[String]) -> i32 {
             break;
         }
         let started = Instant::now();
-        let outcome = run_worker_once(&client, &store, &extractor, &worker_config, now_millis());
+        // The self-sufficient poll: pull the tenant's ledger from the hub, run the claim/execute/record
+        // poll, then push the result back — so this remote node actually sees peers' jobs and delivers
+        // its outcomes, rather than scanning only its own local db (the two-root rehearsal defect).
+        let outcome = run_worker_poll(&client, &store, &extractor, &worker_config, now_millis());
         // Fold this poll's model spend into the running total the budget ceiling is measured against.
         let usage = extractor.drain_model_usage();
         let tokens = spent_total_tokens(&usage).unwrap_or(0);
@@ -1285,8 +1289,8 @@ fn acquire_fabric_worker_lock(root: &Path) -> Option<fs::File> {
 }
 
 /// Watch for Ctrl-C on a dedicated thread with its own tiny runtime and flip `flag` when it fires.
-/// Kept off the worker loop's own path so it never interferes with the per-poll runtime
-/// `run_worker_once` spins up internally.
+/// Kept off the worker loop's own path so it never interferes with the per-poll runtimes
+/// `run_worker_poll` spins up internally.
 fn spawn_sigint_watch(flag: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()

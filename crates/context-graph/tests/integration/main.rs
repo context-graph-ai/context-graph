@@ -15,6 +15,7 @@ mod fabric_privacy;
 mod fabric_retention;
 mod fabric_sharing_push_set;
 mod fabric_status;
+mod fabric_worker_sync;
 
 mod cluster_aggregate_substrate;
 #[cfg(context_graph_internal_test_support)]

@@ -586,6 +586,14 @@ pub enum FabricPollOutcome {
 /// executor body and the poll ordering. It deliberately does NOT pull before claiming so a genuine
 /// claim race is observable: a loser sees the winner's live claim through its own push reply and
 /// reports `LostClaim`; a claim whose competitor's lease has expired is reclaimed at a higher attempt.
+///
+/// This is the INNER claim/execute/record primitive: it does no hub I/O at the poll boundary, so it
+/// scans only rows already present in `client.db()`. A real remote worker never calls it directly —
+/// it drives [`run_worker_poll`], which pulls the tenant's ledger BEFORE this poll (so peers' jobs
+/// are visible) and pushes the recorded result/failure AFTER it (so the outcome reaches the digest
+/// owner without waiting for the next claim's push to piggyback it). Calling `run_worker_once`
+/// directly is the claim-race harness only: it is the seam where a second in-process worker that has
+/// NOT pulled the winner's completed result can still be observed racing the claim.
 #[cfg(feature = "fabric-sync")]
 pub fn run_worker_once<E: ConversationExtractor + Sync>(
     client: &SyncClient,
@@ -624,6 +632,103 @@ pub fn run_worker_once<E: ConversationExtractor + Sync>(
             .map_err(|_| crate::CgError::Engine("fabric worker poll thread panicked".to_string()))?
     })?;
     Ok(outcome)
+}
+
+/// The self-sufficient worker poll a real remote node runs: pull the tenant's ledger from the hub,
+/// run the inner [`run_worker_once`] claim/execute/record poll, then push the recorded result/failure
+/// back to the hub. This is what makes a genuine remote worker functional.
+///
+/// Without the leading pull the worker scans only its own local db and never sees a job another node
+/// submitted — the two-root rehearsal defect where a worker polled for minutes while a remote job
+/// stayed `pending`. Without the trailing push a worker that executed its last job then idled would
+/// strand that result locally: the outcome would otherwise only reach the hub piggybacked on the NEXT
+/// claim's push, which never happens once there is no more work to claim.
+///
+/// Both hub round-trips are best-effort — an unreachable hub degrades to the offline single-node path
+/// (the local db is the arbiter; a local claim/result rides the next successful push), keeping the
+/// ledger's `Won { synced: false }` offline convention. The pull uses cg's per-table contract
+/// (`context_graph_sync_conflict_policies`), the same one `cg sync pull` uses.
+#[cfg(feature = "fabric-sync")]
+pub fn run_worker_poll<E: ConversationExtractor + Sync>(
+    client: &SyncClient,
+    store: &Store,
+    extractor: &E,
+    config: &FabricWorkerConfig,
+    now_ms: i64,
+) -> Result<FabricPollOutcome> {
+    // Pull the tenant's ledger BEFORE the poll so peers' jobs become visible in the local db the
+    // inner poll scans. Best-effort: an unreachable hub just leaves the local db as-is (offline).
+    hub_best_effort(client, HubDirection::Pull)?;
+    let outcome = run_worker_once(client, store, extractor, config, now_ms)?;
+    // Push AFTER the poll so a recorded result/failure reaches the hub — and thus the digest owner's
+    // next pull — immediately. Harmless when the poll wrote nothing (an empty push is a status
+    // exchange), best-effort on the same offline convention.
+    hub_best_effort(client, HubDirection::Push)?;
+    Ok(outcome)
+}
+
+/// The direction of a best-effort hub round-trip.
+#[cfg(feature = "fabric-sync")]
+enum HubDirection {
+    Pull,
+    Push,
+}
+
+/// A best-effort hub drain run on a dedicated thread with its own runtime, mirroring
+/// [`run_worker_once`]'s scaffolding: the poll surface is synchronous and may be called from inside
+/// another runtime (the test hub runs on the caller's runtime), so the transport is driven on a fresh
+/// thread. A hub round-trip that errors is the offline single-node path, never a worker failure, so
+/// pull/push errors are deliberately swallowed (the loop simply stops); only a runtime-build or
+/// thread panic surfaces.
+///
+/// Pull uses cg's registered per-table contract exactly as `cg sync pull` does
+/// ([`crate::context_graph_sync_conflict_policies`]), and both directions drain in a bounded loop
+/// until they make no further progress (the same convergence the CLI's `drain_sync_pull`/
+/// `drain_sync_push` provide).
+#[cfg(feature = "fabric-sync")]
+fn hub_best_effort(client: &SyncClient, direction: HubDirection) -> Result<()> {
+    const MAX_ROUNDS: usize = 32;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = contextdb_server::tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| {
+                        crate::CgError::Engine(format!("fabric worker runtime: {err}"))
+                    })?;
+                runtime.block_on(async {
+                    match direction {
+                        HubDirection::Pull => {
+                            let policies = crate::context_graph_sync_conflict_policies();
+                            for _ in 0..MAX_ROUNDS {
+                                let before = client.pull_watermark();
+                                if client.pull(&policies).await.is_err() {
+                                    break;
+                                }
+                                if client.pull_watermark() == before {
+                                    break;
+                                }
+                            }
+                        }
+                        HubDirection::Push => {
+                            for _ in 0..MAX_ROUNDS {
+                                match client.has_pending_push_changes() {
+                                    Ok(true) => {}
+                                    _ => break,
+                                }
+                                if client.push().await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+                Ok(())
+            })
+            .join()
+            .map_err(|_| crate::CgError::Engine("fabric worker hub thread panicked".to_string()))?
+    })
 }
 
 /// cg's executor over the existing `ConversationExtractor` path. It materializes its job's input
