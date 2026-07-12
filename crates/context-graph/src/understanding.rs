@@ -153,35 +153,7 @@ pub fn mark_structured(
 ) -> Result<()> {
     let db = store.internal_db();
     let tx = db.begin().map_err(map_engine)?;
-    let digest_text = digest_id.to_string();
-    let receipt = match receipt_json {
-        Some(json) => DbValue::Text(json.to_string()),
-        None => DbValue::Null,
-    };
-    let outcome = (|| -> Result<()> {
-        // Write-once: only insert the completion when one does not already exist for this digest.
-        // The completion is the durable, synced apply-guard; the ledger job's computed state reads
-        // `structured` once this row exists (a synced-in completion or a local success), so a peer
-        // that already understood the digest skips it.
-        if !completion_exists(store, &digest_text)? {
-            db.execute_in_tx(
-                tx,
-                "INSERT INTO cg_understanding_completions (id, context_id, model, receipt, completed_at) VALUES ($id, $context_id, $model, $receipt, $completed_at)",
-                &HashMap::from([
-                    ("id".to_string(), DbValue::Text(digest_text.clone())),
-                    (
-                        "context_id".to_string(),
-                        DbValue::Uuid(context_id.as_uuid()),
-                    ),
-                    ("model".to_string(), DbValue::Text(model.to_string())),
-                    ("receipt".to_string(), receipt.clone()),
-                    ("completed_at".to_string(), DbValue::TxId(tx)),
-                ]),
-            )
-            .map_err(map_engine)?;
-        }
-        Ok(())
-    })();
+    let outcome = mark_structured_in_tx(store, tx, context_id, digest_id, model, receipt_json);
     match outcome {
         Ok(()) => db.commit(tx).map_err(map_engine),
         Err(err) => {
@@ -189,6 +161,49 @@ pub fn mark_structured(
             Err(err)
         }
     }
+}
+
+/// Write the write-once completion row on the CALLER's open transaction, so an apply's completion
+/// marker commits atomically with the structured graph it guards (the apply path stages the graph
+/// mutation and this marker on ONE `CaptureTxn` — a crash cannot leave the graph written but the
+/// marker missing). Semantics match [`mark_structured`]: write-once (skipped when a completion
+/// already exists), keyed by digest id, local-only (never syncs).
+pub(crate) fn mark_structured_in_tx(
+    store: &Store,
+    tx: crate::TxId,
+    context_id: ContextId,
+    digest_id: DigestId,
+    model: &str,
+    receipt_json: Option<&str>,
+) -> Result<()> {
+    let db = store.internal_db();
+    let digest_text = digest_id.to_string();
+    let receipt = match receipt_json {
+        Some(json) => DbValue::Text(json.to_string()),
+        None => DbValue::Null,
+    };
+    // Write-once: only insert the completion when one does not already exist for this digest.
+    // The completion is the durable, synced apply-guard; the ledger job's computed state reads
+    // `structured` once this row exists (a synced-in completion or a local success), so a peer
+    // that already understood the digest skips it.
+    if !completion_exists(store, &digest_text)? {
+        db.execute_in_tx(
+            tx,
+            "INSERT INTO cg_understanding_completions (id, context_id, model, receipt, completed_at) VALUES ($id, $context_id, $model, $receipt, $completed_at)",
+            &HashMap::from([
+                ("id".to_string(), DbValue::Text(digest_text.clone())),
+                (
+                    "context_id".to_string(),
+                    DbValue::Uuid(context_id.as_uuid()),
+                ),
+                ("model".to_string(), DbValue::Text(model.to_string())),
+                ("receipt".to_string(), receipt.clone()),
+                ("completed_at".to_string(), DbValue::TxId(tx)),
+            ]),
+        )
+        .map_err(map_engine)?;
+    }
+    Ok(())
 }
 
 /// Record a model failure against a claimed digest: increment `attempts` and stamp `last_error`.

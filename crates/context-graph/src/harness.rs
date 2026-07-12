@@ -975,6 +975,21 @@ pub fn run_capture_into_digest(
     config: &CaptureHarnessConfig,
     reuse_digest: Option<DigestId>,
 ) -> Result<(CaptureReport, CaptureHarnessReport)> {
+    run_capture_into_digest_with_completion(store, request, extractor, config, reuse_digest, None)
+}
+
+/// As [`run_capture_into_digest`], but also records an apply-path completion marker in the SAME
+/// transaction as the structured graph write, so the write-once completion commits atomically with
+/// the graph it guards (the fabric apply/drain path). Every other caller uses [`run_capture_into_digest`]
+/// (i.e. `None`) and is unchanged.
+pub fn run_capture_into_digest_with_completion(
+    store: &Store,
+    request: CaptureRequest,
+    extractor: &dyn ConversationExtractor,
+    config: &CaptureHarnessConfig,
+    reuse_digest: Option<DigestId>,
+    completion: Option<crate::ingest::CaptureCompletionMarker<'_>>,
+) -> Result<(CaptureReport, CaptureHarnessReport)> {
     // Resolve (or create) the capture context first. Every row lands under this context;
     // the context_id always comes from here, never from a model-emitted seed field.
     let context = resolve_capture_context(store, &request.context_label)?;
@@ -1225,6 +1240,7 @@ pub fn run_capture_into_digest(
         harvest,
         &skill_application.firing_records,
         reuse_digest,
+        completion,
     )?;
     outcome.report.model_usage = extractor.drain_model_usage();
     outcome.report.flagged_items = flagged_items;

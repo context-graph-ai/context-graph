@@ -1477,6 +1477,7 @@ fn record_conversation_internal_with_stored_text(
         harvest,
         &skill_application.firing_records,
         None,
+        None,
     )?
     .report;
     report.model_usage = tagger.drain_model_usage();
@@ -2674,6 +2675,26 @@ fn span_text(span: Option<&ExtractedSpan>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// A completion marker to write in the SAME transaction as the capture's graph mutation, so an apply
+/// path's write-once completion commits atomically with the structured graph it guards. Passed to
+/// [`crate::harness::run_capture_into_digest`] / [`capture_structured_harvest`]; every non-apply caller
+/// passes `None` and is unaffected. Before the fix, the fabric apply path committed the graph and the
+/// marker on two separate transactions, so a crash between them could leave the graph written but the
+/// marker missing.
+pub struct CaptureCompletionMarker<'a> {
+    /// The context the completed digest belongs to.
+    pub context_id: ContextId,
+    /// The anchor digest whose understanding just landed.
+    pub digest_id: DigestId,
+    /// The apply marker label (e.g. `fabric-apply` / `fabric-local`).
+    pub model: &'a str,
+    /// A test-only fault seam, fired AFTER the graph rows are staged but BEFORE the marker write and
+    /// commit, so a test can prove the graph mutation and the marker share ONE transaction — a fault
+    /// rolls BOTH back. Production passes `None`.
+    pub fault: Option<&'a dyn crate::fabric::CaptureFault>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_structured_harvest(
     store: &Store,
     context_id: ContextId,
@@ -2682,10 +2703,27 @@ pub(crate) fn capture_structured_harvest(
     harvest: StructuredHarvest,
     skill_firing_records: &[crate::skill_store::SkillFiringRecord],
     reuse_digest: Option<DigestId>,
+    completion: Option<CaptureCompletionMarker<'_>>,
 ) -> Result<HarvestCaptureResult> {
     if harvest.is_empty() {
+        let report = capture_zero_harvest_digest(store, context_id, transcript, reuse_digest)?;
+        // A zero-harvest apply of a reused digest writes NO graph rows (the digest already exists),
+        // so there is nothing to strand: honor the fault seam, then record the completion marker on
+        // its own transaction.
+        if let Some(marker) = completion {
+            if let Some(fault) = marker.fault {
+                fault.fail_after_digest()?;
+            }
+            crate::understanding::mark_structured(
+                store,
+                marker.context_id,
+                marker.digest_id,
+                marker.model,
+                None,
+            )?;
+        }
         return Ok(HarvestCaptureResult {
-            report: capture_zero_harvest_digest(store, context_id, transcript, reuse_digest)?,
+            report,
             resolutions: Vec::new(),
         });
     }
@@ -3190,6 +3228,26 @@ pub(crate) fn capture_structured_harvest(
     }
 
     let total_harvest = tx.total_counts(context_id)?;
+    // The apply-path completion marker joins THIS transaction, so the write-once completion commits
+    // atomically with the structured graph it guards — a crash between the two is impossible. The
+    // fault seam fires after every graph row is staged but before the marker + commit, so a test can
+    // prove the shared fate: an abort here rolls back the graph AND the marker.
+    if let Some(marker) = completion {
+        if let Some(fault) = marker.fault
+            && let Err(err) = fault.fail_after_digest()
+        {
+            tx.rollback();
+            return Err(err);
+        }
+        crate::understanding::mark_structured_in_tx(
+            store,
+            tx.tx,
+            marker.context_id,
+            marker.digest_id,
+            marker.model,
+            None,
+        )?;
+    }
     tx.commit()?;
 
     let mut committed_invalidation_rows = Vec::new();
@@ -3253,6 +3311,13 @@ impl<'a> CaptureTxn<'a> {
             .map_err(map_engine)?;
         self.active = false;
         Ok(())
+    }
+
+    /// Discard every staged write on this transaction. Used by the apply path's fault seam so an
+    /// aborted completion-marker step rolls back the graph mutation it was about to commit with.
+    fn rollback(mut self) {
+        let _ = self.store.internal_db().rollback(self.tx);
+        self.active = false;
     }
 
     /// Record an extracted Outcome inside the open capture transaction, so it commits

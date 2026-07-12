@@ -7,11 +7,13 @@ mod invalidation_fixtures;
 #[path = "../common/refactor_extractor.rs"]
 mod refactor_extractor;
 
+mod fabric_apply_atomicity;
 mod fabric_capture;
 mod fabric_exactly_once;
 mod fabric_migration;
 mod fabric_privacy;
 mod fabric_retention;
+mod fabric_sharing_push_set;
 mod fabric_status;
 
 mod cluster_aggregate_substrate;

@@ -19,14 +19,13 @@ use serde_json::Value;
 
 use contextdb_engine::work_ledger;
 
-use crate::harness::run_capture_into_digest;
+use crate::harness::run_capture_into_digest_with_completion;
 use crate::ingest::{CaptureRequest, ConversationExtractor};
 use crate::tier0::{
     Tier0CaptureReport, Tier0CaptureRequest, capture_tier0_inner, completion_exists_local,
     context_digests, job_exists, map_engine, understanding_job_id,
 };
-use crate::understanding::mark_structured;
-use crate::{CgError, ContextId, DigestId, Result, Store};
+use crate::{ContextId, DigestId, Result, Store};
 
 // The SyncClient-consuming worker seam is the only part of the fabric that pulls
 // contextdb-server (and thus tokio); it lives behind the `fabric-sync` feature so the default
@@ -166,16 +165,24 @@ pub trait CaptureFault {
 /// on this capture, keeps its understanding input local (an `InputRef::local_path`, no copied
 /// `work_inputs` row). Submission is model-free: the executor runs the model later, elsewhere.
 pub fn capture(store: &Store, capture: FabricCapture<'_>) -> Result<Tier0CaptureReport> {
-    let opt_out = capture.source_opt_out
-        || capture
-            .config
-            .map(|config| {
-                config
-                    .per_source_opt_out
-                    .iter()
-                    .any(|source| source == &capture.request.source)
-            })
-            .unwrap_or(false);
+    // Global sharing OFF, a per-source opt-out match, or the per-invocation `--no-share` flag all
+    // resolve to the SAME mechanism: the understanding input is submitted as an `InputRef::local_path`
+    // and NO `work_inputs` copy is written, so the input copy that could leak never exists. Sharing-off
+    // is not a display constant filtered downstream — it is the absence of the copy at the source.
+    let sharing_off = capture
+        .config
+        .map(|config| !config.sharing)
+        .unwrap_or(false);
+    let per_source_opt_out = capture
+        .config
+        .map(|config| {
+            config
+                .per_source_opt_out
+                .iter()
+                .any(|source| source == &capture.request.source)
+        })
+        .unwrap_or(false);
+    let opt_out = capture.source_opt_out || sharing_off || per_source_opt_out;
     capture_tier0_inner(store, capture.request, opt_out, capture.fault)
 }
 
@@ -274,6 +281,28 @@ pub fn apply_result(
     job_id: &str,
     extractor: &dyn ConversationExtractor,
 ) -> Result<ApplyOutcome> {
+    apply_result_inner(store, job_id, extractor, None)
+}
+
+/// Apply a completed result while injecting a capture fault at the completion-marker boundary — the
+/// test-only seam that proves the graph mutation and the completion marker share ONE transaction: a
+/// fault fired after the graph rows are staged but before commit rolls BOTH back, so neither the
+/// structured graph nor the apply marker survives. Production uses [`apply_result`] (no fault).
+pub fn apply_result_with_fault(
+    store: &Store,
+    job_id: &str,
+    extractor: &dyn ConversationExtractor,
+    fault: &dyn CaptureFault,
+) -> Result<ApplyOutcome> {
+    apply_result_inner(store, job_id, extractor, Some(fault))
+}
+
+fn apply_result_inner(
+    store: &Store,
+    job_id: &str,
+    extractor: &dyn ConversationExtractor,
+    fault: Option<&dyn CaptureFault>,
+) -> Result<ApplyOutcome> {
     let Some(digest_id) = resolve_anchor_digest(store, job_id)? else {
         return Ok(ApplyOutcome::AnchorMissing);
     };
@@ -291,7 +320,9 @@ pub fn apply_result(
         // The raw understanding substrate is gone (purged) — nothing to apply onto the anchor.
         return Ok(ApplyOutcome::AnchorMissing);
     };
-    run_capture_into_digest(
+    // The write-once apply marker (LOCAL, never synced) now commits in the SAME transaction as the
+    // structured graph write, so a crash can never leave the graph applied but the marker missing.
+    crate::harness::run_capture_into_digest_with_completion(
         store,
         CaptureRequest {
             context_label,
@@ -301,9 +332,13 @@ pub fn apply_result(
         extractor,
         &crate::harness::CaptureHarnessConfig::default(),
         Some(digest_id),
+        Some(crate::ingest::CaptureCompletionMarker {
+            context_id,
+            digest_id,
+            model: "fabric-apply",
+            fault,
+        }),
     )?;
-    // The write-once apply marker (LOCAL, never synced): the result syncs, the apply guard does not.
-    mark_structured(store, context_id, digest_id, "fabric-apply", None)?;
     Ok(ApplyOutcome::Applied(digest_id))
 }
 
@@ -401,14 +436,16 @@ pub fn movement_decision(ref_kind: &str, sharing_on: bool, is_submitter: bool) -
     }
 }
 
-/// Count the input copies that would enter this node's outbound push set under `config`. With sharing
-/// off, the OFF switch dominates — nothing leaves the machine — so the count is zero regardless of
-/// any copied material. Otherwise it is the number of ephemeral `work_inputs` copies (opted-out
-/// sources never copied a row, so they never count).
+/// Count the ephemeral understanding-input copies that actually sit in this node's outbound push set.
+/// The answer is computed from the REAL rows present, never from re-reading the sharing flag: an input
+/// copy only exists as a `work_inputs` row when submission chose to make one (sharing on, not opted
+/// out), and every `work_inputs` row is unconditionally push-directional (`SyncDirection::Both`), so
+/// its presence IS its push-set membership. With sharing off (or an opted-out source) the copy was
+/// never written, so the count is naturally zero — the OFF switch dominates at the source, not by a
+/// downstream filter. `config` is accepted for API symmetry with the status renderer; the count does
+/// not branch on it.
 pub fn input_material_in_push_set(store: &Store, config: &FabricConfig) -> Result<usize> {
-    if !config.sharing {
-        return Ok(0);
-    }
+    let _ = config;
     let db = store.sync_database();
     let rows = db
         .scan("work_inputs", db.snapshot())
@@ -459,7 +496,9 @@ pub fn drain_local_worker(
         }
         // Execute: run the model over the kept chunk and anchor the structured graph onto the
         // ORIGINAL digest — the executor's structuring and the owner's apply collapse on one node.
-        run_capture_into_digest(
+        // The write-once apply marker joins the SAME transaction as the graph write (a crash can
+        // never leave the graph applied but the marker missing).
+        run_capture_into_digest_with_completion(
             store,
             CaptureRequest {
                 context_label,
@@ -469,8 +508,15 @@ pub fn drain_local_worker(
             extractor,
             &crate::harness::CaptureHarnessConfig::default(),
             Some(digest_id),
+            Some(crate::ingest::CaptureCompletionMarker {
+                context_id,
+                digest_id,
+                model: "fabric-local",
+                fault: None,
+            }),
         )?;
-        // Record the exactly-once result (executor = this node) and the write-once apply marker.
+        // Record the exactly-once result (executor = this node). This is the worker-plane receipt,
+        // deliberately a separate append-only ledger write from the owner-plane apply marker above.
         let receipt = FabricExecutionReceipt {
             executor_node_id: node_id.to_string(),
             total_tokens: candidate.chunk_text.len() as u64,
@@ -486,7 +532,6 @@ pub fn drain_local_worker(
             0,
         )
         .map_err(map_engine)?;
-        mark_structured(store, context_id, digest_id, "fabric-local", None)?;
         drained += 1;
     }
     Ok(drained)
@@ -568,13 +613,15 @@ pub fn run_worker_once<E: ConversationExtractor + Sync>(
                 let runtime = contextdb_server::tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|err| CgError::Engine(format!("fabric worker runtime: {err}")))?;
+                    .map_err(|err| {
+                        crate::CgError::Engine(format!("fabric worker runtime: {err}"))
+                    })?;
                 runtime
                     .block_on(cg_poll_once(client, &executor, config, policy, now_ms))
                     .map_err(map_engine)
             })
             .join()
-            .map_err(|_| CgError::Engine("fabric worker poll thread panicked".to_string()))?
+            .map_err(|_| crate::CgError::Engine("fabric worker poll thread panicked".to_string()))?
     })?;
     Ok(outcome)
 }

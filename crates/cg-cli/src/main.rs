@@ -21,7 +21,8 @@ use cg_cli_conventions::{
     model_byok_status_exit_code,
 };
 use context_graph::fabric::{
-    FABRIC_CONFIG_FILE, FabricConfig, FabricPollOutcome, FabricWorkerConfig, run_worker_once,
+    FABRIC_CONFIG_FILE, FabricCapture, FabricConfig, FabricPollOutcome, FabricWorkerConfig,
+    run_worker_once,
 };
 use context_graph::harness::{
     CaptureHarnessConfig, CaptureHarnessReport, ExtractionPromptInputs, SchemaDescriptor,
@@ -36,7 +37,7 @@ use context_graph::ingest::{
 use context_graph::injection::{INJECTION_TOKEN_BUDGET, build_injection_index};
 use context_graph::tier0::{
     self, ForgetReport, ForgetSelector, Tier0CaptureReport, Tier0CaptureRequest, bump_touch,
-    capture_tier0, forget_raw, queue_counts, raw_footprint,
+    forget_raw, queue_counts, raw_footprint,
 };
 use context_graph::understanding::{
     MAX_UNDERSTANDING_ATTEMPTS, claim_digest, list_pending_digests, mark_failed, mark_structured,
@@ -190,10 +191,31 @@ fn usage_error(message: &str) -> i32 {
     2
 }
 
+/// Load the node's fabric config once (an absent `cg/fabric.toml` = single-node, unchanged) and run a
+/// tier-0 capture through the fabric-aware submission path, honoring the global sharing switch, the
+/// per-source opt-out list, and the per-invocation `--no-share` flag. The CLI stays a caller — the
+/// share/opt-out decision lives in `context_graph::fabric::capture`.
+fn run_fabric_capture(
+    store: &Store,
+    fabric_config: Option<&FabricConfig>,
+    no_share: bool,
+    request: Tier0CaptureRequest,
+) -> context_graph::Result<Tier0CaptureReport> {
+    let mut capture = FabricCapture::new(request);
+    capture.config = fabric_config;
+    capture.source_opt_out = no_share;
+    context_graph::fabric::capture(store, capture)
+}
+
 fn handle_record(args: &[String]) -> i32 {
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
+    let no_share = has_flag(args, "--no-share");
+    let fabric_config = match FabricConfig::load(&root) {
+        Ok(config) => config,
+        Err(err) => return cg_failure(err, &db_path, &context_label),
+    };
     let input = match record_input(args) {
         Ok(input) => input,
         Err(MemoryCliError::UseImportForSessionFiles) => {
@@ -262,7 +284,7 @@ fn handle_record(args: &[String]) -> i32 {
             source: "cg-record".to_string(),
             chunk_window,
         };
-        let tier0 = match capture_tier0(&store, request) {
+        let tier0 = match run_fabric_capture(&store, fabric_config.as_ref(), no_share, request) {
             Ok(report) => report,
             Err(err) => return cg_failure(err, &db_path, &context_label),
         };
@@ -312,7 +334,7 @@ fn handle_record(args: &[String]) -> i32 {
         source: "cg-record".to_string(),
         chunk_window: 0,
     };
-    let report = match capture_tier0(&store, request) {
+    let report = match run_fabric_capture(&store, fabric_config.as_ref(), no_share, request) {
         Ok(report) => report,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
@@ -477,6 +499,11 @@ fn handle_import(args: &[String]) -> i32 {
         Ok(context) => context,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
+    let no_share = has_flag(args, "--no-share");
+    let fabric_config = match FabricConfig::load(&root) {
+        Ok(config) => config,
+        Err(err) => return cg_failure(err, &db_path, &context_label),
+    };
     // Eager opt-in (`--understand-now`): the SAME two-step understanding path the background worker
     // runs, in the foreground. Deterministic tier-0 capture of the reconstructed session (N per-chunk
     // verbatim digests + queue rows), THEN a blocking drain of exactly those digests through the
@@ -497,7 +524,7 @@ fn handle_import(args: &[String]) -> i32 {
             source: "cg-import".to_string(),
             chunk_window: chunk_options.max_chars,
         };
-        let tier0 = match capture_tier0(&store, request) {
+        let tier0 = match run_fabric_capture(&store, fabric_config.as_ref(), no_share, request) {
             Ok(report) => report,
             Err(err) => return cg_failure(err, &db_path, &context_label),
         };
@@ -555,7 +582,7 @@ fn handle_import(args: &[String]) -> i32 {
         source: "cg-import".to_string(),
         chunk_window: chunk_options.max_chars,
     };
-    let report = match capture_tier0(&store, request) {
+    let report = match run_fabric_capture(&store, fabric_config.as_ref(), no_share, request) {
         Ok(report) => report,
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
@@ -705,6 +732,11 @@ fn handle_import_directory(
         Ok(context) => context,
         Err(err) => return cg_failure(err, db_path, context_label),
     };
+    let no_share = has_flag(args, "--no-share");
+    let fabric_config = match FabricConfig::load(root) {
+        Ok(config) => config,
+        Err(err) => return cg_failure(err, db_path, context_label),
+    };
     let started = Instant::now();
     let mut files_imported = 0usize;
     let mut digests_written = 0usize;
@@ -727,7 +759,7 @@ fn handle_import_directory(
             source: "cg-import".to_string(),
             chunk_window: chunk_options.max_chars,
         };
-        let report = match capture_tier0(&store, request) {
+        let report = match run_fabric_capture(&store, fabric_config.as_ref(), no_share, request) {
             Ok(report) => report,
             Err(err) => return cg_failure(err, db_path, context_label),
         };
@@ -3897,6 +3929,10 @@ struct MemoryStatusSnapshot {
     /// many ephemeral understanding-input copies actually sit in the outbound push set. `None` when
     /// no `fabric.toml` is present (a plain single-node install).
     fabric: Option<FabricStatusLine>,
+    /// The per-job fabric understanding state for this context, rendered from the library
+    /// `fabric::job_statuses` under a REAL wall-clock so an expired lease reads as pending, never
+    /// running. Empty when the context has no submitted understanding jobs.
+    fabric_jobs: Vec<FabricJobLine>,
     summary: String,
 }
 
@@ -3904,6 +3940,14 @@ struct MemoryStatusSnapshot {
 struct FabricStatusLine {
     sharing_on: bool,
     inputs_in_push_set: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FabricJobLine {
+    job_id: String,
+    state: String,
+    executor_node_id: Option<String>,
+    receipt: Option<Value>,
 }
 
 fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot {
@@ -3916,6 +3960,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
     let mut raw_retention_days = None;
     let mut last_understanding_run = None;
     let mut fabric = None;
+    let mut fabric_jobs: Vec<FabricJobLine> = Vec::new();
     let last_injection = read_last_injection(root);
     if let Ok(store) = open_memory_store(root) {
         raw_retention_days = tier0::raw_retention_days(&store).unwrap_or(None);
@@ -3942,6 +3987,23 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
             counts = memory_counts(&store, context.id).unwrap_or_default();
             queue = queue_counts(&store, context.id).unwrap_or_default();
             raw = raw_footprint(&store, context.id).unwrap_or_default();
+            // Per-job fabric understanding state, read from the library under a REAL wall-clock: an
+            // expired lease downgrades to pending in `job_statuses`, so the CLI must pass honest time
+            // (never 0 or a stale value) or a dead worker's lease would masquerade as running.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as i64)
+                .unwrap_or(0);
+            fabric_jobs = context_graph::fabric::job_statuses(&store, context.id, now_ms)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|status| FabricJobLine {
+                    job_id: status.job_id,
+                    state: status.state,
+                    executor_node_id: status.executor_node_id,
+                    receipt: status.receipt,
+                })
+                .collect();
         }
     }
     let fabric_summary = fabric
@@ -3978,8 +4040,14 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
             )
         })
         .unwrap_or_default();
+    let fabric_jobs_summary = if fabric_jobs.is_empty() {
+        String::new()
+    } else {
+        let done = fabric_jobs.iter().filter(|job| job.state == "done").count();
+        format!(" | fabric jobs: {} ({} done)", fabric_jobs.len(), done,)
+    };
     let summary = format!(
-        "context: {context_label} goals: {} decisions: {} observations: {} | pending understanding: {} | raw kept: {} chunks / {} bytes{injection_summary}{fabric_summary}",
+        "context: {context_label} goals: {} decisions: {} observations: {} | pending understanding: {} | raw kept: {} chunks / {} bytes{injection_summary}{fabric_summary}{fabric_jobs_summary}",
         counts.goals,
         counts.decisions,
         counts.observations,
@@ -3998,6 +4066,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
         last_understanding_run,
         last_injection,
         fabric,
+        fabric_jobs,
         summary,
     }
 }
@@ -4055,6 +4124,26 @@ fn add_memory_status_fields(value: &mut Value, snapshot: &MemoryStatusSnapshot) 
                 }),
             );
         }
+        // The per-job fabric understanding state for this context: each job's computed state, the
+        // executing node id when done, and the token/time receipt — rendered from the library under a
+        // real wall-clock (an expired lease reads as pending, never running).
+        object.insert(
+            "fabric_jobs".to_string(),
+            Value::Array(
+                snapshot
+                    .fabric_jobs
+                    .iter()
+                    .map(|job| {
+                        json!({
+                            "job_id": job.job_id,
+                            "state": job.state,
+                            "executor_node_id": job.executor_node_id,
+                            "receipt": job.receipt,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
         if let Some(last_run) = &snapshot.last_understanding_run {
             object.insert("last_understanding_run".to_string(), last_run.clone());
         }
