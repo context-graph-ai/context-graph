@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,9 @@ use cg_cli::{CheckRegistry, run_doctor_checks};
 use cg_cli_conventions::{
     host_session_selftest_failure_exit_code, model_byok_selftest_failure_exit_code,
     model_byok_status_exit_code,
+};
+use context_graph::fabric::{
+    FABRIC_CONFIG_FILE, FabricConfig, FabricPollOutcome, FabricWorkerConfig, run_worker_once,
 };
 use context_graph::harness::{
     CaptureHarnessConfig, CaptureHarnessReport, ExtractionPromptInputs, SchemaDescriptor,
@@ -55,7 +59,7 @@ use contextdb_engine::{
     Database,
     sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection},
 };
-use contextdb_server::SyncClient;
+use contextdb_server::{FabricIdentity, SyncClient};
 use fs4::fs_std::FileExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -148,6 +152,7 @@ fn run(args: Vec<String>) -> i32 {
         Some("import") => handle_import(&args[1..]),
         Some("forget") => handle_forget(&args[1..]),
         Some("understand") => handle_understand(&args[1..]),
+        Some("worker") => handle_worker(&args[1..]),
         Some("query") => handle_query(&args[1..]),
         Some("sync") => handle_sync(&args[1..]),
         Some("impact") => handle_impact(&args[1..]),
@@ -176,7 +181,7 @@ fn run(args: Vec<String>) -> i32 {
 
 fn print_help() {
     println!(
-        "Usage: cg <command>\n\nCommands:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  status                        Show model connection status\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n\nExamples:\n  cg model auth login --connection claude --consent\n  cg status\n  cg selftest"
+        "Usage: cg <command>\n\nCommands:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  status                        Show model connection status\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n  worker [--poll-interval MS] [--budget N]\n                                Run this machine as a fabric understanding worker: dial the\n                                configured hub ticket, advertise capability, execute jobs other\n                                nodes submitted (needs cg/fabric.toml + a connected model)\n\nExamples:\n  cg model auth login --connection claude --consent\n  cg status\n  cg selftest\n  cg worker --poll-interval 2000 --budget 200000"
     );
 }
 
@@ -974,6 +979,325 @@ fn understand_worker(args: &[String]) -> i32 {
     };
     persist_last_understanding_run(&store, &summary);
     0
+}
+
+/// `cg worker` — run this machine as a remote understanding executor in its tenant fabric.
+///
+/// This is a DISTINCT verb from `cg understand --worker`, not an extension of it, because the two are
+/// different NODE ROLES. `cg understand --worker` is the single-node detached queue drain: no hub,
+/// silent, one-shot until this machine's OWN backlog empties. `cg worker` is a long-running FABRIC
+/// executor: it dials the configured hub, advertises its understanding capability, and loops
+/// `fabric::run_worker_once` claiming and executing jobs OTHER nodes submitted. Overloading one flag
+/// onto both roles would conflate "drain my own queue" with "execute the fabric's queue", so each
+/// role keeps its own verb and its own per-data-root lockfile.
+///
+/// The CLI stays a pure caller: every claim / lease / matching decision lives in
+/// `fabric::run_worker_once`. This function only loads config + identity, builds the `SyncClient`,
+/// enforces the single-worker lock and budget/poll knobs, and renders per-job receipts.
+fn handle_worker(args: &[String]) -> i32 {
+    let root = data_root();
+    let fabric_path = root.join("cg").join(FABRIC_CONFIG_FILE);
+
+    // A worker without a fabric is a config error, never a silent local drain: refuse loudly and
+    // BEFORE opening any store or network, naming the exact file and the missing key.
+    let config = match FabricConfig::load(&root) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return worker_failure(
+                2,
+                "FabricConfigMissing",
+                &format!(
+                    "cg worker needs a fabric, but {} is absent. Create it with a [fabric] section naming hub_endpoint (the pasted enrollment ticket) and tenant.",
+                    fabric_path.display()
+                ),
+            );
+        }
+        Err(err) => {
+            return worker_failure(
+                2,
+                "FabricConfigUnreadable",
+                &format!("cg worker cannot read {}: {err}", fabric_path.display()),
+            );
+        }
+    };
+    let Some(hub_endpoint) = config
+        .hub_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    else {
+        return worker_failure(
+            2,
+            "FabricHubEndpointMissing",
+            &format!(
+                "cg worker has no hub to dial: set `hub_endpoint` (the pasted enrollment ticket) under [fabric] in {}.",
+                fabric_path.display()
+            ),
+        );
+    };
+    let Some(tenant) = config
+        .tenant
+        .as_deref()
+        .map(str::trim)
+        .filter(|tenant| !tenant.is_empty())
+    else {
+        return worker_failure(
+            2,
+            "FabricTenantMissing",
+            &format!(
+                "cg worker has no tenant to enroll under: set `tenant` under [fabric] in {}.",
+                fabric_path.display()
+            ),
+        );
+    };
+
+    // A worker with no connected/local model can execute nothing — refuse at startup, BEFORE any
+    // network, with the exact `cg model use` fix.
+    if memory_capture_connection_name(&root).is_none() {
+        return worker_failure(
+            4,
+            "NotConnected",
+            "cg worker needs a connected or local model to run understanding; select one with `cg model use <id>` (or `cg model connect` for a hosted key).",
+        );
+    }
+
+    let budget = match parse_understand_budget(args) {
+        Ok(budget) => budget,
+        Err(message) => return usage_error(&message),
+    };
+    let poll_interval = match parse_worker_poll_interval(args) {
+        Ok(interval) => interval,
+        Err(message) => return usage_error(&message),
+    };
+
+    // One `cg worker` per data root — a second invocation is a no-op (exit 0), never a second drain.
+    let Some(_lock) = acquire_fabric_worker_lock(&root) else {
+        eprintln!("cg worker: another worker already holds this data root; nothing to do.");
+        return 0;
+    };
+
+    // The node's stable fabric identity lives next to the memory db, at the established key-file
+    // convention (`fabric-identity.key`). Its node_id is what the worker advertises and claims under,
+    // and the transport dials FROM it (see worker_dial_spec) so the authenticated node_id and the
+    // ledger node_id are the same identity end to end.
+    let key_path = fabric_identity_path(&root);
+    let identity = match FabricIdentity::load_or_generate(&key_path) {
+        Ok(identity) => identity,
+        Err(err) => {
+            return worker_failure(
+                1,
+                "FabricIdentityUnavailable",
+                &format!(
+                    "cg worker cannot load its fabric identity at {}: {err}",
+                    key_path.display()
+                ),
+            );
+        }
+    };
+    let node_id = identity.node_id();
+
+    let store = match open_memory_store(&root) {
+        Ok(store) => store,
+        Err(err) => {
+            return worker_failure(
+                1,
+                "StoreUnavailable",
+                &format!("cg worker cannot open the memory store: {err:?}"),
+            );
+        }
+    };
+    let context_label = memory_context_label(args);
+    let context = match ensure_cli_context(&store, &context_label) {
+        Ok(context) => context,
+        Err(err) => return worker_failure(1, "ContextUnavailable", &format!("{err:?}")),
+    };
+    // The SAME connected-model extractor path the local drain uses. The worker's executor renders its
+    // own transcript context; the extractor's context id is immaterial to that path (it never anchors
+    // a graph here — the digest owner applies the result).
+    let Some(extractor) =
+        ConnectedModelExtractor::for_context(&root, context.id, CaptureHarnessConfig::default())
+    else {
+        return worker_failure(
+            4,
+            "NotConnected",
+            "cg worker needs a connected or local model to run understanding; select one with `cg model use <id>`.",
+        );
+    };
+
+    // Build the SyncClient against the hub, dialing FROM the enrolled identity, and register cg's
+    // per-table sync contract on it exactly as the sync CLI does.
+    let dial_spec = worker_dial_spec(hub_endpoint, &key_path);
+    let client = SyncClient::new(store.sync_database(), &dial_spec, TenantId::from(tenant));
+    register_context_graph_sync_client(&CliSyncClientRegistration(&client));
+
+    // Advertise this node's understanding capability; sharing follows the fabric config.
+    let mut worker_config = FabricWorkerConfig::for_node(&node_id);
+    worker_config.sharing = config.sharing;
+
+    // Clean Ctrl-C: finish the in-flight job, take no new ones. run_worker_once is synchronous and
+    // returns only BETWEEN jobs, so a flag checked at the top of the loop lets the current job finish
+    // and then stops before the next claim.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    spawn_sigint_watch(Arc::clone(&shutdown));
+
+    eprintln!(
+        "cg worker up: node {node_id} tenant {tenant} (poll {}ms). Ctrl-C stops after the current job.",
+        poll_interval.as_millis()
+    );
+
+    let mut spent: Vec<ModelCallUsage> = Vec::new();
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            eprintln!("cg worker: shutdown requested; no new jobs taken.");
+            break;
+        }
+        if budget.exhausted(&spent) {
+            eprintln!("cg worker: budget ceiling reached; stopping.");
+            break;
+        }
+        let started = Instant::now();
+        let outcome = run_worker_once(&client, &store, &extractor, &worker_config, now_millis());
+        // Fold this poll's model spend into the running total the budget ceiling is measured against.
+        let usage = extractor.drain_model_usage();
+        let tokens = spent_total_tokens(&usage).unwrap_or(0);
+        spent.extend(usage);
+        match outcome {
+            Ok(FabricPollOutcome::Executed { job_id }) => {
+                eprintln!(
+                    "worker: job {job_id} executed tokens={tokens} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
+            Ok(FabricPollOutcome::Applied { digest }) => {
+                eprintln!(
+                    "worker: job applied digest={digest} tokens={tokens} elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
+            Ok(FabricPollOutcome::LostClaim { holder }) => {
+                eprintln!(
+                    "worker: lost claim (holder {}) elapsed_ms={}",
+                    holder.as_deref().unwrap_or("unknown"),
+                    started.elapsed().as_millis()
+                );
+                interruptible_sleep(&shutdown, poll_interval);
+            }
+            Ok(FabricPollOutcome::NoWork) => {
+                interruptible_sleep(&shutdown, poll_interval);
+            }
+            Err(err) => {
+                return worker_failure(
+                    1,
+                    "PollFailed",
+                    &format!("cg worker poll against the hub failed: {err:?}"),
+                );
+            }
+        }
+    }
+    0
+}
+
+/// The default worker poll interval when `--poll-interval` is omitted.
+const DEFAULT_WORKER_POLL_MS: u64 = 2000;
+
+/// Parse `--poll-interval MS` (milliseconds between hub polls), defaulting to
+/// [`DEFAULT_WORKER_POLL_MS`]. Reuses the shared positive-integer flag parser.
+fn parse_worker_poll_interval(args: &[String]) -> Result<Duration, String> {
+    match flag_value(args, "--poll-interval") {
+        Some(raw) => {
+            let ms = parse_positive_usize_flag("--poll-interval", &raw)?;
+            Ok(Duration::from_millis(ms as u64))
+        }
+        None => Ok(Duration::from_millis(DEFAULT_WORKER_POLL_MS)),
+    }
+}
+
+/// The node's fabric identity key file, next to the memory db under the data root.
+fn fabric_identity_path(root: &Path) -> PathBuf {
+    root.join("fabric-identity.key")
+}
+
+/// Compose the transport dial spec for the worker, pinning THIS node's enrolled fabric identity so
+/// the transport-authenticated node_id matches the ledger node_id it claims under. Follows contextdb's
+/// established dial-with-identity convention (`...&identity=<key-file>`). An operator who already
+/// pinned an identity in the endpoint keeps it verbatim.
+fn worker_dial_spec(hub_endpoint: &str, key_path: &Path) -> String {
+    let trimmed = hub_endpoint.trim();
+    let key = key_path.display();
+    if trimmed.contains("identity=") {
+        trimmed.to_string()
+    } else if let Some(query) = trimmed.strip_prefix("iroh:?") {
+        format!("iroh:?{query}&identity={key}")
+    } else {
+        let ticket = trimmed.strip_prefix("iroh:").unwrap_or(trimmed);
+        format!("iroh:?to={ticket}&identity={key}")
+    }
+}
+
+/// The per-data-root `cg worker` lock (distinct from the `understand-worker.lock` the local drain
+/// kick uses): holding this file's exclusive lock is what guarantees one fabric worker per root. The
+/// returned handle must stay alive for the worker's lifetime; dropping it releases the lock.
+fn acquire_fabric_worker_lock(root: &Path) -> Option<fs::File> {
+    let path = root.join("fabric-worker.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .ok()?;
+    match file.try_lock_exclusive() {
+        Ok(true) => Some(file),
+        _ => None,
+    }
+}
+
+/// Watch for Ctrl-C on a dedicated thread with its own tiny runtime and flip `flag` when it fires.
+/// Kept off the worker loop's own path so it never interferes with the per-poll runtime
+/// `run_worker_once` spins up internally.
+fn spawn_sigint_watch(flag: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            runtime.block_on(async {
+                let _ = tokio::signal::ctrl_c().await;
+            });
+            flag.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Sleep up to `total`, but wake early (in ~100ms slices) once shutdown is requested so Ctrl-C during
+/// an idle poll interval is honored promptly.
+fn interruptible_sleep(shutdown: &AtomicBool, total: Duration) {
+    let slice = Duration::from_millis(100);
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let step = remaining.min(slice);
+        std::thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+}
+
+/// Emit a structured worker failure line and return `code`. The fabric worker is not a memory-context
+/// operation, so it renders its own `bucket:"fabric"` shape rather than the memory failure envelope.
+fn worker_failure(code: i32, condition: &str, message: &str) -> i32 {
+    println!(
+        "{}",
+        json!({
+            "ok": false,
+            "bucket": "fabric",
+            "surface": "worker",
+            "condition": condition,
+            "message": message,
+        })
+    );
+    code
 }
 
 /// The token ceiling a drain stops at. Token-based today (the Capability-A receipt lane counts

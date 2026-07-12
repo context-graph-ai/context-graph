@@ -24,14 +24,17 @@ nats = ["contextdb-server/nats"]
 [dependencies]
 cg-catalog = { path = "../cg-catalog" }
 cg-cli-conventions.workspace = true
-context-graph = { path = "../context-graph" }
+# fabric-sync enables the SyncClient-consuming worker seam (fabric::run_worker_once) so `cg worker`
+# can run this node as a remote understanding executor. It is a cg-cli-only activation — the library's
+# own default build stays fabric-sync-off (tokio-free embeddable core).
+context-graph = { path = "../context-graph", features = ["fabric-sync"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh"] }
 fs4.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml.workspace = true
 uuid.workspace = true
 
