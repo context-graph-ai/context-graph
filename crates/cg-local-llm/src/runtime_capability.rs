@@ -244,14 +244,13 @@ impl LocalBackendReport {
 
 /// Resolve the backend from the binary capability, the operator's configuration, and a probe.
 ///
-/// SCAFFOLD (deliberately wrong): reports CPU for every input and records zero requested GPU
-/// layers, regardless of capability, configuration, or probe result. The real implementation
-/// (Step 4) resolves CUDA preparation, the CPU-on-GPU-host mismatch, operator-forced CPU, and the
-/// distinct fallback reasons.
+/// `active_backend` is Cpu for EVERY branch here — the resolver may PREPARE a CUDA load (request
+/// non-zero GPU layers) but never claims active CUDA itself; only
+/// [`LocalBackendReport::with_load_observation`] can promote it, and only when the loaded engine
+/// observed real offload.
 #[must_use]
 pub fn resolve_backend(config: &LocalBackendConfig, probe: &dyn GpuProbe) -> LocalBackendReport {
-    let _ = probe;
-    LocalBackendReport {
+    let base = LocalBackendReport {
         binary_capability: config.binary_capability,
         configured_backend: config.configured_backend,
         active_backend: ActiveBackend::Cpu,
@@ -260,5 +259,59 @@ pub fn resolve_backend(config: &LocalBackendConfig, probe: &dyn GpuProbe) -> Loc
         fallback_reason: None,
         gpu_available_but_unusable_by_this_binary: false,
         recommended_action: None,
+    };
+
+    match config.binary_capability {
+        BinaryCapability::Cpu => {
+            // A CPU binary never touches CUDA — it only reports whether the HOST has a usable GPU
+            // this binary cannot exploit, and names the fix. It must never set a fallback reason
+            // (it never tried) and never requests GPU layers.
+            let gpu_available_but_unusable_by_this_binary =
+                matches!(probe.probe(), GpuProbeResult::UsableCuda { .. });
+            let recommended_action = gpu_available_but_unusable_by_this_binary.then(|| {
+                format!(
+                    "This binary is the CPU artifact and cannot use the detected NVIDIA GPU. \
+                     Install the CUDA artifact `{CUDA_ARTIFACT_NAME}` to use it."
+                )
+            });
+            LocalBackendReport {
+                gpu_available_but_unusable_by_this_binary,
+                recommended_action,
+                ..base
+            }
+        }
+        BinaryCapability::Cuda => {
+            if config.configured_backend == ConfiguredBackend::Cpu {
+                // Operator-forced CPU overrides a usable GPU unconditionally: zero requested
+                // layers, and the fallback reason names exactly why CPU ran.
+                return LocalBackendReport {
+                    requested_gpu_layers: Some(0),
+                    fallback_reason: Some(FallbackReason::OperatorForcedCpu),
+                    ..base
+                };
+            }
+            match probe.probe() {
+                GpuProbeResult::NoGpu => LocalBackendReport {
+                    fallback_reason: Some(FallbackReason::NoGpu),
+                    ..base
+                },
+                GpuProbeResult::CudaInitFailed => LocalBackendReport {
+                    fallback_reason: Some(FallbackReason::CudaInitFailed),
+                    ..base
+                },
+                GpuProbeResult::InsufficientVram { .. } => LocalBackendReport {
+                    fallback_reason: Some(FallbackReason::InsufficientVram),
+                    ..base
+                },
+                GpuProbeResult::UsableCuda { .. } => {
+                    // Prepare a CUDA load: request non-zero layers. active_backend STAYS Cpu here
+                    // — only a folded-in load observation with real offload promotes it.
+                    LocalBackendReport {
+                        requested_gpu_layers: Some(config.requested_gpu_layers_when_cuda),
+                        ..base
+                    }
+                }
+            }
+        }
     }
 }

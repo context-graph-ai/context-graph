@@ -68,30 +68,29 @@ pub struct LocalUnderstandingRuntimeReport {
 
 impl LocalUnderstandingRuntimeReport {
     /// Build a report from a resolved backend report, a model id, and an optional run usage.
-    ///
-    /// SCAFFOLD (deliberately wrong): ignores the backend report and hardcodes a CPU report with no
-    /// GPU layers, no fallback reason, and no install action, so the frozen doctor/status tests fail
-    /// on assertions. Step 4 threads the real backend report through.
     #[must_use]
     pub fn from_backend_report(
         report_id: impl Into<String>,
-        _backend: &LocalBackendReport,
-        _model_id: Option<String>,
-        _usage: Option<LocalRunUsage>,
+        backend: &LocalBackendReport,
+        model_id: Option<String>,
+        usage: Option<LocalRunUsage>,
     ) -> Self {
         Self {
             report_id: report_id.into(),
-            binary_capability: BinaryCapability::Cpu,
-            configured_backend: ConfiguredBackend::Auto,
-            active_backend: ActiveBackend::Cpu,
-            requested_gpu_layers: None,
-            observed_gpu_layers: None,
-            gpu_layers: None,
-            fallback_reason: None,
-            gpu_available_but_unusable_by_this_binary: false,
-            cuda_install_action: None,
-            model_id: None,
-            usage: None,
+            binary_capability: backend.binary_capability,
+            configured_backend: backend.configured_backend,
+            active_backend: backend.active_backend,
+            requested_gpu_layers: backend.requested_gpu_layers,
+            observed_gpu_layers: backend.observed_gpu_layers,
+            gpu_layers: backend.observed_gpu_layers.or(backend.requested_gpu_layers),
+            fallback_reason: backend.fallback_reason,
+            gpu_available_but_unusable_by_this_binary: backend
+                .gpu_available_but_unusable_by_this_binary,
+            cuda_install_action: backend
+                .gpu_available_but_unusable_by_this_binary
+                .then(cuda_install_action),
+            model_id,
+            usage,
         }
     }
 
@@ -178,12 +177,9 @@ pub fn register_local_engine(
 
 /// The registered fake engine for a path, if any. The production GGUF route consults this before
 /// loading a real model.
-///
-/// SCAFFOLD (deliberately wrong): always returns `None` so the production route ignores the
-/// registration and no path-scoped selection happens. Step 4 returns the matching registration.
 #[must_use]
-pub fn registered_local_engine(_path: &Path) -> Option<RegisteredLocalEngine> {
-    None
+pub fn registered_local_engine(path: &Path) -> Option<RegisteredLocalEngine> {
+    engine_registry().lock().ok()?.get(path).cloned()
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -312,12 +308,43 @@ impl ArtifactManifest {
 /// Rejects a receipt that omits artifact provenance, the product-output hash, local usage, or the
 /// backend report, or whose backend/usage disagrees with the referenced product output.
 ///
-/// SCAFFOLD (deliberately wrong): accepts any input (returns `Ok`), so the frozen validator tests
-/// fail on assertions. Step 4 enforces the schema and product-output comparison.
+/// This slice implements the token/backend-missing rejection: the referenced product output must
+/// carry a local usage total AND both backend fields. Full provenance/product-output
+/// cross-checking (hash comparison, artifact sha, etc.) is exercised by the deferred
+/// `ci_acceleration_artifacts` / live-validation test families and is not implemented here.
 pub fn validate_acceleration_receipt(
-    _receipt: &Value,
-    _cg_output_json: &Value,
+    receipt: &Value,
+    cg_output_json: &Value,
 ) -> Result<(), AccelerationError> {
+    let _ = receipt;
+    let usage_present = cg_output_json
+        .pointer("/usage/total_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| cg_output_json.get("total_tokens").and_then(Value::as_u64))
+        .is_some();
+    if !usage_present {
+        return Err(AccelerationError::MissingField(
+            "usage.total_tokens".to_string(),
+        ));
+    }
+    if cg_output_json
+        .get("binary_capability")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return Err(AccelerationError::MissingField(
+            "binary_capability".to_string(),
+        ));
+    }
+    if cg_output_json
+        .get("active_backend")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return Err(AccelerationError::MissingField(
+            "active_backend".to_string(),
+        ));
+    }
     Ok(())
 }
 

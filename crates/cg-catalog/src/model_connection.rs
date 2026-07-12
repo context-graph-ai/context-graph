@@ -5810,6 +5810,8 @@ fn understand_local_gguf(
         .understand(prompt, &contract, &params)
         .map_err(|err| CgError::Engine(format!("local understanding failed: {err}")))?;
     let wall_clock_ms = reply.receipt.wall_clock_ms;
+    let prompt_tokens = reply.receipt.prompt_tokens;
+    let generated_tokens = reply.receipt.generated_tokens;
 
     let level = match reply.receipt.level {
         cg_local_llm::LocalEnforcementLevel::Native => EnforcementLevel::Native,
@@ -5863,16 +5865,25 @@ fn understand_local_gguf(
                 .to_string()
         });
 
-    // SCAFFOLD (deliberately wrong): the local receipt's token counts are dropped here instead of
-    // reaching `ModelReply.usage`, so the frozen local-GGUF usage tests fail on assertion. Step 4
-    // maps `prompt_tokens`/`generated_tokens` into a `ProviderUsage` (never synthesizing usage for
-    // a token-less reply).
+    // Reconnect the local receipt's token counts into the normal usage path. A reply carrying NO
+    // tokens at all (a fake/degenerate reply with both counts zero) is never turned into a
+    // synthesized timing-only usage record — it stays `None` so the validation path can reject it
+    // as missing local usage rather than accepting fabricated zeros.
+    let usage = if prompt_tokens == 0 && generated_tokens == 0 {
+        None
+    } else {
+        Some(context_graph::ProviderUsage {
+            prompt_tokens: prompt_tokens as u64,
+            completion_tokens: generated_tokens as u64,
+            total_tokens: (prompt_tokens + generated_tokens) as u64,
+        })
+    };
     let reply = context_graph::ModelReply {
         marker: understanding_marker(&invocation.request),
         phrasing,
         advisory_flag: level == EnforcementLevel::Floor,
         malformed: false,
-        usage: None,
+        usage,
     }
     .with_model_receipt(ModelCallReceipt {
         reliability_level: level,
