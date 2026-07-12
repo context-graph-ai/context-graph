@@ -19,6 +19,7 @@ use context_graph::{
     ContextGraphSyncRegistration, Store, StoreConfig, register_context_graph_sync_client,
 };
 use contextdb_core::TenantId;
+use contextdb_engine::Database;
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
 use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
 use tempfile::TempDir;
@@ -104,6 +105,27 @@ pub async fn fabric_fixture_with_tenants(
             server.run_until(shutdown).await;
         })
     };
+
+    // A genuinely two-tenant fabric gives each tenant its OWN hub view — a separate hub store, dialed
+    // over its own tenant-scoped subjects on the shared broker. When the two edges enroll under
+    // different tenants, stand up the second tenant's hub (a fresh, empty store) so a differently-
+    // tenanted edge's push/pull resolves a responder instead of a transport miss AND sees only its own
+    // tenant's data: the tenant-A edge's rows land on the tenant-A hub and never reach the tenant-B
+    // hub, so a tenant-B edge pulling its own hub gets nothing — cross-tenant movement is impossible
+    // at the fabric boundary. Detached and tied to the same shutdown, so it stops with the fixture.
+    // (Same-tenant fixtures are unchanged.)
+    if edge2_tenant != edge1_tenant {
+        let second = Arc::new(SyncServer::with_transport(
+            Arc::new(Database::open_memory()),
+            broker.server(),
+            TenantId::from(edge2_tenant),
+            cg_conflict_policies(),
+        ));
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            second.run_until(shutdown).await;
+        });
+    }
 
     let edge1 = FabricNode::open(&format!("{test_name}_edge1"));
     let edge2 = FabricNode::open(&format!("{test_name}_edge2"));

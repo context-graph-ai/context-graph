@@ -930,6 +930,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cg-node-fs"
+version = "0.1.0"
+dependencies = [
+ "fs4",
+]
+
+[[package]]
 name = "cg-vision-embedder"
 version = "0.1.0"
 dependencies = [
@@ -1156,7 +1163,9 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "cg-catalog",
+ "cg-node-fs",
  "chrono",
+ "context-graph",
  "contextdb-core",
  "contextdb-engine",
  "contextdb-server",

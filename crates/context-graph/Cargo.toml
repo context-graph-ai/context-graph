@@ -21,15 +21,22 @@ nomic-embedder = [
     "dep:tokenizers",
     "dep:ureq",
 ]
+# The distributed-fabric worker seam. OFF by default so the embeddable core library stays
+# tokio-free and native-dep-free (vigil/WASM embed it, and the purity guards check the
+# default `--edges normal,build` tree). cg-cli and the fabric integration tests enable it;
+# everything the fabric offloads (submission, apply, movement, retention, status) is always
+# compiled — only the SyncClient-consuming worker loop lives behind this flag.
+fabric-sync = ["dep:contextdb-server"]
 
 [dependencies]
 candle-core = { workspace = true, optional = true }
 candle-nn = { workspace = true, optional = true }
 candle-transformers = { workspace = true, optional = true }
+cg-node-fs.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
-contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["nats"] }
+contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["nats"], optional = true }
 fs4.workspace = true
 pollster.workspace = true
 safetensors = { workspace = true, optional = true }
@@ -43,6 +50,10 @@ ureq = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 
 [dev-dependencies]
+# Enable the fabric-sync worker seam for THIS crate's own integration tests (the frozen fabric
+# tests call `fabric::run_worker_once`). This is a test/example/bench-only activation: it does NOT
+# pull contextdb-server/tokio into the default `--edges normal,build` tree the purity guards check.
+context-graph = { path = ".", features = ["fabric-sync"] }
 candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true

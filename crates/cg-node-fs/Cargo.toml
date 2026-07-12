@@ -1,0 +1,15 @@
+[package]
+name = "cg-node-fs"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node-deployment filesystem primitives for cg (config file read, per-data-root worker lock)"
+edition = "2024"
+
+[lib]
+name = "cg_node_fs"
+path = "src/lib.rs"
+
+[dependencies]
+fs4.workspace = true

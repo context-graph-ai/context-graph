@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/context-graph",
+    "crates/cg-node-fs",
     "crates/candle-embeddinggemma",
     "crates/cg-catalog",
     "crates/cg-cli-conventions",
@@ -21,6 +22,7 @@ description = "Agentic memory graph — Intention-centric ontology, contextdb-ba
 
 [workspace.dependencies]
 candle-embeddinggemma = { path = "crates/candle-embeddinggemma" }
+cg-node-fs = { path = "crates/cg-node-fs" }
 cg-cli-conventions = { path = "crates/cg-cli-conventions" }
 uuid = { version = "1.23.0", features = ["v4", "v7", "serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
