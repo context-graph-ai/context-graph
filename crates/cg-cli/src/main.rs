@@ -1069,7 +1069,7 @@ fn drain_context_queue(
     if memory_capture_connection_name(root).is_none() {
         return Ok(DrainOutcome { counts, reports });
     }
-    // Operator-reachable capture config (cg-correctness C5): `<data_root>/cg/capture.toml` when
+    // Operator-reachable capture config: `<data_root>/cg/capture.toml` when
     // present, defaults otherwise; a malformed file fails the drain LOUDLY, never silently
     // reverting to defaults. The file READ lives here (caller); parsing is library.
     let config = match load_capture_config(root) {
@@ -1183,7 +1183,7 @@ fn drain_context_queue(
             }
         }
     }
-    // Session-level goal reconciliation (C4): after this drain structured digests, merge
+    // Session-level goal reconciliation: after this drain structured digests, merge
     // per-chunk duplicate goals into canonical session intentions and surface unattached
     // decisions for review. Runs through the SAME classification seam capture uses; additive
     // writes only. Config-disable via capture.toml `session_reconciliation = false`.
@@ -1200,7 +1200,7 @@ fn drain_context_queue(
         );
         // Capability-A honesty: the reconciliation's judge calls ride THIS extractor — their
         // usage must join EVERY receipt lane like any other provider call (a receipt that
-        // undercounts calls is a lying receipt; the first-light receipt test enforces this).
+        // undercounts calls is a lying receipt; the capture receipt test enforces this).
         // Two lanes: `spent` feeds the understand-side receipts; the last capture report's
         // model_usage feeds the record command's own usage.calls array.
         let reconcile_usage = extractor.drain_model_usage();
@@ -1813,8 +1813,8 @@ fn collect_import_source_chunks(
 #[derive(Clone, Copy, Debug)]
 struct ImportChunkOptions {
     max_chars: usize,
-    /// Bytes of the previous chunk's tail carried into the next chunk (cg-correctness C5:
-    /// operator config via capture.toml `chunk_overlap`; 0 = the shipped no-overlap behavior).
+    /// Bytes of the previous chunk's tail carried into the next chunk (operator config
+    /// via capture.toml `chunk_overlap`; 0 = the shipped no-overlap behavior).
     overlap_chars: usize,
     resolved_chunk_window: usize,
     model_context_tokens: usize,
@@ -1842,7 +1842,7 @@ fn import_chunk_options(args: &[String], root: &Path) -> Result<ImportChunkOptio
             .min(fractional)
             .clamp(1, DEFAULT_IMPORT_CHUNK_WINDOW)
     });
-    // Operator capture config (cg-correctness C5): capture.toml chunk_window applies when no
+    // Operator capture config: capture.toml chunk_window applies when no
     // explicit --chunk-tokens flag was given; chunk_overlap comes only from config. Overlap is
     // clamped to a quarter-window so a misconfigured overlap can never stall chunk progress.
     let capture_config = load_capture_config(root)?;
@@ -1915,7 +1915,7 @@ fn known_model_context_tokens(model_name: &str) -> Option<usize> {
     None
 }
 
-/// Load the operator capture config from `<data_root>/cg/capture.toml` (cg-correctness C5).
+/// Load the operator capture config from `<data_root>/cg/capture.toml`.
 /// Absent file → defaults (never an error); malformed file → loud error with the path named.
 fn load_capture_config(root: &Path) -> Result<CaptureHarnessConfig, String> {
     let path = root.join("cg/capture.toml");
@@ -1938,7 +1938,7 @@ fn stream_import_chunks<F>(
 where
     F: FnMut(&str) -> context_graph::Result<()>,
 {
-    // Whole-file two-phase parse (cg-correctness C2): the selection policy needs lookahead —
+    // Whole-file two-phase parse: the selection policy needs lookahead —
     // tool-result content survives only where the FOLLOWING assistant dialogue engages with it —
     // which a per-line stream cannot express. Per-file memory is bounded by session size (MBs);
     // directory imports remain file-at-a-time.
@@ -3947,8 +3947,7 @@ struct ConnectedModelExtractor {
     /// second prompt source: every schema-bearing prompt is rendered from this descriptor.
     descriptor: SchemaDescriptor,
     /// The capture config the descriptor derived from — the library prompt assembly
-    /// (`render_extraction_prompt`) renders from THIS, so the CLI defines no framing of its own
-    /// (cg-correctness C3).
+    /// (`render_extraction_prompt`) renders from THIS, so the CLI defines no framing of its own.
     config: CaptureHarnessConfig,
     usage: Arc<Mutex<Vec<ModelCallUsage>>>,
     structured_output_rejected: Arc<Mutex<bool>>,
@@ -3957,7 +3956,7 @@ struct ConnectedModelExtractor {
     /// correction examples assembled at the drain call site and appended to the extraction prompt.
     /// `None` on the capture path (no steering) and whenever nothing relevant matches.
     steering: Option<String>,
-    /// Which extraction pass this instance renders (C4 pass focus): `Full` for the shipped
+    /// Which extraction pass this instance renders (pass focus): `Full` for the shipped
     /// single-pass contract; the harness's staged orchestration clones per-pass variants.
     pass: context_graph::ingest::ExtractionPass,
 }
@@ -4193,7 +4192,7 @@ impl ConnectedModelExtractor {
         transcript: &str,
         prior_decisions: &[ExtractionPriorDecision],
     ) -> String {
-        // Pure delegation (cg-correctness C3): the framing, recipe, caps, and schema block are
+        // Pure delegation: the framing, recipe, caps, and schema block are
         // all assembled by the library from the capture config — the bench renders from the SAME
         // source, so they cannot drift.
         let prior_memory = render_prior_decisions_for_prompt(prior_decisions);
@@ -4272,7 +4271,7 @@ impl LlmClient for ConnectedModelExtractor {
 }
 
 impl ConversationExtractor for ConnectedModelExtractor {
-    /// Pass-focused extraction (C4): a per-pass variant shares the usage/receipt accumulators
+    /// Pass-focused extraction: a per-pass variant shares the usage/receipt accumulators
     /// (same Arcs) but renders the FILTERED contract — descriptor, prompt, provider schema, and
     /// parse targets all derive from the pass descriptor, so a focused pass is a genuinely
     /// focused ask, never the full re-ask the trait default would run.

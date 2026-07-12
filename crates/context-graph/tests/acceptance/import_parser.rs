@@ -1,9 +1,9 @@
 use context_graph::CgError;
 use context_graph::ingest::{ClaudeJsonlParser, ImportParser, parser_for_format};
 
-// EXPECTATION CHANGE (2026-07-03, cg-correctness criterion C2, criteria commit 99d99ee):
+// EXPECTATION CHANGE (2026-07-03, tool-output preservation):
 // the original "clean conversation" contract asserted tool blocks vanish WITHOUT TRACE — the
-// exact behavior that deleted decision-bearing tool output at import. The ratified contract:
+// exact behavior that deleted decision-bearing tool output at import. The current contract:
 // every tool event keeps a one-line prose header; result content survives only where the
 // following assistant dialogue engages with it (here: nothing follows, so header only).
 const CLAUDE_JSONL: &str = r#"{"type":"system","content":"noise"}

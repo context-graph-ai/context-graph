@@ -1,6 +1,5 @@
-//! RED contract tests for criteria C1/C8 (criteria commit 99d99ee — the criteria→test mapping
-//! in the run working doc names these). Authored and committed BEFORE implementation; the
-//! implementation commit may not touch this file.
+//! RED contract tests for the gold format and the scoring method. Authored and committed BEFORE
+//! implementation; the implementation commit may not touch this file.
 
 use cg_bench::gold::{
     MadeIn, OmissionTrainingPair, load_gold_str, omission_pair_from_json, omission_pair_to_json,
@@ -33,7 +32,7 @@ impl SimilarityProvider for TableSim {
 
 const GOLD_YAML: &str = r#"
 session: test-session.jsonl
-drafted_by: fable-agent 2026-07-03
+drafted_by: cg-bench 2026-07-03
 approved_by: null
 intentions:
   - key: i1
@@ -110,7 +109,7 @@ fn gold_format_roundtrips_and_records_omissions() {
 
 #[test]
 fn scoring_matcher_applies_frozen_thresholds() {
-    // The registration itself: these values are frozen in docs/cg-correctness-criteria.md.
+    // The registration itself: these values are the pre-registered scoring thresholds.
     assert_eq!(AUTO_MATCH_THRESHOLD, 0.75);
     assert_eq!(AUTO_NON_MATCH_THRESHOLD, 0.55);
 

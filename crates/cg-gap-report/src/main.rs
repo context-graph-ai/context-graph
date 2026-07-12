@@ -1372,8 +1372,8 @@ observations (tightened from the production 3/6/6/6 to bound the local model's w
 full ontology forces every field per item, so output length dominates cost at ~1–2.4 tok/s on 4 \
 shared CPU cores). The SAME caps and prompt go to both engines, so the comparison stays fair; at \
 production caps the local output would be longer and more prone to truncation, not more faithful.\n\n\
-> This report presents OBSERVED DATA for the owner's decision gate. It does not declare the bar \
-cleared — that judgment is the owner's.\n\n",
+> This report presents OBSERVED DATA for the maintainer's decision. It does not declare the bar \
+cleared — that judgment is the maintainer's.\n\n",
         gguf.display(),
         HOSTED_MODEL,
         if grammar_converts {
@@ -1752,7 +1752,7 @@ fn render_gate_summary(
     real: &[RealChunkScore],
     grammar_converts: bool,
 ) -> String {
-    let mut s = String::from("## Owner decision gate: the numbers\n\n");
+    let mut s = String::from("## The numbers\n\n");
 
     // fixtures
     s.push_str("**Adversarial fixtures (local, tuned recipe):**\n\n");
@@ -1873,7 +1873,7 @@ fn render_gate_summary(
 for repositories/models — the `file` over-type count above is this class.\n\
 - *Structural (not a prompt fix):* any parse failures, empty-on-signal, or dropped decisions on \
 real chunks reflect the 2B model's ceiling under the full ontology, not a correctable label.\n\n\
-The owner judges these numbers against the make-or-break bar for zero-cost understanding.\n",
+The maintainer judges these numbers against the make-or-break bar for zero-cost understanding.\n",
     );
     s
 }

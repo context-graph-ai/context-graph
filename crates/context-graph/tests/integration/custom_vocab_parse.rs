@@ -1,7 +1,7 @@
 //! RED test for the S6 smoke catch (2026-07-04): with a USER-SUPPLIED vocabulary configured,
 //! the model correctly emits a custom type (e.g. `"entity_type":"lead"`) — and the harvest
 //! parser hard-errored the WHOLE extraction ("unknown variant `lead`") instead of routing the
-//! value to the raw lane where the configured-vocabulary review flag lives. The ratified C5
+//! value to the raw lane where the configured-vocabulary review flag lives. The
 //! contract is "flags for review, never coerced" — erroring the capture is neither. Committed
 //! failing before the fix; the fix commit may not touch this file.
 

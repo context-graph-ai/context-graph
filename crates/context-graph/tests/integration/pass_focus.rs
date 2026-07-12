@@ -1,4 +1,4 @@
-//! RED contract tests for the pass-focus half of C4 (criteria commit 99d99ee): a focused
+//! RED contract tests for the pass-focus half of staged extraction: a focused
 //! extraction pass must render a FOCUSED contract — descriptor filtered to the pass's fields —
 //! not the full-ontology ask re-run. Found live: production's extract_pass fell through to the
 //! trait default, so "staged" measured self-consistency (full pass ×3, merged), not the probe-2

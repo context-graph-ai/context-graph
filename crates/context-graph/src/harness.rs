@@ -110,8 +110,8 @@ pub fn default_capture_context(tenant_id: &str, _cwd: &str) -> String {
 // CaptureHarnessConfig
 // ---------------------------------------------------------------------------
 
-/// Per-chunk item caps rendered into the extraction prompt (criterion C5, criteria commit
-/// 99d99ee): configuration, not compile-time constants — a live recall clip when set too low
+/// Per-chunk item caps rendered into the extraction prompt: configuration, not compile-time
+/// constants — a live recall clip when set too low
 /// (the hosted ceiling probe sat exactly at the old hardcoded decision cap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemCaps {
@@ -132,7 +132,7 @@ impl Default for ItemCaps {
     }
 }
 
-/// Invocation inputs to the library prompt assembly (criterion C3): everything the caller
+/// Invocation inputs to the library prompt assembly: everything the caller
 /// supplies per call; everything recipe-shaped comes from `CaptureHarnessConfig` instead.
 #[derive(Debug, Clone)]
 pub struct ExtractionPromptInputs<'a> {
@@ -166,15 +166,14 @@ pub struct CaptureHarnessConfig {
     pub tier: Option<String>,
     /// Per-chunk item caps rendered into the prompt. When unset, `ItemCaps::default()`.
     pub item_caps: Option<ItemCaps>,
-    /// USER-SUPPLIED entity vocabulary (owner decision 2026-07-03: "user supplied, never in
-    /// code"). When unset, the 13 built-in types. Feeds schema + prompt + grounding from this
+    /// USER-SUPPLIED entity vocabulary (user supplied, never in code). When unset, the 13 built-in types. Feeds schema + prompt + grounding from this
     /// one source — the first slice of cg-open-entity-vocabulary.
     pub entity_vocabulary: Option<Vec<String>>,
-    /// Staged extraction (C4): run focused entities/decisions passes alongside the full pass
+    /// Staged extraction: run focused entities/decisions passes alongside the full pass
     /// and merge deterministically. Opt-in config; the default is the shipped single pass —
     /// the bench measures both as levers before any default flips.
     pub staged_extraction: bool,
-    /// Session-level goal reconciliation after a drain (C4): merges per-chunk duplicate goals
+    /// Session-level goal reconciliation after a drain: merges per-chunk duplicate goals
     /// into one canonical intention and flags unattached decisions. Default ON (additive,
     /// judgment-improving); `session_reconciliation = false` in capture.toml disables.
     pub session_reconciliation: bool,
@@ -265,7 +264,7 @@ impl CaptureHarnessConfig {
         })
     }
 
-    /// Pass-focused descriptor (C4): the focused passes ask for a SUBSET of the ontology —
+    /// Pass-focused descriptor: the focused passes ask for a SUBSET of the ontology —
     /// entities-only; decisions+goals (the trunk stays attachable) — never the full re-ask.
     pub fn schema_descriptor_for_pass(
         &self,
@@ -286,7 +285,7 @@ impl CaptureHarnessConfig {
         Some(descriptor)
     }
 
-    /// Pass-focused prompt assembly (C4): Full renders byte-identically to
+    /// Pass-focused prompt assembly: Full renders byte-identically to
     /// `render_extraction_prompt`; focused passes render the filtered contract.
     pub fn render_extraction_prompt_for_pass(
         &self,
@@ -321,7 +320,7 @@ exhaustively; leave every other category out."
         )
     }
 
-    /// The ONE production prompt assembly (criterion C3): framing, tuned recipe, schema block,
+    /// The ONE production prompt assembly: framing, tuned recipe, schema block,
     /// caps, and shape guidance, rendered from this config. cg-cli and the bench both call THIS,
     /// so they cannot drift. The tuned rules are the gap-report recipe that probe 2 proved
     /// recovers entities (0 → 15–16/chunk at $0), plus the decision→goal attachment instruction
@@ -427,7 +426,7 @@ impl CaptureHarnessConfig {
     }
 
     pub fn allowed_entity_type_names(&self) -> Vec<String> {
-        // USER-SUPPLIED vocabulary (owner decision 2026-07-03) wins verbatim; the 13 built-in
+        // USER-SUPPLIED vocabulary wins verbatim; the 13 built-in
         // enum types are the default, not the universe.
         if let Some(vocabulary) = &self.entity_vocabulary {
             return vocabulary.clone();
@@ -809,7 +808,7 @@ pub struct CaptureHarnessReport {
     pub withheld_skill_ids: Vec<String>,
     /// Whether the capture receipt leads with the intention section (it does).
     pub receipt_leads_with_intention: bool,
-    /// Deterministic reliability-wrapper actions taken this capture (criterion C6), e.g.
+    /// Deterministic reliability-wrapper actions taken this capture, e.g.
     /// `"reask:entities"`. Visible by contract — a silent recovery would read as "the model did
     /// fine". Empty when no wrapper ran.
     pub reliability_actions: Vec<String>,
@@ -936,7 +935,7 @@ pub fn run_capture(
     run_capture_into_digest(store, request, extractor, config, None)
 }
 
-/// Deterministic staged-harvest merge (criteria C4/C6): focused-pass items JOIN the full pass's
+/// Deterministic staged-harvest merge: focused-pass items JOIN the full pass's
 /// harvest (deduped by normalized text/name); nothing is ever removed, so a lazy-empty focused
 /// pass cannot erase full-pass findings — the probe-2 relocated-lazy-empty failure is
 /// structurally impossible here.
@@ -1005,8 +1004,8 @@ pub fn run_capture_into_digest(
         schema_prompt_block.as_deref(),
     )?;
 
-    // Staged extraction (criterion C4): opt-in focused passes over the same transcript, merged
-    // deterministically. C6 cross-pass consistency is structural here: an empty focused pass
+    // Staged extraction: opt-in focused passes over the same transcript, merged
+    // deterministically. Cross-pass consistency is structural here: an empty focused pass
     // never erases what the full pass found (merge only ADDS).
     if config.staged_extraction && request.model_available {
         let entities_pass = extractor.extract_pass(
@@ -1028,7 +1027,7 @@ pub fn run_capture_into_digest(
         merge_staged_harvests(&mut harvest, entities_pass, decisions_pass);
     }
 
-    // Reliability wrapper (criterion C6): grammar guarantees shape, not effort — zero entities
+    // Reliability wrapper: grammar guarantees shape, not effort — zero entities
     // on a big, content-rich chunk is the observed lazy-empty failure, not a plausible reading.
     // ONE deterministic re-ask through the focused entities pass (never a loop), recorded
     // visibly on the report. Skipped when staging already ran its own entities pass.
@@ -1055,7 +1054,7 @@ pub fn run_capture_into_digest(
         );
     }
 
-    // Goal-key backfill (C4 silent-loss fix): the capture writer SKIPS a decision that resolves
+    // Goal-key backfill (silent-loss fix): the capture writer SKIPS a decision that resolves
     // to no goal — on this harness path a goal-less decision in a goal-less chunk was silently
     // DROPPED (the legacy record path already backfilled; this path did not). Backfill attaches
     // it to the synthetic fallback goal so it is stored and retrievable; the session
@@ -1064,7 +1063,7 @@ pub fn run_capture_into_digest(
 
     // Resolve any raw model-emitted entity-type strings to their typed variant before grounding,
     // skill application, and structural fill; an out-of-vocab raw string is flagged below against
-    // the CONFIGURED vocabulary (C5 — the same source the schema/prompt rendered from).
+    // the CONFIGURED vocabulary (the same source the schema/prompt rendered from).
     let configured_vocab = config.allowed_entity_type_names();
     let mut flagged_items =
         crate::ingest::resolve_raw_entity_types(&mut harvest, &configured_vocab);

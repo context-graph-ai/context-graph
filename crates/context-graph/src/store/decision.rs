@@ -685,10 +685,10 @@ impl Store {
         self.decode_discovery_decisions_at_read(&result.columns, &result.rows, snapshot)
     }
 
-    /// Additive SERVES routing (criterion C4 — the reconciliation writer seam): attach an
+    /// Additive SERVES routing (the reconciliation writer seam): attach an
     /// existing decision to an intention it serves. Idempotent; writes an edge, never edits or
     /// deletes rows. The session-goal reconciliation pass writes through this; the future
-    /// cg-server-core runner reuses the same seam.
+    /// a future server-side runner reuses the same seam.
     pub fn route_decision_to_intention(
         &self,
         decision_id: DecisionId,
@@ -733,7 +733,7 @@ impl Store {
     }
 
     /// Active decisions in a context with NO SERVES edge — the "unattached" set the session
-    /// reconciliation pass must link or surface for review (criterion C4: an unattached
+    /// reconciliation pass must link or surface for review (an unattached
     /// decision cannot participate in currency or impact analysis and is never left silent).
     pub fn decisions_without_serves_in_context(
         &self,

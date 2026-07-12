@@ -1,8 +1,7 @@
-//! The bench report (criterion C7): per-category numbers vs the FROZEN bars (criteria commit
-//! 99d99ee), the hosted-ceiling row next to every local row (the model-gap vs pipeline-gap
+//! The bench report: per-category numbers vs the FROZEN bars, the hosted-ceiling row next to every local row (the model-gap vs pipeline-gap
 //! separator), per-lever history, and a printed verdict — in whichever direction it falls.
 
-/// The owner-ratified bars (docs/cg-correctness-criteria.md). Rendered into every report so
+/// The acceptance bars (documented alongside the scoring method). Rendered into every report so
 /// numbers are always read AGAINST the registration.
 pub const BAR_INTENTION_FIDELITY: f32 = 0.75;
 pub const BAR_ATTACHMENT: f32 = 0.75;
@@ -19,7 +18,7 @@ pub struct CategoryNumbers {
     pub decision_precision: f32,
     pub entity_recall: f32,
     pub entity_type_accuracy: f32,
-    /// Reported, not gated (frozen criteria).
+    /// Reported, not gated (pre-registered scoring method).
     pub observation_recall: f32,
     pub duplication_rate: f32,
     pub sessions: usize,
@@ -66,7 +65,7 @@ impl BenchReport {
     /// Render the report: bars, every variant row (per-lever history), verdict per row.
     pub fn render_markdown(&self) -> String {
         let mut out = format!(
-            "# cg-correctness bench — {}\n\nBars (criteria commit 99d99ee, owner-ratified): \
+            "# capture-correctness bench — {}\n\nBars (pre-registered scoring method): \
              intention ≥ {BAR_INTENTION_FIDELITY:.2}, attachment ≥ {BAR_ATTACHMENT:.2}, \
              decision recall ≥ {BAR_DECISION_RECALL:.2}, decision precision ≥ \
              {BAR_DECISION_PRECISION:.2}, entity recall ≥ {BAR_ENTITY_RECALL:.2}, entity type \

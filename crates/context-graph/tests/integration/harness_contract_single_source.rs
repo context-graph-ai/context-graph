@@ -148,7 +148,7 @@ fn capture_harness_config_threads_prompt_overrides_and_recall_limit_and_window_a
         review_mode: false,
         prompt_override: None,
         tier: Some("haiku".to_string()),
-        // cg-correctness C5 (2026-07-03): the config grew additive fields (item_caps,
+        // The config grew additive fields (item_caps,
         // entity_vocabulary, chunk_overlap); this exhaustive literal takes their defaults.
         // Minimal frozen-file edit in its own commit — every assertion below is unchanged.
         ..CaptureHarnessConfig::default()

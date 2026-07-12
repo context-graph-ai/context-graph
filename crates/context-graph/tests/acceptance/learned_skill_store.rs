@@ -482,7 +482,7 @@ fn exported_edited_skill_pushed_back_becomes_human_authored() {
     );
 }
 
-// RED (receipt honesty, cg ledger DL-CG-1, found by the owner's live smoke): "applied" must mean
+// RED (receipt honesty): "applied" must mean
 // an actual persisted effect. A promoted skill that MATCHES the chunk but whose harvest contains
 // nothing its retype can touch (extraction yielded no such entity) must NOT be reported in
 // applied_skill_ids — the receipt was claiming an effect that never landed, so the follow-up

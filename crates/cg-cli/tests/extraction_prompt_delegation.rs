@@ -1,4 +1,4 @@
-//! RED contract test for criterion C3 (criteria commit 99d99ee): the production extraction
+//! RED contract test for library-owned prompt framing: the production extraction
 //! prompt framing lives in the LIBRARY (the flows-doc "no surface without a library API beneath
 //! it" rule), so the bench and production render from the same source and cannot drift. The CLI
 //! may only delegate. Authored and committed BEFORE implementation; implementation commits may

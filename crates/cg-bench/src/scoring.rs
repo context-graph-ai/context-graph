@@ -1,8 +1,8 @@
-//! The frozen scoring method (criteria commit `99d99ee`).
+//! The pre-registered scoring method.
 //!
 //! Hierarchical, intention-first, session-level. Matching is embedding-similarity banded by the
 //! two frozen thresholds; the gray zone is ROUTED OUT for adjudication (fixed-prompt judge +
-//! owner sample), never silently decided here.
+//! manual sample), never silently decided here.
 
 use crate::gold::GoldSession;
 
@@ -13,7 +13,7 @@ pub const AUTO_NON_MATCH_THRESHOLD: f32 = 0.55;
 
 /// Similarity seam: production runs use the bundled nomic embedder; tests use deterministic
 /// doubles (this trait tests the banding/aggregation logic, never model quality — model quality
-/// is the owner live smoke).
+/// is the live smoke).
 pub trait SimilarityProvider {
     fn similarity(&self, a: &str, b: &str) -> f32;
 }

@@ -1290,8 +1290,8 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "decision_lineage_producer_systems",
     "decision_targets_entity",
     "decision_targets_intention",
-    // cg-correctness C4 (2026-07-03): deliberate additive Store surface — the session-goal
-    // reconciliation writer/reader (cg-server-core's runner reuses the same seams).
+    // Deliberate additive Store surface — the session-goal
+    // reconciliation writer/reader (a future server-side runner reuses the same seams).
     "decisions_without_serves_in_context",
     "dereference_evidence",
     "diff",
@@ -1337,7 +1337,7 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "render_decision_producer_audit_paragraph",
     "render_school_gate_message_body",
     "replay",
-    // cg-correctness C4 (2026-07-03): idempotent additive SERVES routing (reconciliation writer).
+    // Idempotent additive SERVES routing (reconciliation writer).
     "route_decision_to_intention",
     "snapshot_at",
     "state_at",

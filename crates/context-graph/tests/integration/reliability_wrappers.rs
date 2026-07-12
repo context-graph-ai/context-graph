@@ -1,4 +1,4 @@
-//! RED contract tests for criterion C6's re-ask half (criteria commit 99d99ee): grammar
+//! RED contract tests for the reliability re-ask wrapper: grammar
 //! guarantees shape, not effort — the observed lazy-empty failures are intermittent effort
 //! failures. The deterministic wrapper converts intermittent into rare at $0: ONE re-ask when a
 //! result is suspiciously empty (zero entities on a big chunk), never a loop; every wrapper

@@ -1,4 +1,4 @@
-//! RED contract tests for criterion C7 (criteria commit 99d99ee): the bench drives the
+//! RED contract tests for the bench runner: the bench drives the
 //! PRODUCTION capture path (the same library entry the drain calls — never a side harness; the
 //! gap-report's side path is the documented false-green history), reads extraction back from the
 //! store, and its report carries the per-category numbers vs the frozen bars, the hosted-ceiling
@@ -155,7 +155,7 @@ fn bench_report_carries_ceiling_row_and_per_lever_history() {
     });
 
     let rendered = report.render_markdown();
-    // Every report carries the hosted-ceiling row next to the local rows (frozen criteria):
+    // Every report carries the hosted-ceiling row next to the local rows (pre-registered scoring method):
     // the model-gap vs pipeline-gap separator.
     assert!(rendered.contains("gemma4-e2b-it-q4"));
     assert!(rendered.contains("hosted:anthropic/claude-haiku-4.5"));

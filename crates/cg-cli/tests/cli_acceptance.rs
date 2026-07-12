@@ -350,11 +350,10 @@ fn cli_help_root() {
         "bare cg must show help text, got {:?}",
         bare.stdout
     );
-    // STALE-CONTRACT FIX (cg-correctness run, 2026-07-03, own commit): this assertion predated
-    // cg-daily-loop, which made `cg connect claude-code` the real injection-hook installer
-    // (exit 0, hooks written into the harness-isolated HOME). The daily-loop ship documented
-    // this failure as a known baseline instead of updating it; updated here to the shipped,
-    // owner-accepted contract.
+    // STALE-CONTRACT FIX (2026-07-03): this assertion predated the daily-loop work, which made
+    // `cg connect claude-code` the real injection-hook installer (exit 0, hooks written into
+    // the harness-isolated HOME). That work documented this failure as a known baseline instead
+    // of updating it; updated here to the shipped contract.
     let install = harness.run(&["connect", "claude-code"]);
     assert_eq!(
         install.code, 0,

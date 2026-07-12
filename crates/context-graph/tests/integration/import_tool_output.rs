@@ -1,4 +1,4 @@
-//! RED contract tests for criterion C2 (criteria commit 99d99ee): `cg import` must stop deleting
+//! RED contract tests for tool-output preservation: `cg import` must stop deleting
 //! decision-bearing tool output at jsonl parse. Authored and committed BEFORE implementation;
 //! implementation commits may not touch this file.
 //!
@@ -49,7 +49,7 @@ fn user_tool_result_line(id: &str, content: &str) -> String {
 }
 
 /// A session where the relay-mode placement decision's rationale lives in a plan-file read —
-/// the real capture-loss class this criterion closes (the relay-hub session is the live-smoke
+/// the real capture-loss class this test closes (the relay-hub session is the live-smoke
 /// counterpart, assertion S2).
 fn decision_bearing_session() -> String {
     [

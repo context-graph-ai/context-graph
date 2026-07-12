@@ -233,7 +233,7 @@ const CLAUDE_SESSION: &str = r#"{"type":"system","content":"Goal: raw system dec
 {"type":"assistant","message":{"content":[{"type":"text","text":"Current facts: the auth module file is observed at src/auth.py, auth tests cover password-less login, JWT refresh token TTL remains 7 days, and the audit trail lives in docs/auth-migration.md."}]}}
 "#;
 
-// EXPECTATION CHANGE (2026-07-04, cg-correctness criterion C2, same rationale as the
+// EXPECTATION CHANGE (2026-07-04, tool-output preservation, same rationale as the
 // import_parser change): tool events now leave a one-line prose HEADER (tool name + sanitized
 // artifact target only — free-content keys like this fixture's decoy `query` are never
 // rendered, preserving the decoy contract). The old constant pinned "vanish without trace".

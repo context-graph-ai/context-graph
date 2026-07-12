@@ -213,7 +213,7 @@ pub struct StructuredHarvest {
     pub outcomes: Vec<OutcomeSeed>,
 }
 
-/// A USER-SUPPLIED vocabulary (C5) means the model can legitimately emit an entity_type
+/// A USER-SUPPLIED vocabulary means the model can legitimately emit an entity_type
 /// outside the built-in enum (e.g. `"lead"`). The typed field would hard-error the WHOLE
 /// harvest parse — so any entity_type string the enum does not recognize is routed into
 /// `entity_type_raw` BEFORE typed deserialization, where `resolve_raw_entity_types` applies
@@ -563,8 +563,7 @@ pub enum EntityIdentityVerdict {
     Separate,
 }
 
-/// Which extraction pass a staged capture is requesting (criterion C4, criteria commit
-/// 99d99ee). `Full` is the shipped single-pass behavior; the focused passes are the probe-2
+/// Which extraction pass a staged capture is requesting. `Full` is the shipped single-pass behavior; the focused passes are the probe-2
 /// staged recipe as production behavior; `SessionIntention` is the session-level goal
 /// reconciliation pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,7 +577,7 @@ pub enum ExtractionPass {
 pub trait ConversationExtractor {
     fn extract(&self, request: ExtractionRequest<'_>) -> Result<StructuredHarvest>;
 
-    /// Staged extraction seam (C4): a focused pass over the same transcript. The default
+    /// Staged extraction seam: a focused pass over the same transcript. The default
     /// delegates to `extract`, so every existing extractor and test double keeps working; the
     /// connected extractor overrides it to render a pass-specific prompt.
     fn extract_pass(
@@ -882,8 +881,8 @@ const ENGAGEMENT_STOPWORDS: &[&str] = &[
     "through", "under", "until", "where", "which", "while", "within", "without", "would",
 ];
 
-/// The ONE deterministic, model-free selection + rendering policy (criterion C2, criteria
-/// commit 99d99ee): every tool event keeps a one-line prose header naming what was done;
+/// The ONE deterministic, model-free selection + rendering policy: every tool event keeps a
+/// one-line prose header naming what was done;
 /// result content survives only where the following assistant dialogue actually engages with
 /// it (per-line rare-token overlap with the next few assistant turns, capped per event); kept
 /// content is rendered as plain prose, never re-wrapped in tool tags (tag-wrapped content would
@@ -980,7 +979,7 @@ fn engaged_result_lines(
     kept
 }
 
-/// Result of the session-level goal reconciliation pass (criterion C4): per-chunk duplicate
+/// Result of the session-level goal reconciliation pass: per-chunk duplicate
 /// goals merged ADDITIVELY into canonical session intentions (variants absorbed via the shipped
 /// dedup classification — superseded/refined, never deleted), and decisions that cannot attach
 /// to any goal surfaced for review, never silently unattached.
@@ -991,7 +990,7 @@ pub struct ReconcileSummary {
     pub flagged_unattached: usize,
 }
 
-/// Session-level goal reconciliation over a context's captured intentions (criterion C4): the
+/// Session-level goal reconciliation over a context's captured intentions: the
 /// intention is a session-level object the per-chunk pipeline structurally fragments; this pass
 /// runs the SAME identity judgment the capture dedup uses, across the chunks' goals, and applies
 /// the merges additively. Runs after a session's digests are understood (the drain calls it);
@@ -1252,8 +1251,8 @@ fn claude_line_into_items(
 
 /// The human-readable object of a tool call, rendered into the prose header — taken ONLY from
 /// artifact-reference keys (paths, urls, commands), never from free-content keys (`pattern`,
-/// `query`, `prompt`) or an arbitrary first string: those can carry injected prose (the
-/// first-light decoy contract — a tool-use payload saying "Decision: …" must never surface
+/// `query`, `prompt`) or an arbitrary first string: those can carry injected prose (a
+/// tool-use payload saying "Decision: …" must never surface
 /// where extraction mines it). Length-capped so a command cannot smuggle a paragraph.
 fn tool_target_from_input(input: Option<&JsonValue>) -> String {
     const TARGET_CAP: usize = 120;
@@ -1452,7 +1451,7 @@ fn record_conversation_internal_with_stored_text(
     // Resolve any raw model-emitted entity-type strings to their typed variant before grounding and
     // structural fill; an out-of-vocab raw string is flagged here (never silently coerced). This
     // legacy path runs under the default vocabulary; the production drain path threads the
-    // operator-configured vocabulary through the harness (C5).
+    // operator-configured vocabulary through the harness.
     let default_vocab = crate::harness::CaptureHarnessConfig::default().allowed_entity_type_names();
     let mut flagged_items = resolve_raw_entity_types(&mut harvest, &default_vocab);
     prepare_harvest_for_capture(
@@ -2194,7 +2193,7 @@ fn reuse_prior_goals_for_entity_decisions(
 /// Key and text of the SYNTHETIC fallback goal the backfill fabricates when a harvest carries
 /// decisions but no goals. Single-sourced so the session reconciliation pass can recognize its
 /// own marker: a decision serving ONLY this synthetic goal is "unattached" for review purposes
-/// (the hollow-intention shape is a trunk failure, not real attachment — criterion C4).
+/// (the hollow-intention shape is a trunk failure, not real attachment).
 pub(crate) const FALLBACK_GOAL_KEY: &str = "G_context";
 
 pub(crate) fn fallback_goal_text(context_label: &str) -> String {
@@ -2462,7 +2461,7 @@ pub(crate) fn default_decision_type_vocabulary() -> &'static [&'static str] {
 /// is left at its default and reported here so the caller can flag it (never silently coerced). Runs
 /// before grounding and structural fill so the resolved type is what gets stored.
 ///
-/// `legal_vocab` is the CONFIGURED vocabulary (criterion C5 — user-supplied, one source with the
+/// `legal_vocab` is the CONFIGURED vocabulary (user-supplied, one source with the
 /// schema/prompt): a value in the configured list but outside the built-in enum is flagged with an
 /// honest distinct reason (typed storage for custom vocabularies is cg-open-entity-vocabulary's
 /// remaining scope), and every flag carries the configured legal list, so `cg why` shows the
@@ -2549,7 +2548,7 @@ pub(crate) fn grounding_check_harvest(
 ) -> Vec<FlaggedItem> {
     let mut flagged = Vec::new();
 
-    // Entities (name + chosen type), as before. Flags carry the CONFIGURED vocabulary (C5).
+    // Entities (name + chosen type), as before. Flags carry the CONFIGURED vocabulary.
     for seed in &harvest.entities {
         if seed.key.trim().is_empty() || seed.name.trim().is_empty() {
             continue;

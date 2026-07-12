@@ -2198,7 +2198,7 @@ fn cli_by_entity() {
             .pointer("/entity/entity_type")
             .and_then(Value::as_str),
         Some("File"),
-        "by-entity must expose the stored entity type for live smoke assertions"
+        "by-entity must expose the stored entity type for end-to-end assertions"
     );
     assert!(no_resolution(&wrong));
 }

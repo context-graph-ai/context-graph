@@ -1,5 +1,5 @@
 //! Gold answer-key format: session-level labels drafted from the ORIGINAL session files (never
-//! through cg) and owner-approved. Session-level by design — chunk-aligned labels are forbidden
+//! through cg) and curated. Session-level by design — chunk-aligned labels are forbidden
 //! (the importer fix changes chunk boundaries and would invalidate them).
 //!
 //! The format is omission-capable by construction: gold lists what SHOULD have been extracted,
@@ -80,7 +80,7 @@ pub fn to_yaml(gold: &GoldSession) -> Result<String, String> {
 }
 
 /// An omission training pair: the chunk input plus the COMPLETE corrected harvest — the artifact
-/// the correction data engine cannot produce from `cg fix` value-edits alone (criterion C8).
+/// the correction data engine cannot produce from `cg fix` value-edits alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OmissionTrainingPair {
     pub chunk_input: String,

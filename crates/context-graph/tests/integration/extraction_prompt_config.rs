@@ -1,4 +1,4 @@
-//! RED contract tests for criteria C3/C5 (criteria commit 99d99ee): the extraction prompt is
+//! RED contract tests for library-owned prompt assembly and operator config: the extraction prompt is
 //! assembled by the LIBRARY from `CaptureHarnessConfig` (no CLI-resident framing), and every
 //! recipe knob — item caps, prompt override, tier, chunk window/overlap, entity vocabulary — is
 //! operator-reachable configuration. Authored and committed BEFORE implementation; implementation
@@ -60,7 +60,7 @@ fn extraction_prompt_assembly_honors_caps_override_and_vocabulary() {
 
 #[test]
 fn custom_entity_vocabulary_reaches_schema_values() {
-    // Owner decision 2026-07-03: the entity noun list is USER-SUPPLIED configuration, never
+    // The entity noun list is USER-SUPPLIED configuration, never
     // hardcoded ("user supplied, never in code, can be a yaml"). First slice of
     // cg-open-entity-vocabulary: the configured list feeds schema + prompt from ONE source.
     let custom = CaptureHarnessConfig {

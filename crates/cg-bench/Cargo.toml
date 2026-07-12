@@ -5,9 +5,8 @@ edition = "2024"
 license.workspace = true
 publish = false
 
-# Correctness bench (NOT a shipped product surface): grades understanding output against the
-# owner-approved gold set under the pre-registered scoring method frozen in
-# docs/cg-correctness-criteria.md (criteria commit 99d99ee). The scoring thresholds in this crate
+# Correctness bench (NOT a shipped product surface): grades understanding output against a
+# curated gold set under a pre-registered scoring method. The scoring thresholds in this crate
 # are that registration; changing them is a product-frame change, not engineering.
 
 [dependencies]

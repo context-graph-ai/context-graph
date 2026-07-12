@@ -1,6 +1,6 @@
-//! The correctness bench runner (criterion C7, criteria commit 99d99ee): drives the REAL `cg`
+//! The correctness bench runner: drives the REAL `cg`
 //! binaries (import + understand — the production path, never a side harness), reads each
-//! session's extraction back through the library, scores it against the owner-approved gold
+//! session's extraction back through the library, scores it against the curated gold
 //! with the frozen method (production nomic embedder cosine; gray zone ROUTED OUT to a file for
 //! adjudication, never auto-decided), and appends a variant row to the report.
 //!
@@ -204,7 +204,7 @@ fn main() {
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("bench")
         ))
     } else {
-        BenchReport::new("cg-correctness")
+        BenchReport::new("capture-correctness")
     };
     report.push_row(VariantRow {
         label: label.clone(),
@@ -215,7 +215,7 @@ fn main() {
     rendered.push_str(
         "\nNOTES (reading rules, frozen method): this table is LOWER-BOUND diagnostics — \
          auto-matches (cosine >= 0.75) only; gray-zone pairs are routed to the adjudication \
-         file and NOT counted here; no verdict is final before adjudication + the owner \
+         file and NOT counted here; no verdict is final before adjudication + the manual \
          sample. `attach` is structurally 0 until adjudicated intention equivalence is applied \
          (it requires the intention to auto-match first). `obs` is UNSCORED in this run (the \
          column renders 0.00), pending observation adjudication.\n",

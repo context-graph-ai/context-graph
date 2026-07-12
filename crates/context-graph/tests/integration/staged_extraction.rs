@@ -1,4 +1,4 @@
-//! RED contract tests for criteria C4/C6 (criteria commit 99d99ee): staged extraction passes as
+//! RED contract tests for staged extraction and cross-pass consistency: staged extraction passes as
 //! config-selectable PRODUCTION behavior, deterministic cross-pass consistency (a focused pass
 //! returning empty never erases what the full pass found), and session-level goal reconciliation
 //! (per-chunk duplicate goals merge additively into one canonical intention; unattached decisions
@@ -234,7 +234,7 @@ fn default_config_runs_single_full_pass_only() {
 
 #[test]
 fn staged_zero_with_full_nonzero_keeps_full_result() {
-    // Cross-pass consistency (C6): the probe-2 observed failure was the lazy-empty RELOCATING —
+    // Cross-pass consistency: the probe-2 observed failure was the lazy-empty RELOCATING —
     // the decisions-only pass returned zero on a chunk where the full pass found decisions.
     // The deterministic rule: a focused pass returning empty never erases the full pass's items.
     let (_dir, store) = fresh_store();
