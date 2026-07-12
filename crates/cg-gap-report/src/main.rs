@@ -1936,7 +1936,8 @@ mod tests {
     fn corpus_dir_requires_gap_corpus_env_with_no_fallback() {
         // Unset: no default location; the error names the env var so the operator knows what to set.
         unsafe { std::env::remove_var("GAP_CORPUS") };
-        let err = corpus_dir().expect_err("unset GAP_CORPUS must be an error, never a default path");
+        let err =
+            corpus_dir().expect_err("unset GAP_CORPUS must be an error, never a default path");
         assert!(err.contains("GAP_CORPUS"), "error names the env var: {err}");
 
         // Set: the directory is exactly what the operator provided.
