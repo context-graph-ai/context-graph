@@ -349,7 +349,7 @@ fn intention_update_transaction_rollback_on_error() {
     assert_eq!(ok!(store.history(mqtt.id), "history mqtt").len(), 1);
 }
 
-// Use case: end-of-engagement cleanup asks the engine to archive an Intention whose active Decisions still SERVE it; the engine refuses at commit time and names the blocking Decisions (Invariant 1).
+// Use case: end-of-engagement cleanup asks the engine to archive an Intention whose active Decisions still SERVE it; the engine refuses at commit time and names the blocking Decisions.
 #[test]
 fn intention_archive_blocked_by_active_decision() {
     let (_tempdir, db_path, store) = fixture();
@@ -389,7 +389,7 @@ fn intention_archive_blocked_by_active_decision() {
     assert_ne!(decision.id, DecisionId::new_v7());
 }
 
-// Use case: once every SERVES-linked Decision is superseded or archived, the Intention may finally be archived; the engine's liveness check flips branch and commits (Invariant 1 permissive path).
+// Use case: once every SERVES-linked Decision is superseded or archived, the Intention may finally be archived; the engine's liveness check flips branch and commits.
 #[test]
 fn intention_archive_succeeds_when_decisions_superseded() {
     let (_tempdir, db_path, store) = fixture();
@@ -504,7 +504,7 @@ fn decision_create_requires_intention() {
     assert_eq!(raw_decision_count(&db_path), 0);
 }
 
-// Use case: a platform engineer records "use axum" with three reasoning steps and two BASED_ON entities; six months later the graph must return reasoning, SERVES, and BASED_ON snapshots as they were at decision time (Invariant 2).
+// Use case: a platform engineer records "use axum" with three reasoning steps and two BASED_ON entities; six months later the graph must return reasoning, SERVES, and BASED_ON snapshots as they were at decision time.
 #[test]
 fn decision_create_with_serves_and_based_on_edges_persisted() {
     let (_tempdir, db_path, store) = fixture();
@@ -1120,7 +1120,7 @@ fn decision_update_immutable_fields_rejected() {
     assert_eq!(after.confidence, Some(0.9));
 }
 
-// Use case: an architect replaces last quarter's framework choice because upstream is being deprecated; the engine flips the old Decision to Superseded, writes a SUPERSEDES edge atomically, and refuses any second supersede attempt (Invariant 5 DAG).
+// Use case: an architect replaces last quarter's framework choice because upstream is being deprecated; the engine flips the old Decision to Superseded, writes a SUPERSEDES edge atomically, and refuses any second supersede attempt (the supersede chain stays acyclic).
 #[test]
 fn decision_supersede_creates_edge_and_transitions_status() {
     let (_tempdir, db_path, store) = fixture();
@@ -1331,7 +1331,7 @@ fn decision_archive_not_found() {
     assert_eq!(raw_decision_count(&db_path), 0);
 }
 
-// Use case: a compliance auditor a year later asks "what Decisions were active at that review?"; archived Decisions must remain queryable with the row physically present under admin raw scan (Invariant 3 — no hard deletes).
+// Use case: a compliance auditor a year later asks "what Decisions were active at that review?"; archived Decisions must remain queryable with the row physically present under admin raw scan (no hard deletes).
 #[test]
 fn decision_archive_preserves_history() {
     let (_tempdir, db_path, store) = fixture();
@@ -1461,7 +1461,7 @@ fn entity_create_and_snapshot_persist_across_reopen() {
     assert!(!listed.iter().any(|candidate| candidate.id == decoy.id));
 }
 
-// Use case: an operator investigating last month's regression asks what the service looked like two weeks ago versus three; each snapshot's valid_to must equal the next's valid_from as exact txid equality (Invariant 11).
+// Use case: an operator investigating last month's regression asks what the service looked like two weeks ago versus three; each snapshot's valid_to must equal the next's valid_from as exact txid equality.
 #[test]
 fn entity_update_creates_new_snapshot_contiguous_after_reopen() {
     let (_tempdir, db_path, store) = fixture();
@@ -1670,7 +1670,7 @@ fn entity_list_filters_use_engine_indexes() {
     assert!(trace.contains("name_contains"));
 }
 
-// Use case: a cleanup script tries to "fix" a camera sighting recorded at 08:05 by rewriting its timestamp; the engine refuses even admin overwrites so recorded facts stay the canonical source of truth (Invariant 4).
+// Use case: a cleanup script tries to "fix" a camera sighting recorded at 08:05 by rewriting its timestamp; the engine refuses even admin overwrites so recorded facts stay the canonical source of truth.
 #[test]
 fn observation_immutable_mutation_rejected() {
     let (_tempdir, db_path, store) = fixture();
@@ -1723,7 +1723,7 @@ fn observation_immutable_mutation_rejected() {
     assert_eq!(fetched.observed_properties, map(&[("at", json!("08:05"))]));
 }
 
-// Use case: an ingest-pipeline refactor tries to rewrite a Digest's summary; the engine refuses any mutation because every Intention and Decision extracted from that Digest carries a provenance edge back to its bytes (Invariant 16).
+// Use case: an ingest-pipeline refactor tries to rewrite a Digest's summary; the engine refuses any mutation because every Intention and Decision extracted from that Digest carries a provenance edge back to its bytes.
 #[test]
 fn digest_immutable_no_update_symbol() {
     trybuild::TestCases::new().compile_fail("tests/ui/no_update_digest.rs");
@@ -1761,7 +1761,7 @@ fn digest_immutable_no_update_symbol() {
     );
 }
 
-// Use case: a rollout is first recorded as successful, then a week later re-recorded as reverted; the engine replaces the outcome in place and keeps exactly one HAS_OUTCOME edge (Invariant 9).
+// Use case: a rollout is first recorded as successful, then a week later re-recorded as reverted; the engine replaces the outcome in place and keeps exactly one HAS_OUTCOME edge.
 #[test]
 fn outcome_record_idempotent() {
     let (_tempdir, db_path, store) = fixture();
@@ -1937,7 +1937,7 @@ fn context_create_persists_with_labels() {
     assert_eq!(persisted.properties["billing_code"], json!("ACME-2026"));
 }
 
-// Use case: an ingest pipeline repeatedly reports that site-alpha DEPENDS_ON db-alpha; the engine collapses duplicates to a single edge row so impact-analysis counts are not inflated (Invariant 10).
+// Use case: an ingest pipeline repeatedly reports that site-alpha DEPENDS_ON db-alpha; the engine collapses duplicates to a single edge row so impact-analysis counts are not inflated.
 #[test]
 fn relationship_add_idempotent_single_edge() {
     let (_tempdir, db_path, store) = fixture();

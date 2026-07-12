@@ -84,7 +84,7 @@ fn test_relationship_type_variants() {
     );
 }
 
-// Locks the r3 §3 EntityType vocabulary (documented extensible) to the canonical
+// Locks the full EntityType vocabulary (documented extensible) to the canonical
 // kinds in declaration order.
 #[test]
 fn test_entity_type_variants() {

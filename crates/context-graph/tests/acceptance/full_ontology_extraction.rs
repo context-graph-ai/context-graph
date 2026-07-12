@@ -332,7 +332,7 @@ fn decision_confidence_is_null_at_capture_never_fabricated_point_nine() {
 }
 
 // After Outcomes accrue, the library DERIVES a decision's confidence from its BROAD track record
-// per Decision §2 — not just this decision's own single Outcome. Decision §2 (ontology ~line 90):
+// from its BROAD track record — not just this decision's own single Outcome. Confidence accrues from:
 // confidence accrues from "Outcome success rates (direct, plus citing-decision success via the
 // CITES walk), the count of non-invalidating Observations on the decision's basis entities (it
 // survived scrutiny) ...".
@@ -345,7 +345,7 @@ fn decision_confidence_is_null_at_capture_never_fabricated_point_nine() {
 //     non-invalidating Observations (it survived scrutiny);
 //   - Y is cited by decisions whose Outcomes are FAILURE, and its basis entity carries FEWER
 //     non-invalidating Observations.
-// A correct Decision §2 derivation yields X.confidence > Y.confidence; the current single-outcome
+// A correct broad-record derivation yields X.confidence > Y.confidence; the current single-outcome
 // stub yields X == Y (both 1.0) → the `X > Y` assertion fails on an assert! (honest RED at HEAD).
 //
 // X and Y are built directly with `create_decision` (confidence: None) so the test controls their
@@ -419,7 +419,7 @@ fn decision_confidence_becomes_evidence_derived_after_outcomes_accrue() {
     );
     assert!(
         persisted_x.confidence.unwrap() > persisted_y.confidence.unwrap(),
-        "X must have higher derived confidence than Y per Decision §2 (X: success citing-decisions + \
+        "X must have higher derived confidence than Y (X: success citing-decisions + \
          many non-invalidating Observations; Y: failing citing-decisions + few). Both have ONE direct \
          success Outcome, so a single-outcome derivation gives X == Y and FAILS here; got X={:?} Y={:?}",
         persisted_x.confidence,
@@ -501,7 +501,7 @@ fn decision_confidence_is_derived_on_the_production_flow() {
 }
 
 /// A confidence-null subject decision plus the intention and basis entity it is BASED_ON, so the
-/// test can attach CITES precedents and non-invalidating Observations to exercise Decision §2.
+/// test can attach CITES precedents and non-invalidating Observations to exercise the evidence-derived confidence walk.
 struct ConfidenceSubject {
     context_id: ContextId,
     intention_id: IntentionId,
@@ -565,7 +565,7 @@ fn build_confidence_subject(store: &Store, context_name: &str, label: &str) -> C
 
 /// Create a decision that CITES the subject (`precedent_ids: [subject]`), serving the same
 /// intention. Its own Outcome (recorded by the caller) feeds the subject's confidence via the
-/// CITES walk per Decision §2.
+/// CITES walk.
 fn create_citing_decision(store: &Store, subject: &ConfidenceSubject, label: &str) -> DecisionId {
     store
         .create_decision(CreateDecision {
@@ -588,7 +588,7 @@ fn create_citing_decision(store: &Store, subject: &ConfidenceSubject, label: &st
 }
 
 /// Record a NON-invalidating Observation on a basis entity: empty `state_delta` (no state change →
-/// no snapshot → cannot invalidate), so it counts as the entity "surviving scrutiny" per Decision §2.
+/// no snapshot → cannot invalidate), so it counts as the entity "surviving scrutiny".
 fn record_non_invalidating_observation(
     store: &Store,
     context_id: ContextId,
@@ -632,7 +632,7 @@ fn record_non_invalidating_observation(
 
 // The placeholder harness drops the outcomes key; captured_outcomes is always empty.
 // Assert: one Outcome linked to the decision; recording a second REPLACES the first
-// (Invariant 9 — at most one active outcome per decision).
+// (at most one active outcome per decision).
 #[test]
 fn outcome_is_extracted_and_attached_single_active() {
     let (_dir, store) = fresh_store();
@@ -665,7 +665,7 @@ fn outcome_is_extracted_and_attached_single_active() {
     assert!(first_outcomes[0].success, "first outcome success=true");
     let first_id = first_outcomes[0].id;
 
-    // Record a second outcome — Invariant 9: must REPLACE the first.
+    // Record a second outcome — must REPLACE the first (one active outcome per decision).
     store
         .record_outcome(decision_id, false, Some("second".to_string()))
         .expect("record second outcome");
@@ -676,7 +676,7 @@ fn outcome_is_extracted_and_attached_single_active() {
     assert_eq!(
         after_second.len(),
         1,
-        "still exactly one outcome after second (Invariant 9)"
+        "still exactly one outcome after second"
     );
     assert_eq!(
         after_second[0].notes.as_deref(),

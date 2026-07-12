@@ -39,7 +39,7 @@ impl Store {
             }
         };
 
-        // Confidence is evidence-derived (Decision §2): recording an Outcome is the production
+        // Confidence is evidence-derived: recording an Outcome is the production
         // signal that a decision's track record changed. Recompute the confidence of this decision
         // AND of every decision it CITES (a precedent's confidence accrues from the outcomes of the
         // decisions that built on it via the CITES walk), so confidence accrues on the live path
@@ -56,8 +56,8 @@ impl Store {
     }
 
     /// Write an Outcome inside an already-open transaction, replacing any active
-    /// Outcome on the decision so the survivor is the most recent (single active —
-    /// Invariant 9). The caller owns the transaction: on error this returns without
+    /// Outcome on the decision so the survivor is the most recent (one active outcome
+    /// per decision). The caller owns the transaction: on error this returns without
     /// committing or rolling back, so an enclosing capture transaction rolls back as
     /// one unit and nothing is stranded. `context_id` is supplied by the caller
     /// rather than looked up, because the decision may have been created in this same

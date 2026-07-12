@@ -375,7 +375,7 @@ impl Store {
     /// Count the NON-invalidating Observations on an entity: those whose `state_delta` carries no
     /// state change (so they record no snapshot and cannot invalidate a decision). Each such
     /// observation is a "survived scrutiny" signal feeding the evidence-derived confidence of a
-    /// decision based on this entity (Decision §2).
+    /// decision based on this entity.
     pub(crate) fn non_invalidating_observation_count(&self, entity_id: EntityId) -> Result<usize> {
         let params: HashMap<String, Value> =
             [("entity_id".to_string(), Value::Uuid(entity_id.as_uuid()))]

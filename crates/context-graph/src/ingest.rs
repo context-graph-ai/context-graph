@@ -415,7 +415,7 @@ pub struct DecisionSeed {
     /// From model extraction — agent responsible for the decision.
     #[serde(default)]
     pub agent_id: Option<String>,
-    /// From model extraction — confidence (null at capture per Decision §2).
+    /// From model extraction — confidence (null at capture, derived from evidence later).
     #[serde(default)]
     pub confidence: Option<f32>,
     /// From model extraction — reasoning steps.
@@ -504,7 +504,7 @@ pub struct ObservationSeed {
     pub context_id: Option<String>,
 }
 
-/// An outcome extracted from the model — maps to Outcome §5.
+/// An outcome extracted from the model.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct OutcomeSeed {
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
@@ -2623,8 +2623,8 @@ pub(crate) fn grounding_check_harvest(
         }
     }
 
-    // Observations — a value with no supporting span flags MissingSpan (§2: flagged when, and only
-    // when, the span is missing or does not occur in the chunk).
+    // Observations — a value with no supporting span flags MissingSpan when, and only
+    // when, the span is missing or does not occur in the chunk.
     for seed in &harvest.observations {
         if seed.key.trim().is_empty() {
             continue;
@@ -2644,7 +2644,7 @@ pub(crate) fn grounding_check_harvest(
         }
     }
 
-    // Outcomes — a value with no supporting span flags MissingSpan (§2, as for observations).
+    // Outcomes — a value with no supporting span flags MissingSpan, as for observations.
     for seed in &harvest.outcomes {
         if seed.key.trim().is_empty() {
             continue;
@@ -3170,7 +3170,7 @@ pub(crate) fn capture_structured_harvest(
     };
     // Extracted outcomes commit inside the same capture transaction as everything else,
     // so a mid-capture failure strands nothing (one atomic capture). Each replaces any
-    // active Outcome on its decision (single active — Invariant 9); if the harvest names
+    // active Outcome on its decision (one active outcome per decision); if the harvest names
     // the same decision more than once, the last outcome wins.
     let mut outcome_by_decision: BTreeMap<DecisionId, (bool, String)> = BTreeMap::new();
     for seed in &harvest.outcomes {
@@ -3257,7 +3257,7 @@ impl<'a> CaptureTxn<'a> {
 
     /// Record an extracted Outcome inside the open capture transaction, so it commits
     /// atomically with the rest of the capture (no orphan rows on mid-capture failure).
-    /// Replaces any active Outcome on the decision (single active — Invariant 9).
+    /// Replaces any active Outcome on the decision (one active outcome per decision).
     fn record_outcome(
         &self,
         context_id: ContextId,
@@ -3914,7 +3914,7 @@ impl<'a> CaptureTxn<'a> {
     }
 
     /// Assign the catalog grouping handle to an intention (an additive grouping link, not an
-    /// edit of the captured description/status — Invariant 3).
+    /// edit of the captured description/status; the raw row is never edited).
     fn set_intention_catalog_id(
         &self,
         context_id: ContextId,

@@ -338,7 +338,7 @@ fn state_at_nonexistent_entity() -> Result<(), CgError> {
 // Use case: a library consumer renders an Entity's timeline in a dashboard — no phantom gaps,
 // content matches what was committed at each TxId. entity_history returns contiguous oldest-first
 // EntitySnapshots; last snapshot has valid_to==None; contents equal committed values.
-// Invariant 11 at the API surface.
+// Contiguous snapshots (each valid_to equals the next valid_from) at the API surface.
 // Regression guard on cg-crud's shipped entity_history.
 #[test]
 fn history_oldest_first_contiguous() -> Result<(), CgError> {

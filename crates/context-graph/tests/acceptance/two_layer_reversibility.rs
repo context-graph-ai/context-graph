@@ -189,7 +189,7 @@ fn reversal_un_applies_everywhere_and_never_rewrites_stored_history() {
         "read view must revert after reversal; placeholder still returns corrected"
     );
 
-    // The correction event row must still exist in history (Invariant 3: no hard deletes).
+    // The correction event row must still exist in history (no hard deletes).
     let all_entries = list_overlay_entries_for_item(&_store, item_id);
     assert!(
         !all_entries.is_empty(),
@@ -439,7 +439,7 @@ fn corrected_intention_that_was_a_decision_stays_reversible_and_logs_a_lesson() 
         "wrong-type correction reversal must produce a compensation event"
     );
 
-    // History must survive reversal (Invariant 3).
+    // History must survive reversal.
     let entries_after = list_overlay_entries_for_item(&_store, decision_item_id);
     assert!(
         !entries_after.is_empty(),
@@ -539,7 +539,7 @@ fn reversal_concurrent_with_matching_capture_has_deterministic_end_state() {
         "concurrent orderings must converge to same read value"
     );
 
-    // History entries must exist (Invariant 3).
+    // History entries must exist.
     assert!(
         !entries_a.is_empty(),
         "history entries must exist for item_id_a; wrong stub returns empty"

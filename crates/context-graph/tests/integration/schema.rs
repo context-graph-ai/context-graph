@@ -700,7 +700,7 @@ fn test_contexts_table_insert() {
     );
 }
 
-// intentions table round-trip: every r3 §1 column (origin, origin_ref, blueprint_id, bindings, blueprint_proposal, tags) persists as declared.
+// intentions table round-trip: every schema column (origin, origin_ref, blueprint_id, bindings, blueprint_proposal, tags) persists as declared.
 #[test]
 fn test_intentions_table_insert() {
     let db = fresh_db();
@@ -1215,7 +1215,7 @@ fn test_blueprints_table_insert() {
     );
 }
 
-// edges table accepts every r3 relationship label (SERVES, BASED_ON, ABOUT, CITES, SUPERSEDES, RELATES_TO, OBSERVED_ON, HAS_OUTCOME, INVALIDATES, TRIGGERED_BY, MATCHED_BY, GENERATED, EXTRACTED_FROM, INSTANTIATES, REFINES); removing a label at the schema layer silently drops a relationship kind.
+// edges table accepts every relationship label (SERVES, BASED_ON, ABOUT, CITES, SUPERSEDES, RELATES_TO, OBSERVED_ON, HAS_OUTCOME, INVALIDATES, TRIGGERED_BY, MATCHED_BY, GENERATED, EXTRACTED_FROM, INSTANTIATES, REFINES); removing a label at the schema layer silently drops a relationship kind.
 #[test]
 fn test_edges_table_all_relationship_types() {
     let db = fresh_db();
@@ -1478,7 +1478,7 @@ fn test_approvals_table_insert() {
     );
 }
 
-// observations carries TableMeta.immutable=true at the engine layer (Invariant 4); a raw UPDATE must fail with Error::ImmutableTable, not merely be blocked higher up.
+// observations carries TableMeta.immutable=true at the engine layer; a raw UPDATE must fail with Error::ImmutableTable, not merely be blocked higher up.
 #[test]
 fn test_observation_immutable_rejects_update() {
     let db = fresh_db();
@@ -1499,7 +1499,7 @@ fn test_observation_immutable_rejects_update() {
     assert!(matches!(result, Err(Error::ImmutableTable(_))));
 }
 
-// observations rows cannot be physically removed (Invariant 3 + Invariant 4); a raw DELETE must return Error::ImmutableTable from the engine.
+// observations rows cannot be physically removed; a raw DELETE must return Error::ImmutableTable from the engine.
 #[test]
 fn test_observation_immutable_rejects_delete() {
     let db = fresh_db();
@@ -1517,7 +1517,7 @@ fn test_observation_immutable_rejects_delete() {
     assert!(matches!(result, Err(Error::ImmutableTable(_))));
 }
 
-// digests table is immutable at the schema layer (Invariant 16); a raw UPDATE of summary must fail with Error::ImmutableTable.
+// digests table is immutable at the schema layer; a raw UPDATE of summary must fail with Error::ImmutableTable.
 #[test]
 fn test_digest_immutable_rejects_update() {
     let db = fresh_db();
@@ -1802,7 +1802,7 @@ rejected_status_test!(
     "resolved"
 );
 
-// edges of type CITES must form a DAG (Invariant 5); a direct back-edge that would close a 2-node cycle must be rejected at insert.
+// edges of type CITES must form a DAG; a direct back-edge that would close a 2-node cycle must be rejected at insert.
 #[test]
 fn test_cites_dag_rejects_cycle() {
     let db = fresh_db();
@@ -1904,7 +1904,7 @@ fn test_non_cites_edge_allows_bidirectional() {
     assert_eq!(result.rows.len(), 2);
 }
 
-// edges carry a UNIQUE constraint on (source_id, target_id, edge_type); a duplicate insert succeeds as a no-op so add_relationship idempotency is engine-native (Invariant 10).
+// edges carry a UNIQUE constraint on (source_id, target_id, edge_type); a duplicate insert succeeds as a no-op so add_relationship idempotency is engine-native.
 #[test]
 fn test_edge_duplicate_insert_noop() {
     let db = fresh_db();
@@ -1942,7 +1942,7 @@ fn test_edge_duplicate_insert_noop() {
     assert_eq!(result.rows.len(), 1);
 }
 
-// entities.context_id column supports engine-side equality filtering so list_entities scoped to one context cannot bleed rows from another (Invariant 7).
+// entities.context_id column supports engine-side equality filtering so list_entities scoped to one context cannot bleed rows from another.
 #[test]
 fn test_entities_filter_by_context_id() {
     let db = fresh_db();
@@ -2014,7 +2014,7 @@ fn test_edges_filter_by_context_id() {
     assert_eq!(row_value(&result, 0, "source_id"), &Value::Uuid(entity_b));
 }
 
-// entity_snapshots rows whose valid_to equals the next row's valid_from are contiguous and permitted (Invariant 11); the engine must not mistake them for overlaps.
+// entity_snapshots rows whose valid_to equals the next row's valid_from are contiguous and permitted; the engine must not mistake them for overlaps.
 #[test]
 fn test_entity_snapshots_adjacent_rows_insert() {
     let db = fresh_db();
@@ -2150,7 +2150,7 @@ fn test_fk_approval_invalid_decision_id_rejected() {
     ));
 }
 
-// intentions.context_id FK into contexts.id must hold; an intention with a non-existent context would break the isolation boundary (Invariant 7).
+// intentions.context_id FK into contexts.id must hold; an intention with a non-existent context would break the isolation boundary.
 #[test]
 fn test_fk_intention_invalid_context_id_rejected() {
     let db = fresh_db();

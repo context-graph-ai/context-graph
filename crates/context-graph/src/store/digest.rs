@@ -316,7 +316,7 @@ impl Store {
             // Two-layer read view, folded at the library level so a direct (vigil-style) consumer
             // gets the curated view: a capture-unit (digest) the overlay drops is excluded from the
             // read, and a corrected one renders its corrected summary (the latest curation action
-            // wins). The raw digest row stays byte-unchanged underneath (Invariant 3) — this is a
+            // wins). The raw digest row stays byte-unchanged underneath — this is a
             // pure read-time projection.
             let digest_overlay = crate::overlay::overlay_read_decision_for_item(
                 self,

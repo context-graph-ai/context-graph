@@ -98,7 +98,7 @@ pub fn span_faithful_harvest(transcript: &str) -> StructuredHarvest {
                     // agent_id is unverified metadata (no claimed quote), so it carries no span and is
                     // not span-grounded.
                     agent_id: Some("agent-session".to_string()),
-                    confidence: None, // null at capture per Decision §2
+                    confidence: None, // null at capture, derived from evidence later
                     reasoning: vec!["span-faithful reasoning".to_string()],
                     tags: vec!["span-faithful".to_string()],
                     properties: serde_json::json!({"source": "span-faithful"}),

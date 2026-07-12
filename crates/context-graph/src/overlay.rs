@@ -1,6 +1,6 @@
 //! Two-layer reversibility: immutable original captures plus an append-only overlay
 //! that layers corrections, drops, grouping links, and type changes at read time.
-//! Original rows are never edited or deleted (Invariant 3). Reversals are tombstones
+//! Original rows are never edited or deleted. Reversals are tombstones
 //! keyed to the overlay entry they retract; "present and not-retracted" is the live
 //! state, so undo is global and order-tolerant.
 
@@ -16,7 +16,7 @@ pub enum OverlayKind {
     WrongTypeCorrection,
     GroupingReversal,
     /// A tombstone that retracts another overlay entry. Its `value` holds the id of the entry it
-    /// reverses. Append-only: the retracted entry is left byte-unchanged (Invariant 3).
+    /// reverses. Append-only: the retracted entry is left byte-unchanged.
     Reversal,
 }
 
@@ -311,7 +311,7 @@ fn cancelled_overlay_ids(entries: &[OverlayEntry]) -> std::collections::HashSet<
 pub fn reverse_overlay(store: &Store, entry: &mut OverlayEntry) -> Option<CompensationEvent> {
     entry.reversed = true;
 
-    // Append-only (Invariant 3): leave the retracted entry byte-unchanged and record a NEW
+    // Append-only: leave the retracted entry byte-unchanged and record a NEW
     // tombstone row that points at it. The tombstone carries `reversed = true` and its `value`
     // is the id of the entry it retracts; the read view treats any entry a tombstone targets as
     // cancelled. Because it is a fresh insert, the reversal also converges across edges under the
@@ -494,7 +494,7 @@ pub(crate) fn grouped_catalog_for_item(entries: &[OverlayEntry]) -> Option<Strin
 /// `GroupingReversal`/`Reversal` tombstone — or whose catalog was reversed for an item — does not
 /// appear, so a grouping reversed by `cg group rename`/`no` (a retitle drops the old name, a reject
 /// drops the name entirely) is gone from the read view while every original overlay row stays
-/// byte-unchanged (Invariant 3). Names are returned once each, in first-seen order.
+/// byte-unchanged. Names are returned once each, in first-seen order.
 pub fn live_grouping_catalogs(store: &Store) -> Vec<String> {
     let db = store.sync_database();
     let snapshot = db.snapshot();

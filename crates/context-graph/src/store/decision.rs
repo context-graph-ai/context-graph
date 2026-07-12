@@ -571,7 +571,7 @@ impl Store {
 
     /// The basis entities this decision is BASED_ON, read from `decision_basis_snapshots`. Used by
     /// the evidence-derived confidence walk to count the non-invalidating Observations that show the
-    /// decision's basis survived scrutiny (Decision §2).
+    /// decision's basis survived scrutiny.
     pub(crate) fn basis_entity_ids_for_decision(&self, id: DecisionId) -> Result<Vec<EntityId>> {
         let params: HashMap<String, Value> =
             [("decision_id".to_string(), Value::Uuid(id.as_uuid()))]
@@ -2070,7 +2070,7 @@ fn decode_decision_reasoning_producer_snapshot(
 ///
 /// Returns an empty vector when an active Drop overlay excludes the item, and a single
 /// correction-applied `Decision` otherwise. The raw row is never mutated; the merge is a pure
-/// read-time projection (Invariant 3). This is the discovery read path's decoder; the raw decoder
+/// read-time projection. This is the discovery read path's decoder; the raw decoder
 /// `decode_decision_raw` (used by `get_decision`/`replay`) returns the byte-unchanged row.
 fn decode_decision(store: &Store, columns: &[String], row: &[Value]) -> Result<Vec<Decision>> {
     let mut decision = decode_decision_raw(columns, row)?;

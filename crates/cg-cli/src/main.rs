@@ -1742,7 +1742,7 @@ fn print_capture_report_with_harness(
 }
 
 /// The capture-context source label from the library harness report — always the capture context
-/// (a model-emitted `context_id`, even a valid other tenant's, is ignored per Invariant 7).
+/// (a model-emitted `context_id`, even a valid other tenant's, is ignored).
 fn context_id_source_label(harness: &CaptureHarnessReport) -> &'static str {
     match harness.context_id_source {
         context_graph::harness::ContextIdSource::CaptureContext => "capture_context",
@@ -2420,7 +2420,7 @@ fn handle_group(args: &[String]) -> i32 {
 }
 
 /// Reverse every LIVE (non-reversed) grouping link on each given intention via the overlay seam — a
-/// tombstone per link, never an edit or delete of the original row (Invariant 3). After this the
+/// tombstone per link, never an edit or delete of the original row. After this the
 /// intentions are ungrouped in the read view while their grouping history is preserved. Used by
 /// `cg group rename` (before re-linking under the new name) and `cg group no` (to leave them ungrouped).
 fn reverse_live_grouping_links(store: &Store, intentions: &[context_graph::Intention]) {
@@ -2889,7 +2889,7 @@ fn blueprint_proposal_for_intention(store: &Store, intention_id: &str) -> Option
 /// from the append-only grouping-link overlay rows. Only LIVE groupings are surfaced: a link
 /// retracted by a reversal tombstone — the way `cg group rename` drops the old name and `cg group
 /// no` drops the name entirely — does not appear, while every original overlay row stays
-/// byte-unchanged (Invariant 3). Each name appears once.
+/// byte-unchanged. Each name appears once.
 fn stored_grouping_proposals(store: &Store) -> Vec<String> {
     context_graph::overlay::live_grouping_catalogs(store)
 }

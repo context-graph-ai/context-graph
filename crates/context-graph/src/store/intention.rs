@@ -774,7 +774,7 @@ impl Store {
             let mut intention = decode_intention(&result.columns, row)?;
             // Two-layer read merge: a confirmed grouping links the intention to a canonical catalog
             // entry as an additive overlay. Override the read-view `blueprint_catalog_id` with the
-            // grouped catalog while leaving the raw `intentions` row untouched (Invariant 3);
+            // grouped catalog while leaving the raw `intentions` row untouched;
             // `admin_raw_scan_intention_rows` still returns the raw ungrouped row.
             let overlay = crate::overlay::list_overlay_entries_for_item(
                 self,

@@ -19,12 +19,12 @@ const DEFAULT_RECALL_LIMIT: usize = 5;
 // Evidence-derived decision confidence
 // ---------------------------------------------------------------------------
 
-/// Derive a decision's confidence from its **broad track record** per ontology Decision §2 and
-/// persist it via `update_decision`. The model supplies no confidence (null at capture); it accrues
-/// here from append-only, immutable evidence — never a model self-report.
+/// Derive a decision's confidence from its **broad track record** and persist it via
+/// `update_decision`. The model supplies no confidence (null at capture); it accrues here from
+/// append-only, immutable evidence — never a model self-report.
 ///
 /// The track record is three streams of evidence votes, NOT the single active Outcome alone
-/// (Invariant 9 collapses Outcomes to one row, so deriving from the current Outcome cannot tell a
+/// (only one active Outcome is kept per decision, so deriving from the current Outcome cannot tell a
 /// 3-success record from a 1-success/2-failure one):
 ///
 ///   1. The decision's own direct Outcome — one success or failure vote.
@@ -64,7 +64,7 @@ fn decision_track_record(store: &Store, decision_id: DecisionId) -> Result<Decis
     let mut successes = 0usize;
     let mut total = 0usize;
 
-    // Stream 1: the decision's own direct Outcome (single active — Invariant 9).
+    // Stream 1: the decision's own direct Outcome (single active outcome per decision).
     for outcome in store.admin_raw_outcomes_for_decision(decision_id)? {
         total += 1;
         if outcome.success {
@@ -819,7 +819,7 @@ pub struct CaptureHarnessReport {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ContextIdSource {
     /// The capture context supplied by the caller — the only source; a model-emitted
-    /// `context_id`, even a valid other tenant's, is ignored (Invariant 7).
+    /// `context_id`, even a valid other tenant's, is ignored.
     #[default]
     CaptureContext,
     /// A `context_id` emitted by the model. Never used as the source of a stored row.
@@ -920,7 +920,7 @@ impl CaptureReceiptContent {
 ///
 ///   Stage 2 (structural fill): the shared path mints id/status/created_at and the Digest
 ///     embedding with no model call, and sets `context_id` from the capture context — a
-///     model-emitted `context_id`, even a valid other tenant's, is ignored (Invariant 7).
+///     model-emitted `context_id`, even a valid other tenant's, is ignored.
 ///
 ///   Stage 3 (identity resolution): a separate step that narrows the prior decisions to the
 ///     near few (vector/graph neighbours bounded by `recall_limit`) and consults the identity
