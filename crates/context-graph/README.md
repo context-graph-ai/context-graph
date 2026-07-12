@@ -41,6 +41,44 @@ let _store = Store::open_with_embedder_registrations(
 # }
 ```
 
+## Tenant Fabric (`<data_root>/cg/fabric.toml`)
+
+A node with two unequal machines can offload session *understanding* onto a
+stronger enrolled machine in its own tenant fabric. Enrollment lives in a
+per-node `<data_root>/cg/fabric.toml` (separate from the per-work-root
+`capture.toml`), read through the `cg-node-fs` helper. A node with no
+`fabric.toml` is a plain single-node install and never contacts a hub.
+
+```toml
+[fabric]
+# Pasted hub enrollment ticket / endpoint spec for your tenant fabric.
+hub_endpoint = "enrollment-ticket"
+# The tenant this node enrolls under. Cross-tenant movement is impossible at
+# the engine layer.
+tenant = "tenant-alpha"
+# Input-sharing switch. DEFAULT ON (omitting the key is ON). The one visible
+# off knob; set false to keep every understanding input on this machine.
+sharing = true
+# Milliseconds an ephemeral input copy survives after its result lands before
+# each node sweeps its own copy. Defaults to about a day.
+grace_ms = 86400000
+# Per-source opt-out: a source named here keeps its understanding input local
+# (never copied off the machine) regardless of the global sharing switch.
+per_source_opt_out = ["cg-record"]
+```
+
+### What moves, and what never does
+
+The permanent raw store (`cg_source_chunks`) **never syncs** — it stays on the
+capturing machine, always. What may move is a separate, **ephemeral copy of the
+understanding *input*** (the verbatim chunk a worker needs to run the model),
+and only to the user's own **same-tenant** machines. That movement is **on by
+default**, governed by the single visible `sharing` knob, with a **per-source
+opt-out** for individual sources, and each copy is **retention-deleted** on
+every node after its result lands plus the `grace_ms` window. Node id, tokens,
+and wall-clock ride back as an operational receipt only, never a decision basis.
+`cg sync` speaks the pasted ticket / endpoint of your fabric.
+
 ## Continuous Integration
 
 CI runs the workspace test gate across `windows-latest`, `macos-latest`, and

@@ -1,27 +1,42 @@
 mod support;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(feature = "nats")]
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+#[cfg(feature = "nats")]
+use std::sync::Arc;
+#[cfg(feature = "nats")]
+use std::sync::LazyLock;
+#[cfg(feature = "nats")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use context_graph::{
     ContextId, CreateDecision, CreateIntention, DecisionId, DecisionStatus, DiscoveryFilter,
     EntityId, IntentionId, IntentionOrigin, IntentionStatus, Store, StoreConfig,
+};
+#[cfg(feature = "nats")]
+use context_graph::{
     context_graph_pending_push_change_count, context_graph_sync_conflict_policies,
 };
 use contextdb_core::Value as DbValue;
 use contextdb_engine::Database;
+#[cfg(feature = "nats")]
 use contextdb_server::{SyncClient, SyncServer};
 use serde_json::Value;
 use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider, cg_bin};
+#[cfg(feature = "nats")]
 use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+#[cfg(feature = "nats")]
 use testcontainers::runners::AsyncRunner;
+#[cfg(feature = "nats")]
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+#[cfg(feature = "nats")]
 use tokio::sync::OwnedSemaphorePermit;
 
 const AUTH_INITIAL: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py.";
@@ -32,6 +47,7 @@ const CI_PIPELINE_SESSION: &str = "The delivery team needs a CI pipeline. Run CI
 const CLIENT_A_SOX_SESSION: &str = "Client A must keep SOX deploy approvals. The publish pipeline is deploy.yml; require SOX approval before promote.";
 const CLIENT_B_PUBLISH_SESSION: &str = "Client B must avoid the duplicate-publish race. The publish pipeline is deploy.yml; hold 10 min before promote.";
 
+#[cfg(feature = "nats")]
 static CLI_NATS_TEST_LOCK: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
@@ -1183,18 +1199,21 @@ fn json_string_at<'a>(json: &'a Value, paths: &[&str]) -> Option<&'a str> {
         .find_map(|path| json.pointer(path).and_then(Value::as_str))
 }
 
+#[cfg(feature = "nats")]
 fn json_u64_at(json: &Value, paths: &[&str]) -> Option<u64> {
     paths
         .iter()
         .find_map(|path| json.pointer(path).and_then(Value::as_u64))
 }
 
+#[cfg(feature = "nats")]
 fn json_bool_at(json: &Value, paths: &[&str]) -> Option<bool> {
     paths
         .iter()
         .find_map(|path| json.pointer(path).and_then(Value::as_bool))
 }
 
+#[cfg(feature = "nats")]
 fn json_array_len_at(json: &Value, paths: &[&str]) -> Option<u64> {
     paths.iter().find_map(|path| {
         json.pointer(path)
@@ -1497,12 +1516,14 @@ fn memory_counts(output: &CommandOutput) -> Option<(u64, u64, u64)> {
     ))
 }
 
+#[cfg(feature = "nats")]
 struct CliNatsFixture {
     _lock: OwnedSemaphorePermit,
     _container: ContainerAsync<GenericImage>,
     nats_url: String,
 }
 
+#[cfg(feature = "nats")]
 async fn start_cli_nats_or_environment_error() -> CliNatsFixture {
     let lock = CLI_NATS_TEST_LOCK
         .clone()
@@ -1534,6 +1555,7 @@ async fn start_cli_nats_or_environment_error() -> CliNatsFixture {
     }
 }
 
+#[cfg(feature = "nats")]
 struct CliSyncFixture {
     _nats: CliNatsFixture,
     _hub_dir: tempfile::TempDir,
@@ -1545,6 +1567,7 @@ struct CliSyncFixture {
     tenant_id: String,
 }
 
+#[cfg(feature = "nats")]
 impl Drop for CliSyncFixture {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
@@ -1552,6 +1575,7 @@ impl Drop for CliSyncFixture {
     }
 }
 
+#[cfg(feature = "nats")]
 async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
     let nats = start_cli_nats_or_environment_error().await;
     let hub_dir = tempfile::tempdir().expect("hub tempdir");
@@ -1589,6 +1613,7 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
     }
 }
 
+#[cfg(feature = "nats")]
 fn cli_expected_pending_push_change_count(store: &Store, nats_url: &str, tenant_id: &str) -> usize {
     let client = SyncClient::new(
         store.sync_database(),
@@ -1598,12 +1623,14 @@ fn cli_expected_pending_push_change_count(store: &Store, nats_url: &str, tenant_
     context_graph_pending_push_change_count(client.db(), client.push_watermark())
 }
 
+#[cfg(feature = "nats")]
 fn db_table_row_count(db: &Database, table: &str) -> usize {
     db.scan(table, db.snapshot())
         .unwrap_or_else(|err| panic!("scan {table}: {err}"))
         .len()
 }
 
+#[cfg(feature = "nats")]
 fn schema_version_installed_at(db: &Database) -> contextdb_core::TxId {
     let installed_at = db
         .scan("cg_schema_version", db.snapshot())
@@ -1622,6 +1649,7 @@ fn schema_version_installed_at(db: &Database) -> contextdb_core::TxId {
     installed_at[0]
 }
 
+#[cfg(feature = "nats")]
 fn force_write_once_schema_conflict(path: &std::path::Path) -> contextdb_core::TxId {
     let store = persisted_store(Some(path.to_path_buf())).expect("open second CLI store");
     let db = store.sync_database();
@@ -1684,6 +1712,7 @@ fn persisted_store(path: Option<std::path::PathBuf>) -> Option<Store> {
     })
 }
 
+#[cfg(feature = "nats")]
 fn scoped_persisted_store(path: Option<std::path::PathBuf>, context_label: &str) -> Option<Store> {
     let db_path = path?;
     let admin = persisted_store(Some(db_path.clone()))?;
@@ -2720,6 +2749,8 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
     );
 }
 
+// Pinned to the test-only `nats` feature: it drives the compiled `cg` binary against a real broker; the default build speaks Iroh.
+#[cfg(feature = "nats")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending() {
     let offline_harness = extraction_harness();

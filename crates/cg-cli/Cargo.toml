@@ -15,13 +15,19 @@ path = "src/lib.rs"
 name = "cg"
 path = "src/main.rs"
 
+[features]
+# NATS is retained ONLY for the one CLI sync test that drives the compiled `cg` binary as a
+# subprocess against a real broker; it is off the default build so the shipped binary speaks the
+# Iroh ticket/endpoint enrollment flow and never NATS.
+nats = ["contextdb-server/nats"]
+
 [dependencies]
 cg-catalog = { path = "../cg-catalog" }
 cg-cli-conventions.workspace = true
 context-graph = { path = "../context-graph" }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
-contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["nats"] }
+contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh"] }
 fs4.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -32,7 +32,7 @@ use contextdb_core::Value as DbValue;
 use crate::capture_sync_common::{
     TestStore, capture_request, drain_pull, drain_push, flat_pricing, provider_backed_extractor,
     provider_with_unique_usage_for_chunks, provider_with_usage, real_sync_fixture,
-    register_cg_sync_tables, seed_decision_graph,
+    seed_decision_graph,
 };
 use crate::fake_extractor::open_store_with_lexical_embedder;
 
@@ -401,12 +401,7 @@ async fn sync_transport_and_restore_still_round_trips_after_refactor() {
 
     // A wiped/new edge begins empty and must pull back the full committed state.
     let restored_edge = TestStore::new("sync_round_trip_restored_edge");
-    let restored_client = contextdb_server::SyncClient::new(
-        restored_edge.store.sync_database(),
-        &fixture.nats_url,
-        contextdb_core::TenantId::from(&fixture.tenant_id),
-    );
-    register_cg_sync_tables(&restored_client);
+    let restored_client = fixture.new_edge_client(restored_edge.store.sync_database());
     assert_eq!(
         restored_edge
             .store

@@ -4,10 +4,10 @@ use crate::capture_sync_common::{
     assert_real_evidence_content, assert_real_intention_content, assert_real_observation_content,
     assert_real_outcome_state, assert_sync_contract_has_real_table_policies,
     bootstrap_sync_schema_without_rows, drain_pull, drain_push, pre_client_sync_fixture, push_pull,
-    real_sync_fixture, register_cg_sync_tables, seed_decision_graph,
+    real_sync_fixture, seed_decision_graph,
 };
 use context_graph::{DecisionId, DecisionStatus, InvalidationId, InvalidationStatus, Store, TxId};
-use contextdb_core::{TenantId, Value as DbValue};
+use contextdb_core::Value as DbValue;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn decision_observation_and_extracted_from_edge_appear_on_second_edge_after_sync() {
@@ -220,12 +220,7 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
     );
 
     let restored_edge = TestStore::new("wiped_restore_reopened_edge");
-    let restored_client = contextdb_server::SyncClient::new(
-        restored_edge.store.sync_database(),
-        &fixture.nats_url,
-        TenantId::from(&fixture.tenant_id),
-    );
-    register_cg_sync_tables(&restored_client);
+    let restored_client = fixture.new_edge_client(restored_edge.store.sync_database());
     assert_eq!(
         restored_edge
             .store
@@ -732,12 +727,7 @@ async fn cross_context_isolation_survives_sync() {
     let context_a = seed_decision_graph(&fixture.edge1.store, "tenant-alpha-a", "context A");
     let context_b = seed_decision_graph(&fixture.edge1.store, "tenant-alpha-b", "context B");
     let edge2_context_b = fixture.edge2.scoped_store([context_b.context_id]);
-    let edge2_scoped_client = contextdb_server::SyncClient::new(
-        edge2_context_b.sync_database(),
-        &fixture.nats_url,
-        TenantId::from(&fixture.tenant_id),
-    );
-    register_cg_sync_tables(&edge2_scoped_client);
+    let edge2_scoped_client = fixture.new_edge_client(edge2_context_b.sync_database());
     drain_push(&fixture.edge1_client).await;
     drain_pull(&edge2_scoped_client).await;
 

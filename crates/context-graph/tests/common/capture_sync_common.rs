@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -24,17 +23,10 @@ use context_graph::{
 };
 use contextdb_core::{Lsn, TenantId, Value as DbValue};
 use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
-use contextdb_server::{SyncClient, SyncServer};
+use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
 use tempfile::TempDir;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use tokio::sync::OwnedSemaphorePermit;
 
 use crate::fake_extractor::{LabeledTranscriptExtractor, open_store_with_lexical_embedder};
-
-static NATS_TEST_LOCK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 const FORBIDDEN_USAGE_BASIS_VALUES: &[i64] = &[
     180, 220, 233, 377, 980, 1200, 1380, 1441, 1818, 2580, 3217, 3450,
@@ -737,45 +729,8 @@ impl SeededGraph {
     }
 }
 
-pub struct NatsFixture {
-    _lock: OwnedSemaphorePermit,
-    _container: ContainerAsync<GenericImage>,
-    pub nats_url: String,
-}
-
-pub async fn start_nats_or_environment_error() -> NatsFixture {
-    let lock = NATS_TEST_LOCK
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("NATS fixture lock should not close");
-    let conf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/common/nats.conf")
-        .to_string_lossy()
-        .into_owned();
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-    let request = image
-        .with_mount(Mount::bind_mount(conf, "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
-    let container = request
-        .start()
-        .await
-        .expect("environment ERROR: Docker/NATS substrate is required for this sync test");
-    let nats_port = container
-        .get_host_port_ipv4(4222.tcp())
-        .await
-        .expect("NATS port should be mapped");
-    NatsFixture {
-        _lock: lock,
-        _container: container,
-        nats_url: format!("nats://127.0.0.1:{nats_port}"),
-    }
-}
-
 pub struct RealSyncFixture {
-    _nats: NatsFixture,
+    _broker: InProcessBroker,
     _hub: TestStore,
     pub edge1: TestStore,
     pub edge2: TestStore,
@@ -788,7 +743,7 @@ pub struct RealSyncFixture {
 }
 
 pub struct SelfEchoSyncFixture {
-    _nats: NatsFixture,
+    _broker: InProcessBroker,
     pub node: TestStore,
     pub client: SyncClient,
     shutdown: Arc<AtomicBool>,
@@ -796,26 +751,25 @@ pub struct SelfEchoSyncFixture {
 }
 
 pub struct PreClientSyncFixture {
-    _nats: NatsFixture,
+    _broker: InProcessBroker,
     _hub: TestStore,
     pub edge1: TestStore,
     pub edge2: TestStore,
     shutdown: Arc<AtomicBool>,
     _server_task: tokio::task::JoinHandle<()>,
     pub tenant_id: String,
-    pub nats_url: String,
 }
 
 impl PreClientSyncFixture {
     pub fn connect(&self) -> (SyncClient, SyncClient) {
-        let edge1_client = SyncClient::new(
+        let edge1_client = SyncClient::with_transport(
             self.edge1.store.sync_database(),
-            &self.nats_url,
+            self._broker.client(),
             TenantId::from(&self.tenant_id),
         );
-        let edge2_client = SyncClient::new(
+        let edge2_client = SyncClient::with_transport(
             self.edge2.store.sync_database(),
-            &self.nats_url,
+            self._broker.client(),
             TenantId::from(&self.tenant_id),
         );
         register_cg_sync_tables(&edge1_client);
@@ -846,17 +800,26 @@ impl RealSyncFixture {
     pub fn hub_store(&self) -> &Store {
         &self._hub.store
     }
+
+    /// Mint an additional edge client on the SAME in-process hub as this fixture (registered with
+    /// the cg sync tables) — for tests that stand up a wiped/scoped replacement edge.
+    pub fn new_edge_client(&self, db: std::sync::Arc<contextdb_engine::Database>) -> SyncClient {
+        let client =
+            SyncClient::with_transport(db, self._broker.client(), TenantId::from(&self.tenant_id));
+        register_cg_sync_tables(&client);
+        client
+    }
 }
 
 pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
-    let nats = start_nats_or_environment_error().await;
+    let broker = InProcessBroker::new();
     let tenant_id = format!("tenant_{test_name}");
     let hub = TestStore::new(&format!("{test_name}_hub"));
     let hub_db = hub.store.sync_database();
     let policies = cg_conflict_policies();
-    let server = Arc::new(SyncServer::new(
+    let server = Arc::new(SyncServer::with_transport(
         Arc::clone(&hub_db),
-        &nats.nats_url,
+        broker.server(),
         TenantId::from(&tenant_id),
         policies.clone(),
     ));
@@ -868,25 +831,23 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
             server.run_until(shutdown).await;
         })
     };
-    wait_for_nats(&nats.nats_url).await;
 
     let edge1 = TestStore::new(&format!("{test_name}_edge1"));
     let edge2 = TestStore::new(&format!("{test_name}_edge2"));
-    let edge1_client = SyncClient::new(
+    let edge1_client = SyncClient::with_transport(
         edge1.store.sync_database(),
-        &nats.nats_url,
+        broker.client(),
         TenantId::from(&tenant_id),
     );
-    let edge2_client = SyncClient::new(
+    let edge2_client = SyncClient::with_transport(
         edge2.store.sync_database(),
-        &nats.nats_url,
+        broker.client(),
         TenantId::from(&tenant_id),
     );
     register_cg_sync_tables(&edge1_client);
     register_cg_sync_tables(&edge2_client);
-    let nats_url = nats.nats_url.clone();
     RealSyncFixture {
-        _nats: nats,
+        _broker: broker,
         _hub: hub,
         edge1,
         edge2,
@@ -895,19 +856,19 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
         shutdown,
         _server_task: server_task,
         tenant_id,
-        nats_url,
+        nats_url: "in-process".to_string(),
     }
 }
 
 pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
-    let nats = start_nats_or_environment_error().await;
+    let broker = InProcessBroker::new();
     let tenant_id = format!("tenant_{test_name}");
     let node = TestStore::new(&format!("{test_name}_node"));
     let shared_db = node.store.sync_database();
     let policies = cg_conflict_policies();
-    let server = Arc::new(SyncServer::new(
+    let server = Arc::new(SyncServer::with_transport(
         Arc::clone(&shared_db),
-        &nats.nats_url,
+        broker.server(),
         TenantId::from(&tenant_id),
         policies,
     ));
@@ -919,15 +880,14 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
             server.run_until(shutdown).await;
         })
     };
-    wait_for_nats(&nats.nats_url).await;
-    let client = SyncClient::new(
+    let client = SyncClient::with_transport(
         node.store.sync_database(),
-        &nats.nats_url,
+        broker.client(),
         TenantId::from(&tenant_id),
     );
     register_cg_sync_tables(&client);
     SelfEchoSyncFixture {
-        _nats: nats,
+        _broker: broker,
         node,
         client,
         shutdown,
@@ -936,14 +896,14 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
 }
 
 pub async fn pre_client_sync_fixture(test_name: &str) -> PreClientSyncFixture {
-    let nats = start_nats_or_environment_error().await;
+    let broker = InProcessBroker::new();
     let tenant_id = format!("tenant_{test_name}");
     let hub = TestStore::new(&format!("{test_name}_hub"));
     let hub_db = hub.store.sync_database();
     let policies = cg_conflict_policies();
-    let server = Arc::new(SyncServer::new(
+    let server = Arc::new(SyncServer::with_transport(
         Arc::clone(&hub_db),
-        &nats.nats_url,
+        broker.server(),
         TenantId::from(&tenant_id),
         policies.clone(),
     ));
@@ -955,43 +915,17 @@ pub async fn pre_client_sync_fixture(test_name: &str) -> PreClientSyncFixture {
             server.run_until(shutdown).await;
         })
     };
-    wait_for_nats(&nats.nats_url).await;
     let edge1 = TestStore::new(&format!("{test_name}_edge1"));
     let edge2 = TestStore::new(&format!("{test_name}_edge2"));
-    let nats_url = nats.nats_url.clone();
     PreClientSyncFixture {
-        _nats: nats,
+        _broker: broker,
         _hub: hub,
         edge1,
         edge2,
         shutdown,
         _server_task: server_task,
         tenant_id,
-        nats_url,
     }
-}
-
-async fn wait_for_nats(nats_url: &str) {
-    let nats_addr = nats_socket_addr(nats_url);
-    let start = std::time::Instant::now();
-    let mut poll = tokio::time::interval(Duration::from_millis(100));
-    while start.elapsed() < Duration::from_secs(10) {
-        if TcpStream::connect_timeout(&nats_addr, Duration::from_millis(200)).is_ok() {
-            return;
-        }
-        poll.tick().await;
-    }
-    assert!(
-        TcpStream::connect_timeout(&nats_addr, Duration::from_millis(200)).is_ok(),
-        "environment ERROR: NATS did not become reachable at {nats_url}"
-    );
-}
-
-fn nats_socket_addr(nats_url: &str) -> SocketAddr {
-    nats_url
-        .strip_prefix("nats://")
-        .and_then(|addr| addr.parse::<SocketAddr>().ok())
-        .unwrap_or_else(|| panic!("environment ERROR: invalid NATS URL {nats_url}"))
 }
 
 pub fn cg_conflict_policies() -> ConflictPolicies {

@@ -235,7 +235,7 @@ pub struct FailingExtractor;
 
 impl FailingExtractor {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 }
 

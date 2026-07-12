@@ -125,7 +125,7 @@ fn no_remote_configured_opens_and_behaves_exactly_as_today() {
     assert_eq!(status.pull_watermark, Lsn(0));
     assert_eq!(status.pending_push_count, 0);
     assert!(!status.sync_client_constructed);
-    assert!(!status.nats_connection_opened);
+    assert!(!status.hub_connection_opened);
     assert!(
         store
             .store

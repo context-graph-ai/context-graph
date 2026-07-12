@@ -2897,15 +2897,17 @@ fn stored_grouping_proposals(store: &Store) -> Vec<String> {
 fn handle_sync(args: &[String]) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
-            "Usage: cg sync <status|push|pull> --remote-server NATS_URL --tenant-id TENANT_ID"
+            "Usage: cg sync <status|push|pull> --remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID\n\n--remote-server takes the pasted hub enrollment ticket / endpoint spec for your tenant fabric."
         );
         return 0;
     }
     let Some(action) = args.first().map(String::as_str) else {
-        return usage_error("sync requires status, push, or pull");
+        return usage_error(
+            "sync requires status, push, or pull; pass --remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID",
+        );
     };
     let Some(remote_url) = flag_value(args, "--remote-server") else {
-        return usage_error("sync requires --remote-server NATS_URL");
+        return usage_error("sync requires --remote-server <hub-ticket-or-endpoint>");
     };
     let Some(tenant_id) = flag_value(args, "--tenant-id") else {
         return usage_error("sync requires --tenant-id TENANT_ID");
@@ -3013,7 +3015,7 @@ fn handle_sync(args: &[String]) -> i32 {
 
 struct CliSyncBoundary {
     client: SyncClient,
-    nats_connection_opened: Mutex<bool>,
+    hub_connection_opened: Mutex<bool>,
 }
 
 struct CliSyncClientRegistration<'a>(&'a SyncClient);
@@ -3042,12 +3044,12 @@ impl CliSyncBoundary {
         register_context_graph_sync_client(&CliSyncClientRegistration(&client));
         Self {
             client,
-            nats_connection_opened: Mutex::new(false),
+            hub_connection_opened: Mutex::new(false),
         }
     }
 
     fn mark_connected(&self) {
-        if let Ok(mut connected) = self.nats_connection_opened.lock() {
+        if let Ok(mut connected) = self.hub_connection_opened.lock() {
             *connected = true;
         }
     }
@@ -3107,7 +3109,7 @@ impl SyncStatusBoundary for CliSyncBoundary {
     }
 
     fn is_connected(&self) -> bool {
-        self.nats_connection_opened
+        self.hub_connection_opened
             .lock()
             .map(|connected| *connected)
             .unwrap_or(false)
@@ -3200,7 +3202,7 @@ fn sync_status_json(status: &SyncStatusReport) -> Value {
         "pull_watermark": status.pull_watermark.0,
         "pending_push_count": status.pending_push_count,
         "sync_client_constructed": status.sync_client_constructed,
-        "nats_connection_opened": status.nats_connection_opened,
+        "hub_connection_opened": status.hub_connection_opened,
     })
 }
 
@@ -3567,7 +3569,17 @@ struct MemoryStatusSnapshot {
     raw_retention_days: Option<u64>,
     last_understanding_run: Option<Value>,
     last_injection: Option<Value>,
+    /// The fabric sharing posture rendered from library facts: whether input-sharing is on and how
+    /// many ephemeral understanding-input copies actually sit in the outbound push set. `None` when
+    /// no `fabric.toml` is present (a plain single-node install).
+    fabric: Option<FabricStatusLine>,
     summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct FabricStatusLine {
+    sharing_on: bool,
+    inputs_in_push_set: usize,
 }
 
 fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot {
@@ -3579,6 +3591,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
     let mut raw = tier0::RawFootprint::default();
     let mut raw_retention_days = None;
     let mut last_understanding_run = None;
+    let mut fabric = None;
     let last_injection = read_last_injection(root);
     if let Ok(store) = open_memory_store(root) {
         raw_retention_days = tier0::raw_retention_days(&store).unwrap_or(None);
@@ -3586,6 +3599,16 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        // Fabric sharing posture — a renderer over library facts. Sharing ON is proven by input
+        // material actually sitting in the outbound push set, never a displayed constant.
+        if let Ok(Some(config)) = context_graph::fabric::FabricConfig::load(root) {
+            let inputs_in_push_set =
+                context_graph::fabric::input_material_in_push_set(&store, &config).unwrap_or(0);
+            fabric = Some(FabricStatusLine {
+                sharing_on: config.sharing,
+                inputs_in_push_set,
+            });
+        }
         if let Ok(contexts) = store.list_contexts()
             && let Some(context) = contexts
                 .into_iter()
@@ -3597,6 +3620,16 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
             raw = raw_footprint(&store, context.id).unwrap_or_default();
         }
     }
+    let fabric_summary = fabric
+        .as_ref()
+        .map(|fabric| {
+            format!(
+                " | fabric: sharing {}, {} understanding input copies in push set",
+                if fabric.sharing_on { "on" } else { "off" },
+                fabric.inputs_in_push_set,
+            )
+        })
+        .unwrap_or_default();
     let injection_summary = last_injection
         .as_ref()
         .map(|injection| {
@@ -3622,7 +3655,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
         })
         .unwrap_or_default();
     let summary = format!(
-        "context: {context_label} goals: {} decisions: {} observations: {} | pending understanding: {} | raw kept: {} chunks / {} bytes{injection_summary}",
+        "context: {context_label} goals: {} decisions: {} observations: {} | pending understanding: {} | raw kept: {} chunks / {} bytes{injection_summary}{fabric_summary}",
         counts.goals,
         counts.decisions,
         counts.observations,
@@ -3640,6 +3673,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
         raw_retention_days,
         last_understanding_run,
         last_injection,
+        fabric,
         summary,
     }
 }
@@ -3688,6 +3722,15 @@ fn add_memory_status_fields(value: &mut Value, snapshot: &MemoryStatusSnapshot) 
                 "retention_days": snapshot.raw_retention_days,
             }),
         );
+        if let Some(fabric) = &snapshot.fabric {
+            object.insert(
+                "fabric".to_string(),
+                json!({
+                    "sharing": if fabric.sharing_on { "on" } else { "off" },
+                    "inputs_in_push_set": fabric.inputs_in_push_set,
+                }),
+            );
+        }
         if let Some(last_run) = &snapshot.last_understanding_run {
             object.insert("last_understanding_run".to_string(), last_run.clone());
         }

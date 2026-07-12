@@ -163,7 +163,7 @@ pub struct SyncStatusReport {
     pub pull_watermark: Lsn,
     pub pending_push_count: usize,
     pub sync_client_constructed: bool,
-    pub nats_connection_opened: bool,
+    pub hub_connection_opened: bool,
 }
 
 impl Default for SyncStatusReport {
@@ -175,7 +175,7 @@ impl Default for SyncStatusReport {
             pull_watermark: Lsn(0),
             pending_push_count: 0,
             sync_client_constructed: false,
-            nats_connection_opened: false,
+            hub_connection_opened: false,
         }
     }
 }
@@ -446,7 +446,7 @@ pub fn sync_status_report(
             .pending_push_change_count()
             .unwrap_or_else(|_| usize::from(boundary.has_pending_push_changes().unwrap_or(false))),
         sync_client_constructed: true,
-        nats_connection_opened: boundary.is_connected(),
+        hub_connection_opened: boundary.is_connected(),
     }
 }
 

@@ -36,7 +36,7 @@ cg-node-fs.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
-contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["nats"], optional = true }
+contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh"], optional = true }
 fs4.workspace = true
 pollster.workspace = true
 safetensors = { workspace = true, optional = true }
@@ -58,7 +58,7 @@ candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }
-contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["nats"] }
+contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }
