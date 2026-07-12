@@ -258,6 +258,13 @@ pub enum CgError {
     EngineFault {
         source: EngineError,
     },
+    /// The store is already open in another process; the engine reports which pid
+    /// holds it and at what path. A distinct, recoverable condition — callers match
+    /// this variant instead of substring-matching the engine's Debug text.
+    StoreLocked {
+        holder_pid: u32,
+        path: std::path::PathBuf,
+    },
     Engine(String),
 }
 

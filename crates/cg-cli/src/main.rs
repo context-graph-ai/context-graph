@@ -3539,8 +3539,21 @@ fn handle_by_entity(args: &[String]) -> i32 {
 #[derive(Debug)]
 enum MemoryCliError {
     Store(String),
+    StoreLocked { holder_pid: u32, path: PathBuf },
     Io(String),
     UseImportForSessionFiles,
+}
+
+/// Converts a store error into a CLI error, preserving the locked-store condition
+/// as a typed variant. A locked store is matched by type at the exit-code boundary,
+/// never by substring-matching the engine's Debug text.
+fn map_store_open_err(err: context_graph::CgError) -> MemoryCliError {
+    match err {
+        context_graph::CgError::StoreLocked { holder_pid, path } => {
+            MemoryCliError::StoreLocked { holder_pid, path }
+        }
+        other => MemoryCliError::Store(format!("{other:?}")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3730,9 +3743,9 @@ fn open_memory_store_with_expected_schema(
                 embedder,
             }],
         )
-        .map_err(|err| MemoryCliError::Store(format!("{err:?}")));
+        .map_err(map_store_open_err);
     }
-    Store::open(config).map_err(|err| MemoryCliError::Store(format!("{err:?}")))
+    Store::open(config).map_err(map_store_open_err)
 }
 
 fn open_scoped_memory_store_for_sync(
@@ -3755,7 +3768,7 @@ fn open_scoped_memory_store_for_sync(
         config.default_text_embedder = None;
     }
     let scoped = Store::open_with_contexts(config, BTreeSet::from([context.id]))
-        .map_err(|err| MemoryCliError::Store(format!("{err:?}")))?;
+        .map_err(map_store_open_err)?;
     Ok(OpenedSyncStores {
         scoped,
         admin: admin_store,
@@ -4757,12 +4770,15 @@ fn memory_error(err: MemoryCliError, db_path: &Path, context_label: &str) -> i32
             context_label,
             "use `cg import` for session files",
         ),
-        MemoryCliError::Store(message) if message.contains("DatabaseLocked") => memory_failure(
+        MemoryCliError::StoreLocked { holder_pid, path } => memory_failure(
             4,
             "StoreBusy",
             db_path,
             context_label,
-            "store busy / already in use",
+            &format!(
+                "store busy / already in use: another process (pid {holder_pid}) holds {}",
+                path.display()
+            ),
         ),
         MemoryCliError::Store(message) | MemoryCliError::Io(message) => {
             memory_failure(1, "MemoryError", db_path, context_label, &message)
@@ -7463,4 +7479,29 @@ fn home_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A locked store must exit `4`/`StoreBusy` so a caller can distinguish "another
+    // process owns this store" (retryable) from a generic error. The classification
+    // is by the typed `StoreLocked` variant, never by substring-matching Debug text.
+    #[test]
+    fn locked_store_maps_to_store_busy_exit_code() {
+        let err = map_store_open_err(context_graph::CgError::StoreLocked {
+            holder_pid: 4242,
+            path: PathBuf::from("/data/cg/memory.db"),
+        });
+        assert!(matches!(
+            err,
+            MemoryCliError::StoreLocked {
+                holder_pid: 4242,
+                ..
+            }
+        ));
+        let code = memory_error(err, Path::new("/data/cg/memory.db"), "default");
+        assert_eq!(code, 4);
+    }
 }

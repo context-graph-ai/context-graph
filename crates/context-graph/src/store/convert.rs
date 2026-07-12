@@ -77,6 +77,9 @@ pub(super) fn map_engine_err(err: EngineError) -> CgError {
             got: actual,
         },
         EngineError::ContextScopeViolation { .. } => CgError::CrossContextNotSupported,
+        EngineError::DatabaseLocked { holder_pid, path } => {
+            CgError::StoreLocked { holder_pid, path }
+        }
         EngineError::BfsDepthExceeded(d) => CgError::Engine(format!("bfs depth exceeded: {d}")),
         other => CgError::Engine(format!("unexpected engine error: {other}")),
     }
@@ -335,5 +338,31 @@ pub(super) fn audit_operation_from_str(s: &str) -> Result<AuditOperation> {
         "resolve_invalidation" => Ok(AuditOperation::ResolveInvalidation),
         "dismiss_invalidation" => Ok(AuditOperation::DismissInvalidation),
         other => Err(CgError::Engine(format!("unknown audit operation: {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // A locked store is a distinct, recoverable condition ("another process owns
+    // this store"). The converter must surface it as a matchable `CgError` variant
+    // carrying the holder pid and path, so callers classify it by type rather than
+    // by substring-matching Debug text (which silently rots when the format shifts).
+    #[test]
+    fn database_locked_maps_to_typed_store_locked_variant() {
+        let path = PathBuf::from("/data/cg/memory.db");
+        let mapped = map_engine_err(EngineError::DatabaseLocked {
+            holder_pid: 4242,
+            path: path.clone(),
+        });
+        assert_eq!(
+            mapped,
+            CgError::StoreLocked {
+                holder_pid: 4242,
+                path,
+            }
+        );
     }
 }
