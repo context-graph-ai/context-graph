@@ -14,7 +14,7 @@
 //! * `GAP_REAL_CHUNKS=N`    — how many real session chunks to score (default 10).
 //! * `GAP_FIXTURES=<dir>`   — fixtures dir (default `<worktree>/gap-fixtures`).
 //! * `GAP_OUT=<path>`       — report path (default `<worktree>/gap-report.md`).
-//! * `GAP_CORPUS=<dir>`     — real-session jsonl dir (default the cg-ai claude projects dir).
+//! * `GAP_CORPUS=<dir>`     — real-session jsonl dir (required for real-chunk scoring; no default).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1132,12 +1132,17 @@ struct RealChunk {
     text: String,
 }
 
-fn corpus_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("GAP_CORPUS") {
-        return PathBuf::from(d);
+/// Resolve the real-session corpus directory. There is no default location: the corpus is a set of
+/// jsonl session transcripts specific to whoever runs the report, so `GAP_CORPUS` must name it.
+fn corpus_dir() -> Result<PathBuf, String> {
+    match std::env::var("GAP_CORPUS") {
+        Ok(d) if !d.trim().is_empty() => Ok(PathBuf::from(d)),
+        _ => Err(
+            "GAP_CORPUS is not set: point it at a directory of real-session .jsonl transcripts \
+             to score against (there is no default location)"
+                .to_string(),
+        ),
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".claude/projects/-home-lucid-projects-context-graph-ai")
 }
 
 /// Deterministically select up to `want` substantive real chunks. Files are taken in sorted-name
@@ -1146,7 +1151,13 @@ fn corpus_dir() -> PathBuf {
 /// language are taken round-robin so the sample spans multiple sessions. Source + chunk index are
 /// recorded for reproducibility.
 fn select_real_chunks(want: usize) -> Vec<RealChunk> {
-    let dir = corpus_dir();
+    let dir = match corpus_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("gap-report: {e}");
+            std::process::exit(1);
+        }
+    };
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
@@ -1915,4 +1926,25 @@ fn out_path() -> PathBuf {
     std::env::var("GAP_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| worktree_root().join("gap-report.md"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_dir_requires_gap_corpus_env_with_no_fallback() {
+        // Unset: no default location; the error names the env var so the operator knows what to set.
+        unsafe { std::env::remove_var("GAP_CORPUS") };
+        let err = corpus_dir().expect_err("unset GAP_CORPUS must be an error, never a default path");
+        assert!(err.contains("GAP_CORPUS"), "error names the env var: {err}");
+
+        // Set: the directory is exactly what the operator provided.
+        unsafe { std::env::set_var("GAP_CORPUS", "/tmp/gap-corpus-under-test") };
+        assert_eq!(
+            corpus_dir().expect("set GAP_CORPUS resolves"),
+            PathBuf::from("/tmp/gap-corpus-under-test")
+        );
+        unsafe { std::env::remove_var("GAP_CORPUS") };
+    }
 }
