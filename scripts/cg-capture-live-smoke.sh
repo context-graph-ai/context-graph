@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# cg-llm-client-refactor smoke test — OpenRouter BYOK driver (Step 4b acceptance gate)
+# cg capture live smoke test — OpenRouter BYOK driver
 # ---------------------------------------------------------------------------
 # Drives the compiled `cg` binary through the library-grade capture harness
-# (Required Behavior §1–§8) against inputs that exist in NO test fixture and NO
+# against inputs that exist in NO test fixture and NO
 # fake-provider branch, so it can only pass if real extraction + the real
 # downstream logic work. OpenRouter is the model provider (BYOK, OpenAI-compatible).
 #
 # Two halves:
-#   CAPTURE HALF (live now): §1 full-ontology extraction, §4 four-stage pipeline,
-#     §J cost/time receipt + zero-outbound --estimate, §L connected-by-default,
-#     §7 sync split (requires a contextdb relay hub for a release-ready verdict).
-#   CORRECTION/SKILL/HITL HALF (§5,§6,§8): REAL assertions now that the CLI verbs
+#   CAPTURE HALF (live now): full-ontology extraction, the four-stage pipeline,
+#     the cost/time receipt + zero-outbound --estimate, connected-by-default capture,
+#     the sync split (requires a contextdb relay hub for a release-ready verdict).
+#   CORRECTION/SKILL/HITL HALF: REAL assertions now that the CLI verbs
 #     fix/drop/group/undo/skills/review/why are wired. Item handles are `@n`
 #     ordinals over the captured units (digests) in a context, newest first.
 #     Assertions check SHAPES and LOOP behavior, never exact model wording.
@@ -18,9 +18,9 @@
 # WHAT THE CLI CANNOT DRIVE (recorded so a SKIP is read as a finding, not a pass):
 #   - The POSITIVE `cg why` branch needs a genuinely-flagged closed-vocab item; the
 #     flag is model-dependent and the flagged id is not surfaced by `cg review`, so
-#     §8 asserts the discriminating NEGATIVE branch and eyeballs the positive one.
+#     the HITL step asserts the discriminating NEGATIVE branch and eyeballs the positive one.
 #
-# §2 deterministic grounding is not a live-model wording assertion. This smoke runs
+# Deterministic grounding is not a live-model wording assertion. This smoke runs
 # the grounding acceptance module before the live capture so entity, decision_type,
 # agent_id, observation, and outcome grounding remain part of the gate.
 #
@@ -32,13 +32,13 @@
 #   CG_SMOKE_ENDPOINT    https://openrouter.ai/api/v1
 #   CG_SMOKE_TIMEOUT_MS  120000
 #   CG_DATA_ROOT         /tmp/cg-refactor-smoke
-#   CG_SMOKE_LOG         /tmp/cg-llm-client-refactor-smoke.log
+#   CG_SMOKE_LOG         /tmp/cg-capture-live-smoke.log
 #   CG                   <worktree>/target/release/cg
 #   CG_SMOKE_SKIP_BUILD  0    set 1 to skip cargo build
 #   CG_SMOKE_HUB         (unset)  contextdb relay-hub NATS URL with a relay worker
 #                        serving CG_SMOKE_TENANT; missing means NOT RELEASE-READY
-#   CG_SMOKE_TENANT      generated local tenant id; required with CG_SMOKE_HUB for §7 sync
-#   CG_SMOKE_REAL_JSONL  largest real session JSONL to import in the owner-feel gate;
+#   CG_SMOKE_TENANT      generated local tenant id; required with CG_SMOKE_HUB for the sync gate
+#   CG_SMOKE_REAL_JSONL  largest real session JSONL to import in the real-import gate;
 #                        defaults to the largest *.jsonl under CG_SMOKE_REAL_JSONL_DIR
 #   CG_SMOKE_REAL_JSONL_DIR  $HOME/.claude/projects
 #
@@ -51,7 +51,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKTREE="${CG_WORKTREE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 CG="${CG:-$WORKTREE/target/release/cg}"
 CG_DATA_ROOT="${CG_DATA_ROOT:-/tmp/cg-refactor-smoke}"
-LOG="${CG_SMOKE_LOG:-/tmp/cg-llm-client-refactor-smoke.log}"
+LOG="${CG_SMOKE_LOG:-/tmp/cg-capture-live-smoke.log}"
 MODEL="${CG_SMOKE_MODEL:-anthropic/claude-haiku-4.5}"
 ENDPOINT="${CG_SMOKE_ENDPOINT:-https://openrouter.ai/api/v1}"
 PROVIDER="openrouter"
@@ -166,7 +166,7 @@ review_count() {  # review_count <output> <category>   e.g. drift | currency_fli
   grep -oiE "$2=[0-9]+" <<<"$1" | head -1 | grep -oE '[0-9]+'
 }
 
-# A §5–§8 verb is "available" once it is wired into the CLI dispatch. Until then
+# A correction/skill/HITL verb is "available" once it is wired into the CLI dispatch. Until then
 # `cg <verb>` prints `unknown command `<verb>`` (usage_error) and the section SKIPs.
 # All seven verbs (fix/drop/group/undo/skills/review/why) are wired in this build;
 # the guard stays so the script degrades gracefully on an older binary.
@@ -183,7 +183,7 @@ printf 'data root      : %s\n' "$CG_DATA_ROOT"
 printf 'provider       : %s  endpoint=%s\n' "$PROVIDER" "$ENDPOINT"
 printf 'model          : %s\n' "$MODEL"
 printf 'tenant         : %s\n' "$TENANT"
-printf 'relay hub (§7) : %s\n' "${HUB:-<unset — release gate will fail>}"
+printf 'relay hub      : %s\n' "${HUB:-<unset — release gate will fail>}"
 printf 'api key        : OPENROUTER_API_KEY (by NAME only; never printed)\n'
 
 if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
@@ -235,7 +235,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 3A — §2 deterministic grounding over every extracted value class"
+section "STEP 3A — deterministic grounding over every extracted value class"
 if ( cd "$WORKTREE" && cargo test -p context-graph --test acceptance grounding_silence ); then
   check "grounding flags fabricated entity, decision_type, agent_id, observation, and outcome values" 0
 else
@@ -243,7 +243,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 3 — §1/§4 full-ontology capture, receipt leads with intention"
+section "STEP 3 — full-ontology capture, receipt leads with intention"
 read -r -d '' SESS1 <<'EOF' || true
 We are building the billing service and the goal is to keep it reliable under load.
 Decision: we will use PostgreSQL on RDS as the primary store for billing, because we
@@ -266,10 +266,10 @@ note "counts: $(counts_line "$LAST_OUT")"
 note "EYEBALL the rows: a repository+module transcript must yield Repository and Module"
 note "entities (never collapsed to File); the decision must carry a model-derived type and"
 note "reasoning, confidence NULL at capture; the observation must carry its latency lane;"
-note "the outcome must be attached. (§1 — judge by shape, model wording varies.)"
+note "the outcome must be attached. (judge by shape, model wording varies.)"
 
 # ---------------------------------------------------------------------------
-section "STEP 4 — §J cost/time receipt + zero-outbound --estimate"
+section "STEP 4 — cost/time receipt + zero-outbound --estimate"
 check "capture receipt reports token + time cost" \
   "$(grep -q '"prompt_tokens":[1-9]' <<<"$CAPTURE_OUT" && grep -q '"completion_tokens":[1-9]' <<<"$CAPTURE_OUT" && grep -q '"elapsed_ms":[1-9]' <<<"$CAPTURE_OUT" && echo 0 || echo 1)"
 # --estimate must compute without a model call. Prove it by estimating with the
@@ -287,33 +287,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 4B — owner-feel real JSONL import with the default window"
+section "STEP 4B — real JSONL import with the default window"
 REAL_JSONL="$(largest_real_jsonl || true)"
 if [[ -z "$REAL_JSONL" || ! -f "$REAL_JSONL" ]]; then
-  check "owner-feel real JSONL import requires CG_SMOKE_REAL_JSONL or a real *.jsonl under CG_SMOKE_REAL_JSONL_DIR" 1
+  check "real JSONL import requires CG_SMOKE_REAL_JSONL or a real *.jsonl under CG_SMOKE_REAL_JSONL_DIR" 1
 else
   note "real JSONL: $REAL_JSONL"
-  cg_run import --estimate "$REAL_JSONL" --context owner-feel
+  cg_run import --estimate "$REAL_JSONL" --context real-import
   REAL_ESTIMATE_OUT="$LAST_OUT"
-  check "owner-feel real JSONL estimate succeeds with zero provider calls" \
+  check "real JSONL estimate succeeds with zero provider calls" \
     "$([[ $LAST_RC -eq 0 ]] && jq -e '.estimate.provider_calls == 0' <<<"$(json_first_obj "$REAL_ESTIMATE_OUT")" >/dev/null 2>&1 && echo 0 || echo 1)"
-  check "owner-feel real JSONL default import window is bounded for hosted output budget" \
+  check "real JSONL default import window is bounded for hosted output budget" \
     "$(jq -e '.estimate.resolved_chunk_window <= 16000 and .estimate.chunks > 1' <<<"$(json_first_obj "$REAL_ESTIMATE_OUT")" >/dev/null 2>&1 && echo 0 || echo 1)"
-  cg_run import --understand-now "$REAL_JSONL" --context owner-feel
+  cg_run import --understand-now "$REAL_JSONL" --context real-import
   REAL_IMPORT_OUT="$LAST_OUT"
   REAL_IMPORT_OBJ="$(json_first_obj "$REAL_IMPORT_OUT")"
-  check "owner-feel real JSONL import succeeds on the default window" \
+  check "real JSONL import succeeds on the default window" \
     "$([[ $LAST_RC -eq 0 ]] && is_ok_json "$REAL_IMPORT_OUT" && echo 0 || echo 1)"
-  check "owner-feel real JSONL import exercises the multi-chunk path" \
+  check "real JSONL import exercises the multi-chunk path" \
     "$(jq -e '.import_chunks > 1' <<<"$REAL_IMPORT_OBJ" >/dev/null 2>&1 && echo 0 || echo 1)"
-  check "owner-feel real JSONL import captures non-empty typed memory" \
+  check "real JSONL import captures non-empty typed memory" \
     "$(jq -e '(.captured.goals + .captured.decisions + .captured.observations) > 0' <<<"$REAL_IMPORT_OBJ" >/dev/null 2>&1 && echo 0 || echo 1)"
-  check "owner-feel real JSONL import reports at least one Native captured usage call per successful chunk" \
+  check "real JSONL import reports at least one Native captured usage call per successful chunk" \
     "$(jq -e '([.usage.calls[] | select(.reliability_level == "Native" and .outcome == "captured")] | length) >= .import_chunks' <<<"$REAL_IMPORT_OBJ" >/dev/null 2>&1 && echo 0 || echo 1)"
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 5 — §L connected-by-default (tenant context, not cwd-hash)"
+section "STEP 5 — connected-by-default (tenant context, not cwd-hash)"
 mkdir -p /tmp/cg-cwd-A /tmp/cg-cwd-B /tmp/cg-cwd-C
 ( cd /tmp/cg-cwd-A && printf '%s' "We decided to adopt Rust for the new ingest worker." | "$CG" record --understand-now --tenant-id "$TENANT" >/dev/null 2>&1 )
 ( cd /tmp/cg-cwd-B && printf '%s' "We decided to deploy the ingest worker on Kubernetes." | "$CG" record --understand-now --tenant-id "$TENANT" >/dev/null 2>&1 )
@@ -322,10 +322,10 @@ LAST_OUT="$( cd /tmp/cg-cwd-C && "$CG" status --tenant-id "$TENANT" 2>&1 )"; pri
 check "captures from two different working dirs both land under the tenant context" \
   "$(counts_nonzero "$LAST_OUT" && echo 0 || echo 1)"
 note "If cwd-hashing were still in play these would be in 3 different contexts and this status"
-note "(from a 3rd dir) would be empty. (§L — pinned by refactored_capture_context_defaults_to_tenant.)"
+note "(from a 3rd dir) would be empty. (pinned by refactored_capture_context_defaults_to_tenant.)"
 
 # ---------------------------------------------------------------------------
-section "STEP 6 — §8 two-layer reversibility (cg fix / cg drop / cg group / cg undo)"
+section "STEP 6 — two-layer reversibility (cg fix / cg drop / cg group / cg undo)"
 # Item handles are `@n` ordinals over the captured units (digests) in a context,
 # newest first: `@1` is the latest capture, `@2` the one before it (see
 # resolve_item_handle / captured_units_newest_first in cg-cli). fix/drop/undo/why
@@ -395,11 +395,11 @@ if verb_available fix && verb_available drop && verb_available undo && verb_avai
   check "group no: neither grouping name survives in the read view (a DISTINCT reject effect)" \
     "$(! contains "$LAST_OUT" "$GNAME" && ! contains "$LAST_OUT" "$GNAME2" && echo 0 || echo 1)"
 else
-  pending "§8 reversibility — cg fix/drop/group/undo not all wired into this binary"
+  pending "reversibility — cg fix/drop/group/undo not all wired into this binary"
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 7 — §6 learned-skill loop (cg fix x N → held-out promotion → LLM-authored skill → auto-apply)"
+section "STEP 7 — learned-skill loop (cg fix x N → held-out promotion → LLM-authored skill → auto-apply)"
 TRAINED_SKILL_ID="skill-retype-context-graph-file-repository"
 TRAINED_SKILL_DESCRIPTION=""
 TRAINED_SKILL_RULE=""
@@ -493,11 +493,11 @@ if verb_available skills && verb_available fix; then
   check "cg skills review off returns ok with review_hold=false" \
     "$([[ $LAST_RC -eq 0 ]] && [[ "$(json_field "$LAST_OUT" '.review_hold')" == "false" ]] && echo 0 || echo 1)"
 else
-  check "§6 learned-skill loop requires cg skills/fix to be wired into the CLI" 1
+  check "learned-skill loop requires cg skills/fix to be wired into the CLI" 1
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 8 — §8 HITL surface (cg review / cg why)"
+section "STEP 8 — HITL surface (cg review / cg why)"
 if verb_available review; then
   cg_run review --context billing-demo
   check "cg review runs and reports per-category counts" "$([[ $LAST_RC -eq 0 ]] && echo 0 || echo 1)"
@@ -505,7 +505,7 @@ if verb_available review; then
   #   summary: uncertain=N groupings=N drift=N currency_flips=N
   # The three single-edge categories (uncertain/grouping/drift) plus the
   # present-but-empty currency category must ALL appear (currency stays structurally
-  # empty on a single edge — server-core owns reconciliation — but is never omitted).
+  # empty on a single edge — a future server-side runner owns reconciliation — but is never omitted).
   check "cg review shows the three single-edge categories + the present-but-empty currency category" \
     "$(grep -qiE 'uncertain' <<<"$LAST_OUT" && grep -qiE 'grouping' <<<"$LAST_OUT" \
        && grep -qiE 'drift' <<<"$LAST_OUT" && grep -qiE 'currenc' <<<"$LAST_OUT" && echo 0 || echo 1)"
@@ -530,21 +530,21 @@ if verb_available review; then
     # surfaced through cg review's JSON), so this cannot be driven deterministically
     # from the CLI in a BYOK smoke. We assert the legal-vocab branch is reachable by
     # confirming the negative branch is closed-vocab-aware, and report the positive
-    # path as a clean owner-eyeball step rather than a false pass.
+    # path as a clean manual-eyeball step rather than a false pass.
     note "POSITIVE cg-why path: on a genuinely-flagged closed-vocab item (e.g. an entity whose"
     note "type span is unsupported), cg why <id> returns flagged=true + legal_types=[the 13 EntityType"
     note "values]. Flagging is model-dependent and cg review does not surface the flagged id, so this"
-    note "branch is an owner eyeball: capture a transcript that forces an entity-type flag, then run"
+    note "branch is a manual eyeball: capture a transcript that forces an entity-type flag, then run"
     note "cg why <that-entity-id>."
   else
-    check "§8 cg why is wired" 1
+    check "cg why is wired" 1
   fi
 else
-  check "§8 HITL surface — cg review is wired into the CLI" 1
+  check "HITL surface — cg review is wired into the CLI" 1
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 9 — §6 drift safeguard (one alert, nothing auto-disabled)"
+section "STEP 9 — drift safeguard (one alert, nothing auto-disabled)"
 if verb_available skills && verb_available review; then
   OUT_OF_SCOPE_TEXT="Goal G_scope: classify the auth-service file artifact. Entity E_scope: auth-service type=file path=auth-service. Decision D_scope: treat auth-service as a file artifact for indexing serves G_scope based_on E_scope."
   if cg_record_retry 3 --context skillz "$OUT_OF_SCOPE_TEXT"; then
@@ -578,11 +578,11 @@ if verb_available skills && verb_available review; then
   check "the drifting LLM-authored skill is NOT auto-disabled" \
     "$(jq -e --arg id "$TRAINED_SKILL_ID" '.skills[]? | select(.id == $id and .active == true and .provenance == "llm-authored")' <<<"$(json_first_obj "$LAST_OUT")" >/dev/null 2>&1 && echo 0 || echo 1)"
 else
-  check "§6 drift safeguard requires cg skills/review to be wired into the CLI" 1
+  check "drift safeguard requires cg skills/review to be wired into the CLI" 1
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 10 — §7 cross-machine skill durability over the contextdb relay hub"
+section "STEP 10 — cross-machine skill durability over the contextdb relay hub"
 if [[ -z "$HUB" || -z "${CG_SMOKE_TENANT:-}" ]]; then
   check "cross-machine skill durability requires CG_SMOKE_HUB and CG_SMOKE_TENANT" 1
   note "This is a release-gate blocker, not a clean skip: run with a contextdb-enterprise-server relay NATS URL."
@@ -644,9 +644,9 @@ printf '\nReading the result:\n'
 printf '  CAPTURE, correction, promotion, LLM-authored skill creation, record/import auto-apply,\n'
 printf '    drift, and cross-machine skill durability are hard pass/fail assertions.\n'
 printf '  Promotion, llm-authored, drift, or cross-machine sync skips are release blockers.\n'
-printf '  The positive cg-why flag remains an owner-eyeball note because the flagged id is not\n'
+printf '  The positive cg-why flag remains a manual-eyeball note because the flagged id is not\n'
 printf '    surfaced by cg review; it is not counted as a pass or a skip by this script.\n'
-printf '  Grounding (§2) is covered by the deterministic Step 3A acceptance module over\n'
+printf '  Grounding is covered by the deterministic Step 3A acceptance module over\n'
 printf '    entity, decision_type, agent_id, observation, and outcome values.\n'
 
 (( FAIL == 0 && SKIP == 0 ))
