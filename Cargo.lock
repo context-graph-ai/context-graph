@@ -908,17 +908,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cg-gap-report"
-version = "0.1.0"
-dependencies = [
- "cg-catalog",
- "cg-local-llm",
- "context-graph",
- "serde_json",
- "serde_yaml_ng",
-]
-
-[[package]]
 name = "cg-local-llm"
 version = "0.1.0"
 dependencies = [

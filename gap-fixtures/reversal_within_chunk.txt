@@ -1,5 +1,0 @@
-User: Let's use RocksDB as the storage backend for the write-ahead log. It has the best write throughput and we already have the dependency.
-Assistant: Agreed, I'll wire RocksDB into the WAL path.
-User: Actually wait — I just checked and RocksDB's LSM compaction will fight our fsync-per-commit durability requirement. Scrap that. We're going with a custom append-only segment file instead; sequential writes, no compaction, we control fsync.
-Assistant: Good catch. Switching the design to a custom append-only segment file for the WAL, with explicit fsync per commit. RocksDB is out.
-User: Right. And the segment file rotates at 128MB.
