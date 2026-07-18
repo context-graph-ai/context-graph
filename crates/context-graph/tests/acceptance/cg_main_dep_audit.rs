@@ -1561,26 +1561,6 @@ fn default_build_dep_tree_for_context_graph_and_cg_catalog_has_no_tokio_runtime(
     }
 }
 
-/// Regression guard for the load-bearing embeddable-core purity invariant: the `context-graph`
-/// core library (what vigil and any WASM target embed) must NEVER pull the local-model engine
-/// (`cg-local-llm` → `llama-cpp-2` → `llama-cpp-sys-2`, which vendors llama.cpp and needs a C++
-/// toolchain). The engine lives in the cg-catalog/worker layer on purpose; core stays pure Rust,
-/// no native deps. cg-catalog itself DOES pull llama (via cg-local-llm) and is intentionally not
-/// guarded here — only the embeddable core is. context-graph's dependency on cg-catalog is a
-/// dev-dependency, so it is absent from the default+build tree checked below; if a future change
-/// added llama to core's normal/build deps, this fails CI instead of silently breaking the guarantee.
-#[test]
-fn default_build_dep_tree_for_context_graph_core_carries_no_llama_local_model_engine() {
-    let tree = default_build_tree("context-graph");
-    assert!(
-        !tree
-            .lines()
-            .any(|line| line.contains("llama") || line.contains("cg-local-llm")),
-        "context-graph core default-build dependency tree must not pull the llama local-model engine \
-         (the embeddable core stays native-dep-free for vigil/WASM):\n{tree}"
-    );
-}
-
 #[test]
 fn embedder_trait_surface_remains_byte_identical_with_catalog_workspace_member() {
     let embedder: Box<dyn Embedder> = Box::new(MockEmbedder::new("acceptance_mock_text", 8));

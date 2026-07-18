@@ -1,6 +1,6 @@
 //! The bench's capture driver and store read-back. The driver goes through the
 //! PRODUCTION library entry (`run_capture` — the same terminal path the understanding drain
-//! calls via `run_capture_into_digest`); the gap-report harness's side execution path is the
+//! calls via `run_capture_into_digest`); a side execution path is the
 //! documented false-green history this replaces. Real full-bench runs drive the actual `cg`
 //! binaries; this library driver is the deterministic-double seam for CI.
 

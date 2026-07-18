@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,10 +28,6 @@ use crate::{
     CacheStatus, Capability, Catalog, CatalogEntry, CatalogRegistrations, License, ModelKind,
     Source,
 };
-
-/// A resolved local model's on-disk cache directory plus its artifact filenames and per-file
-/// sha256s (the metadata `connect_local_model` needs to register a fetched GGUF as a worker).
-type LocalModelCache = (PathBuf, Vec<String>, Vec<(String, String)>);
 
 pub const DEGRADED_MARKER: &str = "running without a connected model";
 const HOSTED_TIMEOUT: Duration = Duration::from_secs(45);
@@ -372,7 +368,7 @@ impl ModelProofError {
 
     pub fn message(&self) -> String {
         match self {
-            Self::NoHostSession => "No drivable host session was found. Use a local model first; env-var key setup is a later fallback.".to_string(),
+            Self::NoHostSession => "No drivable host session was found. Connect a hosted model with `cg model connect`.".to_string(),
             Self::ConsentNotRecorded => "Consent is not recorded; run cg model auth login --connection <provider> --consent before cg selftest.".to_string(),
             Self::HostToolMissing { .. } => "The selected provider tool is gone; re-install it or run cg model auth login again.".to_string(),
             Self::HostLoginExpired { .. } => {
@@ -4100,121 +4096,6 @@ impl ModelConnectionCatalog {
         model
     }
 
-    /// Select a fetched local model (a bundled GGUF, e.g. the understanding default) as the active
-    /// understanding worker. Unlike `connect_env_var` / `connect_host_session_*`, this needs no
-    /// credential: a local model runs fully in-process, so it is wired to a `NoAuth` connection.
-    ///
-    /// The daily-loop $0-local path this makes walkable: `cg model fetch --defaults` caches the GGUF,
-    /// then `cg model use --local` calls this so the understanding-queue drain routes to the
-    /// in-process model at zero token/dollar cost.
-    pub fn connect_local_model(
-        &mut self,
-        model_id: &str,
-    ) -> std::result::Result<ConnectionRead, String> {
-        let name = model_id.to_string();
-
-        // Resolve the on-disk artifact directory. Prefer an already-registered local model's
-        // cache path; otherwise resolve a fetched-but-unregistered artifact (the bundled
-        // understanding default after `cg model fetch`) from the catalog manifest.
-        let existing = self.read_model(model_id);
-        let (cache_path, artifact_filenames, per_file_sha256) =
-            match existing.as_ref().and_then(|model| model.cache_path.clone()) {
-                Some(path) => (
-                    path,
-                    existing
-                        .as_ref()
-                        .map(|model| model.artifact_filenames.clone())
-                        .unwrap_or_default(),
-                    existing
-                        .as_ref()
-                        .map(|model| model.per_file_sha256.clone())
-                        .unwrap_or_default(),
-                ),
-                None => self.local_model_cache(model_id)?,
-            };
-
-        // Register the model as a LocalPath LlmClient. `connection_name` is `None` in the catalog
-        // registration on purpose: the catalog entry source must stay `LocalPath` (the in-process
-        // dispatch requires it), and `NamedConnection` would shadow it.
-        let registration_model = ModelRead {
-            id: name.clone(),
-            kind: ModelKind::LlmClient,
-            connection_name: None,
-            welded_auth_env_var: None,
-            exposed_secret: None,
-            cache_path: Some(cache_path.clone()),
-            hosted_endpoint: None,
-            artifact_filenames,
-            per_file_sha256,
-        };
-        if !self.upsert_shipped_catalog_entry(&registration_model) {
-            return Err(format!(
-                "failed to register local model {model_id} as the active understanding worker"
-            ));
-        }
-        // The in-memory model record points its `connection_name` at the connection so
-        // `model_for_connection` / `active_model_id` resolve the local GGUF once it is active.
-        let mut resolved = registration_model;
-        resolved.connection_name = Some(name.clone());
-        self.models.insert(name.clone(), resolved);
-
-        // Consent auto-recorded is a deliberate product decision: the consent gate exists only to
-        // stop cg from silently burning a paid chat subscription / provider quota. A local
-        // in-process model has ZERO token/quota spend, so that concern is moot here — the act of
-        // running `cg model use` IS the opt-in. `spend_owner` is "local" to make the $0 lane honest.
-        let read = ConnectionRead {
-            name: name.clone(),
-            credential_reference: CredentialReference::no_auth(),
-            exposed_secret: None,
-            consent_recorded: true,
-            spend_owner: "local".to_string(),
-        };
-        self.connections.insert(name.clone(), read.clone());
-        self.active_connection_name = Some(name.clone());
-        // A prior failure on a reused connection name would gate memory capture off; clear it so the
-        // freshly-selected local worker starts clean.
-        let _ = self.clear_connection_last_error_result(&name);
-        self.persist();
-        Ok(read)
-    }
-
-    /// Resolve a fetched local model's cache directory and artifact metadata from the catalog
-    /// manifest, or a clear "fetch it first" error. Used when the model is not yet registered as a
-    /// local connection model (e.g. right after `cg model fetch --defaults`).
-    fn local_model_cache(&self, model_id: &str) -> std::result::Result<LocalModelCache, String> {
-        if self.root.as_os_str().is_empty() {
-            return Err(self.local_model_missing_message(model_id));
-        }
-        let catalog = Catalog::open_with_scope_against_root(&self.root, CONNECTION_CATALOG_SCOPE)
-            .map_err(|err| format!("local model catalog open failed: {err}"))?;
-        let Ok(entry) = catalog.show(model_id) else {
-            return Err(self.local_model_missing_message(model_id));
-        };
-        if !matches!(entry.source, Source::LocalPath { .. }) {
-            return Err(format!(
-                "model {model_id} is not a local model; `cg model use` selects a fetched local model (use `cg model connect` for an HTTP endpoint)"
-            ));
-        }
-        if entry.cache_status != CacheStatus::Cached {
-            return Err(self.local_model_missing_message(model_id));
-        }
-        let cache_path = entry
-            .local_path
-            .clone()
-            .ok_or_else(|| self.local_model_missing_message(model_id))?;
-        Ok((cache_path, entry.artifact_filenames, entry.per_file_sha256))
-    }
-
-    fn local_model_missing_message(&self, model_id: &str) -> String {
-        if model_id == crate::UNDERSTANDING_DEFAULT_ID {
-            format!(
-                "local understanding model `{model_id}` is not cached; run `cg model fetch --defaults` first"
-            )
-        } else {
-            format!("local model `{model_id}` is not cached; run `cg model fetch {model_id}` first")
-        }
-    }
-
     pub fn register_legacy_hosted_model_with_welded_env_var(
         &mut self,
         id: impl Into<String>,
@@ -5569,9 +5450,8 @@ impl<C: LlmClient> UnderstandingRuntime<C> {
         }
 
         // Hosted transports re-derive structured output from the provider config, so the contract
-        // is stripped from the message input. A local (cache-path) model has no provider config —
-        // the in-process GGUF path reads the schema off the request itself to build its grammar —
-        // so the contract is retained for it.
+        // is stripped from the message input. A local (cache-path) model has no provider config, so
+        // the contract is retained for it.
         let runtime_request = if cache_path.is_some() {
             request.clone()
         } else {
@@ -5699,15 +5579,6 @@ fn understand_local_single_file(
         ));
     }
     let artifact_path = &invocation.local_artifacts[0];
-    // A single-file GGUF is the bundled understanding model: run it in-process through
-    // `cg-local-llm` (grammar-constrained, CPU-only), not the candle safetensors proof path.
-    if artifact_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-    {
-        return understand_local_gguf(invocation, artifact_path).map(|run| run.reply);
-    }
     let proof = local_candle_artifact_proof(artifact_path)?;
     let artifact = artifact_path
         .file_name()
@@ -5723,373 +5594,6 @@ fn understand_local_single_file(
         malformed: false,
         usage: None,
     })
-}
-
-/// Explicit context window for the in-process understanding model — never a silent default (an
-/// unset window truncates). Sized well above a normal capture chunk; a prompt that overruns it
-/// fails loudly (`ContextTooSmall`) rather than being silently cut.
-const LOCAL_UNDERSTANDING_N_CTX: u32 = 8192;
-/// Generation budget for one in-process understanding call. A full-ontology extraction of a
-/// decision-rich chunk emits verbose JSON — each decision carries decision_type, a reasoning array,
-/// tags, properties, and spans — so at production item caps (3/6/6/6) the object routinely exceeds
-/// 2048 tokens and truncates before it closes, yielding zero memory. Sized to fit a full extraction
-/// within the 8192 context window (prompt ~3k + generation ~4k). Higher = more wall-clock on CPU.
-const LOCAL_UNDERSTANDING_MAX_TOKENS: u32 = 4096;
-
-/// Process-global cache of loaded in-process engines, keyed by GGUF artifact path, so a 3.1GB
-/// model is loaded once per process rather than per capture chunk.
-static LOCAL_GGUF_ENGINES: OnceLock<Mutex<HashMap<PathBuf, Arc<cg_local_llm::LlamaCppEngine>>>> =
-    OnceLock::new();
-
-fn local_gguf_engine(path: &Path) -> context_graph::Result<Arc<cg_local_llm::LlamaCppEngine>> {
-    let cache = LOCAL_GGUF_ENGINES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .map_err(|_| CgError::Engine("local understanding engine cache poisoned".to_string()))?;
-    if let Some(engine) = guard.get(path) {
-        return Ok(engine.clone());
-    }
-    // `llama-cpp-2` asserts (panics, not `Result::Err`) when the path does not exist, which would
-    // poison this very mutex for every later call in the process. Fail loudly but cleanly first.
-    if !path.is_file() {
-        return Err(CgError::Engine(format!(
-            "local understanding model file not found: {}",
-            path.display()
-        )));
-    }
-    let engine = Arc::new(
-        cg_local_llm::LlamaCppEngine::load_from_gguf(path).map_err(|err| {
-            CgError::Engine(format!("local understanding model load failed: {err}"))
-        })?,
-    );
-    guard.insert(path.to_path_buf(), engine.clone());
-    Ok(engine)
-}
-
-/// One driven local-GGUF understanding call: the mapped `ModelReply`, the combined runtime report
-/// (probe/config resolution folded with whatever the engine observed at load) for the SAME run,
-/// the model id that produced it, and the raw wall-clock milliseconds off the local receipt (kept
-/// alongside the mapped reply so callers that build a `ModelCallUsage` never have to re-derive
-/// timing from anything but the observed local reply).
-struct LocalGgufRun {
-    reply: context_graph::ModelReply,
-    backend_report: cg_local_llm::LocalBackendReport,
-    model_id: String,
-    wall_clock_ms: u128,
-}
-
-/// Run one understanding call in-process against the bundled GGUF model. The instruction+schema
-/// prompt is the harness-rendered text (`input_without_output_contract`); the output contract's
-/// JSON schema becomes the grammar so off-shape replies are structurally impossible. Temperature 0
-/// and an explicit context window are the local-runtime recipe; the achieved level (Native when a
-/// grammar was genuinely attached, Floor when it degraded) and the outcome come straight from the
-/// engine's observed reply and are mapped onto the shipped receipt.
-///
-/// Consults the path-scoped fake-engine registration (`acceleration::registered_local_engine`)
-/// FIRST so tests can drive this exact production route without a real GGUF; falls back to the
-/// cached real `LlamaCppEngine` otherwise. Both paths run through the SAME
-/// `dyn LocalUnderstandingEngine` call below — no parallel test-only adapter.
-fn understand_local_gguf(
-    invocation: &ModelInvocation,
-    artifact_path: &Path,
-) -> context_graph::Result<LocalGgufRun> {
-    let registration = crate::acceleration::registered_local_engine(artifact_path);
-    let engine: Arc<dyn cg_local_llm::LocalUnderstandingEngine> = match &registration {
-        Some(reg) => reg.engine.clone(),
-        None => local_gguf_engine(artifact_path)?,
-    };
-    let contract = match invocation.request.output_contract() {
-        OutputContract::Schema(schema) => cg_local_llm::LocalOutputContract::Schema(schema),
-        OutputContract::Unconstrained => cg_local_llm::LocalOutputContract::Unconstrained,
-    };
-    let prompt = invocation.request.input_without_output_contract();
-    let params = cg_local_llm::GenerationParams::new(LOCAL_UNDERSTANDING_N_CTX)
-        .with_max_tokens(LOCAL_UNDERSTANDING_MAX_TOKENS)
-        .with_temperature(0.0);
-    let reply = engine
-        .understand(prompt, &contract, &params)
-        .map_err(|err| CgError::Engine(format!("local understanding failed: {err}")))?;
-    let wall_clock_ms = reply.receipt.wall_clock_ms;
-    let prompt_tokens = reply.receipt.prompt_tokens;
-    let generated_tokens = reply.receipt.generated_tokens;
-
-    let level = match reply.receipt.level {
-        cg_local_llm::LocalEnforcementLevel::Native => EnforcementLevel::Native,
-        cg_local_llm::LocalEnforcementLevel::Floor => EnforcementLevel::Floor,
-    };
-    // Empty (refusal-shaped) content is surfaced as a Refusal so the caller does not treat an
-    // empty reply as a captured harvest; truncation and capture map straight across.
-    let outcome = match reply.receipt.outcome {
-        cg_local_llm::LocalOutcome::Captured => ModelCallOutcome::Captured,
-        cg_local_llm::LocalOutcome::Truncation => ModelCallOutcome::Truncation,
-        cg_local_llm::LocalOutcome::Empty => ModelCallOutcome::Refusal,
-    };
-    let phrasing = if outcome == ModelCallOutcome::Refusal {
-        String::new()
-    } else {
-        reply.text
-    };
-
-    // The backend report for THIS run: the registration's own config+probe when a fake engine is
-    // registered, else the compiled binary's default config against the safe no-GPU probe. Folding
-    // the engine's own load observation is what may promote active_backend to Cuda — a probe/config
-    // report alone never does.
-    let backend_config = registration
-        .as_ref()
-        .map(|reg| reg.backend_config)
-        .unwrap_or_else(|| {
-            cg_local_llm::LocalBackendConfig::new(
-                cg_local_llm::BinaryCapability::compiled(),
-                cg_local_llm::ConfiguredBackend::Auto,
-            )
-        });
-    let default_probe: Arc<dyn cg_local_llm::GpuProbe> = Arc::new(cg_local_llm::NoGpuProbe);
-    let probe = registration
-        .as_ref()
-        .map(|reg| reg.probe.clone())
-        .unwrap_or(default_probe);
-    let base_report = cg_local_llm::resolve_backend(&backend_config, probe.as_ref());
-    let backend_report = match engine.load_observation() {
-        Some(observation) => base_report.with_load_observation(observation),
-        None => base_report,
-    };
-
-    let model_id = registration
-        .as_ref()
-        .map(|reg| reg.model_id.clone())
-        .unwrap_or_else(|| {
-            artifact_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("local-gguf")
-                .to_string()
-        });
-
-    // Reconnect the local receipt's token counts into the normal usage path. A reply carrying NO
-    // tokens at all (a fake/degenerate reply with both counts zero) is never turned into a
-    // synthesized timing-only usage record — it stays `None` so the validation path can reject it
-    // as missing local usage rather than accepting fabricated zeros.
-    let usage = if prompt_tokens == 0 && generated_tokens == 0 {
-        None
-    } else {
-        Some(context_graph::ProviderUsage {
-            prompt_tokens: prompt_tokens as u64,
-            completion_tokens: generated_tokens as u64,
-            total_tokens: (prompt_tokens + generated_tokens) as u64,
-        })
-    };
-    let reply = context_graph::ModelReply {
-        marker: understanding_marker(&invocation.request),
-        phrasing,
-        advisory_flag: level == EnforcementLevel::Floor,
-        malformed: false,
-        usage,
-    }
-    .with_model_receipt(ModelCallReceipt {
-        reliability_level: level,
-        outcome,
-        structured_output_rejected: false,
-    });
-
-    Ok(LocalGgufRun {
-        reply,
-        backend_report,
-        model_id,
-        wall_clock_ms,
-    })
-}
-
-fn local_gguf_invocation(
-    artifact_path: &Path,
-    prompt: &str,
-    contract: cg_local_llm::LocalOutputContract,
-) -> ModelInvocation {
-    let output_contract = match contract {
-        cg_local_llm::LocalOutputContract::Unconstrained => OutputContract::Unconstrained,
-        cg_local_llm::LocalOutputContract::Schema(schema) => OutputContract::Schema(schema),
-    };
-    let request = UnderstandingRequest {
-        context_id: ContextId::new_v7(),
-        consumer: UnderstandingConsumer::ConversationCondensation,
-        deployment: DeploymentSurface::Edge,
-        input: prompt.to_string(),
-        paid: false,
-    }
-    .with_output_contract(output_contract);
-    // SAFETY: this builds an invocation for the local-GGUF route only, with `local_artifacts` set
-    // to exactly the path the caller is authorizing understanding against and
-    // `local_catalog_authorized: true` — the same authorization shape the catalog cache-proof path
-    // produces. Callers of the public seams below own that authorization decision.
-    unsafe {
-        ModelInvocation::from_authorized_runtime_parts(AuthorizedModelInvocationParts {
-            request,
-            resolved_connection: None,
-            resolved_credential: None,
-            hosted_endpoint: None,
-            provider_config: None,
-            cache_path: None,
-            local_artifacts: vec![artifact_path.to_path_buf()],
-            local_catalog_authorized: true,
-        })
-    }
-}
-
-/// One driven local-understanding run through the production catalog GGUF route: the mapped
-/// `ModelReply` plus the combined runtime report for that SAME run. `cg doctor`/`cg model status`
-/// and tests below the CLI drive this directly; nothing above re-derives any of it.
-pub struct LocalUnderstandingRun {
-    pub reply: context_graph::ModelReply,
-    pub runtime_report: crate::acceleration::LocalUnderstandingRuntimeReport,
-}
-
-/// Drive the production local-GGUF route directly (below any CLI): consults the path-scoped fake
-/// engine registration first, else the real cached llama.cpp engine, and returns the mapped
-/// `ModelReply` alongside the combined runtime report for the SAME run.
-pub fn run_local_gguf_understanding(
-    artifact_path: &Path,
-    prompt: &str,
-    contract: cg_local_llm::LocalOutputContract,
-) -> context_graph::Result<LocalUnderstandingRun> {
-    let invocation = local_gguf_invocation(artifact_path, prompt, contract);
-    let run = understand_local_gguf(&invocation, artifact_path)?;
-    let usage = run
-        .reply
-        .usage
-        .clone()
-        .map(|usage| crate::acceleration::LocalRunUsage {
-            prompt_tokens: usage.prompt_tokens,
-            generated_tokens: usage.completion_tokens,
-            wall_clock_ms: run.wall_clock_ms as u64,
-        });
-    let runtime_report = crate::acceleration::LocalUnderstandingRuntimeReport::from_backend_report(
-        format!("local-run:{}", artifact_path.display()),
-        &run.backend_report,
-        Some(run.model_id),
-        usage,
-    );
-    Ok(LocalUnderstandingRun {
-        reply: run.reply,
-        runtime_report,
-    })
-}
-
-/// A no-op `HostedProviderBoundary`: the local-GGUF capture path never calls a hosted provider, but
-/// `capture_with_usage_visibility`'s signature still takes one. Calling it is a caller bug.
-struct NoopHostedProviderBoundary;
-
-impl context_graph::HostedProviderBoundary for NoopHostedProviderBoundary {
-    fn call_model(
-        &self,
-        _prompt: &str,
-    ) -> context_graph::Result<context_graph::HostedProviderReply> {
-        Err(CgError::Engine(
-            "local-GGUF capture never calls a hosted provider".to_string(),
-        ))
-    }
-
-    fn call_count(&self) -> usize {
-        0
-    }
-}
-
-/// A `ConversationExtractor` that drives the production local-GGUF route
-/// (`understand_local_gguf`) for one registered/real artifact path, parses the reply as a
-/// structured harvest, and records one `ModelCallUsage` per call carrying BOTH the run's usage and
-/// its runtime backend facts (test 1.4's "same run" join).
-struct LocalGgufExtractor {
-    artifact_path: PathBuf,
-    pending: Mutex<Vec<context_graph::ModelCallUsage>>,
-}
-
-impl LocalGgufExtractor {
-    fn new(artifact_path: PathBuf) -> Self {
-        Self {
-            artifact_path,
-            pending: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl context_graph::ingest::ConversationExtractor for LocalGgufExtractor {
-    fn extract(
-        &self,
-        request: context_graph::ingest::ExtractionRequest<'_>,
-    ) -> context_graph::Result<context_graph::ingest::StructuredHarvest> {
-        let invocation = local_gguf_invocation(
-            &self.artifact_path,
-            request.transcript,
-            cg_local_llm::LocalOutputContract::Unconstrained,
-        );
-        let run = understand_local_gguf(&invocation, &self.artifact_path)?;
-        let receipt = run.reply.model_call_receipt();
-        let usage_state = match &run.reply.usage {
-            Some(usage) => context_graph::UsageReportState::Tokens(usage.clone()),
-            None => context_graph::UsageReportState::Unavailable,
-        };
-        let runtime = context_graph::LocalRuntimeReceipt {
-            binary_capability: run.backend_report.binary_capability.as_str().to_string(),
-            configured_backend: run.backend_report.configured_backend.as_str().to_string(),
-            active_backend: run.backend_report.active_backend.as_str().to_string(),
-            gpu_layers: run
-                .backend_report
-                .observed_gpu_layers
-                .or(run.backend_report.requested_gpu_layers),
-            fallback_reason: run
-                .backend_report
-                .fallback_reason
-                .map(|reason| reason.as_str().to_string()),
-        };
-        self.pending
-            .lock()
-            .map_err(|_| CgError::Engine("local gguf usage lock poisoned".to_string()))?
-            .push(context_graph::ModelCallUsage {
-                chunk_index: 0,
-                usage: usage_state,
-                elapsed: Duration::from_millis(run.wall_clock_ms as u64),
-                reliability_level: receipt.reliability_level,
-                outcome: receipt.outcome,
-                flow_tag: Some("extraction".to_string()),
-                model_id: Some(run.model_id.clone()),
-                runtime: Some(runtime),
-            });
-        context_graph::ingest::StructuredHarvest::from_json_str(&run.reply.phrasing)
-    }
-
-    fn drain_model_usage(&self) -> Vec<context_graph::ModelCallUsage> {
-        std::mem::take(
-            &mut *self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-}
-
-/// Drive a single-chunk capture through the real usage-report path (`capture_with_usage_visibility`,
-/// the same path `cg record --understand-now` uses) against the local-GGUF route for
-/// `artifact_path`. Returns the same `usage_receipt_json` shape the CLI receipt renders, and — via
-/// `capture_with_usage_visibility`'s own persistence — leaves a `provider_usage` Observation in the
-/// store carrying this run's usage and runtime facts.
-pub fn capture_local_understanding_usage(
-    store: &context_graph::Store,
-    context_label: &str,
-    transcript: &str,
-    artifact_path: &Path,
-) -> context_graph::Result<Value> {
-    let extractor = LocalGgufExtractor::new(artifact_path.to_path_buf());
-    let receipt = context_graph::capture_with_usage_visibility(
-        store,
-        context_graph::ingest::CaptureRequest {
-            context_label: context_label.to_string(),
-            transcript: transcript.to_string(),
-            model_available: true,
-        },
-        transcript.len().max(1),
-        &extractor,
-        &NoopHostedProviderBoundary,
-        context_graph::CapturePricing::FlatSubscription,
-    )?;
-    Ok(context_graph::usage_receipt_json(&receipt))
 }
 
 fn local_candle_artifact_proof(path: &Path) -> context_graph::Result<String> {

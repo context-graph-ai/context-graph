@@ -19,7 +19,6 @@ path = "src/lib.rs"
 candle-embeddinggemma.workspace = true
 candle-core.workspace = true
 cg-cli-conventions.workspace = true
-cg-local-llm = { path = "../cg-local-llm" }
 context-graph = { path = "../context-graph" }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true

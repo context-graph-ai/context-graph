@@ -9,7 +9,7 @@
 //!            --work-root <dir> --label <variant-label> --model-name <for the report> \
 //!            [--report <report.md>] [--gray-out <gray.tsv>]
 //!
-//! The caller configures the model (`cg model use ...` / `cg model connect ...`) and capture
+//! The caller configures the model (`cg model connect ...`) and capture
 //! config (`<work-root>/cg/capture.toml`) BEFORE invoking; the bench never edits them — one
 //! variant per invocation, per-lever history accumulates across invocations via --report.
 
@@ -128,7 +128,7 @@ fn main() {
             &["import", session_path, "--context", &context],
         )
         .expect("cg import");
-        eprintln!("[cg-bench] {prefix}: understand… (this is the slow, $0 part)");
+        eprintln!("[cg-bench] {prefix}: understand… (this is the slow part)");
         run_cg(&cg, &work_root, &["understand", "--context", &context]).expect("cg understand");
 
         // Read the extraction back through the library (the store the binaries wrote).

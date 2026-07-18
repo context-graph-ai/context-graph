@@ -668,7 +668,6 @@ impl<'a> FlowTaggingWrapper<'a> {
             outcome: ModelCallOutcome::Captured,
             flow_tag: Some(flow.to_string()),
             model_id: Some(self.default_model_id.to_string()),
-            runtime: None,
         });
     }
 }

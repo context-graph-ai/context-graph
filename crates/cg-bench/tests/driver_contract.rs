@@ -1,6 +1,6 @@
 //! RED contract tests for the bench runner: the bench drives the
 //! PRODUCTION capture path (the same library entry the drain calls — never a side harness; the
-//! gap-report's side path is the documented false-green history), reads extraction back from the
+//! prior side path is the documented false-green history), reads extraction back from the
 //! store, and its report carries the per-category numbers vs the frozen bars, the hosted-ceiling
 //! row, and the per-lever history. Authored and committed BEFORE implementation; implementation
 //! commits may not touch this file.

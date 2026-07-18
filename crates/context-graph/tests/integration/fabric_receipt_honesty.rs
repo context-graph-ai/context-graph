@@ -67,7 +67,6 @@ impl ConversationExtractor for KnownUsageExtractor {
             outcome: ModelCallOutcome::Captured,
             flow_tag: Some("extraction".to_string()),
             model_id: Some("known-usage-double".to_string()),
-            runtime: None,
         }]
     }
 }

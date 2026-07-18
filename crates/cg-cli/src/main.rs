@@ -95,7 +95,7 @@ const RELATION_OUTPUT_SCHEMA: &str = r#"{
 }"#;
 const HOST_SESSION_SPEND_KIND: &str = "subscription quota";
 const BYOK_HTTP_SPEND_KIND: &str = "provider API call";
-const LOCAL_SPEND_KIND: &str = "local in-process ($0)";
+const LOCAL_MODEL_SPEND_KIND: &str = "local model";
 const MODEL_SELFTEST_PROMPT: &str =
     "Reply with exactly this text and nothing else: cg-host-session-proof";
 
@@ -1084,13 +1084,13 @@ fn handle_worker(args: &[String]) -> i32 {
         );
     };
 
-    // A worker with no connected/local model can execute nothing — refuse at startup, BEFORE any
-    // network, with the exact `cg model use` fix.
+    // A worker with no connected model can execute nothing — refuse at startup, BEFORE any
+    // network, naming the `cg model connect` fix.
     if memory_capture_connection_name(&root).is_none() {
         return worker_failure(
             4,
             "NotConnected",
-            "cg worker needs a connected or local model to run understanding; select one with `cg model use <id>` (or `cg model connect` for a hosted key).",
+            "cg worker needs a connected model to run understanding; connect one with `cg model connect` (or `cg model auth login`).",
         );
     }
 
@@ -1153,7 +1153,7 @@ fn handle_worker(args: &[String]) -> i32 {
         return worker_failure(
             4,
             "NotConnected",
-            "cg worker needs a connected or local model to run understanding; select one with `cg model use <id>`.",
+            "cg worker needs a connected model to run understanding; connect one with `cg model connect`.",
         );
     };
 
@@ -4630,7 +4630,6 @@ impl ConnectedModelExtractor {
                 outcome: receipt.outcome,
                 flow_tag: None,
                 model_id: None,
-                runtime: None,
             });
         }
     }
@@ -4949,6 +4948,17 @@ impl ConversationExtractor for ConnectedModelExtractor {
     }
 }
 
+/// A persisted local selection whose artifact set names a `.gguf` is a pre-removal in-process
+/// understanding model. That runtime was removed, so such a selection is inert everywhere: the
+/// `cg understand`/`cg worker` model gates treat it as not-connected (refusing with `cg model
+/// connect` before any drain), and `cg model status`/`list` render it not-connected rather than
+/// operational. The kept safetensors seam carries no `.gguf`, so it is unaffected.
+fn local_artifacts_name_gguf(artifact_filenames: &[String]) -> bool {
+    artifact_filenames
+        .iter()
+        .any(|name| name.to_ascii_lowercase().ends_with(".gguf"))
+}
+
 fn memory_capture_connection_name(root: &Path) -> Option<String> {
     let catalog = ModelConnectionCatalog::open(root);
     if catalog.load_error().is_some() {
@@ -4962,6 +4972,14 @@ fn memory_capture_connection_name(root: &Path) -> Option<String> {
     if catalog
         .last_error_for_connection(&connection_name)
         .is_some()
+    {
+        return None;
+    }
+    // An upgraded data root can carry a pre-removal GGUF understanding selection whose in-process
+    // runtime is gone. Treat it as not-connected so understanding refuses at the gates (naming
+    // `cg model connect`) instead of degrading to a silent no-op inside dispatch.
+    if let Some(model) = catalog.model_for_connection(&connection_name)
+        && local_artifacts_name_gguf(&model.artifact_filenames)
     {
         return None;
     }
@@ -5630,12 +5648,11 @@ fn handle_model(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("--help") | Some("-h") => {
             println!(
-                "Usage: cg model <command>\n\nCommands:\n  connect       Register a named OpenAI-compatible BYOK endpoint\n  use           Select a fetched local model as the $0 in-process understanding worker\n  status        Show model connection status\n  selftest      Spend one consented proof call\n  auth login    Connect cg to an existing model host session\n  list          List registered models\n  show <id>     Show model metadata\n  fetch         Prefetch model artifacts into the local cache\n\nExamples:\n  cg model fetch --defaults\n  cg model use --local\n  cg model connect openai --endpoint https://api.openai.com/v1 --api-key sk-... --consent\n  cg model status openai\n  cg model selftest openai"
+                "Usage: cg model <command>\n\nCommands:\n  connect       Register a named OpenAI-compatible BYOK endpoint\n  status        Show model connection status\n  selftest      Spend one consented proof call\n  auth login    Connect cg to an existing model host session\n  list          List registered models\n  show <id>     Show model metadata\n  fetch         Prefetch model artifacts into the local cache\n\nExamples:\n  cg model fetch --defaults\n  cg model connect openai --endpoint https://api.openai.com/v1 --api-key sk-... --consent\n  cg model status openai\n  cg model selftest openai"
             );
             0
         }
         Some("connect") => handle_model_connect(&args[1..]),
-        Some("use") => handle_model_use(&args[1..]),
         Some("status") => handle_status(&args[1..], StatusSurface::ModelByok),
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::ModelByok),
         Some("list") => handle_model_list(&args[1..]),
@@ -5646,12 +5663,12 @@ fn handle_model(args: &[String]) -> i32 {
         }
         Some("auth") => usage_error("expected `cg model auth login`"),
         _ => usage_error(
-            "expected `cg model connect`, `cg model use`, `cg model status`, `cg model selftest`, `cg model list`, `cg model show`, `cg model fetch`, or `cg model auth login`",
+            "expected `cg model connect`, `cg model status`, `cg model selftest`, `cg model list`, `cg model show`, `cg model fetch`, or `cg model auth login`",
         ),
     }
 }
 
-/// Format a byte count as a human-readable size for fetch disclosure (e.g. `3.1 GB`, `548 MB`).
+/// Format a byte count as a human-readable size for fetch disclosure (e.g. `548 MB`).
 fn format_bytes(bytes: u64) -> String {
     const GB: f64 = 1_000_000_000.0;
     const MB: f64 = 1_000_000.0;
@@ -5666,15 +5683,11 @@ fn format_bytes(bytes: u64) -> String {
 fn handle_model_fetch(args: &[String]) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
-            "Usage: cg model fetch [--defaults | --all-understanding | <id>] [--format json|text]\n\n\
+            "Usage: cg model fetch [--defaults | <id>] [--format json|text]\n\n\
 Prefetches model artifacts into the local cache with honest size disclosure.\n\
-  cg model fetch --defaults            Fetch the default embedder AND the default (e2b) understanding model.\n\
-  cg model fetch --all-understanding   Fetch every understanding tier (e2b ~3.1GB + e4b ~4.98GB).\n\
-  cg model fetch gemma4-e2b-it-q4      Fetch the default (e2b) understanding tier.\n\
-  cg model fetch gemma4-e4b-it-q4      Fetch the larger (e4b) understanding escalation tier.\n\
+  cg model fetch --defaults            Fetch the default embedder.\n\
   cg model fetch <id>                  Fetch one model by catalog id.\n\n\
-The local understanding models run fully in-process (no server, no ollama); a staged copy next \
-to the cache is seeded without re-downloading."
+A staged copy next to the cache is seeded without re-downloading."
         );
         return 0;
     }
@@ -5686,47 +5699,12 @@ to the cache is seeded without re-downloading."
     };
 
     let embedder = cg_catalog::embedder_default_disclosure();
-    let understanding = cg_catalog::understanding_default_disclosure();
-    let understanding_all = cg_catalog::understanding_disclosures();
     let target = positional_arg(args);
-    let all_understanding = has_flag(args, "--all-understanding");
-
-    // `cg model fetch --all-understanding` is a convenience that fetches every bundled
-    // understanding tier (e2b default + e4b escalation) in one go.
-    if all_understanding {
-        if format == OutputFormat::Text {
-            println!("fetching all understanding tiers:");
-            for tier in &understanding_all {
-                println!("  {}\t{}", tier.id, format_bytes(tier.byte_size));
-            }
-        }
-        let mut results = Vec::new();
-        for tier in &understanding_all {
-            match catalog.fetch_understanding(&tier.id) {
-                Ok(result) => {
-                    if format == OutputFormat::Text {
-                        println!("result\t{}\t{result:?}", tier.id);
-                    }
-                    results.push(json!({
-                        "id": tier.id, "bytes": tier.byte_size,
-                        "size": format_bytes(tier.byte_size), "result": format!("{result:?}"),
-                    }));
-                }
-                Err(err) => return failure(1, "fetch_failed", "network", &format!("{err:?}")),
-            }
-        }
-        if format == OutputFormat::Json {
-            print_json(&json!({ "fetched": results }));
-        }
-        return 0;
-    }
-
     let defaults = has_flag(args, "--defaults") || target.is_none();
 
     if defaults {
-        // Disclose what will be fetched, with sizes, before downloading. `--defaults` fetches the
-        // embedder + the DEFAULT (e2b) understanding tier; the larger e4b escalation tier is listed
-        // as available so the ~4.98GB size is honest up front, fetched on demand via its id.
+        // Disclose what will be fetched, with its size, before downloading. `--defaults` fetches
+        // the default embedder.
         if format == OutputFormat::Text {
             println!("fetching defaults:");
             println!(
@@ -5734,44 +5712,9 @@ to the cache is seeded without re-downloading."
                 embedder.id,
                 format_bytes(embedder.byte_size)
             );
-            println!(
-                "  {} (understanding, default)\t{}",
-                understanding.id,
-                format_bytes(understanding.byte_size)
-            );
-            for tier in &understanding_all {
-                if tier.id != understanding.id {
-                    println!(
-                        "  {} (understanding, optional — fetch with `cg model fetch {}`)\t{}",
-                        tier.id,
-                        tier.id,
-                        format_bytes(tier.byte_size)
-                    );
-                }
-            }
         }
         return match catalog.prefetch_defaults() {
-            Ok(mut summary) => {
-                // prefetch_defaults seeds the understanding model from a staged copy but never
-                // downloads; the explicit fetch verb does the network download on a fresh machine.
-                if !catalog.understanding_model_cached(&understanding.id) {
-                    match catalog.fetch_understanding_default() {
-                        Ok(_) => {
-                            summary
-                                .skipped
-                                .retain(|entry| entry.model_id != understanding.id);
-                            summary.fetched.push(cg_catalog::FetchedEntry {
-                                model_id: understanding.id.clone(),
-                                artifact_sha: String::new(),
-                            });
-                        }
-                        Err(err) => {
-                            if format == OutputFormat::Text {
-                                eprintln!("WARN understanding model fetch failed: {err:?}");
-                            }
-                        }
-                    }
-                }
+            Ok(summary) => {
                 if format == OutputFormat::Text {
                     for fetched in &summary.fetched {
                         println!("fetched\t{}\t{}", fetched.model_id, fetched.artifact_sha);
@@ -5780,17 +5723,10 @@ to the cache is seeded without re-downloading."
                         println!("skipped\t{}\t{:?}", skipped.model_id, skipped.reason);
                     }
                 } else {
-                    let mut disclosed = vec![json!({
+                    let disclosed = vec![json!({
                         "id": embedder.id, "bytes": embedder.byte_size,
                         "size": format_bytes(embedder.byte_size),
                     })];
-                    for tier in &understanding_all {
-                        disclosed.push(json!({
-                            "id": tier.id, "bytes": tier.byte_size,
-                            "size": format_bytes(tier.byte_size),
-                            "default": tier.id == understanding.id,
-                        }));
-                    }
                     print_json(&json!({
                         "fetched": summary.fetched.iter().map(|entry| json!({
                             "id": entry.model_id, "sha": entry.artifact_sha,
@@ -5810,33 +5746,19 @@ to the cache is seeded without re-downloading."
     let Some(id) = target else {
         return usage_error("expected `cg model fetch --defaults` or `cg model fetch <id>`");
     };
-    let (disclosed_bytes, fetch_result) =
-        if let Some(tier) = cg_catalog::understanding_model_disclosure(&id) {
-            // Any bundled understanding tier (e2b default or e4b escalation): seed-from-staging is
-            // preferred over download, with the same honest size disclosure.
-            if format == OutputFormat::Text {
-                println!("fetching\t{}\t{}", tier.id, format_bytes(tier.byte_size));
-            }
-            (tier.byte_size, catalog.fetch_understanding(&id))
-        } else {
-            let bytes = catalog.show(&id).map(|entry| entry.byte_size).unwrap_or(0);
-            if format == OutputFormat::Text {
-                println!("fetching\t{id}\t{}", format_bytes(bytes));
-            }
-            (
-                bytes,
-                catalog.fetch(None, &id, cg_catalog::OutputMode::Headless),
-            )
-        };
-    match fetch_result {
+    let bytes = catalog.show(&id).map(|entry| entry.byte_size).unwrap_or(0);
+    if format == OutputFormat::Text {
+        println!("fetching\t{id}\t{}", format_bytes(bytes));
+    }
+    match catalog.fetch(None, &id, cg_catalog::OutputMode::Headless) {
         Ok(result) => {
             if format == OutputFormat::Text {
                 println!("result\t{result:?}");
             } else {
                 print_json(&json!({
                     "id": id,
-                    "bytes": disclosed_bytes,
-                    "size": format_bytes(disclosed_bytes),
+                    "bytes": bytes,
+                    "size": format_bytes(bytes),
                     "result": format!("{result:?}"),
                 }));
             }
@@ -6027,78 +5949,6 @@ fn handle_model_connect(args: &[String]) -> i32 {
     0
 }
 
-/// `cg model use <model-id>` / `cg model use --local` — select a fetched local model as the active
-/// understanding worker. It runs fully in-process at $0 (no server, no tokens, no quota), so this is
-/// what makes the daily-loop local path walkable after `cg model fetch --defaults`.
-fn handle_model_use(args: &[String]) -> i32 {
-    if has_flag(args, "--help") || has_flag(args, "-h") {
-        println!(
-            "Usage: cg model use [<model-id> | --local] [--format json|text]\n\n\
-Select a fetched local understanding tier as the active worker. It runs fully in-process at $0 \
-(no server, no tokens, no quota). `--local` is shorthand for the bundled default (e2b).\n\n\
-Valid ids: gemma4-e2b-it-q4 (default), gemma4-e4b-it-q4 (larger escalation tier). Fetch it first \
-with `cg model fetch --defaults` (e2b) or `cg model fetch gemma4-e4b-it-q4` (e4b).\n\n\
-Examples:\n  cg model use --local\n  cg model use gemma4-e2b-it-q4\n  cg model use gemma4-e4b-it-q4"
-        );
-        return 0;
-    }
-    let format = output_format(args);
-    let root = data_root();
-    let model_id = if has_flag(args, "--local") {
-        cg_catalog::UNDERSTANDING_DEFAULT_ID.to_string()
-    } else if let Some(id) = positional_arg(args) {
-        id
-    } else {
-        return usage_error("expected `cg model use <model-id>` or `cg model use --local`");
-    };
-    // `cg model use` selects a local $0 understanding worker; the valid targets are the bundled
-    // understanding tiers. Reject anything else up front with the valid-id list so the user is not
-    // left with a bare "not cached" when they simply typo'd or named a hosted model.
-    if cg_catalog::understanding_model_spec(&model_id).is_none() {
-        let valid = cg_catalog::understanding_model_ids().join(", ");
-        return failure(
-            2,
-            "unknown_local_model",
-            "config",
-            &format!(
-                "`{model_id}` is not a bundled understanding model; valid ids are: {valid} (use `cg model connect` for a hosted BYOK endpoint)"
-            ),
-        );
-    }
-    let mut catalog = ModelConnectionCatalog::open(&root);
-    if let Some(error) = catalog.load_error().map(str::to_string) {
-        return unreadable_connections_file(&error);
-    }
-    match catalog.connect_local_model(&model_id) {
-        Ok(connection) => {
-            if format == OutputFormat::Text {
-                println!("connection: {}", connection.name);
-                println!("model: {model_id}");
-                println!("worker: local in-process ($0, no tokens, no quota)");
-                println!("active: true");
-                println!("consent_recorded: {}", connection.consent_recorded);
-                return 0;
-            }
-            print_json(&json!({
-                "ok": true,
-                "connection": connection.name,
-                "model": model_id,
-                "active": true,
-                "local": true,
-                "spend_kind": "local in-process ($0)",
-                "consent_recorded": connection.consent_recorded,
-                "message": format!(
-                    "{model_id} is now the active understanding worker; it runs in-process at $0"
-                ),
-            }));
-            0
-        }
-        // Not cached / not a local model: the library error already names the fix
-        // (`run cg model fetch --defaults first`). Exit non-zero so scripts can branch.
-        Err(err) => failure(1, "local_model_unavailable", "config", &err),
-    }
-}
-
 fn handle_model_list(args: &[String]) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
@@ -6117,29 +5967,16 @@ fn handle_model_list(args: &[String]) -> i32 {
     }
     let models = catalog.list_models();
 
-    // The bundled local understanding tiers (e2b default + e4b escalation) are listed with
-    // cached/not-cached status and which one is the active worker, whether or not they are already
-    // registered as a connection model. Cached status comes from the on-disk catalog.
-    let active_model_id = catalog.active_model_id();
-    let disk_catalog = Catalog::open_with_scope_against_root(&root, CONNECTION_SCOPE).ok();
-    let understanding: Vec<(String, bool, bool)> = cg_catalog::understanding_model_ids()
-        .into_iter()
-        .map(|id| {
-            let cached = disk_catalog
-                .as_ref()
-                .is_some_and(|catalog| catalog.understanding_model_cached(id));
-            let active = active_model_id.as_deref() == Some(id);
-            (id.to_string(), cached, active)
-        })
-        .collect();
-
     if format == OutputFormat::Text {
         for model in &models {
+            // A persisted pre-removal GGUF selection (artifact set names a `.gguf`) is inert: the
+            // in-process runtime is gone, so it is never reported as connected.
             let connected = model
                 .connection_name
                 .as_deref()
                 .and_then(|name| catalog.read_connection(name))
-                .is_some();
+                .is_some()
+                && !local_artifacts_name_gguf(&model.artifact_filenames);
             let endpoint = model.hosted_endpoint.as_ref();
             println!(
                 "{}\t{:?}\tconnected={}\tconnection={}\tprovider={}\tmodel={}\tendpoint={}",
@@ -6158,22 +5995,17 @@ fn handle_model_list(args: &[String]) -> i32 {
                     .unwrap_or("")
             );
         }
-        for (id, cached, active) in &understanding {
-            let default = *id == cg_catalog::UNDERSTANDING_DEFAULT_ID;
-            println!(
-                "{id}\tunderstanding\tcached={cached}\tactive={active}\tdefault={default}\tworker=local in-process ($0)"
-            );
-        }
         return 0;
     }
-    let mut rows = models
+    let rows = models
         .iter()
         .map(|model| {
             let connected = model
                 .connection_name
                 .as_deref()
                 .and_then(|name| catalog.read_connection(name))
-                .is_some();
+                .is_some()
+                && !local_artifacts_name_gguf(&model.artifact_filenames);
             let endpoint = model.hosted_endpoint.as_ref();
             let provider_model = endpoint
                 .map(|endpoint| endpoint.provider_model.clone())
@@ -6189,32 +6021,6 @@ fn handle_model_list(args: &[String]) -> i32 {
             })
         })
         .collect::<Vec<_>>();
-    // Annotate an already-registered understanding row with cached/active/understanding, or append
-    // a fresh row for a tier that is not yet registered (e.g. an uncached e4b).
-    for (id, cached, active) in &understanding {
-        let default = *id == cg_catalog::UNDERSTANDING_DEFAULT_ID;
-        if let Some(existing) = rows
-            .iter_mut()
-            .find(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
-            && let Some(object) = existing.as_object_mut()
-        {
-            object.insert("understanding".to_string(), json!(true));
-            object.insert("cached".to_string(), json!(cached));
-            object.insert("active".to_string(), json!(active));
-            object.insert("default".to_string(), json!(default));
-        } else {
-            rows.push(json!({
-                "id": id,
-                "kind": "LlmClient",
-                "understanding": true,
-                "cached": cached,
-                "active": active,
-                "default": default,
-                "connected": active,
-                "worker": "local in-process ($0)",
-            }));
-        }
-    }
     print_json(&json!(rows));
     0
 }
@@ -6441,23 +6247,30 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     let endpoint = model
         .as_ref()
         .and_then(|model| model.hosted_endpoint.as_ref());
-    // A local model (a fetched GGUF with a cache_path) runs fully in-process — no hosted endpoint
-    // and no host tool. Render it as a $0 in-process worker, not a missing host tool.
+    // A registered local model carries a cache_path and no hosted endpoint. A persisted pre-removal
+    // GGUF selection (its artifact set names a `.gguf`) is inert — the in-process runtime is gone —
+    // so it is never rendered as ready/active; a kept non-GGUF local registration renders neutrally.
+    let is_stale_local_gguf = model.as_ref().is_some_and(|model| {
+        model.cache_path.is_some() && local_artifacts_name_gguf(&model.artifact_filenames)
+    });
     let local_model_id = model
         .as_ref()
-        .filter(|model| model.cache_path.is_some())
+        .filter(|model| model.cache_path.is_some() && !is_stale_local_gguf)
         .map(|model| model.id.clone());
     let is_local = local_model_id.is_some();
     let (fallback_provider, account) = provider_account(&connection);
     let provider = endpoint
         .map(|endpoint| endpoint.provider.clone())
         .unwrap_or(fallback_provider);
-    let tool_condition =
-        if endpoint.is_none() && !is_local && !provider_tool_available(&root, &provider) {
-            json!("host_tool_missing")
-        } else {
-            Value::Null
-        };
+    let tool_condition = if endpoint.is_none()
+        && !is_local
+        && !is_stale_local_gguf
+        && !provider_tool_available(&root, &provider)
+    {
+        json!("host_tool_missing")
+    } else {
+        Value::Null
+    };
     let consent_status_error = if effective_surface == StatusSurface::ModelByok
         && endpoint.is_some()
         && !connection.consent_recorded
@@ -6472,7 +6285,9 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     };
     let last_error =
         consent_status_error.or_else(|| catalog.last_error_for_connection(&connection.name));
-    let state = if last_error.is_some() {
+    let state = if is_stale_local_gguf {
+        "not_connected"
+    } else if last_error.is_some() {
         "degraded"
     } else {
         "ready"
@@ -6483,7 +6298,9 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
         connection.spend_owner.clone()
     };
     let spend_kind = if is_local {
-        LOCAL_SPEND_KIND
+        LOCAL_MODEL_SPEND_KIND
+    } else if is_stale_local_gguf {
+        "unavailable"
     } else if endpoint.is_some() {
         BYOK_HTTP_SPEND_KIND
     } else {
@@ -6511,7 +6328,11 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
             println!("endpoint: {}", endpoint.base_url);
         } else if let Some(local_model_id) = &local_model_id {
             println!("model: {local_model_id}");
-            println!("worker: {LOCAL_SPEND_KIND}");
+            println!("worker: {LOCAL_MODEL_SPEND_KIND}");
+        } else if is_stale_local_gguf {
+            println!(
+                "worker: unavailable — the bundled local understanding runtime was removed; run `cg model connect`"
+            );
         }
         println!("state: {state}");
         println!("degraded: {}", last_error.is_some());
@@ -6543,10 +6364,12 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     };
     let status_message = if tool_condition == json!("host_tool_missing") {
         "host_tool_missing: provider tool is gone"
+    } else if is_stale_local_gguf {
+        "the bundled local understanding model was removed; run `cg model connect` to connect a hosted model"
     } else if degraded {
         "last selftest failed"
     } else if is_local {
-        "local model active; understanding runs in-process at $0 (no tokens, no quota)"
+        "local model registered"
     } else if connection_works {
         "live proof passed; automatic capture is ready"
     } else {
@@ -6568,7 +6391,7 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
         "bucket": bucket,
         "degraded": degraded,
         "last_error": last_error.clone(),
-        "connection_active": true,
+        "connection_active": !is_stale_local_gguf,
         "connection_name": connection.name,
         "spend_owner": spend_owner,
         "store_path": root.display().to_string(),
@@ -6768,7 +6591,7 @@ fn handle_model_auth_login(args: &[String]) -> i32 {
         _ => {
             print_json(&json!({
                 "candidates": candidate_envelope(&candidates),
-                "message": "Available host-session candidate found. Run cg model auth login --connection <provider> --consent to connect; local model remains available before env-var key setup.",
+                "message": "Available host-session candidate found. Run cg model auth login --connection <provider> --consent to connect, or cg model connect for a hosted BYOK endpoint.",
             }));
             0
         }
@@ -6892,10 +6715,6 @@ fn candidate_envelope(candidates: &[Candidate]) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
-    out.push(json!({
-        "kind": "local model",
-        "label": "local model",
-    }));
     out.push(json!({
         "kind": "env-var key",
         "label": "env-var key",
@@ -7646,7 +7465,7 @@ fn no_host_session_failure() -> i32 {
         4,
         "no_host_session",
         "auth",
-        "No drivable host session was found. Use a local model first; env-var key setup is a later fallback.",
+        "No drivable host session was found. Connect a hosted model with cg model connect (or cg model auth login).",
     )
 }
 
@@ -7675,7 +7494,7 @@ fn no_host_session_failure_with_reason(provider: &str, reason: &str) -> i32 {
         "no_host_session",
         "auth",
         &format!(
-            "No drivable host session was found for {provider}: {reason}. Use a local model first; env-var key setup is a later fallback."
+            "No drivable host session was found for {provider}: {reason}. Connect a hosted model with cg model connect (or cg model auth login)."
         ),
     )
 }

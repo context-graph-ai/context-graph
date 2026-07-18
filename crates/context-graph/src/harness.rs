@@ -322,8 +322,8 @@ exhaustively; leave every other category out."
 
     /// The ONE production prompt assembly: framing, tuned recipe, schema block,
     /// caps, and shape guidance, rendered from this config. cg-cli and the bench both call THIS,
-    /// so they cannot drift. The tuned rules are the gap-report recipe that probe 2 proved
-    /// recovers entities (0 → 15–16/chunk at $0), plus the decision→goal attachment instruction
+    /// so they cannot drift. The tuned rules are the extraction recipe that probe 2 proved
+    /// recovers entities (0 → 15–16/chunk), plus the decision→goal attachment instruction
     /// (the primary observed trunk failure), now production behavior instead of harness-only.
     pub fn render_extraction_prompt(&self, inputs: &ExtractionPromptInputs<'_>) -> String {
         let descriptor = self
