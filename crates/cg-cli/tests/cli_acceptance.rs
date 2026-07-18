@@ -1842,7 +1842,7 @@ fn selftest_persists_nothing_the_model_said() {
 }
 
 #[test]
-fn no_host_session_message_leads_local_model_then_env_key_never_key_headline() {
+fn no_host_session_message_guides_to_model_connect() {
     let harness = CliHarness::new();
     let connect = harness.run(&["model", "auth", "login"]);
     assert_eq!(connect.code, 4);
@@ -1851,11 +1851,20 @@ fn no_host_session_message_leads_local_model_then_env_key_never_key_headline() {
     assert_eq!(selftest.code, 4);
     assert_condition(&selftest, "no_host_session");
     for output in [connect, selftest] {
-        let local = output.stdout.find("local model");
-        let env = output.stdout.find("env-var key");
         assert!(
-            matches!((local, env), (Some(local), Some(env)) if local < env),
-            "local-model alternative must lead env-var key"
+            !output.stdout.to_lowercase().contains("local model"),
+            "no-host-session guidance must not recommend the removed local-model path: {}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("model use"),
+            "no-host-session guidance must not recommend `cg model use`: {}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("cg model connect"),
+            "no-host-session guidance must point at hosted `cg model connect`: {}",
+            output.stdout
         );
         let first_line = output.stdout.lines().next().unwrap_or_default();
         assert!(

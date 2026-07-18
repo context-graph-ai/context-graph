@@ -91,9 +91,9 @@ fn worker_refuses_when_hub_endpoint_missing_naming_the_key() {
 }
 
 #[test]
-fn worker_refuses_without_a_model_pointing_at_cg_model_use() {
+fn worker_refuses_without_a_model_with_actionable_connect_guidance() {
     let harness = CliHarness::new();
-    // A complete fabric, but no connected/local model: the worker can execute nothing.
+    // A complete fabric, but no connected model: the worker can execute nothing.
     write_fabric(
         &harness,
         "[fabric]\nhub_endpoint = \"enrollment-ticket\"\ntenant = \"tenant-alpha\"\n",
@@ -107,8 +107,12 @@ fn worker_refuses_without_a_model_pointing_at_cg_model_use() {
     );
     let text = combined(&output);
     assert!(
-        text.contains("cg model use"),
-        "the refusal names the exact fix action: {text}"
+        text.contains("cg model connect"),
+        "the refusal names the hosted-connect fix action: {text}"
+    );
+    assert!(
+        !text.contains("cg model use"),
+        "the refusal must not point at the removed local-model path: {text}"
     );
     assert!(
         text.contains("notconnected"),
