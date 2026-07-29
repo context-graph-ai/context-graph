@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use context_graph::ListEntityFilter;
-use context_graph::capture_sync_status::context_graph_sync_table_contract;
 use context_graph::embedder::mock::LexicalMockEmbedder;
 use context_graph::ingest::memory_counts;
 use context_graph::tier0::{
@@ -20,7 +19,6 @@ use context_graph::{
     CgError, ContextId, Embedder, EmbedderRegistration, EmbeddingInput, EmbeddingOutput, Result,
     Store, StoreConfig,
 };
-use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
 
 use super::fake_extractor::open_store_with_lexical_embedder;
 
@@ -422,13 +420,7 @@ fn queue_rows_survive_reopen() {
 
 #[test]
 fn sync_contract_registers_new_tables() {
-    let contract = context_graph_sync_table_contract();
-    let policy = |table: &str| -> Option<(SyncDirection, ConflictPolicy)> {
-        contract
-            .iter()
-            .find(|policy| policy.table == table)
-            .map(|policy| (policy.direction, policy.conflict_policy))
-    };
+    let (_dir, store) = fresh_store();
     // Raw and per-device runtime state never leave the machine. The private understanding queue is
     // retired at schema v10 (the work ledger's computed job state subsumes it).
     for table in [
@@ -436,18 +428,41 @@ fn sync_contract_registers_new_tables() {
         "cg_retrieval_touches",
         "cg_local_settings",
     ] {
+        let meta = store
+            .sync_database()
+            .table_meta(table)
+            .unwrap_or_else(|| panic!("{table} must be installed"));
         assert_eq!(
-            policy(table),
-            Some((SyncDirection::None, ConflictPolicy::InsertIfNotExists)),
-            "{table} must be local-only (SyncDirection::None)"
+            meta.sync_direction.map(|direction| direction.sql()),
+            Some("SYNC OFF"),
+            "{table} must declare local-only sync behavior"
+        );
+        assert_eq!(
+            meta.conflict_policy
+                .and_then(|policy| policy.declared_clause()),
+            None,
+            "{table} is SYNC OFF and must not declare a conflict policy"
         );
     }
     // The understanding-completion marker is a LOCAL write-once apply guard (this node already
     // applied a result onto its digest); the structured graph rows are what sync, not the guard.
+    let completion_meta = store
+        .sync_database()
+        .table_meta("cg_understanding_completions")
+        .expect("cg_understanding_completions must be installed");
     assert_eq!(
-        policy("cg_understanding_completions"),
-        Some((SyncDirection::None, ConflictPolicy::InsertIfNotExists)),
-        "cg_understanding_completions is a local apply marker (None, InsertIfNotExists)"
+        completion_meta
+            .sync_direction
+            .map(|direction| direction.sql()),
+        Some("SYNC OFF"),
+        "cg_understanding_completions is a local apply marker"
+    );
+    assert_eq!(
+        completion_meta
+            .conflict_policy
+            .and_then(|policy| policy.declared_clause()),
+        None,
+        "cg_understanding_completions is SYNC OFF and must not declare a conflict policy"
     );
 }
 

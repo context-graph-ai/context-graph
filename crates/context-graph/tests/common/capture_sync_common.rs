@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
@@ -10,20 +10,18 @@ use context_graph::ingest::{
 };
 use context_graph::schema::{DIGEST_VECTOR_DIMENSION, TABLES};
 use context_graph::{
-    CapturePricing, ContextGraphSyncRegistration, ContextGraphSyncTablePolicy, ContextId,
-    CreateContext, CreateDecision, CreateDigest, CreateEntity, CreateIntention, Decision,
-    DecisionId, DecisionStatus, DigestId, EmbeddingId, EmbeddingTarget, EnforcementLevel, EntityId,
-    EntitySnapshotId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef,
-    HostedProviderBoundary, HostedProviderReply, Intention, IntentionOrigin, IntentionPatch,
-    IntentionStatus, ModelCallOutcome, ModelCallUsage, ObservationId, Outcome,
-    PrecomputedEmbedding, ProgressKind, ProviderUsage, RecordObservation, Store, StoreConfig,
-    SyncStatusBoundary, TxId, UsageReportState, context_graph_pending_push_change_count,
-    context_graph_sync_conflict_policies, context_graph_sync_table_contract,
-    provider_usage_from_str, register_context_graph_sync_client,
+    CapturePricing, ContextId, CreateContext, CreateDecision, CreateDigest, CreateEntity,
+    CreateIntention, Decision, DecisionId, DecisionStatus, DigestId, EmbeddingId, EmbeddingTarget,
+    EnforcementLevel, EntityId, EntitySnapshotId, EntityType, EvidenceId, EvidenceKind,
+    EvidenceProducer, EvidenceRef, HostedProviderBoundary, HostedProviderReply, Intention,
+    IntentionOrigin, IntentionPatch, IntentionStatus, ModelCallOutcome, ModelCallUsage,
+    ObservationId, Outcome, PrecomputedEmbedding, ProgressKind, ProviderUsage, RecordObservation,
+    Store, StoreConfig, SyncStatusBoundary, TxId, UsageReportState,
+    context_graph_pending_push_change_count, provider_usage_from_str,
 };
 use contextdb_core::{Lsn, TenantId, Value as DbValue};
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::transport::iroh::IrohServer;
+use contextdb_server::{SyncClient, SyncServer};
 use tempfile::TempDir;
 
 use crate::fake_extractor::{LabeledTranscriptExtractor, open_store_with_lexical_embedder};
@@ -265,6 +263,147 @@ pub struct TestStore {
     pub store: Store,
 }
 
+pub struct TicketedMemoryNode {
+    pub store: Store,
+    pub client: SyncClient,
+}
+
+pub struct TicketedMemoryFixture {
+    _root: TempDir,
+    hub: Store,
+    ticket: String,
+    tenant_id: String,
+    shutdown: Arc<AtomicBool>,
+    server_task: tokio::task::JoinHandle<()>,
+}
+
+impl TicketedMemoryFixture {
+    pub fn hub_store(&self) -> &Store {
+        &self.hub
+    }
+
+    pub fn open_edge(&self, name: &str) -> TicketedMemoryNode {
+        let db_path = self._root.path().join(format!("{name}.db"));
+        let store = open_store_with_lexical_embedder(StoreConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
+        });
+        let dial_spec = contextdb_server::peer_dial_spec(
+            &self.ticket,
+            &db_path.with_extension("fabric-identity.key"),
+        );
+        let client = SyncClient::new(
+            store.sync_database(),
+            &dial_spec,
+            TenantId::from(&self.tenant_id),
+        );
+        TicketedMemoryNode { store, client }
+    }
+
+    pub async fn shutdown(self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        within(self.server_task)
+            .await
+            .expect("ticketed hub task stops within the test bound");
+    }
+}
+
+pub async fn ticketed_memory_fixture(test_name: &str) -> TicketedMemoryFixture {
+    let root = tempfile::tempdir().expect("ticketed fixture tempdir");
+    let tenant_id = format!("tenant_{test_name}");
+    let hub = open_store_with_lexical_embedder(StoreConfig {
+        db_path: root.path().join("hub.db"),
+        ..Default::default()
+    });
+    let endpoint = within(IrohServer::bind(&format!(
+        "iroh:?identity={}",
+        root.path().join("hub.fabric-identity.key").display()
+    )))
+    .await
+    .expect("bind ticketed Iroh hub");
+    let ticket = endpoint.ticket();
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+        hub.sync_database(),
+        endpoint.transport(),
+        TenantId::from(&tenant_id),
+    ));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_task = tokio::spawn({
+        let server = Arc::clone(&server);
+        let shutdown = Arc::clone(&shutdown);
+        async move { server.run_until(shutdown).await }
+    });
+    TicketedMemoryFixture {
+        _root: root,
+        hub,
+        ticket,
+        tenant_id,
+        shutdown,
+        server_task,
+    }
+}
+
+pub async fn within<F: std::future::Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(30), future)
+        .await
+        .expect("bounded authenticated sync operation")
+}
+
+pub async fn drain_ticketed_push(client: &SyncClient) {
+    for _ in 0..32 {
+        if !client
+            .has_pending_push_changes()
+            .expect("ticketed pending push check")
+        {
+            return;
+        }
+        let before = client.push_watermark();
+        within(client.push()).await.expect("ticketed push round");
+        if !client
+            .has_pending_push_changes()
+            .expect("ticketed pending push check")
+        {
+            return;
+        }
+        assert!(
+            client.push_watermark() > before,
+            "ticketed push drain must advance while work remains"
+        );
+    }
+    panic!("ticketed push did not drain within 32 rounds");
+}
+
+pub async fn drain_ticketed_pull(client: &SyncClient) {
+    for _ in 0..32 {
+        let before = client.pull_watermark();
+        within(client.pull_default())
+            .await
+            .expect("ticketed pull round");
+        if client.pull_watermark() == before {
+            return;
+        }
+    }
+    panic!("ticketed pull did not drain within 32 rounds");
+}
+
+pub async fn unavailable_authenticated_client(
+    db: Arc<contextdb_engine::Database>,
+    tenant_id: &str,
+    real_hub_ticket: &str,
+    edge_db_path: &Path,
+) -> SyncClient {
+    let full: iroh_tickets::endpoint::EndpointTicket =
+        real_hub_ticket.parse().expect("fixture hub ticket parses");
+    let blackhole_addr = iroh::EndpointAddr::new(full.endpoint_addr().id)
+        .with_ip_addr("240.0.0.1:38321".parse().expect("black-hole socket addr"));
+    let blackhole_ticket = iroh_tickets::endpoint::EndpointTicket::new(blackhole_addr).to_string();
+    let dial_spec = contextdb_server::peer_dial_spec(
+        &blackhole_ticket,
+        &edge_db_path.with_extension("fabric-identity.key"),
+    );
+    SyncClient::new(db, &dial_spec, TenantId::from(tenant_id))
+}
+
 impl TestStore {
     pub fn new(label: &str) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -292,6 +431,10 @@ impl TestStore {
             contexts.into_iter().collect::<BTreeSet<_>>(),
         )
         .expect("open scoped store")
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 }
 
@@ -728,7 +871,6 @@ impl SeededGraph {
 }
 
 pub struct RealSyncFixture {
-    _broker: InProcessBroker,
     _hub: TestStore,
     pub edge1: TestStore,
     pub edge2: TestStore,
@@ -737,11 +879,10 @@ pub struct RealSyncFixture {
     shutdown: Arc<AtomicBool>,
     _server_task: tokio::task::JoinHandle<()>,
     pub tenant_id: String,
-    pub nats_url: String,
+    pub remote_url: String,
 }
 
 pub struct SelfEchoSyncFixture {
-    _broker: InProcessBroker,
     pub node: TestStore,
     pub client: SyncClient,
     shutdown: Arc<AtomicBool>,
@@ -749,10 +890,10 @@ pub struct SelfEchoSyncFixture {
 }
 
 pub struct PreClientSyncFixture {
-    _broker: InProcessBroker,
     _hub: TestStore,
     pub edge1: TestStore,
     pub edge2: TestStore,
+    ticket: String,
     shutdown: Arc<AtomicBool>,
     _server_task: tokio::task::JoinHandle<()>,
     pub tenant_id: String,
@@ -760,18 +901,24 @@ pub struct PreClientSyncFixture {
 
 impl PreClientSyncFixture {
     pub fn connect(&self) -> (SyncClient, SyncClient) {
-        let edge1_client = SyncClient::with_transport(
+        let edge1_dial_spec = contextdb_server::peer_dial_spec(
+            &self.ticket,
+            &self.edge1.db_path.with_extension("fabric-identity.key"),
+        );
+        let edge1_client = SyncClient::new(
             self.edge1.store.sync_database(),
-            self._broker.client(),
+            &edge1_dial_spec,
             TenantId::from(&self.tenant_id),
         );
-        let edge2_client = SyncClient::with_transport(
+        let edge2_dial_spec = contextdb_server::peer_dial_spec(
+            &self.ticket,
+            &self.edge2.db_path.with_extension("fabric-identity.key"),
+        );
+        let edge2_client = SyncClient::new(
             self.edge2.store.sync_database(),
-            self._broker.client(),
+            &edge2_dial_spec,
             TenantId::from(&self.tenant_id),
         );
-        register_cg_sync_tables(&edge1_client);
-        register_cg_sync_tables(&edge2_client);
         (edge1_client, edge2_client)
     }
 }
@@ -799,27 +946,31 @@ impl RealSyncFixture {
         &self._hub.store
     }
 
-    /// Mint an additional edge client on the SAME in-process hub as this fixture (registered with
-    /// the cg sync tables) — for tests that stand up a wiped/scoped replacement edge.
-    pub fn new_edge_client(&self, db: std::sync::Arc<contextdb_engine::Database>) -> SyncClient {
-        let client =
-            SyncClient::with_transport(db, self._broker.client(), TenantId::from(&self.tenant_id));
-        register_cg_sync_tables(&client);
-        client
+    /// Mint an additional persisted-identity edge client on this ticketed hub.
+    pub fn new_edge_client(
+        &self,
+        db: std::sync::Arc<contextdb_engine::Database>,
+        identity_path: &Path,
+    ) -> SyncClient {
+        let dial_spec = contextdb_server::peer_dial_spec(&self.remote_url, identity_path);
+        SyncClient::new(db, &dial_spec, TenantId::from(&self.tenant_id))
     }
 }
 
 pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
-    let broker = InProcessBroker::new();
     let tenant_id = format!("tenant_{test_name}");
     let hub = TestStore::new(&format!("{test_name}_hub"));
-    let hub_db = hub.store.sync_database();
-    let policies = cg_conflict_policies();
-    let server = Arc::new(SyncServer::with_transport(
-        Arc::clone(&hub_db),
-        broker.server(),
+    let endpoint = within(IrohServer::bind(&format!(
+        "iroh:?identity={}",
+        hub.db_path.with_extension("fabric-identity.key").display()
+    )))
+    .await
+    .expect("bind authenticated fixture hub");
+    let remote_url = endpoint.ticket();
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+        hub.store.sync_database(),
+        endpoint.transport(),
         TenantId::from(&tenant_id),
-        policies.clone(),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
@@ -832,20 +983,25 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
 
     let edge1 = TestStore::new(&format!("{test_name}_edge1"));
     let edge2 = TestStore::new(&format!("{test_name}_edge2"));
-    let edge1_client = SyncClient::with_transport(
+    let edge1_dial_spec = contextdb_server::peer_dial_spec(
+        &remote_url,
+        &edge1.db_path.with_extension("fabric-identity.key"),
+    );
+    let edge1_client = SyncClient::new(
         edge1.store.sync_database(),
-        broker.client(),
+        &edge1_dial_spec,
         TenantId::from(&tenant_id),
     );
-    let edge2_client = SyncClient::with_transport(
+    let edge2_dial_spec = contextdb_server::peer_dial_spec(
+        &remote_url,
+        &edge2.db_path.with_extension("fabric-identity.key"),
+    );
+    let edge2_client = SyncClient::new(
         edge2.store.sync_database(),
-        broker.client(),
+        &edge2_dial_spec,
         TenantId::from(&tenant_id),
     );
-    register_cg_sync_tables(&edge1_client);
-    register_cg_sync_tables(&edge2_client);
     RealSyncFixture {
-        _broker: broker,
         _hub: hub,
         edge1,
         edge2,
@@ -854,21 +1010,25 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
         shutdown,
         _server_task: server_task,
         tenant_id,
-        nats_url: "in-process".to_string(),
+        remote_url,
     }
 }
 
 pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
-    let broker = InProcessBroker::new();
     let tenant_id = format!("tenant_{test_name}");
     let node = TestStore::new(&format!("{test_name}_node"));
     let shared_db = node.store.sync_database();
-    let policies = cg_conflict_policies();
-    let server = Arc::new(SyncServer::with_transport(
+    let endpoint = within(IrohServer::bind(&format!(
+        "iroh:?identity={}",
+        node.db_path.with_extension("fabric-identity.key").display()
+    )))
+    .await
+    .expect("bind authenticated self-echo hub");
+    let ticket = endpoint.ticket();
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
         Arc::clone(&shared_db),
-        broker.server(),
+        endpoint.transport(),
         TenantId::from(&tenant_id),
-        policies,
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
@@ -878,14 +1038,16 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
             server.run_until(shutdown).await;
         })
     };
-    let client = SyncClient::with_transport(
+    let dial_spec = contextdb_server::peer_dial_spec(
+        &ticket,
+        &node.db_path.with_extension("fabric-identity.key"),
+    );
+    let client = SyncClient::new(
         node.store.sync_database(),
-        broker.client(),
+        &dial_spec,
         TenantId::from(&tenant_id),
     );
-    register_cg_sync_tables(&client);
     SelfEchoSyncFixture {
-        _broker: broker,
         node,
         client,
         shutdown,
@@ -894,16 +1056,19 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
 }
 
 pub async fn pre_client_sync_fixture(test_name: &str) -> PreClientSyncFixture {
-    let broker = InProcessBroker::new();
     let tenant_id = format!("tenant_{test_name}");
     let hub = TestStore::new(&format!("{test_name}_hub"));
-    let hub_db = hub.store.sync_database();
-    let policies = cg_conflict_policies();
-    let server = Arc::new(SyncServer::with_transport(
-        Arc::clone(&hub_db),
-        broker.server(),
+    let endpoint = within(IrohServer::bind(&format!(
+        "iroh:?identity={}",
+        hub.db_path.with_extension("fabric-identity.key").display()
+    )))
+    .await
+    .expect("bind pre-client authenticated hub");
+    let ticket = endpoint.ticket();
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+        hub.store.sync_database(),
+        endpoint.transport(),
         TenantId::from(&tenant_id),
-        policies.clone(),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
@@ -916,38 +1081,14 @@ pub async fn pre_client_sync_fixture(test_name: &str) -> PreClientSyncFixture {
     let edge1 = TestStore::new(&format!("{test_name}_edge1"));
     let edge2 = TestStore::new(&format!("{test_name}_edge2"));
     PreClientSyncFixture {
-        _broker: broker,
         _hub: hub,
         edge1,
         edge2,
+        ticket,
         shutdown,
         _server_task: server_task,
         tenant_id,
     }
-}
-
-pub fn cg_conflict_policies() -> ConflictPolicies {
-    context_graph_sync_conflict_policies()
-}
-
-struct TestSyncClientRegistration<'a>(&'a SyncClient);
-
-impl ContextGraphSyncRegistration for TestSyncClientRegistration<'_> {
-    fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
-        self.0.set_default_conflict_policy(policy);
-    }
-
-    fn set_table_direction(&self, table: &str, direction: SyncDirection) {
-        self.0.set_table_direction(table, direction);
-    }
-
-    fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
-        self.0.set_conflict_policy(table, policy);
-    }
-}
-
-pub fn register_cg_sync_tables(client: &SyncClient) {
-    register_context_graph_sync_client(&TestSyncClientRegistration(client));
 }
 
 pub fn expected_pending_push_change_count(client: &SyncClient) -> usize {
@@ -960,16 +1101,12 @@ pub async fn push_pull(edge1: &SyncClient, edge2: &SyncClient) {
 }
 
 pub async fn bootstrap_sync_schema_without_rows(fixture: &RealSyncFixture) {
-    fixture
-        .edge1_client
-        .push()
+    within(fixture.edge1_client.push())
         .await
         .expect("edge1 pushes schema watermark");
     for _ in 0..32 {
         let before = fixture.edge2_client.pull_watermark();
-        fixture
-            .edge2_client
-            .pull(&cg_conflict_policies())
+        within(fixture.edge2_client.pull_default())
             .await
             .expect("edge2 admin handle pulls schema watermark");
         if fixture.edge2_client.pull_watermark() == before {
@@ -998,7 +1135,7 @@ pub async fn drain_push(client: &SyncClient) {
             return;
         }
         let before = client.push_watermark();
-        client.push().await.expect("push sync round");
+        within(client.push()).await.expect("push sync round");
         if !client
             .has_pending_push_changes()
             .expect("pending push check")
@@ -1016,8 +1153,7 @@ pub async fn drain_push(client: &SyncClient) {
 pub async fn drain_pull(client: &SyncClient) {
     for _ in 0..32 {
         let before = client.pull_watermark();
-        client
-            .pull(&cg_conflict_policies())
+        within(client.pull_default())
             .await
             .expect("pull sync round");
         if client.pull_watermark() == before {
@@ -1043,80 +1179,46 @@ pub fn assert_decision_status_active(store: &Store, decision_id: DecisionId) {
 }
 
 pub fn assert_sync_contract_has_real_table_policies() {
-    let contract = context_graph_sync_table_contract();
-    assert!(
-        !contract.is_empty(),
-        "production sync table contract must enumerate cg tables"
-    );
-    let expected_tables = TABLES
-        .iter()
-        .map(|table| table.name)
-        .collect::<BTreeSet<_>>();
-    let mut actual_tables = BTreeSet::new();
-    let mut duplicate_tables = Vec::new();
-    for policy in &contract {
-        if !actual_tables.insert(policy.table) {
-            duplicate_tables.push(policy.table);
-        }
-    }
-    assert!(
-        duplicate_tables.is_empty(),
-        "sync table contract must not duplicate policies for tables: {duplicate_tables:?}"
-    );
-    let missing_tables = expected_tables
-        .difference(&actual_tables)
-        .copied()
-        .collect::<Vec<_>>();
-    assert!(
-        missing_tables.is_empty(),
-        "sync table contract missing explicit policies for cg tables: {missing_tables:?}"
-    );
-    let extra_tables = actual_tables
-        .difference(&expected_tables)
-        .copied()
-        .collect::<Vec<_>>();
-    assert!(
-        extra_tables.is_empty(),
-        "sync table contract names tables outside context_graph::schema::TABLES: {extra_tables:?}"
-    );
-    assert_eq!(
-        contract.len(),
-        TABLES.len(),
-        "sync table contract must cover every cg schema table exactly once"
-    );
     let expected = expected_sync_table_policies();
     assert_eq!(
         expected.len(),
         TABLES.len(),
         "test expectation must classify every cg schema table"
     );
-    for table in expected_tables {
-        let (direction, conflict_policy) = expected
-            .get(table)
-            .copied()
-            .unwrap_or_else(|| panic!("test expectation missing policy for {table}"));
-        assert_policy(&contract, table, direction, conflict_policy);
-    }
-    let runtime_policies = context_graph_sync_conflict_policies();
-    for table in ["cg_changed_cursors", "cg_runtime_models"] {
-        assert_eq!(
-            runtime_policies.per_table.get(table),
-            Some(&ConflictPolicy::InsertIfNotExists),
-            "{table} must be registered as local-only runtime state"
+    for table in TABLES {
+        let (expected_direction, expected_conflict) = expected
+            .get(table.name)
+            .unwrap_or_else(|| panic!("test expectation missing policy for {}", table.name));
+        assert!(
+            table.ddl.contains(expected_direction),
+            "{} must declare `{expected_direction}` in its own DDL",
+            table.name
         );
+        match expected_conflict {
+            Some(expected_conflict) => assert!(
+                table.ddl.contains(expected_conflict),
+                "{} must declare `{expected_conflict}` in its own DDL",
+                table.name
+            ),
+            None => assert!(
+                !table.ddl.contains("SYNC CONFLICT"),
+                "{} is SYNC OFF and must not declare a conflict policy",
+                table.name
+            ),
+        }
     }
 }
 
-fn expected_sync_table_policies() -> BTreeMap<&'static str, (SyncDirection, ConflictPolicy)> {
-    let write_once = (SyncDirection::Both, ConflictPolicy::InsertIfNotExists);
-    let hub_arbitrated = (SyncDirection::Both, ConflictPolicy::ServerWins);
-    let local_only = (SyncDirection::None, ConflictPolicy::InsertIfNotExists);
+fn expected_sync_table_policies() -> BTreeMap<&'static str, (&'static str, Option<&'static str>)> {
+    let write_once = ("SYNC TWO WAY", Some("SYNC CONFLICT KEEP FIRST"));
+    let keep_latest = ("SYNC TWO WAY", Some("SYNC CONFLICT KEEP LATEST"));
+    let local_only = ("SYNC OFF", None);
     BTreeMap::from([
         ("cg_schema_version", write_once),
         ("contexts", write_once),
-        ("intentions", hub_arbitrated),
-        ("decisions", hub_arbitrated),
-        ("entities", hub_arbitrated),
+        ("intentions", keep_latest),
+        ("decisions", keep_latest),
+        ("entities", keep_latest),
         ("observations", write_once),
         ("evidence", write_once),
         ("embedding_spaces", write_once),
@@ -1127,10 +1229,10 @@ fn expected_sync_table_policies() -> BTreeMap<&'static str, (SyncDirection, Conf
         ("entity_reference_embeddings_256", write_once),
         ("entity_reference_embeddings_512", write_once),
         ("entity_reference_embeddings_768", write_once),
-        ("reindex_cursors", hub_arbitrated),
+        ("reindex_cursors", keep_latest),
         ("evidence_availability_log", write_once),
-        ("outcomes", hub_arbitrated),
-        ("invalidations", hub_arbitrated),
+        ("outcomes", keep_latest),
+        ("invalidations", keep_latest),
         ("signatures", write_once),
         ("signature_aggregates", write_once),
         ("signature_producer_lineage", write_once),
@@ -1141,55 +1243,25 @@ fn expected_sync_table_policies() -> BTreeMap<&'static str, (SyncDirection, Conf
         ("entity_snapshots", write_once),
         ("entity_snapshot_observations", write_once),
         ("decision_basis_snapshots", write_once),
-        ("entity_current_snapshots", hub_arbitrated),
+        ("entity_current_snapshots", keep_latest),
         ("entity_snapshot_links", write_once),
         ("intention_snapshots", write_once),
         ("approvals", write_once),
         ("audit_log", local_only),
         ("conflicts", write_once),
         ("precedent_matches", write_once),
-        // Skill-loop sync policies (implemented):
-        //   cg_learned_skills:    (Both, ServerWins)     — hub-arbitrated, syncs tenant-wide
-        //   cg_teaching_events:   (Both, InsertIfNotExists) — order-free set union, syncs tenant-wide
-        //   cg_skill_firing_trace: (None, InsertIfNotExists) — local-only per device
-        //   cg_review_cursor:     (None, InsertIfNotExists) — local-only per owner
-        ("cg_learned_skills", hub_arbitrated),
+        ("cg_learned_skills", keep_latest),
         ("cg_teaching_events", write_once),
         ("cg_skill_firing_trace", local_only),
         ("cg_review_cursor", local_only),
-        // Two-layer overlay corrections + compensation/reversal events are append-only rows that
-        // propagate tenant-wide so a reversal reaches every machine: (Both, InsertIfNotExists).
         ("cg_overlay_entries", write_once),
         ("cg_compensation_events", write_once),
-        // Pending review items are local-only per owner (never synced).
         ("cg_pending_review_items", local_only),
-        // Tier-0 capture tables (schema v10). Raw source chunks are the NDA line and never leave the
-        // device; retrieval touches and local settings are per-device runtime state — all
-        // (None, InsertIfNotExists). The private understanding queue is retired (the work ledger's
-        // computed job state subsumes it). The understanding completion is a write-once LOCAL apply
-        // marker (this node already applied a result onto its digest), so it stays machine-local
-        // (None, InsertIfNotExists) — the structured graph rows are what sync, not the apply guard.
         ("cg_source_chunks", local_only),
         ("cg_retrieval_touches", local_only),
         ("cg_local_settings", local_only),
         ("cg_understanding_completions", local_only),
     ])
-}
-
-fn assert_policy(
-    contract: &[ContextGraphSyncTablePolicy],
-    table: &str,
-    direction: SyncDirection,
-    conflict_policy: ConflictPolicy,
-) {
-    let actual = contract.iter().find(|policy| policy.table == table);
-    assert!(actual.is_some(), "sync table contract missing {table}");
-    let actual = actual.expect("policy was asserted present");
-    assert_eq!(actual.direction, direction, "{table} sync direction");
-    assert_eq!(
-        actual.conflict_policy, conflict_policy,
-        "{table} conflict policy"
-    );
 }
 
 pub fn assert_real_decision_content(store: &Store, id: DecisionId, expected_description: &str) {

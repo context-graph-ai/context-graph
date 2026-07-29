@@ -14,10 +14,11 @@
 use context_graph::fabric::{
     self, FabricCapture, FabricPollOutcome, FabricWorkerConfig, run_worker_poll,
 };
+use std::time::Duration;
 
 use crate::fabric_common::{
-    FabricFixture, FabricNode, cg_conflict_policies, context_id, fabric_fixture, tier0_request,
-    work_row_count,
+    FabricFixture, FabricNode, context_id, fabric_fixture, tier0_request,
+    unavailable_authenticated_client, work_row_count,
 };
 
 const SESSION: &str = "User: Goal G1: resume across machines. Assistant: Decision D1: keep the auth module at src/auth.py.";
@@ -33,20 +34,32 @@ async fn push_only(client: &contextdb_server::SyncClient) {
         {
             break;
         }
-        client.push().await.expect("push round");
+        tokio::time::timeout(Duration::from_secs(30), client.push())
+            .await
+            .expect("authenticated push stays bounded")
+            .expect("push round");
     }
+    assert!(
+        !client
+            .has_pending_push_changes()
+            .expect("pending push check"),
+        "push did not drain within 32 authenticated rounds"
+    );
 }
 
 /// Pull the hub onto one edge WITHOUT any worker involvement — the digest owner's own `cg sync pull`.
 async fn pull_only(client: &contextdb_server::SyncClient) {
-    let policies = cg_conflict_policies();
     for _ in 0..32 {
         let before = client.pull_watermark();
-        client.pull(&policies).await.expect("pull round");
+        tokio::time::timeout(Duration::from_secs(30), client.pull_default())
+            .await
+            .expect("authenticated pull stays bounded")
+            .expect("pull round");
         if client.pull_watermark() == before {
-            break;
+            return;
         }
     }
+    panic!("pull did not converge within 32 authenticated rounds");
 }
 
 #[tokio::test]
@@ -116,14 +129,9 @@ async fn remote_worker_pulls_the_job_then_pushes_the_result_without_a_fixture_pr
 
 #[tokio::test]
 async fn worker_poll_with_unreachable_hub_degrades_quietly_offline() {
-    // A genuinely hub-less node: a broker with NO server behind it, so every pull/push errors with
-    // NoResponder. The self-sufficient poll must swallow both hub round-trips (best-effort) and STILL
-    // claim + execute a locally-present job through the ledger's offline `Won { synced: false }`
-    // convention — the wrapper must never wedge or surface an error just because the hub is down. This
-    // is the offline single-node semantics the no-hub callers depend on, checked end to end.
-    use contextdb_core::TenantId;
-    use contextdb_server::{InProcessBroker, SyncClient};
-
+    // A genuinely hub-less persisted-identity node uses a valid authenticated ticket whose endpoint
+    // has gone away. The self-sufficient poll must treat both round trips as best-effort and still
+    // execute the locally present job through the offline claim convention.
     let node = FabricNode::open("offline_worker");
     fabric::capture(
         &node.store,
@@ -131,15 +139,9 @@ async fn worker_poll_with_unreachable_hub_degrades_quietly_offline() {
     )
     .expect("capture on the offline node");
 
-    // No SyncServer is stood up on this broker, so the client resolves no responder — every hub
-    // round-trip errors, exercising the offline path rather than a happy hub.
-    let broker = InProcessBroker::new();
-    let client = SyncClient::with_transport(
-        node.store.sync_database(),
-        broker.client(),
-        TenantId::from("tenant-alpha"),
-    );
-    crate::fabric_common::register_cg_sync_tables(&client);
+    let client =
+        unavailable_authenticated_client(node.store.sync_database(), "tenant-alpha", &node.db_path)
+            .await;
 
     let ext = crate::fabric_common::CountingExtractor::new();
     let config = FabricWorkerConfig::for_node("solo-worker");

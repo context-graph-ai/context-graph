@@ -15,15 +15,13 @@
 //   - cg_review_surfaces_three_single_edge_categories_currency_flips_structurally_empty: placeholder omits category
 //   - cg_review_summary_reports_true_per_category_counts: placeholder reports capped length
 
-use context_graph::capture_sync_status::context_graph_sync_table_contract;
 use context_graph::ingest::{CaptureRequest, record_conversation_with_extractor};
 use context_graph::review_surface::{
     MessageKind, ReviewCategory, ReviewCursor, ReviewItem, ReviewVerb, act_on_item,
     build_review_summary_with_currency_category, emit_capture_receipt, gather_review_summary,
 };
 use context_graph::skill_store::REVIEW_CURSOR_TABLE;
-use context_graph::{ContextGraphSyncTablePolicy, Store, StoreConfig};
-use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
+use context_graph::{Store, StoreConfig};
 
 use super::fake_extractor::open_store_with_lexical_embedder;
 use super::refactor_extractor::SpanFaithfulExtractor;
@@ -36,16 +34,6 @@ fn fresh_store(name: &str) -> (tempfile::TempDir, Store) {
         ..Default::default()
     });
     (dir, store)
-}
-
-fn find_policy(
-    contract: &[ContextGraphSyncTablePolicy],
-    table: &str,
-) -> Option<(SyncDirection, ConflictPolicy)> {
-    contract
-        .iter()
-        .find(|p| p.table == table)
-        .map(|p| (p.direction, p.conflict_policy))
 }
 
 fn make_review_item(id: &str, category: ReviewCategory) -> ReviewItem {
@@ -305,22 +293,23 @@ fn pending_item_persists_through_an_intervening_confident_capture() {
     );
 }
 
-// Test 9 (store-state / sync policy): placeholder cg_review_cursor policy is
-// (Both, InsertIfNotExists) — it would sync. Test fails on the SyncDirection::None assertion.
+// Test 9: the review cursor is local operational state.
 #[test]
 fn review_cursor_is_not_synced() {
-    let contract = context_graph_sync_table_contract();
-    let policy = find_policy(&contract, REVIEW_CURSOR_TABLE);
-
-    assert!(
-        policy.is_some(),
-        "cg_review_cursor must be registered in context_graph_sync_table_contract"
-    );
-
-    let (direction, _conflict_policy) = policy.unwrap();
+    let (_dir, store) = fresh_store("review_cursor_is_not_synced");
+    let meta = store
+        .sync_database()
+        .table_meta(REVIEW_CURSOR_TABLE)
+        .expect("cg_review_cursor must be installed");
     assert_eq!(
-        direction,
-        SyncDirection::None,
-        "cg_review_cursor must have SyncDirection::None (local only); wrong stub returns Both"
+        meta.sync_direction.map(|direction| direction.sql()),
+        Some("SYNC OFF"),
+        "cg_review_cursor must declare local-only behavior"
+    );
+    assert_eq!(
+        meta.conflict_policy
+            .and_then(|policy| policy.declared_clause()),
+        None,
+        "cg_review_cursor is SYNC OFF and must not declare a conflict policy"
     );
 }

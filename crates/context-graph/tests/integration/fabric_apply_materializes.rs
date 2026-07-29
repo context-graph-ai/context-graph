@@ -11,10 +11,10 @@
 use context_graph::fabric::{
     self, ApplyOutcome, FabricCapture, FabricPollOutcome, FabricWorkerConfig,
 };
+use std::time::Duration;
 
 use crate::fabric_common::{
-    CountingExtractor, FabricFixture, cg_conflict_policies, context_id, fabric_fixture,
-    memory_total, tier0_request,
+    CountingExtractor, FabricFixture, context_id, fabric_fixture, memory_total, tier0_request,
 };
 
 const SESSION: &str = "User: Goal G1: resume across machines. Assistant: Decision D1: keep the auth module at src/auth.py.";
@@ -28,20 +28,32 @@ async fn push_only(client: &contextdb_server::SyncClient) {
         {
             break;
         }
-        client.push().await.expect("push round");
+        tokio::time::timeout(Duration::from_secs(30), client.push())
+            .await
+            .expect("authenticated push stays bounded")
+            .expect("push round");
     }
+    assert!(
+        !client
+            .has_pending_push_changes()
+            .expect("pending push check"),
+        "push did not drain within 32 authenticated rounds"
+    );
 }
 
 /// Pull the hub onto one edge, no worker involvement — the digest owner's own `cg sync pull`.
 async fn pull_only(client: &contextdb_server::SyncClient) {
-    let policies = cg_conflict_policies();
     for _ in 0..32 {
         let before = client.pull_watermark();
-        client.pull(&policies).await.expect("pull round");
+        tokio::time::timeout(Duration::from_secs(30), client.pull_default())
+            .await
+            .expect("authenticated pull stays bounded")
+            .expect("pull round");
         if client.pull_watermark() == before {
-            break;
+            return;
         }
     }
+    panic!("pull did not converge within 32 authenticated rounds");
 }
 
 #[tokio::test]

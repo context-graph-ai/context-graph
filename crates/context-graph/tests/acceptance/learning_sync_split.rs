@@ -1,34 +1,31 @@
 // Sync split acceptance tests (6 tests).
 //
-// learned_skill_sync_table_policies_match_the_declared_contract is integration-style
-// (no Docker): calls context_graph_sync_table_contract() and asserts correct policies.
-// Placeholder policies in capture_sync_status.rs return (Both, InsertIfNotExists) for all four
-// skill tables, so the SyncDirection::None and ServerWins assertions fail.
-//
-// The remaining five tests use the real Docker/NATS TestStore fixture from
-// capture_sync_common, modeled on edge_sync_convergence.rs.
+// The store-state journeys use the same authenticated, ticketed Iroh path as production.
+// The declaration proof reads the installed table metadata, which is the one sync authority.
 
 use std::collections::HashMap;
 
-use context_graph::capture_sync_status::context_graph_sync_table_contract;
 use context_graph::skill_store::{
     FIRING_TRACE_TABLE, REVIEW_CURSOR_TABLE, SKILL_TABLE, SkillApplyStrategy, SkillEffectEnvelope,
     TEACHING_EVENT_TABLE,
 };
-use context_graph::{ContextGraphSyncTablePolicy, Store, TxId};
+use context_graph::{Store, TxId};
 use contextdb_core::Value as DbValue;
-use contextdb_engine::sync_types::{ConflictPolicy, SyncDirection};
 
-use super::capture_sync_common::{bidirectional_sync, push_pull, real_sync_fixture};
+use super::capture_sync_common::{TestStore, bidirectional_sync, push_pull, real_sync_fixture};
 
-fn find_policy(
-    contract: &[ContextGraphSyncTablePolicy],
-    table: &str,
-) -> Option<(SyncDirection, ConflictPolicy)> {
-    contract
-        .iter()
-        .find(|p| p.table == table)
-        .map(|p| (p.direction, p.conflict_policy))
+fn declared_sync_policy(store: &Store, table: &str) -> (Option<String>, Option<String>) {
+    let meta = store
+        .sync_database()
+        .table_meta(table)
+        .unwrap_or_else(|| panic!("{table} must be installed"));
+    (
+        meta.sync_direction
+            .map(|direction| direction.sql().to_string()),
+        meta.conflict_policy
+            .and_then(|policy| policy.declared_clause())
+            .map(str::to_string),
+    )
 }
 
 fn insert_skill(store: &Store, id: &str, description: &str, rule: &str, provenance: &str) {
@@ -139,7 +136,7 @@ fn skill_row_by_id(store: &Store, skill_id: &str) -> Option<HashMap<String, DbVa
     .map(|row| row.values)
 }
 
-// Test 1 (store-state, Docker/NATS): A skill promoted on edge1 must be visible on edge2
+// Test 1: a skill promoted on edge1 must be visible on edge2
 // (both in the raw row AND via list_skills_in_store) after a push/pull. The placeholder
 // list_skills_in_store returns empty, so the listing assertion fails even though the sync
 // engine propagates the row correctly.
@@ -248,7 +245,7 @@ async fn skills_sync_tenant_wide_hub_arbitrated() {
     );
 }
 
-// Test 2 (store-state, Docker/NATS): Teaching events from both edges must converge to the
+// Test 2: teaching events from both edges must converge to the
 // full union and be visible via list_teaching_events_in_store (which reads the persisted
 // table, not a HashMap). Placeholder: list_teaching_events_in_store always returns empty →
 // the listing count assertion fails even after the sync propagates all 4 rows into both tables.
@@ -314,19 +311,15 @@ async fn teaching_events_sync_tenant_wide_order_free_set_union() {
     );
 }
 
-// Test 3 (store-state, Docker/NATS): Firing trace must NOT sync: after push/pull, edge2
-// must hold zero trace rows from edge1.
+// Test 3: firing trace must remain on its originating device.
 #[tokio::test(flavor = "multi_thread")]
 async fn firing_trace_stays_local_per_device_not_synced() {
     let fixture = real_sync_fixture("firing_trace_stays_local_per_device_not_synced").await;
 
-    // Assert the policy is SyncDirection::None (placeholder returns Both).
-    let contract = context_graph_sync_table_contract();
-    let policy = find_policy(&contract, FIRING_TRACE_TABLE);
     assert_eq!(
-        policy,
-        Some((SyncDirection::None, ConflictPolicy::InsertIfNotExists)),
-        "firing-trace table must have SyncDirection::None; wrong stub returns Both"
+        declared_sync_policy(&fixture.edge1.store, FIRING_TRACE_TABLE),
+        (Some("SYNC OFF".to_string()), None),
+        "the local firing trace must declare its local-only behavior in table metadata"
     );
 
     for i in 0..3usize {
@@ -353,7 +346,7 @@ async fn firing_trace_stays_local_per_device_not_synced() {
     );
 }
 
-// Test 4 (store-state, Docker/NATS): After one A→B sync, B holds the skill identity AND
+// Test 4: after one A→B sync, B holds the skill identity AND
 // zero A-origin firing-trace rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn firing_trace_stays_local_while_skill_crosses_in_one_sync() {
@@ -394,7 +387,7 @@ async fn firing_trace_stays_local_while_skill_crosses_in_one_sync() {
     );
 }
 
-// Test 5 (store-state, Docker/NATS): A reversal/undo on edge A propagates on the next sync,
+// Test 5: a reversal/undo on edge A propagates on the next sync,
 // order-tolerant. Placeholder: InsertIfNotExists cannot update existing rows; skills table
 // with placeholder policy may not correctly handle the active=false reversal row convergence.
 #[tokio::test(flavor = "multi_thread")]
@@ -464,42 +457,38 @@ async fn reversal_undo_propagates_on_next_sync_order_tolerant_and_global() {
     );
 }
 
-// Test 6 (integration, no Docker): Assert correct policies from
-// context_graph_sync_table_contract(). Placeholders return (Both, InsertIfNotExists)
-// for all four tables.
+// Test 6: the installed metadata is the complete declaration authority for learning state.
 #[test]
 fn learned_skill_sync_table_policies_match_the_declared_contract() {
-    let contract = context_graph_sync_table_contract();
+    let store = TestStore::new("learned_skill_sync_table_policies_match_the_declared_contract");
 
-    // cg_learned_skills: correct = (Both, ServerWins); placeholder = (Both, InsertIfNotExists).
-    let skills_policy = find_policy(&contract, SKILL_TABLE);
     assert_eq!(
-        skills_policy,
-        Some((SyncDirection::Both, ConflictPolicy::ServerWins)),
-        "cg_learned_skills must be (Both, ServerWins); wrong stub returns (Both, InsertIfNotExists)"
+        declared_sync_policy(&store.store, SKILL_TABLE),
+        (
+            Some("SYNC TWO WAY".to_string()),
+            Some("SYNC CONFLICT KEEP LATEST".to_string())
+        ),
+        "learned skill state must converge by the declared latest mutation"
     );
 
-    // cg_teaching_events: correct = (Both, InsertIfNotExists).
-    let teaching_policy = find_policy(&contract, TEACHING_EVENT_TABLE);
     assert_eq!(
-        teaching_policy,
-        Some((SyncDirection::Both, ConflictPolicy::InsertIfNotExists)),
-        "cg_teaching_events must be (Both, InsertIfNotExists)"
+        declared_sync_policy(&store.store, TEACHING_EVENT_TABLE),
+        (
+            Some("SYNC TWO WAY".to_string()),
+            Some("SYNC CONFLICT KEEP FIRST".to_string())
+        ),
+        "teaching events are independently identified additive history"
     );
 
-    // cg_skill_firing_trace: correct = (None, InsertIfNotExists); placeholder = (Both, InsertIfNotExists).
-    let firing_policy = find_policy(&contract, FIRING_TRACE_TABLE);
     assert_eq!(
-        firing_policy,
-        Some((SyncDirection::None, ConflictPolicy::InsertIfNotExists)),
-        "cg_skill_firing_trace must be (None, InsertIfNotExists); wrong stub returns (Both, InsertIfNotExists)"
+        declared_sync_policy(&store.store, FIRING_TRACE_TABLE),
+        (Some("SYNC OFF".to_string()), None),
+        "firing trace is local operational state"
     );
 
-    // cg_review_cursor: correct = (None, InsertIfNotExists); placeholder = (Both, InsertIfNotExists).
-    let cursor_policy = find_policy(&contract, REVIEW_CURSOR_TABLE);
     assert_eq!(
-        cursor_policy,
-        Some((SyncDirection::None, ConflictPolicy::InsertIfNotExists)),
-        "cg_review_cursor must be (None, InsertIfNotExists); wrong stub returns (Both, InsertIfNotExists)"
+        declared_sync_policy(&store.store, REVIEW_CURSOR_TABLE),
+        (Some("SYNC OFF".to_string()), None),
+        "review cursor is local operational state"
     );
 }

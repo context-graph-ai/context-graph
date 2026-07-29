@@ -1,27 +1,24 @@
 //! Test-support harness for the fabric first-light acceptance tests.
 //!
-//! Every fabric test runs against a REAL in-process contextdb hub (`SyncServer` in relay posture
-//! over the always-compiled `InProcessBroker`) and two REAL `SyncClient` edges — no Docker, no NATS,
-//! no wire transport. Claim exclusivity, conflict attribution, and replace-on-pull come from the
-//! real engine, never a mock that hands out a winner by fiat.
+//! Every fabric test runs against a real authenticated, ticketed Iroh hub and two production
+//! `SyncClient` edges with persisted identities. Claim exclusivity, conflict attribution, and
+//! replace-on-pull come from the real engine, never a mock that hands out a winner by fiat.
 //!
 //! The doubles here (call-counting extractor, capture fault seam, injected-clock helper) live in
 //! test support only, never in `src/`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use context_graph::fabric::CaptureFault;
 use context_graph::ingest::{ConversationExtractor, ExtractionRequest, StructuredHarvest};
 use context_graph::tier0::Tier0CaptureRequest;
-use context_graph::{
-    ContextGraphSyncRegistration, Store, StoreConfig, register_context_graph_sync_client,
-};
+use context_graph::{Store, StoreConfig};
 use contextdb_core::TenantId;
-use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ConflictPolicies, ConflictPolicy, SyncDirection};
-use contextdb_server::{InProcessBroker, SyncClient, SyncServer};
+use contextdb_server::transport::iroh::IrohServer;
+use contextdb_server::{SyncClient, SyncServer};
 use tempfile::TempDir;
 
 use crate::fake_extractor::{LabeledTranscriptExtractor, open_store_with_lexical_embedder};
@@ -58,16 +55,15 @@ impl FabricNode {
     }
 }
 
-/// A real in-process hub plus two real edges, all sharing one `InProcessBroker`.
+/// Authenticated ticketed hubs plus two real persisted-identity edges.
 pub struct FabricFixture {
-    _broker: InProcessBroker,
-    _hub: FabricNode,
+    _hubs: Vec<FabricNode>,
     pub edge1: FabricNode,
     pub edge2: FabricNode,
     pub edge1_client: SyncClient,
     pub edge2_client: SyncClient,
     shutdown: Arc<AtomicBool>,
-    _server_task: tokio::task::JoinHandle<()>,
+    _server_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for FabricFixture {
@@ -88,94 +84,85 @@ pub async fn fabric_fixture_with_tenants(
     edge1_tenant: &str,
     edge2_tenant: &str,
 ) -> FabricFixture {
-    let broker = InProcessBroker::new();
-    let hub = FabricNode::open(&format!("{test_name}_hub"));
-    let policies = cg_conflict_policies();
-    let server = Arc::new(SyncServer::with_transport(
-        hub.store.sync_database(),
-        broker.server(),
-        TenantId::from(edge1_tenant),
-        policies,
-    ));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let server_task = {
-        let server = Arc::clone(&server);
-        let shutdown = Arc::clone(&shutdown);
-        tokio::spawn(async move {
-            server.run_until(shutdown).await;
-        })
+    let (first_hub, first_ticket, first_task) = start_ticketed_hub(
+        &format!("{test_name}_hub_{edge1_tenant}"),
+        edge1_tenant,
+        Arc::clone(&shutdown),
+    )
+    .await;
+    let mut hubs = vec![first_hub];
+    let mut server_tasks = vec![first_task];
+    let edge2_ticket = if edge2_tenant == edge1_tenant {
+        first_ticket.clone()
+    } else {
+        let (second_hub, second_ticket, second_task) = start_ticketed_hub(
+            &format!("{test_name}_hub_{edge2_tenant}"),
+            edge2_tenant,
+            Arc::clone(&shutdown),
+        )
+        .await;
+        hubs.push(second_hub);
+        server_tasks.push(second_task);
+        second_ticket
     };
-
-    // A genuinely two-tenant fabric gives each tenant its OWN hub view — a separate hub store, dialed
-    // over its own tenant-scoped subjects on the shared broker. When the two edges enroll under
-    // different tenants, stand up the second tenant's hub (a fresh, empty store) so a differently-
-    // tenanted edge's push/pull resolves a responder instead of a transport miss AND sees only its own
-    // tenant's data: the tenant-A edge's rows land on the tenant-A hub and never reach the tenant-B
-    // hub, so a tenant-B edge pulling its own hub gets nothing — cross-tenant movement is impossible
-    // at the fabric boundary. Detached and tied to the same shutdown, so it stops with the fixture.
-    // (Same-tenant fixtures are unchanged.)
-    if edge2_tenant != edge1_tenant {
-        let second = Arc::new(SyncServer::with_transport(
-            Arc::new(Database::open_memory()),
-            broker.server(),
-            TenantId::from(edge2_tenant),
-            cg_conflict_policies(),
-        ));
-        let shutdown = Arc::clone(&shutdown);
-        tokio::spawn(async move {
-            second.run_until(shutdown).await;
-        });
-    }
 
     let edge1 = FabricNode::open(&format!("{test_name}_edge1"));
     let edge2 = FabricNode::open(&format!("{test_name}_edge2"));
-    let edge1_client = SyncClient::with_transport(
+    let edge1_dial_spec = contextdb_server::peer_dial_spec(
+        &first_ticket,
+        &edge1.db_path.with_extension("fabric-identity.key"),
+    );
+    let edge1_client = SyncClient::new(
         edge1.store.sync_database(),
-        broker.client(),
+        &edge1_dial_spec,
         TenantId::from(edge1_tenant),
     );
-    let edge2_client = SyncClient::with_transport(
+    let edge2_dial_spec = contextdb_server::peer_dial_spec(
+        &edge2_ticket,
+        &edge2.db_path.with_extension("fabric-identity.key"),
+    );
+    let edge2_client = SyncClient::new(
         edge2.store.sync_database(),
-        broker.client(),
+        &edge2_dial_spec,
         TenantId::from(edge2_tenant),
     );
-    register_cg_sync_tables(&edge1_client);
-    register_cg_sync_tables(&edge2_client);
 
     FabricFixture {
-        _broker: broker,
-        _hub: hub,
+        _hubs: hubs,
         edge1,
         edge2,
         edge1_client,
         edge2_client,
         shutdown,
-        _server_task: server_task,
+        _server_tasks: server_tasks,
     }
 }
 
-pub fn cg_conflict_policies() -> ConflictPolicies {
-    context_graph::context_graph_sync_conflict_policies()
-}
-
-struct FabricSyncRegistration<'a>(&'a SyncClient);
-
-impl ContextGraphSyncRegistration for FabricSyncRegistration<'_> {
-    fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
-        self.0.set_default_conflict_policy(policy);
-    }
-
-    fn set_table_direction(&self, table: &str, direction: SyncDirection) {
-        self.0.set_table_direction(table, direction);
-    }
-
-    fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
-        self.0.set_conflict_policy(table, policy);
-    }
-}
-
-pub fn register_cg_sync_tables(client: &SyncClient) {
-    register_context_graph_sync_client(&FabricSyncRegistration(client));
+async fn start_ticketed_hub(
+    label: &str,
+    tenant: &str,
+    shutdown: Arc<AtomicBool>,
+) -> (FabricNode, String, tokio::task::JoinHandle<()>) {
+    let hub = FabricNode::open(label);
+    let endpoint = tokio::time::timeout(
+        Duration::from_secs(30),
+        IrohServer::bind(&format!(
+            "iroh:?identity={}",
+            hub.db_path.with_extension("fabric-identity.key").display()
+        )),
+    )
+    .await
+    .expect("authenticated hub bind stays bounded")
+    .expect("bind authenticated ticketed hub");
+    let ticket = endpoint.ticket();
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+        hub.store.sync_database(),
+        endpoint.transport(),
+        TenantId::from(tenant),
+    ));
+    let task = tokio::spawn(async move { server.run_until(shutdown).await });
+    (hub, ticket, task)
 }
 
 /// Drive one edge's push, then the other's pull, to converge the ledger.
@@ -187,16 +174,64 @@ pub async fn push_then_pull(pusher: &SyncClient, puller: &SyncClient) {
         {
             break;
         }
-        pusher.push().await.expect("push round");
-    }
-    let policies = cg_conflict_policies();
-    for _ in 0..32 {
-        let before = puller.pull_watermark();
-        puller.pull(&policies).await.expect("pull round");
-        if puller.pull_watermark() == before {
-            break;
+        let before = pusher.push_watermark();
+        tokio::time::timeout(Duration::from_secs(30), pusher.push())
+            .await
+            .expect("authenticated push stays bounded")
+            .expect("push round");
+        if pusher
+            .has_pending_push_changes()
+            .expect("pending push check")
+        {
+            assert!(
+                pusher.push_watermark() > before,
+                "push must advance while changes remain"
+            );
         }
     }
+    assert!(
+        !pusher
+            .has_pending_push_changes()
+            .expect("pending push check"),
+        "push did not drain within 32 authenticated rounds"
+    );
+    for _ in 0..32 {
+        let before = puller.pull_watermark();
+        tokio::time::timeout(Duration::from_secs(30), puller.pull_default())
+            .await
+            .expect("authenticated pull stays bounded")
+            .expect("pull round");
+        if puller.pull_watermark() == before {
+            return;
+        }
+    }
+    panic!("pull did not converge within 32 authenticated rounds");
+}
+
+/// A production client with a valid authenticated ticket whose endpoint has gone away.
+pub async fn unavailable_authenticated_client(
+    db: Arc<contextdb_engine::Database>,
+    tenant: &str,
+    edge_db_path: &Path,
+) -> SyncClient {
+    let root = tempfile::tempdir().expect("unavailable authenticated endpoint tempdir");
+    let endpoint = tokio::time::timeout(
+        Duration::from_secs(30),
+        IrohServer::bind(&format!(
+            "iroh:?identity={}",
+            root.path().join("unavailable-hub.key").display()
+        )),
+    )
+    .await
+    .expect("unavailable endpoint bind stays bounded")
+    .expect("mint authenticated unavailable endpoint ticket");
+    let ticket = endpoint.ticket();
+    drop(endpoint);
+    let dial_spec = contextdb_server::peer_dial_spec(
+        &ticket,
+        &edge_db_path.with_extension("fabric-identity.key"),
+    );
+    SyncClient::new(db, &dial_spec, TenantId::from(tenant))
 }
 
 /// An extractor double that records how many times the model boundary was invoked, wrapping the

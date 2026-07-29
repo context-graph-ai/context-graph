@@ -1,43 +1,26 @@
 mod support;
 
-use std::collections::BTreeSet;
-#[cfg(feature = "nats")]
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-#[cfg(feature = "nats")]
 use std::sync::Arc;
-#[cfg(feature = "nats")]
-use std::sync::LazyLock;
-#[cfg(feature = "nats")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use context_graph::context_graph_pending_push_change_count;
 use context_graph::{
     ContextId, CreateDecision, CreateIntention, DecisionId, DecisionStatus, DiscoveryFilter,
     EntityId, IntentionId, IntentionOrigin, IntentionStatus, Store, StoreConfig,
 };
-#[cfg(feature = "nats")]
-use context_graph::{
-    context_graph_pending_push_change_count, context_graph_sync_conflict_policies,
-};
 use contextdb_core::Value as DbValue;
 use contextdb_engine::Database;
-#[cfg(feature = "nats")]
+use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::{SyncClient, SyncServer};
 use serde_json::Value;
 use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider, cg_bin};
-#[cfg(feature = "nats")]
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-#[cfg(feature = "nats")]
-use testcontainers::runners::AsyncRunner;
-#[cfg(feature = "nats")]
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-#[cfg(feature = "nats")]
-use tokio::sync::OwnedSemaphorePermit;
 
 const AUTH_INITIAL: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py.";
 const AUTH_WITH_JWT: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py. Use JWT with 15-min access tokens.";
@@ -46,10 +29,6 @@ const AUTH_CURRENT_WITH_JWT: &str = "Acme password-less login is now served by t
 const CI_PIPELINE_SESSION: &str = "The delivery team needs a CI pipeline. Run CI on every pull request, block merges when CI fails, and include unit tests, clippy, and release build in .github/workflows/ci.yml.";
 const CLIENT_A_SOX_SESSION: &str = "Client A must keep SOX deploy approvals. The publish pipeline is deploy.yml; require SOX approval before promote.";
 const CLIENT_B_PUBLISH_SESSION: &str = "Client B must avoid the duplicate-publish race. The publish pipeline is deploy.yml; hold 10 min before promote.";
-
-#[cfg(feature = "nats")]
-static CLI_NATS_TEST_LOCK: LazyLock<Arc<tokio::sync::Semaphore>> =
-    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
 
 fn combined(output: &CommandOutput) -> String {
     format!("{}\n{}", output.stdout, output.stderr)
@@ -1199,21 +1178,18 @@ fn json_string_at<'a>(json: &'a Value, paths: &[&str]) -> Option<&'a str> {
         .find_map(|path| json.pointer(path).and_then(Value::as_str))
 }
 
-#[cfg(feature = "nats")]
 fn json_u64_at(json: &Value, paths: &[&str]) -> Option<u64> {
     paths
         .iter()
         .find_map(|path| json.pointer(path).and_then(Value::as_u64))
 }
 
-#[cfg(feature = "nats")]
 fn json_bool_at(json: &Value, paths: &[&str]) -> Option<bool> {
     paths
         .iter()
         .find_map(|path| json.pointer(path).and_then(Value::as_bool))
 }
 
-#[cfg(feature = "nats")]
 fn json_array_len_at(json: &Value, paths: &[&str]) -> Option<u64> {
     paths.iter().find_map(|path| {
         json.pointer(path)
@@ -1516,58 +1492,16 @@ fn memory_counts(output: &CommandOutput) -> Option<(u64, u64, u64)> {
     ))
 }
 
-#[cfg(feature = "nats")]
-struct CliNatsFixture {
-    _lock: OwnedSemaphorePermit,
-    _container: ContainerAsync<GenericImage>,
-    nats_url: String,
-}
-
-#[cfg(feature = "nats")]
-async fn start_cli_nats_or_environment_error() -> CliNatsFixture {
-    let lock = CLI_NATS_TEST_LOCK
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("NATS fixture lock should not close");
-    let conf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../context-graph/tests/common/nats.conf")
-        .to_string_lossy()
-        .into_owned();
-    let image = GenericImage::new("nats", "latest")
-        .with_exposed_port(4222.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("Server is ready"));
-    let request = image
-        .with_mount(Mount::bind_mount(conf, "/etc/nats/nats.conf"))
-        .with_cmd(["--js", "--config", "/etc/nats/nats.conf"]);
-    let container = request
-        .start()
-        .await
-        .expect("environment ERROR: Docker/NATS substrate is required for this CLI sync test");
-    let nats_port = container
-        .get_host_port_ipv4(4222.tcp())
-        .await
-        .expect("NATS port should be mapped");
-    CliNatsFixture {
-        _lock: lock,
-        _container: container,
-        nats_url: format!("nats://127.0.0.1:{nats_port}"),
-    }
-}
-
-#[cfg(feature = "nats")]
 struct CliSyncFixture {
-    _nats: CliNatsFixture,
     _hub_dir: tempfile::TempDir,
     _hub_store: Store,
     hub_db: Arc<Database>,
     shutdown: Arc<AtomicBool>,
     server_task: tokio::task::JoinHandle<()>,
-    nats_url: String,
+    remote_url: String,
     tenant_id: String,
 }
 
-#[cfg(feature = "nats")]
 impl Drop for CliSyncFixture {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
@@ -1575,9 +1509,7 @@ impl Drop for CliSyncFixture {
     }
 }
 
-#[cfg(feature = "nats")]
 async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
-    let nats = start_cli_nats_or_environment_error().await;
     let hub_dir = tempfile::tempdir().expect("hub tempdir");
     let tenant_id = format!("tenant-{}", label.replace('_', "-"));
     let hub_store = Store::open(StoreConfig {
@@ -1587,11 +1519,21 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
     })
     .expect("open CLI sync hub store");
     let hub_db = hub_store.sync_database();
-    let server = Arc::new(SyncServer::new(
+    let endpoint = tokio::time::timeout(
+        Duration::from_secs(30),
+        IrohServer::bind(&format!(
+            "iroh:?identity={}",
+            hub_dir.path().join("hub.fabric-identity.key").display()
+        )),
+    )
+    .await
+    .expect("CLI authenticated hub bind stays bounded")
+    .expect("bind CLI authenticated hub");
+    let remote_url = endpoint.ticket();
+    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
         Arc::clone(&hub_db),
-        &nats.nats_url,
+        endpoint.transport(),
         contextdb_core::TenantId::from(&tenant_id),
-        context_graph_sync_conflict_policies(),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
@@ -1599,38 +1541,53 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move { server.run_until(shutdown).await })
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let nats_url = nats.nats_url.clone();
     CliSyncFixture {
-        _nats: nats,
         _hub_dir: hub_dir,
         _hub_store: hub_store,
         hub_db,
         shutdown,
         server_task,
-        nats_url,
+        remote_url,
         tenant_id,
     }
 }
 
-#[cfg(feature = "nats")]
-fn cli_expected_pending_push_change_count(store: &Store, nats_url: &str, tenant_id: &str) -> usize {
+async fn unavailable_authenticated_ticket(label: &str) -> String {
+    let root = tempfile::tempdir().expect("unavailable CLI endpoint tempdir");
+    let endpoint = tokio::time::timeout(
+        Duration::from_secs(30),
+        IrohServer::bind(&format!(
+            "iroh:?identity={}",
+            root.path().join(format!("{label}.key")).display()
+        )),
+    )
+    .await
+    .expect("unavailable CLI endpoint bind stays bounded")
+    .expect("mint authenticated unavailable CLI ticket");
+    let ticket = endpoint.ticket();
+    drop(endpoint);
+    ticket
+}
+
+fn cli_expected_pending_push_change_count(
+    store: &Store,
+    remote_url: &str,
+    tenant_id: &str,
+) -> usize {
     let client = SyncClient::new(
         store.sync_database(),
-        nats_url,
+        remote_url,
         contextdb_core::TenantId::from(tenant_id),
     );
     context_graph_pending_push_change_count(client.db(), client.push_watermark())
 }
 
-#[cfg(feature = "nats")]
 fn db_table_row_count(db: &Database, table: &str) -> usize {
     db.scan(table, db.snapshot())
         .unwrap_or_else(|err| panic!("scan {table}: {err}"))
         .len()
 }
 
-#[cfg(feature = "nats")]
 fn schema_version_installed_at(db: &Database) -> contextdb_core::TxId {
     let installed_at = db
         .scan("cg_schema_version", db.snapshot())
@@ -1649,7 +1606,6 @@ fn schema_version_installed_at(db: &Database) -> contextdb_core::TxId {
     installed_at[0]
 }
 
-#[cfg(feature = "nats")]
 fn force_write_once_schema_conflict(path: &std::path::Path) -> contextdb_core::TxId {
     let store = persisted_store(Some(path.to_path_buf())).expect("open second CLI store");
     let db = store.sync_database();
@@ -1712,7 +1668,6 @@ fn persisted_store(path: Option<std::path::PathBuf>) -> Option<Store> {
     })
 }
 
-#[cfg(feature = "nats")]
 fn scoped_persisted_store(path: Option<std::path::PathBuf>, context_label: &str) -> Option<Store> {
     let db_path = path?;
     let admin = persisted_store(Some(db_path.clone()))?;
@@ -2749,16 +2704,15 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
     );
 }
 
-// Pinned to the test-only `nats` feature: it drives the compiled `cg` binary against a real broker; the default build speaks Iroh.
-#[cfg(feature = "nats")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending() {
+    let unavailable_remote = unavailable_authenticated_ticket("offline-cli-hub").await;
     let offline_harness = extraction_harness();
     let offline_record = offline_harness.run_with_stdin(
         &[
             "record", "--understand-now",
             "--remote-server",
-            "nats://127.0.0.1:1",
+            unavailable_remote.as_str(),
             "--tenant-id",
             "offline-cli-tenant",
         ],
@@ -2787,7 +2741,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         &[
             "record", "--understand-now",
             "--remote-server",
-            fixture.nats_url.as_str(),
+            fixture.remote_url.as_str(),
             "--tenant-id",
             fixture.tenant_id.as_str(),
         ],
@@ -2804,7 +2758,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         );
         let count = cli_expected_pending_push_change_count(
             &store,
-            fixture.nats_url.as_str(),
+            fixture.remote_url.as_str(),
             fixture.tenant_id.as_str(),
         ) as u64;
         assert!(
@@ -2818,7 +2772,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         "sync",
         "status",
         "--remote-server",
-        fixture.nats_url.as_str(),
+        fixture.remote_url.as_str(),
         "--tenant-id",
         fixture.tenant_id.as_str(),
     ]);
@@ -2826,7 +2780,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
     let pending_json = output_json(&pending_status).expect("pending sync status JSON");
     assert_eq!(
         json_string_at(&pending_json, &["/sync/remote_url", "/remote_url"]),
-        Some(fixture.nats_url.as_str())
+        Some(fixture.remote_url.as_str())
     );
     assert_eq!(
         json_string_at(&pending_json, &["/sync/tenant_id", "/tenant_id"]),
@@ -2853,7 +2807,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         "sync",
         "push",
         "--remote-server",
-        fixture.nats_url.as_str(),
+        fixture.remote_url.as_str(),
         "--tenant-id",
         fixture.tenant_id.as_str(),
     ]);
@@ -2868,7 +2822,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
             .expect("open scoped CLI store after push");
         cli_expected_pending_push_change_count(
             &store,
-            fixture.nats_url.as_str(),
+            fixture.remote_url.as_str(),
             fixture.tenant_id.as_str(),
         ) as u64
     };
@@ -2876,7 +2830,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         "sync",
         "status",
         "--remote-server",
-        fixture.nats_url.as_str(),
+        fixture.remote_url.as_str(),
         "--tenant-id",
         fixture.tenant_id.as_str(),
     ]);
@@ -2902,7 +2856,7 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         "sync",
         "pull",
         "--remote-server",
-        fixture.nats_url.as_str(),
+        fixture.remote_url.as_str(),
         "--tenant-id",
         fixture.tenant_id.as_str(),
     ]);

@@ -9,7 +9,7 @@
 # Two halves:
 #   CAPTURE HALF (live now): full-ontology extraction, the four-stage pipeline,
 #     the cost/time receipt + zero-outbound --estimate, connected-by-default capture,
-#     the sync split (requires a contextdb relay hub for a release-ready verdict).
+#     the sync split (requires a ticketed Iroh hub for a release-ready verdict).
 #   CORRECTION/SKILL/HITL HALF: REAL assertions now that the CLI verbs
 #     fix/drop/group/undo/skills/review/why are wired. Item handles are `@n`
 #     ordinals over the captured units (digests) in a context, newest first.
@@ -31,13 +31,15 @@
 #   CG_SMOKE_MODEL       anthropic/claude-haiku-4.5   any OpenRouter model slug
 #   CG_SMOKE_ENDPOINT    https://openrouter.ai/api/v1
 #   CG_SMOKE_TIMEOUT_MS  120000
-#   CG_DATA_ROOT         /tmp/cg-refactor-smoke
+#   CG_DATA_ROOT         /tmp/context-graph-ai/cg-refactor-smoke
 #   CG_SMOKE_LOG         /tmp/cg-capture-live-smoke.log
-#   CG                   <worktree>/target/release/cg
-#   CG_SMOKE_SKIP_BUILD  0    set 1 to skip cargo build
-#   CG_SMOKE_HUB         (unset)  contextdb relay-hub NATS URL with a relay worker
-#                        serving CG_SMOKE_TENANT; missing means NOT RELEASE-READY
-#   CG_SMOKE_TENANT      generated local tenant id; required with CG_SMOKE_HUB for the sync gate
+#   CG                   installed release `cg` binary
+#   CONTEXTDB            installed release `contextdb` binary used read-only on stopped edge files
+#   CG_SMOKE_SKIP_BUILD  1    required: this smoke accepts installed release binaries only
+#   CG_SMOKE_HUB_TICKET  (unset)  pasted authenticated Iroh enrollment ticket for an isolated
+#                        ContextDB hub serving CG_SMOKE_TENANT; missing means NOT RELEASE-READY
+#   CG_SMOKE_TENANT      generated local tenant id; must be supplied with CG_SMOKE_HUB_TICKET
+#                        for the cross-machine sync gate
 #   CG_SMOKE_REAL_JSONL  largest real session JSONL to import in the real-import gate;
 #                        defaults to the largest *.jsonl under CG_SMOKE_REAL_JSONL_DIR
 #   CG_SMOKE_REAL_JSONL_DIR  $HOME/.claude/projects
@@ -50,7 +52,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKTREE="${CG_WORKTREE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 CG="${CG:-$WORKTREE/target/release/cg}"
-CG_DATA_ROOT="${CG_DATA_ROOT:-/tmp/cg-refactor-smoke}"
+CONTEXTDB="${CONTEXTDB:-$WORKTREE/../contextdb/target/release/contextdb}"
+CG_DATA_ROOT="${CG_DATA_ROOT:-/tmp/context-graph-ai/cg-refactor-smoke}"
 LOG="${CG_SMOKE_LOG:-/tmp/cg-capture-live-smoke.log}"
 MODEL="${CG_SMOKE_MODEL:-anthropic/claude-haiku-4.5}"
 ENDPOINT="${CG_SMOKE_ENDPOINT:-https://openrouter.ai/api/v1}"
@@ -58,7 +61,12 @@ PROVIDER="openrouter"
 TIMEOUT_MS="${CG_SMOKE_TIMEOUT_MS:-120000}"
 SKIP_BUILD="${CG_SMOKE_SKIP_BUILD:-0}"
 TENANT="${CG_SMOKE_TENANT:-cg-smoke-$RANDOM-$$}"
-HUB="${CG_SMOKE_HUB:-}"
+HUB_TICKET="${CG_SMOKE_HUB_TICKET:-}"
+EDGE_A_ROOT="$CG_DATA_ROOT"
+ESTIMATE_ROOT="${CG_DATA_ROOT}-estimate"
+EDGE_B_ROOT="${CG_DATA_ROOT}-edgeB"
+EDGE_C_ROOT="${CG_DATA_ROOT}-edgeC-restore"
+SAFE_DELETE_ROOTS=("$EDGE_A_ROOT" "$ESTIMATE_ROOT" "$EDGE_B_ROOT" "$EDGE_C_ROOT")
 
 export CG_DATA_ROOT
 unset CG_USE_TEST_LEXICAL_EMBEDDER   # use the REAL bundled embedder, not the test one
@@ -84,11 +92,99 @@ check() {  # check "<desc>" <0|1>
 skip()    { printf '   [SKIP] %s\n' "$1"; SKIP=$((SKIP+1)); }
 pending() { printf '   [PENDING] %s\n' "$1"; SKIP=$((SKIP+1)); }
 
+SAFE_REMOVE_RESOLVED=""
+validate_remove_tree_target() {  # validate_remove_tree_target <one exact smoke root>
+  local raw="${1:-}" resolved candidate candidate_resolved user_home workspace_root repository_root depth part
+  local -a path_parts
+  SAFE_REMOVE_RESOLVED=""
+  [[ -n "$raw" ]] || { printf 'REFUSING destructive removal: empty target\n' >&2; return 1; }
+  command -v realpath >/dev/null 2>&1 \
+    || { printf 'REFUSING destructive removal: realpath is unavailable\n' >&2; return 1; }
+  resolved="$(realpath -m -- "$raw")" \
+    || { printf 'REFUSING destructive removal: cannot resolve %q\n' "$raw" >&2; return 1; }
+  user_home="$(realpath -m -- "${HOME:-/}")"
+  workspace_root="$(realpath -m -- "$WORKTREE/..")"
+  repository_root="$(realpath -m -- "$WORKTREE")"
+
+  case "$resolved" in
+    ""|/|/tmp|/var/tmp|/home|"$user_home"|"$workspace_root"|"$repository_root")
+      printf 'REFUSING destructive removal of protected root: %q\n' "$resolved" >&2
+      return 1
+      ;;
+    "$workspace_root"/*|"$repository_root"/*)
+      printf 'REFUSING destructive removal inside the workspace/repository: %q\n' "$resolved" >&2
+      return 1
+      ;;
+  esac
+  case "$workspace_root" in
+    "$resolved"|"$resolved"/*)
+      printf 'REFUSING destructive removal of an ancestor containing the workspace: %q\n' "$resolved" >&2
+      return 1
+      ;;
+  esac
+  case "$repository_root" in
+    "$resolved"|"$resolved"/*)
+      printf 'REFUSING destructive removal of an ancestor containing the repository: %q\n' "$resolved" >&2
+      return 1
+      ;;
+  esac
+
+  IFS='/' read -r -a path_parts <<<"$resolved"
+  depth=0
+  for part in "${path_parts[@]}"; do
+    [[ -z "$part" ]] || depth=$((depth + 1))
+  done
+  if (( depth < 3 )); then
+    printf 'REFUSING destructive removal of shallow/shared root: %q\n' "$resolved" >&2
+    return 1
+  fi
+
+  for candidate in "${SAFE_DELETE_ROOTS[@]}"; do
+    candidate_resolved="$(realpath -m -- "$candidate")"
+    [[ "$resolved" == "$candidate_resolved" ]] && break
+    candidate_resolved=""
+  done
+  if [[ -z "$candidate_resolved" ]]; then
+    printf 'REFUSING destructive removal outside the exact smoke-root inventory: %q\n' "$resolved" >&2
+    return 1
+  fi
+
+  SAFE_REMOVE_RESOLVED="$resolved"
+}
+safe_remove_tree() {  # safe_remove_tree <one exact smoke root>
+  validate_remove_tree_target "$1" || return 1
+  local resolved="$SAFE_REMOVE_RESOLVED"
+  rm -rf -- "$resolved"
+}
+
+redact_ticket_stream() {
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -n "$HUB_TICKET" ]]; then
+      line="${line//"$HUB_TICKET"/<redacted-iroh-ticket>}"
+    fi
+    printf '%s\n' "$line"
+  done
+}
+display_cg_command() {
+  local redact_next=0 arg
+  printf '\n$ cg'
+  for arg in "$@"; do
+    if [[ "$redact_next" == "1" ]]; then
+      printf ' %q' '<redacted-iroh-ticket>'
+      redact_next=0
+    else
+      printf ' %q' "$arg"
+      [[ "$arg" == "--remote-server" ]] && redact_next=1
+    fi
+  done
+  printf '\n'
+}
 cg_run() {  # cg_run <argv...>  -> LAST_OUT / LAST_RC
-  printf '\n$ cg %s\n' "$*"
+  display_cg_command "$@"
   local tmp
   tmp="$(mktemp /tmp/cg-smoke-cg-run.XXXXXX)"
-  "$CG" "$@" 2>&1 | tee "$tmp"
+  "$CG" "$@" 2>&1 | redact_ticket_stream | tee "$tmp"
   LAST_RC=${PIPESTATUS[0]}
   LAST_OUT="$(cat "$tmp")"
   rm -f "$tmp"
@@ -166,6 +262,157 @@ review_count() {  # review_count <output> <category>   e.g. drift | currency_fli
   grep -oiE "$2=[0-9]+" <<<"$1" | head -1 | grep -oE '[0-9]+'
 }
 
+CDB_OUT=""; CDB_ERR=""; CDB_RC=0
+cdb_query() {  # cdb_query <data-root> <read-only-sql>
+  local root="$1" sql="$2" out err
+  out="$(mktemp /tmp/cg-smoke-contextdb-out.XXXXXX)"
+  err="$(mktemp /tmp/cg-smoke-contextdb-err.XXXXXX)"
+  printf '\n$ printf <read-only-sql> | contextdb %q --json --all\n' "$root/context-graph.db"
+  printf '%s\n' "$sql" | "$CONTEXTDB" "$root/context-graph.db" --json --all >"$out" 2>"$err"
+  CDB_RC=$?
+  CDB_OUT="$(cat "$out")"
+  CDB_ERR="$(cat "$err")"
+  printf '%s\n' "$CDB_OUT"
+  [[ -z "$CDB_ERR" ]] || printf '%s\n' "$CDB_ERR"
+  rm -f "$out" "$err"
+}
+cdb_schema_inventory() {  # cdb_schema_inventory <data-root> <table>...
+  local root="$1" input out err table
+  shift
+  input="$(mktemp /tmp/cg-smoke-schema-input.XXXXXX)"
+  out="$(mktemp /tmp/cg-smoke-schema-out.XXXXXX)"
+  err="$(mktemp /tmp/cg-smoke-schema-err.XXXXXX)"
+  for table in "$@"; do
+    printf '.schema %s\n' "$table" >>"$input"
+  done
+  printf '\n$ contextdb %q --json --all < <schema-inventory>\n' "$root/context-graph.db"
+  "$CONTEXTDB" "$root/context-graph.db" --json --all <"$input" >"$out" 2>"$err"
+  CDB_RC=$?
+  CDB_OUT="$(cat "$out")"
+  CDB_ERR="$(cat "$err")"
+  printf '%s\n' "$CDB_OUT"
+  [[ -z "$CDB_ERR" ]] || printf '%s\n' "$CDB_ERR"
+  rm -f "$input" "$out" "$err"
+}
+
+MEMORY_PROVENANCE=""; MEMORY_HISTORY=""; MEMORY_INTENTIONS=""
+MEMORY_CONFLICTS=""; MEMORY_INVALIDATIONS=""; MEMORY_SUPERSEDES=""
+read_memory_evidence() {  # read_memory_evidence <data-root> <label>
+  local root="$1" label="$2" context_filter entity_id
+  context_filter="(SELECT id FROM contexts WHERE name = 'memory-convergence')"
+
+  cdb_query "$root" "SELECT d.id AS decision_id, d.agent_id, d.status, dbs.entity_id, dbs.snapshot_id, eso.observation_id, o.source AS observation_source, o.timestamp AS observed_at, e.id AS evidence_id, e.source_ref, ot.id AS outcome_id, ot.success, ot.notes FROM decisions d INNER JOIN decision_basis_snapshots dbs ON d.id = dbs.decision_id INNER JOIN entity_snapshot_observations eso ON dbs.context_id = eso.context_id AND dbs.entity_id = eso.entity_id AND dbs.snapshot_id = eso.snapshot_id INNER JOIN observations o ON eso.observation_id = o.id INNER JOIN evidence e ON o.id = e.observation_id INNER JOIN outcomes ot ON d.id = ot.decision_id WHERE d.context_id = ${context_filter} ORDER BY d.agent_id;"
+  check "${label}: installed contextdb reads the complete decision provenance join" \
+    "$([[ $CDB_RC -eq 0 ]] && echo 0 || echo 1)"
+  MEMORY_PROVENANCE="$(jq -S -c '
+    unique_by([
+      .decision_id, .entity_id, .snapshot_id, .observation_id, .evidence_id, .outcome_id
+    ])
+    | sort_by([
+        .decision_id, .entity_id, .snapshot_id, .observation_id, .evidence_id, .outcome_id
+      ])
+  ' <<<"$CDB_OUT" 2>/dev/null || printf 'null')"
+  entity_id="$(jq -r '.[0].entity_id // ""' <<<"$MEMORY_PROVENANCE" 2>/dev/null)"
+
+  cdb_query "$root" "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE context_id = ${context_filter} AND entity_id = '${entity_id}' ORDER BY id;"
+  check "${label}: installed contextdb reads the complete shared-entity history" \
+    "$([[ $CDB_RC -eq 0 ]] && echo 0 || echo 1)"
+  MEMORY_HISTORY="$(jq -S -c 'unique_by(.id) | sort_by(.id)' <<<"$CDB_OUT" 2>/dev/null || printf 'null')"
+
+  cdb_query "$root" "SELECT e.source_id AS decision_id, e.target_id AS intention_id FROM edges e WHERE e.context_id = ${context_filter} AND e.edge_type = 'SERVES' ORDER BY e.source_id;"
+  check "${label}: installed contextdb reads both decisions' shared intention" \
+    "$([[ $CDB_RC -eq 0 ]] && echo 0 || echo 1)"
+  MEMORY_INTENTIONS="$(jq -S -c '
+    unique_by([.decision_id, .intention_id]) | sort_by([.decision_id, .intention_id])
+  ' <<<"$CDB_OUT" 2>/dev/null || printf 'null')"
+
+  cdb_query "$root" "SELECT older_decision_id, newer_decision_id, threatened_intention_ids, intention_in_tension FROM conflicts WHERE context_id = ${context_filter};"
+  check "${label}: installed contextdb reads explicit decision tension" \
+    "$([[ $CDB_RC -eq 0 ]] && echo 0 || echo 1)"
+  MEMORY_CONFLICTS="$(jq -S -c '
+    map(.threatened_intention_ids |=
+      ((if type == "string" then fromjson else . end) | unique | sort))
+    | unique_by([.older_decision_id, .newer_decision_id])
+    | sort_by([.older_decision_id, .newer_decision_id])
+  ' <<<"$CDB_OUT" 2>/dev/null || printf 'null')"
+
+  cdb_query "$root" "SELECT id, affected_decision_id, trigger_observation_id FROM invalidations WHERE context_id = ${context_filter};"
+  check "${label}: installed contextdb reads the semantic invalidation set" \
+    "$([[ $CDB_RC -eq 0 ]] && echo 0 || echo 1)"
+  MEMORY_INVALIDATIONS="$(jq -S -c '
+    unique_by([.id, .affected_decision_id, .trigger_observation_id])
+    | sort_by([.id, .affected_decision_id, .trigger_observation_id])
+  ' <<<"$CDB_OUT" 2>/dev/null || printf 'null')"
+
+  cdb_query "$root" "SELECT id, source_id, target_id FROM edges WHERE context_id = ${context_filter} AND edge_type = 'SUPERSEDES';"
+  check "${label}: installed contextdb reads the decision supersession set" \
+    "$([[ $CDB_RC -eq 0 ]] && echo 0 || echo 1)"
+  MEMORY_SUPERSEDES="$(jq -S -c '
+    unique_by([.id, .source_id, .target_id]) | sort_by([.id, .source_id, .target_id])
+  ' <<<"$CDB_OUT" 2>/dev/null || printf 'null')"
+}
+
+assert_memory_evidence() {  # assert_memory_evidence <label>
+  local label="$1"
+  check "${label}: both independently identified decisions and their exact evidence chains survive" \
+    "$(jq -e '
+      length >= 2
+      and ([.[].decision_id] | unique | length) == 2
+      and ([.[].agent_id] | unique | sort) == ["agent-a", "agent-b"]
+      and ([.[].status] | unique) == ["active"]
+      and ([.[].success] | unique | sort) == [false, true]
+      and ([.[].entity_id] | unique | length) == 1
+      and any(.[]; .agent_id == "agent-a" and .success == true)
+      and any(.[]; .agent_id == "agent-b" and .success == false)
+      and all(.[];
+        (.decision_id | length) > 0
+        and (.snapshot_id | length) > 0
+        and (.observation_id | length) > 0
+        and (.evidence_id | length) > 0
+        and (.outcome_id | length) > 0
+        and (.observation_source | length) > 0
+        and .observation_source == .agent_id
+        and (.source_ref | length) > 0
+        and (.observed_at != null and (.observed_at | type) == "number"))
+      and (group_by(.decision_id) | length) == 2
+      and all(group_by(.decision_id)[];
+        length >= 1
+        and ([.[].agent_id] | unique | length) == 1
+        and ([.[].entity_id] | unique | length) == 1
+        and ([.[].outcome_id] | unique | length) == 1
+        and ([.[].success] | unique | length) == 1)
+    ' <<<"$MEMORY_PROVENANCE" >/dev/null 2>&1 && echo 0 || echo 1)"
+  check "${label}: the later real capture time survives without making either decision current" \
+    "$(jq -e '
+      ([.[] | select(.agent_id == "agent-a") | .observed_at] | max) as $agent_a_latest
+      | ([.[] | select(.agent_id == "agent-b") | .observed_at] | min) as $agent_b_earliest
+      | $agent_a_latest < $agent_b_earliest
+    ' <<<"$MEMORY_PROVENANCE" >/dev/null 2>&1 && echo 0 || echo 1)"
+  check "${label}: full shared-entity history contains the common start and both evidence bases" \
+    "$(jq -e --argjson provenance "$MEMORY_PROVENANCE" '
+      length >= 3
+      and ([.[].entity_id] | unique | length) == 1
+      and (($provenance | map(.snapshot_id) | unique) - ([.[].id] | unique) | length) == 0
+    ' <<<"$MEMORY_HISTORY" >/dev/null 2>&1 && echo 0 || echo 1)"
+  check "${label}: both decisions serve exactly the same intention" \
+    "$(jq -e --argjson provenance "$MEMORY_PROVENANCE" '
+      length == 2
+      and ([.[].decision_id] | sort) == ($provenance | map(.decision_id) | unique | sort)
+      and ([.[].intention_id] | unique | length) == 1
+    ' <<<"$MEMORY_INTENTIONS" >/dev/null 2>&1 && echo 0 || echo 1)"
+  check "${label}: one exact conflict names both decisions, their intention, and real tension" \
+    "$(jq -e --argjson provenance "$MEMORY_PROVENANCE" --argjson intentions "$MEMORY_INTENTIONS" '
+      length == 1
+      and ([.[0].older_decision_id, .[0].newer_decision_id] | sort)
+          == ($provenance | map(.decision_id) | unique | sort)
+      and .[0].intention_in_tension == true
+      and ((.[0].threatened_intention_ids
+            | if type == "string" then fromjson else . end) == [$intentions[0].intention_id])
+    ' <<<"$MEMORY_CONFLICTS" >/dev/null 2>&1 && echo 0 || echo 1)"
+  check "${label}: convergence invents neither semantic invalidation nor supersession" \
+    "$([[ "$MEMORY_INVALIDATIONS" == "[]" && "$MEMORY_SUPERSEDES" == "[]" ]] && echo 0 || echo 1)"
+}
+
 # A correction/skill/HITL verb is "available" once it is wired into the CLI dispatch. Until then
 # `cg <verb>` prints `unknown command `<verb>`` (usage_error) and the section SKIPs.
 # All seven verbs (fix/drop/group/undo/skills/review/why) are wired in this build;
@@ -179,11 +426,16 @@ verb_available() {
 section "SETUP"
 printf 'log file       : %s\n' "$LOG"
 printf 'cg binary      : %s\n' "$CG"
+printf 'contextdb      : %s\n' "$CONTEXTDB"
 printf 'data root      : %s\n' "$CG_DATA_ROOT"
 printf 'provider       : %s  endpoint=%s\n' "$PROVIDER" "$ENDPOINT"
 printf 'model          : %s\n' "$MODEL"
 printf 'tenant         : %s\n' "$TENANT"
-printf 'relay hub      : %s\n' "${HUB:-<unset — release gate will fail>}"
+if [[ -n "$HUB_TICKET" ]]; then
+  printf 'Iroh hub ticket: configured\n'
+else
+  printf 'Iroh hub ticket: <unset — release gate will fail>\n'
+fi
 printf 'api key        : OPENROUTER_API_KEY (by NAME only; never printed)\n'
 
 if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
@@ -193,17 +445,26 @@ fi
 json_require_jq || exit 2
 
 # ---------------------------------------------------------------------------
-section "STEP 0 — build cg"
-if [[ "$SKIP_BUILD" == "1" && -x "$CG" ]]; then
-  note "skip build (CG_SMOKE_SKIP_BUILD=1), using existing $CG"
-else
-  ( cd "$WORKTREE" && cargo build --release --bin cg )
+section "STEP 0 — installed release binaries only"
+if [[ "$SKIP_BUILD" != "1" ]]; then
+  check "CG_SMOKE_SKIP_BUILD=1 selects the installed-binary smoke path" 1
+  note "This smoke never builds from a checkout. Supply installed release binaries through CG and CONTEXTDB."
+  exit 2
 fi
 [[ -x "$CG" ]] && check "cg binary present and executable" 0 || { check "cg binary present and executable" 1; exit 2; }
+[[ -x "$CONTEXTDB" ]] && check "contextdb binary present and executable" 0 || { check "contextdb binary present and executable" 1; exit 2; }
+WORKSPACE_ANCESTOR="$(realpath -m -- "$WORKTREE/../..")"
+if ! validate_remove_tree_target "$WORKTREE/.." >/dev/null 2>&1 \
+  && ! validate_remove_tree_target "$WORKSPACE_ANCESTOR" >/dev/null 2>&1; then
+  check "destructive cleanup guard refuses the workspace and an ancestor containing it" 0
+else
+  check "destructive cleanup guard refuses the workspace and an ancestor containing it" 1
+  exit 2
+fi
 
 # ---------------------------------------------------------------------------
 section "STEP 1 — clean throwaway state + raise provider timeout"
-rm -rf "$CG_DATA_ROOT"
+safe_remove_tree "$CG_DATA_ROOT" || exit 2
 mkdir -p "$CG_DATA_ROOT/cg"
 cat > "$CG_DATA_ROOT/cg/providers.toml" <<EOF
 [providers.${PROVIDER}]
@@ -212,13 +473,13 @@ EOF
 note "wrote $CG_DATA_ROOT/cg/providers.toml (timeout_ms=${TIMEOUT_MS})"
 
 # ---------------------------------------------------------------------------
-section "STEP 1B — relay hub preflight for the cross-machine gate"
-if [[ -z "$HUB" || -z "$TENANT" ]]; then
-  check "cross-machine skill durability has CG_SMOKE_HUB and CG_SMOKE_TENANT" 1
-  note "This is a release-gate blocker, not a clean skip: run with a NATS URL served by a contextdb relay worker for the tenant."
+section "STEP 1B — ticketed Iroh hub preflight for the cross-machine gate"
+if [[ -z "$HUB_TICKET" || -z "${CG_SMOKE_TENANT:-}" ]]; then
+  check "cross-machine skill durability has CG_SMOKE_HUB_TICKET and CG_SMOKE_TENANT" 1
+  note "This is a release-gate blocker, not a clean skip: supply an authenticated Iroh enrollment ticket for this tenant."
 else
-  cg_run sync push --remote-server "$HUB" --tenant-id "$TENANT"
-  check "relay hub accepts an initial sync push for this tenant" "$(ok_rc)"
+  cg_run sync push --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "ticketed Iroh hub accepts an initial sync push for this tenant" "$(ok_rc)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -235,12 +496,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 3A — deterministic grounding over every extracted value class"
-if ( cd "$WORKTREE" && cargo test -p context-graph --test acceptance grounding_silence ); then
-  check "grounding flags fabricated entity, decision_type, agent_id, observation, and outcome values" 0
-else
-  check "grounding flags fabricated entity, decision_type, agent_id, observation, and outcome values" 1
-fi
+section "STEP 3A — deterministic grounding belongs to the ordinary gate"
+note "The ordinary gate runs the grounding_silence acceptance module. This installed-binary smoke does not invoke Cargo."
 
 # ---------------------------------------------------------------------------
 section "STEP 3 — full-ontology capture, receipt leads with intention"
@@ -274,7 +531,7 @@ check "capture receipt reports token + time cost" \
   "$(grep -q '"prompt_tokens":[1-9]' <<<"$CAPTURE_OUT" && grep -q '"completion_tokens":[1-9]' <<<"$CAPTURE_OUT" && grep -q '"elapsed_ms":[1-9]' <<<"$CAPTURE_OUT" && echo 0 || echo 1)"
 # --estimate must compute without a model call. Prove it by estimating with the
 # provider connection REMOVED from a fresh data root (no outbound possible).
-( export CG_DATA_ROOT="${CG_DATA_ROOT}-estimate"; rm -rf "$CG_DATA_ROOT"; mkdir -p "$CG_DATA_ROOT"
+( export CG_DATA_ROOT="$ESTIMATE_ROOT"; safe_remove_tree "$CG_DATA_ROOT" || exit 2; mkdir -p "$CG_DATA_ROOT"
   printf '%s\n' '{"message":{"role":"user","content":"We decided to keep PostgreSQL on RDS for billing reliability."}}' > "$CG_DATA_ROOT/sess.jsonl"
   printf '\n$ cg import sess.jsonl --estimate   (no model connection in this data root)\n'
   "$CG" import "$CG_DATA_ROOT/sess.jsonl" --estimate 2>&1
@@ -582,25 +839,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-section "STEP 10 — cross-machine skill durability over the contextdb relay hub"
-if [[ -z "$HUB" || -z "${CG_SMOKE_TENANT:-}" ]]; then
-  check "cross-machine skill durability requires CG_SMOKE_HUB and CG_SMOKE_TENANT" 1
-  note "This is a release-gate blocker, not a clean skip: run with a contextdb-enterprise-server relay NATS URL."
+section "STEP 10 — cross-machine skill durability over authenticated ticketed Iroh"
+if [[ -z "$HUB_TICKET" || -z "${CG_SMOKE_TENANT:-}" ]]; then
+  check "cross-machine skill durability requires CG_SMOKE_HUB_TICKET and CG_SMOKE_TENANT" 1
+  note "This is a release-gate blocker, not a clean skip: supply an authenticated Iroh enrollment ticket for this tenant."
 else
-  EDGE_A_ROOT="$CG_DATA_ROOT"
-  EDGE_B_ROOT="${CG_DATA_ROOT}-edgeB"
   export CG_DATA_ROOT="$EDGE_A_ROOT"
-  cg_run sync push --remote-server "$HUB" --tenant-id "$TENANT"
-  check "edge A pushed learned skill rows to the contextdb relay hub" \
+  cg_run sync push --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "edge A pushed learned skill rows to the authenticated ticketed Iroh hub" \
     "$([[ $LAST_RC -eq 0 ]] && is_ok_json "$LAST_OUT" && echo 0 || echo 1)"
 
-  rm -rf "$EDGE_B_ROOT"
+  safe_remove_tree "$EDGE_B_ROOT" || exit 2
   mkdir -p "$EDGE_B_ROOT"
   export CG_DATA_ROOT="$EDGE_B_ROOT"
   cg_run model connect "$PROVIDER" --provider "$PROVIDER" --endpoint "$ENDPOINT" --model "$MODEL" --env-key OPENROUTER_API_KEY --consent
   check "edge B model connect returned ok" "$(ok_rc)"
-  cg_run sync pull --remote-server "$HUB" --tenant-id "$TENANT"
-  check "edge B pulled from the contextdb relay hub" \
+  cg_run sync pull --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "edge B pulled from the authenticated ticketed Iroh hub" \
     "$([[ $LAST_RC -eq 0 ]] && is_ok_json "$LAST_OUT" && echo 0 || echo 1)"
   cg_run skills --context skillz
   EDGE_B_SKILL_JSON="$(jq -c --arg id "$TRAINED_SKILL_ID" '.skills[]? | select(.id == $id)' <<<"$(json_first_obj "$LAST_OUT")" | head -1)"
@@ -624,6 +879,232 @@ else
   check "edge B stores context-graph as Repository after applying the pulled skill" \
     "$([[ "$(json_field "$LAST_OUT" '.entity.entity_type')" == "Repository" ]] && echo 0 || echo 1)"
   export CG_DATA_ROOT="$EDGE_A_ROOT"
+fi
+
+# ---------------------------------------------------------------------------
+section "STEP 11 — usage-first agent memory survives convergence, reopen, and wipe/restore"
+if [[ -z "$HUB_TICKET" || -z "${CG_SMOKE_TENANT:-}" ]]; then
+  check "agent-memory convergence requires CG_SMOKE_HUB_TICKET and CG_SMOKE_TENANT" 1
+  note "This is a release-gate blocker: the proof needs two real edges and a wiped third edge against one authenticated hub."
+else
+  read -r -d '' MEMORY_BASE <<'EOF' || true
+Goal G_memory: keep the shared authentication implementation correct.
+Entity E_auth: shared authentication module type=file path=src/auth.rs.
+EOF
+  read -r -d '' MEMORY_EDGE_A <<'EOF' || true
+Agent identity: agent-a.
+Goal G_memory: keep the shared authentication implementation correct.
+Entity E_auth: shared authentication module type=file path=src/auth.rs.
+Observation O_agent_a: agent-a observed the shared authentication module path change src/auth.rs -> src/authentication.rs; source=agent-a.
+Decision D_agent_a: agent-a chose src/authentication.rs for the authentication implementation, decision_type=authentication_implementation, agent_id=agent-a, serves G_memory, based_on E_auth.
+Outcome for D_agent_a: success=true; agent-a independently verified the implementation.
+EOF
+  read -r -d '' MEMORY_EDGE_B <<'EOF' || true
+Agent identity: agent-b.
+Goal G_memory: keep the shared authentication implementation correct.
+Entity E_auth: shared authentication module type=file path=src/auth.rs.
+Observation O_agent_b: agent-b observed the shared authentication module path change src/auth.rs -> src/identity.rs; source=agent-b.
+Decision D_agent_b: agent-b chose src/identity.rs for the authentication implementation, decision_type=authentication_implementation, agent_id=agent-b, serves G_memory, based_on E_auth.
+Outcome for D_agent_b: success=false; agent-b independently found the implementation unsuccessful.
+EOF
+
+  export CG_DATA_ROOT="$EDGE_A_ROOT"
+  cg_record_retry 3 --context memory-convergence "$MEMORY_BASE"
+  check "edge A records the common goal and shared entity before either agent branches" "$(ok_rc)"
+  cg_run sync push --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "edge A pushes the common starting memory" "$(ok_rc)"
+
+  export CG_DATA_ROOT="$EDGE_B_ROOT"
+  cg_run sync pull --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "edge B pulls the common starting memory before working independently" "$(ok_rc)"
+
+  export CG_DATA_ROOT="$EDGE_A_ROOT"
+  cg_record_retry 3 --context memory-convergence "$MEMORY_EDGE_A"
+  check "edge A records agent-a's identified observation, decision, basis, and outcome" "$(ok_rc)"
+
+  export CG_DATA_ROOT="$EDGE_B_ROOT"
+  cg_record_retry 3 --context memory-convergence "$MEMORY_EDGE_B"
+  check "edge B records agent-b's identified observation, decision, basis, and outcome" "$(ok_rc)"
+
+  export CG_DATA_ROOT="$EDGE_A_ROOT"
+  cg_run sync push --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "edge A pushes its independent memory first without claiming semantic precedence" "$(ok_rc)"
+  export CG_DATA_ROOT="$EDGE_B_ROOT"
+  cg_run sync push --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "edge B pushes its later real-world memory without overwriting edge A" "$(ok_rc)"
+  export CG_DATA_ROOT="$EDGE_A_ROOT"
+  cg_run sync pull --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "edge A pulls the converged memory" "$(ok_rc)"
+  export CG_DATA_ROOT="$EDGE_B_ROOT"
+  cg_run sync pull --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "edge B pulls the converged memory" "$(ok_rc)"
+
+  read_memory_evidence "$EDGE_A_ROOT" "edge A after convergence"
+  assert_memory_evidence "edge A after convergence"
+  EDGE_A_EVIDENCE="$(jq -nc \
+    --argjson provenance "$MEMORY_PROVENANCE" \
+    --argjson history "$MEMORY_HISTORY" \
+    --argjson intentions "$MEMORY_INTENTIONS" \
+    --argjson conflicts "$MEMORY_CONFLICTS" \
+    --argjson invalidations "$MEMORY_INVALIDATIONS" \
+    --argjson supersedes "$MEMORY_SUPERSEDES" \
+    '{provenance:$provenance,history:$history,intentions:$intentions,conflicts:$conflicts,invalidations:$invalidations,supersedes:$supersedes}')"
+
+  read_memory_evidence "$EDGE_B_ROOT" "edge B after convergence"
+  assert_memory_evidence "edge B after convergence"
+  EDGE_B_EVIDENCE="$(jq -nc \
+    --argjson provenance "$MEMORY_PROVENANCE" \
+    --argjson history "$MEMORY_HISTORY" \
+    --argjson intentions "$MEMORY_INTENTIONS" \
+    --argjson conflicts "$MEMORY_CONFLICTS" \
+    --argjson invalidations "$MEMORY_INVALIDATIONS" \
+    --argjson supersedes "$MEMORY_SUPERSEDES" \
+    '{provenance:$provenance,history:$history,intentions:$intentions,conflicts:$conflicts,invalidations:$invalidations,supersedes:$supersedes}')"
+  check "both independently stopped edge files expose byte-for-byte equivalent memory evidence" \
+    "$([[ "$EDGE_A_EVIDENCE" == "$EDGE_B_EVIDENCE" ]] && echo 0 || echo 1)"
+
+  export CG_DATA_ROOT="$EDGE_A_ROOT"
+  cg_run status --context memory-convergence
+  check "edge A reopens through a fresh cg process" "$(ok_rc)"
+  export CG_DATA_ROOT="$EDGE_B_ROOT"
+  cg_run status --context memory-convergence
+  check "edge B reopens through a fresh cg process" "$(ok_rc)"
+  read_memory_evidence "$EDGE_A_ROOT" "reopened edge A"
+  assert_memory_evidence "reopened edge A"
+  REOPENED_A_EVIDENCE="$(jq -nc \
+    --argjson provenance "$MEMORY_PROVENANCE" \
+    --argjson history "$MEMORY_HISTORY" \
+    --argjson intentions "$MEMORY_INTENTIONS" \
+    --argjson conflicts "$MEMORY_CONFLICTS" \
+    --argjson invalidations "$MEMORY_INVALIDATIONS" \
+    --argjson supersedes "$MEMORY_SUPERSEDES" \
+    '{provenance:$provenance,history:$history,intentions:$intentions,conflicts:$conflicts,invalidations:$invalidations,supersedes:$supersedes}')"
+  read_memory_evidence "$EDGE_B_ROOT" "reopened edge B"
+  assert_memory_evidence "reopened edge B"
+  REOPENED_B_EVIDENCE="$(jq -nc \
+    --argjson provenance "$MEMORY_PROVENANCE" \
+    --argjson history "$MEMORY_HISTORY" \
+    --argjson intentions "$MEMORY_INTENTIONS" \
+    --argjson conflicts "$MEMORY_CONFLICTS" \
+    --argjson invalidations "$MEMORY_INVALIDATIONS" \
+    --argjson supersedes "$MEMORY_SUPERSEDES" \
+    '{provenance:$provenance,history:$history,intentions:$intentions,conflicts:$conflicts,invalidations:$invalidations,supersedes:$supersedes}')"
+  check "process reopen changes none of either edge's memory evidence" \
+    "$([[ "$EDGE_A_EVIDENCE" == "$REOPENED_A_EVIDENCE" && "$EDGE_A_EVIDENCE" == "$REOPENED_B_EVIDENCE" ]] && echo 0 || echo 1)"
+
+  export CG_DATA_ROOT="$EDGE_A_ROOT"
+  cg_run review --context memory-convergence
+  MEMORY_CURRENCY_COUNT="$(review_count "$LAST_OUT" currency_flips)"
+  check "cg review keeps reconciliation explicit instead of silently choosing a current decision" \
+    "$([[ $LAST_RC -eq 0 && -n "$MEMORY_CURRENCY_COUNT" ]] && echo 0 || echo 1)"
+  note "Both active decisions remain in explicit tension; currency_flips=${MEMORY_CURRENCY_COUNT:-<absent>} does not choose a winner."
+
+  safe_remove_tree "$EDGE_C_ROOT" || exit 2
+  mkdir -p "$EDGE_C_ROOT"
+  export CG_DATA_ROOT="$EDGE_C_ROOT"
+  cg_run sync pull --remote-server "$HUB_TICKET" --tenant-id "$TENANT"
+  check "a wiped third edge restores solely from the authenticated hub" "$(ok_rc)"
+  read_memory_evidence "$EDGE_C_ROOT" "wiped-and-restored edge C"
+  assert_memory_evidence "wiped-and-restored edge C"
+  RESTORED_C_EVIDENCE="$(jq -nc \
+    --argjson provenance "$MEMORY_PROVENANCE" \
+    --argjson history "$MEMORY_HISTORY" \
+    --argjson intentions "$MEMORY_INTENTIONS" \
+    --argjson conflicts "$MEMORY_CONFLICTS" \
+    --argjson invalidations "$MEMORY_INVALIDATIONS" \
+    --argjson supersedes "$MEMORY_SUPERSEDES" \
+    '{provenance:$provenance,history:$history,intentions:$intentions,conflicts:$conflicts,invalidations:$invalidations,supersedes:$supersedes}')"
+  check "the wiped edge restores the exact complete history, provenance, and unresolved tension" \
+    "$([[ "$EDGE_A_EVIDENCE" == "$RESTORED_C_EVIDENCE" ]] && echo 0 || echo 1)"
+
+  export CG_DATA_ROOT="$EDGE_A_ROOT"
+  cg_run changed --context memory-convergence
+  check "cg changed installs and exercises the local changed cursor without inventing staleness" \
+    "$([[ $LAST_RC -eq 0 && "$(json_field "$LAST_OUT" '.changed | length')" == "0" ]] && echo 0 || echo 1)"
+
+  KEEP_LATEST_TABLES=(
+    intentions decisions entities reindex_cursors outcomes invalidations
+    entity_current_snapshots cg_learned_skills
+  )
+  KEEP_FIRST_TABLES=(
+    cg_schema_version contexts observations evidence embedding_spaces embedding_space_bindings
+    evidence_embedding_handles entity_reference_embedding_handles
+    entity_reference_embeddings_128 entity_reference_embeddings_256
+    entity_reference_embeddings_512 entity_reference_embeddings_768
+    evidence_availability_log signatures signature_aggregates signature_producer_lineage
+    digests digest_embedding_handles blueprints edges entity_snapshots
+    entity_snapshot_observations decision_basis_snapshots entity_snapshot_links
+    intention_snapshots approvals conflicts precedent_matches cg_teaching_events
+    cg_overlay_entries cg_compensation_events
+  )
+  SYNC_OFF_TABLES=(
+    audit_log cg_skill_firing_trace cg_review_cursor cg_pending_review_items
+    cg_source_chunks cg_retrieval_touches cg_understanding_completions cg_local_settings
+    cg_changed_cursors cg_runtime_models
+  )
+  ENGINE_OWNED_TABLES=(
+    work_jobs work_claims work_results work_failures work_cancellations work_inputs
+    work_capabilities
+  )
+  cdb_schema_inventory "$EDGE_A_ROOT" \
+    "${KEEP_LATEST_TABLES[@]}" "${KEEP_FIRST_TABLES[@]}" "${SYNC_OFF_TABLES[@]}" \
+    "${ENGINE_OWNED_TABLES[@]}"
+  SCHEMA_INVENTORY="$CDB_OUT"
+  check "installed contextdb emits all 49 Context Graph declarations plus seven engine-owned schemas (56 total)" \
+    "$([[ $CDB_RC -eq 0 && "$(jq -s 'length' <<<"$SCHEMA_INVENTORY" 2>/dev/null)" == "56" ]] && echo 0 || echo 1)"
+  check "the schema inventory names 8 KEEP LATEST, 31 KEEP FIRST, and 10 SYNC OFF CG tables" \
+    "$([[ ${#KEEP_LATEST_TABLES[@]} -eq 8 && ${#KEEP_FIRST_TABLES[@]} -eq 31 && ${#SYNC_OFF_TABLES[@]} -eq 10 ]] && echo 0 || echo 1)"
+
+  DECLARATION_FAILURES=()
+  for table in "${KEEP_LATEST_TABLES[@]}"; do
+    jq -se --arg table "$table" '
+      [.[] | select(.table == $table)] as $match
+      | ($match | length) == 1
+        and $match[0].sync_direction == "two_way"
+        and $match[0].conflict_policy == "keep_latest"
+    ' <<<"$SCHEMA_INVENTORY" >/dev/null 2>&1 || DECLARATION_FAILURES+=("${table}: expected TWO WAY / KEEP LATEST")
+  done
+  for table in "${KEEP_FIRST_TABLES[@]}"; do
+    jq -se --arg table "$table" '
+      [.[] | select(.table == $table)] as $match
+      | ($match | length) == 1
+        and $match[0].sync_direction == "two_way"
+        and $match[0].conflict_policy == "keep_first"
+    ' <<<"$SCHEMA_INVENTORY" >/dev/null 2>&1 || DECLARATION_FAILURES+=("${table}: expected TWO WAY / KEEP FIRST")
+  done
+  for table in "${SYNC_OFF_TABLES[@]}"; do
+    jq -se --arg table "$table" '
+      [.[] | select(.table == $table)] as $match
+      | ($match | length) == 1
+        and $match[0].sync_direction == "sync_off"
+        and ($match[0] | has("conflict_policy") | not)
+    ' <<<"$SCHEMA_INVENTORY" >/dev/null 2>&1 || DECLARATION_FAILURES+=("${table}: expected SYNC OFF and no conflict policy")
+  done
+  for table in "${ENGINE_OWNED_TABLES[@]}"; do
+    jq -se --arg table "$table" '
+      [.[] | select(.table == $table)] as $match | ($match | length) == 1
+    ' <<<"$SCHEMA_INVENTORY" >/dev/null 2>&1 || DECLARATION_FAILURES+=("${table}: engine-owned schema missing")
+  done
+  check "every CG table exposes its exact frozen declaration; engine-owned tables are only existence-checked" \
+    "$([[ ${#DECLARATION_FAILURES[@]} -eq 0 ]] && echo 0 || echo 1)"
+  for failure in "${DECLARATION_FAILURES[@]}"; do note "$failure"; done
+
+  FORBIDDEN_POLICY_SYMBOLS=(
+    context_graph_sync_table_contract ContextGraphSyncTablePolicy sync_policy_for_table
+    context_graph_sync_conflict_policies register_context_graph_sync_client
+    ContextGraphSyncRegistration work_ledger_conflict_policy_entries
+    LOCAL_ONLY_RUNTIME_SYNC_TABLES ConflictPolicies ConflictPolicy SyncDirection
+    '.set_default_conflict_policy(' '.set_table_direction(' '.set_conflict_policy('
+  )
+  POLICY_SOURCE_OFFENDERS=""
+  for symbol in "${FORBIDDEN_POLICY_SYMBOLS[@]}"; do
+    matches="$(rg -nF --glob '*.rs' -- "$symbol" \
+      "$WORKTREE/crates/context-graph/src" "$WORKTREE/crates/cg-cli/src" 2>/dev/null || true)"
+    [[ -z "$matches" ]] || POLICY_SOURCE_OFFENDERS+="${symbol}"$'\n'"${matches}"$'\n'
+  done
+  check "recursive production-source audit finds no moved helper or runtime map rebuilding declared policy" \
+    "$([[ -z "$POLICY_SOURCE_OFFENDERS" ]] && echo 0 || echo 1)"
+  [[ -z "$POLICY_SOURCE_OFFENDERS" ]] || printf '%s' "$POLICY_SOURCE_OFFENDERS"
 fi
 
 # ---------------------------------------------------------------------------

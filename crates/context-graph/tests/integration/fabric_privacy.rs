@@ -4,7 +4,6 @@
 use context_graph::fabric::{
     self, FabricCapture, FabricConfig, FabricPollOutcome, FabricWorkerConfig, MovementDecision,
 };
-use contextdb_engine::sync_types::SyncDirection;
 
 use crate::fabric_common::{
     CountingExtractor, FabricNode, context_id, fabric_fixture_with_tenants, memory_total,
@@ -229,14 +228,21 @@ async fn default_on_sharing_is_same_tenant_scoped() {
 
 #[test]
 fn permanent_raw_store_never_syncs() {
-    let contract = context_graph::context_graph_sync_table_contract();
-    let raw = contract
-        .iter()
-        .find(|policy| policy.table == "cg_source_chunks")
-        .expect("cg_source_chunks is in the sync contract");
+    let node = FabricNode::open("permanent_raw_store_never_syncs");
+    let raw = node
+        .store
+        .sync_database()
+        .table_meta("cg_source_chunks")
+        .expect("cg_source_chunks must be installed");
     assert_eq!(
-        raw.direction,
-        SyncDirection::None,
-        "the permanent raw store carries no-sync direction; no push changeset ever contains it"
+        raw.sync_direction.map(|direction| direction.sql()),
+        Some("SYNC OFF"),
+        "the permanent raw store declares no-sync direction; no push changeset ever contains it"
+    );
+    assert_eq!(
+        raw.conflict_policy
+            .and_then(|policy| policy.declared_clause()),
+        None,
+        "cg_source_chunks is SYNC OFF and must not declare a conflict policy"
     );
 }

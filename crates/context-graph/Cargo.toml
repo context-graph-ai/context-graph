@@ -58,16 +58,17 @@ candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }
-contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh"] }
+contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh", "test-seams"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }
 criterion.workspace = true
+iroh = { version = "1.0.2", default-features = false, features = ["tls-ring"] }
+iroh-tickets = "1.0.0"
 safetensors.workspace = true
 sha2.workspace = true
 serde_yaml_ng.workspace = true
 tempfile.workspace = true
-testcontainers = "0.27"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokenizers.workspace = true
 trybuild.workspace = true

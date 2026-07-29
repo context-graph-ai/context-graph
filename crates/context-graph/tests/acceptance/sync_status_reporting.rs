@@ -16,14 +16,14 @@ async fn status_reports_configured_remote_and_sync_watermark() {
     push_pull(&fixture.edge1_client, &fixture.edge2_client).await;
     let status = sync_status_report(
         &fixture.edge1.store,
-        Some(&fixture.nats_url),
+        Some(&fixture.remote_url),
         Some(&fixture.tenant_id),
         Some(&TestSyncStatusBoundary(&fixture.edge1_client)),
     );
 
     assert_eq!(
         status.remote_url.as_deref(),
-        Some(fixture.nats_url.as_str())
+        Some(fixture.remote_url.as_str())
     );
     assert_eq!(
         status.tenant_id.as_deref(),
@@ -57,7 +57,7 @@ async fn status_reports_pending_push_count() {
     );
     let pending = sync_status_report(
         &fixture.edge1.store,
-        Some(&fixture.nats_url),
+        Some(&fixture.remote_url),
         Some(&fixture.tenant_id),
         Some(&TestSyncStatusBoundary(&fixture.edge1_client)),
     );
@@ -65,7 +65,7 @@ async fn status_reports_pending_push_count() {
     let expected_drained = expected_pending_push_change_count(&fixture.edge1_client);
     let drained = sync_status_report(
         &fixture.edge1.store,
-        Some(&fixture.nats_url),
+        Some(&fixture.remote_url),
         Some(&fixture.tenant_id),
         Some(&TestSyncStatusBoundary(&fixture.edge1_client)),
     );

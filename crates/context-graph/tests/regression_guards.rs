@@ -401,7 +401,12 @@ async fn sync_transport_and_restore_still_round_trips_after_refactor() {
 
     // A wiped/new edge begins empty and must pull back the full committed state.
     let restored_edge = TestStore::new("sync_round_trip_restored_edge");
-    let restored_client = fixture.new_edge_client(restored_edge.store.sync_database());
+    let restored_client = fixture.new_edge_client(
+        restored_edge.store.sync_database(),
+        &restored_edge
+            .db_path()
+            .with_extension("fabric-identity.key"),
+    );
     assert_eq!(
         restored_edge
             .store

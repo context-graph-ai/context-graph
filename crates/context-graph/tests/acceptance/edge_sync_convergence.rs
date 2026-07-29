@@ -220,7 +220,12 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
     );
 
     let restored_edge = TestStore::new("wiped_restore_reopened_edge");
-    let restored_client = fixture.new_edge_client(restored_edge.store.sync_database());
+    let restored_client = fixture.new_edge_client(
+        restored_edge.store.sync_database(),
+        &restored_edge
+            .db_path()
+            .with_extension("fabric-identity.key"),
+    );
     assert_eq!(
         restored_edge
             .store
@@ -727,7 +732,13 @@ async fn cross_context_isolation_survives_sync() {
     let context_a = seed_decision_graph(&fixture.edge1.store, "tenant-alpha-a", "context A");
     let context_b = seed_decision_graph(&fixture.edge1.store, "tenant-alpha-b", "context B");
     let edge2_context_b = fixture.edge2.scoped_store([context_b.context_id]);
-    let edge2_scoped_client = fixture.new_edge_client(edge2_context_b.sync_database());
+    let edge2_scoped_client = fixture.new_edge_client(
+        edge2_context_b.sync_database(),
+        &fixture
+            .edge2
+            .db_path()
+            .with_extension("fabric-identity.key"),
+    );
     drain_push(&fixture.edge1_client).await;
     drain_pull(&edge2_scoped_client).await;
 
