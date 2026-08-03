@@ -1646,7 +1646,7 @@ impl Store {
                 changed_at,
             });
         }
-        input_diffs.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+        input_diffs.sort_by_key(|diff| diff.entity_id);
         let changed_input_count = input_diffs.iter().filter(|diff| diff.changed).count() as u32;
 
         let mut cited_intention_snapshots = Vec::with_capacity(decision.intention_ids.len());
@@ -1655,7 +1655,7 @@ impl Store {
                 self.intention_snapshot_for_decision_at_read(*intention_id, &decision, snapshot)?;
             cited_intention_snapshots.push(snapshot_row);
         }
-        cited_intention_snapshots.sort_by(|a, b| a.intention_id.cmp(&b.intention_id));
+        cited_intention_snapshots.sort_by_key(|snapshot| snapshot.intention_id);
 
         let unchanged_input_count = input_diffs.len() as u32 - changed_input_count;
         let invalidations_at_read = self.invalidations_for_decision_at_read(id, snapshot)?;

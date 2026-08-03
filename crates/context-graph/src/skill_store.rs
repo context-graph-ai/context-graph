@@ -882,7 +882,7 @@ fn unresolved_firing_id_for_skill_capture(
             Some((created, id))
         })
         .collect();
-    candidates.sort_by(|a, b| value_order_key(&b.0).cmp(&value_order_key(&a.0)));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(value_order_key(&candidate.0)));
     Some(
         candidates
             .into_iter()
@@ -939,7 +939,7 @@ fn unresolved_firing_effect_rows_for_capture(
             ))
         })
         .collect();
-    candidates.sort_by(|a, b| value_order_key(&a.0).cmp(&value_order_key(&b.0)));
+    candidates.sort_by_key(|candidate| value_order_key(&candidate.0));
     Some(candidates.into_iter().map(|(_, row)| row).collect())
 }
 

@@ -570,7 +570,7 @@ pub fn drain_local_worker(
             pending.push((context.id, label.clone(), candidate));
         }
     }
-    pending.sort_by(|a, b| b.2.touch_count.cmp(&a.2.touch_count));
+    pending.sort_by_key(|candidate| std::cmp::Reverse(candidate.2.touch_count));
 
     let mut drained = 0usize;
     for (context_id, context_label, candidate) in pending {
