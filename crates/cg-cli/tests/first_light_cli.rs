@@ -475,15 +475,9 @@ fn schema_allows_null(schema: &Value) -> bool {
         return false;
     };
     match object.get("type") {
-        Some(Value::String(type_name)) => {
-            if type_name == "null" {
-                return true;
-            }
-        }
-        Some(Value::Array(types)) => {
-            if types.iter().any(|item| item.as_str() == Some("null")) {
-                return true;
-            }
+        Some(Value::String(type_name)) if type_name == "null" => return true,
+        Some(Value::Array(types)) if types.iter().any(|item| item.as_str() == Some("null")) => {
+            return true;
         }
         _ => {}
     }
