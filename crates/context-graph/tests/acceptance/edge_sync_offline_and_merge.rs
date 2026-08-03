@@ -30,16 +30,29 @@ struct IndependentHistory {
     outcome: Outcome,
 }
 
-fn record_independent_history(
-    store: &Store,
+struct IndependentHistoryInput<'a> {
     context_id: ContextId,
     intention_id: IntentionId,
     shared_entity_id: EntityId,
-    author: &str,
-    revised_path: &str,
+    author: &'a str,
+    revised_path: &'a str,
     observed_at: DateTime<Utc>,
     outcome_success: bool,
+}
+
+fn record_independent_history(
+    store: &Store,
+    input: IndependentHistoryInput<'_>,
 ) -> IndependentHistory {
+    let IndependentHistoryInput {
+        context_id,
+        intention_id,
+        shared_entity_id,
+        author,
+        revised_path,
+        observed_at,
+        outcome_success,
+    } = input;
     let observation_id = ObservationId::new_v7();
     let evidence_id = EvidenceId::new_v7();
     let evidence_source = format!("vigil-edge:session/{author}");
@@ -50,7 +63,7 @@ fn record_independent_history(
             context_id,
             observation_type: "agent_session_fact".to_string(),
             source: author.to_string(),
-            observed_at: observed_at.clone(),
+            observed_at,
             evidence: vec![EvidenceRef {
                 id: evidence_id,
                 source_ref: evidence_source.clone(),
@@ -343,23 +356,27 @@ async fn independent_memory_histories_survive_convergence_restart_and_restore() 
 
     let history_a = record_independent_history(
         &edge_a.store,
-        context.id,
-        intention.id,
-        entity.id,
-        "agent-a",
-        "src/authentication.rs",
-        fixed_observed_at("2026-01-15T10:00:00Z"),
-        true,
+        IndependentHistoryInput {
+            context_id: context.id,
+            intention_id: intention.id,
+            shared_entity_id: entity.id,
+            author: "agent-a",
+            revised_path: "src/authentication.rs",
+            observed_at: fixed_observed_at("2026-01-15T10:00:00Z"),
+            outcome_success: true,
+        },
     );
     let history_b = record_independent_history(
         &edge_b.store,
-        context.id,
-        intention.id,
-        entity.id,
-        "agent-b",
-        "src/identity.rs",
-        fixed_observed_at("2026-01-15T10:05:00Z"),
-        false,
+        IndependentHistoryInput {
+            context_id: context.id,
+            intention_id: intention.id,
+            shared_entity_id: entity.id,
+            author: "agent-b",
+            revised_path: "src/identity.rs",
+            observed_at: fixed_observed_at("2026-01-15T10:05:00Z"),
+            outcome_success: false,
+        },
     );
     assert_ne!(history_a.decision_id, history_b.decision_id);
     assert_ne!(history_a.observation_id, history_b.observation_id);
