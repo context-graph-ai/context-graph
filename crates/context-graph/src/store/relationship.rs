@@ -14,6 +14,18 @@ use super::convert::{map_engine_err, relationship_type_from_str, relationship_ty
 
 impl Store {
     pub fn add_relationship(&self, from: EntityId, to: EntityId, rel: String) -> Result<()> {
+        self.add_relationship_after_insert(from, to, rel, || {})
+    }
+
+    // Keeping the insert/commit boundary in one private helper lets the unit test force the
+    // commit-time uniqueness schedule without exposing a test control in the public API.
+    fn add_relationship_after_insert(
+        &self,
+        from: EntityId,
+        to: EntityId,
+        rel: String,
+        after_insert: impl FnOnce(),
+    ) -> Result<()> {
         let from_entity = self.get_entity(from)?;
         if from_entity.is_none() {
             return Err(CgError::NotFound {
@@ -43,10 +55,44 @@ impl Store {
             None,
         ) {
             let _ = self.db.rollback(tx);
+            if matches!(&e, CgError::UniqueViolation { entity: "edge", .. })
+                && self.relationship_exists(from, to, &rel)?
+            {
+                return Ok(());
+            }
             return Err(e);
         }
-        self.db.commit(tx).map_err(map_engine_err)?;
-        Ok(())
+        after_insert();
+        match self.db.commit(tx) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let mapped = map_engine_err(err);
+                if matches!(&mapped, CgError::UniqueViolation { entity: "edge", .. })
+                    && self.relationship_exists(from, to, &rel)?
+                {
+                    return Ok(());
+                }
+                Err(mapped)
+            }
+        }
+    }
+
+    fn relationship_exists(&self, from: EntityId, to: EntityId, rel: &str) -> Result<bool> {
+        let params: HashMap<String, Value> = [
+            ("source_id".to_string(), Value::Uuid(from.as_uuid())),
+            ("target_id".to_string(), Value::Uuid(to.as_uuid())),
+            ("edge_type".to_string(), Value::Text(rel.to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        Ok(!result.rows.is_empty())
     }
 
     pub fn traverse(&self, start: EntityId, filter: TraverseFilter) -> Result<TraversalResult> {
@@ -334,6 +380,182 @@ impl Store {
             format!("DELETE FROM edges WHERE {}", clauses.join(" AND ")),
             params,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, mpsc};
+
+    use contextdb_engine::plugin::DatabasePlugin;
+
+    use super::*;
+    use crate::{CreateContext, CreateEntity, EntityType, StoreConfig};
+
+    fn fixture() -> (tempfile::TempDir, Store, EntityId, EntityId, EntityId) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(StoreConfig {
+            db_path: dir.path().join("relationship-race.db"),
+            default_text_embedder: None,
+            ..Default::default()
+        })
+        .expect("open store");
+        let context = store
+            .create_context(CreateContext {
+                name: "relationship-race".to_string(),
+                labels: Vec::new(),
+                properties: BTreeMap::new(),
+            })
+            .expect("context")
+            .id;
+        let from = store
+            .create_entity(CreateEntity {
+                entity_type: EntityType::Service,
+                name: "service".to_string(),
+                properties: BTreeMap::new(),
+                tags: Vec::new(),
+                context_id: context,
+            })
+            .expect("source")
+            .id;
+        let to = store
+            .create_entity(CreateEntity {
+                entity_type: EntityType::Database,
+                name: "database".to_string(),
+                properties: BTreeMap::new(),
+                tags: Vec::new(),
+                context_id: context,
+            })
+            .expect("target")
+            .id;
+        let unrelated = store
+            .create_entity(CreateEntity {
+                entity_type: EntityType::Infrastructure,
+                name: "queue".to_string(),
+                properties: BTreeMap::new(),
+                tags: Vec::new(),
+                context_id: context,
+            })
+            .expect("unrelated target")
+            .id;
+        (dir, store, from, to, unrelated)
+    }
+
+    #[test]
+    fn exact_triple_commit_time_uniqueness_is_idempotent() {
+        let (_dir, store, from, to, _unrelated) = fixture();
+        let (inserted_tx, inserted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let paused_writer = store.clone();
+        let first = std::thread::spawn(move || {
+            paused_writer.add_relationship_after_insert(from, to, "DEPENDS_ON".to_string(), || {
+                inserted_tx.send(()).expect("first insert announced");
+                release_rx.recv().expect("first commit released");
+            })
+        });
+
+        inserted_rx
+            .recv()
+            .expect("first edge insert completed before its commit");
+        store
+            .add_relationship(from, to, "DEPENDS_ON".to_string())
+            .expect("second exact triple commits while first is paused");
+        release_tx.send(()).expect("release first commit");
+        first
+            .join()
+            .expect("first writer joined")
+            .expect("duplicate commit is idempotent");
+        assert_eq!(
+            store
+                .admin_raw_edge_count(from, "DEPENDS_ON".to_string(), to)
+                .expect("edge count"),
+            1,
+            "the commit-time duplicate leaves exactly one relationship"
+        );
+    }
+
+    struct UnrelatedEdgeUniqueViolation;
+
+    impl DatabasePlugin for UnrelatedEdgeUniqueViolation {
+        fn pre_commit(
+            &self,
+            _ws: &contextdb_tx::WriteSet,
+            _source: contextdb_engine::plugin::CommitSource,
+        ) -> contextdb_core::Result<()> {
+            Err(contextdb_core::Error::UniqueViolation {
+                table: "edges".to_string(),
+                column: "id".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn unrelated_edge_uniqueness_is_not_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = StoreConfig {
+            db_path: dir.path().join("relationship-unrelated-unique.db"),
+            default_text_embedder: None,
+            ..Default::default()
+        };
+        let seed = Store::open(config.clone()).expect("open seed store");
+        let context = seed
+            .create_context(CreateContext {
+                name: "relationship-unrelated-unique".to_string(),
+                labels: Vec::new(),
+                properties: BTreeMap::new(),
+            })
+            .expect("context")
+            .id;
+        let from = seed
+            .create_entity(CreateEntity {
+                entity_type: EntityType::Service,
+                name: "service".to_string(),
+                properties: BTreeMap::new(),
+                tags: Vec::new(),
+                context_id: context,
+            })
+            .expect("source")
+            .id;
+        let exact_target = seed
+            .create_entity(CreateEntity {
+                entity_type: EntityType::Database,
+                name: "database".to_string(),
+                properties: BTreeMap::new(),
+                tags: Vec::new(),
+                context_id: context,
+            })
+            .expect("exact target")
+            .id;
+        let unrelated_target = seed
+            .create_entity(CreateEntity {
+                entity_type: EntityType::Infrastructure,
+                name: "queue".to_string(),
+                properties: BTreeMap::new(),
+                tags: Vec::new(),
+                context_id: context,
+            })
+            .expect("unrelated target")
+            .id;
+        seed.add_relationship(from, unrelated_target, "DEPENDS_ON".to_string())
+            .expect("unrelated edge");
+        drop(seed);
+
+        let store = Store::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            Some(Arc::new(UnrelatedEdgeUniqueViolation)),
+            Vec::new(),
+        )
+        .expect("reopen with failing commit plugin");
+        let err = store
+            .add_relationship(from, exact_target, "DEPENDS_ON".to_string())
+            .expect_err("an unrelated edge uniqueness failure stays loud");
+        assert!(
+            matches!(err, CgError::UniqueViolation { entity: "edge", .. }),
+            "the unrelated uniqueness violation must be returned: {err:?}"
+        );
     }
 }
 

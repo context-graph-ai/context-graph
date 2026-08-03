@@ -156,9 +156,9 @@ async fn start_ticketed_hub(
     .expect("authenticated hub bind stays bounded")
     .expect("bind authenticated ticketed hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+    let server = Arc::new(SyncServer::new(
         hub.store.sync_database(),
-        endpoint.transport(),
+        &endpoint,
         TenantId::from(tenant),
     ));
     let task = tokio::spawn(async move { server.run_until(shutdown).await });

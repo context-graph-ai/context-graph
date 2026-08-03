@@ -597,10 +597,34 @@ async fn concurrent_intention_and_decision_basis_both_survive_convergence() {
 async fn self_echo_pull_of_own_writes_is_idempotent() {
     let fixture = self_echo_sync_fixture("self_echo_pull_of_own_writes_is_idempotent").await;
     let seeded = seed_decision_graph(&fixture.node.store, "tenant-alpha", "self echo");
-    within(fixture.client.push()).await.expect("self push");
-    within(fixture.client.pull_default())
+    let pushed = within(fixture.client.push()).await.expect("self push");
+    assert!(
+        pushed.applied_rows > 0,
+        "the separate hub must accept the edge's graph before the echo pull: {pushed:?}"
+    );
+    assert!(
+        pushed.conflicts.is_empty(),
+        "the hub setup must not report a conflict: {pushed:?}"
+    );
+    assert_eq!(
+        pushed.skipped_rows, 0,
+        "the hub setup must not refuse a row by policy: {pushed:?}"
+    );
+    let pulled = within(fixture.client.pull_default())
         .await
         .expect("self pull");
+    assert_eq!(
+        pulled.applied_rows, 0,
+        "an unchanged self-echo applies no row: {pulled:?}"
+    );
+    assert!(
+        pulled.conflicts.is_empty(),
+        "an unchanged self-echo is not a conflict: {pulled:?}"
+    );
+    assert_eq!(
+        pulled.skipped_rows, 0,
+        "an unchanged self-echo is not a policy refusal: {pulled:?}"
+    );
 
     assert_decision_status_active(&fixture.node.store, seeded.decision.id);
     let invalidations = fixture

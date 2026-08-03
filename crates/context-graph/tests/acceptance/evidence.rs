@@ -2217,6 +2217,15 @@ fn record_observation_concurrent_cross_handle_against_same_entity_serializable_p
     for adjacent in history.windows(2) {
         assert_eq!(adjacent[0].valid_to, Some(adjacent[1].valid_from));
     }
+    let current = history.last().expect("current snapshot");
+    assert_eq!(current.valid_to, None, "the final snapshot remains open");
+    for writer in 0..4 {
+        assert_eq!(
+            current.properties.get(&format!("writer_{writer}")),
+            Some(&serde_json::json!(writer)),
+            "the serialized snapshot chain retains writer {writer}'s delta"
+        );
+    }
     let txids = history
         .iter()
         .map(|snapshot| snapshot.valid_from.0)

@@ -27,10 +27,28 @@ use super::{evidence_kind_str, retention_status_str};
 
 const ENTITY_REFERENCE_MATCH_THRESHOLD: f32 = 0.8;
 
+trait RecordObservationHooks {
+    fn after_state_delta_guards(&mut self) {}
+
+    fn conditional_update_conflict(&mut self) {}
+}
+
+struct NoopRecordObservationHooks;
+
+impl RecordObservationHooks for NoopRecordObservationHooks {}
+
 impl Store {
-    pub fn record_observation(
+    pub fn record_observation(&self, input: RecordObservation) -> Result<RecordObservationResult> {
+        self.record_observation_with_hooks(input, &mut NoopRecordObservationHooks)
+    }
+
+    // The hook is private and the public entry point always supplies the no-op implementation.
+    // It gives the unit test one exact point after strict snapshot guards are staged and before
+    // the no-op decision, without changing the production operation.
+    fn record_observation_with_hooks<H: RecordObservationHooks>(
         &self,
         mut input: RecordObservation,
+        hooks: &mut H,
     ) -> Result<RecordObservationResult> {
         for evidence in &mut input.evidence {
             evidence.observation_id = input.id;
@@ -137,7 +155,7 @@ impl Store {
                     }
                 }
             }
-            let snapshot_id = match self.merge_state_delta_in_tx(tx, &input) {
+            let snapshot_id = match self.merge_state_delta_in_tx(tx, &input, hooks) {
                 Ok(snapshot_id) => snapshot_id,
                 Err(StateDeltaMergeError::Retry) => {
                     let _ = self.db.rollback(tx);
@@ -224,6 +242,11 @@ impl Store {
             }
             if let Err(err) = self.db.commit(tx) {
                 match err {
+                    EngineError::ConditionalUpdateConflict { .. } => {
+                        hooks.conditional_update_conflict();
+                        std::thread::yield_now();
+                        continue;
+                    }
                     EngineError::UniqueViolation { table, column }
                         if record_observation_snapshot_retry_unique(&table, &column) =>
                     {
@@ -972,10 +995,11 @@ impl Store {
             })
     }
 
-    fn merge_state_delta_in_tx(
+    fn merge_state_delta_in_tx<H: RecordObservationHooks>(
         &self,
         tx: crate::TxId,
         input: &RecordObservation,
+        hooks: &mut H,
     ) -> std::result::Result<Option<EntitySnapshotId>, StateDeltaMergeError> {
         if input.state_delta.is_empty() {
             return Ok(None);
@@ -983,6 +1007,34 @@ impl Store {
         let current = self
             .open_entity_snapshot_for_merge(input.entity_id)
             .map_err(StateDeltaMergeError::Error)?;
+        if let Some(current) = current.as_ref() {
+            let still_open = self
+                .db
+                .guard_row_conditions_in_tx(
+                    tx,
+                    "entity_snapshots",
+                    "id",
+                    &Value::Uuid(current.id.as_uuid()),
+                    &[("valid_to".to_string(), Value::Null)],
+                )
+                .map_err(map_engine_err)
+                .map_err(StateDeltaMergeError::Error)?;
+            let still_current = self
+                .db
+                .guard_row_conditions_in_tx(
+                    tx,
+                    "entity_current_snapshots",
+                    "entity_id",
+                    &Value::Uuid(input.entity_id.as_uuid()),
+                    &[("snapshot_id".to_string(), Value::Uuid(current.id.as_uuid()))],
+                )
+                .map_err(map_engine_err)
+                .map_err(StateDeltaMergeError::Error)?;
+            if !still_open || !still_current {
+                return Err(StateDeltaMergeError::Retry);
+            }
+            hooks.after_state_delta_guards();
+        }
         let mut new_properties = current
             .as_ref()
             .map(|snapshot| snapshot.properties.clone())
@@ -1917,6 +1969,170 @@ fn validate_content_hash(hash: Option<&str>) -> Result<()> {
         Err(CgError::InvalidEvidenceHash {
             hash: hash.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+
+    use chrono::Utc;
+
+    use super::*;
+    use crate::{CreateContext, CreateEntity, EntityType, StoreConfig};
+
+    fn observation_input(
+        entity_id: EntityId,
+        context_id: ContextId,
+        region: &str,
+    ) -> RecordObservation {
+        let observation_id = ObservationId::new_v7();
+        RecordObservation {
+            id: observation_id,
+            entity_id,
+            context_id,
+            observation_type: "snapshot-guard-race".to_string(),
+            source: "unit-test".to_string(),
+            observed_at: Utc::now(),
+            evidence: vec![EvidenceRef {
+                id: EvidenceId::new_v7(),
+                observation_id,
+                context_id,
+                kind: EvidenceKind::Text,
+                source_ref:
+                    "cas://sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                mime_type: Some("text/plain".to_string()),
+                content_hash: None,
+                captured_at: Some(Utc::now()),
+                byte_range: None,
+                time_range_ms: None,
+                frame_index: None,
+                region: None,
+                producer: EvidenceProducer {
+                    system: "unit-test".to_string(),
+                    model_name: "fixture".to_string(),
+                    model_version: "1".to_string(),
+                    pipeline_version: "1".to_string(),
+                },
+                text_projection: None,
+                derived_from: None,
+                retention_status: RetentionStatus::RetainedExternal,
+                media_retention_until: None,
+                properties: BTreeMap::new(),
+            }],
+            observed_properties: BTreeMap::new(),
+            state_delta: BTreeMap::from([("region".to_string(), Some(serde_json::json!(region)))]),
+            properties: BTreeMap::new(),
+            embeddings: Vec::new(),
+        }
+    }
+
+    struct SnapshotGuardRaceHook {
+        paused_once: bool,
+        guards_registered: mpsc::Sender<()>,
+        release: Option<mpsc::Receiver<()>>,
+        conditional_conflicts: usize,
+    }
+
+    impl RecordObservationHooks for SnapshotGuardRaceHook {
+        fn after_state_delta_guards(&mut self) {
+            if !self.paused_once {
+                self.paused_once = true;
+                self.guards_registered
+                    .send(())
+                    .expect("strict snapshot guards announced");
+                self.release
+                    .take()
+                    .expect("one-shot release receiver")
+                    .recv()
+                    .expect("stale no-op writer released");
+            }
+        }
+
+        fn conditional_update_conflict(&mut self) {
+            self.conditional_conflicts += 1;
+        }
+    }
+
+    #[test]
+    fn stale_no_op_snapshot_merge_retries_after_strict_guard_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(StoreConfig {
+            db_path: dir.path().join("snapshot-guard-race.db"),
+            default_text_embedder: None,
+            ..Default::default()
+        })
+        .expect("open store");
+        let context_id = store
+            .create_context(CreateContext {
+                name: "snapshot-guard-race".to_string(),
+                labels: Vec::new(),
+                properties: BTreeMap::new(),
+            })
+            .expect("context")
+            .id;
+        let entity_id = store
+            .create_entity(CreateEntity {
+                entity_type: EntityType::Service,
+                name: "stateful service".to_string(),
+                properties: BTreeMap::from([("region".to_string(), serde_json::json!("stable"))]),
+                tags: Vec::new(),
+                context_id,
+            })
+            .expect("entity")
+            .id;
+        let (guards_registered_tx, guards_registered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let stale_writer = store.clone();
+        let stale = std::thread::spawn(move || {
+            let mut hook = SnapshotGuardRaceHook {
+                paused_once: false,
+                guards_registered: guards_registered_tx,
+                release: Some(release_rx),
+                conditional_conflicts: 0,
+            };
+            let result = stale_writer.record_observation_with_hooks(
+                observation_input(entity_id, context_id, "stable"),
+                &mut hook,
+            );
+            (result, hook.conditional_conflicts)
+        });
+
+        guards_registered_rx
+            .recv()
+            .expect("the no-op writer registered strict guards before its decision");
+        store
+            .record_observation(observation_input(entity_id, context_id, "draining"))
+            .expect("competing state change commits while stale writer is paused");
+        release_tx.send(()).expect("release stale no-op writer");
+        let (restored, conditional_conflicts) = stale.join().expect("stale writer joined");
+        let restored = restored.expect("conditional conflict retries");
+
+        assert_eq!(
+            conditional_conflicts, 1,
+            "the stale no-op commit must observe ConditionalUpdateConflict exactly once"
+        );
+        assert!(
+            restored.snapshot_id.is_some(),
+            "retry turns the former no-op into the snapshot that restores the requested state"
+        );
+        let history = store.entity_history(entity_id).expect("history");
+        assert_eq!(
+            history.len(),
+            3,
+            "seed, competing, and restoring snapshots remain"
+        );
+        assert_eq!(
+            history
+                .last()
+                .expect("restoring snapshot")
+                .properties
+                .get("region"),
+            Some(&serde_json::json!("stable")),
+            "the retry restores the no-op writer's intended state"
+        );
     }
 }
 

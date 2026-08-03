@@ -1993,6 +1993,60 @@ fn relationship_add_idempotent_single_edge() {
     );
 }
 
+// Use case: two ingest workers report the same dependency at once; both calls succeed and leave
+// one edge rather than turning harmless duplication into an operator-visible failure.
+#[test]
+fn relationship_add_concurrent_duplicate_is_idempotent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = StoreConfig {
+        db_path: dir.path().join("cg.db"),
+        ..Default::default()
+    };
+    let seed = Store::open(config.clone()).expect("open seed store");
+    let ctx = seed
+        .create_context(context_input("concurrent-ingest"))
+        .expect("context")
+        .id;
+    let from = seed
+        .create_entity(create_entity_input(ctx, EntityType::Service, "site-alpha"))
+        .expect("source entity")
+        .id;
+    let to = seed
+        .create_entity(create_entity_input(ctx, EntityType::Database, "db-alpha"))
+        .expect("target entity")
+        .id;
+    drop(seed);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers = (0..2)
+        .map(|_| {
+            let config = config.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = Store::open(config).expect("open worker store");
+                barrier.wait();
+                store.add_relationship(from, to, "DEPENDS_ON".to_string())
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker joined"))
+        .collect::<Vec<_>>();
+    assert!(
+        results.iter().all(Result::is_ok),
+        "both duplicate reports must succeed: {results:?}"
+    );
+
+    let reader = Store::open(config).expect("open reader store");
+    assert_eq!(
+        reader
+            .admin_raw_edge_count(from, "DEPENDS_ON".to_string(), to)
+            .expect("raw edge count"),
+        1
+    );
+}
+
 // Use case: a dependency-mapping agent passes a typoed Entity id as the edge source; the engine refuses at write time so traversals never hit a dangling half-edge pointing at nothing.
 #[test]
 fn relationship_add_missing_entity_rejected() {

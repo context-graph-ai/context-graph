@@ -185,10 +185,7 @@ impl ScopedStore<'_> {
                 subscription_id.clone(),
             ));
         }
-        let metrics = self
-            .store
-            .db
-            .sink_metrics_for_test(subscription_id.sink_name());
+        let metrics = self.store.db.sink_metrics(subscription_id.sink_name());
         Ok(SubscriptionMetrics {
             delivered: metrics.delivered,
             queued: metrics.queued,

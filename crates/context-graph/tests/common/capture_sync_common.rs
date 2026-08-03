@@ -322,9 +322,9 @@ pub async fn ticketed_memory_fixture(test_name: &str) -> TicketedMemoryFixture {
     .await
     .expect("bind ticketed Iroh hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+    let server = Arc::new(SyncServer::new(
         hub.sync_database(),
-        endpoint.transport(),
+        &endpoint,
         TenantId::from(&tenant_id),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -883,6 +883,7 @@ pub struct RealSyncFixture {
 }
 
 pub struct SelfEchoSyncFixture {
+    _hub: TestStore,
     pub node: TestStore,
     pub client: SyncClient,
     shutdown: Arc<AtomicBool>,
@@ -967,9 +968,9 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
     .await
     .expect("bind authenticated fixture hub");
     let remote_url = endpoint.ticket();
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+    let server = Arc::new(SyncServer::new(
         hub.store.sync_database(),
-        endpoint.transport(),
+        &endpoint,
         TenantId::from(&tenant_id),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1016,18 +1017,18 @@ pub async fn real_sync_fixture(test_name: &str) -> RealSyncFixture {
 
 pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
     let tenant_id = format!("tenant_{test_name}");
+    let hub = TestStore::new(&format!("{test_name}_hub"));
     let node = TestStore::new(&format!("{test_name}_node"));
-    let shared_db = node.store.sync_database();
     let endpoint = within(IrohServer::bind(&format!(
         "iroh:?identity={}",
-        node.db_path.with_extension("fabric-identity.key").display()
+        hub.db_path.with_extension("fabric-identity.key").display()
     )))
     .await
     .expect("bind authenticated self-echo hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
-        Arc::clone(&shared_db),
-        endpoint.transport(),
+    let server = Arc::new(SyncServer::new(
+        hub.store.sync_database(),
+        &endpoint,
         TenantId::from(&tenant_id),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1048,6 +1049,7 @@ pub async fn self_echo_sync_fixture(test_name: &str) -> SelfEchoSyncFixture {
         TenantId::from(&tenant_id),
     );
     SelfEchoSyncFixture {
+        _hub: hub,
         node,
         client,
         shutdown,
@@ -1065,9 +1067,9 @@ pub async fn pre_client_sync_fixture(test_name: &str) -> PreClientSyncFixture {
     .await
     .expect("bind pre-client authenticated hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::with_authenticated_transport_for_test(
+    let server = Arc::new(SyncServer::new(
         hub.store.sync_database(),
-        endpoint.transport(),
+        &endpoint,
         TenantId::from(&tenant_id),
     ));
     let shutdown = Arc::new(AtomicBool::new(false));
