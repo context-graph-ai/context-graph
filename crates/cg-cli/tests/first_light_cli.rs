@@ -1579,7 +1579,8 @@ fn cli_expected_pending_push_change_count(
         remote_url,
         contextdb_core::TenantId::from(tenant_id),
     );
-    context_graph_pending_push_change_count(client.db(), client.push_watermark())
+    context_graph_pending_push_change_count(&client)
+        .expect("count the exact pending push set for the CLI fixture")
 }
 
 fn db_table_row_count(db: &Database, table: &str) -> usize {
@@ -1606,23 +1607,23 @@ fn schema_version_installed_at(db: &Database) -> contextdb_core::TxId {
     installed_at[0]
 }
 
-fn force_write_once_schema_conflict(path: &std::path::Path) -> contextdb_core::TxId {
+fn force_divergent_schema_version(path: &std::path::Path) -> contextdb_core::TxId {
     let store = persisted_store(Some(path.to_path_buf())).expect("open second CLI store");
     let db = store.sync_database();
     let original_installed_at = schema_version_installed_at(db.as_ref());
     let committed = db.committed_watermark();
-    let conflict_installed_at = if original_installed_at != committed {
+    let divergent_installed_at = if original_installed_at != committed {
         committed
     } else {
         assert!(
             committed.0 > 0,
-            "schema version fixture needs a prior valid txid to create a divergent write-once row"
+            "schema version fixture needs a prior valid txid to create a divergent schema row"
         );
         contextdb_core::TxId(committed.0 - 1)
     };
     assert_ne!(
-        original_installed_at, conflict_installed_at,
-        "schema version fixture must create a divergent local write-once row"
+        original_installed_at, divergent_installed_at,
+        "schema version fixture must create a divergent local schema row"
     );
     db.execute(
         "UPDATE cg_schema_version SET installed_at = $installed_at WHERE id = $id",
@@ -1630,17 +1631,17 @@ fn force_write_once_schema_conflict(path: &std::path::Path) -> contextdb_core::T
             ("id".to_string(), DbValue::Int64(1)),
             (
                 "installed_at".to_string(),
-                DbValue::TxId(conflict_installed_at),
+                DbValue::TxId(divergent_installed_at),
             ),
         ]),
     )
-    .expect("create local write-once conflict fixture");
+    .expect("create local divergent schema-version fixture");
     assert_eq!(
         schema_version_installed_at(db.as_ref()),
-        conflict_installed_at,
-        "fixture must create a local write-once schema conflict"
+        divergent_installed_at,
+        "fixture must create a local divergent schema version"
     );
-    conflict_installed_at
+    divergent_installed_at
 }
 
 fn count_after_label(text: &str, label: &str) -> Option<u64> {
@@ -2848,10 +2849,11 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
         Some(expected_drained)
     );
     assert_eq!(expected_drained, 0);
+    let hub_schema_installed_at = schema_version_installed_at(fixture.hub_db.as_ref());
 
     let second_edge = CliHarness::new();
     let second_edge_store_path = second_edge.data_root.path().join("context-graph.db");
-    let local_schema_installed_at = force_write_once_schema_conflict(&second_edge_store_path);
+    let divergent_schema_installed_at = force_divergent_schema_version(&second_edge_store_path);
     let pull = second_edge.run(&[
         "sync",
         "pull",
@@ -2868,27 +2870,32 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
             &["/sync/apply_result/conflicts", "/apply_result/conflicts"]
         ),
         Some(0),
-        "cg sync pull must report the real ApplyResult from the production per-table policy contract; a default ServerWins pull records a conflict for the write-once schema row: {pull_json}"
+        "cg sync pull must report the real ApplyResult from the declared two-way KEEP FIRST schema policy: {pull_json}"
     );
     assert!(
         json_u64_at(
             &pull_json,
             &[
-                "/sync/apply_result/skipped_rows",
-                "/apply_result/skipped_rows"
+                "/sync/apply_result/applied_rows",
+                "/apply_result/applied_rows"
             ]
         )
         .unwrap_or(0)
             > 0,
-        "write-once schema conflict fixture must exercise the InsertIfNotExists skip path: {pull_json}"
+        "the declared KEEP FIRST pull must apply hub rows to the divergent edge: {pull_json}"
     );
     {
         let post_pull_db =
             Database::open(&second_edge_store_path).expect("open second edge after pull");
         assert_eq!(
             schema_version_installed_at(&post_pull_db),
-            local_schema_installed_at,
-            "cg sync pull must preserve the local divergent write-once schema row while reporting zero conflicts"
+            hub_schema_installed_at,
+            "cg sync pull must converge the divergent schema row to the hub's accepted KEEP FIRST value"
+        );
+        assert_ne!(
+            schema_version_installed_at(&post_pull_db),
+            divergent_schema_installed_at,
+            "the deliberately divergent local schema row must not survive a two-way KEEP FIRST pull"
         );
     }
     let pulled_query = second_edge.run(&[

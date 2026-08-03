@@ -43,23 +43,18 @@ use context_graph::understanding::{
     MAX_UNDERSTANDING_ATTEMPTS, claim_digest, list_pending_digests, mark_failed, mark_structured,
 };
 use context_graph::{
-    CG_SCHEMA_VERSION, CapturePricing, CgError, ContextGraphSyncRegistration, ContextId,
-    CreateContext, Decision, DecisionId, DecisionStatus, DeploymentSurface, DigestId,
-    DigestSearchFilter, DiscoveryFilter, Embedder, EmbedderRegistration, EnforcementLevel, Entity,
-    EntityId, EntitySnapshot, Invalidation, InvalidationStatus, LlmClient, ModelCallOutcome,
-    ModelCallReceipt, ModelCallUsage, ModelInvocation, ModelReply, OutputContract, ProviderUsage,
-    Store, StoreConfig, SyncDrainFuture, SyncProbeFuture, SyncPullBoundary, SyncPushBoundary,
-    SyncStatusBoundary, SyncStatusReport, UnderstandingConsumer, UnderstandingRequest,
-    UsageReportState, context_graph_pending_push_change_count,
-    context_graph_sync_conflict_policies, drain_sync_pull, drain_sync_push,
-    register_context_graph_sync_client, sync_status_report, usage_receipt_from_calls,
-    usage_receipt_json,
+    CG_SCHEMA_VERSION, CapturePricing, CgError, ContextId, CreateContext, Decision, DecisionId,
+    DecisionStatus, DeploymentSurface, DigestId, DigestSearchFilter, DiscoveryFilter, Embedder,
+    EmbedderRegistration, EnforcementLevel, Entity, EntityId, EntitySnapshot, Invalidation,
+    InvalidationStatus, LlmClient, ModelCallOutcome, ModelCallReceipt, ModelCallUsage,
+    ModelInvocation, ModelReply, OutputContract, ProviderUsage, Store, StoreConfig,
+    SyncDrainFuture, SyncProbeFuture, SyncPullBoundary, SyncPushBoundary, SyncStatusBoundary,
+    SyncStatusReport, UnderstandingConsumer, UnderstandingRequest, UsageReportState,
+    context_graph_pending_push_change_count, drain_sync_pull, drain_sync_push, sync_status_report,
+    usage_receipt_from_calls, usage_receipt_json,
 };
 use contextdb_core::{Lsn, TenantId, Value as DbValue};
-use contextdb_engine::{
-    Database,
-    sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection},
-};
+use contextdb_engine::{Database, sync_types::ApplyResult};
 use contextdb_server::{FabricIdentity, SyncClient};
 use fs4::fs_std::FileExt;
 use serde::Deserialize;
@@ -1157,11 +1152,10 @@ fn handle_worker(args: &[String]) -> i32 {
         );
     };
 
-    // Build the SyncClient against the hub, dialing FROM the enrolled identity, and register cg's
-    // per-table sync contract on it exactly as the sync CLI does.
+    // Build the SyncClient against the hub, dialing FROM the enrolled identity. Its ordinary sync
+    // behavior comes from the durable table declarations installed with this store.
     let dial_spec = worker_dial_spec(hub_endpoint, &key_path);
     let client = SyncClient::new(store.sync_database(), &dial_spec, TenantId::from(tenant));
-    register_context_graph_sync_client(&CliSyncClientRegistration(&client));
 
     // Advertise this node's understanding capability; sharing follows the fabric config.
     let mut worker_config = FabricWorkerConfig::for_node(&node_id);
@@ -3355,8 +3349,7 @@ fn handle_sync(args: &[String]) -> i32 {
                     );
                 }
             };
-            let policies = context_graph_sync_conflict_policies();
-            let drain = runtime.block_on(drain_sync_pull(&boundary, &policies));
+            let drain = runtime.block_on(drain_sync_pull(&boundary));
             match drain {
                 Ok(report) => {
                     // A pulled reversal teaching event takes effect locally: re-derive each
@@ -3401,22 +3394,6 @@ struct CliSyncBoundary {
     hub_connection_opened: Mutex<bool>,
 }
 
-struct CliSyncClientRegistration<'a>(&'a SyncClient);
-
-impl ContextGraphSyncRegistration for CliSyncClientRegistration<'_> {
-    fn set_default_conflict_policy(&self, policy: ConflictPolicy) {
-        self.0.set_default_conflict_policy(policy);
-    }
-
-    fn set_table_direction(&self, table: &str, direction: SyncDirection) {
-        self.0.set_table_direction(table, direction);
-    }
-
-    fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy) {
-        self.0.set_conflict_policy(table, policy);
-    }
-}
-
 impl CliSyncBoundary {
     fn new(data_store: &Store, _admin_store: &Store, remote_url: &str, tenant_id: &str) -> Self {
         let client = SyncClient::new(
@@ -3424,7 +3401,6 @@ impl CliSyncBoundary {
             remote_url,
             TenantId::from(tenant_id),
         );
-        register_context_graph_sync_client(&CliSyncClientRegistration(&client));
         Self {
             client,
             hub_connection_opened: Mutex::new(false),
@@ -3463,11 +3439,8 @@ impl CliSyncBoundary {
         self.client.push().await.map_err(sync_client_error)
     }
 
-    async fn run_pull_round(
-        &self,
-        policies: &ConflictPolicies,
-    ) -> context_graph::Result<ApplyResult> {
-        self.client.pull(policies).await.map_err(sync_client_error)
+    async fn run_pull_round(&self) -> context_graph::Result<ApplyResult> {
+        self.client.pull_default().await.map_err(sync_client_error)
     }
 }
 
@@ -3485,10 +3458,7 @@ impl SyncStatusBoundary for CliSyncBoundary {
     }
 
     fn pending_push_change_count(&self) -> context_graph::Result<usize> {
-        Ok(context_graph_pending_push_change_count(
-            self.client.db(),
-            self.persisted_push_watermark(),
-        ))
+        context_graph_pending_push_change_count(&self.client)
     }
 
     fn is_connected(&self) -> bool {
@@ -3535,9 +3505,9 @@ impl SyncPullBoundary for CliSyncBoundary {
         self.persisted_pull_watermark()
     }
 
-    fn pull_round<'a>(&'a self, policies: &'a ConflictPolicies) -> SyncDrainFuture<'a> {
+    fn pull_round(&self) -> SyncDrainFuture<'_> {
         Box::pin(async move {
-            let result = self.run_pull_round(policies).await;
+            let result = self.run_pull_round().await;
             if result.is_ok() {
                 self.mark_connected();
             }

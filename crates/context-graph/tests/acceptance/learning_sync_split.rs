@@ -387,9 +387,8 @@ async fn firing_trace_stays_local_while_skill_crosses_in_one_sync() {
     );
 }
 
-// Test 5: a reversal/undo on edge A propagates on the next sync,
-// order-tolerant. Placeholder: InsertIfNotExists cannot update existing rows; skills table
-// with placeholder policy may not correctly handle the active=false reversal row convergence.
+// Test 5: a reversal/undo on edge A propagates on the next sync. The skills table's declared
+// KEEP LATEST policy converges the hub-accepted later mutation.
 #[tokio::test(flavor = "multi_thread")]
 async fn reversal_undo_propagates_on_next_sync_order_tolerant_and_global() {
     let fixture =
@@ -440,20 +439,17 @@ async fn reversal_undo_propagates_on_next_sync_order_tolerant_and_global() {
         "reversal teaching event must propagate to edge2; got {edge2_teaching_count}"
     );
 
-    // Edge2's skill must reflect the reverted (inactive) state.
-    // Placeholder: InsertIfNotExists cannot update existing rows, so active=false
-    // update may not propagate → assertion fails.
+    // Edge2's skill must reflect the hub-accepted later inactive mutation.
     let skill_on_b = skill_row_by_id(&fixture.edge2.store, "sk-reversal");
     assert!(
         skill_on_b.is_some(),
         "skill row must still exist on edge2 after reversal sync"
     );
     let active_val = skill_on_b.unwrap().get("active").cloned();
-    // With ServerWins the hub's authoritative active=false wins.
     assert_eq!(
         active_val,
         Some(DbValue::Bool(false)),
-        "skill must be inactive on edge2 after reversal sync (ServerWins arbitration)"
+        "skill must be inactive on edge2 after the hub-accepted KEEP LATEST reversal"
     );
 }
 

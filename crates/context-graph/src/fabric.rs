@@ -535,7 +535,7 @@ pub fn movement_decision(ref_kind: &str, sharing_on: bool, is_submitter: bool) -
 /// Count the ephemeral understanding-input copies that actually sit in this node's outbound push set.
 /// The answer is computed from the REAL rows present, never from re-reading the sharing flag: an input
 /// copy only exists as a `work_inputs` row when submission chose to make one (sharing on, not opted
-/// out), and every `work_inputs` row is unconditionally push-directional (`SyncDirection::Both`), so
+/// out), and every `work_inputs` row has the engine-owned two-way declaration, so
 /// its presence IS its push-set membership. With sharing off (or an opted-out source) the copy was
 /// never written, so the count is naturally zero — the OFF switch dominates at the source, not by a
 /// downstream filter. `config` is accepted for API symmetry with the status renderer; the count does
@@ -744,8 +744,8 @@ pub fn run_worker_once<E: ConversationExtractor + Sync>(
 ///
 /// Both hub round-trips are best-effort — an unreachable hub degrades to the offline single-node path
 /// (the local db is the arbiter; a local claim/result rides the next successful push), keeping the
-/// ledger's `Won { synced: false }` offline convention. The pull uses cg's per-table contract
-/// (`context_graph_sync_conflict_policies`), the same one `cg sync pull` uses.
+/// ledger's `Won { synced: false }` offline convention. The pull uses the same durable table
+/// declarations as `cg sync pull`.
 #[cfg(feature = "fabric-sync")]
 pub fn run_worker_poll<E: ConversationExtractor + Sync>(
     client: &SyncClient,
@@ -779,10 +779,9 @@ enum HubDirection {
 /// pull/push errors are deliberately swallowed (the loop simply stops); only a runtime-build or
 /// thread panic surfaces.
 ///
-/// Pull uses cg's registered per-table contract exactly as `cg sync pull` does
-/// ([`crate::context_graph_sync_conflict_policies`]), and both directions drain in a bounded loop
-/// until they make no further progress (the same convergence the CLI's `drain_sync_pull`/
-/// `drain_sync_push` provide).
+/// Pull uses the durable table declarations exactly as `cg sync pull` does, and both directions
+/// drain in a bounded loop until they make no further progress (the same convergence the CLI's
+/// `drain_sync_pull`/`drain_sync_push` provide).
 #[cfg(feature = "fabric-sync")]
 fn hub_best_effort(client: &SyncClient, direction: HubDirection) -> Result<()> {
     const MAX_ROUNDS: usize = 32;
@@ -798,10 +797,9 @@ fn hub_best_effort(client: &SyncClient, direction: HubDirection) -> Result<()> {
                 runtime.block_on(async {
                     match direction {
                         HubDirection::Pull => {
-                            let policies = crate::context_graph_sync_conflict_policies();
                             for _ in 0..MAX_ROUNDS {
                                 let before = client.pull_watermark();
-                                if client.pull(&policies).await.is_err() {
+                                if client.pull_default().await.is_err() {
                                     break;
                                 }
                                 if client.pull_watermark() == before {

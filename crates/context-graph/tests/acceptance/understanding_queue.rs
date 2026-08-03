@@ -62,7 +62,11 @@ fn pending_digests_ordered_by_touch_then_age() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = fresh_store(dir.path());
     let first = capture_one(&store, "s1", "User: we chose sqlite for the local cache");
-    let second = capture_one(&store, "s2", "User: we picked nats for the event bus");
+    let second = capture_one(
+        &store,
+        "s2",
+        "User: we picked event stream for the event bus",
+    );
     let third = capture_one(&store, "s3", "User: we adopted rust for the engine core");
     let ctx = context_id(&store);
 
@@ -84,7 +88,9 @@ fn pending_digests_ordered_by_touch_then_age() {
         .find(|p| p.digest_id == second)
         .expect("second present");
     assert!(
-        second_row.chunk_text.contains("nats for the event bus"),
+        second_row
+            .chunk_text
+            .contains("event stream for the event bus"),
         "pending row carries the raw chunk: {}",
         second_row.chunk_text
     );

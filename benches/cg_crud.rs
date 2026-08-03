@@ -100,7 +100,10 @@ fn bench_decision_list_by_intention_10k(c: &mut Criterion) {
         .create_intention(create_intention_input(ctx.id, "pick a web framework"))
         .expect("I1");
     let i2 = store
-        .create_intention(create_intention_input(ctx.id, "pick a message broker"))
+        .create_intention(create_intention_input(
+            ctx.id,
+            "pick an event delivery mechanism",
+        ))
         .expect("I2");
     let d1 = store
         .create_decision(create_decision_input(
@@ -121,7 +124,7 @@ fn bench_decision_list_by_intention_10k(c: &mut Criterion) {
     let d3 = store
         .create_decision(create_decision_input(
             ctx.id,
-            "use nats",
+            "use event stream",
             vec![i2.id],
             vec![],
         ))

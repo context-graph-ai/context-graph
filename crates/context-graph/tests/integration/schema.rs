@@ -3199,9 +3199,20 @@ fn combination_embedding_spaces_table_unique_on_embedding_space_id_concurrent_se
 }
 
 #[test]
-fn combination_embedding_space_bindings_unique_composite_table_column_space() {
+fn combination_embedding_space_bindings_composite_primary_key_identity() {
     let db = fresh_db();
     assert_table_present(&db, "embedding_space_bindings");
+    assert_eq!(
+        db.table_meta("embedding_space_bindings")
+            .expect("embedding-space bindings metadata")
+            .primary_key_columns,
+        vec![
+            "embedding_space_id".to_string(),
+            "table_name".to_string(),
+            "vector_column".to_string(),
+        ],
+        "the binding identity is the ordered space, table, and vector-column triple"
+    );
     for (space_id, model_name) in [
         ("text_default_nomic_v1_5_768", "embeddinggemma-300m"),
         ("other_text_space", "other-text"),
@@ -3245,7 +3256,10 @@ fn combination_embedding_space_bindings_unique_composite_table_column_space() {
         &binding_params,
     );
     assert!(first.is_ok());
-    assert!(second.is_ok());
+    assert!(
+        matches!(second, Err(Error::UniqueViolation { .. })),
+        "a duplicate composite binding must fail with a typed unique-identity error, got {second:?}"
+    );
     assert_eq!(
         scalar_count(
             &db,

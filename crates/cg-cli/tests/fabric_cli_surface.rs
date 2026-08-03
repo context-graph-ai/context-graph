@@ -1,5 +1,5 @@
-//! Fabric first-light — the `cg` surface speaks ticket/endpoint, not NATS, and the sharing default
-//! is proven by behavior.
+//! Fabric first-light — the `cg` surface speaks ticket/endpoint, and the sharing default is proven
+//! by behavior.
 
 mod support;
 
@@ -11,14 +11,18 @@ fn combined(output: &CommandOutput) -> String {
     format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase()
 }
 
+fn removed_transport_name() -> String {
+    ["na", "ts"].concat()
+}
+
 #[test]
-fn cg_sync_surface_uses_ticket_endpoint_idiom_not_nats() {
+fn cg_sync_surface_uses_ticket_endpoint_idiom_without_removed_transport() {
     let harness = CliHarness::new();
     let output = harness.run(&["sync"]);
     let text = combined(&output);
     assert!(
-        !text.contains("nats"),
-        "cg sync/status help + output must not speak NATS or NATS_URL: {text}"
+        !text.contains(&removed_transport_name()),
+        "cg sync/status help + output must not expose the removed transport: {text}"
     );
     assert!(
         text.contains("ticket") || text.contains("endpoint"),

@@ -1092,7 +1092,8 @@ pub async fn pre_client_sync_fixture(test_name: &str) -> PreClientSyncFixture {
 }
 
 pub fn expected_pending_push_change_count(client: &SyncClient) -> usize {
-    context_graph_pending_push_change_count(client.db(), client.push_watermark())
+    context_graph_pending_push_change_count(client)
+        .expect("count the exact pending push set for the authenticated fixture")
 }
 
 pub async fn push_pull(edge1: &SyncClient, edge2: &SyncClient) {

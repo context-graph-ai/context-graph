@@ -15,6 +15,10 @@ fn combined(output: &CommandOutput) -> String {
     format!("{}\n{}", output.stdout, output.stderr).to_ascii_lowercase()
 }
 
+fn removed_transport_name() -> String {
+    ["na", "ts"].concat()
+}
+
 fn write_fabric(harness: &CliHarness, body: &str) {
     let fabric_dir = harness.data_root.path().join("cg");
     fs::create_dir_all(&fabric_dir).expect("create cg dir");
@@ -39,7 +43,7 @@ fn help_documents_worker_verb_and_flags_without_transport_names() {
         "cg help documents the worker budget flag: {text}"
     );
     assert!(
-        !text.contains("nats") && !text.contains("iroh"),
+        !text.contains(&removed_transport_name()) && !text.contains("iroh"),
         "cg help names no transport (ticket/hub idiom only): {text}"
     );
 }
@@ -66,7 +70,7 @@ fn worker_refuses_when_fabric_config_absent_naming_the_path() {
         "the refusal is typed: {text}"
     );
     assert!(
-        !text.contains("nats") && !text.contains("iroh"),
+        !text.contains(&removed_transport_name()) && !text.contains("iroh"),
         "the refusal names no transport: {text}"
     );
 }

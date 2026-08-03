@@ -734,7 +734,10 @@ fn decision_list_by_intention() {
         "I1"
     );
     let i2 = ok!(
-        store.create_intention(create_intention_input(ctx.id, "pick a message broker")),
+        store.create_intention(create_intention_input(
+            ctx.id,
+            "pick an event delivery mechanism"
+        )),
         "I2"
     );
     let d1 = ok!(
@@ -758,7 +761,7 @@ fn decision_list_by_intention() {
     let d3 = ok!(
         store.create_decision(create_decision_input(
             ctx.id,
-            "use nats",
+            "use event stream",
             vec![i2.id],
             vec![]
         )),
@@ -1737,7 +1740,7 @@ fn digest_immutable_no_update_symbol() {
     let digest = ok!(
         store.create_digest(create_digest_input(
             ctx,
-            "chose nats for transport after NAT-survival discussion"
+            "chose event stream for transport after connectivity review"
         )),
         "tx1"
     );
@@ -1751,12 +1754,12 @@ fn digest_immutable_no_update_symbol() {
     let fetched = ok!(store.get_digest(digest.id), "tx4").expect("digest");
     assert_eq!(
         fetched.summary,
-        "chose nats for transport after NAT-survival discussion"
+        "chose event stream for transport after connectivity review"
     );
     assert_eq!(
         fetched.vector_text,
         Some(digest_embedding_fixture(
-            "chose nats for transport after NAT-survival discussion"
+            "chose event stream for transport after connectivity review"
         ))
     );
 }

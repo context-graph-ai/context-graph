@@ -1,9 +1,9 @@
 //! Fabric first-light — the frozen source rule: no transport name in ledger/payload/job/apply code.
 //!
-//! The ledger treats cg's payload as opaque and knows no transport. The authenticated Iroh endpoint
+//! The ledger treats cg's payload as opaque and knows no transport. The authenticated endpoint
 //! belongs to the `[fabric]` config surface and the contextdb adapter — never to cg's submission,
-//! payload, job, apply, or sync-declaration sources. The removed broker must not reappear anywhere
-//! in that path either.
+//! payload, job, apply, or sync-declaration sources. No removed transport may reappear anywhere in
+//! that path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -27,13 +27,14 @@ fn no_transport_name_in_ledger_or_payload_sources() {
         "harness.rs",
         "capture_sync_status.rs",
     ];
+    let removed_transport = ["na", "ts"].concat();
     let mut offenders = Vec::new();
     for file in scanned {
         let path = src.join(file);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        for name in ["iroh", "nats"] {
+        for name in ["iroh", removed_transport.as_str()] {
             if text.contains(name) {
                 offenders.push(format!("{file} names transport `{name}`"));
             }

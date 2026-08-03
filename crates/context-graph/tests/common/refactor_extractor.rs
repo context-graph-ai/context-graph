@@ -472,15 +472,15 @@ impl ConversationExtractor for DecisionWithMetadataExtractor {
         });
         harvest.decisions.push(DecisionSeed {
             key: "D1".to_string(),
-            text: "use NATS for async messaging".to_string(),
+            text: "use event stream for async messaging".to_string(),
             goal_key: Some("G1".to_string()),
             decision_type: Some("architecture".to_string().into()),
             reasoning: vec![
                 "low latency".to_string(),
-                "built-in persistence with JetStream".to_string(),
+                "built-in durable replay".to_string(),
             ],
             tags: vec!["messaging".to_string(), "async".to_string()],
-            properties: serde_json::json!({"protocol": "NATS", "version": "2.x"}),
+            properties: serde_json::json!({"protocol": "event-stream", "version": "2.x"}),
             confidence: None,
             ..Default::default()
         });

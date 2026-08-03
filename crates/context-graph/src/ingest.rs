@@ -6311,7 +6311,7 @@ fn ensure_runtime_model_table(store: &Store) -> Result<()> {
         return Ok(());
     }
     db.execute(
-        "CREATE TABLE cg_runtime_models (id UUID PRIMARY KEY, context_label TEXT NOT NULL, model_key TEXT NOT NULL, advertised_context_tokens INTEGER NOT NULL, default_for_context BOOLEAN NOT NULL, created_at TXID NOT NULL)",
+        "CREATE TABLE cg_runtime_models (id UUID PRIMARY KEY, context_label TEXT NOT NULL, model_key TEXT NOT NULL, advertised_context_tokens INTEGER NOT NULL, default_for_context BOOLEAN NOT NULL, created_at TXID NOT NULL) SYNC OFF",
         &HashMap::new(),
     )
     .map_err(map_engine)?;
@@ -6324,7 +6324,7 @@ fn ensure_changed_cursor_table(store: &Store) -> Result<()> {
         return Ok(());
     }
     db.execute(
-        "CREATE TABLE cg_changed_cursors (context_id UUID PRIMARY KEY, last_seen_tx TXID NOT NULL, updated_at TXID NOT NULL)",
+        "CREATE TABLE cg_changed_cursors (context_id UUID PRIMARY KEY, last_seen_tx TXID NOT NULL, updated_at TXID NOT NULL) SYNC OFF",
         &HashMap::new(),
     )
     .map_err(map_engine)?;

@@ -315,7 +315,7 @@ pub fn reverse_overlay(store: &Store, entry: &mut OverlayEntry) -> Option<Compen
     // tombstone row that points at it. The tombstone carries `reversed = true` and its `value`
     // is the id of the entry it retracts; the read view treats any entry a tombstone targets as
     // cancelled. Because it is a fresh insert, the reversal also converges across edges under the
-    // overlay table's order-free `InsertIfNotExists` sync policy.
+    // overlay table's declared order-free `KEEP FIRST` sync policy.
     let tombstone = OverlayEntry {
         id: uuid::Uuid::new_v4().to_string(),
         item_id: entry.item_id.clone(),

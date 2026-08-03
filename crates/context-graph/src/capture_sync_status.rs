@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use contextdb_core::Lsn;
-use contextdb_engine::Database;
-use contextdb_engine::sync_types::{ApplyResult, ConflictPolicies, ConflictPolicy, SyncDirection};
-use contextdb_engine::work_ledger;
+use contextdb_engine::sync_types::ApplyResult;
+#[cfg(feature = "fabric-sync")]
+use contextdb_server::SyncClient;
 use serde_json::Value;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -17,7 +17,6 @@ use crate::ingest::{
     CaptureReport, CaptureRequest, ConversationExtractor, ExtractionRequest,
     RollingCaptureAccumulator, record_conversation_with_extractor,
 };
-use crate::schema::TABLES;
 use crate::{
     CgError, ContextId, CreateEntity, EnforcementLevel, EntityId, EntityType, EvidenceId,
     EvidenceKind, EvidenceProducer, EvidenceRef, ListEntityFilter, ModelCallOutcome,
@@ -178,13 +177,6 @@ pub struct DefaultContextCaptureResult {
     pub context_id: ContextId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextGraphSyncTablePolicy {
-    pub table: &'static str,
-    pub direction: SyncDirection,
-    pub conflict_policy: ConflictPolicy,
-}
-
 pub trait SyncStatusBoundary {
     fn push_watermark(&self) -> Lsn;
     fn pull_watermark(&self) -> Lsn;
@@ -207,7 +199,7 @@ pub trait SyncPushBoundary {
 
 pub trait SyncPullBoundary {
     fn pull_watermark(&self) -> Lsn;
-    fn pull_round<'a>(&'a self, policies: &'a ConflictPolicies) -> SyncDrainFuture<'a>;
+    fn pull_round(&self) -> SyncDrainFuture<'_>;
 }
 
 #[derive(Debug, Clone)]
@@ -452,14 +444,11 @@ pub async fn drain_sync_push(boundary: &dyn SyncPushBoundary) -> Result<SyncDrai
     )))
 }
 
-pub async fn drain_sync_pull(
-    boundary: &dyn SyncPullBoundary,
-    policies: &ConflictPolicies,
-) -> Result<SyncDrainReport> {
+pub async fn drain_sync_pull(boundary: &dyn SyncPullBoundary) -> Result<SyncDrainReport> {
     let mut report = empty_sync_drain_report(boundary.pull_watermark());
     for _ in 0..MAX_SYNC_DRAIN_ROUNDS {
         let before = boundary.pull_watermark();
-        let round = boundary.pull_round(policies).await?;
+        let round = boundary.pull_round().await?;
         let after = boundary.pull_watermark();
         merge_sync_round(&mut report, round, after);
         if after == before {
@@ -471,82 +460,13 @@ pub async fn drain_sync_pull(
     )))
 }
 
-pub fn context_graph_sync_table_contract() -> Vec<ContextGraphSyncTablePolicy> {
-    TABLES
-        .iter()
-        .map(|table| {
-            let (direction, conflict_policy) = sync_policy_for_table(table.name);
-            ContextGraphSyncTablePolicy {
-                table: table.name,
-                direction,
-                conflict_policy,
-            }
-        })
-        .collect()
+#[cfg(feature = "fabric-sync")]
+pub fn context_graph_pending_push_change_count(client: &SyncClient) -> Result<usize> {
+    client
+        .pending_push_change_count()
+        .map_err(|err| CgError::Engine(format!("sync failed: {err:?}")))
 }
 
-pub fn context_graph_sync_conflict_policies() -> ConflictPolicies {
-    let mut per_table = context_graph_sync_table_contract()
-        .into_iter()
-        .map(|policy| (policy.table.to_string(), policy.conflict_policy))
-        .collect::<std::collections::HashMap<_, _>>();
-    for table in LOCAL_ONLY_RUNTIME_SYNC_TABLES {
-        per_table.insert(table.to_string(), ConflictPolicy::InsertIfNotExists);
-    }
-    // The seven work-ledger fabric tables carry the shipped ledger's own per-table conflict contract
-    // verbatim — the ledger owns that arbitration; cg never re-derives it.
-    for (table, policy) in work_ledger::work_ledger_conflict_policy_entries() {
-        per_table.insert(table.to_string(), policy);
-    }
-    ConflictPolicies {
-        per_table,
-        default: ConflictPolicy::ServerWins,
-    }
-}
-
-pub trait ContextGraphSyncRegistration {
-    fn set_default_conflict_policy(&self, policy: ConflictPolicy);
-    fn set_table_direction(&self, table: &str, direction: SyncDirection);
-    fn set_conflict_policy(&self, table: &str, policy: ConflictPolicy);
-}
-
-pub fn register_context_graph_sync_client(client: &impl ContextGraphSyncRegistration) {
-    client.set_default_conflict_policy(ConflictPolicy::ServerWins);
-    for policy in context_graph_sync_table_contract() {
-        client.set_table_direction(policy.table, policy.direction);
-        client.set_conflict_policy(policy.table, policy.conflict_policy);
-    }
-    for table in LOCAL_ONLY_RUNTIME_SYNC_TABLES {
-        client.set_table_direction(table, SyncDirection::None);
-        client.set_conflict_policy(table, ConflictPolicy::InsertIfNotExists);
-    }
-    // The work-ledger fabric tables sync tenant-wide (both directions) under the shipped ledger's own
-    // conflict contract, so a submitter's job, a worker's claim/result, and the ephemeral input copy
-    // converge across the tenant's machines.
-    for (table, policy) in work_ledger::work_ledger_conflict_policy_entries() {
-        client.set_table_direction(table, SyncDirection::Both);
-        client.set_conflict_policy(table, policy);
-    }
-}
-
-pub fn context_graph_pending_push_change_count(db: &Database, since: Lsn) -> usize {
-    let mut directions = context_graph_sync_table_contract()
-        .into_iter()
-        .map(|policy| (policy.table.to_string(), policy.direction))
-        .collect::<std::collections::HashMap<_, _>>();
-    for table in LOCAL_ONLY_RUNTIME_SYNC_TABLES {
-        directions.insert(table.to_string(), SyncDirection::None);
-    }
-    for (table, _) in work_ledger::work_ledger_conflict_policy_entries() {
-        directions.insert(table.to_string(), SyncDirection::Both);
-    }
-    let changes = db
-        .changes_since(since)
-        .filter_by_direction(&directions, &[SyncDirection::Push, SyncDirection::Both]);
-    changes.rows.len() + changes.edges.len() + changes.vectors.len() + changes.ddl.len()
-}
-
-const LOCAL_ONLY_RUNTIME_SYNC_TABLES: &[&str] = &["cg_changed_cursors", "cg_runtime_models"];
 const MAX_SYNC_DRAIN_ROUNDS: usize = 32;
 
 fn empty_sync_drain_report(lsn: Lsn) -> SyncDrainReport {
@@ -815,45 +735,4 @@ fn provider_usage_entity_id(store: &Store, context_id: ContextId) -> Result<Enti
         context_id,
     })?;
     Ok(entity.id)
-}
-
-fn sync_policy_for_table(table: &str) -> (SyncDirection, ConflictPolicy) {
-    let write_once = (SyncDirection::Both, ConflictPolicy::InsertIfNotExists);
-    let hub_arbitrated = (SyncDirection::Both, ConflictPolicy::ServerWins);
-    match table {
-        "audit_log" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        "intentions"
-        | "decisions"
-        | "entities"
-        | "reindex_cursors"
-        | "outcomes"
-        | "invalidations"
-        | "entity_current_snapshots" => hub_arbitrated,
-        // Skill-loop tables: explicit per-table sync policies.
-        //   cg_learned_skills syncs tenant-wide, hub-arbitrated (ServerWins).
-        //   cg_teaching_events syncs tenant-wide as an order-free set union (InsertIfNotExists).
-        //   cg_skill_firing_trace is local-only per device (None).
-        //   cg_review_cursor is local-only per owner (None).
-        "cg_learned_skills" => hub_arbitrated,
-        "cg_teaching_events" => write_once,
-        "cg_skill_firing_trace" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        "cg_review_cursor" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        // Pending review items: local-only (like the review cursor, never synced).
-        "cg_pending_review_items" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        // Overlay corrections + compensation/reversal events: append-only, propagate tenant-wide.
-        "cg_overlay_entries" => write_once,
-        "cg_compensation_events" => write_once,
-        // Tier-0 capture tables (schema v10). Raw source chunks, retrieval touches, and local
-        // settings are all machine-local runtime state that NEVER leaves the device — raw is the NDA
-        // line, and the touches/settings are per-device. The private understanding queue is retired
-        // (the work ledger's computed job state subsumes it). The understanding completion is a
-        // write-once LOCAL apply marker: it records that THIS node already applied a result onto its
-        // digest, so it stays machine-local (`None`) — the structured graph rows are what sync, not
-        // the apply guard.
-        "cg_source_chunks" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        "cg_retrieval_touches" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        "cg_local_settings" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        "cg_understanding_completions" => (SyncDirection::None, ConflictPolicy::InsertIfNotExists),
-        _ => write_once,
-    }
 }

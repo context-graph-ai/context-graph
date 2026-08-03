@@ -298,7 +298,8 @@ fn per_call_usage_is_tagged_by_flow_and_model_not_just_chunk() {
         &store,
         CaptureRequest {
             context_label: "j-flow-ctx".to_string(),
-            transcript: "Goal G1: seed capture.\nDecision D1: choose NATS. serves G1".to_string(),
+            transcript: "Goal G1: seed capture.\nDecision D1: choose event stream. serves G1"
+                .to_string(),
             model_available: true,
         },
         &seed_extractor,

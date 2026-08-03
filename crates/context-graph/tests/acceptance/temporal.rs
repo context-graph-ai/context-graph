@@ -140,7 +140,9 @@ fn intention_prior_language_queryable_at_any_txid() -> Result<(), CgError> {
         store.update_intention(
             intention.id,
             IntentionPatch {
-                description: Some("use a transport that traverses NAT; NATS chosen".to_string()),
+                description: Some(
+                    "use a transport that supports the fleet; event stream chosen".to_string()
+                ),
                 status: None,
                 properties: None,
                 tags: None,

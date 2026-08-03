@@ -6518,10 +6518,9 @@ fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_file
         let text = std::fs::read_to_string(&file).expect("source file");
         let dependency_audit_test = file == crate_dir.join("tests/acceptance/cg_main_dep_audit.rs")
             || file == crate_dir.join("tests/acceptance/host_session_substrate_guards.rs");
-        let real_nats_test_support = file == crate_dir.join("tests/common/capture_sync_common.rs");
         for forbidden in &direct_forbidden {
             assert!(
-                !text.contains(forbidden) || dependency_audit_test || real_nats_test_support,
+                !text.contains(forbidden) || dependency_audit_test,
                 "forbidden dereference call in {}: {forbidden}",
                 file.display()
             );

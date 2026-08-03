@@ -56,6 +56,7 @@ mod screenshot_memory_review;
 mod skill_drift_safeguard;
 #[path = "../common/skill_fixtures.rs"]
 mod skill_fixtures;
+mod snapshot_branch_sync;
 mod structured_harvest_parser;
 mod subscriptions;
 mod sync_status_reporting;
