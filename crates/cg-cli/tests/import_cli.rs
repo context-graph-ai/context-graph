@@ -512,17 +512,17 @@ fn cli_import_claude_session_becomes_memory() {
         .iter()
         .map(|(_, description, status)| (description.as_str(), *status))
         .collect::<Vec<_>>();
-    persisted_decisions.sort_by(|left, right| left.0.cmp(right.0));
+    persisted_decisions.sort_by_key(|row| row.0);
     let mut second_persisted_decisions = second_persisted
         .iter()
         .map(|(_, description, status)| (description.as_str(), *status))
         .collect::<Vec<_>>();
-    second_persisted_decisions.sort_by(|left, right| left.0.cmp(right.0));
+    second_persisted_decisions.sort_by_key(|row| row.0);
     let mut audit_persisted_decisions = audit_persisted
         .iter()
         .map(|(_, description, status)| (description.as_str(), *status))
         .collect::<Vec<_>>();
-    audit_persisted_decisions.sort_by(|left, right| left.0.cmp(right.0));
+    audit_persisted_decisions.sort_by_key(|row| row.0);
 
     assert_eq!(
         (

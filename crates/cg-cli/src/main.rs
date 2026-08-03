@@ -2564,7 +2564,7 @@ fn captured_units_newest_first(store: &Store, context_id: Option<ContextId>) -> 
         })
         .collect();
     // Newest first: TxId/created_at descending.
-    rows.sort_by(|a, b| db_value_order_key(&b.0).cmp(&db_value_order_key(&a.0)));
+    rows.sort_by_key(|row| std::cmp::Reverse(db_value_order_key(&row.0)));
     rows.into_iter().map(|(_, id)| id).collect()
 }
 

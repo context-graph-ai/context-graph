@@ -2096,7 +2096,7 @@ fn cli_by_intention() {
         .iter()
         .map(|(_, description, status)| (description.as_str(), *status))
         .collect::<Vec<_>>();
-    persisted_decisions.sort_by(|left, right| left.0.cmp(right.0));
+    persisted_decisions.sort_by_key(|row| row.0);
 
     assert_eq!(
         (
