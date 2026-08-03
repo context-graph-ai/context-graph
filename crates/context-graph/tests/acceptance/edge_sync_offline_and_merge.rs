@@ -12,14 +12,16 @@ use context_graph::{
     ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId,
     DecisionStatus, EntityId, EntitySnapshotId, EntityType, EvidenceId, EvidenceKind, EvidenceRef,
     IntentionId, IntentionOrigin, IntentionStatus, ObservationId, Outcome, RecordObservation,
-    Store,
+    Store, TxId,
 };
-use contextdb_core::Value as DbValue;
-use std::collections::{BTreeMap, BTreeSet};
+use contextdb_core::{Lsn, Value as DbValue};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use uuid::Uuid;
 
 struct IndependentHistory {
     author: String,
     decision_id: DecisionId,
+    decision_created_at: TxId,
     decision_description: String,
     observation_id: ObservationId,
     evidence_id: EvidenceId,
@@ -38,6 +40,12 @@ struct IndependentHistoryInput<'a> {
     revised_path: &'a str,
     observed_at: DateTime<Utc>,
     outcome_success: bool,
+}
+
+struct ExpectedConflict {
+    id: Uuid,
+    values: HashMap<String, DbValue>,
+    hub_outbound_lsn: Lsn,
 }
 
 fn record_independent_history(
@@ -117,6 +125,7 @@ fn record_independent_history(
     IndependentHistory {
         author: author.to_string(),
         decision_id: decision.id,
+        decision_created_at: decision.created_at,
         decision_description,
         observation_id,
         evidence_id,
@@ -135,6 +144,7 @@ fn assert_independent_histories(
     shared_entity_id: EntityId,
     initial_snapshot_id: EntitySnapshotId,
     histories: &[&IndependentHistory],
+    expected_conflict: &ExpectedConflict,
 ) {
     let expected_decisions = histories
         .iter()
@@ -242,7 +252,13 @@ fn assert_independent_histories(
         );
     }
 
-    assert_exact_decision_tension(store, context_id, intention_id, histories);
+    assert_exact_decision_tension(
+        store,
+        context_id,
+        intention_id,
+        histories,
+        expected_conflict,
+    );
     assert!(
         store
             .list_invalidations(context_id, None, None)
@@ -257,7 +273,28 @@ fn assert_exact_decision_tension(
     context_id: ContextId,
     intention_id: IntentionId,
     histories: &[&IndependentHistory],
+    expected_conflict: &ExpectedConflict,
 ) {
+    let actual = decision_tension_values(
+        store,
+        context_id,
+        intention_id,
+        histories,
+        expected_conflict.id,
+    );
+    assert_eq!(
+        actual, expected_conflict.values,
+        "hub, edges, restart, restore, and replay must expose byte-for-byte equivalent conflict rows"
+    );
+}
+
+fn decision_tension_values(
+    store: &Store,
+    context_id: ContextId,
+    intention_id: IntentionId,
+    histories: &[&IndependentHistory],
+    expected_conflict_id: Uuid,
+) -> HashMap<String, DbValue> {
     let expected_pair = histories
         .iter()
         .map(|history| history.decision_id.as_uuid())
@@ -281,6 +318,11 @@ fn assert_exact_decision_tension(
         "the two opposite outcomes on one shared basis produce one explicit tension"
     );
     let row = matching[0];
+    assert_eq!(
+        row.values.get("id"),
+        Some(&DbValue::Uuid(expected_conflict_id)),
+        "every replica and replay must use the same deterministic conflict identity"
+    );
     let actual_pair = ["older_decision_id", "newer_decision_id"]
         .into_iter()
         .map(|column| match row.values.get(column) {
@@ -302,6 +344,93 @@ fn assert_exact_decision_tension(
         row.values.get("intention_in_tension"),
         Some(&DbValue::Bool(true)),
         "opposite outcomes for decisions serving the same intention must expose tension"
+    );
+    assert!(
+        matches!(row.values.get("detected_at"), Some(DbValue::TxId(_))),
+        "the exact conflict row must retain its detection transaction"
+    );
+    row.values.clone()
+}
+
+fn ordered_decision_ids(left: &IndependentHistory, right: &IndependentHistory) -> (Uuid, Uuid) {
+    if (left.decision_created_at.0, left.decision_id.as_uuid())
+        <= (right.decision_created_at.0, right.decision_id.as_uuid())
+    {
+        (left.decision_id.as_uuid(), right.decision_id.as_uuid())
+    } else {
+        (right.decision_id.as_uuid(), left.decision_id.as_uuid())
+    }
+}
+
+fn capture_hub_outbound_conflict(
+    store: &Store,
+    context_id: ContextId,
+    intention_id: IntentionId,
+    histories: &[&IndependentHistory],
+) -> ExpectedConflict {
+    let (older, newer) = ordered_decision_ids(histories[0], histories[1]);
+    let rows = store
+        .sync_database()
+        .scan("conflicts", store.sync_database().snapshot())
+        .expect("scan hub-derived decision tensions");
+    let matching = rows
+        .iter()
+        .filter(|row| {
+            row.values.get("context_id") == Some(&DbValue::Uuid(context_id.as_uuid()))
+                && row.values.get("older_decision_id") == Some(&DbValue::Uuid(older))
+                && row.values.get("newer_decision_id") == Some(&DbValue::Uuid(newer))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "the hub must derive one conflict for the exact context and ordered decision pair"
+    );
+    let id = match matching[0].values.get("id") {
+        Some(DbValue::Uuid(id)) => *id,
+        other => panic!("hub-derived conflict must carry a UUID identity, got {other:?}"),
+    };
+    let values = decision_tension_values(store, context_id, intention_id, histories, id);
+    let outbound = store
+        .sync_database()
+        .changes_since(Lsn(0))
+        .rows
+        .into_iter()
+        .filter(|row| row.table == "conflicts" && row.values.get("id") == Some(&DbValue::Uuid(id)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outbound.len(),
+        1,
+        "the hub-derived conflict must have exactly one outbound change-log row"
+    );
+    assert_eq!(
+        outbound[0].values, values,
+        "the hub must serve the exact conflict row it derived"
+    );
+    assert!(
+        outbound[0].lsn > Lsn(0),
+        "the hub-derived conflict needs a committed outbound LSN"
+    );
+    ExpectedConflict {
+        id,
+        values,
+        hub_outbound_lsn: outbound[0].lsn,
+    }
+}
+
+fn assert_no_conflict_echo(client: &contextdb_server::SyncClient, boundary: &str) {
+    assert_eq!(
+        client
+            .pending_push_change_count()
+            .expect("count outbound work after conflict pull"),
+        0,
+        "{boundary}: sync-trigger derivation must not enqueue an outbound echo"
+    );
+    assert!(
+        !client
+            .has_pending_push_changes()
+            .expect("read outbound state after conflict pull"),
+        "{boundary}: pending-push state must remain clean"
     );
 }
 
@@ -487,8 +616,21 @@ async fn independent_memory_histories_survive_convergence_restart_and_restore() 
     // position is not semantic time and cannot choose which decision is current.
     drain_ticketed_push(&edge_a.client).await;
     drain_ticketed_push(&edge_b.client).await;
+    let expected_conflict = capture_hub_outbound_conflict(
+        fixture.hub_store(),
+        context.id,
+        intention.id,
+        &[&history_a, &history_b],
+    );
     drain_ticketed_pull(&edge_a.client).await;
     drain_ticketed_pull(&edge_b.client).await;
+    assert!(
+        edge_a.client.pull_watermark() >= expected_conflict.hub_outbound_lsn
+            && edge_b.client.pull_watermark() >= expected_conflict.hub_outbound_lsn,
+        "both edges must advance through the hub-derived conflict's outbound LSN"
+    );
+    assert_no_conflict_echo(&edge_a.client, "edge A after conflict pull");
+    assert_no_conflict_echo(&edge_b.client, "edge B after conflict pull");
     for store in [fixture.hub_store(), &edge_a.store, &edge_b.store] {
         assert_independent_histories(
             store,
@@ -497,6 +639,7 @@ async fn independent_memory_histories_survive_convergence_restart_and_restore() 
             entity.id,
             initial_snapshot_id,
             &[&history_a, &history_b],
+            &expected_conflict,
         );
     }
 
@@ -504,6 +647,8 @@ async fn independent_memory_histories_survive_convergence_restart_and_restore() 
     drop(edge_b);
     let restarted_a = fixture.open_edge("edge-a");
     let restarted_b = fixture.open_edge("edge-b");
+    assert_no_conflict_echo(&restarted_a.client, "edge A after reopen");
+    assert_no_conflict_echo(&restarted_b.client, "edge B after reopen");
     assert_independent_histories(
         &restarted_a.store,
         context.id,
@@ -511,6 +656,7 @@ async fn independent_memory_histories_survive_convergence_restart_and_restore() 
         entity.id,
         initial_snapshot_id,
         &[&history_a, &history_b],
+        &expected_conflict,
     );
     assert_independent_histories(
         &restarted_b.store,
@@ -519,10 +665,21 @@ async fn independent_memory_histories_survive_convergence_restart_and_restore() 
         entity.id,
         initial_snapshot_id,
         &[&history_a, &history_b],
+        &expected_conflict,
     );
 
     let restored = fixture.open_edge("wiped-edge-restore");
+    assert_eq!(
+        restored.client.pull_watermark(),
+        Lsn(0),
+        "the wiped destination must begin before the hub conflict"
+    );
     drain_ticketed_pull(&restored.client).await;
+    assert!(
+        restored.client.pull_watermark() >= expected_conflict.hub_outbound_lsn,
+        "the fresh destination must demonstrably replay through the hub-derived conflict LSN"
+    );
+    assert_no_conflict_echo(&restored.client, "wiped edge after full-history pull");
     assert_independent_histories(
         &restored.store,
         context.id,
@@ -530,6 +687,7 @@ async fn independent_memory_histories_survive_convergence_restart_and_restore() 
         entity.id,
         initial_snapshot_id,
         &[&history_a, &history_b],
+        &expected_conflict,
     );
     fixture.shutdown().await;
 }

@@ -4,10 +4,11 @@ pub(crate) const IMPACT_ANALYSIS_TRIGGER_DDL: &str =
 pub(crate) const CONFLICT_DETECTION_DECISIONS_TRIGGER_DDL: &str =
     "CREATE TRIGGER conflict_detection_on_decisions ON decisions WHEN INSERT";
 pub(crate) const CONFLICT_DETECTION_OUTCOMES_TRIGGER_DDL: &str =
-    "CREATE TRIGGER conflict_detection_on_outcomes ON outcomes WHEN INSERT";
+    "CREATE TRIGGER conflict_detection_on_outcomes ON outcomes WHEN INSERT INCLUDING SYNC";
 pub(crate) const PRECEDENT_MATCH_TRIGGER_DDL: &str =
     "CREATE TRIGGER precedent_match_on_decisions ON decisions WHEN INSERT";
 pub(crate) const OUTCOMES_DDL: &str = "CREATE TABLE outcomes (id UUID NOT NULL UNIQUE, decision_id UUID NOT NULL REFERENCES decisions(id), context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), success BOOLEAN NOT NULL, notes TEXT, recorded_at TXID NOT NULL, PRIMARY KEY (context_id, decision_id), UNIQUE (context_id, id), FOREIGN KEY (context_id, decision_id) REFERENCES decisions(context_id, id)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
+pub(crate) const CONFLICTS_DDL: &str = "CREATE TABLE conflicts (id UUID NOT NULL UNIQUE, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), older_decision_id UUID NOT NULL REFERENCES decisions(id), newer_decision_id UUID NOT NULL REFERENCES decisions(id), threatened_intention_ids JSON NOT NULL DEFAULT '[]', intention_in_tension BOOLEAN NOT NULL, detected_at TXID NOT NULL, PRIMARY KEY (context_id, older_decision_id, newer_decision_id), FOREIGN KEY (context_id, older_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, newer_decision_id) REFERENCES decisions(context_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
 
 #[derive(Debug, Clone, Copy)]
 pub struct TableSpec {
@@ -173,7 +174,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "conflicts",
-        ddl: "CREATE TABLE conflicts (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), older_decision_id UUID NOT NULL REFERENCES decisions(id), newer_decision_id UUID NOT NULL REFERENCES decisions(id), threatened_intention_ids JSON NOT NULL DEFAULT '[]', intention_in_tension BOOLEAN NOT NULL, detected_at TXID NOT NULL, UNIQUE (context_id, older_decision_id, newer_decision_id), FOREIGN KEY (context_id, older_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, newer_decision_id) REFERENCES decisions(context_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        ddl: CONFLICTS_DDL,
     },
     TableSpec {
         name: "precedent_matches",
@@ -281,3 +282,28 @@ pub const INDEXES: &[IndexSpec] = &[
         ddl: "CREATE INDEX idx_digest_embedding_handles_producer_system ON digest_embedding_handles (producer_system)",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{CONFLICT_DETECTION_OUTCOMES_TRIGGER_DDL, CONFLICTS_DDL, TABLES};
+
+    #[test]
+    fn sync_conflict_derivation_schema_is_frozen() {
+        assert_eq!(
+            CONFLICT_DETECTION_OUTCOMES_TRIGGER_DDL,
+            "CREATE TRIGGER conflict_detection_on_outcomes ON outcomes WHEN INSERT INCLUDING SYNC"
+        );
+        assert_eq!(
+            CONFLICTS_DDL,
+            "CREATE TABLE conflicts (id UUID NOT NULL UNIQUE, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), older_decision_id UUID NOT NULL REFERENCES decisions(id), newer_decision_id UUID NOT NULL REFERENCES decisions(id), threatened_intention_ids JSON NOT NULL DEFAULT '[]', intention_in_tension BOOLEAN NOT NULL, detected_at TXID NOT NULL, PRIMARY KEY (context_id, older_decision_id, newer_decision_id), FOREIGN KEY (context_id, older_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, newer_decision_id) REFERENCES decisions(context_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST"
+        );
+        assert_eq!(
+            TABLES
+                .iter()
+                .find(|table| table.name == "conflicts")
+                .expect("conflicts table is declared")
+                .ddl,
+            CONFLICTS_DDL
+        );
+    }
+}

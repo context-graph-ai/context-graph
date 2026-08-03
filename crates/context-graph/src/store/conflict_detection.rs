@@ -2,7 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use contextdb_core::{Error as EngineError, TxId, Value};
 use contextdb_engine::{Database, TriggerContext};
-use uuid::Uuid;
+use sha2::{Digest, Sha256};
+use uuid::{Builder, Uuid, Variant, Version};
 
 use crate::Result;
 use crate::schema::{
@@ -14,6 +15,7 @@ use super::convert::map_engine_err;
 
 const CONFLICT_DETECTION_ON_DECISIONS: &str = "conflict_detection_on_decisions";
 const CONFLICT_DETECTION_ON_OUTCOMES: &str = "conflict_detection_on_outcomes";
+const CONFLICT_ID_DOMAIN: &[u8] = b"context-graph/conflict-detected/v1\0";
 
 #[derive(Debug, Clone)]
 struct DecisionProjection {
@@ -122,11 +124,12 @@ fn insert_conflict_row(
     anchor: &DecisionProjection,
     candidate: Candidate,
 ) -> contextdb_core::Result<()> {
-    let (older, newer) = if candidate.created_at <= anchor.created_at {
-        (candidate.id, anchor.id)
-    } else {
-        (anchor.id, candidate.id)
-    };
+    let (older, newer) =
+        if (candidate.created_at.0, candidate.id) <= (anchor.created_at.0, anchor.id) {
+            (candidate.id, anchor.id)
+        } else {
+            (anchor.id, candidate.id)
+        };
     let threatened = served_intersection(db, tx, anchor.context_id, older, newer)?;
     let threatened_ids = threatened
         .iter()
@@ -136,7 +139,10 @@ fn insert_conflict_row(
     let threatened_json = serde_json::to_value(threatened_ids)
         .map_err(|err| EngineError::Other(format!("conflict intentions serialize: {err}")))?;
     let params = HashMap::from([
-        ("id".to_string(), Value::Uuid(Uuid::now_v7())),
+        (
+            "id".to_string(),
+            Value::Uuid(deterministic_conflict_id(anchor.context_id, older, newer)),
+        ),
         ("context_id".to_string(), Value::Uuid(anchor.context_id)),
         ("older_decision_id".to_string(), Value::Uuid(older)),
         ("newer_decision_id".to_string(), Value::Uuid(newer)),
@@ -158,6 +164,21 @@ fn insert_conflict_row(
         Ok(_) | Err(EngineError::UniqueViolation { .. }) => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+fn deterministic_conflict_id(context_id: Uuid, older: Uuid, newer: Uuid) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(CONFLICT_ID_DOMAIN);
+    hasher.update(context_id.as_bytes());
+    hasher.update(older.as_bytes());
+    hasher.update(newer.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Builder::from_bytes(bytes)
+        .with_variant(Variant::RFC4122)
+        .with_version(Version::Custom)
+        .into_uuid()
 }
 
 fn decision_projection(
@@ -344,5 +365,26 @@ fn row_txid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::
         other => Err(EngineError::Other(format!(
             "expected {column} txid, got {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deterministic_conflict_id;
+    use uuid::{Uuid, Variant, Version};
+
+    #[test]
+    fn conflict_id_is_stable_and_domain_scoped() {
+        let context_id = Uuid::parse_str("01890f47-a0b1-7cc1-98d8-111111111111").unwrap();
+        let other_context = Uuid::parse_str("01890f47-a0b1-7cc1-98d8-aaaaaaaaaaaa").unwrap();
+        let older = Uuid::parse_str("01890f47-a0b1-7cc1-98d8-222222222222").unwrap();
+        let newer = Uuid::parse_str("01890f47-a0b1-7cc1-98d8-333333333333").unwrap();
+        let id = deterministic_conflict_id(context_id, older, newer);
+
+        assert_eq!(id.get_variant(), Variant::RFC4122);
+        assert_eq!(id.get_version(), Some(Version::Custom));
+        assert_eq!(id, deterministic_conflict_id(context_id, older, newer));
+        assert_ne!(id, deterministic_conflict_id(context_id, newer, older));
+        assert_ne!(id, deterministic_conflict_id(other_context, older, newer));
     }
 }

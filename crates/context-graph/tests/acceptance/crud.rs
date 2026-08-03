@@ -2022,6 +2022,43 @@ fn outcome_record_idempotent() {
     );
 }
 
+// Use case: a newly created schema-11 database must persist the natural identity of a decision
+// tension and opt only the outcome-driven detector into deriving tensions from received sync rows.
+#[test]
+fn fresh_schema_v11_persists_conflict_identity_and_sync_trigger_scope() {
+    let (_tempdir, _db_path, store) = fixture();
+    let db = store.sync_database();
+    assert_eq!(
+        db.table_meta("conflicts")
+            .expect("fresh schema-11 conflicts metadata")
+            .primary_key_columns,
+        vec![
+            "context_id".to_string(),
+            "older_decision_id".to_string(),
+            "newer_decision_id".to_string(),
+        ],
+        "a conflict is identified by its Context and ordered Decision pair"
+    );
+
+    let triggers = db.list_triggers();
+    let outcomes_trigger = triggers
+        .iter()
+        .find(|trigger| trigger.name == "conflict_detection_on_outcomes")
+        .expect("fresh schema-11 outcome conflict trigger");
+    assert!(
+        outcomes_trigger.including_sync,
+        "received outcomes must run deterministic conflict derivation"
+    );
+    let decisions_trigger = triggers
+        .iter()
+        .find(|trigger| trigger.name == "conflict_detection_on_decisions")
+        .expect("fresh schema-11 decision conflict trigger");
+    assert!(
+        !decisions_trigger.including_sync,
+        "the ordinary decision trigger must retain the default local-write scope"
+    );
+}
+
 // Use case: an operator points the schema-11 binary at a schema-10 database; open refuses loudly
 // and leaves the older file untouched instead of partially rewriting the Outcome identity.
 #[test]
