@@ -601,20 +601,18 @@ fn schema_allows_null(schema: &Value) -> bool {
     let Some(object) = schema.as_object() else {
         return false;
     };
-    if let Some(type_value) = object.get("type") {
-        match type_value {
-            Value::String(type_name) => {
-                if type_name == "null" {
-                    return true;
-                }
+    match object.get("type") {
+        Some(Value::String(type_name)) => {
+            if type_name == "null" {
+                return true;
             }
-            Value::Array(types) => {
-                if types.iter().any(|item| item.as_str() == Some("null")) {
-                    return true;
-                }
-            }
-            _ => {}
         }
+        Some(Value::Array(types)) => {
+            if types.iter().any(|item| item.as_str() == Some("null")) {
+                return true;
+            }
+        }
+        _ => {}
     }
     object
         .get("anyOf")
