@@ -311,6 +311,107 @@ fn fixed_observed_at(value: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn assert_virtual_outcome_relationship(
+    store: &Store,
+    decision_id: DecisionId,
+    expected: &Outcome,
+    rejected: &Outcome,
+) {
+    assert_real_outcome_state(store, decision_id, expected, 1);
+    assert_eq!(
+        store
+            .admin_raw_has_outcome_edge_count(decision_id)
+            .expect("read virtual HAS_OUTCOME count"),
+        1,
+        "one current outcome is one virtual HAS_OUTCOME relationship"
+    );
+    assert!(
+        store
+            .has_outcome_relationship(decision_id, expected.id)
+            .expect("read winning virtual relationship"),
+        "the current outcome must be reachable through HAS_OUTCOME"
+    );
+    assert!(
+        !store
+            .has_outcome_relationship(decision_id, rejected.id)
+            .expect("read rejected virtual relationship"),
+        "a rejected current outcome must not retain a virtual HAS_OUTCOME relationship"
+    );
+    let rows = store
+        .sync_database()
+        .scan("edges", store.sync_database().snapshot())
+        .expect("scan physical edge rows");
+    assert!(
+        rows.iter().all(|row| {
+            !(row.values.get("source_id") == Some(&DbValue::Uuid(decision_id.as_uuid()))
+                && row.values.get("edge_type") == Some(&DbValue::Text("HAS_OUTCOME".to_string())))
+        }),
+        "HAS_OUTCOME must be derived from the current outcome row, never retained as a generic immutable edge"
+    );
+}
+
+// Use case: two offline agents record opposite outcomes for one Decision. After reconnecting,
+// every replica must expose exactly one current outcome and one virtual HAS_OUTCOME relationship;
+// the losing generic edge must not survive sync, restart, or wipe-and-restore.
+#[tokio::test(flavor = "multi_thread")]
+async fn contended_outcome_keeps_one_virtual_relationship_after_sync_restart_and_restore() {
+    let fixture = ticketed_memory_fixture("contended_outcome_virtual_relationship").await;
+    let edge_a = fixture.open_edge("outcome-edge-a");
+    let edge_b = fixture.open_edge("outcome-edge-b");
+    let seeded = seed_decision_graph(&edge_a.store, "outcome-tenant", "virtual outcome");
+    drain_ticketed_push(&edge_a.client).await;
+    drain_ticketed_pull(&edge_b.client).await;
+
+    let outcome_a = edge_a
+        .store
+        .record_outcome(
+            seeded.decision.id,
+            true,
+            Some("accepted on edge a".to_string()),
+        )
+        .expect("record edge-a outcome");
+    let outcome_b = edge_b
+        .store
+        .record_outcome(
+            seeded.decision.id,
+            false,
+            Some("rejected on edge b".to_string()),
+        )
+        .expect("record edge-b outcome");
+
+    drain_ticketed_push(&edge_a.client).await;
+    drain_ticketed_push(&edge_b.client).await;
+    drain_ticketed_pull(&edge_a.client).await;
+    drain_ticketed_pull(&edge_b.client).await;
+
+    let winner = fixture
+        .hub_store()
+        .get_decision(seeded.decision.id)
+        .expect("read hub decision")
+        .expect("hub decision survives")
+        .outcome
+        .expect("hub has one current outcome");
+    let rejected = if winner.id == outcome_a.id {
+        &outcome_b
+    } else {
+        assert_eq!(winner.id, outcome_b.id, "winner is one submitted outcome");
+        &outcome_a
+    };
+    for store in [fixture.hub_store(), &edge_a.store, &edge_b.store] {
+        assert_virtual_outcome_relationship(store, seeded.decision.id, &winner, rejected);
+    }
+
+    drop(edge_a);
+    drop(edge_b);
+    let restarted_a = fixture.open_edge("outcome-edge-a");
+    assert_virtual_outcome_relationship(&restarted_a.store, seeded.decision.id, &winner, rejected);
+
+    let restored = fixture.open_edge("outcome-wiped-restore");
+    drain_ticketed_pull(&restored.client).await;
+    assert_virtual_outcome_relationship(&restored.store, seeded.decision.id, &winner, rejected);
+    fixture.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn independent_memory_histories_survive_convergence_restart_and_restore() {
     let fixture = ticketed_memory_fixture("independent_memory_histories_survive_convergence").await;

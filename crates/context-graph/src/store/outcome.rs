@@ -91,7 +91,6 @@ impl Store {
                     &delete_params,
                 )
                 .map_err(map_engine_err)?;
-            self.delete_edges_in_tx(tx, Some(decision_id.as_uuid()), None, Some("HAS_OUTCOME"))?;
         }
         let insert_params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
@@ -113,15 +112,6 @@ impl Store {
                 &insert_params,
             )
             .map_err(map_engine_err)?;
-        self.insert_edge_in_tx(
-            tx,
-            decision_id.as_uuid(),
-            id.as_uuid(),
-            "HAS_OUTCOME",
-            context_id,
-            None,
-        )?;
-
         let outcome = Outcome {
             id,
             decision_id,
@@ -158,24 +148,49 @@ impl Store {
         Ok(outcome)
     }
 
+    /// `HAS_OUTCOME` is a virtual one-to-one relationship backed by the current
+    /// `outcomes.decision_id` row. It cannot live in the immutable generic edge
+    /// table: competing offline outcomes would retain both physical edges after
+    /// `KEEP LATEST` picks one current outcome.
     pub fn admin_raw_has_outcome_edge_count(&self, decision_id: DecisionId) -> Result<u64> {
+        let params: HashMap<String, Value> = [(
+            "decision_id".to_string(),
+            Value::Uuid(decision_id.as_uuid()),
+        )]
+        .into_iter()
+        .collect();
+        let result = self
+            .db
+            .execute(
+                "SELECT id FROM outcomes WHERE decision_id = $decision_id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        Ok(result.rows.len() as u64)
+    }
+
+    pub fn has_outcome_relationship(
+        &self,
+        decision_id: DecisionId,
+        outcome_id: OutcomeId,
+    ) -> Result<bool> {
         let params: HashMap<String, Value> = [
-            ("source_id".to_string(), Value::Uuid(decision_id.as_uuid())),
             (
-                "edge_type".to_string(),
-                Value::Text("HAS_OUTCOME".to_string()),
+                "decision_id".to_string(),
+                Value::Uuid(decision_id.as_uuid()),
             ),
+            ("outcome_id".to_string(), Value::Uuid(outcome_id.as_uuid())),
         ]
         .into_iter()
         .collect();
         let result = self
             .db
             .execute(
-                "SELECT id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type",
+                "SELECT id FROM outcomes WHERE decision_id = $decision_id AND id = $outcome_id",
                 &params,
             )
             .map_err(map_engine_err)?;
-        Ok(result.rows.len() as u64)
+        Ok(!result.rows.is_empty())
     }
 
     pub fn admin_raw_outcomes_for_decision(&self, decision_id: DecisionId) -> Result<Vec<Outcome>> {

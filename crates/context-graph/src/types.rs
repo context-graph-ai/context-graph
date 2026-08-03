@@ -1100,8 +1100,9 @@ pub struct AuditFilter {
     pub after: Option<AuditId>,
 }
 
-/// Schema 11 adds immutable intention-history heads and predecessor links.  A schema-10 root is
-/// deliberately refused rather than silently receiving a partial history migration.
+/// Schema 11 adds immutable history heads and predecessor links and keys the current outcome by
+/// its context and decision. A schema-10 root is deliberately refused rather than silently
+/// receiving a partial migration.
 pub const CG_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

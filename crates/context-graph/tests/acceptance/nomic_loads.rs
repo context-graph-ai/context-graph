@@ -1309,6 +1309,9 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "get_evidence",
     "get_intention",
     "get_observation",
+    // HAS_OUTCOME is derived from the current outcome mapping rather than a
+    // retained generic edge, so consumers need one explicit relationship read.
+    "has_outcome_relationship",
     "history",
     "incoming_supersedes",
     "initialize_fresh",

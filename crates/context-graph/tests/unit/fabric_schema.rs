@@ -6,6 +6,6 @@ use context_graph::types::CG_SCHEMA_VERSION;
 fn schema_version_is_eleven() {
     assert_eq!(
         CG_SCHEMA_VERSION, 11,
-        "immutable intention-history heads and links require schema 11"
+        "immutable history and context/decision-keyed outcomes require schema 11"
     );
 }

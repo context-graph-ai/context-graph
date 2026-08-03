@@ -336,51 +336,6 @@ impl Store {
         let edges = self.edges_from_sources(context_id, &[source], Some(rel))?;
         Ok(edges.into_iter().map(|(_, target, _)| target).collect())
     }
-
-    pub(super) fn delete_edges_in_tx(
-        &self,
-        tx: TxId,
-        source_id: Option<Uuid>,
-        target_id: Option<Uuid>,
-        edge_type: Option<&str>,
-    ) -> Result<()> {
-        let (sql, params) = match Self::build_delete_edges(source_id, target_id, edge_type) {
-            Some(pair) => pair,
-            None => return Ok(()),
-        };
-        self.db
-            .execute_in_tx(tx, &sql, &params)
-            .map_err(map_engine_err)?;
-        Ok(())
-    }
-
-    fn build_delete_edges(
-        source_id: Option<Uuid>,
-        target_id: Option<Uuid>,
-        edge_type: Option<&str>,
-    ) -> Option<(String, HashMap<String, Value>)> {
-        let mut clauses: Vec<&str> = Vec::new();
-        let mut params: HashMap<String, Value> = HashMap::new();
-        if let Some(s) = source_id {
-            clauses.push("source_id = $source_id");
-            params.insert("source_id".to_string(), Value::Uuid(s));
-        }
-        if let Some(t) = target_id {
-            clauses.push("target_id = $target_id");
-            params.insert("target_id".to_string(), Value::Uuid(t));
-        }
-        if let Some(et) = edge_type {
-            clauses.push("edge_type = $edge_type");
-            params.insert("edge_type".to_string(), Value::Text(et.to_string()));
-        }
-        if clauses.is_empty() {
-            return None;
-        }
-        Some((
-            format!("DELETE FROM edges WHERE {}", clauses.join(" AND ")),
-            params,
-        ))
-    }
 }
 
 pub(super) fn uuid_or_clause(

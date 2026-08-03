@@ -1986,13 +1986,26 @@ fn outcome_record_idempotent() {
         )),
         "decision"
     );
-    ok!(
+    let first = ok!(
         store.record_outcome(decision.id, true, None),
         "first outcome"
     );
-    ok!(
+    let second = ok!(
         store.record_outcome(decision.id, false, Some("reverted".to_string())),
         "second outcome"
+    );
+    assert_ne!(
+        first.id, second.id,
+        "the mapping is the sync identity; each outcome keeps its distinct audit UUID"
+    );
+    assert_eq!(
+        store
+            .sync_database()
+            .table_meta("outcomes")
+            .expect("outcomes metadata")
+            .primary_key_columns,
+        vec!["context_id".to_string(), "decision_id".to_string()],
+        "fresh schema 11 must identify one current outcome by its Context and Decision"
     );
     drop(store);
     let store = reopen(&db_path);
@@ -2006,6 +2019,68 @@ fn outcome_record_idempotent() {
             "edge count"
         ),
         1
+    );
+}
+
+// Use case: an operator points the schema-11 binary at a schema-10 database; open refuses loudly
+// and leaves the older file untouched instead of partially rewriting the Outcome identity.
+#[test]
+fn schema_v10_open_refuses_without_mutating_outcomes() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let db_path = tempdir.path().join("schema-v10.db");
+    let db = Database::open(&db_path).expect("raw database");
+    db.execute(
+        "CREATE TABLE cg_schema_version (id INTEGER PRIMARY KEY, version INTEGER NOT NULL, installed_at TXID NOT NULL)",
+        &std::collections::HashMap::new(),
+    )
+    .expect("version table");
+    db.execute(
+        "INSERT INTO cg_schema_version (id, version, installed_at) VALUES ($id, $version, $installed_at)",
+        &std::collections::HashMap::from([
+            ("id".to_string(), contextdb_core::Value::Int64(1)),
+            (
+                "version".to_string(),
+                contextdb_core::Value::Int64((context_graph::CG_SCHEMA_VERSION - 1) as i64),
+            ),
+            (
+                "installed_at".to_string(),
+                contextdb_core::Value::TxId(context_graph::TxId(1)),
+            ),
+        ]),
+    )
+    .expect("version row");
+    drop(db);
+
+    let opened = Store::open(StoreConfig {
+        db_path: db_path.clone(),
+        ..Default::default()
+    });
+    assert!(matches!(
+        opened,
+        Err(CgError::LegacySchemaDetected {
+            found_version,
+            expected_version,
+        }) if found_version == context_graph::CG_SCHEMA_VERSION - 1
+            && expected_version == context_graph::CG_SCHEMA_VERSION
+    ));
+
+    let db = Database::open(&db_path).expect("reopen rejected database");
+    assert!(
+        db.table_meta("outcomes").is_none(),
+        "refusal must not install any schema-11 table"
+    );
+    let version = db
+        .execute(
+            "SELECT version FROM cg_schema_version",
+            &std::collections::HashMap::new(),
+        )
+        .expect("read preserved version");
+    assert_eq!(
+        version.rows,
+        vec![vec![contextdb_core::Value::Int64(
+            (context_graph::CG_SCHEMA_VERSION - 1) as i64
+        )]],
+        "refusal must preserve the schema-10 version row"
     );
 }
 
