@@ -383,6 +383,25 @@ impl Store {
     }
 }
 
+pub(super) fn uuid_or_clause(
+    column: &str,
+    prefix: &str,
+    values: &[Uuid],
+    params: &mut HashMap<String, Value>,
+) -> String {
+    let placeholders = values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            let name = format!("{prefix}_{idx}");
+            params.insert(name.clone(), Value::Uuid(*value));
+            format!("${name}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{column} IN ({placeholders})")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -557,23 +576,4 @@ mod tests {
             "the unrelated uniqueness violation must be returned: {err:?}"
         );
     }
-}
-
-pub(super) fn uuid_or_clause(
-    column: &str,
-    prefix: &str,
-    values: &[Uuid],
-    params: &mut HashMap<String, Value>,
-) -> String {
-    let placeholders = values
-        .iter()
-        .enumerate()
-        .map(|(idx, value)| {
-            let name = format!("{prefix}_{idx}");
-            params.insert(name.clone(), Value::Uuid(*value));
-            format!("${name}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{column} IN ({placeholders})")
 }

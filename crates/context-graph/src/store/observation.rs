@@ -1972,6 +1972,91 @@ fn validate_content_hash(hash: Option<&str>) -> Result<()> {
     }
 }
 
+fn validate_mime(kind: EvidenceKind, mime: Option<&str>) -> Result<()> {
+    if mime == Some("application/octet-stream") {
+        return Err(CgError::InvalidMimeForEvidenceKind);
+    }
+    let accepted = match kind {
+        EvidenceKind::Text => {
+            mime.is_none()
+                || mime == Some("application/json")
+                || mime.is_some_and(|m| m.starts_with("text/"))
+        }
+        EvidenceKind::StructuredSignal => mime.is_none() || mime == Some("application/json"),
+        EvidenceKind::ImageFrame => mime.is_some_and(|mime| mime.starts_with("image/")),
+        EvidenceKind::AudioSegment => mime.is_some_and(|mime| mime.starts_with("audio/")),
+        EvidenceKind::VideoSegment => mime.is_some_and(|mime| mime.starts_with("video/")),
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(CgError::InvalidMimeForEvidenceKind)
+    }
+}
+
+fn validate_region(region: Option<&JsonValue>) -> Result<()> {
+    let Some(JsonValue::Object(region)) = region else {
+        return Ok(());
+    };
+    if !(region.contains_key("x")
+        || region.contains_key("y")
+        || region.contains_key("w")
+        || region.contains_key("h"))
+    {
+        if region.contains_key("line_start") || region.contains_key("line_end") {
+            let line_start = region_integer(region, "line_start")?;
+            let line_end = region_integer(region, "line_end")?;
+            if line_start < 0 {
+                return Err(CgError::InvalidEvidenceRegionBounds {
+                    field: "line_start",
+                });
+            }
+            if line_end < line_start {
+                return Err(CgError::InvalidEvidenceRegionBounds { field: "line_end" });
+            }
+        }
+        return Ok(());
+    }
+    let x = region_number(region, "x")?;
+    let y = region_number(region, "y")?;
+    let w = region_number(region, "w")?;
+    let h = region_number(region, "h")?;
+    if x < 0.0 {
+        return Err(CgError::InvalidEvidenceRegionBounds { field: "x" });
+    }
+    if y < 0.0 {
+        return Err(CgError::InvalidEvidenceRegionBounds { field: "y" });
+    }
+    if w <= 0.0 {
+        return Err(CgError::InvalidEvidenceRegionBounds { field: "w" });
+    }
+    if h <= 0.0 {
+        return Err(CgError::InvalidEvidenceRegionBounds { field: "h" });
+    }
+    if x + w > 1.0 {
+        return Err(CgError::InvalidEvidenceRegionBounds { field: "x" });
+    }
+    if y + h > 1.0 {
+        return Err(CgError::InvalidEvidenceRegionBounds { field: "y" });
+    }
+    Ok(())
+}
+
+fn region_integer(region: &serde_json::Map<String, JsonValue>, field: &'static str) -> Result<i64> {
+    region
+        .get(field)
+        .and_then(JsonValue::as_i64)
+        .ok_or(CgError::InvalidEvidenceRegionBounds { field })
+}
+
+fn region_number(region: &serde_json::Map<String, JsonValue>, field: &'static str) -> Result<f64> {
+    region
+        .get(field)
+        .and_then(JsonValue::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or(CgError::InvalidEvidenceRegionBounds { field })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2134,89 +2219,4 @@ mod tests {
             "the retry restores the no-op writer's intended state"
         );
     }
-}
-
-fn validate_mime(kind: EvidenceKind, mime: Option<&str>) -> Result<()> {
-    if mime == Some("application/octet-stream") {
-        return Err(CgError::InvalidMimeForEvidenceKind);
-    }
-    let accepted = match kind {
-        EvidenceKind::Text => {
-            mime.is_none()
-                || mime == Some("application/json")
-                || mime.is_some_and(|m| m.starts_with("text/"))
-        }
-        EvidenceKind::StructuredSignal => mime.is_none() || mime == Some("application/json"),
-        EvidenceKind::ImageFrame => mime.is_some_and(|mime| mime.starts_with("image/")),
-        EvidenceKind::AudioSegment => mime.is_some_and(|mime| mime.starts_with("audio/")),
-        EvidenceKind::VideoSegment => mime.is_some_and(|mime| mime.starts_with("video/")),
-    };
-    if accepted {
-        Ok(())
-    } else {
-        Err(CgError::InvalidMimeForEvidenceKind)
-    }
-}
-
-fn validate_region(region: Option<&JsonValue>) -> Result<()> {
-    let Some(JsonValue::Object(region)) = region else {
-        return Ok(());
-    };
-    if !(region.contains_key("x")
-        || region.contains_key("y")
-        || region.contains_key("w")
-        || region.contains_key("h"))
-    {
-        if region.contains_key("line_start") || region.contains_key("line_end") {
-            let line_start = region_integer(region, "line_start")?;
-            let line_end = region_integer(region, "line_end")?;
-            if line_start < 0 {
-                return Err(CgError::InvalidEvidenceRegionBounds {
-                    field: "line_start",
-                });
-            }
-            if line_end < line_start {
-                return Err(CgError::InvalidEvidenceRegionBounds { field: "line_end" });
-            }
-        }
-        return Ok(());
-    }
-    let x = region_number(region, "x")?;
-    let y = region_number(region, "y")?;
-    let w = region_number(region, "w")?;
-    let h = region_number(region, "h")?;
-    if x < 0.0 {
-        return Err(CgError::InvalidEvidenceRegionBounds { field: "x" });
-    }
-    if y < 0.0 {
-        return Err(CgError::InvalidEvidenceRegionBounds { field: "y" });
-    }
-    if w <= 0.0 {
-        return Err(CgError::InvalidEvidenceRegionBounds { field: "w" });
-    }
-    if h <= 0.0 {
-        return Err(CgError::InvalidEvidenceRegionBounds { field: "h" });
-    }
-    if x + w > 1.0 {
-        return Err(CgError::InvalidEvidenceRegionBounds { field: "x" });
-    }
-    if y + h > 1.0 {
-        return Err(CgError::InvalidEvidenceRegionBounds { field: "y" });
-    }
-    Ok(())
-}
-
-fn region_integer(region: &serde_json::Map<String, JsonValue>, field: &'static str) -> Result<i64> {
-    region
-        .get(field)
-        .and_then(JsonValue::as_i64)
-        .ok_or(CgError::InvalidEvidenceRegionBounds { field })
-}
-
-fn region_number(region: &serde_json::Map<String, JsonValue>, field: &'static str) -> Result<f64> {
-    region
-        .get(field)
-        .and_then(JsonValue::as_f64)
-        .filter(|value| value.is_finite())
-        .ok_or(CgError::InvalidEvidenceRegionBounds { field })
 }
