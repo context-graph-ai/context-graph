@@ -86,13 +86,30 @@ jobs:
         with:
           tool: cargo-deny@0.20.2,cargo-expand@1.0.124
       - run: |
+          require_file_without_match() {
+            local pattern="$1"
+            local file="$2"
+            local grep_status=0
+            grep -q -E "$pattern" "$file" || grep_status=$?
+            case "$grep_status" in
+              0)
+                echo "forbidden dependency marker found in $file" >&2
+                return 1
+                ;;
+              1) return 0 ;;
+              *)
+                echo "dependency-marker scan failed for $file" >&2
+                return "$grep_status"
+                ;;
+            esac
+          }
           cargo deny --config deny.toml check
           cargo expand --lib -p context-graph | tee "$RUNNER_TEMP/context-graph-expanded.rs"
           test -s "$RUNNER_TEMP/context-graph-expanded.rs"
-          rg --files-without-match 'embeddinggemma|candle_embeddinggemma' "$RUNNER_TEMP/context-graph-expanded.rs"
+          require_file_without_match 'embeddinggemma|candle_embeddinggemma' "$RUNNER_TEMP/context-graph-expanded.rs"
           cargo tree -p context-graph -e normal,build | tee "$RUNNER_TEMP/context-graph-tree.txt"
           test -s "$RUNNER_TEMP/context-graph-tree.txt"
-          rg --files-without-match '(^|[[:space:]])candle-embeddinggemma([[:space:]]|$)' "$RUNNER_TEMP/context-graph-tree.txt"
+          require_file_without_match '(^|[[:space:]])candle-embeddinggemma([[:space:]]|$)' "$RUNNER_TEMP/context-graph-tree.txt"
       - run: rustup run stable cargo fmt --all --check
       - run: rustup run stable cargo clippy --workspace --all-targets -- -D warnings
       - run: rustup run stable cargo test --workspace
