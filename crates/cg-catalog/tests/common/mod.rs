@@ -176,22 +176,61 @@ pub fn stub_base_url(server: &tiny_http::Server) -> String {
     format!("http://{}:{}", addr.ip(), addr.port())
 }
 
+pub struct CountedNomicFixtureServer {
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    server_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CountedNomicFixtureServer {
+    fn stop_and_join(&mut self) -> std::thread::Result<()> {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match self.server_thread.take() {
+            Some(server_thread) => server_thread.join(),
+            None => Ok(()),
+        }
+    }
+
+    pub fn shutdown_and_join(mut self) {
+        self.stop_and_join().expect("server thread joins");
+    }
+}
+
+impl Drop for CountedNomicFixtureServer {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
 pub fn serve_nomic_fixture_until_idle_counted(
     server: tiny_http::Server,
     request_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
-            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let url = request.url().to_string();
-            let filename = ["tokenizer.json", "config.json", "REVISION"]
-                .into_iter()
-                .find(|candidate| url.ends_with(candidate))
-                .unwrap_or("model.safetensors");
-            let bytes = fs::read(fixture_dir("nomic").join(filename)).expect("fixture bytes");
-            let _ = request.respond(tiny_http::Response::from_data(bytes));
+) -> CountedNomicFixtureServer {
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_shutdown = std::sync::Arc::clone(&shutdown);
+    let server_thread = std::thread::spawn(move || {
+        while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let url = request.url().to_string();
+                    let filename = ["tokenizer.json", "config.json", "REVISION"]
+                        .into_iter()
+                        .find(|candidate| url.ends_with(candidate))
+                        .unwrap_or("model.safetensors");
+                    let bytes =
+                        fs::read(fixture_dir("nomic").join(filename)).expect("fixture bytes");
+                    let _ = request.respond(tiny_http::Response::from_data(bytes));
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
         }
-    })
+    });
+    CountedNomicFixtureServer {
+        shutdown,
+        server_thread: Some(server_thread),
+    }
 }
 
 pub fn dir_regular_file_size_sum(root: &Path) -> u64 {

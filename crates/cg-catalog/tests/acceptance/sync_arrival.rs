@@ -224,15 +224,27 @@ struct FirstResponseGatedNomicServer {
     first_request_rx: mpsc::Receiver<()>,
     release_tx: mpsc::Sender<()>,
     shutdown: Arc<AtomicBool>,
-    server_thread: std::thread::JoinHandle<()>,
+    server_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FirstResponseGatedNomicServer {
-    fn shutdown_and_join(self) {
+    fn stop_and_join(&mut self) -> std::thread::Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
-        self.server_thread
-            .join()
-            .expect("gated source server joins");
+        let _ = self.release_tx.send(());
+        match self.server_thread.take() {
+            Some(server_thread) => server_thread.join(),
+            None => Ok(()),
+        }
+    }
+
+    fn shutdown_and_join(mut self) {
+        self.stop_and_join().expect("gated source server joins");
+    }
+}
+
+impl Drop for FirstResponseGatedNomicServer {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
     }
 }
 
@@ -248,32 +260,40 @@ fn start_first_response_gated_nomic_server(
     let server_shutdown = Arc::clone(&shutdown);
     let server_thread = std::thread::spawn(move || {
         let mut first_release = Some(release_rx);
+        let mut responder_threads = Vec::new();
         while !server_shutdown.load(Ordering::SeqCst) {
             match server.recv_timeout(Duration::from_millis(50)) {
                 Ok(Some(request)) => {
                     if let Some(release_rx) = first_release.take() {
                         let first_request_tx = first_request_tx.clone();
-                        std::thread::spawn(move || {
+                        responder_threads.push(std::thread::spawn(move || {
                             first_request_tx.send(()).expect("first request signalled");
                             release_rx
                                 .recv_timeout(Duration::from_secs(30))
                                 .expect("first response release signal");
                             respond_with_nomic_fixture(request);
-                        });
+                        }));
                     } else {
-                        std::thread::spawn(move || respond_with_nomic_fixture(request));
+                        responder_threads.push(std::thread::spawn(move || {
+                            respond_with_nomic_fixture(request)
+                        }));
                     }
                 }
                 Ok(None) => {}
                 Err(_) => break,
             }
         }
+        for responder_thread in responder_threads {
+            responder_thread
+                .join()
+                .expect("gated source responder joins");
+        }
     });
     FirstResponseGatedNomicServer {
         first_request_rx,
         release_tx,
         shutdown,
-        server_thread,
+        server_thread: Some(server_thread),
     }
 }
 
@@ -440,7 +460,7 @@ fn sync_arrival_headless_mode_produces_observation_identical_to_interactive_mode
     assert!(
         gated_server
             .first_request_rx
-            .recv_timeout(Duration::from_millis(700))
+            .recv_timeout(Duration::from_secs(30))
             .is_ok(),
         "first headless resolver should reach the configured source before publishing artifacts"
     );

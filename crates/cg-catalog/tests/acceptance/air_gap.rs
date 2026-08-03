@@ -6,7 +6,11 @@ use serde_json::json;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 
 use crate::common::{
     CANONICAL_LICENSE_GATE_MESSAGE, FIXTURE_NOMIC_CONFIG_JSON_SHA,
@@ -20,6 +24,31 @@ use crate::common::{
 fn stub_base_url(server: &tiny_http::Server) -> String {
     let addr = server.server_addr().to_ip().expect("stub server TCP addr");
     format!("http://{}:{}", addr.ip(), addr.port())
+}
+
+struct CorruptFixtureServer {
+    shutdown: Arc<AtomicBool>,
+    server_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CorruptFixtureServer {
+    fn stop_and_join(&mut self) -> std::thread::Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        match self.server_thread.take() {
+            Some(server_thread) => server_thread.join(),
+            None => Ok(()),
+        }
+    }
+
+    fn shutdown_and_join(mut self) {
+        self.stop_and_join().expect("corrupt fixture server joins");
+    }
+}
+
+impl Drop for CorruptFixtureServer {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
 }
 
 fn eviction_fetch_child_if_requested() -> bool {
@@ -602,7 +631,7 @@ fn manual_cache_eviction_via_rm_rf_reflected_in_list_and_re_embed_re_fetches_lou
     );
     drop(held_lock);
     assert!(child.wait().expect("eviction fetch child waits").success());
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "post-eviction refetch should exercise the configured source after progress"
@@ -619,20 +648,33 @@ fn hf_endpoint_returns_200_with_corrupted_bytes_sha_check_catches_it_catalog_ref
     write_source_override(temp.path(), NOMIC_ID, &base_url, TEST_NEW_NOMIC_REVISION);
     let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = std::sync::Arc::clone(&request_count);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
     let server_thread = std::thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let corrupt = b"corrupted model.safetensors bytes with matching HTTP success".to_vec();
-            let response = tiny_http::Response::from_data(corrupt.clone()).with_header(
-                tiny_http::Header::from_bytes(
-                    &b"Content-Length"[..],
-                    corrupt.len().to_string().as_bytes(),
-                )
-                .expect("content-length header"),
-            );
-            let _ = request.respond(response);
+        while !server_shutdown.load(Ordering::SeqCst) {
+            match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let corrupt =
+                        b"corrupted model.safetensors bytes with matching HTTP success".to_vec();
+                    let response = tiny_http::Response::from_data(corrupt.clone()).with_header(
+                        tiny_http::Header::from_bytes(
+                            &b"Content-Length"[..],
+                            corrupt.len().to_string().as_bytes(),
+                        )
+                        .expect("content-length header"),
+                    );
+                    let _ = request.respond(response);
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
         }
     });
+    let server_thread = CorruptFixtureServer {
+        shutdown,
+        server_thread: Some(server_thread),
+    };
     let log_bytes = Arc::new(Mutex::new(Vec::new()));
     let writer_bytes = Arc::clone(&log_bytes);
     let subscriber = tracing_subscriber::fmt()
@@ -685,7 +727,7 @@ fn hf_endpoint_returns_200_with_corrupted_bytes_sha_check_catches_it_catalog_ref
         !temp.path().join("context-graph.db").exists(),
         "fetch(None, ...) must not infer a hidden Store under the model cache root"
     );
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "corrupt-HF test must exercise the configured stub endpoint"

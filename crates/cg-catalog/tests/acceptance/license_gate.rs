@@ -190,7 +190,7 @@ fn license_gate_fetch_for_apache_model_does_not_emit_canonical_message_or_refuse
     let result = catalog_at(temp.path(), "host-A")
         .fetch(None, NOMIC_ID, OutputMode::Interactive)
         .expect("fetch returns");
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert_eq!(result, FetchResult::Completed);
     assert!(
         request_count.load(std::sync::atomic::Ordering::SeqCst) > 0,

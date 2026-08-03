@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -129,32 +129,69 @@ fn stub_base_url(server: &tiny_http::Server) -> String {
     format!("http://{}:{}", addr.ip(), addr.port())
 }
 
+struct UpdateFixtureServer {
+    shutdown: Arc<AtomicBool>,
+    server_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UpdateFixtureServer {
+    fn stop_and_join(&mut self) -> std::thread::Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        match self.server_thread.take() {
+            Some(server_thread) => server_thread.join(),
+            None => Ok(()),
+        }
+    }
+
+    fn shutdown_and_join(mut self) {
+        self.stop_and_join().expect("server thread joins");
+    }
+}
+
+impl Drop for UpdateFixtureServer {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
 fn serve_nomic_fixture_until_idle_counted(
     server: tiny_http::Server,
     revision: &'static str,
     request_count: Arc<AtomicUsize>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
-            request_count.fetch_add(1, Ordering::SeqCst);
-            let url = request.url().to_string();
-            let fixture = fixture_dir("nomic");
-            let bytes = if url.ends_with("REVISION") {
-                revision.as_bytes().to_vec()
-            } else if url.ends_with("model.safetensors") {
-                std::fs::read(fixture.join("model.safetensors")).expect("fixture model")
-            } else if url.ends_with("tokenizer.json") {
-                std::fs::read(fixture.join("tokenizer.json")).expect("fixture tokenizer")
-            } else {
-                std::fs::read(fixture.join("config.json")).expect("fixture config")
-            };
-            let response = tiny_http::Response::from_data(bytes);
-            let _ = request.respond(response);
+) -> UpdateFixtureServer {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
+    let server_thread = std::thread::spawn(move || {
+        while !server_shutdown.load(Ordering::SeqCst) {
+            match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let url = request.url().to_string();
+                    let fixture = fixture_dir("nomic");
+                    let bytes = if url.ends_with("REVISION") {
+                        revision.as_bytes().to_vec()
+                    } else if url.ends_with("model.safetensors") {
+                        std::fs::read(fixture.join("model.safetensors")).expect("fixture model")
+                    } else if url.ends_with("tokenizer.json") {
+                        std::fs::read(fixture.join("tokenizer.json")).expect("fixture tokenizer")
+                    } else {
+                        std::fs::read(fixture.join("config.json")).expect("fixture config")
+                    };
+                    let response = tiny_http::Response::from_data(bytes);
+                    let _ = request.respond(response);
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
         }
-    })
+    });
+    UpdateFixtureServer {
+        shutdown,
+        server_thread: Some(server_thread),
+    }
 }
 
-fn serve_nomic_fixture_until_idle(server: tiny_http::Server) -> std::thread::JoinHandle<()> {
+fn serve_nomic_fixture_until_idle(server: tiny_http::Server) -> UpdateFixtureServer {
     serve_nomic_fixture_until_idle_counted(
         server,
         TEST_NEW_NOMIC_REVISION,
@@ -167,30 +204,42 @@ fn serve_revision_source_until_idle_counted(
     revision: &'static str,
     request_count: Arc<AtomicUsize>,
     request_urls: Arc<Mutex<Vec<String>>>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(2)) {
-            request_count.fetch_add(1, Ordering::SeqCst);
-            let url = request.url().to_string();
-            request_urls
-                .lock()
-                .expect("request url log")
-                .push(url.clone());
-            let bytes = if url.ends_with("REVISION") {
-                revision.as_bytes().to_vec()
-            } else {
-                Vec::new()
-            };
-            let _ = request.respond(tiny_http::Response::from_data(bytes));
+) -> UpdateFixtureServer {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
+    let server_thread = std::thread::spawn(move || {
+        while !server_shutdown.load(Ordering::SeqCst) {
+            match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let url = request.url().to_string();
+                    request_urls
+                        .lock()
+                        .expect("request url log")
+                        .push(url.clone());
+                    let bytes = if url.ends_with("REVISION") {
+                        revision.as_bytes().to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let _ = request.respond(tiny_http::Response::from_data(bytes));
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
         }
-    })
+    });
+    UpdateFixtureServer {
+        shutdown,
+        server_thread: Some(server_thread),
+    }
 }
 
 fn start_update_revision_source(
     root: &std::path::Path,
     configured_revision: &'static str,
     upstream_revision: &'static str,
-) -> (Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+) -> (Arc<AtomicUsize>, UpdateFixtureServer) {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
     let base_url = stub_base_url(&server);
     write_source_override(root, NOMIC_ID, &base_url, configured_revision);
@@ -208,7 +257,7 @@ fn start_empty_revision_source(
 ) -> (
     Arc<AtomicUsize>,
     Arc<Mutex<Vec<String>>>,
-    std::thread::JoinHandle<()>,
+    UpdateFixtureServer,
 ) {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
     let base_url = stub_base_url(&server);
@@ -217,21 +266,36 @@ fn start_empty_revision_source(
     let request_paths = Arc::new(Mutex::new(Vec::new()));
     let counter = Arc::clone(&request_count);
     let paths = Arc::clone(&request_paths);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
     let server_thread = std::thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
-            counter.fetch_add(1, Ordering::SeqCst);
-            let url = request.url().to_string();
-            paths.lock().expect("request paths").push(url.clone());
-            let response = if request.url().ends_with("REVISION") {
-                tiny_http::Response::from_string("")
-            } else {
-                tiny_http::Response::from_string("unexpected non-revision request")
-                    .with_status_code(500)
-            };
-            let _ = request.respond(response);
+        while !server_shutdown.load(Ordering::SeqCst) {
+            match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let url = request.url().to_string();
+                    paths.lock().expect("request paths").push(url.clone());
+                    let response = if request.url().ends_with("REVISION") {
+                        tiny_http::Response::from_string("")
+                    } else {
+                        tiny_http::Response::from_string("unexpected non-revision request")
+                            .with_status_code(500)
+                    };
+                    let _ = request.respond(response);
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
         }
     });
-    (request_count, request_paths, server_thread)
+    (
+        request_count,
+        request_paths,
+        UpdateFixtureServer {
+            shutdown,
+            server_thread: Some(server_thread),
+        },
+    )
 }
 
 fn wait_for_payload(payloads: &Arc<Mutex<Vec<InvalidationDetectedPayload>>>) {
@@ -251,7 +315,7 @@ fn cg_update_check_empty_source_revision_fails_loudly_without_observation_or_cac
     let (request_count, request_paths, server_thread) = start_empty_revision_source(temp.path());
     let (_store_temp, store) = separate_store();
     let result = catalog_at(temp.path(), "host-A").update_check(&store);
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(Ordering::SeqCst) > 0,
         "update_check should consult the configured REVISION source before reporting success"
@@ -300,7 +364,7 @@ fn cg_update_check_produces_observation_on_per_model_entity_with_new_revision_an
     let returned = catalog_at(temp.path(), "host-A")
         .update_check(&store)
         .expect("update check returns");
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(Ordering::SeqCst) > 0,
         "update_check should consult the configured upstream revision source"
@@ -355,7 +419,7 @@ fn cg_update_check_with_no_upstream_changes_writes_zero_observations_returns_emp
     let observations = catalog_at(temp.path(), "host-A")
         .update_check(&store)
         .expect("update check returns");
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(Ordering::SeqCst) > 0,
         "no-change update_check should still consult the configured upstream revision source"
@@ -387,7 +451,7 @@ fn cg_update_check_observation_consumed_by_impact_analysis_invalidates_decisions
     let _observations = catalog_at(temp.path(), "host-A")
         .update_check(&store)
         .expect("update check returns");
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     let rows = store
         .list_observations(Some(*CG_CATALOG_CONTEXT_ID))
         .expect("observations readable");
@@ -439,7 +503,7 @@ fn cg_update_check_observation_consumed_by_subscriptions_pushes_intention_anchor
     let _observations = catalog_at(temp.path(), "host-A")
         .update_check(&store)
         .expect("update check returns");
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     wait_for_payload(&payloads);
     let rows = store
         .list_observations(Some(*CG_CATALOG_CONTEXT_ID))
@@ -487,7 +551,7 @@ fn cg_update_check_default_is_report_only_does_not_apply_updates() {
     let observations = catalog_at(&cache_root, "host-A")
         .update_check(&store)
         .expect("update check returns");
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     let after_revision =
         std::fs::read_to_string(model_dir.join("REVISION")).expect("revision readable");
     assert_eq!(after_revision, before_revision);
@@ -531,7 +595,7 @@ fn cg_update_check_auto_flag_applies_apache_updates_and_refuses_to_apply_license
     let observations = catalog
         .update(&store, UpdatePolicy::Auto)
         .expect("update returns");
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     let after_nomic_revision =
         std::fs::read_to_string(nomic_dir.join("REVISION")).expect("nomic revision readable");
     let after_gemma_revision =
@@ -572,7 +636,7 @@ fn cg_update_check_includes_test_fixtures_requiring_re_baseline_section_per_affe
     let observations = catalog_at(&cache_root, "host-A")
         .update_check(&store)
         .expect("update check returns");
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(observations.iter().any(|observation| {
         observation
             .revision_coupled_fixtures
@@ -615,12 +679,8 @@ fn cg_update_check_writes_observation_on_per_binary_cg_entity_for_cg_binary_itse
     let returned_observations = catalog_at(temp.path(), "host-A")
         .update_check(&store)
         .expect("update check returns");
-    nomic_server_thread
-        .join()
-        .expect("nomic server thread joins");
-    binary_server_thread
-        .join()
-        .expect("binary server thread joins");
+    nomic_server_thread.shutdown_and_join();
+    binary_server_thread.shutdown_and_join();
     assert!(
         binary_request_count.load(Ordering::SeqCst) > 0,
         "binary update check should poll its configured release source, not infer from model updates"

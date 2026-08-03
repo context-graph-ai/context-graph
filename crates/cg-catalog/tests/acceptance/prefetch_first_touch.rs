@@ -15,9 +15,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::common::{
-    FIXTURE_NOMIC_MODEL_SAFETENSORS_SHA, GEMMA_ID, NOMIC_ID, NOMIC_REVISION, catalog_at,
-    fixture_dir, fixture_sha, hold_model_lock, serve_nomic_fixture_until_idle_counted,
-    stub_base_url, write_source_override, write_source_override_with_actual_shas,
+    CountedNomicFixtureServer, FIXTURE_NOMIC_MODEL_SAFETENSORS_SHA, GEMMA_ID, NOMIC_ID,
+    NOMIC_REVISION, catalog_at, fixture_dir, fixture_sha, hold_model_lock,
+    serve_nomic_fixture_until_idle_counted, stub_base_url, write_source_override,
+    write_source_override_with_actual_shas,
 };
 
 const NOMIC_PRODUCTION_MODEL_SHA: &str =
@@ -481,13 +482,38 @@ fn spawn_first_touch_child(test_name: &str, cache_root: &Path) -> Child {
         .expect("first-touch child spawns")
 }
 
-fn start_nomic_source_override(root: &Path) -> (Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+fn start_nomic_source_override(root: &Path) -> (Arc<AtomicUsize>, CountedNomicFixtureServer) {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
     let base_url = stub_base_url(&server);
     write_source_override(root, NOMIC_ID, &base_url, NOMIC_REVISION);
     let request_count = Arc::new(AtomicUsize::new(0));
     let server_thread = serve_nomic_fixture_until_idle_counted(server, Arc::clone(&request_count));
     (request_count, server_thread)
+}
+
+struct SourceFixtureServer {
+    shutdown: Arc<AtomicBool>,
+    server_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SourceFixtureServer {
+    fn stop_and_join(&mut self) -> std::thread::Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+        match self.server_thread.take() {
+            Some(server_thread) => server_thread.join(),
+            None => Ok(()),
+        }
+    }
+
+    fn shutdown_and_join(mut self) {
+        self.stop_and_join().expect("server thread joins");
+    }
+}
+
+impl Drop for SourceFixtureServer {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -547,32 +573,44 @@ fn serve_source_fixture_counted(
     source_dir: PathBuf,
     request_count: Arc<AtomicUsize>,
     request_paths: Arc<Mutex<Vec<String>>>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
-            request_count.fetch_add(1, Ordering::SeqCst);
-            let url = request.url().to_string();
-            request_paths
-                .lock()
-                .expect("request paths")
-                .push(url.clone());
-            let filename = match url.as_str() {
-                "/model.safetensors" => "model.safetensors",
-                "/tokenizer.json" => "tokenizer.json",
-                "/config.json" => "config.json",
-                "/REVISION" => "REVISION",
-                _ => {
-                    let _ = request.respond(
-                        tiny_http::Response::from_string("unexpected artifact path")
-                            .with_status_code(404),
-                    );
-                    continue;
+) -> SourceFixtureServer {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
+    let server_thread = std::thread::spawn(move || {
+        while !server_shutdown.load(Ordering::SeqCst) {
+            match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let url = request.url().to_string();
+                    request_paths
+                        .lock()
+                        .expect("request paths")
+                        .push(url.clone());
+                    let filename = match url.as_str() {
+                        "/model.safetensors" => "model.safetensors",
+                        "/tokenizer.json" => "tokenizer.json",
+                        "/config.json" => "config.json",
+                        "/REVISION" => "REVISION",
+                        _ => {
+                            let _ = request.respond(
+                                tiny_http::Response::from_string("unexpected artifact path")
+                                    .with_status_code(404),
+                            );
+                            continue;
+                        }
+                    };
+                    let bytes = fs::read(source_dir.join(filename)).expect("source fixture bytes");
+                    let _ = request.respond(tiny_http::Response::from_data(bytes));
                 }
-            };
-            let bytes = fs::read(source_dir.join(filename)).expect("source fixture bytes");
-            let _ = request.respond(tiny_http::Response::from_data(bytes));
+                Ok(None) => {}
+                Err(_) => break,
+            }
         }
-    })
+    });
+    SourceFixtureServer {
+        shutdown,
+        server_thread: Some(server_thread),
+    }
 }
 
 fn start_nomic_source_override_without_revision(
@@ -580,7 +618,7 @@ fn start_nomic_source_override_without_revision(
 ) -> (
     Arc<AtomicUsize>,
     Arc<Mutex<Vec<String>>>,
-    std::thread::JoinHandle<()>,
+    SourceFixtureServer,
 ) {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server");
     let base_url = stub_base_url(&server);
@@ -589,26 +627,43 @@ fn start_nomic_source_override_without_revision(
     let request_paths = Arc::new(Mutex::new(Vec::new()));
     let count = Arc::clone(&request_count);
     let paths = Arc::clone(&request_paths);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
     let server_thread = std::thread::spawn(move || {
-        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
-            count.fetch_add(1, Ordering::SeqCst);
-            let url = request.url().to_string();
-            paths.lock().expect("request paths").push(url.clone());
-            let filename = ["tokenizer.json", "config.json", "REVISION"]
-                .into_iter()
-                .find(|candidate| url.ends_with(candidate))
-                .unwrap_or("model.safetensors");
-            if filename == "REVISION" {
-                let _ = request.respond(
-                    tiny_http::Response::from_string("missing revision").with_status_code(404),
-                );
-            } else {
-                let bytes = fs::read(fixture_dir("nomic").join(filename)).expect("fixture bytes");
-                let _ = request.respond(tiny_http::Response::from_data(bytes));
+        while !server_shutdown.load(Ordering::SeqCst) {
+            match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Some(request)) => {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let url = request.url().to_string();
+                    paths.lock().expect("request paths").push(url.clone());
+                    let filename = ["tokenizer.json", "config.json", "REVISION"]
+                        .into_iter()
+                        .find(|candidate| url.ends_with(candidate))
+                        .unwrap_or("model.safetensors");
+                    if filename == "REVISION" {
+                        let _ = request.respond(
+                            tiny_http::Response::from_string("missing revision")
+                                .with_status_code(404),
+                        );
+                    } else {
+                        let bytes =
+                            fs::read(fixture_dir("nomic").join(filename)).expect("fixture bytes");
+                        let _ = request.respond(tiny_http::Response::from_data(bytes));
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => break,
             }
         }
     });
-    (request_count, request_paths, server_thread)
+    (
+        request_count,
+        request_paths,
+        SourceFixtureServer {
+            shutdown,
+            server_thread: Some(server_thread),
+        },
+    )
 }
 
 fn first_stderr_line_while_child_is_in_flight(
@@ -677,7 +732,7 @@ fn prefetch_defaults_writes_artifacts_on_disk_for_apache_models_only() {
             .any(|entry| entry.model_id == GEMMA_ID
                 && entry.reason == SkipReason::ManualAcceptanceRequired)
     );
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "prefetch_defaults should exercise the configured Apache source override"
@@ -737,7 +792,7 @@ fn first_touch_lazy_fetch_emits_stderr_signal_within_two_hundred_fifty_milliseco
     );
     drop(held_lock);
     assert!(child.wait().expect("first-touch child waits").success());
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(Ordering::SeqCst) > 0,
         "first-touch fetch should use the configured local source override after the progress line"
@@ -831,7 +886,7 @@ fn first_touch_lazy_fetch_observer_event_payload_carries_resolved_source_and_byt
         fetch.join().expect("fetch thread joins"),
         Ok(FetchResult::Completed)
     );
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(Ordering::SeqCst) > 0,
         "first-touch fetch should complete through the local source override, not the network"
@@ -938,9 +993,7 @@ fn install_script_prefetch_defaults_flag_drives_apache_model_download_before_fir
     );
     let output = run_install(&home, &prefix, &cache_root, &["--prefetch-defaults"]);
     assert_success(&output, "install --prefetch-defaults");
-    install_server_thread
-        .join()
-        .expect("install source server joins");
+    install_server_thread.shutdown_and_join();
     assert!(
         install_request_count.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "--prefetch-defaults should fetch through the configured source override"
@@ -1025,7 +1078,7 @@ fn install_script_prefetch_defaults_flag_drives_apache_model_download_before_fir
         output.stderr.is_empty(),
         "prefetched first use must not emit lazy-fetch progress"
     );
-    server_thread.join().expect("server thread joins");
+    server_thread.shutdown_and_join();
     assert_eq!(
         request_count.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -1087,9 +1140,7 @@ fn install_script_prefetch_defaults_flag_drives_apache_model_download_before_fir
             &bad_cache_root,
             &["--prefetch-defaults"],
         );
-        bad_server_thread
-            .join()
-            .expect("bad source override server joins");
+        bad_server_thread.shutdown_and_join();
         assert!(
             bad_request_count.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "--prefetch-defaults should contact the configured source before failing {artifact} SHA validation"
@@ -1118,7 +1169,7 @@ fn install_script_prefetch_defaults_fails_when_source_override_revision_artifact
     let (request_count, request_paths, server_thread) =
         start_nomic_source_override_without_revision(&cache_root);
     let output = run_install(&home, &prefix, &cache_root, &["--prefetch-defaults"]);
-    server_thread.join().expect("install source server joins");
+    server_thread.shutdown_and_join();
     assert!(
         request_count.load(Ordering::SeqCst) > 0,
         "--prefetch-defaults should contact the configured source before failing"
