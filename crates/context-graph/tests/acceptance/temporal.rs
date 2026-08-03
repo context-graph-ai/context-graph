@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
 
 use chrono::Utc;
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, EntityId,
-    EntityType, IntentionOrigin, IntentionPatch, IntentionStatus, ReasoningStep, Store,
-    StoreConfig,
+    EntityType, IntentionId, IntentionOrigin, IntentionPatch, IntentionStatus, ReasoningStep,
+    Store, StoreConfig,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -115,9 +116,9 @@ fn decision_input(
 
 // Use case: an audit/forensics use — a regulator reads a Q3 incident report and must see the Intention
 // text in force the day the alert fired, not the edited current wording. Delivers the "what did we
-// mean" temporal promise on the Intention snapshot timeline: history() returns oldest-first
-// contiguous snapshots, intention_at() selects by [valid_from, valid_to) covering the query TxId.
-// Regression guard on cg-crud's shipped intention_at + history(IntentionId) surface.
+// mean" temporal promise on the Intention snapshot timeline: history() returns immutable
+// oldest-first snapshots and intention_at() follows the single known branch at the query TxId.
+// Regression guard on the write-once intention-history surface.
 #[test]
 fn intention_prior_language_queryable_at_any_txid() -> Result<(), CgError> {
     let (_tempdir, db_path, store) = fixture();
@@ -162,13 +163,16 @@ fn intention_prior_language_queryable_at_any_txid() -> Result<(), CgError> {
         snapshots[0].valid_from < snapshots[1].valid_from,
         "oldest-first ordering"
     );
+    assert_ne!(
+        snapshots[0].id, snapshots[1].id,
+        "exact snapshot identities"
+    );
     assert_eq!(
-        snapshots[0].valid_to,
-        Some(snapshots[1].valid_from),
-        "contiguity: snapshots[0].valid_to == snapshots[1].valid_from"
+        snapshots[0].valid_to, None,
+        "predecessor remains write-once"
     );
     assert_eq!(snapshots[0].description, "use MQTT for transport");
-    assert_eq!(snapshots[1].valid_to, None, "open last snapshot");
+    assert_eq!(snapshots[1].valid_to, None, "successor remains write-once");
 
     let covering = ok!(
         store.intention_at(intention.id, tx_decision),
@@ -180,10 +184,263 @@ fn intention_prior_language_queryable_at_any_txid() -> Result<(), CgError> {
         "v1 wording at D1.created_at, not the current v2 text"
     );
     assert!(covering.valid_from <= tx_decision, "valid_from <= query tx");
-    assert!(
-        covering.valid_to.expect("closed v1") > tx_decision,
-        "valid_to > query tx (half-open interval covers tx)"
+    assert_eq!(
+        covering.id, snapshots[0].id,
+        "history branch picks the original wording"
     );
+    Ok(())
+}
+
+// Use case: two offline operators refine the same intention from the same prior wording.  A
+// branchless "what did we mean then?" answer must refuse rather than silently choose a winner;
+// a caller that knows the branch can still recover its exact wording, and a Decision keeps the
+// exact snapshot it actually served.
+#[test]
+fn intention_history_fork_refuses_branchless_read_and_replay_uses_exact_served_snapshot()
+-> Result<(), CgError> {
+    let (_tempdir, _db_path, store) = fixture();
+    let context = ok!(
+        store.create_context(context_input("intention-fork")),
+        "context"
+    )
+    .id;
+    let intention = ok!(
+        store.create_intention(intention_input(context, "v0: protect the loading dock")),
+        "v0"
+    );
+    ok!(
+        store.update_intention(
+            intention.id,
+            IntentionPatch {
+                description: Some("v1: protect the loading dock after hours".to_string()),
+                ..Default::default()
+            }
+        ),
+        "v1"
+    );
+    let before_fork = ok!(store.history(intention.id), "history before fork");
+    let v0 = before_fork[0].clone();
+    let v1 = before_fork[1].clone();
+    let decision = ok!(
+        store.create_decision(decision_input(
+            context,
+            "install a loading-dock sensor",
+            vec![intention.id],
+            vec![],
+        )),
+        "decision serves v1"
+    );
+
+    ok!(
+        store.update_intention_on_branch(
+            intention.id,
+            v0.id,
+            IntentionPatch {
+                description: Some(
+                    "v2: protect the loading dock whenever it is unattended".to_string()
+                ),
+                ..Default::default()
+            }
+        ),
+        "v2 branches from v0"
+    );
+    let history = ok!(store.history(intention.id), "fork history");
+    assert_eq!(history.len(), 3, "v0 plus two immutable successors");
+    assert!(history.iter().all(|snapshot| snapshot.valid_to.is_none()));
+    let links = ok!(store.intention_snapshot_links(intention.id), "fork links");
+    assert_eq!(links.len(), 2, "one immutable link for each successor");
+    assert!(
+        links
+            .iter()
+            .all(|link| link.predecessor_snapshot_id == v0.id)
+    );
+    assert!(links.iter().all(|link| link.id.is_valid()));
+    let v2 = history
+        .iter()
+        .find(|snapshot| snapshot.description.starts_with("v2:"))
+        .expect("v2 snapshot");
+    let ambiguity = store.intention_at(intention.id, v2.valid_from);
+    assert!(matches!(
+        ambiguity,
+        Err(CgError::AmbiguousIntentionHistory { ref branch_head_ids, .. })
+            if branch_head_ids.contains(&v1.id) && branch_head_ids.contains(&v2.id)
+    ));
+    let v1_on_named_branch = ok!(
+        store.intention_at_on_branch(intention.id, v2.valid_from, v1.id),
+        "explicit v1 branch"
+    )
+    .expect("v1 branch state");
+    assert_eq!(v1_on_named_branch.id, v1.id);
+    let replay = ok!(store.replay(decision.id), "replay exact served snapshot");
+    assert_eq!(replay.cited_intention_snapshots.len(), 1);
+    assert_eq!(replay.cited_intention_snapshots[0].id, v1.id);
+    assert_eq!(
+        replay.cited_intention_snapshots[0].description,
+        "v1: protect the loading dock after hours"
+    );
+    Ok(())
+}
+
+// Use case: two live writers start from the same wording at the same instant. Each commit must
+// preserve its own complete values and link to that exact predecessor; no writer may combine the
+// other writer's values with its own history edge.
+#[test]
+fn concurrent_intention_branch_writers_commit_unmixed_snapshots_and_links() -> Result<(), CgError> {
+    let (_tempdir, _db_path, store) = fixture();
+    let context = store.create_context(context_input("concurrent-intention-branch"))?;
+    let intention = store.create_intention(intention_input(
+        context.id,
+        "v0: keep every loading-dock event attributable",
+    ))?;
+    let predecessor = store.history(intention.id)?[0].id;
+    let barrier = Arc::new(Barrier::new(3));
+
+    let spawn_writer = |description: &'static str, owner: &'static str, tag: &'static str| {
+        let writer = store.clone();
+        let ready = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            ready.wait();
+            writer.update_intention_on_branch(
+                intention.id,
+                predecessor,
+                IntentionPatch {
+                    description: Some(description.to_string()),
+                    properties: Some(map(&[("owner", json!(owner))])),
+                    tags: Some(vec![tag.to_string()]),
+                    ..Default::default()
+                },
+            )
+        })
+    };
+    let writer_a = spawn_writer("branch A: protect after hours", "operator-a", "branch-a");
+    let writer_b = spawn_writer(
+        "branch B: protect whenever unattended",
+        "operator-b",
+        "branch-b",
+    );
+    barrier.wait();
+    let branch_a = writer_a.join().expect("writer A thread")?;
+    let branch_b = writer_b.join().expect("writer B thread")?;
+
+    assert_eq!(branch_a.description, "branch A: protect after hours");
+    assert_eq!(branch_a.properties["owner"], json!("operator-a"));
+    assert_eq!(branch_a.tags, vec!["branch-a"]);
+    assert_eq!(
+        branch_b.description,
+        "branch B: protect whenever unattended"
+    );
+    assert_eq!(branch_b.properties["owner"], json!("operator-b"));
+    assert_eq!(branch_b.tags, vec!["branch-b"]);
+    assert_ne!(branch_a.id, branch_b.id);
+
+    let history = store.history(intention.id)?;
+    for expected in [&branch_a, &branch_b] {
+        let stored = history
+            .iter()
+            .find(|snapshot| snapshot.id == expected.id)
+            .expect("writer snapshot persists");
+        assert_eq!(stored, expected, "each writer's values stay together");
+    }
+    let links = store.intention_snapshot_links(intention.id)?;
+    for successor in [branch_a.id, branch_b.id] {
+        assert!(
+            links.iter().any(|link| {
+                link.predecessor_snapshot_id == predecessor
+                    && link.successor_snapshot_id == successor
+            }),
+            "successor {successor} retains the exact predecessor observed by its writer"
+        );
+    }
+    Ok(())
+}
+
+// Use case: reconciliation must never attach a decision to a missing or other-tenant intention.
+// Both checks happen inside the same transaction that would write the edge and immutable citation.
+#[test]
+fn decision_routing_refuses_missing_and_cross_context_intentions_atomically() -> Result<(), CgError>
+{
+    let (_tempdir, _db_path, store) = fixture();
+    let context_a = store.create_context(context_input("routing-context-a"))?;
+    let context_b = store.create_context(context_input("routing-context-b"))?;
+    let intention_a = store.create_intention(intention_input(context_a.id, "serve tenant A"))?;
+    let intention_b = store.create_intention(intention_input(context_b.id, "serve tenant B"))?;
+    let decision = store.create_decision(decision_input(
+        context_a.id,
+        "keep routing tenant-scoped",
+        vec![intention_a.id],
+        vec![],
+    ))?;
+
+    assert!(matches!(
+        store.route_decision_to_intention(decision.id, IntentionId::new_v7()),
+        Err(CgError::IntentionNotFound { .. })
+    ));
+    assert!(matches!(
+        store.route_decision_to_intention(decision.id, intention_b.id),
+        Err(CgError::CrossContextRelationship)
+    ));
+    assert_eq!(
+        store
+            .get_decision(decision.id)?
+            .expect("decision remains readable")
+            .intention_ids,
+        vec![intention_a.id],
+        "both refusals leave the original routing unchanged"
+    );
+    Ok(())
+}
+
+// Use case: a product owner refines an intention and then archives it. The original wording,
+// refinement, and retirement must remain three immutable rows connected by two links; archive is
+// not a hidden rewrite of the currently selected row.
+#[test]
+fn intention_update_and_archive_append_immutable_history_and_move_current_pointer()
+-> Result<(), CgError> {
+    let (_tempdir, _db_path, store) = fixture();
+    let context = ok!(
+        store.create_context(context_input("intention-archive")),
+        "context"
+    )
+    .id;
+    let intention = ok!(
+        store.create_intention(intention_input(context, "v0: retain incident evidence")),
+        "v0"
+    );
+    ok!(
+        store.update_intention(
+            intention.id,
+            IntentionPatch {
+                description: Some("v1: retain incident evidence for ninety days".to_string()),
+                ..Default::default()
+            }
+        ),
+        "v1"
+    );
+    let archived = ok!(
+        store.archive_intention(intention.id, "retention policy withdrawn".to_string()),
+        "archive"
+    );
+    assert_eq!(archived.status, IntentionStatus::Archived);
+    let history = ok!(store.history(intention.id), "archive history");
+    assert_eq!(history.len(), 3);
+    assert!(history.iter().all(|snapshot| snapshot.valid_to.is_none()));
+    assert_eq!(history[2].status, IntentionStatus::Archived);
+    let links = ok!(
+        store.intention_snapshot_links(intention.id),
+        "archive links"
+    );
+    assert_eq!(links.len(), 2);
+    assert_eq!(links[0].predecessor_snapshot_id, history[0].id);
+    assert_eq!(links[0].successor_snapshot_id, history[1].id);
+    assert_eq!(links[1].predecessor_snapshot_id, history[1].id);
+    assert_eq!(links[1].successor_snapshot_id, history[2].id);
+    let current = ok!(
+        store.intention_at_on_branch(intention.id, history[2].valid_from, history[2].id),
+        "archive branch"
+    )
+    .expect("archived snapshot");
+    assert_eq!(current.id, history[2].id);
+    assert_eq!(current.status, IntentionStatus::Archived);
     Ok(())
 }
 

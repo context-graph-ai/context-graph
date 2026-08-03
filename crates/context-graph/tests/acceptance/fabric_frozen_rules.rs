@@ -56,6 +56,7 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "outcomes",
         "invalidations",
         "entity_current_snapshots",
+        "intention_current_snapshots",
         "cg_learned_skills",
     ];
     const KEEP_FIRST: &[&str] = &[
@@ -84,6 +85,8 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "decision_basis_snapshots",
         "entity_snapshot_links",
         "intention_snapshots",
+        "intention_snapshot_links",
+        "decision_intention_citations",
         "approvals",
         "conflicts",
         "precedent_matches",
@@ -113,8 +116,8 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "work_capabilities",
     ];
 
-    assert_eq!(KEEP_LATEST.len(), 8);
-    assert_eq!(KEEP_FIRST.len(), 31);
+    assert_eq!(KEEP_LATEST.len(), 9);
+    assert_eq!(KEEP_FIRST.len(), 33);
     assert_eq!(SYNC_OFF.len(), 10);
     assert_eq!(ENGINE_OWNED.len(), 7);
 

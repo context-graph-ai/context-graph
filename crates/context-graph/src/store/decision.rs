@@ -36,18 +36,6 @@ impl Store {
                 });
             }
         }
-        let intention_contexts = self.intention_context_ids(&input.intention_ids)?;
-        for iid in &input.intention_ids {
-            match intention_contexts.get(iid) {
-                Some(ictx) => {
-                    if *ictx != input.context_id {
-                        return Err(CgError::CrossContextViolation);
-                    }
-                }
-                None => return Err(CgError::IntentionNotFound { id: *iid }),
-            }
-        }
-
         for eid in &input.based_on_entity_ids {
             if !eid.is_valid() {
                 return Err(CgError::InvalidIdentity {
@@ -106,6 +94,17 @@ impl Store {
         let basis_snapshots = self.basis_snapshots_for_basis(&basis_snapshot_ids)?;
 
         let tx = self.begin_tx()?;
+        let intention_snapshot_ids = match self.intention_snapshot_ids_for_context_in_tx(
+            tx,
+            input.context_id,
+            &input.intention_ids,
+        ) {
+            Ok(snapshot_ids) => snapshot_ids,
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(error);
+            }
+        };
         let reasoning_json = match self.reasoning_json_with_producer_snapshot_in_tx(
             tx,
             &input.reasoning,
@@ -171,10 +170,26 @@ impl Store {
                 iid.as_uuid(),
                 "SERVES",
                 input.context_id,
-                None,
+                Some(serves_snapshot_edge_properties(
+                    *intention_snapshot_ids
+                        .get(iid)
+                        .expect("validated intention snapshot"),
+                )),
             ) {
                 let _ = self.db.rollback(tx);
                 return Err(e);
+            }
+            if let Err(error) = self.insert_decision_intention_citation_in_tx(
+                tx,
+                input.context_id,
+                id,
+                *iid,
+                *intention_snapshot_ids
+                    .get(iid)
+                    .expect("validated intention snapshot"),
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(error);
             }
         }
         let mut basis_edge_entities = BTreeSet::new();
@@ -296,6 +311,74 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    fn intention_snapshot_ids_for_context_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        intention_ids: &[IntentionId],
+    ) -> Result<HashMap<IntentionId, IntentionSnapshotId>> {
+        let mut snapshot_ids = HashMap::with_capacity(intention_ids.len());
+        for intention_id in intention_ids {
+            let result = self
+                .db
+                .execute_in_tx(
+                    tx,
+                    "SELECT context_id FROM intentions WHERE id = $id",
+                    &HashMap::from([("id".to_string(), Value::Uuid(intention_id.as_uuid()))]),
+                )
+                .map_err(map_engine_err)?;
+            let Some(row) = result.rows.first() else {
+                return Err(CgError::IntentionNotFound { id: *intention_id });
+            };
+            let found_context = match row.first() {
+                Some(Value::Uuid(value)) => ContextId::from(*value),
+                other => {
+                    return Err(CgError::Engine(format!(
+                        "intention context lookup returned invalid row {other:?}"
+                    )));
+                }
+            };
+            if found_context != context_id {
+                return Err(CgError::CrossContextViolation);
+            }
+            let snapshot_id = self
+                .current_intention_snapshot_id_in_tx(tx, *intention_id)?
+                .ok_or_else(|| {
+                    CgError::Engine(format!(
+                        "data-integrity: intention {} has no current snapshot pointer",
+                        intention_id
+                    ))
+                })?;
+            snapshot_ids.insert(*intention_id, snapshot_id);
+        }
+        Ok(snapshot_ids)
+    }
+
+    fn insert_decision_intention_citation_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        decision_id: DecisionId,
+        intention_id: IntentionId,
+        snapshot_id: IntentionSnapshotId,
+    ) -> Result<()> {
+        self.db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO decision_intention_citations (id, context_id, decision_id, intention_id, snapshot_id, created_at) VALUES ($id, $context_id, $decision_id, $intention_id, $snapshot_id, $created_at)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(uuid::Uuid::now_v7())),
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    ("decision_id".to_string(), Value::Uuid(decision_id.as_uuid())),
+                    ("intention_id".to_string(), Value::Uuid(intention_id.as_uuid())),
+                    ("snapshot_id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
+                    ("created_at".to_string(), Value::TxId(tx)),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        Ok(())
     }
 
     fn basis_snapshots_for_decision(&self, id: DecisionId) -> Result<Vec<EntitySnapshotId>> {
@@ -694,39 +777,106 @@ impl Store {
         decision_id: DecisionId,
         intention_id: IntentionId,
     ) -> Result<()> {
-        if self.decision_targets_intention(decision_id, RelationshipType::Serves, intention_id)? {
-            return Ok(());
-        }
-        let params: HashMap<String, Value> =
-            [("id".to_string(), Value::Uuid(decision_id.as_uuid()))]
-                .into_iter()
-                .collect();
-        let result = self
-            .db
-            .execute("SELECT context_id FROM decisions WHERE id = $id", &params)
-            .map_err(map_engine_err)?;
+        let tx = self.begin_tx()?;
+        let params = HashMap::from([("id".to_string(), Value::Uuid(decision_id.as_uuid()))]);
+        let result = match self.db.execute_in_tx(
+            tx,
+            "SELECT context_id FROM decisions WHERE id = $id",
+            &params,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(error));
+            }
+        };
         let Some(row) = result.rows.first() else {
+            let _ = self.db.rollback(tx);
             return Err(CgError::DecisionNotFound { id: decision_id });
         };
         let context_id = match row.first() {
             Some(Value::Uuid(context)) => ContextId::from(*context),
             other => {
+                let _ = self.db.rollback(tx);
                 return Err(CgError::Engine(format!(
                     "decision context lookup returned invalid row {other:?}"
                 )));
             }
         };
-        let tx = self.begin_tx()?;
+        let intention = match self.db.execute_in_tx(
+            tx,
+            "SELECT context_id FROM intentions WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(intention_id.as_uuid()))]),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(error));
+            }
+        };
+        let Some(intention_row) = intention.rows.first() else {
+            let _ = self.db.rollback(tx);
+            return Err(CgError::IntentionNotFound { id: intention_id });
+        };
+        if intention_row.first() != Some(&Value::Uuid(context_id.as_uuid())) {
+            let _ = self.db.rollback(tx);
+            return Err(CgError::CrossContextRelationship);
+        }
+        let existing = match self.db.execute_in_tx(
+            tx,
+            "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type AND context_id = $context_id",
+            &HashMap::from([
+                ("source_id".to_string(), Value::Uuid(decision_id.as_uuid())),
+                ("target_id".to_string(), Value::Uuid(intention_id.as_uuid())),
+                ("edge_type".to_string(), Value::Text("SERVES".to_string())),
+                ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+            ]),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(error));
+            }
+        };
+        if !existing.rows.is_empty() {
+            let _ = self.db.rollback(tx);
+            return Ok(());
+        }
+        let intention_snapshot_id = match self.current_intention_snapshot_id_in_tx(tx, intention_id)
+        {
+            Ok(Some(snapshot_id)) => snapshot_id,
+            Ok(None) => {
+                let _ = self.db.rollback(tx);
+                return Err(CgError::Engine(format!(
+                    "data-integrity: intention {} has no current snapshot pointer",
+                    intention_id
+                )));
+            }
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(error);
+            }
+        };
         if let Err(e) = self.insert_edge_in_tx(
             tx,
             decision_id.as_uuid(),
             intention_id.as_uuid(),
             "SERVES",
             context_id,
-            None,
+            Some(serves_snapshot_edge_properties(intention_snapshot_id)),
         ) {
             let _ = self.db.rollback(tx);
             return Err(e);
+        }
+        if let Err(error) = self.insert_decision_intention_citation_in_tx(
+            tx,
+            context_id,
+            decision_id,
+            intention_id,
+            intention_snapshot_id,
+        ) {
+            let _ = self.db.rollback(tx);
+            return Err(error);
         }
         self.db.commit(tx).map_err(map_engine_err)?;
         Ok(())
@@ -1067,17 +1217,6 @@ impl Store {
                 });
             }
         }
-        let intention_contexts = self.intention_context_ids(&new.intention_ids)?;
-        for iid in &new.intention_ids {
-            match intention_contexts.get(iid) {
-                Some(ictx) => {
-                    if *ictx != new.context_id {
-                        return Err(CgError::CrossContextViolation);
-                    }
-                }
-                None => return Err(CgError::IntentionNotFound { id: *iid }),
-            }
-        }
         for eid in &new.based_on_entity_ids {
             if !eid.is_valid() {
                 return Err(CgError::InvalidIdentity {
@@ -1135,6 +1274,17 @@ impl Store {
         let basis_snapshots = self.basis_snapshots_for_basis(&basis_snapshot_ids)?;
 
         let tx = self.begin_tx()?;
+        let intention_snapshot_ids = match self.intention_snapshot_ids_for_context_in_tx(
+            tx,
+            new.context_id,
+            &new.intention_ids,
+        ) {
+            Ok(snapshot_ids) => snapshot_ids,
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(error);
+            }
+        };
         let reasoning_json = match self.reasoning_json_with_producer_snapshot_in_tx(
             tx,
             &new.reasoning,
@@ -1223,10 +1373,26 @@ impl Store {
                 iid.as_uuid(),
                 "SERVES",
                 new.context_id,
-                None,
+                Some(serves_snapshot_edge_properties(
+                    *intention_snapshot_ids
+                        .get(iid)
+                        .expect("validated intention snapshot"),
+                )),
             ) {
                 let _ = self.db.rollback(tx);
                 return Err(e);
+            }
+            if let Err(error) = self.insert_decision_intention_citation_in_tx(
+                tx,
+                new.context_id,
+                new_id,
+                *iid,
+                *intention_snapshot_ids
+                    .get(iid)
+                    .expect("validated intention snapshot"),
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(error);
             }
         }
         let mut basis_edge_entities = BTreeSet::new();
@@ -1789,41 +1955,50 @@ impl Store {
         decision: &Decision,
         snapshot: SnapshotId,
     ) -> Result<IntentionSnapshot> {
-        let result = self
+        let citation = self
             .db
             .execute_at_snapshot(
-                "SELECT intention_id, description, status, origin, properties, tags, valid_from, valid_to FROM intention_snapshots WHERE intention_id = $intention_id AND valid_from <= $decision_tx",
+                "SELECT snapshot_id FROM decision_intention_citations WHERE decision_id = $decision_id AND intention_id = $intention_id AND context_id = $context_id",
                 &HashMap::from([
                     (
                         "intention_id".to_string(),
                         Value::Uuid(intention_id.as_uuid()),
                     ),
-                    ("decision_tx".to_string(), Value::TxId(decision.created_at)),
+                    ("decision_id".to_string(), Value::Uuid(decision.id.as_uuid())),
+                    ("context_id".to_string(), Value::Uuid(decision.context_id.as_uuid())),
                 ]),
                 snapshot,
             )
             .map_err(map_engine_err)?;
-        let mut snapshots = Vec::new();
-        for row in &result.rows {
-            let snapshot_row = decode_intention_snapshot_at_read(&result.columns, row)?;
-            if snapshot_row.valid_from <= decision.created_at
-                && snapshot_row
-                    .valid_to
-                    .map(|valid_to| decision.created_at < valid_to)
-                    .unwrap_or(true)
-            {
-                snapshots.push(snapshot_row);
-            }
-        }
-        snapshots
-            .into_iter()
-            .max_by_key(|snapshot| snapshot.valid_from)
+        let citation_row = citation.rows.first().ok_or_else(|| {
+            CgError::Engine(format!(
+                "data-integrity: decision {} has no immutable intention citation for {}",
+                decision.id, intention_id
+            ))
+        })?;
+        let snapshot_id =
+            IntentionSnapshotId::from(get_uuid(citation_row, &citation.columns, "snapshot_id")?);
+        let result = self
+            .db
+            .execute_at_snapshot(
+                "SELECT id, intention_id, description, status, origin, properties, tags, valid_from, valid_to FROM intention_snapshots WHERE id = $snapshot_id AND intention_id = $intention_id AND context_id = $context_id",
+                &HashMap::from([
+                    ("snapshot_id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
+                    ("intention_id".to_string(), Value::Uuid(intention_id.as_uuid())),
+                    ("context_id".to_string(), Value::Uuid(decision.context_id.as_uuid())),
+                ]),
+                snapshot,
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| decode_intention_snapshot_at_read(&result.columns, row))
+            .transpose()?
             .ok_or_else(|| {
                 CgError::Engine(format!(
-                    "data-integrity: SERVES edge to intention {} has no snapshot covering decision {}.created_at {}",
-                    intention_id,
-                    decision.id,
-                    decision.created_at.0
+                    "data-integrity: decision {} cites missing intention snapshot {}",
+                    decision.id, snapshot_id
                 ))
             })
     }
@@ -1858,6 +2033,7 @@ fn decode_intention_snapshot_at_read(
     row: &[Value],
 ) -> Result<IntentionSnapshot> {
     Ok(IntentionSnapshot {
+        id: IntentionSnapshotId::from(get_uuid(row, columns, "id")?),
         intention_id: IntentionId::from(get_uuid(row, columns, "intention_id")?),
         description: get_text(row, columns, "description")?,
         status: intention_status_from_str(&get_text(row, columns, "status")?)?,
@@ -1945,6 +2121,12 @@ fn basis_snapshot_edge_properties(
         object.insert("basis_fields".to_string(), serde_json::json!(fields));
     }
     properties
+}
+
+/// A SERVES edge is immutable provenance: it names the exact intention wording/status that the
+/// decision served.  Replaying a decision must not guess from transaction time after branches.
+fn serves_snapshot_edge_properties(snapshot_id: IntentionSnapshotId) -> JsonValue {
+    serde_json::json!({ "intention_snapshot_id": snapshot_id.as_uuid().to_string() })
 }
 
 fn decision_basis_row_id(decision_id: DecisionId, basis_order: usize) -> uuid::Uuid {

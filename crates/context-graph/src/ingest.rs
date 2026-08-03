@@ -14,8 +14,8 @@ use crate::{
     CreateDigest, Decision, DecisionId, DecisionStatus, DigestId, Embedder, EmbeddingId,
     EmbeddingInput, EmbeddingOutput, EmbeddingTarget, EnforcementLevel, EntityId, EntitySnapshotId,
     EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionId,
-    InvalidationId, InvalidationSeverity, InvalidationStatus, ModelCallOutcome, ObservationId,
-    PrecomputedEmbedding, ReasoningStep, Result, Store,
+    IntentionSnapshotId, InvalidationId, InvalidationSeverity, InvalidationStatus,
+    ModelCallOutcome, ObservationId, PrecomputedEmbedding, ReasoningStep, Result, Store,
 };
 
 const EXTRACTION_PRIOR_DECISION_LIMIT: usize = 64;
@@ -3457,10 +3457,11 @@ impl<'a> CaptureTxn<'a> {
                 ("created_at".to_string(), DbValue::TxId(self.tx)),
             ]),
         )?;
+        let snapshot_id = uuid::Uuid::now_v7();
         self.execute(
             "INSERT INTO intention_snapshots (id, context_id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $context_id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
             HashMap::from([
-                ("id".to_string(), DbValue::Uuid(uuid::Uuid::now_v7())),
+                ("id".to_string(), DbValue::Uuid(snapshot_id)),
                 ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
                 ("intention_id".to_string(), DbValue::Uuid(id.as_uuid())),
                 ("description".to_string(), DbValue::Text(description.to_string())),
@@ -3470,6 +3471,15 @@ impl<'a> CaptureTxn<'a> {
                 ("tags".to_string(), DbValue::Json(json!([]))),
                 ("valid_from".to_string(), DbValue::TxId(self.tx)),
                 ("valid_to".to_string(), DbValue::Null),
+            ]),
+        )?;
+        self.execute(
+            "INSERT INTO intention_current_snapshots (context_id, intention_id, snapshot_id, updated_at) VALUES ($context_id, $intention_id, $snapshot_id, $updated_at)",
+            HashMap::from([
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("intention_id".to_string(), DbValue::Uuid(id.as_uuid())),
+                ("snapshot_id".to_string(), DbValue::Uuid(snapshot_id)),
+                ("updated_at".to_string(), DbValue::TxId(self.tx)),
             ]),
         )?;
         self.insert_audit("create", "intention", id.as_uuid(), context_id)?;
@@ -4365,12 +4375,31 @@ impl<'a> CaptureTxn<'a> {
             }
         }
         for intention_id in &input.intention_ids {
+            let intention_snapshot_id = self
+                .current_intention_snapshot_id(input.context_id, *intention_id)?
+                .ok_or(CgError::NotFound {
+                    id: Some(intention_id.as_uuid().to_string()),
+                    missing: Some("intention_snapshot"),
+                })?;
             self.insert_edge(
                 id.as_uuid(),
                 intention_id.as_uuid(),
                 "SERVES",
                 input.context_id,
-                None,
+                Some(json!({
+                    "intention_snapshot_id": intention_snapshot_id.as_uuid().to_string(),
+                })),
+            )?;
+            self.execute(
+                "INSERT INTO decision_intention_citations (id, context_id, decision_id, intention_id, snapshot_id, created_at) VALUES ($id, $context_id, $decision_id, $intention_id, $snapshot_id, $created_at)",
+                HashMap::from([
+                    ("id".to_string(), DbValue::Uuid(uuid::Uuid::now_v7())),
+                    ("context_id".to_string(), DbValue::Uuid(input.context_id.as_uuid())),
+                    ("decision_id".to_string(), DbValue::Uuid(id.as_uuid())),
+                    ("intention_id".to_string(), DbValue::Uuid(intention_id.as_uuid())),
+                    ("snapshot_id".to_string(), DbValue::Uuid(intention_snapshot_id.as_uuid())),
+                    ("created_at".to_string(), DbValue::TxId(self.tx)),
+                ]),
             )?;
         }
         for precedent_id in &input.precedent_ids {
@@ -4640,6 +4669,29 @@ impl<'a> CaptureTxn<'a> {
             .map_err(map_engine)?;
         Ok(result.rows.first().and_then(|row| match row.first() {
             Some(DbValue::Uuid(id)) => Some(EntitySnapshotId::from(*id)),
+            _ => None,
+        }))
+    }
+
+    fn current_intention_snapshot_id(
+        &self,
+        context_id: ContextId,
+        intention_id: IntentionId,
+    ) -> Result<Option<IntentionSnapshotId>> {
+        let result = self
+            .store
+            .internal_db()
+            .execute_in_tx(
+                self.tx,
+                "SELECT snapshot_id FROM intention_current_snapshots WHERE context_id = $context_id AND intention_id = $intention_id",
+                &HashMap::from([
+                    ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                    ("intention_id".to_string(), DbValue::Uuid(intention_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine)?;
+        Ok(result.rows.first().and_then(|row| match row.first() {
+            Some(DbValue::Uuid(id)) => Some(IntentionSnapshotId::from(*id)),
             _ => None,
         }))
     }

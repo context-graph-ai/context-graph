@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::{
-    ContextId, DecisionId, DecisionStatus, EvidenceId, IntentionId, IntentionStatus,
-    InvalidationId, InvalidationStatus, TxId,
+    ContextId, DecisionId, DecisionStatus, EvidenceId, IntentionId, IntentionSnapshotId,
+    IntentionStatus, InvalidationId, InvalidationStatus, TxId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +203,14 @@ pub enum CgError {
     IntentionIllegalTransition {
         from: IntentionStatus,
         to: IntentionStatus,
+    },
+    /// More than one immutable intention-history branch is live at the requested transaction.
+    /// Call `intention_at_on_branch` with one returned branch head; guessing would rewrite the
+    /// user's recorded meaning.
+    AmbiguousIntentionHistory {
+        intention_id: IntentionId,
+        at: TxId,
+        branch_head_ids: Vec<IntentionSnapshotId>,
     },
     ActiveDecisionsReference {
         intention_id: IntentionId,

@@ -3,8 +3,9 @@ use crate::capture_sync_common::{
 };
 use chrono::{DateTime, Utc};
 use context_graph::{
-    CgError, ContextId, CreateContext, CreateEntity, EntityId, EntitySnapshotId, EntityType,
-    EvidenceId, EvidenceRef, ObservationId, RecordObservation, Store,
+    CgError, ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, EntityId,
+    EntitySnapshotId, EntityType, EvidenceId, EvidenceRef, IntentionId, IntentionOrigin,
+    IntentionPatch, IntentionSnapshotId, IntentionStatus, ObservationId, RecordObservation, Store,
 };
 use contextdb_core::{Error as DbError, TxId, Value as DbValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -123,6 +124,118 @@ fn assert_duplicate_link_is_refused(
     assert!(
         matches!(duplicate, Err(DbError::UniqueViolation { .. })),
         "an exact predecessor-to-successor link must fail with its unique identity error, got {duplicate:?}"
+    );
+}
+
+fn assert_intention_fork_and_exact_replay(
+    store: &Store,
+    intention_id: IntentionId,
+    decision_id: context_graph::DecisionId,
+    predecessor: IntentionSnapshotId,
+    branch_a: IntentionSnapshotId,
+    branch_b: IntentionSnapshotId,
+) {
+    let history = store.history(intention_id).expect("read synced history");
+    assert_eq!(
+        history.len(),
+        3,
+        "one predecessor and two successors survive"
+    );
+    assert!(
+        history.iter().all(|snapshot| snapshot.valid_to.is_none()),
+        "immutable snapshots are never closed by rewriting valid_to"
+    );
+    let links = store
+        .intention_snapshot_links(intention_id)
+        .expect("read synced intention links");
+    assert_eq!(
+        links
+            .iter()
+            .map(|link| (link.predecessor_snapshot_id, link.successor_snapshot_id))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([(predecessor, branch_a), (predecessor, branch_b)]),
+        "both public-API updates retain the shared predecessor"
+    );
+
+    let at = history
+        .iter()
+        .filter(|snapshot| snapshot.id == branch_a || snapshot.id == branch_b)
+        .map(|snapshot| snapshot.valid_from)
+        .max()
+        .expect("both fork heads exist");
+    let ambiguity = store.intention_at(intention_id, at);
+    assert!(
+        matches!(
+            ambiguity,
+            Err(CgError::AmbiguousIntentionHistory {
+                intention_id: ambiguous_id,
+                ref branch_head_ids,
+                ..
+            }) if ambiguous_id == intention_id
+                && branch_head_ids == &{
+                    let mut expected = vec![branch_a, branch_b];
+                    expected.sort_by_key(|id| id.as_uuid());
+                    expected
+                }
+        ),
+        "a branchless temporal read must return the typed ambiguity with both heads, got {ambiguity:?}"
+    );
+    for branch in [branch_a, branch_b] {
+        assert_eq!(
+            store
+                .intention_at_on_branch(intention_id, at, branch)
+                .expect("read explicitly selected branch")
+                .expect("selected branch has a covering snapshot")
+                .id,
+            branch,
+            "an explicit branch read returns that exact immutable head"
+        );
+    }
+
+    let replay = store
+        .replay(decision_id)
+        .expect("replay decision after intention fork convergence");
+    assert_eq!(
+        replay
+            .cited_intention_snapshots
+            .iter()
+            .map(|snapshot| snapshot.id)
+            .collect::<Vec<_>>(),
+        vec![branch_a],
+        "Decision replay returns the exact intention wording cited at creation, never the converged current pointer"
+    );
+}
+
+fn assert_immutable_row_refuses_update_and_delete(store: &Store, table: &str) {
+    let db = store.sync_database();
+    let row = db
+        .scan(table, db.snapshot())
+        .unwrap_or_else(|error| panic!("scan {table}: {error:?}"))
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{table} must contain a row for the immutability probe"));
+    let id = match row.values.get("id") {
+        Some(DbValue::Uuid(id)) => *id,
+        value => panic!("{table}.id must be UUID, got {value:?}"),
+    };
+    let update = db.execute(
+        &format!("UPDATE {table} SET id = $replacement_id WHERE id = $id"),
+        &HashMap::from([
+            ("id".to_string(), DbValue::Uuid(id)),
+            ("replacement_id".to_string(), DbValue::Uuid(Uuid::now_v7())),
+        ]),
+    );
+    assert!(
+        matches!(update, Err(DbError::ImmutableTable(ref actual)) if actual == table),
+        "raw UPDATE of {table} must fail at the immutable-table boundary, got {update:?}"
+    );
+    let delete = db.execute(
+        &format!("DELETE FROM {table} WHERE id = $id"),
+        &HashMap::from([("id".to_string(), DbValue::Uuid(id))]),
+    );
+    assert!(
+        matches!(delete, Err(DbError::ImmutableTable(ref actual)) if actual == table),
+        "raw DELETE of {table} must fail at the immutable-table boundary, got {delete:?}"
     );
 }
 
@@ -264,6 +377,130 @@ async fn successor_snapshot_branches_survive_sync_restart_and_restore() {
         entity.id,
         predecessor,
         [successor_a, successor_b],
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn intention_fork_and_exact_decision_citation_survive_ticketed_sync_restart_and_restore() {
+    let fixture = ticketed_memory_fixture("intention_snapshot_branches").await;
+    let edge_a = fixture.open_edge("intention-edge-a");
+    let edge_b = fixture.open_edge("intention-edge-b");
+    let context = edge_a
+        .store
+        .create_context(CreateContext {
+            name: "intention provenance".to_string(),
+            ..Default::default()
+        })
+        .expect("create intention context");
+    let intention = edge_a
+        .store
+        .create_intention(CreateIntention {
+            description: "protect the loading dock".to_string(),
+            status: IntentionStatus::Active,
+            origin: IntentionOrigin::Human,
+            context_id: context.id,
+            ..Default::default()
+        })
+        .expect("create shared predecessor intention");
+    let predecessor = edge_a
+        .store
+        .history(intention.id)
+        .expect("read initial intention history")
+        .into_iter()
+        .next()
+        .expect("intention creation writes its initial snapshot")
+        .id;
+
+    drain_ticketed_push(&edge_a.client).await;
+    drain_ticketed_pull(&edge_b.client).await;
+
+    let branch_a = edge_a
+        .store
+        .update_intention_on_branch(
+            intention.id,
+            predecessor,
+            IntentionPatch {
+                description: Some("protect the loading dock after hours".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("edge A appends its successor through the public API");
+    assert_eq!(branch_a.description, "protect the loading dock after hours");
+    let decision = edge_a
+        .store
+        .create_decision(CreateDecision {
+            decision_type: "security".to_string(),
+            description: "install a loading-dock sensor".to_string(),
+            intention_ids: vec![intention.id],
+            context_id: context.id,
+            ..Default::default()
+        })
+        .expect("Decision cites edge A's exact successor");
+
+    let branch_b = edge_b
+        .store
+        .update_intention_on_branch(
+            intention.id,
+            predecessor,
+            IntentionPatch {
+                description: Some("protect the loading dock whenever it is unattended".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("edge B appends its successor through the public API");
+    assert_eq!(
+        branch_b.description,
+        "protect the loading dock whenever it is unattended"
+    );
+    assert_ne!(
+        branch_a.id, branch_b.id,
+        "the offline successors have independent immutable identities"
+    );
+
+    drain_ticketed_push(&edge_a.client).await;
+    drain_ticketed_push(&edge_b.client).await;
+    drain_ticketed_pull(&edge_a.client).await;
+    drain_ticketed_pull(&edge_b.client).await;
+
+    for store in [fixture.hub_store(), &edge_a.store, &edge_b.store] {
+        assert_intention_fork_and_exact_replay(
+            store,
+            intention.id,
+            decision.id,
+            predecessor,
+            branch_a.id,
+            branch_b.id,
+        );
+    }
+    for table in [
+        "intention_snapshots",
+        "intention_snapshot_links",
+        "decision_intention_citations",
+    ] {
+        assert_immutable_row_refuses_update_and_delete(fixture.hub_store(), table);
+    }
+
+    drop(edge_a);
+    let restarted_a = fixture.open_edge("intention-edge-a");
+    assert_intention_fork_and_exact_replay(
+        &restarted_a.store,
+        intention.id,
+        decision.id,
+        predecessor,
+        branch_a.id,
+        branch_b.id,
+    );
+
+    let restored = fixture.open_edge("intention-wiped-restore");
+    drain_ticketed_pull(&restored.client).await;
+    assert_intention_fork_and_exact_replay(
+        &restored.store,
+        intention.id,
+        decision.id,
+        predecessor,
+        branch_a.id,
+        branch_b.id,
     );
     fixture.shutdown().await;
 }

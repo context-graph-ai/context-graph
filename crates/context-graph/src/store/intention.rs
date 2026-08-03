@@ -87,7 +87,7 @@ impl Store {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
-        if let Err(e) = self.insert_intention_snapshot_in_tx(
+        let snapshot_id = match self.insert_intention_snapshot_in_tx(
             tx,
             input.context_id,
             id,
@@ -98,6 +98,15 @@ impl Store {
             &tags_json,
             tx,
         ) {
+            Ok(snapshot_id) => snapshot_id,
+            Err(e) => {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+        };
+        if let Err(e) =
+            self.set_current_intention_snapshot_in_tx(tx, input.context_id, id, snapshot_id)
+        {
             let _ = self.db.rollback(tx);
             return Err(e);
         }
@@ -342,11 +351,17 @@ impl Store {
         &self,
         patches: Vec<(IntentionId, IntentionPatch)>,
     ) -> Result<Vec<Intention>> {
+        let tx = self.begin_tx()?;
         let mut currents: Vec<Intention> = Vec::with_capacity(patches.len());
         for (id, _) in &patches {
-            match self.get_intention(*id)? {
-                Some(i) => currents.push(i),
-                None => {
+            match self.get_intention_in_tx(tx, *id) {
+                Ok(Some(i)) => currents.push(i),
+                Err(error) => {
+                    let _ = self.db.rollback(tx);
+                    return Err(error);
+                }
+                Ok(None) => {
+                    let _ = self.db.rollback(tx);
                     return Err(CgError::NotFound {
                         id: Some(id.as_uuid().to_string()),
                         missing: Some("intention"),
@@ -355,7 +370,6 @@ impl Store {
             }
         }
 
-        let tx = self.begin_tx()?;
         let mut ok = true;
         let mut err: Option<CgError> = None;
         for (current, patch) in currents.iter().zip(patches.iter().map(|(_, p)| p)) {
@@ -483,8 +497,16 @@ impl Store {
                 })?;
         }
 
-        // Close prior snapshot, open a new one in the same tx.
-        self.close_open_intention_snapshot_in_tx(tx, current.context_id, current.id, tx)?;
+        // Snapshots are write-once.  A concurrent/offline update branches from the exact
+        // predecessor it observed; it never rewrites that predecessor's validity interval.
+        let predecessor_snapshot_id = self
+            .current_intention_snapshot_id_in_tx(tx, current.id)?
+            .ok_or_else(|| {
+                CgError::Engine(format!(
+                    "data-integrity: intention {} has no current snapshot pointer",
+                    current.id
+                ))
+            })?;
         let new_properties_json = properties_to_json(&new_properties);
         let new_tags_json = JsonValue::Array(
             new_tags
@@ -492,7 +514,7 @@ impl Store {
                 .map(|t| JsonValue::String(t.clone()))
                 .collect(),
         );
-        self.insert_intention_snapshot_in_tx(
+        let successor_snapshot_id = self.insert_intention_snapshot_in_tx(
             tx,
             current.context_id,
             current.id,
@@ -502,6 +524,19 @@ impl Store {
             &new_properties_json,
             &new_tags_json,
             tx,
+        )?;
+        self.insert_intention_snapshot_link_in_tx(
+            tx,
+            current.context_id,
+            current.id,
+            predecessor_snapshot_id,
+            successor_snapshot_id,
+        )?;
+        self.set_current_intention_snapshot_in_tx(
+            tx,
+            current.context_id,
+            current.id,
+            successor_snapshot_id,
         )?;
         self.record_audit_in_tx(
             tx,
@@ -515,14 +550,181 @@ impl Store {
         Ok(())
     }
 
+    /// Create a successor from one explicitly named immutable snapshot.
+    ///
+    /// Offline writers use this seam after they have both observed the same predecessor. Each
+    /// writer's values and predecessor link are read and written in one transaction, so a later
+    /// current-pointer winner cannot silently change what the other branch meant.
+    pub fn update_intention_on_branch(
+        &self,
+        id: IntentionId,
+        predecessor_snapshot_id: IntentionSnapshotId,
+        patch: IntentionPatch,
+    ) -> Result<IntentionSnapshot> {
+        if !id.is_valid() || !predecessor_snapshot_id.is_valid() {
+            return Err(CgError::InvalidIdentity {
+                context: "IntentionSnapshotId",
+            });
+        }
+        let tx = self.begin_tx()?;
+        let successor =
+            match self.update_intention_on_branch_in_tx(tx, id, predecessor_snapshot_id, &patch) {
+                Ok(successor) => successor,
+                Err(error) => {
+                    let _ = self.db.rollback(tx);
+                    return Err(error);
+                }
+            };
+        self.db.commit(tx).map_err(map_engine_err)?;
+        self.history(id)?
+            .into_iter()
+            .find(|snapshot| snapshot.id == successor.id)
+            .ok_or_else(|| {
+                CgError::Engine(format!(
+                    "data-integrity: committed intention snapshot {} is not readable",
+                    successor.id
+                ))
+            })
+    }
+
+    fn update_intention_on_branch_in_tx(
+        &self,
+        tx: TxId,
+        id: IntentionId,
+        predecessor_snapshot_id: IntentionSnapshotId,
+        patch: &IntentionPatch,
+    ) -> Result<IntentionSnapshot> {
+        let current = self
+            .get_intention_in_tx(tx, id)?
+            .ok_or(CgError::IntentionNotFound { id })?;
+        let predecessor = self
+            .intention_snapshot_in_tx(tx, current.context_id, id, predecessor_snapshot_id)?
+            .ok_or(CgError::NotFound {
+                id: Some(predecessor_snapshot_id.as_uuid().to_string()),
+                missing: Some("intention_snapshot"),
+            })?;
+
+        let description = patch
+            .description
+            .clone()
+            .unwrap_or_else(|| predecessor.description.clone());
+        let properties = patch
+            .properties
+            .clone()
+            .unwrap_or_else(|| predecessor.properties.clone());
+        let tags = patch
+            .tags
+            .clone()
+            .unwrap_or_else(|| predecessor.tags.clone());
+        let status = patch.status.unwrap_or(predecessor.status);
+        let properties_json = properties_to_json(&properties);
+        let tags_json = JsonValue::Array(tags.iter().cloned().map(JsonValue::String).collect());
+
+        self.db
+            .execute_in_tx(
+                tx,
+                "UPDATE intentions SET description = $description, properties = $properties, tags = $tags WHERE id = $id AND context_id = $context_id",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(id.as_uuid())),
+                    ("context_id".to_string(), Value::Uuid(current.context_id.as_uuid())),
+                    ("description".to_string(), Value::Text(description.clone())),
+                    ("properties".to_string(), Value::Json(properties_json.clone())),
+                    ("tags".to_string(), Value::Json(tags_json.clone())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        if patch.status.is_some() {
+            self.db
+                .execute_in_tx(
+                    tx,
+                    "UPDATE intentions SET status = $status WHERE id = $id AND context_id = $context_id",
+                    &HashMap::from([
+                        ("id".to_string(), Value::Uuid(id.as_uuid())),
+                        ("context_id".to_string(), Value::Uuid(current.context_id.as_uuid())),
+                        (
+                            "status".to_string(),
+                            Value::Text(intention_status_str(status).to_string()),
+                        ),
+                    ]),
+                )
+                .map_err(|error| match error {
+                    EngineError::InvalidStateTransition(_)
+                    | EngineError::PropagationAborted { .. } => {
+                        CgError::IntentionIllegalTransition {
+                            from: current.status,
+                            to: status,
+                        }
+                    }
+                    other => map_engine_err(other),
+                })?;
+        }
+
+        let successor_snapshot_id = self.insert_intention_snapshot_in_tx(
+            tx,
+            current.context_id,
+            id,
+            &description,
+            status,
+            predecessor.origin,
+            &properties_json,
+            &tags_json,
+            tx,
+        )?;
+        self.insert_intention_snapshot_link_in_tx(
+            tx,
+            current.context_id,
+            id,
+            predecessor_snapshot_id,
+            successor_snapshot_id,
+        )?;
+        self.set_current_intention_snapshot_in_tx(
+            tx,
+            current.context_id,
+            id,
+            successor_snapshot_id,
+        )?;
+        self.record_audit_in_tx(
+            tx,
+            AuditOperation::Update,
+            Principal::System,
+            None,
+            AuditTarget::Intention(id),
+            current.context_id,
+            None,
+        )?;
+        Ok(IntentionSnapshot {
+            id: successor_snapshot_id,
+            intention_id: id,
+            description,
+            status,
+            origin: predecessor.origin,
+            properties,
+            tags,
+            valid_from: tx,
+            valid_to: None,
+        })
+    }
+
     pub fn archive_intention(&self, id: IntentionId, reason: String) -> Result<Intention> {
-        let current = self.get_intention(id)?.ok_or_else(|| CgError::NotFound {
-            id: Some(id.as_uuid().to_string()),
-            missing: Some("intention"),
-        })?;
-        let active_serving_result = self
+        let tx = self.begin_tx()?;
+        let current = match self.get_intention_in_tx(tx, id) {
+            Ok(Some(current)) => current,
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(error);
+            }
+            Ok(None) => {
+                let _ = self.db.rollback(tx);
+                return Err(CgError::NotFound {
+                    id: Some(id.as_uuid().to_string()),
+                    missing: Some("intention"),
+                });
+            }
+        };
+        let active_serving_result = match self
             .db
-            .execute(
+            .execute_in_tx(
+                tx,
                 "WITH serving_decisions AS (SELECT b_id FROM GRAPH_TABLE(edges MATCH (a)<-[:SERVES]-(b) WHERE a.id = $intention_id COLUMNS (b.id AS b_id))) SELECT d.id FROM decisions d INNER JOIN serving_decisions sd ON d.id = sd.b_id WHERE d.context_id = $context_id AND d.status = $status",
                 &HashMap::from([(
                     "intention_id".to_string(),
@@ -534,8 +736,13 @@ impl Store {
                     "status".to_string(),
                     Value::Text("active".to_string()),
                 )]),
-            )
-            .map_err(map_engine_err)?;
+            ) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(error));
+            }
+        };
         let active_serving: Vec<DecisionId> = active_serving_result
             .rows
             .iter()
@@ -545,6 +752,7 @@ impl Store {
             })
             .collect();
         if !active_serving.is_empty() {
+            let _ = self.db.rollback(tx);
             return Err(CgError::ActiveDecisionsReference {
                 intention_id: id,
                 decision_ids: active_serving
@@ -554,7 +762,6 @@ impl Store {
             });
         }
 
-        let tx = self.begin_tx()?;
         let params: HashMap<String, Value> = [
             ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("status".to_string(), Value::Text("archived".to_string())),
@@ -569,7 +776,62 @@ impl Store {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
-        if let Err(e) = self.close_open_intention_snapshot_in_tx(tx, current.context_id, id, tx) {
+        let predecessor_snapshot_id = match self.current_intention_snapshot_id_in_tx(tx, id) {
+            Ok(Some(snapshot_id)) => snapshot_id,
+            Ok(None) => {
+                let _ = self.db.rollback(tx);
+                return Err(CgError::Engine(format!(
+                    "data-integrity: intention {} has no current snapshot pointer",
+                    id
+                )));
+            }
+            Err(error) => {
+                let _ = self.db.rollback(tx);
+                return Err(error);
+            }
+        };
+        let properties_json = properties_to_json(&current.properties);
+        let tags_json = JsonValue::Array(
+            current
+                .tags
+                .iter()
+                .cloned()
+                .map(JsonValue::String)
+                .collect(),
+        );
+        let archived_snapshot_id = match self.insert_intention_snapshot_in_tx(
+            tx,
+            current.context_id,
+            id,
+            &current.description,
+            IntentionStatus::Archived,
+            current.origin,
+            &properties_json,
+            &tags_json,
+            tx,
+        ) {
+            Ok(snapshot_id) => snapshot_id,
+            Err(e) => {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.insert_intention_snapshot_link_in_tx(
+            tx,
+            current.context_id,
+            id,
+            predecessor_snapshot_id,
+            archived_snapshot_id,
+        ) {
+            let _ = self.db.rollback(tx);
+            return Err(e);
+        }
+        if let Err(e) = self.set_current_intention_snapshot_in_tx(
+            tx,
+            current.context_id,
+            id,
+            archived_snapshot_id,
+        ) {
             let _ = self.db.rollback(tx);
             return Err(e);
         }
@@ -593,41 +855,6 @@ impl Store {
         })
     }
 
-    pub(super) fn intention_context_ids(
-        &self,
-        ids: &[IntentionId],
-    ) -> Result<HashMap<IntentionId, ContextId>> {
-        let mut out: HashMap<IntentionId, ContextId> = HashMap::new();
-        if ids.is_empty() {
-            return Ok(out);
-        }
-        for iid in ids {
-            let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(iid.as_uuid()))]
-                .into_iter()
-                .collect();
-            let r = self
-                .db
-                .execute(
-                    "SELECT id, context_id FROM intentions WHERE id = $id",
-                    &params,
-                )
-                .map_err(map_engine_err)?;
-            if r.rows.is_empty() {
-                continue;
-            }
-            let ictx = match r.rows[0].get(1) {
-                Some(Value::Uuid(u)) => ContextId::from(*u),
-                _ => {
-                    return Err(CgError::Engine(
-                        "intention row missing context_id".to_string(),
-                    ));
-                }
-            };
-            out.insert(*iid, ictx);
-        }
-        Ok(out)
-    }
-
     pub fn history(&self, id: IntentionId) -> Result<Vec<IntentionSnapshot>> {
         if !id.is_valid() {
             return Err(CgError::InvalidIdentity {
@@ -649,7 +876,7 @@ impl Store {
         for row in &result.rows {
             snaps.push(decode_intention_snapshot(&result.columns, row)?);
         }
-        snaps.sort_by_key(|s| s.valid_from.0);
+        snaps.sort_by_key(|s| (s.valid_from.0, s.id.as_uuid()));
         Ok(snaps)
     }
 
@@ -659,26 +886,90 @@ impl Store {
                 context: "IntentionId",
             });
         }
-        let params: HashMap<String, Value> =
-            [("intention_id".to_string(), Value::Uuid(id.as_uuid()))]
-                .into_iter()
-                .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, intention_id, description, status, origin, properties, tags, valid_from, valid_to FROM intention_snapshots WHERE intention_id = $intention_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        for row in &result.rows {
-            let snap = decode_intention_snapshot(&result.columns, row)?;
-            let in_range =
-                snap.valid_from.0 <= at.0 && snap.valid_to.map(|t| t.0 > at.0).unwrap_or(true);
-            if in_range {
-                return Ok(Some(snap));
-            }
+        let history = self.history(id)?;
+        let eligible: HashSet<IntentionSnapshotId> = history
+            .iter()
+            .filter(|snapshot| snapshot.valid_from <= at)
+            .map(|snapshot| snapshot.id)
+            .collect();
+        if eligible.is_empty() {
+            return Ok(None);
         }
-        Ok(None)
+        let linked_predecessors: HashSet<IntentionSnapshotId> = self
+            .intention_snapshot_link_pairs(id)?
+            .into_iter()
+            .filter_map(|(predecessor, successor)| {
+                eligible.contains(&successor).then_some(predecessor)
+            })
+            .collect();
+        let mut heads: Vec<IntentionSnapshotId> = eligible
+            .iter()
+            .copied()
+            .filter(|snapshot_id| !linked_predecessors.contains(snapshot_id))
+            .collect();
+        heads.sort_by_key(|snapshot_id| snapshot_id.as_uuid());
+        match heads.as_slice() {
+            [] => Err(CgError::Engine(format!(
+                "data-integrity: intention {} has no history head at {}",
+                id, at.0
+            ))),
+            [head] => self.intention_at_on_branch(id, at, *head),
+            _ => Err(CgError::AmbiguousIntentionHistory {
+                intention_id: id,
+                at,
+                branch_head_ids: heads,
+            }),
+        }
+    }
+
+    /// Read one named immutable history branch.  This is the only branch-aware temporal read:
+    /// callers must choose when offline edits produced two legitimate successor meanings.
+    pub fn intention_at_on_branch(
+        &self,
+        id: IntentionId,
+        at: TxId,
+        branch_head_id: IntentionSnapshotId,
+    ) -> Result<Option<IntentionSnapshot>> {
+        if !id.is_valid() || !branch_head_id.is_valid() {
+            return Err(CgError::InvalidIdentity {
+                context: "IntentionSnapshotId",
+            });
+        }
+        let history = self.history(id)?;
+        let by_id: HashMap<IntentionSnapshotId, IntentionSnapshot> = history
+            .into_iter()
+            .map(|snapshot| (snapshot.id, snapshot))
+            .collect();
+        if !by_id.contains_key(&branch_head_id) {
+            return Err(CgError::NotFound {
+                id: Some(branch_head_id.as_uuid().to_string()),
+                missing: Some("intention_snapshot"),
+            });
+        }
+        let predecessors: HashMap<IntentionSnapshotId, IntentionSnapshotId> = self
+            .intention_snapshot_link_pairs(id)?
+            .into_iter()
+            .map(|(predecessor, successor)| (successor, predecessor))
+            .collect();
+        let mut cursor = branch_head_id;
+        let mut lineage = HashSet::new();
+        loop {
+            if !lineage.insert(cursor) {
+                return Err(CgError::Engine(format!(
+                    "data-integrity: cyclic intention history for {}",
+                    id
+                )));
+            }
+            let Some(predecessor) = predecessors.get(&cursor).copied() else {
+                break;
+            };
+            cursor = predecessor;
+        }
+        Ok(lineage
+            .into_iter()
+            .filter_map(|snapshot_id| by_id.get(&snapshot_id).cloned())
+            .filter(|snapshot| snapshot.valid_from <= at)
+            .max_by_key(|snapshot| (snapshot.valid_from.0, snapshot.id.as_uuid())))
     }
 
     pub fn admin_raw_insert_intention(&self, input: Intention) -> Result<()> {
@@ -823,9 +1114,10 @@ impl Store {
         properties_json: &JsonValue,
         tags_json: &JsonValue,
         valid_from: TxId,
-    ) -> Result<()> {
+    ) -> Result<IntentionSnapshotId> {
+        let snapshot_id = IntentionSnapshotId::new_v7();
         let params: HashMap<String, Value> = [
-            ("id".to_string(), Value::Uuid(Uuid::now_v7())),
+            ("id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
             ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
             (
                 "intention_id".to_string(),
@@ -860,15 +1152,15 @@ impl Store {
                 &params,
             )
             .map_err(map_engine_err)?;
-        Ok(())
+        Ok(snapshot_id)
     }
 
-    pub(super) fn close_open_intention_snapshot_in_tx(
+    pub(super) fn set_current_intention_snapshot_in_tx(
         &self,
         tx: TxId,
         context_id: ContextId,
         intention_id: IntentionId,
-        valid_to: TxId,
+        snapshot_id: IntentionSnapshotId,
     ) -> Result<()> {
         let params: HashMap<String, Value> = [
             ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
@@ -876,18 +1168,200 @@ impl Store {
                 "intention_id".to_string(),
                 Value::Uuid(intention_id.as_uuid()),
             ),
-            ("valid_to".to_string(), Value::TxId(valid_to)),
+            (
+                "snapshot_id".to_string(),
+                Value::Uuid(snapshot_id.as_uuid()),
+            ),
+            ("updated_at".to_string(), Value::TxId(tx)),
         ]
         .into_iter()
         .collect();
-        self.db
+        let updated = self.db
             .execute_in_tx(
                 tx,
-                "UPDATE intention_snapshots SET valid_to = $valid_to WHERE context_id = $context_id AND intention_id = $intention_id AND valid_to IS NULL",
+                "UPDATE intention_current_snapshots SET snapshot_id = $snapshot_id, updated_at = $updated_at WHERE context_id = $context_id AND intention_id = $intention_id",
                 &params,
             )
-            .map_err(map_engine_err)?;
+            .map_err(map_engine_err)?
+            .rows_affected;
+        if updated == 1 {
+            return Ok(());
+        }
+        self.db.execute_in_tx(
+            tx,
+            "INSERT INTO intention_current_snapshots (context_id, intention_id, snapshot_id, updated_at) VALUES ($context_id, $intention_id, $snapshot_id, $updated_at)",
+            &params,
+        ).map_err(map_engine_err)?;
         Ok(())
+    }
+
+    pub(super) fn current_intention_snapshot_id_in_tx(
+        &self,
+        tx: TxId,
+        intention_id: IntentionId,
+    ) -> Result<Option<IntentionSnapshotId>> {
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT snapshot_id FROM intention_current_snapshots WHERE intention_id = $intention_id",
+                &HashMap::from([(
+                    "intention_id".to_string(),
+                    Value::Uuid(intention_id.as_uuid()),
+                )]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| get_uuid(row, &result.columns, "snapshot_id").map(IntentionSnapshotId::from))
+            .transpose()
+    }
+
+    fn get_intention_in_tx(&self, tx: TxId, id: IntentionId) -> Result<Option<Intention>> {
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| decode_intention(&result.columns, row))
+            .transpose()
+    }
+
+    fn intention_snapshot_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        intention_id: IntentionId,
+        snapshot_id: IntentionSnapshotId,
+    ) -> Result<Option<IntentionSnapshot>> {
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT id, intention_id, description, status, origin, properties, tags, valid_from, valid_to FROM intention_snapshots WHERE context_id = $context_id AND intention_id = $intention_id AND id = $snapshot_id",
+                &HashMap::from([
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    ("intention_id".to_string(), Value::Uuid(intention_id.as_uuid())),
+                    ("snapshot_id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| decode_intention_snapshot(&result.columns, row))
+            .transpose()
+    }
+
+    fn insert_intention_snapshot_link_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        intention_id: IntentionId,
+        predecessor_snapshot_id: IntentionSnapshotId,
+        successor_snapshot_id: IntentionSnapshotId,
+    ) -> Result<()> {
+        let params = HashMap::from([
+            ("id".to_string(), Value::Uuid(Uuid::now_v7())),
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+            (
+                "intention_id".to_string(),
+                Value::Uuid(intention_id.as_uuid()),
+            ),
+            (
+                "predecessor_snapshot_id".to_string(),
+                Value::Uuid(predecessor_snapshot_id.as_uuid()),
+            ),
+            (
+                "successor_snapshot_id".to_string(),
+                Value::Uuid(successor_snapshot_id.as_uuid()),
+            ),
+            ("created_at".to_string(), Value::TxId(tx)),
+        ]);
+        self.db.execute_in_tx(
+            tx,
+            "INSERT INTO intention_snapshot_links (id, context_id, intention_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $context_id, $intention_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
+            &params,
+        ).map_err(map_engine_err)?;
+        Ok(())
+    }
+
+    /// Return the immutable history edges so a caller can show the user exactly which branch it
+    /// is asking `intention_at_on_branch` to follow.
+    pub fn intention_snapshot_links(
+        &self,
+        intention_id: IntentionId,
+    ) -> Result<Vec<IntentionSnapshotLink>> {
+        if !intention_id.is_valid() {
+            return Err(CgError::InvalidIdentity {
+                context: "IntentionId",
+            });
+        }
+        let result = self
+            .db
+            .execute(
+                "SELECT id, intention_id, predecessor_snapshot_id, successor_snapshot_id, created_at FROM intention_snapshot_links WHERE intention_id = $intention_id",
+                &HashMap::from([(
+                    "intention_id".to_string(),
+                    Value::Uuid(intention_id.as_uuid()),
+                )]),
+            )
+            .map_err(map_engine_err)?;
+        let mut links = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            links.push(IntentionSnapshotLink {
+                id: IntentionSnapshotLinkId::from(get_uuid(row, &result.columns, "id")?),
+                intention_id: IntentionId::from(get_uuid(row, &result.columns, "intention_id")?),
+                predecessor_snapshot_id: IntentionSnapshotId::from(get_uuid(
+                    row,
+                    &result.columns,
+                    "predecessor_snapshot_id",
+                )?),
+                successor_snapshot_id: IntentionSnapshotId::from(get_uuid(
+                    row,
+                    &result.columns,
+                    "successor_snapshot_id",
+                )?),
+                created_at: get_txid(row, &result.columns, "created_at")?,
+            });
+        }
+        links.sort_by_key(|link| (link.created_at.0, link.id.as_uuid()));
+        Ok(links)
+    }
+
+    fn intention_snapshot_link_pairs(
+        &self,
+        intention_id: IntentionId,
+    ) -> Result<Vec<(IntentionSnapshotId, IntentionSnapshotId)>> {
+        let result = self.db.execute(
+            "SELECT predecessor_snapshot_id, successor_snapshot_id FROM intention_snapshot_links WHERE intention_id = $intention_id",
+            &HashMap::from([("intention_id".to_string(), Value::Uuid(intention_id.as_uuid()))]),
+        ).map_err(map_engine_err)?;
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    IntentionSnapshotId::from(get_uuid(
+                        row,
+                        &result.columns,
+                        "predecessor_snapshot_id",
+                    )?),
+                    IntentionSnapshotId::from(get_uuid(
+                        row,
+                        &result.columns,
+                        "successor_snapshot_id",
+                    )?),
+                ))
+            })
+            .collect()
     }
 }
 
@@ -921,6 +1395,7 @@ fn decode_intention_snapshot(columns: &[String], row: &[Value]) -> Result<Intent
     let valid_from = get_txid(row, columns, "valid_from")?;
     let valid_to = get_optional_txid(row, columns, "valid_to")?;
     Ok(IntentionSnapshot {
+        id: IntentionSnapshotId::from(get_uuid(row, columns, "id")?),
         intention_id,
         description,
         status,

@@ -148,7 +148,19 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "intention_snapshots",
-        ddl: "CREATE TABLE intention_snapshots (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), intention_id UUID NOT NULL REFERENCES intentions(id), description TEXT NOT NULL, status TEXT NOT NULL, origin TEXT NOT NULL, properties JSON, tags JSON, valid_from TXID NOT NULL, valid_to TXID, UNIQUE (context_id, id), FOREIGN KEY (context_id, intention_id) REFERENCES intentions(context_id, id)) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        ddl: "CREATE TABLE intention_snapshots (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), intention_id UUID NOT NULL REFERENCES intentions(id), description TEXT NOT NULL, status TEXT NOT NULL, origin TEXT NOT NULL, properties JSON, tags JSON, valid_from TXID NOT NULL, valid_to TXID, UNIQUE (context_id, id), UNIQUE (context_id, intention_id, id), FOREIGN KEY (context_id, intention_id) REFERENCES intentions(context_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+    },
+    TableSpec {
+        name: "intention_current_snapshots",
+        ddl: "CREATE TABLE intention_current_snapshots (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), intention_id UUID PRIMARY KEY REFERENCES intentions(id), snapshot_id UUID NOT NULL REFERENCES intention_snapshots(id), updated_at TXID NOT NULL, UNIQUE (context_id, intention_id), FOREIGN KEY (context_id, intention_id) REFERENCES intentions(context_id, id), FOREIGN KEY (context_id, intention_id, snapshot_id) REFERENCES intention_snapshots(context_id, intention_id, id)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+    },
+    TableSpec {
+        name: "intention_snapshot_links",
+        ddl: "CREATE TABLE intention_snapshot_links (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), intention_id UUID NOT NULL REFERENCES intentions(id), predecessor_snapshot_id UUID NOT NULL REFERENCES intention_snapshots(id), successor_snapshot_id UUID NOT NULL REFERENCES intention_snapshots(id), created_at TXID NOT NULL, UNIQUE (context_id, intention_id, predecessor_snapshot_id, successor_snapshot_id), UNIQUE (context_id, intention_id, successor_snapshot_id), FOREIGN KEY (context_id, intention_id) REFERENCES intentions(context_id, id), FOREIGN KEY (context_id, intention_id, predecessor_snapshot_id) REFERENCES intention_snapshots(context_id, intention_id, id), FOREIGN KEY (context_id, intention_id, successor_snapshot_id) REFERENCES intention_snapshots(context_id, intention_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+    },
+    TableSpec {
+        name: "decision_intention_citations",
+        ddl: "CREATE TABLE decision_intention_citations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), decision_id UUID NOT NULL REFERENCES decisions(id), intention_id UUID NOT NULL REFERENCES intentions(id), snapshot_id UUID NOT NULL REFERENCES intention_snapshots(id), created_at TXID NOT NULL, UNIQUE (context_id, decision_id, intention_id), FOREIGN KEY (context_id, decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, intention_id) REFERENCES intentions(context_id, id), FOREIGN KEY (context_id, intention_id, snapshot_id) REFERENCES intention_snapshots(context_id, intention_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
     },
     TableSpec {
         name: "approvals",

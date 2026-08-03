@@ -101,6 +101,8 @@ id_type!(InvalidationId);
 id_type!(EvidenceId, nil_default);
 id_type!(EmbeddingId, nil_default);
 id_type!(EntitySnapshotId, nil_default);
+id_type!(IntentionSnapshotId, nil_default);
+id_type!(IntentionSnapshotLinkId, nil_default);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum IntentionStatus {
@@ -566,6 +568,9 @@ pub struct Intention {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntentionSnapshot {
+    /// The immutable identity of this exact wording/status snapshot. Decisions cite this id,
+    /// rather than reconstructing a past intention from a wall of overlapping branches.
+    pub id: IntentionSnapshotId,
     pub intention_id: IntentionId,
     pub description: String,
     pub status: IntentionStatus,
@@ -574,6 +579,16 @@ pub struct IntentionSnapshot {
     pub tags: Vec<String>,
     pub valid_from: TxId,
     pub valid_to: Option<TxId>,
+}
+
+/// One immutable predecessor → successor edge in an intention's history DAG.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentionSnapshotLink {
+    pub id: IntentionSnapshotLinkId,
+    pub intention_id: IntentionId,
+    pub predecessor_snapshot_id: IntentionSnapshotId,
+    pub successor_snapshot_id: IntentionSnapshotId,
+    pub created_at: TxId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1085,7 +1100,9 @@ pub struct AuditFilter {
     pub after: Option<AuditId>,
 }
 
-pub const CG_SCHEMA_VERSION: u32 = 10;
+/// Schema 11 adds immutable intention-history heads and predecessor links.  A schema-10 root is
+/// deliberately refused rather than silently receiving a partial history migration.
+pub const CG_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreConfig {
