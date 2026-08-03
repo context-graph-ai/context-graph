@@ -3,14 +3,24 @@ name: ci
 on:
   pull_request:
   push:
+  workflow_dispatch:
+    inputs:
+      contextdb_sha:
+        description: Exact 40-character ContextDB commit SHA
+        required: true
+        type: string
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 defaults:
   run:
     shell: bash
+    working-directory: workspace/context-graph
 
 jobs:
   test:
@@ -19,22 +29,64 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate exact ContextDB SHA
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: .
+        env:
+          CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+            exit 1
+          fi
+      - name: Check out Context Graph
+        uses: actions/checkout@v4
+        with:
+          path: workspace/context-graph
+          persist-credentials: false
+      - name: Check out ContextDB
+        uses: actions/checkout@v4
+        with:
+          repository: context-graph-ai/contextdb
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.contextdb_sha || 'dev' }}
+          path: workspace/contextdb
+          persist-credentials: false
+      - name: Print and verify checked revisions
+        env:
+          REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+        run: |
+          context_graph_sha="$(git rev-parse HEAD)"
+          contextdb_sha="$(git -C ../contextdb rev-parse HEAD)"
+          if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "checkouts must resolve to immutable 40-character commit SHAs" >&2
+            exit 1
+          fi
+          if [[ "$context_graph_sha" != "$GITHUB_SHA" ]]; then
+            echo "checked-out Context Graph SHA does not match GITHUB_SHA" >&2
+            exit 1
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
+            echo "checked-out ContextDB SHA does not match contextdb_sha" >&2
+            exit 1
+          fi
+          printf 'Context Graph SHA: %s\n' "$context_graph_sha"
+          printf 'ContextDB SHA: %s\n' "$contextdb_sha"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          workspaces: workspace/context-graph -> target
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cache/cg/embedders
             ~/AppData/Local/cg/embedders
-          key: cg-embedders-${{ runner.os }}-${{ hashFiles('crates/context-graph/src/embedder/nomic.rs') }}
+          key: cg-embedders-${{ runner.os }}-${{ hashFiles('workspace/context-graph/crates/context-graph/src/embedder/nomic.rs') }}
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-expand
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124
       - run: |
-          cargo deny check --config deny.toml
+          cargo deny --config deny.toml check
           cargo expand --lib -p context-graph | tee "$RUNNER_TEMP/context-graph-expanded.rs"
           test -s "$RUNNER_TEMP/context-graph-expanded.rs"
           rg --files-without-match 'embeddinggemma|candle_embeddinggemma' "$RUNNER_TEMP/context-graph-expanded.rs"
