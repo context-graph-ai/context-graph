@@ -592,7 +592,7 @@ fn probe_evidence_derived_from_fk_delete_race_rejects_child_insert() {
 }
 
 #[test]
-fn probe_record_observation_concurrent_same_entity_snapshot_timeline_contiguous() {
+fn probe_record_observation_concurrent_same_entity_appends_immutable_chain() {
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (context, entity) = seed_context_entity(&seed);
@@ -619,16 +619,10 @@ fn probe_record_observation_concurrent_same_entity_snapshot_timeline_contiguous(
     for handle in handles {
         handle.join().expect("writer joined").expect("record");
     }
-    let history = Store::open(config)
-        .expect("reader")
-        .entity_history(entity)
-        .expect("history");
+    let reader = Store::open(config).expect("reader");
+    let history = reader.entity_history(entity).expect("history");
     assert_eq!(history.len(), 7);
-    assert!(
-        history
-            .windows(2)
-            .all(|pair| pair[0].valid_to == Some(pair[1].valid_from))
-    );
+    assert!(history.iter().all(|snapshot| snapshot.valid_to.is_none()));
     assert_eq!(
         history
             .iter()
@@ -637,6 +631,9 @@ fn probe_record_observation_concurrent_same_entity_snapshot_timeline_contiguous(
             .len(),
         history.len()
     );
+    let graph = reader.entity_history_graph(entity).expect("history graph");
+    assert_eq!(graph.links.len(), 6);
+    assert_eq!(graph.branch_heads.len(), 1);
 }
 
 #[test]
@@ -721,15 +718,9 @@ fn probe_basis_diff_under_concurrent_writer_returns_mvcc_consistent_horizon() {
     let diff = diff.expect("basis diff");
     assert!(diff.is_invalidated_candidate);
     assert_eq!(diff.read_txid, diff.current_snapshot_read_txid);
-    let snapshot_at_diff = history
-        .iter()
-        .find(|snapshot| {
-            snapshot.valid_from <= diff.read_txid
-                && snapshot
-                    .valid_to
-                    .map(|valid_to| diff.read_txid < valid_to)
-                    .unwrap_or(true)
-        })
+    let snapshot_at_diff = reader
+        .state_at(entity, diff.read_txid)
+        .expect("resolve immutable history at basis_diff read txid")
         .expect("snapshot visible at basis_diff read txid");
     assert!(
         diff.divergences.iter().any(|divergence| {

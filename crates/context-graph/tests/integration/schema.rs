@@ -1305,6 +1305,83 @@ fn test_entity_snapshots_table_insert() {
 }
 
 #[test]
+fn entity_snapshot_rows_reject_raw_update_and_delete_as_engine_immutable() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(20_060);
+    let entity_id = Uuid::from_u128(20_061);
+    let snapshot_id = Uuid::from_u128(20_062);
+    insert_context(&db, context_id, "ctx-immutable-snapshot");
+    insert_entity(&db, entity_id, context_id, "entity");
+    insert_snapshot(&db, snapshot_id, context_id, entity_id, 1, 2);
+
+    let update = db.execute(
+        "UPDATE entity_snapshots SET valid_to = $valid_to WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(snapshot_id)),
+            ("valid_to", Value::TxId(TxId(3))),
+        ]),
+    );
+    assert!(
+        matches!(update, Err(Error::ImmutableTable(ref table)) if table == "entity_snapshots"),
+        "raw snapshot update must be refused by engine immutability, got {update:?}"
+    );
+    let delete = db.execute(
+        "DELETE FROM entity_snapshots WHERE id = $id",
+        &params(vec![("id", Value::Uuid(snapshot_id))]),
+    );
+    assert!(
+        matches!(delete, Err(Error::ImmutableTable(ref table)) if table == "entity_snapshots"),
+        "raw snapshot delete must be refused by engine immutability, got {delete:?}"
+    );
+}
+
+#[test]
+fn entity_snapshot_link_rows_reject_raw_update_and_delete_as_engine_immutable() {
+    let db = fresh_db();
+    let context_id = Uuid::from_u128(20_063);
+    let entity_id = Uuid::from_u128(20_064);
+    let predecessor = Uuid::from_u128(20_065);
+    let successor = Uuid::from_u128(20_066);
+    let link_id = Uuid::from_u128(20_067);
+    insert_context(&db, context_id, "ctx-immutable-link");
+    insert_entity(&db, entity_id, context_id, "entity");
+    insert_snapshot(&db, predecessor, context_id, entity_id, 1, 2);
+    insert_snapshot(&db, successor, context_id, entity_id, 2, 3);
+    db.execute(
+        "INSERT INTO entity_snapshot_links (id, context_id, entity_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $context_id, $entity_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(link_id)),
+            ("context_id", Value::Uuid(context_id)),
+            ("entity_id", Value::Uuid(entity_id)),
+            ("predecessor_snapshot_id", Value::Uuid(predecessor)),
+            ("successor_snapshot_id", Value::Uuid(successor)),
+            ("created_at", Value::TxId(TxId(3))),
+        ]),
+    )
+    .expect("insert immutable ancestry link");
+
+    let update = db.execute(
+        "UPDATE entity_snapshot_links SET created_at = $created_at WHERE id = $id",
+        &params(vec![
+            ("id", Value::Uuid(link_id)),
+            ("created_at", Value::TxId(TxId(4))),
+        ]),
+    );
+    assert!(
+        matches!(update, Err(Error::ImmutableTable(ref table)) if table == "entity_snapshot_links"),
+        "raw ancestry-link update must be refused by engine immutability, got {update:?}"
+    );
+    let delete = db.execute(
+        "DELETE FROM entity_snapshot_links WHERE id = $id",
+        &params(vec![("id", Value::Uuid(link_id))]),
+    );
+    assert!(
+        matches!(delete, Err(Error::ImmutableTable(ref table)) if table == "entity_snapshot_links"),
+        "raw ancestry-link delete must be refused by engine immutability, got {delete:?}"
+    );
+}
+
+#[test]
 fn combination_entity_snapshot_links_reject_cross_entity_successor_by_composite_fk() {
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_070);
@@ -3787,7 +3864,7 @@ fn combination_invalidation_cross_context_raw_insert_rejected_by_schema() {
 }
 
 #[test]
-fn combination_record_observation_concurrent_against_same_entity_snapshot_timeline_contiguous() {
+fn combination_record_observation_concurrent_appends_immutable_snapshot_chain() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -3818,10 +3895,8 @@ fn combination_record_observation_concurrent_against_same_entity_snapshot_timeli
     for handle in handles {
         handle.join().expect("writer joined").expect("record");
     }
-    let snapshots = context_graph::Store::open(config)
-        .expect("reader")
-        .entity_history(entity)
-        .expect("history");
+    let reader = context_graph::Store::open(config).expect("reader");
+    let snapshots = reader.entity_history(entity).expect("history");
     assert_eq!(snapshots.len(), 7);
     assert_eq!(
         snapshots
@@ -3832,9 +3907,16 @@ fn combination_record_observation_concurrent_against_same_entity_snapshot_timeli
         snapshots.len()
     );
     for pair in snapshots.windows(2) {
-        assert_eq!(pair[0].valid_to, Some(pair[1].valid_from));
+        assert_eq!(pair[0].valid_to, None);
         assert!(pair[0].valid_from < pair[1].valid_from);
     }
+    assert_eq!(
+        snapshots.last().and_then(|snapshot| snapshot.valid_to),
+        None
+    );
+    let graph = reader.entity_history_graph(entity).expect("history graph");
+    assert_eq!(graph.links.len(), 6);
+    assert_eq!(graph.branch_heads.len(), 1);
 }
 
 #[test]

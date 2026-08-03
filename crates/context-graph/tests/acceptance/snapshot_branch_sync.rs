@@ -3,8 +3,8 @@ use crate::capture_sync_common::{
 };
 use chrono::{DateTime, Utc};
 use context_graph::{
-    ContextId, CreateContext, CreateEntity, EntityId, EntitySnapshotId, EntityType, EvidenceId,
-    EvidenceRef, ObservationId, RecordObservation, Store,
+    CgError, ContextId, CreateContext, CreateEntity, EntityId, EntitySnapshotId, EntityType,
+    EvidenceId, EvidenceRef, ObservationId, RecordObservation, Store,
 };
 use contextdb_core::{Error as DbError, TxId, Value as DbValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -195,6 +195,49 @@ async fn successor_snapshot_branches_survive_sync_restart_and_restore() {
             [successor_a, successor_b],
         );
     }
+    let graph = fixture
+        .hub_store()
+        .entity_history_graph(entity.id)
+        .expect("read immutable history graph");
+    assert_eq!(
+        graph.branch_heads.into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([successor_a, successor_b]),
+        "the transport/current pointer is not allowed to choose a semantic branch"
+    );
+    let at_end = TxId(u64::MAX);
+    let ambiguous = fixture.hub_store().state_at(entity.id, at_end);
+    assert!(
+        matches!(
+            ambiguous,
+            Err(CgError::AmbiguousTemporalState {
+                entity_id,
+                at,
+                ref branch_heads,
+            }) if entity_id == entity.id
+                && at == at_end
+                && branch_heads.iter().copied().collect::<BTreeSet<_>>()
+                    == BTreeSet::from([successor_a, successor_b])
+        ),
+        "a fork must require an explicit semantic branch, got {ambiguous:?}"
+    );
+    let branch_a = fixture
+        .hub_store()
+        .state_at_on_branch(entity.id, at_end, successor_a)
+        .expect("resolve explicit branch a")
+        .expect("branch a remains live");
+    assert_eq!(
+        branch_a.properties["path"],
+        serde_json::json!("src/authentication.rs")
+    );
+    let branch_b = fixture
+        .hub_store()
+        .state_at_on_branch(entity.id, at_end, successor_b)
+        .expect("resolve explicit branch b")
+        .expect("branch b remains live");
+    assert_eq!(
+        branch_b.properties["path"],
+        serde_json::json!("src/identity.rs")
+    );
     assert_duplicate_link_is_refused(
         fixture.hub_store(),
         context.id,

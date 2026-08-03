@@ -128,7 +128,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "entity_snapshots",
-        ddl: "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL REFERENCES entities(id), data JSON NOT NULL, valid_from TXID NOT NULL, valid_to TXID, UNIQUE (context_id, id), UNIQUE (context_id, entity_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id)) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        ddl: "CREATE TABLE entity_snapshots (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL REFERENCES entities(id), data JSON NOT NULL, valid_from TXID NOT NULL, valid_to TXID, UNIQUE (context_id, id), UNIQUE (context_id, entity_id, id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
     },
     TableSpec {
         name: "entity_snapshot_observations",
@@ -144,7 +144,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "entity_snapshot_links",
-        ddl: "CREATE TABLE entity_snapshot_links (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL REFERENCES entities(id), predecessor_snapshot_id UUID NOT NULL REFERENCES entity_snapshots(id), successor_snapshot_id UUID NOT NULL REFERENCES entity_snapshots(id), created_at TXID NOT NULL, UNIQUE (context_id, entity_id, predecessor_snapshot_id, successor_snapshot_id), UNIQUE (context_id, entity_id, successor_snapshot_id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id), FOREIGN KEY (context_id, entity_id, predecessor_snapshot_id) REFERENCES entity_snapshots(context_id, entity_id, id), FOREIGN KEY (context_id, entity_id, successor_snapshot_id) REFERENCES entity_snapshots(context_id, entity_id, id)) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+        ddl: "CREATE TABLE entity_snapshot_links (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), entity_id UUID NOT NULL REFERENCES entities(id), predecessor_snapshot_id UUID NOT NULL REFERENCES entity_snapshots(id), successor_snapshot_id UUID NOT NULL REFERENCES entity_snapshots(id), created_at TXID NOT NULL, UNIQUE (context_id, entity_id, predecessor_snapshot_id, successor_snapshot_id), UNIQUE (context_id, entity_id, successor_snapshot_id), FOREIGN KEY (context_id, entity_id) REFERENCES entities(context_id, id), FOREIGN KEY (context_id, entity_id, predecessor_snapshot_id) REFERENCES entity_snapshots(context_id, entity_id, id), FOREIGN KEY (context_id, entity_id, successor_snapshot_id) REFERENCES entity_snapshots(context_id, entity_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
     },
     TableSpec {
         name: "intention_snapshots",

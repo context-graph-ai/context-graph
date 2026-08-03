@@ -1059,26 +1059,6 @@ impl Store {
         let (entity_type, entity_name) = self
             .entity_snapshot_identity_in_tx(tx, input.entity_id)
             .map_err(StateDeltaMergeError::Error)?;
-        if let Some(current) = current.as_ref() {
-            let close_params = HashMap::from([
-                ("id".to_string(), Value::Uuid(current.id.as_uuid())),
-                ("new_valid_to".to_string(), Value::TxId(tx)),
-            ]);
-            let closed = self
-                .db
-                .execute_in_tx(
-                    tx,
-                    "UPDATE entity_snapshots SET valid_to = $new_valid_to WHERE id = $id AND valid_to IS NULL",
-                    &close_params,
-                )
-                .map_err(map_engine_err)
-                .map_err(StateDeltaMergeError::Error)?
-                .rows_affected;
-            if closed != 1 {
-                return Err(StateDeltaMergeError::Retry);
-            }
-        }
-
         let snapshot_id = EntitySnapshotId::new_v7();
         let snapshot_data = serde_json::json!({
             "entity_id": input.entity_id.as_uuid().to_string(),

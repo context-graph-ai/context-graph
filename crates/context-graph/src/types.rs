@@ -620,6 +620,27 @@ pub struct EntitySnapshot {
     pub valid_to: Option<TxId>,
 }
 
+/// One immutable ancestry edge in an entity's state history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntitySnapshotLink {
+    pub predecessor_snapshot_id: EntitySnapshotId,
+    pub successor_snapshot_id: EntitySnapshotId,
+    pub created_at: TxId,
+}
+
+/// The complete immutable history graph for one entity.
+///
+/// `branch_heads` are the snapshots with no successor. `archived_heads` is the
+/// subset that records an archive terminal rather than a live entity state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityHistoryGraph {
+    pub entity_id: EntityId,
+    pub snapshots: Vec<EntitySnapshot>,
+    pub links: Vec<EntitySnapshotLink>,
+    pub branch_heads: Vec<EntitySnapshotId>,
+    pub archived_heads: Vec<EntitySnapshotId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
     pub id: ObservationId,

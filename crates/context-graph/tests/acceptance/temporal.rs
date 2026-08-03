@@ -245,13 +245,13 @@ fn state_at_returns_historical_snapshot_for_each_moment() -> Result<(), CgError>
     assert_eq!(s1.properties["region"], json!("us-east-1"));
     assert_eq!(s1.properties["tier"], json!("standard"));
     assert_eq!(s1.valid_from, tx1);
-    assert_eq!(s1.valid_to, Some(tx2));
+    assert_eq!(s1.valid_to, None);
 
     let s2 = ok!(store.state_at(entity.id, tx2), "state_at tx2").expect("snapshot at tx2");
     assert_eq!(s2.properties["region"], json!("us-west-2"));
     assert_eq!(s2.properties["tier"], json!("standard"));
     assert_eq!(s2.valid_from, tx2);
-    assert_eq!(s2.valid_to, Some(tx3));
+    assert_eq!(s2.valid_to, None);
 
     let s3 = ok!(store.state_at(entity.id, tx3), "state_at tx3").expect("snapshot at tx3");
     assert_eq!(s3.properties["region"], json!("us-west-2"));
@@ -338,12 +338,11 @@ fn state_at_nonexistent_entity() -> Result<(), CgError> {
 }
 
 // Use case: a library consumer renders an Entity's timeline in a dashboard — no phantom gaps,
-// content matches what was committed at each TxId. entity_history returns contiguous oldest-first
-// EntitySnapshots; last snapshot has valid_to==None; contents equal committed values.
-// Contiguous snapshots (each valid_to equals the next valid_from) at the API surface.
+// content matches what was committed at each TxId. entity_history returns immutable oldest-first
+// EntitySnapshots; every snapshot remains open and ancestry links identify successors.
 // Regression guard on cg-crud's shipped entity_history.
 #[test]
-fn history_oldest_first_contiguous() -> Result<(), CgError> {
+fn history_oldest_first_immutable_and_linked() -> Result<(), CgError> {
     let (_tempdir, db_path, store) = fixture();
     let ctx = ok!(store.create_context(context_input("timeline")), "context").id;
     let entity = ok!(
@@ -385,16 +384,11 @@ fn history_oldest_first_contiguous() -> Result<(), CgError> {
     let tx2 = history[1].valid_from;
     let tx3 = history[2].valid_from;
     assert_eq!(history[0].valid_from, tx1);
-    assert_eq!(history[0].valid_to, Some(tx2));
+    assert_eq!(history[0].valid_to, None);
     assert_eq!(history[0].properties["size"], json!("4"));
     assert_eq!(history[0].properties["lead"], json!("alice"));
     assert_eq!(history[1].valid_from, tx2);
-    assert_eq!(
-        history[1].valid_from,
-        history[0].valid_to.expect("closed [0]"),
-        "contiguity: [1].valid_from == [0].valid_to"
-    );
-    assert_eq!(history[1].valid_to, Some(tx3));
+    assert_eq!(history[1].valid_to, None);
     assert_eq!(history[1].properties["size"], json!("6"));
     assert_eq!(history[1].properties["lead"], json!("alice"));
     assert_eq!(history[2].valid_from, tx3);
@@ -406,6 +400,13 @@ fn history_oldest_first_contiguous() -> Result<(), CgError> {
             && history[1].valid_from < history[2].valid_from,
         "strictly increasing valid_from"
     );
+    let graph = ok!(store.entity_history_graph(entity.id), "history graph");
+    assert_eq!(
+        graph.links.len(),
+        2,
+        "one immutable ancestry link per update"
+    );
+    assert_eq!(graph.branch_heads, vec![history[2].id]);
     drop(store);
     let store = reopen(&db_path);
     let history2 = ok!(store.entity_history(entity.id), "history after reopen");

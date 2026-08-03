@@ -409,9 +409,13 @@ impl Store {
     }
 
     fn archived_entity_txid(&self, entity_id: EntityId) -> Result<crate::TxId> {
-        self.entity_history(entity_id)?
+        let graph = self.entity_history_graph(entity_id)?;
+        let archived_heads = graph.archived_heads;
+        graph
+            .snapshots
             .into_iter()
-            .filter_map(|snapshot| snapshot.valid_to)
+            .filter(|snapshot| archived_heads.contains(&snapshot.id))
+            .map(|snapshot| snapshot.valid_from)
             .max_by_key(|txid| txid.0)
             .ok_or(CgError::EntityNotFound { entity_id })
     }

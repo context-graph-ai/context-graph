@@ -2146,8 +2146,7 @@ fn record_observation_partial_evidence_failure_rolls_back_observation_and_snapsh
 }
 
 #[test]
-fn record_observation_concurrent_cross_handle_against_same_entity_serializable_produces_contiguous_snapshots()
- {
+fn record_observation_concurrent_cross_handle_appends_immutable_snapshot_chain() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -2214,11 +2213,11 @@ fn record_observation_concurrent_cross_handle_against_same_entity_serializable_p
     let reader = Store::open(config).expect("reader open");
     let history = reader.entity_history(entity).expect("history");
     assert_eq!(history.len(), 5);
-    for adjacent in history.windows(2) {
-        assert_eq!(adjacent[0].valid_to, Some(adjacent[1].valid_from));
-    }
+    assert!(history.iter().all(|snapshot| snapshot.valid_to.is_none()));
     let current = history.last().expect("current snapshot");
-    assert_eq!(current.valid_to, None, "the final snapshot remains open");
+    let graph = reader.entity_history_graph(entity).expect("history graph");
+    assert_eq!(graph.links.len(), 4);
+    assert_eq!(graph.branch_heads, vec![current.id]);
     for writer in 0..4 {
         assert_eq!(
             current.properties.get(&format!("writer_{writer}")),
@@ -2853,15 +2852,9 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
         .find(|change| change.field == "writer")
         .expect("writer field change");
     assert_eq!(writer_change.old_value, None);
-    let snapshot_at_replay = history
-        .iter()
-        .find(|snapshot| {
-            snapshot.valid_from <= replay.read_txid
-                && snapshot
-                    .valid_to
-                    .map(|valid_to| replay.read_txid < valid_to)
-                    .unwrap_or(true)
-        })
+    let snapshot_at_replay = reader
+        .state_at(entity, replay.read_txid)
+        .expect("resolve immutable history at replay read txid")
         .expect("snapshot visible at replay read txid");
     assert_eq!(
         writer_change.new_value.as_ref(),
@@ -3704,18 +3697,9 @@ fn basis_diff_under_concurrent_writer_returns_one_consistent_basis_to_current_dr
     );
     for divergence in &diff.divergences {
         assert_eq!(divergence.read_txid, diff.read_txid);
-        let entity_history = reader
-            .entity_history(divergence.entity_id)
-            .expect("divergent entity history");
-        let snapshot_at_diff = entity_history
-            .iter()
-            .find(|snapshot| {
-                snapshot.valid_from <= diff.read_txid
-                    && snapshot
-                        .valid_to
-                        .map(|valid_to| diff.read_txid < valid_to)
-                        .unwrap_or(true)
-            })
+        let snapshot_at_diff = reader
+            .state_at(divergence.entity_id, diff.read_txid)
+            .expect("resolve immutable history at basis_diff read txid")
             .expect("snapshot visible at basis_diff read txid");
         assert!(
             divergence.value_diffs.iter().any(|value_diff| {

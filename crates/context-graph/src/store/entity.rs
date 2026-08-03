@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use contextdb_core::Value;
+use contextdb_core::{Error as ContextDbError, Value};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
@@ -212,19 +212,7 @@ impl Store {
     }
 
     pub fn snapshot_at(&self, id: EntityId, at: TxId) -> Result<Option<EntitySnapshot>> {
-        if !id.is_valid() {
-            return Err(CgError::InvalidIdentity {
-                context: "EntityId",
-            });
-        }
-        for snap in self.entity_history(id)? {
-            let in_range =
-                snap.valid_from.0 <= at.0 && snap.valid_to.map(|t| t.0 > at.0).unwrap_or(true);
-            if in_range {
-                return Ok(Some(snap));
-            }
-        }
-        Ok(None)
+        self.state_at(id, at)
     }
 
     pub fn current_entity_snapshot(&self, id: EntityId) -> Result<Option<EntitySnapshot>> {
@@ -268,136 +256,301 @@ impl Store {
                 context: "EntityId",
             });
         }
-        for snap in self.entity_history(id)? {
-            let in_range =
-                snap.valid_from.0 <= txid.0 && snap.valid_to.map(|t| t.0 > txid.0).unwrap_or(true);
-            if in_range {
-                return Ok(Some(snap));
-            }
+        let graph = self.entity_history_graph(id)?;
+        let branch_heads = temporal_branch_heads(&graph, txid);
+        match branch_heads.as_slice() {
+            [] => Ok(None),
+            [head] => self.state_at_on_graph_branch(&graph, txid, *head),
+            _ => Err(CgError::AmbiguousTemporalState {
+                entity_id: id,
+                at: txid,
+                branch_heads,
+            }),
         }
-        Ok(None)
+    }
+
+    /// Resolve one explicitly chosen immutable history branch. The caller supplies a
+    /// branch head because transport/current-pointer order is not semantic history.
+    pub fn state_at_on_branch(
+        &self,
+        id: EntityId,
+        txid: TxId,
+        head_snapshot: EntitySnapshotId,
+    ) -> Result<Option<EntitySnapshot>> {
+        if !id.is_valid() {
+            return Err(CgError::InvalidIdentity {
+                context: "EntityId",
+            });
+        }
+        let graph = self.entity_history_graph(id)?;
+        if !graph.branch_heads.contains(&head_snapshot) {
+            return Err(CgError::NotFound {
+                id: Some(head_snapshot.as_uuid().to_string()),
+                missing: Some("entity_history_branch_head"),
+            });
+        }
+        self.state_at_on_graph_branch(&graph, txid, head_snapshot)
+    }
+
+    fn state_at_on_graph_branch(
+        &self,
+        graph: &EntityHistoryGraph,
+        txid: TxId,
+        head_snapshot: EntitySnapshotId,
+    ) -> Result<Option<EntitySnapshot>> {
+        let by_id: HashMap<EntitySnapshotId, EntitySnapshot> = graph
+            .snapshots
+            .iter()
+            .cloned()
+            .map(|snapshot| (snapshot.id, snapshot))
+            .collect();
+        let predecessors: HashMap<EntitySnapshotId, EntitySnapshotId> = graph
+            .links
+            .iter()
+            .map(|link| (link.successor_snapshot_id, link.predecessor_snapshot_id))
+            .collect();
+        let mut cursor = head_snapshot;
+        let mut selected = None;
+        loop {
+            let Some(snapshot) = by_id.get(&cursor) else {
+                return Err(CgError::Engine(
+                    "entity history link references absent snapshot".into(),
+                ));
+            };
+            if snapshot_covers(snapshot, txid) {
+                selected = Some(snapshot.clone());
+                break;
+            }
+            let Some(predecessor) = predecessors.get(&cursor).copied() else {
+                break;
+            };
+            cursor = predecessor;
+        }
+        let Some(snapshot) = selected else {
+            return Ok(None);
+        };
+        if graph.archived_heads.contains(&snapshot.id) {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
+    }
+
+    /// Return the immutable snapshot graph; this is the history authority.
+    /// `entity_current_snapshots` remains a fast operational pointer only.
+    pub fn entity_history_graph(&self, id: EntityId) -> Result<EntityHistoryGraph> {
+        if !id.is_valid() {
+            return Err(CgError::InvalidIdentity {
+                context: "EntityId",
+            });
+        }
+        let params = HashMap::from([("entity_id".to_string(), Value::Uuid(id.as_uuid()))]);
+        let result = self
+            .db
+            .execute(
+                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut snapshots = Vec::with_capacity(result.rows.len());
+        let mut archived_heads = BTreeSet::new();
+        for row in &result.rows {
+            let snapshot = decode_snapshot(&result.columns, row)?;
+            if snapshot_is_archive(row, &result.columns)? {
+                archived_heads.insert(snapshot.id);
+            }
+            snapshots.push(self.hydrate_snapshot_observations(snapshot)?);
+        }
+        snapshots.sort_by_key(|snapshot| (snapshot.valid_from.0, snapshot.id.as_uuid()));
+
+        let links_result = self
+            .db
+            .execute(
+                "SELECT predecessor_snapshot_id, successor_snapshot_id, created_at FROM entity_snapshot_links WHERE entity_id = $entity_id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let mut links = Vec::with_capacity(links_result.rows.len());
+        let mut predecessors = BTreeSet::new();
+        for row in &links_result.rows {
+            let predecessor_snapshot_id = EntitySnapshotId::from(get_uuid(
+                row,
+                &links_result.columns,
+                "predecessor_snapshot_id",
+            )?);
+            let successor_snapshot_id = EntitySnapshotId::from(get_uuid(
+                row,
+                &links_result.columns,
+                "successor_snapshot_id",
+            )?);
+            predecessors.insert(predecessor_snapshot_id);
+            links.push(EntitySnapshotLink {
+                predecessor_snapshot_id,
+                successor_snapshot_id,
+                created_at: get_txid(row, &links_result.columns, "created_at")?,
+            });
+        }
+        links.sort_by_key(|link| {
+            (
+                link.created_at.0,
+                link.predecessor_snapshot_id.as_uuid(),
+                link.successor_snapshot_id.as_uuid(),
+            )
+        });
+        let mut branch_heads: Vec<_> = snapshots
+            .iter()
+            .map(|snapshot| snapshot.id)
+            .filter(|snapshot_id| !predecessors.contains(snapshot_id))
+            .collect();
+        branch_heads.sort_by_key(|snapshot_id| snapshot_id.as_uuid());
+        Ok(EntityHistoryGraph {
+            entity_id: id,
+            snapshots,
+            links,
+            branch_heads,
+            archived_heads: archived_heads.into_iter().collect(),
+        })
     }
 
     pub fn update_entity(&self, id: EntityId, patch: EntityPatch) -> Result<Entity> {
-        let current = self.get_entity(id)?.ok_or(CgError::NotFound {
-            id: Some(id.as_uuid().to_string()),
-            missing: Some("entity"),
-        })?;
-        let new_name = patch.name.clone().unwrap_or_else(|| current.name.clone());
-        let new_properties = patch
-            .properties
-            .clone()
-            .unwrap_or_else(|| current.properties.clone());
-        let new_tags = patch.tags.clone().unwrap_or_else(|| current.tags.clone());
+        loop {
+            let tx = self.begin_tx()?;
+            let current = match self.entity_in_tx(tx, id) {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    let _ = self.db.rollback(tx);
+                    return Err(CgError::NotFound {
+                        id: Some(id.as_uuid().to_string()),
+                        missing: Some("entity"),
+                    });
+                }
+                Err(err) => {
+                    let _ = self.db.rollback(tx);
+                    return Err(err);
+                }
+            };
+            let predecessor =
+                match self.current_entity_snapshot_id_in_tx(tx, current.context_id, id) {
+                    Ok(predecessor) => predecessor,
+                    Err(err) => {
+                        let _ = self.db.rollback(tx);
+                        return Err(err);
+                    }
+                };
+            if let Err(err) = self.guard_current_entity_snapshot_in_tx(tx, id, predecessor) {
+                let _ = self.db.rollback(tx);
+                return Err(err);
+            }
+            let new_name = patch.name.clone().unwrap_or_else(|| current.name.clone());
+            let new_properties = patch
+                .properties
+                .clone()
+                .unwrap_or_else(|| current.properties.clone());
+            let new_tags = patch.tags.clone().unwrap_or_else(|| current.tags.clone());
 
-        let tags_json = JsonValue::Array(
-            new_tags
-                .iter()
-                .map(|t| JsonValue::String(t.clone()))
-                .collect(),
-        );
+            let tags_json = JsonValue::Array(
+                new_tags
+                    .iter()
+                    .map(|t| JsonValue::String(t.clone()))
+                    .collect(),
+            );
 
-        let tx = self.begin_tx()?;
-        let update_params: HashMap<String, Value> = [
-            ("id".to_string(), Value::Uuid(id.as_uuid())),
-            ("name".to_string(), Value::Text(new_name.clone())),
-            (
-                "properties".to_string(),
-                Value::Json(properties_to_json(&new_properties)),
-            ),
-            ("tags".to_string(), Value::Json(tags_json)),
-        ]
-        .into_iter()
-        .collect();
-        if let Err(e) = self.db.execute_in_tx(
-            tx,
-            "UPDATE entities SET name = $name, properties = $properties, tags = $tags WHERE id = $id",
-            &update_params,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(e));
+            let update_params: HashMap<String, Value> = [
+                ("id".to_string(), Value::Uuid(id.as_uuid())),
+                ("name".to_string(), Value::Text(new_name.clone())),
+                (
+                    "properties".to_string(),
+                    Value::Json(properties_to_json(&new_properties)),
+                ),
+                ("tags".to_string(), Value::Json(tags_json)),
+            ]
+            .into_iter()
+            .collect();
+            if let Err(e) = self.db.execute_in_tx(
+                tx,
+                "UPDATE entities SET name = $name, properties = $properties, tags = $tags WHERE id = $id",
+                &update_params,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(e));
+            }
+            let snapshot_id = Uuid::now_v7();
+            let snapshot_data = serde_json::json!({
+                "entity_id": id.as_uuid().to_string(),
+                "entity_type": entity_type_str(current.entity_type),
+                "name": new_name.clone(),
+                "properties": properties_to_json(&new_properties),
+            });
+            let snap_params: HashMap<String, Value> = [
+                ("id".to_string(), Value::Uuid(snapshot_id)),
+                (
+                    "context_id".to_string(),
+                    Value::Uuid(current.context_id.as_uuid()),
+                ),
+                ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
+                ("data".to_string(), Value::Json(snapshot_data)),
+                ("valid_from".to_string(), Value::TxId(tx)),
+                ("valid_to".to_string(), Value::Null),
+            ]
+            .into_iter()
+            .collect();
+            if let Err(e) = self.db.execute_in_tx(
+                tx,
+                "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
+                &snap_params,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(e));
+            }
+            if let Some(predecessor) = predecessor
+                && let Err(e) = self.insert_entity_snapshot_link_in_tx(
+                    tx,
+                    current.context_id,
+                    id,
+                    predecessor,
+                    EntitySnapshotId::from(snapshot_id),
+                )
+            {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+            if let Err(e) = self.set_current_entity_snapshot_in_tx(
+                tx,
+                current.context_id,
+                id,
+                EntitySnapshotId::from(snapshot_id),
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+            if let Err(e) = self.record_audit_in_tx(
+                tx,
+                AuditOperation::Update,
+                Principal::System,
+                None,
+                AuditTarget::Entity(id),
+                current.context_id,
+                None,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+            match self.db.commit(tx) {
+                Ok(()) => {
+                    return Ok(Entity {
+                        id,
+                        entity_type: current.entity_type,
+                        name: new_name,
+                        properties: new_properties,
+                        tags: new_tags,
+                        context_id: current.context_id,
+                        status: current.status,
+                        created_at: current.created_at,
+                    });
+                }
+                Err(ContextDbError::ConditionalUpdateConflict { .. }) => continue,
+                Err(err) => return Err(map_engine_err(err)),
+            }
         }
-
-        let close_params: HashMap<String, Value> = [
-            (
-                "context_id".to_string(),
-                Value::Uuid(current.context_id.as_uuid()),
-            ),
-            ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
-            ("valid_to".to_string(), Value::TxId(tx)),
-        ]
-        .into_iter()
-        .collect();
-        if let Err(e) = self.db.execute_in_tx(
-            tx,
-            "UPDATE entity_snapshots SET valid_to = $valid_to WHERE context_id = $context_id AND entity_id = $entity_id AND valid_to IS NULL",
-            &close_params,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(e));
-        }
-
-        let snapshot_id = Uuid::now_v7();
-        let snapshot_data = serde_json::json!({
-            "entity_id": id.as_uuid().to_string(),
-            "entity_type": entity_type_str(current.entity_type),
-            "name": new_name.clone(),
-            "properties": properties_to_json(&new_properties),
-        });
-        let snap_params: HashMap<String, Value> = [
-            ("id".to_string(), Value::Uuid(snapshot_id)),
-            (
-                "context_id".to_string(),
-                Value::Uuid(current.context_id.as_uuid()),
-            ),
-            ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
-            ("data".to_string(), Value::Json(snapshot_data)),
-            ("valid_from".to_string(), Value::TxId(tx)),
-            ("valid_to".to_string(), Value::Null),
-        ]
-        .into_iter()
-        .collect();
-        if let Err(e) = self.db.execute_in_tx(
-            tx,
-            "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
-            &snap_params,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(e));
-        }
-        if let Err(e) = self.set_current_entity_snapshot_in_tx(
-            tx,
-            current.context_id,
-            id,
-            EntitySnapshotId::from(snapshot_id),
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(e);
-        }
-        if let Err(e) = self.record_audit_in_tx(
-            tx,
-            AuditOperation::Update,
-            Principal::System,
-            None,
-            AuditTarget::Entity(id),
-            current.context_id,
-            None,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(e);
-        }
-        self.db.commit(tx).map_err(map_engine_err)?;
-
-        Ok(Entity {
-            id,
-            entity_type: current.entity_type,
-            name: new_name,
-            properties: new_properties,
-            tags: new_tags,
-            context_id: current.context_id,
-            status: current.status,
-            created_at: current.created_at,
-        })
     }
 
     pub fn entity_history(&self, id: EntityId) -> Result<Vec<EntitySnapshot>> {
@@ -426,61 +579,197 @@ impl Store {
     }
 
     pub fn archive_entity(&self, id: EntityId) -> Result<Entity> {
-        let current = self.get_entity(id)?.ok_or(CgError::NotFound {
-            id: Some(id.as_uuid().to_string()),
-            missing: Some("entity"),
-        })?;
-        let tx = self.begin_tx()?;
-        let params: HashMap<String, Value> = [
-            ("id".to_string(), Value::Uuid(id.as_uuid())),
-            ("status".to_string(), Value::Text("archived".to_string())),
-        ]
-        .into_iter()
-        .collect();
-        if let Err(e) = self.db.execute_in_tx(
-            tx,
-            "UPDATE entities SET status = $status WHERE id = $id",
-            &params,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(e));
+        loop {
+            let tx = self.begin_tx()?;
+            let current = match self.entity_in_tx(tx, id) {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    let _ = self.db.rollback(tx);
+                    return Err(CgError::NotFound {
+                        id: Some(id.as_uuid().to_string()),
+                        missing: Some("entity"),
+                    });
+                }
+                Err(err) => {
+                    let _ = self.db.rollback(tx);
+                    return Err(err);
+                }
+            };
+            let predecessor =
+                match self.current_entity_snapshot_id_in_tx(tx, current.context_id, id) {
+                    Ok(predecessor) => predecessor,
+                    Err(err) => {
+                        let _ = self.db.rollback(tx);
+                        return Err(err);
+                    }
+                };
+            if let Err(err) = self.guard_current_entity_snapshot_in_tx(tx, id, predecessor) {
+                let _ = self.db.rollback(tx);
+                return Err(err);
+            }
+            let params: HashMap<String, Value> = [
+                ("id".to_string(), Value::Uuid(id.as_uuid())),
+                ("status".to_string(), Value::Text("archived".to_string())),
+            ]
+            .into_iter()
+            .collect();
+            if let Err(e) = self.db.execute_in_tx(
+                tx,
+                "UPDATE entities SET status = $status WHERE id = $id",
+                &params,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(e));
+            }
+            let terminal_snapshot_id = EntitySnapshotId::new_v7();
+            let terminal_data = serde_json::json!({
+                "entity_id": id.as_uuid().to_string(),
+                "entity_type": entity_type_str(current.entity_type),
+                "name": current.name.clone(),
+                "properties": properties_to_json(&current.properties),
+                "archived": true,
+            });
+            let terminal_params = HashMap::from([
+                (
+                    "id".to_string(),
+                    Value::Uuid(terminal_snapshot_id.as_uuid()),
+                ),
+                (
+                    "context_id".to_string(),
+                    Value::Uuid(current.context_id.as_uuid()),
+                ),
+                ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
+                ("data".to_string(), Value::Json(terminal_data)),
+                ("valid_from".to_string(), Value::TxId(tx)),
+                ("valid_to".to_string(), Value::Null),
+            ]);
+            if let Err(e) = self.db.execute_in_tx(
+                tx,
+                "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
+                &terminal_params,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(e));
+            }
+            if let Some(predecessor) = predecessor
+                && let Err(e) = self.insert_entity_snapshot_link_in_tx(
+                    tx,
+                    current.context_id,
+                    id,
+                    predecessor,
+                    terminal_snapshot_id,
+                )
+            {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+            if let Err(e) = self.set_current_entity_snapshot_in_tx(
+                tx,
+                current.context_id,
+                id,
+                terminal_snapshot_id,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+            if let Err(e) = self.record_audit_in_tx(
+                tx,
+                AuditOperation::Archive,
+                Principal::System,
+                None,
+                AuditTarget::Entity(id),
+                current.context_id,
+                None,
+            ) {
+                let _ = self.db.rollback(tx);
+                return Err(e);
+            }
+            match self.db.commit(tx) {
+                Ok(()) => {
+                    return Ok(Entity {
+                        status: EntityStatus::Archived,
+                        ..current
+                    });
+                }
+                Err(ContextDbError::ConditionalUpdateConflict { .. }) => continue,
+                Err(err) => return Err(map_engine_err(err)),
+            }
         }
-        let close_params: HashMap<String, Value> = [
-            (
-                "context_id".to_string(),
-                Value::Uuid(current.context_id.as_uuid()),
-            ),
-            ("entity_id".to_string(), Value::Uuid(id.as_uuid())),
-            ("valid_to".to_string(), Value::TxId(tx)),
-        ]
-        .into_iter()
-        .collect();
-        if let Err(e) = self.db.execute_in_tx(
-            tx,
-            "UPDATE entity_snapshots SET valid_to = $valid_to WHERE context_id = $context_id AND entity_id = $entity_id AND valid_to IS NULL",
-            &close_params,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(map_engine_err(e));
-        }
-        if let Err(e) = self.record_audit_in_tx(
-            tx,
-            AuditOperation::Archive,
-            Principal::System,
-            None,
-            AuditTarget::Entity(id),
-            current.context_id,
-            None,
-        ) {
-            let _ = self.db.rollback(tx);
-            return Err(e);
-        }
-        self.db.commit(tx).map_err(map_engine_err)?;
+    }
 
-        Ok(Entity {
-            status: EntityStatus::Archived,
-            ..current
-        })
+    fn entity_in_tx(&self, tx: TxId, id: EntityId) -> Result<Option<Entity>> {
+        if !id.is_valid() {
+            return Err(CgError::InvalidIdentity {
+                context: "EntityId",
+            });
+        }
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT id, entity_type, name, properties, tags, context_id, status, created_at FROM entities WHERE id = $id",
+                &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| decode_entity(&result.columns, row))
+            .transpose()
+    }
+
+    fn current_entity_snapshot_id_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        entity_id: EntityId,
+    ) -> Result<Option<EntitySnapshotId>> {
+        let result = self
+            .db
+            .execute_in_tx(
+                tx,
+                "SELECT snapshot_id FROM entity_current_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
+                &HashMap::from([
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        result
+            .rows
+            .first()
+            .map(|row| get_uuid(row, &result.columns, "snapshot_id").map(EntitySnapshotId::from))
+            .transpose()
+    }
+
+    fn guard_current_entity_snapshot_in_tx(
+        &self,
+        tx: TxId,
+        entity_id: EntityId,
+        snapshot_id: Option<EntitySnapshotId>,
+    ) -> Result<()> {
+        let Some(snapshot_id) = snapshot_id else {
+            return Ok(());
+        };
+        let guarded = self
+            .db
+            .guard_row_conditions_in_tx(
+                tx,
+                "entity_current_snapshots",
+                "entity_id",
+                &Value::Uuid(entity_id.as_uuid()),
+                &[(
+                    "snapshot_id".to_string(),
+                    Value::Uuid(snapshot_id.as_uuid()),
+                )],
+            )
+            .map_err(map_engine_err)?;
+        if !guarded {
+            return Err(CgError::Engine(
+                "entity current-snapshot pointer changed inside its transaction".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn set_current_entity_snapshot_in_tx(
@@ -516,6 +805,31 @@ impl Store {
                 tx,
                 "INSERT INTO entity_current_snapshots (context_id, entity_id, snapshot_id, updated_at) VALUES ($context_id, $entity_id, $snapshot_id, $updated_at)",
                 &update_params,
+            )
+            .map_err(map_engine_err)?;
+        Ok(())
+    }
+
+    pub(super) fn insert_entity_snapshot_link_in_tx(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        entity_id: EntityId,
+        predecessor_snapshot_id: EntitySnapshotId,
+        successor_snapshot_id: EntitySnapshotId,
+    ) -> Result<()> {
+        self.db
+            .execute_in_tx(
+                tx,
+                "INSERT INTO entity_snapshot_links (id, context_id, entity_id, predecessor_snapshot_id, successor_snapshot_id, created_at) VALUES ($id, $context_id, $entity_id, $predecessor_snapshot_id, $successor_snapshot_id, $created_at)",
+                &HashMap::from([
+                    ("id".to_string(), Value::Uuid(Uuid::now_v7())),
+                    ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                    ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
+                    ("predecessor_snapshot_id".to_string(), Value::Uuid(predecessor_snapshot_id.as_uuid())),
+                    ("successor_snapshot_id".to_string(), Value::Uuid(successor_snapshot_id.as_uuid())),
+                    ("created_at".to_string(), Value::TxId(tx)),
+                ]),
             )
             .map_err(map_engine_err)?;
         Ok(())
@@ -960,6 +1274,46 @@ fn decode_snapshot(columns: &[String], row: &[Value]) -> Result<EntitySnapshot> 
         valid_from,
         valid_to,
     })
+}
+
+fn snapshot_is_archive(row: &[Value], columns: &[String]) -> Result<bool> {
+    Ok(get_json(row, columns, "data")?
+        .get("archived")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false))
+}
+
+fn temporal_branch_heads(graph: &EntityHistoryGraph, at: TxId) -> Vec<EntitySnapshotId> {
+    let snapshots_at: BTreeSet<_> = graph
+        .snapshots
+        .iter()
+        .filter(|snapshot| snapshot_covers(snapshot, at))
+        .map(|snapshot| snapshot.id)
+        .collect();
+    let predecessors_with_successor_at: BTreeSet<_> = graph
+        .links
+        .iter()
+        .filter(|link| {
+            graph
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == link.successor_snapshot_id)
+                .is_some_and(|snapshot| snapshot_covers(snapshot, at))
+        })
+        .map(|link| link.predecessor_snapshot_id)
+        .collect();
+    snapshots_at
+        .into_iter()
+        .filter(|snapshot_id| !predecessors_with_successor_at.contains(snapshot_id))
+        .collect()
+}
+
+fn snapshot_covers(snapshot: &EntitySnapshot, at: TxId) -> bool {
+    snapshot.valid_from.0 <= at.0
+        && snapshot
+            .valid_to
+            .map(|valid_to| at.0 < valid_to.0)
+            .unwrap_or(true)
 }
 
 fn ordered_observation_ids(columns: &[String], rows: &[Vec<Value>]) -> Result<Vec<ObservationId>> {

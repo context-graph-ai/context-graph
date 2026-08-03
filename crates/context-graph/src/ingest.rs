@@ -4517,15 +4517,6 @@ impl<'a> CaptureTxn<'a> {
         }
         let (entity_type, entity_name) =
             self.entity_identity(context_id, entity_id, current.as_ref())?;
-        if let Some(current) = &current {
-            self.execute(
-                "UPDATE entity_snapshots SET valid_to = $valid_to WHERE id = $id AND valid_to IS NULL",
-                HashMap::from([
-                    ("id".to_string(), DbValue::Uuid(current.id.as_uuid())),
-                    ("valid_to".to_string(), DbValue::TxId(self.tx)),
-                ]),
-            )?;
-        }
         let snapshot_id = EntitySnapshotId::new_v7();
         let properties_json = properties_to_json_value(&new_properties);
         self.insert_entity_snapshot(EntitySnapshotInsert {

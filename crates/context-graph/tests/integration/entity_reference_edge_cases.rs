@@ -516,16 +516,20 @@ fn entity_reference_embedding_parent_entity_archive_does_not_orphan_child_rows()
         })
         .unwrap_or_default();
     let archived = fixture.store.archive_entity(entity.id);
-    let expected_archived_at = fixture
-        .store
-        .entity_history(entity.id)
-        .ok()
-        .and_then(|history| {
-            history
-                .into_iter()
-                .filter_map(|snapshot| snapshot.valid_to)
-                .max_by_key(|txid| txid.0)
-        });
+    let expected_archived_at =
+        fixture
+            .store
+            .entity_history_graph(entity.id)
+            .ok()
+            .and_then(|graph| {
+                let archived_heads = graph.archived_heads;
+                graph
+                    .snapshots
+                    .into_iter()
+                    .filter(|snapshot| archived_heads.contains(&snapshot.id))
+                    .map(|snapshot| snapshot.valid_from)
+                    .max_by_key(|txid| txid.0)
+            });
     let rows = fixture
         .store
         .list_entity_reference_embeddings_for_entity(entity.id);

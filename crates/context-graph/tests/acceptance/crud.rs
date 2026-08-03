@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use chrono::Utc;
@@ -14,6 +14,7 @@ use context_graph::{
     PrecomputedEmbedding, ReasoningStep, RecordObservation, RelationshipType, RetentionStatus,
     StorageKey, Store, StoreConfig, TraverseFilter,
 };
+use contextdb_core::{TxId, Value as DbValue};
 use contextdb_engine::Database;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1464,9 +1465,9 @@ fn entity_create_and_snapshot_persist_across_reopen() {
     assert!(!listed.iter().any(|candidate| candidate.id == decoy.id));
 }
 
-// Use case: an operator investigating last month's regression asks what the service looked like two weeks ago versus three; each snapshot's valid_to must equal the next's valid_from as exact txid equality.
+// Use case: an operator investigating last month's regression asks what the service looked like two weeks ago versus three. Successors are immutable graph nodes, so the old state is never rewritten to make room for a new one.
 #[test]
-fn entity_update_creates_new_snapshot_contiguous_after_reopen() {
+fn entity_update_appends_immutable_snapshot_chain_after_reopen() {
     let (_tempdir, db_path, store) = fixture();
     let ctx = ok!(store.create_context(context_input("platform")), "context").id;
     let entity = ok!(
@@ -1514,10 +1515,10 @@ fn entity_update_creates_new_snapshot_contiguous_after_reopen() {
     let tx0 = history[0].valid_from;
     let tx1 = history[1].valid_from;
     let tx2 = history[2].valid_from;
-    assert_eq!(history[0].valid_to, Some(history[1].valid_from));
-    assert_eq!(history[1].valid_to, Some(history[2].valid_from));
     assert!(history[0].valid_from < history[1].valid_from);
     assert!(history[1].valid_from < history[2].valid_from);
+    assert_eq!(history[0].valid_to, None);
+    assert_eq!(history[1].valid_to, None);
     assert_eq!(history[2].valid_to, None);
     assert_eq!(history[0].properties["version"], json!("1.4.2"));
     assert_eq!(history[1].properties["version"], json!("1.5.0"));
@@ -1525,6 +1526,196 @@ fn entity_update_creates_new_snapshot_contiguous_after_reopen() {
     assert_eq!(history[0].valid_from, tx0);
     assert_eq!(history[1].valid_from, tx1);
     assert_eq!(history[2].valid_from, tx2);
+    let graph = ok!(store.entity_history_graph(entity.id), "history graph");
+    assert_eq!(graph.links.len(), 2);
+    assert_eq!(graph.branch_heads, vec![history[2].id]);
+    assert_eq!(
+        ok!(
+            store.state_at(entity.id, history[1].valid_from),
+            "linear state"
+        ),
+        Some(history[1].clone())
+    );
+}
+
+#[test]
+fn entity_state_at_bridges_legacy_intervals_into_new_immutable_successor() {
+    let (_tempdir, _db_path, store) = fixture();
+    let context_id = ContextId::from(uuid::Uuid::from_u128(0x1e6a_c001));
+    let entity_id = EntityId::from(uuid::Uuid::from_u128(0x1e6a_e001));
+    let first_snapshot = uuid::Uuid::from_u128(0x1e6a_5001);
+    let second_snapshot = uuid::Uuid::from_u128(0x1e6a_5002);
+    let db = store.sync_database();
+    db.execute(
+        "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+            ("name".to_string(), DbValue::Text("legacy-history".to_string())),
+            ("labels".to_string(), DbValue::Json(json!([]))),
+            ("properties".to_string(), DbValue::Json(json!({}))),
+            ("created_at".to_string(), DbValue::TxId(TxId(1))),
+        ]),
+    )
+    .expect("insert legacy context");
+    db.execute(
+        "INSERT INTO entities (id, entity_type, name, status, context_id, properties, tags, created_at) VALUES ($id, $entity_type, $name, $status, $context_id, $properties, $tags, $created_at)",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+            ("entity_type".to_string(), DbValue::Text("SERVICE".to_string())),
+            ("name".to_string(), DbValue::Text("legacy-service".to_string())),
+            ("status".to_string(), DbValue::Text("active".to_string())),
+            ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+            ("properties".to_string(), DbValue::Json(json!({"version": "v2"}))),
+            ("tags".to_string(), DbValue::Json(json!([]))),
+            ("created_at".to_string(), DbValue::TxId(TxId(1))),
+        ]),
+    )
+    .expect("insert legacy entity");
+    for (snapshot_id, version, valid_from, valid_to) in [
+        (first_snapshot, "v1", TxId(1), DbValue::TxId(TxId(2))),
+        (second_snapshot, "v2", TxId(2), DbValue::Null),
+    ] {
+        db.execute(
+            "INSERT INTO entity_snapshots (id, context_id, entity_id, data, valid_from, valid_to) VALUES ($id, $context_id, $entity_id, $data, $valid_from, $valid_to)",
+            &HashMap::from([
+                ("id".to_string(), DbValue::Uuid(snapshot_id)),
+                ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+                ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+                ("data".to_string(), DbValue::Json(json!({
+                    "entity_id": entity_id.as_uuid().to_string(),
+                    "entity_type": "SERVICE",
+                    "name": "legacy-service",
+                    "properties": {"version": version},
+                }))),
+                ("valid_from".to_string(), DbValue::TxId(valid_from)),
+                ("valid_to".to_string(), valid_to),
+            ]),
+        )
+        .expect("insert persisted legacy interval snapshot");
+    }
+    db.execute(
+        "INSERT INTO entity_current_snapshots (context_id, entity_id, snapshot_id, updated_at) VALUES ($context_id, $entity_id, $snapshot_id, $updated_at)",
+        &HashMap::from([
+            ("context_id".to_string(), DbValue::Uuid(context_id.as_uuid())),
+            ("entity_id".to_string(), DbValue::Uuid(entity_id.as_uuid())),
+            ("snapshot_id".to_string(), DbValue::Uuid(second_snapshot)),
+            ("updated_at".to_string(), DbValue::TxId(TxId(2))),
+        ]),
+    )
+    .expect("insert legacy current pointer");
+
+    let updated = ok!(
+        store.update_entity(
+            entity_id,
+            EntityPatch {
+                properties: Some(map(&[("version", json!("v3"))])),
+                ..Default::default()
+            },
+        ),
+        "append post-upgrade immutable successor"
+    );
+    assert_eq!(updated.properties["version"], json!("v3"));
+    let history = ok!(store.entity_history(entity_id), "mixed history");
+    let third = history.last().expect("new immutable successor");
+    assert_eq!(
+        ok!(store.state_at(entity_id, TxId(1)), "legacy v1")
+            .expect("legacy v1")
+            .properties["version"],
+        json!("v1")
+    );
+    assert_eq!(
+        ok!(store.state_at(entity_id, TxId(2)), "legacy v2")
+            .expect("legacy v2")
+            .properties["version"],
+        json!("v2")
+    );
+    assert_eq!(
+        ok!(
+            store.state_at(entity_id, third.valid_from),
+            "post-upgrade v3"
+        )
+        .expect("post-upgrade v3")
+        .properties["version"],
+        json!("v3")
+    );
+    let graph = ok!(store.entity_history_graph(entity_id), "mixed graph");
+    assert_eq!(graph.links.len(), 1);
+    assert_eq!(
+        graph.links[0].predecessor_snapshot_id.as_uuid(),
+        second_snapshot
+    );
+    assert_eq!(graph.links[0].successor_snapshot_id, third.id);
+}
+
+#[test]
+fn concurrent_entity_updates_read_basis_and_advance_pointer_in_one_transaction() {
+    let (_tempdir, db_path, store) = fixture();
+    let context_id = ok!(
+        store.create_context(context_input("concurrent entity")),
+        "context"
+    )
+    .id;
+    let entity = ok!(
+        store.create_entity(CreateEntity {
+            entity_type: EntityType::Service,
+            name: "transactional-basis".to_string(),
+            properties: map(&[("seed", json!(true))]),
+            tags: Vec::new(),
+            context_id,
+        }),
+        "entity"
+    );
+    let entity_id = entity.id;
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|writer| {
+            let db_path = db_path.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let store = reopen(&db_path);
+                barrier.wait();
+                store.update_entity(
+                    entity_id,
+                    EntityPatch {
+                        name: Some(format!("transactional-basis-{writer}")),
+                        ..Default::default()
+                    },
+                )
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle
+            .join()
+            .expect("update writer joined")
+            .expect("concurrent update committed");
+    }
+
+    let store = reopen(&db_path);
+    let graph = ok!(store.entity_history_graph(entity_id), "history graph");
+    assert_eq!(graph.snapshots.len(), 3);
+    assert_eq!(graph.links.len(), 2);
+    assert_eq!(graph.branch_heads.len(), 1);
+    assert!(
+        graph
+            .snapshots
+            .iter()
+            .all(|snapshot| snapshot.valid_to.is_none())
+    );
+    let mut predecessors = graph
+        .links
+        .iter()
+        .map(|link| link.predecessor_snapshot_id)
+        .collect::<BTreeSet<_>>();
+    let root = graph.snapshots.first().expect("creation snapshot").id;
+    assert!(predecessors.remove(&root));
+    assert_eq!(
+        predecessors.len(),
+        1,
+        "the second writer linked from the first writer"
+    );
 }
 
 // Use case: a retired service is archived so default listings no longer surface it, but every prior snapshot stays queryable so historical Decisions that BASED_ON it remain explainable.
@@ -1569,7 +1760,7 @@ fn entity_archive_retains_history() {
     drop(store);
     let store = reopen(&db_path);
     let history = ok!(store.entity_history(entity.id), "history");
-    assert_eq!(history.len(), 3);
+    assert_eq!(history.len(), 4);
     let snapshot = ok!(
         store.snapshot_at(entity.id, history[1].valid_from),
         "snapshot"
@@ -1578,7 +1769,17 @@ fn entity_archive_retains_history() {
     assert_eq!(snapshot.entity_id, entity.id);
     assert_eq!(snapshot.name, "payments-v1");
     assert_eq!(snapshot.properties["region"], json!("us-east"));
-    assert!(history[2].valid_to.is_some());
+    assert_eq!(history[2].valid_to, None);
+    let graph = ok!(store.entity_history_graph(entity.id), "history graph");
+    assert_eq!(graph.links.len(), 3);
+    assert_eq!(graph.archived_heads, vec![history[3].id]);
+    assert_eq!(
+        ok!(
+            store.state_at(entity.id, history[3].valid_from),
+            "state after archive"
+        ),
+        None
+    );
     let listed = ok!(
         store.list_entities(ListEntityFilter::default()),
         "default list"

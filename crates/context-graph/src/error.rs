@@ -123,6 +123,13 @@ pub enum CgError {
     EntityNotFound {
         entity_id: crate::EntityId,
     },
+    /// More than one immutable history branch covers the requested point.
+    /// Call `state_at_on_branch` with one of these heads to choose explicitly.
+    AmbiguousTemporalState {
+        entity_id: crate::EntityId,
+        at: TxId,
+        branch_heads: Vec<crate::EntitySnapshotId>,
+    },
     ProducerFieldExceedsMaxLength {
         field: &'static str,
         max: usize,
