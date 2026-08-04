@@ -27,7 +27,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # windows-latest is intentionally excluded: the ContextDB substrate's
+        # durable large-request sync staging is Unix-only by design (it
+        # requires descriptor-relative filesystem operations), enforced via a
+        # deliberate compile_error! under #[cfg(not(unix))] in
+        # contextdb-server. ContextDB's own CI matrix has no Windows leg, so
+        # Context Graph cannot build the sync test surface on Windows either.
+        os: [macos-latest, ubuntu-latest]
     steps:
       - name: Validate exact ContextDB SHA
         if: github.event_name == 'workflow_dispatch'
