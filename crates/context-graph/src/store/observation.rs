@@ -1522,7 +1522,7 @@ impl Store {
             )));
         }
 
-        let invalidation_id = InvalidationId::new_v7();
+        let invalidation_id = InvalidationId::from(invalidation.decision_id.as_uuid());
         self.db
             .execute_in_tx(
                 tx,

@@ -923,7 +923,10 @@ fn insert_invalidation_rows(
         let severity_key = format!("severity_{index}");
         let threatened_key = format!("threatened_intention_ids_{index}");
         let unserved_key = format!("intention_now_un_served_{index}");
-        params.insert(id_key.clone(), Value::Uuid(Uuid::now_v7()));
+        params.insert(
+            id_key.clone(),
+            Value::Uuid(InvalidationId::from(row.affected_decision_id).as_uuid()),
+        );
         params.insert(affected_key.clone(), Value::Uuid(row.affected_decision_id));
         params.insert(basis_diff_key.clone(), Value::Json(basis_diff));
         params.insert(
