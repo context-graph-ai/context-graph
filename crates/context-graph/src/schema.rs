@@ -99,7 +99,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "invalidations",
-                ddl: INVALIDATIONS_DDL,
+        ddl: INVALIDATIONS_DDL,
     },
     TableSpec {
         name: "signatures",
