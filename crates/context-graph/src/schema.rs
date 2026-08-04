@@ -240,6 +240,23 @@ pub const TABLES: &[TableSpec] = &[
     },
 ];
 
+/// The two per-device runtime tables. They are local operational state (`SYNC OFF`) and are
+/// deliberately NOT members of `TABLES` — the frozen sync-declaration classification keeps them
+/// outside the graph schema. They are installed at store open all the same, so a first write to
+/// either one adds no schema change a node would otherwise owe its hub.
+pub(crate) const RUNTIME_MODELS_DDL: &str = "CREATE TABLE cg_runtime_models (id UUID PRIMARY KEY, context_label TEXT NOT NULL, model_key TEXT NOT NULL, advertised_context_tokens INTEGER NOT NULL, default_for_context BOOLEAN NOT NULL, created_at TXID NOT NULL) SYNC OFF";
+pub(crate) const CHANGED_CURSORS_DDL: &str = "CREATE TABLE cg_changed_cursors (context_id UUID PRIMARY KEY, last_seen_tx TXID NOT NULL, updated_at TXID NOT NULL) SYNC OFF";
+pub(crate) const LOCAL_RUNTIME_TABLES: &[TableSpec] = &[
+    TableSpec {
+        name: "cg_runtime_models",
+        ddl: RUNTIME_MODELS_DDL,
+    },
+    TableSpec {
+        name: "cg_changed_cursors",
+        ddl: CHANGED_CURSORS_DDL,
+    },
+];
+
 pub const SUBSCRIPTION_EVENT_TYPE_DDL: &[&str] = &[
     "CREATE EVENT TYPE invalidation_detected WHEN INSERT ON invalidations",
     "CREATE EVENT TYPE new_decision WHEN INSERT ON decisions",

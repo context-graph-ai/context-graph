@@ -30,7 +30,7 @@ use contextdb_engine::{Database, plugin::DatabasePlugin};
 use crate::Result;
 use crate::embedding_space::default_text_embedding_space;
 use crate::error::CgError;
-use crate::schema::{INDEXES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES};
+use crate::schema::{INDEXES, LOCAL_RUNTIME_TABLES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES};
 use crate::types::*;
 use crate::{Embedder, EmbedderRegistration};
 
@@ -695,6 +695,16 @@ fn initialize_schema(db: &Database) -> Result<()> {
     // tables are inert on a single-node install.
     contextdb_engine::work_ledger::install_work_ledger_schema(db).map_err(map_engine_err)?;
     for table in TABLES {
+        if db.table_meta(table.name).is_some() {
+            continue;
+        }
+        db.execute(table.ddl, &HashMap::new())
+            .map_err(map_engine_err)?;
+    }
+    // The per-device runtime tables (`SYNC OFF`) install here too, not lazily on first write: a
+    // table created after a node has drained its push leaves that node reporting schema it still
+    // owes the hub, so registering a runtime model would read as pending graph transport.
+    for table in LOCAL_RUNTIME_TABLES {
         if db.table_meta(table.name).is_some() {
             continue;
         }
