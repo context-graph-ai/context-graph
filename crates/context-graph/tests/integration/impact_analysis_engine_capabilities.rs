@@ -331,7 +331,10 @@ fn trigger_callback_failure_rolls_back_observation() {
     };
     let result = store.record_observation(attempted);
 
-    assert!(matches!(result, Err(CgError::Engine(_))));
+    assert!(
+        matches!(&result, Err(CgError::UniqueViolation { entity, .. }) if *entity == "invalidation"),
+        "the failing callback surfaces the duplicate invalidation that stopped it: {result:?}"
+    );
     drop(store);
     let db = open_raw_database(&dir);
     let observations = db
