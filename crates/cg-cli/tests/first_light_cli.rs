@@ -1182,14 +1182,6 @@ fn json_bool_at(json: &Value, paths: &[&str]) -> Option<bool> {
         .find_map(|path| json.pointer(path).and_then(Value::as_bool))
 }
 
-fn json_array_len_at(json: &Value, paths: &[&str]) -> Option<u64> {
-    paths.iter().find_map(|path| {
-        json.pointer(path)
-            .and_then(Value::as_array)
-            .map(|items| items.len() as u64)
-    })
-}
-
 fn completion_records_since(harness: &CliHarness, start: usize) -> Vec<Value> {
     let records = harness.providers.completion_records();
     assert!(
@@ -2856,13 +2848,36 @@ async fn sync_cli_push_pull_status_reports_remote_tenant_watermarks_and_pending(
     ]);
     assert_eq!(pull.code, 0, "{}", combined(&pull));
     let pull_json = output_json(&pull).expect("pull sync JSON");
+    // A divergent edge pulling a two-way KEEP FIRST table adopts the hub's accepted value and says
+    // so: the resolution is reported as a typed diagnostic, never applied silently and never kept
+    // local. Match on the reason and the table — the node ids and hub positions are per-run.
+    let adoptions = pull_json
+        .pointer("/sync/apply_result/conflicts")
+        .or_else(|| pull_json.pointer("/apply_result/conflicts"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !adoptions.is_empty(),
+        "cg sync pull must report the hub adoptions it performed on the divergent edge: {pull_json}"
+    );
+    for adoption in &adoptions {
+        assert_eq!(
+            adoption.pointer("/reason").and_then(Value::as_str),
+            Some("keep_first_hub_adopted"),
+            "every reported pull resolution is a KEEP FIRST hub adoption: {pull_json}"
+        );
+    }
+    let adopted_tables = adoptions
+        .iter()
+        .filter_map(|adoption| adoption.pointer("/table").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        json_array_len_at(
-            &pull_json,
-            &["/sync/apply_result/conflicts", "/apply_result/conflicts"]
-        ),
-        Some(0),
-        "cg sync pull must report the real ApplyResult from the declared two-way KEEP FIRST schema policy: {pull_json}"
+        adopted_tables,
+        ["cg_schema_version", "contexts"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the divergent schema row and the context row are the rows the hub wins: {pull_json}"
     );
     assert!(
         json_u64_at(
