@@ -6354,7 +6354,7 @@ fn ensure_runtime_model_table(store: &Store) -> Result<()> {
         return Ok(());
     }
     db.execute(crate::schema::RUNTIME_MODELS_DDL, &HashMap::new())
-    .map_err(map_engine)?;
+        .map_err(map_engine)?;
     Ok(())
 }
 
@@ -6364,7 +6364,7 @@ fn ensure_changed_cursor_table(store: &Store) -> Result<()> {
         return Ok(());
     }
     db.execute(crate::schema::CHANGED_CURSORS_DDL, &HashMap::new())
-    .map_err(map_engine)?;
+        .map_err(map_engine)?;
     Ok(())
 }
 
