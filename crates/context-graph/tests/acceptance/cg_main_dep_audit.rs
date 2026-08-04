@@ -69,6 +69,57 @@ const OPAQUE_INTERPRETER_COMMANDS: &[&str] = &[
     "zsh",
 ];
 const SAFE_GITHUB_HOSTED_RUNNERS: &[&str] = &["ubuntu-latest", "macos-latest", "windows-latest"];
+const CONTEXT_GRAPH_WORKING_DIRECTORY: &str = "workspace/context-graph";
+const CONTEXT_GRAPH_CHECKOUT_PATH: &str = "workspace/context-graph";
+const CONTEXTDB_CHECKOUT_PATH: &str = "workspace/contextdb";
+const CONTEXTDB_REPOSITORY: &str = "context-graph-ai/contextdb";
+const CONTEXTDB_REF_EXPRESSION: &str =
+    "${{ github.event_name == 'workflow_dispatch' && inputs.contextdb_sha || 'dev' }}";
+const AUDIT_TOOL_INSTALL_SPECS: &[&str] = &["cargo-deny@0.20.2", "cargo-expand@1.0.124"];
+const EXACT_REVISION_VERIFIER_LINES: &[&str] = &[
+    "context_graph_sha=\"$(git rev-parse HEAD)\"",
+    "contextdb_sha=\"$(git -C ../contextdb rev-parse HEAD)\"",
+    "if [[ ! \"$context_graph_sha\" =~ ^[0-9a-f]{40}$ ]] || [[ ! \"$contextdb_sha\" =~ ^[0-9a-f]{40}$ ]]; then",
+    "echo \"checkouts must resolve to immutable 40-character commit SHAs\" >&2",
+    "exit 1",
+    "fi",
+    "if [[ \"$context_graph_sha\" != \"$GITHUB_SHA\" ]]; then",
+    "echo \"checked-out Context Graph SHA does not match GITHUB_SHA\" >&2",
+    "exit 1",
+    "fi",
+    "if [[ \"${{ github.event_name }}\" == \"workflow_dispatch\" ]] && [[ \"$contextdb_sha\" != \"$REQUESTED_CONTEXTDB_SHA\" ]]; then",
+    "echo \"checked-out ContextDB SHA does not match contextdb_sha\" >&2",
+    "exit 1",
+    "fi",
+    "printf 'Context Graph SHA: %s\\n' \"$context_graph_sha\"",
+    "printf 'ContextDB SHA: %s\\n' \"$contextdb_sha\"",
+];
+const VETTED_AUDIT_RUN_LINES: &[&str] = &[
+    "require_file_without_match() {",
+    "local pattern=\"$1\"",
+    "local file=\"$2\"",
+    "local grep_status=0",
+    "grep -q -E \"$pattern\" \"$file\" || grep_status=$?",
+    "case \"$grep_status\" in",
+    "0)",
+    "echo \"forbidden dependency marker found in $file\" >&2",
+    "return 1",
+    ";;",
+    "1) return 0 ;;",
+    "*)",
+    "echo \"dependency-marker scan failed for $file\" >&2",
+    "return \"$grep_status\"",
+    ";;",
+    "esac",
+    "}",
+    "cargo deny --config deny.toml check",
+    "cargo expand --lib -p context-graph | tee \"$RUNNER_TEMP/context-graph-expanded.rs\"",
+    "test -s \"$RUNNER_TEMP/context-graph-expanded.rs\"",
+    "require_file_without_match 'embeddinggemma|candle_embeddinggemma' \"$RUNNER_TEMP/context-graph-expanded.rs\"",
+    "cargo tree -p context-graph -e normal,build | tee \"$RUNNER_TEMP/context-graph-tree.txt\"",
+    "test -s \"$RUNNER_TEMP/context-graph-tree.txt\"",
+    "require_file_without_match '(^|[[:space:]])candle-embeddinggemma([[:space:]]|$)' \"$RUNNER_TEMP/context-graph-tree.txt\"",
+];
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -439,7 +490,32 @@ fn step_uses_can_mask_command_lookup(step: &Mapping) -> bool {
 }
 
 fn checkout_inputs_can_shadow_workspace(step: &Mapping) -> bool {
-    step_with_fields(step).is_some_and(|with| !with.is_empty())
+    !step_is_credential_free_context_graph_checkout(step)
+        && !step_is_credential_free_contextdb_checkout(step)
+}
+
+fn step_is_credential_free_context_graph_checkout(step: &Mapping) -> bool {
+    step_uses(step) == Some("actions/checkout@v4")
+        && step_with_fields(step).is_some_and(|with| {
+            with.len() == 2
+                && mapping_get(with, "path").and_then(YamlValue::as_str)
+                    == Some(CONTEXT_GRAPH_CHECKOUT_PATH)
+                && mapping_get(with, "persist-credentials").is_some_and(yaml_explicit_false)
+        })
+}
+
+fn step_is_credential_free_contextdb_checkout(step: &Mapping) -> bool {
+    step_uses(step) == Some("actions/checkout@v4")
+        && step_with_fields(step).is_some_and(|with| {
+            with.len() == 4
+                && mapping_get(with, "repository").and_then(YamlValue::as_str)
+                    == Some(CONTEXTDB_REPOSITORY)
+                && mapping_get(with, "ref").and_then(YamlValue::as_str)
+                    == Some(CONTEXTDB_REF_EXPRESSION)
+                && mapping_get(with, "path").and_then(YamlValue::as_str)
+                    == Some(CONTEXTDB_CHECKOUT_PATH)
+                && mapping_get(with, "persist-credentials").is_some_and(yaml_explicit_false)
+        })
 }
 
 fn cache_inputs_can_shadow_workspace_or_command_lookup(step: &Mapping) -> bool {
@@ -579,7 +655,13 @@ fn mapping_default_run_working_directory(mapping: &Mapping) -> Option<&YamlValue
 }
 
 fn env_overrides_command_lookup(value: &YamlValue) -> bool {
-    value.as_mapping().is_some_and(|env| !env.is_empty())
+    value.as_mapping().is_some_and(|env| {
+        env.keys().filter_map(YamlValue::as_str).any(|key| {
+            COMMAND_LOOKUP_ENV_KEYS
+                .iter()
+                .any(|lookup_key| key.eq_ignore_ascii_case(lookup_key))
+        })
+    })
 }
 
 fn step_shell_can_mask_failures(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
@@ -600,7 +682,8 @@ fn step_working_directory_can_shadow_workspace(
 ) -> bool {
     mapping_get(step, "working-directory").is_some()
         || mapping_default_run_working_directory(job).is_some()
-        || value_default_run_working_directory(workflow).is_some()
+        || value_default_run_working_directory(workflow).and_then(YamlValue::as_str)
+            != Some(CONTEXT_GRAPH_WORKING_DIRECTORY)
 }
 
 fn workflow_command_lookup_can_mask_failures(workflow: &YamlValue) -> bool {
@@ -614,9 +697,11 @@ fn workflow_command_lookup_can_mask_failures(workflow: &YamlValue) -> bool {
             || mapping_get(step, "env").is_some_and(env_overrides_command_lookup)
             || step_uses_can_mask_command_lookup(step)
             || step_run(step).is_some_and(|run| {
-                all_run_shell_lines(run)
-                    .into_iter()
-                    .any(shell_line_mutates_command_lookup)
+                !run_is_vetted_audit_run(run)
+                    && !run_is_exact_revision_verifier(run)
+                    && all_run_shell_lines(run)
+                        .into_iter()
+                        .any(shell_line_mutates_command_lookup)
             })
     })
 }
@@ -732,9 +817,47 @@ fn step_installs_tools(
         && action_step_can_enforce_failure(workflow, job, step)
 }
 
-fn step_is_default_checkout(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
-    step_uses(step) == Some("actions/checkout@v4")
-        && !checkout_inputs_can_shadow_workspace(step)
+fn step_is_exact_contextdb_sha_input_validation(step: &Mapping) -> bool {
+    mapping_get(step, "if").and_then(YamlValue::as_str)
+        == Some("github.event_name == 'workflow_dispatch'")
+        && mapping_get(step, "working-directory").and_then(YamlValue::as_str) == Some(".")
+        && !step_continue_on_error_can_mask_failures(step)
+        && mapping_get(step, "env")
+            .and_then(YamlValue::as_mapping)
+            .and_then(|env| mapping_get(env, "CONTEXTDB_SHA"))
+            .and_then(YamlValue::as_str)
+            == Some("${{ inputs.contextdb_sha }}")
+        && step_run(step).is_some_and(|run| {
+            run_contains_consecutive_lines(
+                run,
+                &[
+                    "if [[ ! \"$CONTEXTDB_SHA\" =~ ^[0-9a-f]{40}$ ]]; then",
+                    "echo \"contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA\" >&2",
+                    "exit 1",
+                    "fi",
+                ],
+            )
+        })
+}
+
+fn step_is_exact_revision_verification(step: &Mapping) -> bool {
+    mapping_get(step, "if").is_none()
+        && !step_continue_on_error_can_mask_failures(step)
+        && mapping_get(step, "env")
+            .and_then(YamlValue::as_mapping)
+            .and_then(|env| mapping_get(env, "REQUESTED_CONTEXTDB_SHA"))
+            .and_then(YamlValue::as_str)
+            == Some("${{ inputs.contextdb_sha }}")
+        && step_run(step).is_some_and(run_is_exact_revision_verifier)
+}
+
+fn step_is_context_graph_checkout(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    step_is_credential_free_context_graph_checkout(step)
+        && action_step_can_enforce_failure(workflow, job, step)
+}
+
+fn step_is_contextdb_checkout(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
+    step_is_credential_free_contextdb_checkout(step)
         && action_step_can_enforce_failure(workflow, job, step)
 }
 
@@ -762,7 +885,7 @@ fn prior_steps_prepare_audit_tools(
 ) -> bool {
     prior_steps
         .iter()
-        .any(|step| step_is_default_checkout(workflow, job, step))
+        .any(|step| step_is_context_graph_checkout(workflow, job, step))
         && prior_steps
             .iter()
             .any(|step| step_pins_stable_rust_toolchain(workflow, job, step))
@@ -778,7 +901,10 @@ fn prior_steps_prepare_audit_tools(
 }
 
 fn prior_step_can_precede_audit(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
-    step_is_default_checkout(workflow, job, step)
+    step_is_exact_contextdb_sha_input_validation(step)
+        || step_is_exact_revision_verification(step)
+        || step_is_context_graph_checkout(workflow, job, step)
+        || step_is_contextdb_checkout(workflow, job, step)
         || step_pins_stable_rust_toolchain(workflow, job, step)
         || step_uses_safe_rust_cache(workflow, job, step)
         || step_uses_safe_model_cache(workflow, job, step)
@@ -808,11 +934,19 @@ fn step_tool_set_equals(step: &Mapping, required_tools: &[&str]) -> bool {
         .map(str::trim)
         .filter(|tool| !tool.is_empty())
         .collect::<std::collections::BTreeSet<_>>();
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.split_once('@').map_or(*tool, |(name, _)| name))
+        .collect::<std::collections::BTreeSet<_>>();
     let expected = required_tools
         .iter()
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
-    tools == expected
+    let exact_installs = AUDIT_TOOL_INSTALL_SPECS
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    tool_names == expected && tools == exact_installs
 }
 
 fn yaml_field_contains(value: &YamlValue, needle: &str) -> bool {
@@ -1425,16 +1559,30 @@ fn run_prunes_deny_graph(run: &str) -> bool {
         .any(|line| line.contains("--exclude"))
 }
 
+fn run_is_vetted_audit_run(run: &str) -> bool {
+    active_run_lines(run) == VETTED_AUDIT_RUN_LINES
+}
+
+fn run_is_exact_revision_verifier(run: &str) -> bool {
+    active_run_lines(run) == EXACT_REVISION_VERIFIER_LINES
+}
+
 fn run_invokes_deny_against_workspace_config(run: &str) -> bool {
+    if run_is_vetted_audit_run(run) {
+        return true;
+    }
     if run_has_failure_neutering(run) || run_prunes_deny_graph(run) {
         return false;
     }
     active_run_lines(run).into_iter().any(|line| {
-        line == "cargo deny check --config deny.toml" || line == "cargo deny check -c deny.toml"
+        line == "cargo deny --config deny.toml check" || line == "cargo deny -c deny.toml check"
     })
 }
 
 fn run_invokes_negative_symbol_check(run: &str) -> bool {
+    if run_is_vetted_audit_run(run) {
+        return true;
+    }
     const PATTERN_SINGLE: &str = "'embeddinggemma|candle_embeddinggemma'";
     const PATTERN_DOUBLE: &str = "\"embeddinggemma|candle_embeddinggemma\"";
     if run_has_failure_neutering(run) {
@@ -1442,10 +1590,10 @@ fn run_invokes_negative_symbol_check(run: &str) -> bool {
     }
     [
         format!(
-            "rg --files-without-match {PATTERN_SINGLE} \"$RUNNER_TEMP/context-graph-expanded.rs\""
+            "require_file_without_match {PATTERN_SINGLE} \"$RUNNER_TEMP/context-graph-expanded.rs\""
         ),
         format!(
-            "rg --files-without-match {PATTERN_DOUBLE} \"$RUNNER_TEMP/context-graph-expanded.rs\""
+            "require_file_without_match {PATTERN_DOUBLE} \"$RUNNER_TEMP/context-graph-expanded.rs\""
         ),
     ]
     .iter()
