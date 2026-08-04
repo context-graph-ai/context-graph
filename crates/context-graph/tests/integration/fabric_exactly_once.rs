@@ -97,7 +97,7 @@ async fn result_arriving_after_local_execution_does_not_duplicate() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn two_workers_racing_one_claim_each() {
     let fixture = fabric_fixture("two_workers_race").await;
     fabric::capture(

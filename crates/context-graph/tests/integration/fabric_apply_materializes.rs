@@ -56,7 +56,7 @@ async fn pull_only(client: &contextdb_server::SyncClient) {
     panic!("pull did not converge within 32 authenticated rounds");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn pulled_worker_result_materializes_memory_on_submitter() {
     let fixture: FabricFixture = fabric_fixture("apply_materializes").await;
 
@@ -129,7 +129,7 @@ async fn pulled_worker_result_materializes_memory_on_submitter() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn apply_commits_the_worker_payload_and_never_re_extracts_on_the_submitter() {
     let fixture: FabricFixture = fabric_fixture("apply_payload_not_model").await;
 

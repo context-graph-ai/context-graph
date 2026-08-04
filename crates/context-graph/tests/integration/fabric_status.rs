@@ -53,7 +53,7 @@ async fn expired_lease_job_not_shown_as_running() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn worker_that_lost_claim_race_does_not_report_success() {
     let fixture = fabric_fixture("lost_race_status").await;
     fabric::capture(

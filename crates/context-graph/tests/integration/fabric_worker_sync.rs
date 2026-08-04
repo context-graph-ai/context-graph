@@ -62,7 +62,7 @@ async fn pull_only(client: &contextdb_server::SyncClient) {
     panic!("pull did not converge within 32 authenticated rounds");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn remote_worker_pulls_the_job_then_pushes_the_result_without_a_fixture_prepull() {
     let fixture: FabricFixture = fabric_fixture("remote_worker_self_sufficient").await;
 
@@ -127,7 +127,7 @@ async fn remote_worker_pulls_the_job_then_pushes_the_result_without_a_fixture_pr
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn worker_poll_with_unreachable_hub_degrades_quietly_offline() {
     // A genuinely hub-less persisted-identity node uses a valid authenticated ticket whose endpoint
     // has gone away. The self-sufficient poll must treat both round trips as best-effort and still
