@@ -1026,7 +1026,7 @@ fn test_invalidations_table_insert() {
 }
 
 #[test]
-fn combination_invalidations_unique_per_context_affected_decision_collapses_raw_duplicate() {
+fn combination_invalidations_unique_per_context_affected_decision_refuses_raw_duplicate() {
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_060);
     let entity_id = Uuid::from_u128(20_061);
@@ -1045,8 +1045,7 @@ fn combination_invalidations_unique_per_context_affected_decision_collapses_raw_
         observation_id,
     );
 
-    let duplicate = db
-        .execute(
+    let duplicate = db.execute(
         "INSERT INTO invalidations (id, status, context_id, affected_decision_id, trigger_observation_id, basis_diff, severity, detected_at) VALUES ($id, $status, $context_id, $affected_decision_id, $trigger_observation_id, $basis_diff, $severity, $detected_at)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(20_065))),
@@ -1058,9 +1057,15 @@ fn combination_invalidations_unique_per_context_affected_decision_collapses_raw_
             ("severity", Value::Text("critical".into())),
             ("detected_at", Value::TxId(TxId(3_u64))),
         ]),
-    )
-    .expect("duplicate insert is a contextdb unique no-op");
-    assert_eq!(duplicate.rows_affected, 0);
+    );
+    assert!(
+        matches!(
+            &duplicate,
+            Err(contextdb_core::Error::UniqueViolation { table, column })
+                if table == "invalidations" && column == "context_id, affected_decision_id"
+        ),
+        "a second invalidation for the same context and decision is refused: {duplicate:?}"
+    );
     assert_eq!(
         scalar_count(
             &db,
@@ -1981,9 +1986,9 @@ fn test_non_cites_edge_allows_bidirectional() {
     assert_eq!(result.rows.len(), 2);
 }
 
-// edges carry a UNIQUE constraint on (source_id, target_id, edge_type); a duplicate insert succeeds as a no-op so add_relationship idempotency is engine-native.
+// edges carry a UNIQUE constraint on (source_id, target_id, edge_type); a duplicate raw insert is refused loudly, and add_relationship absorbs that refusal to stay idempotent.
 #[test]
-fn test_edge_duplicate_insert_noop() {
+fn test_edge_duplicate_insert_refused() {
     let db = fresh_db();
     let context_id = Uuid::from_u128(7150);
     insert_context(&db, context_id, "ctx");
@@ -2004,8 +2009,12 @@ fn test_edge_duplicate_insert_noop() {
         ]),
     );
     assert!(
-        second.is_ok(),
-        "duplicate edge insert should no-op: {second:?}"
+        matches!(
+            &second,
+            Err(contextdb_core::Error::UniqueViolation { table, column })
+                if table == "edges" && column == "source_id, target_id, edge_type"
+        ),
+        "duplicate edge insert is refused: {second:?}"
     );
     let result = db.execute(
         "SELECT * FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
