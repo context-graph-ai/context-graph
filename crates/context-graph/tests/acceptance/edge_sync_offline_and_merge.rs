@@ -757,6 +757,11 @@ async fn concurrent_distinct_inserts_on_two_edges_all_survive_after_sync() {
     assert_sync_contract_has_real_table_policies();
 }
 
+/// Two edges race to record an outcome on the same decision. The last write the hub
+/// commits wins — here edge2's, because pushes reach the hub in a fixed order (edge1
+/// then edge2) — and every edge converges on that exact row, id and content. Which of
+/// the competing statuses is TRULY current is the reconciliation layer's judgment;
+/// transport only promises this deterministic convergence.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_mutable_status_row_converges_deterministically() {
     let fixture = real_sync_fixture("concurrent_mutable_status_row_converges").await;
@@ -773,13 +778,13 @@ async fn concurrent_mutable_status_row_converges_deterministically() {
     assert_real_outcome_state(
         &fixture.edge2.store,
         seeded.decision.id,
-        &contended.server_winner,
+        &contended.hub_latest_winner,
         1,
     );
     assert_real_outcome_state(
         &fixture.edge1.store,
         seeded.decision.id,
-        &contended.server_winner,
+        &contended.hub_latest_winner,
         1,
     );
     assert_real_decision_content(

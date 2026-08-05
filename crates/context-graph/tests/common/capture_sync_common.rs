@@ -763,7 +763,10 @@ pub async fn touch_same_decision_graph_concurrently(
 }
 
 pub struct ConcurrentOutcomeTouch {
-    pub server_winner: Outcome,
+    /// The outcome the hub accepts LAST for the contended decision. Both edges write
+    /// concurrently, but the pushes reach the hub in a fixed order (edge1 then edge2),
+    /// so the last hub commit — edge2's row — is the value the whole fleet converges on.
+    pub hub_latest_winner: Outcome,
     pub surrounding_edge1: SeededGraph,
     pub surrounding_edge2: SeededGraph,
 }
@@ -781,40 +784,40 @@ pub async fn record_contended_outcomes_concurrently(
     let edge2_barrier = Arc::clone(&barrier);
     let edge1 = tokio::task::spawn_blocking(move || {
         edge1_barrier.wait();
-        let outcome = edge1_store
+        let _outcome = edge1_store
             .record_outcome(
                 edge1_decision_id,
                 true,
-                Some("server-winner outcome from edge1".to_string()),
+                Some("earlier contended outcome from edge1".to_string()),
             )
             .expect("edge1 records contended outcome");
-        let surrounding = seed_decision_graph(
+        seed_decision_graph(
             &edge1_store,
             "tenant-alpha-surrounding-edge1",
             "edge1 surrounding",
-        );
-        (outcome, surrounding)
+        )
     });
     let edge2 = tokio::task::spawn_blocking(move || {
         edge2_barrier.wait();
-        let _outcome = edge2_store
+        let outcome = edge2_store
             .record_outcome(
                 edge2_decision_id,
                 false,
-                Some("incoming loser outcome from edge2".to_string()),
+                Some("later contended outcome from edge2".to_string()),
             )
             .expect("edge2 records contended outcome");
-        seed_decision_graph(
+        let surrounding = seed_decision_graph(
             &edge2_store,
             "tenant-alpha-surrounding-edge2",
             "edge2 surrounding",
-        )
+        );
+        (outcome, surrounding)
     });
     let (edge1, edge2) = tokio::join!(edge1, edge2);
-    let (server_winner, surrounding_edge1) = edge1.expect("edge1 contended outcome");
-    let surrounding_edge2 = edge2.expect("edge2 contended outcome");
+    let surrounding_edge1 = edge1.expect("edge1 contended outcome");
+    let (hub_latest_winner, surrounding_edge2) = edge2.expect("edge2 contended outcome");
     ConcurrentOutcomeTouch {
-        server_winner,
+        hub_latest_winner,
         surrounding_edge1,
         surrounding_edge2,
     }
