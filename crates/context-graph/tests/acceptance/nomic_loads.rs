@@ -1332,6 +1332,8 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "list_observations",
     "match_entity_reference",
     "open",
+    "open_with_consumer_schema",
+    "open_with_consumer_schema_scoped",
     "open_with_contexts",
     "open_with_embedder_registrations",
     "precedent_chain",

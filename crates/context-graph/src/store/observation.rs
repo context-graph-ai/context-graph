@@ -8,6 +8,7 @@ use crate::Result;
 use crate::embedder::EmbeddingInput;
 use crate::error::{CgError, EngineError as CgEngineError};
 use crate::messaging::OverrideFailureReason;
+use crate::schema::ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX;
 use crate::types::*;
 
 use super::Store;
@@ -641,7 +642,10 @@ impl Store {
                     vector: embedding.vector.clone(),
                     target: embedding.target.clone(),
                     produced_by: embedding.produced_by.clone(),
-                    table_name: format!("entity_reference_embeddings_{}", space.dimension),
+                    table_name: format!(
+                        "{}{}",
+                        ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, space.dimension
+                    ),
                     vector_column: "vector".to_string(),
                 })
             }
@@ -1375,7 +1379,10 @@ impl Store {
                 found: query_vector.len() as u32,
             });
         }
-        let table = format!("entity_reference_embeddings_{}", space.dimension);
+        let table = format!(
+            "{}{}",
+            ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, space.dimension
+        );
         let result = self
             .db
             .execute_in_tx(

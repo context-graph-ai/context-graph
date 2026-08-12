@@ -1,5 +1,6 @@
 mod audit;
 mod conflict_detection;
+mod consumer_tables;
 mod context;
 pub(crate) mod convert;
 mod decision;
@@ -24,13 +25,16 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use contextdb_core::{ColumnType, Error as EngineError, TxId, Value};
+use contextdb_core::{ColumnType, Error as EngineError, ScopeLabel, TxId, Value};
 use contextdb_engine::{Database, plugin::DatabasePlugin};
 
 use crate::Result;
 use crate::embedding_space::default_text_embedding_space;
 use crate::error::CgError;
-use crate::schema::{INDEXES, LOCAL_RUNTIME_TABLES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES};
+use crate::schema::{
+    ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, INDEXES, LOCAL_RUNTIME_TABLES,
+    SUBSCRIPTION_EVENT_TYPE_DDL, TABLES,
+};
 use crate::types::*;
 use crate::{Embedder, EmbedderRegistration};
 
@@ -38,6 +42,8 @@ use crate::{Embedder, EmbedderRegistration};
 use crate::embedder::nomic::NomicTextEmbedder;
 
 use self::conflict_detection::register_conflict_detection_triggers;
+pub use self::consumer_tables::{ConsumerSchema, ConsumerTable};
+use self::consumer_tables::{install_consumer_schema, validate_consumer_schema};
 use self::convert::map_engine_err;
 pub use self::digest::{DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit};
 pub use self::entity_reference_embeddings::{EntityMatch, EntityReferenceMatchOptions};
@@ -165,7 +171,72 @@ impl Store {
         config: StoreConfig,
         registrations: Vec<EmbedderRegistration>,
     ) -> Result<Self> {
-        Self::open_with_config_inner_with_plugin(config, false, None, None, registrations)
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            None,
+            None,
+            registrations,
+            ConsumerSchema::none(),
+        )
+    }
+
+    /// Opens the store and, in it, creates the tables `consumer_schema` declares.
+    ///
+    /// For a consumer that embeds this library and wants its own rows to live in
+    /// the store context-graph already opens rather than in a second database of
+    /// its own. Each declaration is contextdb `CREATE TABLE` text executed as
+    /// written — `RETAIN`, sync direction and conflict policy stay the consumer's
+    /// declarations on the consumer's table, and the engine's refusals reach the
+    /// caller unaltered. context-graph checks only ownership: the namespace must be
+    /// the consumer's, every declared table must sit under it, and no declaration
+    /// may claim a name context-graph already owns; a declaration that reshapes a
+    /// table the engine owns is refused by the engine itself, on the declaration.
+    ///
+    /// Existing tables are left alone, so reopening with the same declaration
+    /// keeps the rows already there.
+    pub fn open_with_consumer_schema(
+        config: StoreConfig,
+        registrations: Vec<EmbedderRegistration>,
+        consumer_schema: ConsumerSchema,
+    ) -> Result<Self> {
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            None,
+            None,
+            registrations,
+            consumer_schema,
+        )
+    }
+
+    /// Opens the store the way [`Store::open_with_consumer_schema`] does, on a
+    /// handle that carries `scope_labels`.
+    ///
+    /// A consumer whose tables declare `SCOPE_LABEL` columns runs the same
+    /// declaration on every machine and lets the role it opens with decide what
+    /// it may write: an edge-labelled handle is refused a row a declaration
+    /// reserves for the hub, by the engine, on the write itself. The labels
+    /// narrow the handle the caller works through and nothing else — the
+    /// declaration is created and context-graph's own schema is installed the
+    /// same way either way.
+    pub fn open_with_consumer_schema_scoped(
+        config: StoreConfig,
+        registrations: Vec<EmbedderRegistration>,
+        consumer_schema: ConsumerSchema,
+        scope_labels: BTreeSet<ScopeLabel>,
+    ) -> Result<Self> {
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            Some(scope_labels),
+            None,
+            registrations,
+            consumer_schema,
+        )
     }
 
     pub fn open_with_contexts(config: StoreConfig, contexts: BTreeSet<ContextId>) -> Result<Self> {
@@ -177,7 +248,15 @@ impl Store {
         config: StoreConfig,
         plugin: Arc<dyn DatabasePlugin>,
     ) -> Result<Self> {
-        Self::open_with_config_inner_with_plugin(config, false, None, Some(plugin), Vec::new())
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            None,
+            Some(plugin),
+            Vec::new(),
+            ConsumerSchema::none(),
+        )
     }
 
     #[cfg(context_graph_internal_test_support)]
@@ -186,7 +265,15 @@ impl Store {
         plugin: Arc<dyn DatabasePlugin>,
         registrations: Vec<EmbedderRegistration>,
     ) -> Result<Self> {
-        Self::open_with_config_inner_with_plugin(config, false, None, Some(plugin), registrations)
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            None,
+            Some(plugin),
+            registrations,
+            ConsumerSchema::none(),
+        )
     }
 
     pub fn initialize_fresh(config: StoreConfig) -> Result<Self> {
@@ -217,7 +304,9 @@ impl Store {
             replace_shared_handle,
             contexts,
             None,
+            None,
             Vec::new(),
+            ConsumerSchema::none(),
         )
     }
 
@@ -225,9 +314,12 @@ impl Store {
         config: StoreConfig,
         replace_shared_handle: bool,
         contexts: Option<BTreeSet<ContextId>>,
+        scope_labels: Option<BTreeSet<ScopeLabel>>,
         plugin: Option<Arc<dyn DatabasePlugin>>,
         registrations: Vec<EmbedderRegistration>,
+        consumer_schema: ConsumerSchema,
     ) -> Result<Self> {
+        validate_consumer_schema(&consumer_schema)?;
         let mut config = config;
         let mut registrations = registrations;
         let explicit_registration_count = registrations.len();
@@ -274,8 +366,15 @@ impl Store {
             .default_text_embedder
             .as_ref()
             .is_some_and(|config| matches!(config.source, crate::ModelSource::Disabled));
-        let (db, resource_owner) =
-            open_bootstrapped_database(&db_path, &config, replace_shared_handle, contexts, plugin)?;
+        let (db, resource_owner) = open_bootstrapped_database(
+            &db_path,
+            &config,
+            replace_shared_handle,
+            contexts,
+            scope_labels,
+            plugin,
+            &consumer_schema,
+        )?;
         let store = Self {
             db_path,
             db,
@@ -557,7 +656,9 @@ fn open_bootstrapped_database(
     config: &StoreConfig,
     replace_shared_handle: bool,
     contexts: Option<BTreeSet<ContextId>>,
+    scope_labels: Option<BTreeSet<ScopeLabel>>,
     plugin: Option<Arc<dyn DatabasePlugin>>,
+    consumer_schema: &ConsumerSchema,
 ) -> Result<(Arc<Database>, Option<Arc<Database>>)> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().expect("store registry lock");
@@ -565,35 +666,45 @@ fn open_bootstrapped_database(
         && !replace_shared_handle
         && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
     {
-        bootstrap_schema(&existing, config, true)?;
+        bootstrap_schema(&existing, config, true, consumer_schema)?;
         register_store_triggers(&existing)?;
-        if let Some(contexts) = contexts {
-            let engine_contexts = contexts
-                .into_iter()
-                .map(|ctx| contextdb_core::types::ContextId::new(ctx.as_uuid()))
-                .collect();
-            return Ok((
-                Arc::new(existing.scoped_with_contexts(engine_contexts)),
-                Some(existing),
-            ));
-        }
-        return Ok((existing, None));
+        return Ok(narrowed_handle(existing, contexts, scope_labels));
     }
     let db = Arc::new(match plugin {
         Some(plugin) => Database::open_with_plugin(db_path, plugin).map_err(map_engine_err)?,
         None => Database::open(db_path).map_err(map_engine_err)?,
     });
-    bootstrap_schema(&db, config, false)?;
+    bootstrap_schema(&db, config, false, consumer_schema)?;
     register_store_triggers(&db)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
-    if let Some(contexts) = contexts {
-        let engine_contexts = contexts
-            .into_iter()
-            .map(|ctx| contextdb_core::types::ContextId::new(ctx.as_uuid()))
-            .collect();
-        return Ok((Arc::new(db.scoped_with_contexts(engine_contexts)), Some(db)));
+    Ok(narrowed_handle(db, contexts, scope_labels))
+}
+
+/// The handle the store works through, and the unnarrowed database behind it.
+///
+/// A caller that declared neither contexts nor scope labels works through the
+/// database itself. A caller that declared either works through a narrowed view
+/// of it, and the database it was narrowed from is kept as the store's resource
+/// owner — bootstrapping, the shared-handle registry and the schema path all
+/// stay on the real database, so a role only ever narrows what the caller may
+/// read and write, never what context-graph installed.
+fn narrowed_handle(
+    db: Arc<Database>,
+    contexts: Option<BTreeSet<ContextId>>,
+    scope_labels: Option<BTreeSet<ScopeLabel>>,
+) -> (Arc<Database>, Option<Arc<Database>>) {
+    if contexts.is_none() && scope_labels.is_none() {
+        return (db, None);
     }
-    Ok((db, None))
+    let engine_contexts: Option<BTreeSet<contextdb_core::types::ContextId>> =
+        contexts.map(|contexts| {
+            contexts
+                .into_iter()
+                .map(|ctx| contextdb_core::types::ContextId::new(ctx.as_uuid()))
+                .collect()
+        });
+    let narrowed = db.scoped_with_constraints(engine_contexts, scope_labels, None);
+    (Arc::new(narrowed), Some(db))
 }
 
 fn validate_embedder_registrations(registrations: &[EmbedderRegistration]) -> Result<()> {
@@ -650,7 +761,12 @@ fn default_embedding_space_map(extra: &[EmbeddingSpaceDecl]) -> HashMap<Evidence
     out
 }
 
-fn bootstrap_schema(db: &Database, config: &StoreConfig, reused_shared_handle: bool) -> Result<()> {
+fn bootstrap_schema(
+    db: &Database,
+    config: &StoreConfig,
+    reused_shared_handle: bool,
+    consumer_schema: &ConsumerSchema,
+) -> Result<()> {
     validate_embedding_space_declarations(&config.extra_embedding_spaces)?;
     let mut bootstrapped_reused_handle = false;
     let mut schema_was_empty = false;
@@ -677,6 +793,10 @@ fn bootstrap_schema(db: &Database, config: &StoreConfig, reused_shared_handle: b
         seed_embedding_spaces(db, &config.extra_embedding_spaces)?;
         validate_schema_version_after_bootstrap(db, config.expected_schema_version)?;
     }
+    // Consumer-owned tables land after context-graph's own schema is installed and
+    // its version row seeded, so the version gate never opens on a store that holds
+    // consumer tables and none of context-graph's.
+    install_consumer_schema(db, consumer_schema)?;
     Ok(())
 }
 
@@ -742,7 +862,7 @@ fn ensure_entity_reference_embedding_tables(
         if dimension == 0 || dimension > 4096 {
             continue;
         }
-        let table = format!("entity_reference_embeddings_{dimension}");
+        let table = format!("{ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX}{dimension}");
         if db.table_meta(&table).is_some() {
             continue;
         }

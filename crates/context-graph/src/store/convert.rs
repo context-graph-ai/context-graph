@@ -81,6 +81,10 @@ pub(super) fn map_engine_err(err: EngineError) -> CgError {
             CgError::StoreLocked { holder_pid, path }
         }
         EngineError::BfsDepthExceeded(d) => CgError::Engine(format!("bfs depth exceeded: {d}")),
+        // A schema the engine will not accept — a consumer-declared table among
+        // them. The engine already says what is wrong and what to declare instead,
+        // so its wording is what the caller reads.
+        EngineError::SchemaInvalid { reason } => CgError::Engine(reason),
         other => CgError::Engine(format!("unexpected engine error: {other}")),
     }
 }

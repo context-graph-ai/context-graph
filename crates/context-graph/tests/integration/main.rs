@@ -39,6 +39,7 @@ mod engine_probes {
     pub mod embedder_concurrency;
 }
 mod capture_pipeline;
+mod consumer_tables;
 mod custom_vocab_parse;
 #[cfg(context_graph_internal_test_support)]
 mod explain_introspection;

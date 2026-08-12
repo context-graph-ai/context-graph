@@ -85,6 +85,13 @@ pub enum CgError {
     InvalidEmbeddingSpaceId {
         reason: &'static str,
     },
+    /// A consumer-declared table was refused before its DDL reached the engine.
+    /// `subject` is the offending table name, or the namespace when the namespace
+    /// itself is what context-graph refused.
+    ConsumerTableRefused {
+        subject: String,
+        reason: &'static str,
+    },
     InconsistentEmbeddingSpaceDeclaration {
         space_id: String,
     },

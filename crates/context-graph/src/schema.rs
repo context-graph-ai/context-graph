@@ -24,6 +24,13 @@ pub struct IndexSpec {
     pub ddl: &'static str,
 }
 
+/// The head of the table names context-graph creates per embedding dimension at
+/// runtime (`entity_reference_embeddings_768` and its siblings) rather than
+/// declaring in [`TABLES`]. Single-sourced here because both the code that
+/// creates those tables and the code that must recognise the family as
+/// context-graph's own read it.
+pub(crate) const ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX: &str = "entity_reference_embeddings_";
+
 pub const TABLES: &[TableSpec] = &[
     TableSpec {
         name: "cg_schema_version",

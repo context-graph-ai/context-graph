@@ -365,7 +365,7 @@ mod tests {
     use contextdb_engine::plugin::DatabasePlugin;
 
     use super::*;
-    use crate::{CreateContext, CreateEntity, EntityType, StoreConfig};
+    use crate::{ConsumerSchema, CreateContext, CreateEntity, EntityType, StoreConfig};
 
     fn fixture() -> (tempfile::TempDir, Store, EntityId, EntityId, EntityId) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -519,8 +519,10 @@ mod tests {
             config,
             false,
             None,
+            None,
             Some(Arc::new(UnrelatedEdgeUniqueViolation)),
             Vec::new(),
+            ConsumerSchema::none(),
         )
         .expect("reopen with failing commit plugin");
         let err = store

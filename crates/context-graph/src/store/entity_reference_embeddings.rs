@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use contextdb_core::{Error as EngineError, Value, VectorIndexRef};
 
+use crate::schema::ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX;
 use crate::{CgError, ContextId, EmbeddingId, EntityId, EntityStatus, EvidenceProducer, Result};
 
 use super::Store;
@@ -64,7 +65,10 @@ impl Store {
                 found: query_vector.len() as u32,
             });
         }
-        let table = format!("entity_reference_embeddings_{}", space.dimension);
+        let table = format!(
+            "{}{}",
+            ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, space.dimension
+        );
         let top_k = options.top_k.unwrap_or(10).max(1);
         // Over-fetch reference rows so several references of one entity cannot
         // crowd other entities out of the deduplicated result. The cap bounds
@@ -176,7 +180,10 @@ impl Store {
                 found: vector.len() as u32,
             });
         }
-        let table = format!("entity_reference_embeddings_{}", space.dimension);
+        let table = format!(
+            "{}{}",
+            ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, space.dimension
+        );
         let tx = self.begin_tx()?;
         let existing = self.find_entity_reference_row(&table, entity_id, label.as_deref())?;
         let (id, row_id) = if let Some((id, row_id)) = existing {
@@ -306,7 +313,7 @@ impl Store {
             .db
             .table_names()
             .into_iter()
-            .filter(|table| table.starts_with("entity_reference_embeddings_"))
+            .filter(|table| table.starts_with(ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX))
         {
             for row in self.db.scan(&table, snapshot).map_err(map_engine_err)? {
                 if row.values.get("entity_id") == Some(&Value::Uuid(entity_id.as_uuid())) {
@@ -343,7 +350,7 @@ impl Store {
             .db
             .table_names()
             .into_iter()
-            .filter(|table| table.starts_with("entity_reference_embeddings_"))
+            .filter(|table| table.starts_with(ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX))
         {
             for row in self
                 .db
@@ -438,7 +445,7 @@ pub fn entity_reference_cosine_match(
         .db
         .table_names()
         .into_iter()
-        .filter(|table| table.starts_with("entity_reference_embeddings_"))
+        .filter(|table| table.starts_with(ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX))
     {
         for row in store
             .db

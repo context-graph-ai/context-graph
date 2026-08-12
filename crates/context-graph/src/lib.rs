@@ -22,7 +22,7 @@ pub mod types;
 pub mod understanding;
 
 pub use capture_sync_status::*;
-pub use contextdb_core::TxId;
+pub use contextdb_core::{ScopeLabel, TxId};
 pub use control_transport::{ControlHandler, request_control, start_control_listener};
 pub use embedder::{
     Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput, ModelSource,
@@ -37,8 +37,8 @@ pub use llm::*;
 pub use messaging::{MessageBody, MismatchKind, OverrideFailureReason};
 pub use producer::CG_EDGE_SYSTEM_TAG;
 pub use store::{
-    DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit, EntityMatch,
-    EntityReferenceMatchOptions, ReindexEvent, ReindexOptions, Store,
+    ConsumerSchema, ConsumerTable, DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit,
+    EntityMatch, EntityReferenceMatchOptions, ReindexEvent, ReindexOptions, Store,
 };
 pub use types::*;
 
