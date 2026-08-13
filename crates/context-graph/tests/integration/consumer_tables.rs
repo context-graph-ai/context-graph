@@ -633,3 +633,104 @@ fn a_hub_scoped_consumer_handle_writes_the_row_its_declaration_reserves_for_the_
         "the hub reads back the row it wrote through its own narrowed handle"
     );
 }
+
+/// The same table as `HUB_SETTINGS_DDL` as an earlier version of a consumer might
+/// have created it: same name, same columns, but without the `SCOPE_LABEL` the
+/// hub/edge refusal rests on.
+const HUB_SETTINGS_DDL_BEFORE_THE_LABEL: &str =
+    "CREATE TABLE vigil_hub_settings (name TEXT PRIMARY KEY, requested TEXT, scope_label TEXT)";
+
+fn schema_with(name: &str, ddl: &str) -> ConsumerSchema {
+    ConsumerSchema {
+        namespace: "vigil".to_string(),
+        tables: vec![ConsumerTable {
+            name: name.to_string(),
+            ddl: ddl.to_string(),
+        }],
+    }
+}
+
+fn drift_refusal(
+    dir: &tempfile::TempDir,
+    created_with: &str,
+    reopened_with: &str,
+) -> (String, String) {
+    let store = open_with(config(dir), schema_with("vigil_hub_settings", created_with))
+        .expect("the earlier declaration creates the table");
+    drop(store);
+
+    let err = open_with(
+        config(dir),
+        schema_with("vigil_hub_settings", reopened_with),
+    )
+    .expect_err("a declaration that no longer describes the table in the store must be refused");
+    match err {
+        CgError::ConsumerTableDrifted { table, mismatch } => (table, mismatch),
+        other => panic!("declaration drift must be refused by name, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_declaration_that_adds_the_scope_label_the_refusal_rests_on_is_refused_on_the_table_that_lacks_it()
+ {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let (table, mismatch) =
+        drift_refusal(&dir, HUB_SETTINGS_DDL_BEFORE_THE_LABEL, HUB_SETTINGS_DDL);
+
+    assert_eq!(
+        "vigil_hub_settings", table,
+        "the refusal must name the table whose declaration no longer matches"
+    );
+    assert!(
+        mismatch.contains("scope_label"),
+        "the refusal must name what differs, so the consumer knows the hub/edge refusal is not in force: {mismatch}"
+    );
+}
+
+#[test]
+fn a_declaration_that_changes_where_a_consumer_table_travels_is_refused_on_the_table_that_still_travels_the_old_way()
+ {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let (table, mismatch) = drift_refusal(
+        &dir,
+        "CREATE TABLE vigil_hub_settings (name TEXT PRIMARY KEY, requested TEXT) SYNC TWO WAY SYNC CONFLICT KEEP LATEST",
+        "CREATE TABLE vigil_hub_settings (name TEXT PRIMARY KEY, requested TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST",
+    );
+
+    assert_eq!("vigil_hub_settings", table);
+    assert!(
+        mismatch.contains("sync direction") && mismatch.contains("conflict policy"),
+        "the refusal must name both policies that no longer match: {mismatch}"
+    );
+}
+
+#[test]
+fn a_declaration_that_adds_a_column_is_refused_on_the_table_that_does_not_have_it() {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let (_, mismatch) = drift_refusal(
+        &dir,
+        "CREATE TABLE vigil_hub_settings (name TEXT PRIMARY KEY, requested TEXT)",
+        "CREATE TABLE vigil_hub_settings (name TEXT PRIMARY KEY, requested TEXT, author TEXT)",
+    );
+
+    assert!(
+        mismatch.contains("column"),
+        "the refusal must name the column surface that differs: {mismatch}"
+    );
+}
+
+#[test]
+fn the_declaration_that_created_the_table_still_opens_it() {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let store = open_with(config(&dir), hub_settings_schema()).expect("first declaration");
+    write_hub_setting(&store, "detector_sample_frames").expect("the row the declaration allows");
+    drop(store);
+
+    let store = open_with(config(&dir), hub_settings_schema())
+        .expect("an unchanged declaration must keep opening the table it created");
+    assert_eq!(
+        vec!["detector_sample_frames".to_string()],
+        hub_setting_names(&store),
+        "verifying the declaration must not disturb the rows already there"
+    );
+}
