@@ -92,6 +92,15 @@ pub enum CgError {
         subject: String,
         reason: &'static str,
     },
+    /// A consumer-declared table already in the store no longer matches the
+    /// declaration the consumer opened with. `mismatch` names every difference
+    /// found, so the consumer can see which of its own policies — a scope label,
+    /// a sync direction, a column — is not the one in force. context-graph
+    /// changes nothing: what to do about the table is the consumer's call.
+    ConsumerTableDrifted {
+        table: String,
+        mismatch: String,
+    },
     InconsistentEmbeddingSpaceDeclaration {
         space_id: String,
     },

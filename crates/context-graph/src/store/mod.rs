@@ -194,8 +194,24 @@ impl Store {
     /// may claim a name context-graph already owns; a declaration that reshapes a
     /// table the engine owns is refused by the engine itself, on the declaration.
     ///
-    /// Existing tables are left alone, so reopening with the same declaration
-    /// keeps the rows already there.
+    /// A table that is already there is never recreated or altered, so reopening
+    /// with the same declaration keeps the rows already there. A declaration that
+    /// no longer describes the table in the store — a `SCOPE_LABEL` added since it
+    /// was created, a changed sync direction or conflict policy, a different
+    /// column — is refused with [`CgError::ConsumerTableDrifted`], naming the table
+    /// and every difference. Nothing is migrated: a consumer running on policy it
+    /// did not declare is the failure this refusal exists to prevent, and what to
+    /// do about the table — migrate it, rename it, start a new store — is the
+    /// consumer's own call.
+    ///
+    /// The comparison is contextdb's own parse of the declaration against the
+    /// table's stored shape, and it covers every clause `CREATE TABLE` carries
+    /// except two: a column `DEFAULT` and a `RANK POLICY` are compared on
+    /// presence rather than contents, because the engine does not publish the
+    /// form it stores them in. See `verify_existing_table` in
+    /// `store::consumer_tables` for the full list.
+    ///
+    /// [`CgError::ConsumerTableDrifted`]: crate::CgError::ConsumerTableDrifted
     pub fn open_with_consumer_schema(
         config: StoreConfig,
         registrations: Vec<EmbedderRegistration>,

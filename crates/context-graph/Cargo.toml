@@ -36,6 +36,7 @@ cg-node-fs.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
+contextdb-parser.workspace = true
 contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh"], optional = true }
 fs4.workspace = true
 pollster.workspace = true

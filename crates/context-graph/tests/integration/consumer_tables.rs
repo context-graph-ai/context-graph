@@ -734,3 +734,113 @@ fn the_declaration_that_created_the_table_still_opens_it() {
         "verifying the declaration must not disturb the rows already there"
     );
 }
+
+/// The four tables the settings consumer declares, written out as it renders
+/// them. A store opened twice on these must open both times: a verification that
+/// refused a declaration the engine itself created the table from would take the
+/// consumer's store away on the second start.
+const CONSUMER_TABLES_AS_SHIPPED: &[(&str, &str)] = &[
+    (
+        "vigil_settings_local",
+        "CREATE TABLE vigil_settings_local (setting_name TEXT NOT NULL, author TEXT NOT NULL, surface TEXT NOT NULL, scope_level TEXT NOT NULL, scope_target TEXT NOT NULL, value_type TEXT NOT NULL, value TEXT NOT NULL, reason TEXT NOT NULL, written_at_ms INTEGER NOT NULL, domain_generation INTEGER NOT NULL, reset_record INTEGER NOT NULL, PRIMARY KEY (setting_name, surface, scope_level, scope_target)) SYNC PUSH ONLY SYNC CONFLICT KEEP LATEST",
+    ),
+    (
+        "vigil_settings_pushed",
+        "CREATE TABLE vigil_settings_pushed (setting_name TEXT NOT NULL, author TEXT NOT NULL, surface TEXT NOT NULL, scope_level TEXT NOT NULL, scope_target TEXT NOT NULL, value_type TEXT NOT NULL, value TEXT NOT NULL, reason TEXT NOT NULL, written_at_ms INTEGER NOT NULL, domain_generation INTEGER NOT NULL, reset_record INTEGER NOT NULL, scope_label TEXT SCOPE_LABEL ('server'), PRIMARY KEY (setting_name, surface, scope_level, scope_target)) SYNC PULL ONLY SYNC CONFLICT KEEP LATEST",
+    ),
+    (
+        "vigil_settings_machine",
+        "CREATE TABLE vigil_settings_machine (setting_name TEXT NOT NULL, author TEXT NOT NULL, surface TEXT NOT NULL, scope_level TEXT NOT NULL, scope_target TEXT NOT NULL, value_type TEXT NOT NULL, value TEXT NOT NULL, reason TEXT NOT NULL, written_at_ms INTEGER NOT NULL, domain_generation INTEGER NOT NULL, reset_record INTEGER NOT NULL, PRIMARY KEY (setting_name, surface, scope_level, scope_target)) SYNC OFF",
+    ),
+    (
+        "vigil_settings_echo_ledger",
+        "CREATE TABLE vigil_settings_echo_ledger (setting_name TEXT NOT NULL, surface TEXT NOT NULL, scope_level TEXT NOT NULL, scope_target TEXT NOT NULL, last_write_out TEXT NOT NULL, last_read_back TEXT NOT NULL, PRIMARY KEY (setting_name, surface, scope_level, scope_target)) SYNC OFF",
+    ),
+];
+
+/// A declaration carrying a clause on every surface the verification compares —
+/// retention with a declared unit, sync direction, conflict policy, history,
+/// vector quantization, a scope label, a context-id column, a default, a
+/// table-level unique constraint — so a false refusal on any one of them shows up
+/// here rather than on a consumer's second start.
+const EVERY_CLAUSE_DDL: &str = "CREATE TABLE vigil_every_clause (id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE, weight REAL DEFAULT 1.0, tags JSON, seen TIMESTAMP, embedding VECTOR(4) WITH (quantization = 'SQ8'), holder TEXT CONTEXT_ID, scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('server'), UNIQUE (name, holder)) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP LATEST HISTORY CURRENT ONLY";
+
+fn reopens_cleanly(schema: ConsumerSchema) {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    drop(open_with(config(&dir), schema.clone()).expect("first open creates the declared tables"));
+    drop(
+        open_with(config(&dir), schema.clone())
+            .expect("a second open must accept the declaration that created the tables"),
+    );
+    open_with(config(&dir), schema).expect("and so must every open after that");
+}
+
+#[test]
+fn the_declarations_the_settings_consumer_ships_reopen_the_store_they_created() {
+    reopens_cleanly(ConsumerSchema {
+        namespace: "vigil".to_string(),
+        tables: CONSUMER_TABLES_AS_SHIPPED
+            .iter()
+            .map(|(name, ddl)| ConsumerTable {
+                name: name.to_string(),
+                ddl: ddl.to_string(),
+            })
+            .collect(),
+    });
+}
+
+#[test]
+fn a_declaration_carrying_every_clause_the_check_compares_reopens_the_table_it_created() {
+    reopens_cleanly(schema_with("vigil_every_clause", EVERY_CLAUSE_DDL));
+}
+
+/// The clauses the engine records somewhere other than the column list — a state
+/// machine, an edge propagation rule, and a foreign key whose own
+/// propagation rule the engine keeps on the table rather than on the column that
+/// wrote it. A false refusal on any of these would show up on the second open.
+const GRAPH_SHAPED_TABLES: &[(&str, &str)] = &[
+    (
+        "vigil_review",
+        "CREATE TABLE vigil_review (id UUID PRIMARY KEY, status TEXT NOT NULL) STATE MACHINE (status: open -> [closed, void], closed -> void) PROPAGATE ON EDGE supersedes OUTGOING STATE closed SET status MAX DEPTH 3 ABORT ON FAILURE",
+    ),
+    (
+        "vigil_review_note",
+        "CREATE TABLE vigil_review_note (id UUID PRIMARY KEY, review_id UUID REFERENCES vigil_review(id) ON STATE closed PROPAGATE SET status MAX DEPTH 2, status TEXT NOT NULL)",
+    ),
+];
+
+#[test]
+fn a_declaration_carrying_the_graph_shaped_clauses_reopens_the_table_it_created() {
+    reopens_cleanly(ConsumerSchema {
+        namespace: "vigil".to_string(),
+        tables: GRAPH_SHAPED_TABLES
+            .iter()
+            .map(|(name, ddl)| ConsumerTable {
+                name: name.to_string(),
+                ddl: ddl.to_string(),
+            })
+            .collect(),
+    });
+}
+
+#[test]
+fn a_declaration_that_changes_a_propagation_rule_is_refused_on_the_table_that_still_carries_the_old_one()
+ {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let created = "CREATE TABLE vigil_hub_settings (id UUID PRIMARY KEY, status TEXT NOT NULL) STATE MACHINE (status: open -> closed) PROPAGATE ON EDGE supersedes OUTGOING STATE closed SET status MAX DEPTH 3";
+    let changed = "CREATE TABLE vigil_hub_settings (id UUID PRIMARY KEY, status TEXT NOT NULL) STATE MACHINE (status: open -> closed) PROPAGATE ON EDGE supersedes OUTGOING STATE closed SET status MAX DEPTH 5";
+    let (_, mismatch) = drift_refusal(&dir, created, changed);
+
+    assert!(
+        mismatch.contains("propagation rules") && mismatch.contains("depth"),
+        "the refusal must name the rule that no longer matches: {mismatch}"
+    );
+}
+
+#[test]
+fn a_declaration_naming_dag_edge_types_reopens_the_table_it_created() {
+    reopens_cleanly(schema_with(
+        "vigil_lineage",
+        "CREATE TABLE vigil_lineage (id UUID PRIMARY KEY, name TEXT NOT NULL) DAG ('supersedes', 'refines')",
+    ));
+}

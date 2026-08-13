@@ -846,6 +846,7 @@ dependencies = [
  "context-graph",
  "contextdb-core",
  "contextdb-engine",
+ "contextdb-parser",
  "contextdb-server",
  "contextdb-tx",
  "contextdb-vector",
