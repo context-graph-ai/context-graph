@@ -838,6 +838,7 @@ name = "context-graph"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "candle-embeddinggemma",
  "candle-nn",
  "candle-transformers",
  "cg-catalog",
@@ -877,6 +878,7 @@ dependencies = [
  "cg-catalog",
  "cg-cli-conventions",
  "context-graph",
+ "context-graph-cli",
  "contextdb-core",
  "contextdb-engine",
  "contextdb-server",
@@ -893,6 +895,7 @@ dependencies = [
 name = "contextdb-core"
 version = "1.0.0"
 dependencies = [
+ "bincode 2.0.1",
  "rand 0.9.4",
  "roaring",
  "serde",
@@ -925,6 +928,7 @@ dependencies = [
  "iroh-tickets",
  "irpc",
  "libc",
+ "nix",
  "parking_lot",
  "range-collections",
  "redb",
@@ -3409,6 +3413,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3694,6 +3707,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

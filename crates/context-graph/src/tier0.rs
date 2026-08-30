@@ -13,23 +13,31 @@
 //! also owns the purge path (`forget_raw`) and the retention window (`raw_retention_days`): keeping
 //! raw without a way to delete it is not shippable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use contextdb_core::{Value as DbValue, VectorIndexRef};
 use contextdb_engine::work_ledger::{
-    self, InputRef, JobSpec, add_job_input_in_tx, job_state, submit_job_in_tx,
+    self, InputRef, JobSpec, add_job_input_in_tx, job_state, job_state_counts, submit_job_in_tx,
 };
 use sha2::{Digest as _, Sha256};
 
 use crate::embedding_space::BuiltinSpaceRegistry;
 use crate::fabric::CaptureFault;
 use crate::ingest::split_transcript_into_windows;
+use crate::status_reads::{StatusReads, aggregate_u64};
 use crate::understanding::MAX_UNDERSTANDING_ATTEMPTS;
 use crate::{
     CgError, Context, ContextId, CreateContext, DigestId, EmbeddingId, EvidenceProducer, Result,
     Store,
 };
+
+pub use crate::status_reads::{ReadObservation, StatusReadObserver, UnobservedReads};
+
+/// The `kind` tier-0 capture stamps on every digest it writes, in the same transaction as that
+/// digest's understanding job. It is what makes "the digests this context queued for understanding"
+/// answerable as one aggregate.
+pub(crate) const VERBATIM_KIND: &str = "verbatim";
 
 /// The work-ledger class every tier-0 understanding job is submitted under. A worker advertises this
 /// as a requirement tag to become eligible.
@@ -314,7 +322,7 @@ fn write_verbatim_digest(
                     DbValue::Text(request.session_ref.clone()),
                 ),
                 ("summary".to_string(), DbValue::Text(summary.to_string())),
-                ("kind".to_string(), DbValue::Text("verbatim".to_string())),
+                ("kind".to_string(), DbValue::Text(VERBATIM_KIND.to_string())),
                 ("vector_text".to_string(), DbValue::Vector(vector.clone())),
                 (
                     "dimension".to_string(),
@@ -468,32 +476,148 @@ fn submit_understanding_job(
     Ok(())
 }
 
-/// Count understanding jobs in one context, by state, over the work ledger (the ledger's computed job
-/// state subsumes the retired private queue). A digest carrying a write-once completion is
-/// `structured` regardless of the underlying ledger rows; otherwise the ledger's `job_state` maps
-/// pending/leased/failed/cancelled to pending/in_flight/failed/skipped.
+/// Count understanding jobs in one context, by state, through the bounded reading door.
+///
+/// What an operator is entitled to: the numbers are CORRECT on a store of any size, and asking for
+/// them costs the same whether the machine has done a day's work or a year's. A context holding
+/// hundreds of thousands of captured digests is far past what one read may examine, so this walks
+/// the context's own digests one bounded page at a time and keeps only the running counts and the
+/// page in hand — never a set of identities that grows with the store, never a collected table, and
+/// never a read whose size follows the ledger rather than the page in hand.
+///
+/// A digest is in the understanding queue only once its job is on the work ledger, so per page the
+/// first read asks the ledger which of that page's job ids it actually holds. A digest with no job
+/// row is not queued at all — the drain path skips it for the same reason
+/// ([`crate::understanding::list_pending_digests`]) — so status never advertises it, in any bucket.
+///
+/// Of the digests that ARE enqueued, the ones carrying a write-once completion are found with one
+/// more membership read over that page's digest ids, and the rest have their state decided by the
+/// work ledger's own batched answer ([`job_state_counts`]) for exactly those jobs. The ledger owns
+/// what a job's state IS; this only counts. A completion wins over whatever the ledger says, so a
+/// digest that is both completed and Done is counted once, as structured. Pending is what the ledger
+/// holds a job row for and has nothing live or terminal to say about, which falls out of the page's
+/// arithmetic rather than a scan. The batched counts cannot report an id the ledger disowns here —
+/// the membership read has already removed every one of them — and were such a count to appear it is
+/// excluded as well, so no bucket ever grows from a job that does not exist.
 pub fn queue_counts(store: &Store, context_id: ContextId) -> Result<QueueCounts> {
-    let mut counts = QueueCounts::default();
+    queue_counts_observed(store, context_id, &UnobservedReads)
+}
+
+/// [`queue_counts`], telling `observer` about every bounded read it makes.
+///
+/// The same code path production takes: what an observer is told is what a plain
+/// [`queue_counts`] does.
+pub fn queue_counts_observed(
+    store: &Store,
+    context_id: ContextId,
+    observer: &dyn StatusReadObserver,
+) -> Result<QueueCounts> {
     let db = store.internal_db();
-    for (digest_id, _order) in context_digests(store, context_id)? {
-        let digest_text = digest_id.to_string();
-        let job_id = understanding_job_id(digest_id);
-        if !job_exists(store, &job_id)? {
-            continue;
-        }
-        if completion_exists_local(store, &digest_text)? {
-            counts.structured += 1;
-            continue;
-        }
-        match job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)? {
-            work_ledger::JobState::Pending => counts.pending += 1,
-            work_ledger::JobState::Leased { .. } => counts.in_flight += 1,
-            work_ledger::JobState::Done => counts.structured += 1,
-            work_ledger::JobState::Failed => counts.failed += 1,
-            work_ledger::JobState::Cancelled => counts.skipped += 1,
-        }
-    }
+    let reads = StatusReads::open(store, observer)?;
+    let mut queued_params = HashMap::from([(
+        "context_id".to_string(),
+        DbValue::Uuid(context_id.as_uuid()),
+    )]);
+    queued_params.insert("kind".to_string(), DbValue::Text(VERBATIM_KIND.to_string()));
+
+    let mut counts = QueueCounts::default();
+    // Every digest tier-0 capture wrote in this context, in bounded pages. `kind` is what capture
+    // stamps on the digest it writes in the same transaction as the job, so this is the queue's
+    // candidate universe, and it is already scoped to the context — no job identity from another
+    // context is ever read, whatever else the machine has queued.
+    reads.for_each_page(
+        "SELECT id FROM digests WHERE context_id = $context_id AND kind = $kind",
+        &queued_params,
+        |rows| {
+            let digests: Vec<DigestId> = rows
+                .iter()
+                .filter_map(|row| match row.first() {
+                    Some(DbValue::Uuid(id)) => Some(DigestId::from(*id)),
+                    _ => None,
+                })
+                .collect();
+            if digests.is_empty() {
+                return Ok(());
+            }
+            // Only a digest whose job reached the ledger is in the queue. One membership read for
+            // the whole page decides that, and everything below counts only what survives it.
+            let page_jobs: Vec<String> = digests
+                .iter()
+                .map(|digest| understanding_job_id(*digest))
+                .collect();
+            let enqueued = keys_present(&reads, "work_jobs", "job_id", &page_jobs)?;
+            let queued: Vec<(String, String)> = digests
+                .iter()
+                .zip(page_jobs)
+                .filter(|(_, job_id)| enqueued.contains(job_id))
+                .map(|(digest, job_id)| (digest.to_string(), job_id))
+                .collect();
+            if queued.is_empty() {
+                return Ok(());
+            }
+            let digest_keys: Vec<String> = queued
+                .iter()
+                .map(|(digest_text, _)| digest_text.clone())
+                .collect();
+            let completed =
+                keys_present(&reads, "cg_understanding_completions", "id", &digest_keys)?;
+            counts.structured += completed.len();
+            let jobs: Vec<&String> = queued
+                .iter()
+                .filter(|(digest_text, _)| !completed.contains(digest_text))
+                .map(|(_, job_id)| job_id)
+                .collect();
+            if jobs.is_empty() {
+                return Ok(());
+            }
+            let states = job_state_counts(db, &jobs, ledger_clock_ms()).map_err(map_engine)?;
+            counts.in_flight += states.leased;
+            counts.structured += states.done;
+            counts.failed += states.failed;
+            counts.skipped += states.cancelled;
+            // A job the ledger holds a row for and has nothing live or terminal to say about is
+            // queued and untouched. An id the ledger disowns cannot reach here, and is excluded if
+            // it ever does.
+            counts.pending += states.pending;
+            Ok(())
+        },
+    )?;
     Ok(counts)
+}
+
+/// Which of one page's keys `table` actually holds a row for, under `key_column`.
+///
+/// One bounded read for the whole page: the page's keys are asked about together with a keyed `IN`,
+/// so the cost follows the page in hand and not the size of the table being asked. This is how a
+/// status total learns both which digests reached the work ledger and which carry a write-once
+/// completion, without ever reading either table through.
+fn keys_present(
+    reads: &StatusReads<'_>,
+    table: &str,
+    key_column: &str,
+    keys: &[String],
+) -> Result<HashSet<String>> {
+    let mut params = HashMap::with_capacity(keys.len());
+    let mut placeholders = Vec::with_capacity(keys.len());
+    for (position, key) in keys.iter().enumerate() {
+        let name = format!("key{position}");
+        params.insert(name.clone(), DbValue::Text(key.clone()));
+        placeholders.push(format!("${name}"));
+    }
+    let statement = format!(
+        "SELECT {key_column} FROM {table} WHERE {key_column} IN ({})",
+        placeholders.join(", ")
+    );
+    let mut present = HashSet::with_capacity(keys.len());
+    reads.for_each_page(&statement, &params, |rows| {
+        for row in rows {
+            if let Some(DbValue::Text(key)) = row.first() {
+                present.insert(key.clone());
+            }
+        }
+        Ok(())
+    })?;
+    Ok(present)
 }
 
 /// The advisory wall-clock the local single-node claim model reads. Local claims take an unexpiring
@@ -657,26 +781,35 @@ pub fn digest_kind(store: &Store, digest_id: DigestId) -> Result<Option<String>>
 }
 
 /// The raw-source footprint (kept chunks + total bytes) for one context.
+///
+/// One aggregate, paged to completion through the bounded reading door: a context holding more raw
+/// chunks than a single read may examine still gets an exact count and an exact byte total, because
+/// each fetch spends its own work budget and the running totals survive between them.
 pub fn raw_footprint(store: &Store, context_id: ContextId) -> Result<RawFootprint> {
-    // The engine has no aggregate support, so tally row bytes in Rust.
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT byte_len FROM cg_source_chunks WHERE context_id = $context_id",
-            &HashMap::from([(
-                "context_id".to_string(),
-                DbValue::Uuid(context_id.as_uuid()),
-            )]),
-        )
-        .map_err(map_engine)?;
-    let mut footprint = RawFootprint::default();
-    for row in &result.rows {
-        footprint.chunk_count += 1;
-        if let Some(DbValue::Int64(bytes)) = row.first() {
-            footprint.bytes += (*bytes).max(0) as u64;
-        }
-    }
-    Ok(footprint)
+    raw_footprint_observed(store, context_id, &UnobservedReads)
+}
+
+/// [`raw_footprint`], telling `observer` about every bounded read it makes.
+///
+/// The same code path production takes: what an observer is told is what a plain [`raw_footprint`]
+/// does.
+pub fn raw_footprint_observed(
+    store: &Store,
+    context_id: ContextId,
+    observer: &dyn StatusReadObserver,
+) -> Result<RawFootprint> {
+    let reads = StatusReads::open(store, observer)?;
+    let total = reads.total(
+        "SELECT COUNT(*), SUM(byte_len) FROM cg_source_chunks WHERE context_id = $context_id",
+        &HashMap::from([(
+            "context_id".to_string(),
+            DbValue::Uuid(context_id.as_uuid()),
+        )]),
+    )?;
+    Ok(RawFootprint {
+        chunk_count: usize::try_from(aggregate_u64(&total, 0)).unwrap_or(usize::MAX),
+        bytes: aggregate_u64(&total, 1),
+    })
 }
 
 /// Purge kept raw source chunks and mark their still-pending queue rows `skipped`. Raw purge is

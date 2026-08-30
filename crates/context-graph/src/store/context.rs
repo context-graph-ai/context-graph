@@ -15,6 +15,7 @@ use super::encode::{
     get_json, get_text, get_txid, get_uuid, properties_from_json, properties_to_json,
     tags_from_json,
 };
+use super::graph_rows::GraphRows;
 
 impl Store {
     pub fn create_context(&self, input: CreateContext) -> Result<Context> {
@@ -86,42 +87,51 @@ impl Store {
     }
 
     pub fn list_contexts(&self) -> Result<Vec<Context>> {
-        let result = self
-            .db
-            .execute(
-                "SELECT id, name, labels, properties, created_at FROM contexts",
-                &HashMap::new(),
-            )
-            .map_err(map_engine_err)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            out.push(decode_context(&result.columns, row)?);
-        }
-        Ok(out)
+        list_contexts(self.as_graph_rows())
     }
 
     pub fn get_context(&self, id: ContextId) -> Result<Option<Context>> {
         self.observe_read("get_context");
-        if !id.is_valid() {
-            return Err(CgError::InvalidIdentity {
-                context: "ContextId",
-            });
-        }
-        let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, name, labels, properties, created_at FROM contexts WHERE id = $id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        if result.rows.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_context(&result.columns, &result.rows[0])?))
+        get_context(self.as_graph_rows(), id)
     }
+}
+
+/// Every context in the store, as both doors answer it.
+///
+/// Reads `contexts`.
+pub(crate) fn list_contexts(rows: &dyn GraphRows) -> Result<Vec<Context>> {
+    let result = rows.query_rows(
+        "SELECT id, name, labels, properties, created_at FROM contexts",
+        &HashMap::new(),
+    )?;
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        out.push(decode_context(&result.columns, row)?);
+    }
+    Ok(out)
+}
+
+/// One context by id, or the answered absence when the store holds no such row. An id that is not
+/// a well-formed identity is refused before the store is asked, on both doors alike.
+///
+/// Reads `contexts`.
+pub(crate) fn get_context(rows: &dyn GraphRows, id: ContextId) -> Result<Option<Context>> {
+    if !id.is_valid() {
+        return Err(CgError::InvalidIdentity {
+            context: "ContextId",
+        });
+    }
+    let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
+        .into_iter()
+        .collect();
+    let result = rows.query_rows(
+        "SELECT id, name, labels, properties, created_at FROM contexts WHERE id = $id",
+        &params,
+    )?;
+    if result.rows.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decode_context(&result.columns, &result.rows[0])?))
 }
 
 fn deterministic_context_id(name: &str) -> ContextId {

@@ -1,23 +1,24 @@
-mod audit;
+pub(crate) mod audit;
 mod conflict_detection;
 mod consumer_tables;
-mod context;
+pub(crate) mod context;
 pub(crate) mod convert;
-mod decision;
+pub(crate) mod decision;
 mod digest;
 pub(crate) mod embedding;
 mod encode;
-mod entity;
+pub(crate) mod entity;
 pub(crate) mod entity_reference_embeddings;
-mod evidence;
+pub(crate) mod evidence;
+pub(crate) mod graph_rows;
 mod impact_analysis;
-mod intention;
+pub(crate) mod intention;
 mod invalidation_lifecycle;
-mod observation;
+pub(crate) mod observation;
 mod outcome;
 mod precedent_match;
 mod reindex;
-mod relationship;
+pub(crate) mod relationship;
 pub mod signatures;
 mod subscriptions;
 
@@ -26,11 +27,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use contextdb_core::{ColumnType, Error as EngineError, ScopeLabel, TxId, Value};
-use contextdb_engine::{Database, plugin::DatabasePlugin};
+use contextdb_engine::{
+    Database, DatabaseOpenOptions, OpenDisposition, QueryResult, plugin::DatabasePlugin,
+};
 
 use crate::Result;
+use crate::consumer_read::ConsumerDeclaration;
 use crate::embedding_space::default_text_embedding_space;
 use crate::error::CgError;
+use crate::owner_control::{ControlHandler, owner_read_config};
 use crate::schema::{
     ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, INDEXES, LOCAL_RUNTIME_TABLES,
     SUBSCRIPTION_EVENT_TYPE_DDL, TABLES,
@@ -43,8 +48,12 @@ use crate::embedder::nomic::NomicTextEmbedder;
 
 use self::conflict_detection::register_conflict_detection_triggers;
 pub use self::consumer_tables::{ConsumerSchema, ConsumerTable};
+// The read door holds a declaration to the persisted table too, and must decide that the same way
+// this door does: one conversion from declared text to the store's own scope vocabulary.
+pub(crate) use self::consumer_tables::scope_label_kind;
 use self::consumer_tables::{install_consumer_schema, validate_consumer_schema};
 use self::convert::map_engine_err;
+use self::convert::{map_consumer_open_err, map_open_err};
 pub use self::digest::{DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit};
 pub use self::entity_reference_embeddings::{EntityMatch, EntityReferenceMatchOptions};
 use self::impact_analysis::register_impact_analysis_trigger;
@@ -176,7 +185,7 @@ impl Store {
             false,
             None,
             None,
-            None,
+            DatabaseOpenExtras::default(),
             registrations,
             ConsumerSchema::none(),
         )
@@ -222,7 +231,7 @@ impl Store {
             false,
             None,
             None,
-            None,
+            DatabaseOpenExtras::default(),
             registrations,
             consumer_schema,
         )
@@ -249,9 +258,94 @@ impl Store {
             false,
             None,
             Some(scope_labels),
-            None,
+            DatabaseOpenExtras::default(),
             registrations,
             consumer_schema,
+        )
+    }
+
+    /// Opens a store the consumer ALREADY HAS for change, or refuses. Nothing is ever created.
+    ///
+    /// The atomic door. A consumer that means to change a store it already has otherwise has two
+    /// bad choices: look the path up first and race whoever moves it between the look and the
+    /// open, or accept that a typo, an unmounted volume or a link whose target is gone quietly
+    /// materializes a brand-new empty deployment and reports success — and that second one is the
+    /// dangerous one, because the consumer is told everything worked and writes its data into a
+    /// store nobody will ever look for.
+    ///
+    /// So the open is ATTEMPTED. context-graph asks no existence question of its own — there is no
+    /// `Path::exists()` here or anywhere behind this call — and the engine's typed outcome is the
+    /// sole authority: a store that is not there comes back [`CgError::StoreMissing`], one that is
+    /// there and cannot be looked at comes back [`CgError::StoreUnreadable`], and every refusal
+    /// leaves the store, its companion and the directory holding them byte-for-byte as they were
+    /// found.
+    ///
+    /// `declaration` is the same value the read-only [`crate::ConsumerReader`] takes: its schema is
+    /// created and checked exactly as [`Store::open_with_consumer_schema`] does, and its scope
+    /// labels narrow the returned handle exactly as
+    /// [`Store::open_with_consumer_schema_scoped`] does — a declaration naming no label narrows
+    /// nothing. The door is ADDITIVE: every opener that came before goes on creating an absent
+    /// store exactly as it always has.
+    ///
+    /// [`CgError::StoreMissing`]: crate::CgError::StoreMissing
+    /// [`CgError::StoreUnreadable`]: crate::CgError::StoreUnreadable
+    pub fn open_existing_for_change(
+        config: StoreConfig,
+        registrations: Vec<EmbedderRegistration>,
+        declaration: ConsumerDeclaration,
+    ) -> Result<Self> {
+        let ConsumerDeclaration {
+            schema,
+            scope_labels,
+        } = declaration;
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            (!scope_labels.is_empty()).then_some(scope_labels),
+            DatabaseOpenExtras::existing_only(),
+            registrations,
+            schema,
+        )
+    }
+
+    /// Opens the store and becomes the administrative OWNER of it: while this handle is alive,
+    /// `handler` answers every administrative frame another process sends with
+    /// [`crate::owner_control::request_owner`], naming only this store's path.
+    ///
+    /// The handler runs inside the owner while it holds the store, so it may read and write through
+    /// this `Store` freely. Nothing here is a second transport: the channel, its deadlines and its
+    /// refusals are contextdb's owner-read surface, attached at this one writable open.
+    pub fn open_with_control_handler(config: StoreConfig, handler: ControlHandler) -> Result<Self> {
+        Self::open_with_control_handler_and_embedder_registrations(config, handler, Vec::new())
+    }
+
+    /// Opens the store as the administrative owner the way
+    /// [`Store::open_with_control_handler`] does, with `registrations` live on that same
+    /// handle the way [`Store::open_with_embedder_registrations`] does.
+    ///
+    /// One store, one open, both capabilities: a runtime that recognizes what it stores
+    /// AND answers administrative frames — Vigil is the shipped example — needs no second
+    /// open and no second handle. `handler` answers every frame another process sends with
+    /// [`crate::owner_control::request_owner`] naming this store's path, and the embedders
+    /// in `registrations` serve every embedding written through this handle, including the
+    /// ones the handler itself triggers while it holds the store. The two open surfaces
+    /// that carry only one of the pair are this call with the other side left empty, so
+    /// what an embedder registration means and what a handler may do are the same here as
+    /// there.
+    pub fn open_with_control_handler_and_embedder_registrations(
+        config: StoreConfig,
+        handler: ControlHandler,
+        registrations: Vec<EmbedderRegistration>,
+    ) -> Result<Self> {
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            None,
+            DatabaseOpenExtras::with_owner_control(handler),
+            registrations,
+            ConsumerSchema::none(),
         )
     }
 
@@ -269,7 +363,7 @@ impl Store {
             false,
             None,
             None,
-            Some(plugin),
+            DatabaseOpenExtras::with_plugin(plugin),
             Vec::new(),
             ConsumerSchema::none(),
         )
@@ -286,7 +380,7 @@ impl Store {
             false,
             None,
             None,
-            Some(plugin),
+            DatabaseOpenExtras::with_plugin(plugin),
             registrations,
             ConsumerSchema::none(),
         )
@@ -320,7 +414,7 @@ impl Store {
             replace_shared_handle,
             contexts,
             None,
-            None,
+            DatabaseOpenExtras::default(),
             Vec::new(),
             ConsumerSchema::none(),
         )
@@ -331,7 +425,7 @@ impl Store {
         replace_shared_handle: bool,
         contexts: Option<BTreeSet<ContextId>>,
         scope_labels: Option<BTreeSet<ScopeLabel>>,
-        plugin: Option<Arc<dyn DatabasePlugin>>,
+        extras: DatabaseOpenExtras,
         registrations: Vec<EmbedderRegistration>,
         consumer_schema: ConsumerSchema,
     ) -> Result<Self> {
@@ -388,7 +482,7 @@ impl Store {
             replace_shared_handle,
             contexts,
             scope_labels,
-            plugin,
+            &extras,
             &consumer_schema,
         )?;
         let store = Self {
@@ -450,7 +544,8 @@ impl Store {
         path: impl AsRef<Path>,
         fixture: LegacySchemaFixture,
     ) -> Result<()> {
-        let db = Database::open(path.as_ref()).map_err(map_engine_err)?;
+        let db =
+            Database::open(path.as_ref()).map_err(|error| map_open_err(path.as_ref(), error))?;
         match fixture {
             LegacySchemaFixture::LegacyDigest384 => {
                 db.execute(
@@ -552,6 +647,15 @@ impl Store {
     pub fn last_query_trace(&self) -> Result<String> {
         let guard = self.trace.lock().expect("trace lock");
         Ok(guard.clone())
+    }
+
+    /// The writable handle's own row executor for the typed graph reads.
+    ///
+    /// Nothing is added here: the statement is the shared read's own text, and the refusal is the
+    /// one conversion this crate already puts every engine error through. What makes it a seam is
+    /// only that the read-only door can offer the same call over its read session.
+    pub(crate) fn as_graph_rows(&self) -> &dyn graph_rows::GraphRows {
+        self
     }
 
     #[cfg(context_graph_internal_test_support)]
@@ -667,18 +771,99 @@ fn maybe_register_default_text_embedder(
     }
 }
 
+impl graph_rows::GraphRows for Store {
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        self.db.execute(sql, params).map_err(map_engine_err)
+    }
+}
+
+/// What a writable open carries beyond the store's own configuration: the consumer's database
+/// plugin, and the handler the live owner answers administrative requests with. Both reach the
+/// engine through the one writable-open door, so there is a single place where "how this store was
+/// opened" is decided.
+#[derive(Clone, Default)]
+pub(crate) struct DatabaseOpenExtras {
+    plugin: Option<Arc<dyn DatabasePlugin>>,
+    owner_control: Option<ControlHandler>,
+    /// Whether this open may bring the store into existence. The default is the creating
+    /// disposition every opener that came before has always had.
+    open_disposition: OpenDisposition,
+}
+
+impl DatabaseOpenExtras {
+    #[cfg(any(test, context_graph_internal_test_support))]
+    pub(crate) fn with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Self {
+        Self {
+            plugin: Some(plugin),
+            owner_control: None,
+            open_disposition: OpenDisposition::default(),
+        }
+    }
+
+    fn with_owner_control(handler: ControlHandler) -> Self {
+        Self {
+            plugin: None,
+            owner_control: Some(handler),
+            open_disposition: OpenDisposition::default(),
+        }
+    }
+
+    /// The consumer edit door: open a store that already exists, or refuse.
+    fn existing_only() -> Self {
+        Self {
+            plugin: None,
+            owner_control: None,
+            open_disposition: OpenDisposition::ExistingOnly,
+        }
+    }
+
+    /// Whether this open asks for nothing of its own, and so may share a handle already open on
+    /// the same path in this process.
+    fn is_plain(&self) -> bool {
+        self.plugin.is_none() && self.owner_control.is_none()
+    }
+
+    fn open_options(&self) -> DatabaseOpenOptions {
+        let mut options = DatabaseOpenOptions {
+            open_disposition: self.open_disposition,
+            ..DatabaseOpenOptions::default()
+        };
+        if let Some(plugin) = self.plugin.clone() {
+            options.plugin = plugin;
+        }
+        if let Some(handler) = self.owner_control.clone() {
+            options.owner_reads = owner_read_config(handler);
+        }
+        options
+    }
+
+    /// Say what a refused open means, in the vocabulary the door that asked for it promised.
+    ///
+    /// The consumer edit door owes its caller the missing-versus-unreadable answer it was opened
+    /// to give; every opener that creates an absent store keeps the wording it has always had.
+    fn map_refusal(&self, db_path: &Path, error: EngineError) -> CgError {
+        match self.open_disposition {
+            OpenDisposition::ExistingOnly => map_consumer_open_err(db_path, error),
+            OpenDisposition::CreateIfMissing => map_open_err(db_path, error),
+        }
+    }
+}
+
 fn open_bootstrapped_database(
     db_path: &Path,
     config: &StoreConfig,
     replace_shared_handle: bool,
     contexts: Option<BTreeSet<ContextId>>,
     scope_labels: Option<BTreeSet<ScopeLabel>>,
-    plugin: Option<Arc<dyn DatabasePlugin>>,
+    extras: &DatabaseOpenExtras,
     consumer_schema: &ConsumerSchema,
 ) -> Result<(Arc<Database>, Option<Arc<Database>>)> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = registry.lock().expect("store registry lock");
-    if plugin.is_none()
+    // A handle opened for one caller's plugin or for one caller's owner handler answers to that
+    // caller alone: sharing it would hand a second opener a database serving somebody else's
+    // administrative frames.
+    if extras.is_plain()
         && !replace_shared_handle
         && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
     {
@@ -686,10 +871,12 @@ fn open_bootstrapped_database(
         register_store_triggers(&existing)?;
         return Ok(narrowed_handle(existing, contexts, scope_labels));
     }
-    let db = Arc::new(match plugin {
-        Some(plugin) => Database::open_with_plugin(db_path, plugin).map_err(map_engine_err)?,
-        None => Database::open(db_path).map_err(map_engine_err)?,
-    });
+    // The open is the only place that knows WHICH store was refused, and readers still reading a
+    // store are reported by the substrate without one — so the path is supplied here.
+    let db = Arc::new(
+        Database::open_with_options(db_path, extras.open_options())
+            .map_err(|error| extras.map_refusal(db_path, error))?,
+    );
     bootstrap_schema(&db, config, false, consumer_schema)?;
     register_store_triggers(&db)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));

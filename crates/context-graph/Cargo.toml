@@ -56,6 +56,12 @@ uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 # pull contextdb-server/tokio into the default `--edges normal,build` tree the purity guards check.
 context-graph = { path = ".", features = ["fabric-sync"] }
 candle-core.workspace = true
+# The README is this crate's front page, and a `#[cfg(doctest)]` item in `lib.rs` hands it to the
+# doctest harness so its example is compiled — without splicing the README text into the crate's
+# own docs. The example registers an EmbeddingGemma embedder, which is where that embedder lives.
+# A dev-only edge: `candle-embeddinggemma` depends on this crate in the ordinary direction, and
+# nothing here reaches it outside tests and doctests.
+candle-embeddinggemma = { path = "../candle-embeddinggemma" }
 candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }

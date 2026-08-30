@@ -1,5 +1,15 @@
+// The README's example is compiled by the doctest harness. An example nothing builds drifts
+// silently: the symbols it names are renamed or moved by ordinary work, and the first person to
+// find out is a reader who copied it.
+
+/// Keeps the README's example compiling under the doctest harness without splicing the README
+/// text into the crate's expanded source.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctest;
+
 pub mod capture_sync_status;
-pub mod control_transport;
+pub mod consumer_read;
 pub mod embedder;
 pub mod embedding_space;
 pub mod embedding_target;
@@ -12,29 +22,33 @@ pub mod injection;
 pub mod llm;
 pub mod messaging;
 pub mod overlay;
+pub mod owner_control;
 pub mod producer;
 pub mod review_surface;
 pub mod schema;
 pub mod skill_store;
+pub mod status_reads;
 pub mod store;
 pub mod tier0;
 pub mod types;
 pub mod understanding;
 
 pub use capture_sync_status::*;
+pub use consumer_read::graph::ConsumerGraphView;
+pub use consumer_read::{ConsumerDeclaration, ConsumerReader};
 pub use contextdb_core::{ScopeLabel, TxId};
-pub use control_transport::{ControlHandler, request_control, start_control_listener};
 pub use embedder::{
     Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput, ModelSource,
     load_observer::{EmbedderLoadEvent, EmbedderLoadObserver},
 };
-pub use error::CgError;
+pub use error::{CgError, ReaderIdentity};
 pub use injection::{
     INJECTION_TOKEN_BUDGET, InjectionIndex, InjectionLine, InjectionTier,
     VERBATIM_SIMILARITY_THRESHOLD, build_injection_index,
 };
 pub use llm::*;
 pub use messaging::{MessageBody, MismatchKind, OverrideFailureReason};
+pub use owner_control::{ControlHandler, OwnerControlError};
 pub use producer::CG_EDGE_SYSTEM_TAG;
 pub use store::{
     ConsumerSchema, ConsumerTable, DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit,

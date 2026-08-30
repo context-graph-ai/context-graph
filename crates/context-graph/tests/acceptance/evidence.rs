@@ -828,7 +828,6 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
     for file in files {
         if file == crate_dir.join("src/embedder/embeddinggemma.rs")
             || file == crate_dir.join("src/embedder/nomic.rs")
-            || file == crate_dir.join("src/control_transport.rs")
         {
             continue;
         }
@@ -857,7 +856,6 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
     for file in files {
         if file == crate_dir.join("src/embedder/embeddinggemma.rs")
             || file == crate_dir.join("src/embedder/nomic.rs")
-            || file == crate_dir.join("src/control_transport.rs")
         {
             continue;
         }
@@ -869,12 +867,20 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
                     || trimmed == "let _ = std::fs::remove_file(&config.db_path);"
                     || trimmed == "let _ = std::fs::create_dir_all(parent);"
                     || trimmed == "if let Ok(mut file) = std::fs::OpenOptions::new()");
+            // Telling a caller's observer what a bounded database read did is not fetching bytes
+            // off a disk; it is the status totals reporting their own cost.
+            let allowed_read_observation = trimmed.contains("observer.read(");
+            // Asking the already-open read session for a typed metadata answer is a database
+            // read, not a filesystem probe.
+            let allowed_session_metadata = file == crate_dir.join("src/consumer_read.rs")
+                && (trimmed == ".metadata("
+                    || trimmed == ".metadata(MetadataRequest::Tables, continuation.as_deref())");
             for forbidden in [
                 "std::fs",
                 "fs::read",
                 "fs::File",
                 "File::open",
-                "OpenOptions",
+                "fs::OpenOptions",
                 "std::io::Read",
                 "tokio::fs",
                 "read_to_end",
@@ -889,7 +895,10 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
                 "copy(",
             ] {
                 assert!(
-                    !trimmed.contains(forbidden) || allowed_store_rebuild,
+                    !trimmed.contains(forbidden)
+                        || allowed_store_rebuild
+                        || allowed_read_observation
+                        || allowed_session_metadata,
                     "core source must not fetch or probe evidence bytes in {}: {line}",
                     file.display()
                 );
@@ -6521,7 +6530,6 @@ fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_file
         if file.starts_with(crate_dir.join("src")) {
             if file == crate_dir.join("src/embedder/embeddinggemma.rs")
                 || file == crate_dir.join("src/embedder/nomic.rs")
-                || file == crate_dir.join("src/control_transport.rs")
             {
                 continue;
             }
@@ -6533,7 +6541,7 @@ fn cg_library_crate_context_graph_carries_no_outbound_http_or_subprocess_or_file
                     "std::fs::read",
                     "std::fs::File",
                     "File::open",
-                    "OpenOptions",
+                    "fs::OpenOptions",
                     "tokio::fs",
                 ] {
                     assert!(

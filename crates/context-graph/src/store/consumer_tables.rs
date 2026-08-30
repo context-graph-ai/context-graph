@@ -635,7 +635,10 @@ fn vector_quantization(declared: DeclaredQuantization) -> VectorQuantization {
     }
 }
 
-fn scope_label_kind(declared: &ScopeLabelConstraint) -> ScopeLabelKind {
+/// One declared scope column in the shape the store records it, so a declaration and a persisted
+/// table are compared as one vocabulary. Shared with the reading door, which asks the same
+/// question of the same declaration text.
+pub(crate) fn scope_label_kind(declared: &ScopeLabelConstraint) -> ScopeLabelKind {
     match declared {
         ScopeLabelConstraint::Simple { labels } => ScopeLabelKind::Simple {
             write_labels: labels.clone(),

@@ -15,6 +15,13 @@ path = "src/lib.rs"
 name = "cg"
 path = "src/main.rs"
 
+[features]
+# The `cg status` fault-injection door, off in every shipped build. It is turned on ONLY by this
+# package's dev-dependency on itself below, so `cargo test` compiles it and `cargo build` — debug
+# or release — does not: a build profile is not a test boundary, and a developer's ordinary debug
+# binary must neither read nor contain the variable.
+status-fault-injection = []
+
 [dependencies]
 cg-catalog = { path = "../cg-catalog" }
 cg-cli-conventions.workspace = true
@@ -33,5 +40,15 @@ toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# This package on itself, so the fault-injection door above is compiled for TEST builds and only
+# those. Cargo resolves dev-dependency features for `cargo test` and leaves them out of
+# `cargo build`/`cargo install`, which is the boundary a profile check does not give.
+context-graph-cli = { path = ".", features = ["status-fault-injection"] }
+# The store-contention harness (tests/support/store_contention.rs) parks a real direct reader
+# inside contextdb's shipped read-image hydration checkpoint, which is the only honest way to
+# produce reader contention: it exists only WHILE a committed image is loading. That checkpoint is
+# compiled behind contextdb-engine's `test-seams` feature. This is a test-only activation — the
+# `cg` binary's own dependency edge on contextdb-engine is unchanged.
+contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh", "test-seams"] }
 tempfile.workspace = true

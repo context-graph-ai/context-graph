@@ -21,7 +21,9 @@ use super::encode::{
     properties_from_json, properties_to_json, tags_from_json,
 };
 use super::evidence::decode_evidence;
+use super::graph_rows::GraphRows;
 use super::intention::decode_intention;
+use super::relationship::edge_targets;
 
 impl Store {
     pub fn create_decision(&self, input: CreateDecision) -> Result<Decision> {
@@ -264,53 +266,7 @@ impl Store {
 
     pub fn get_decision(&self, id: DecisionId) -> Result<Option<Decision>> {
         self.observe_read("get_decision");
-        if !id.is_valid() {
-            return Err(CgError::InvalidIdentity {
-                context: "DecisionId",
-            });
-        }
-        let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at FROM decisions WHERE id = $id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        if result.rows.is_empty() {
-            return Ok(None);
-        }
-        let mut decision = decode_decision_raw(&result.columns, &result.rows[0])?;
-        decision.intention_ids = self.intentions_for_decision(id)?;
-        decision.based_on_snapshots = self.basis_snapshots_for_decision(id)?;
-        decision.outcome = self.outcome_for_decision(id)?;
-        decision.precedent_ids = self.precedents_for_decision(id, decision.context_id)?;
-        Ok(Some(decision))
-    }
-
-    fn intentions_for_decision(&self, id: DecisionId) -> Result<Vec<IntentionId>> {
-        let params: HashMap<String, Value> = [
-            ("source_id".to_string(), Value::Uuid(id.as_uuid())),
-            ("edge_type".to_string(), Value::Text("SERVES".to_string())),
-        ]
-        .into_iter()
-        .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT target_id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type ORDER BY id ASC",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            if let Some(Value::Uuid(u)) = row.first() {
-                out.push(IntentionId::from(*u));
-            }
-        }
-        Ok(out)
+        get_decision(self.as_graph_rows(), id)
     }
 
     fn intention_snapshot_ids_for_context_in_tx(
@@ -379,17 +335,6 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         Ok(())
-    }
-
-    fn basis_snapshots_for_decision(&self, id: DecisionId) -> Result<Vec<EntitySnapshotId>> {
-        let result = self
-            .db
-            .execute(
-                "SELECT snapshot_id, basis_order FROM decision_basis_snapshots WHERE decision_id = $decision_id",
-                &HashMap::from([("decision_id".to_string(), Value::Uuid(id.as_uuid()))]),
-            )
-            .map_err(map_engine_err)?;
-        ordered_snapshot_ids(&result.columns, &result.rows, "basis_order", "snapshot_id")
     }
 
     pub(super) fn basis_snapshots_for_basis(
@@ -600,21 +545,7 @@ impl Store {
     }
 
     pub(super) fn outcome_for_decision(&self, id: DecisionId) -> Result<Option<Outcome>> {
-        let params: HashMap<String, Value> =
-            [("decision_id".to_string(), Value::Uuid(id.as_uuid()))]
-                .into_iter()
-                .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, decision_id, success, notes, recorded_at FROM outcomes WHERE decision_id = $decision_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        if result.rows.is_empty() {
-            return Ok(None);
-        }
-        Some(decode_outcome(&result.columns, &result.rows[0])).transpose()
+        outcome_for_decision(self.as_graph_rows(), id)
     }
 
     pub(super) fn precedents_for_decision(
@@ -622,8 +553,7 @@ impl Store {
         id: DecisionId,
         context_id: ContextId,
     ) -> Result<Vec<DecisionId>> {
-        let targets = self.edge_targets(context_id, id.as_uuid(), RelationshipType::Cites)?;
-        Ok(targets.into_iter().map(DecisionId::from).collect())
+        precedents_for_decision(self.as_graph_rows(), id, context_id)
     }
 
     /// The decisions that CITE this one (the reverse of the CITES precedent edge): every later
@@ -2265,6 +2195,105 @@ fn decode_decision(store: &Store, columns: &[String], row: &[Value]) -> Result<V
         decision.description = corrected;
     }
     Ok(vec![decision])
+}
+
+/// One decision by id, assembled exactly as both doors assemble it: the decision row, then the
+/// intentions it SERVES, the entity snapshots it was BASED_ON, its outcome, and the precedents it
+/// CITES. An id that is not a well-formed identity is refused before the store is asked, and a
+/// decision that is not there is an answered absence rather than a failure.
+///
+/// Reads `decisions`, `edges`, `decision_basis_snapshots` and `outcomes`.
+pub(crate) fn get_decision(rows: &dyn GraphRows, id: DecisionId) -> Result<Option<Decision>> {
+    if !id.is_valid() {
+        return Err(CgError::InvalidIdentity {
+            context: "DecisionId",
+        });
+    }
+    let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
+        .into_iter()
+        .collect();
+    let result = rows.query_rows(
+        "SELECT id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at FROM decisions WHERE id = $id",
+        &params,
+    )?;
+    if result.rows.is_empty() {
+        return Ok(None);
+    }
+    let mut decision = decode_decision_raw(&result.columns, &result.rows[0])?;
+    decision.intention_ids = intentions_for_decision(rows, id)?;
+    decision.based_on_snapshots = basis_snapshots_for_decision(rows, id)?;
+    decision.outcome = outcome_for_decision(rows, id)?;
+    decision.precedent_ids = precedents_for_decision(rows, id, decision.context_id)?;
+    Ok(Some(decision))
+}
+
+/// The intentions one decision SERVES, in the order the edges were written.
+///
+/// Reads `edges`.
+fn intentions_for_decision(rows: &dyn GraphRows, id: DecisionId) -> Result<Vec<IntentionId>> {
+    let params: HashMap<String, Value> = [
+        ("source_id".to_string(), Value::Uuid(id.as_uuid())),
+        ("edge_type".to_string(), Value::Text("SERVES".to_string())),
+    ]
+    .into_iter()
+    .collect();
+    let result = rows.query_rows(
+        "SELECT target_id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type ORDER BY id ASC",
+        &params,
+    )?;
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        if let Some(Value::Uuid(u)) = row.first() {
+            out.push(IntentionId::from(*u));
+        }
+    }
+    Ok(out)
+}
+
+/// The entity snapshots one decision was BASED_ON, in the basis order it recorded.
+///
+/// Reads `decision_basis_snapshots`.
+fn basis_snapshots_for_decision(
+    rows: &dyn GraphRows,
+    id: DecisionId,
+) -> Result<Vec<EntitySnapshotId>> {
+    let result = rows.query_rows(
+        "SELECT snapshot_id, basis_order FROM decision_basis_snapshots WHERE decision_id = $decision_id",
+        &HashMap::from([("decision_id".to_string(), Value::Uuid(id.as_uuid()))]),
+    )?;
+    ordered_snapshot_ids(&result.columns, &result.rows, "basis_order", "snapshot_id")
+}
+
+/// One decision's outcome, or the answered absence when nobody has recorded one.
+///
+/// Reads `outcomes`.
+pub(super) fn outcome_for_decision(
+    rows: &dyn GraphRows,
+    id: DecisionId,
+) -> Result<Option<Outcome>> {
+    let params: HashMap<String, Value> = [("decision_id".to_string(), Value::Uuid(id.as_uuid()))]
+        .into_iter()
+        .collect();
+    let result = rows.query_rows(
+        "SELECT id, decision_id, success, notes, recorded_at FROM outcomes WHERE decision_id = $decision_id",
+        &params,
+    )?;
+    if result.rows.is_empty() {
+        return Ok(None);
+    }
+    Some(decode_outcome(&result.columns, &result.rows[0])).transpose()
+}
+
+/// The decisions one decision CITES as precedent, inside its own context.
+///
+/// Reads `edges`.
+pub(super) fn precedents_for_decision(
+    rows: &dyn GraphRows,
+    id: DecisionId,
+    context_id: ContextId,
+) -> Result<Vec<DecisionId>> {
+    let targets = edge_targets(rows, context_id, id.as_uuid(), RelationshipType::Cites)?;
+    Ok(targets.into_iter().map(DecisionId::from).collect())
 }
 
 fn decode_decision_raw(columns: &[String], row: &[Value]) -> Result<Decision> {

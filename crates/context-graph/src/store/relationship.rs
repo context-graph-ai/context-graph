@@ -11,6 +11,7 @@ use crate::types::*;
 
 use super::Store;
 use super::convert::{map_engine_err, relationship_type_from_str, relationship_type_str};
+use super::graph_rows::GraphRows;
 
 impl Store {
     pub fn add_relationship(&self, from: EntityId, to: EntityId, rel: String) -> Result<()> {
@@ -277,54 +278,7 @@ impl Store {
         sources: &[Uuid],
         rel: Option<RelationshipType>,
     ) -> Result<Vec<(Uuid, Uuid, RelationshipType)>> {
-        if sources.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut params: HashMap<String, Value> =
-            [("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]
-                .into_iter()
-                .collect();
-        let source_clause = uuid_or_clause("source_id", "source", sources, &mut params);
-        let mut sql = format!(
-            "SELECT source_id, target_id, edge_type FROM edges WHERE ({source_clause}) AND context_id = $context_id"
-        );
-        if let Some(rel) = rel {
-            sql.push_str(" AND edge_type = $edge_type");
-            params.insert(
-                "edge_type".to_string(),
-                Value::Text(relationship_type_str(rel).to_string()),
-            );
-        }
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            let source = match row.first() {
-                Some(Value::Uuid(u)) => *u,
-                _ => continue,
-            };
-            let target = match row.get(1) {
-                Some(Value::Uuid(u)) => *u,
-                _ => continue,
-            };
-            let rel = match row.get(2) {
-                Some(Value::Text(t)) => relationship_type_from_str(t)?,
-                _ => continue,
-            };
-            out.push((source, target, rel));
-        }
-        if sources.len() <= 64 {
-            let source_order: HashMap<Uuid, usize> =
-                sources.iter().enumerate().map(|(i, u)| (*u, i)).collect();
-            out.sort_by(|a, b| {
-                source_order
-                    .get(&a.0)
-                    .unwrap_or(&usize::MAX)
-                    .cmp(source_order.get(&b.0).unwrap_or(&usize::MAX))
-                    .then_with(|| a.1.cmp(&b.1))
-                    .then_with(|| relationship_type_str(a.2).cmp(relationship_type_str(b.2)))
-            });
-        }
-        Ok(out)
+        edges_from_sources(self.as_graph_rows(), context_id, sources, rel)
     }
 
     pub(super) fn edge_targets(
@@ -333,9 +287,80 @@ impl Store {
         source: Uuid,
         rel: RelationshipType,
     ) -> Result<Vec<Uuid>> {
-        let edges = self.edges_from_sources(context_id, &[source], Some(rel))?;
-        Ok(edges.into_iter().map(|(_, target, _)| target).collect())
+        edge_targets(self.as_graph_rows(), context_id, source, rel)
     }
+}
+
+/// The edges leaving a set of sources inside one context, as both doors read them.
+///
+/// Reads `edges`.
+pub(super) fn edges_from_sources(
+    rows: &dyn GraphRows,
+    context_id: ContextId,
+    sources: &[Uuid],
+    rel: Option<RelationshipType>,
+) -> Result<Vec<(Uuid, Uuid, RelationshipType)>> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut params: HashMap<String, Value> =
+        [("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]
+            .into_iter()
+            .collect();
+    let source_clause = uuid_or_clause("source_id", "source", sources, &mut params);
+    let mut sql = format!(
+        "SELECT source_id, target_id, edge_type FROM edges WHERE ({source_clause}) AND context_id = $context_id"
+    );
+    if let Some(rel) = rel {
+        sql.push_str(" AND edge_type = $edge_type");
+        params.insert(
+            "edge_type".to_string(),
+            Value::Text(relationship_type_str(rel).to_string()),
+        );
+    }
+    let result = rows.query_rows(&sql, &params)?;
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        let source = match row.first() {
+            Some(Value::Uuid(u)) => *u,
+            _ => continue,
+        };
+        let target = match row.get(1) {
+            Some(Value::Uuid(u)) => *u,
+            _ => continue,
+        };
+        let rel = match row.get(2) {
+            Some(Value::Text(t)) => relationship_type_from_str(t)?,
+            _ => continue,
+        };
+        out.push((source, target, rel));
+    }
+    if sources.len() <= 64 {
+        let source_order: HashMap<Uuid, usize> =
+            sources.iter().enumerate().map(|(i, u)| (*u, i)).collect();
+        out.sort_by(|a, b| {
+            source_order
+                .get(&a.0)
+                .unwrap_or(&usize::MAX)
+                .cmp(source_order.get(&b.0).unwrap_or(&usize::MAX))
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| relationship_type_str(a.2).cmp(relationship_type_str(b.2)))
+        });
+    }
+    Ok(out)
+}
+
+/// Where one source's edges of one kind point, as both doors read them.
+///
+/// Reads `edges`.
+pub(super) fn edge_targets(
+    rows: &dyn GraphRows,
+    context_id: ContextId,
+    source: Uuid,
+    rel: RelationshipType,
+) -> Result<Vec<Uuid>> {
+    let edges = edges_from_sources(rows, context_id, &[source], Some(rel))?;
+    Ok(edges.into_iter().map(|(_, target, _)| target).collect())
 }
 
 pub(super) fn uuid_or_clause(
@@ -520,7 +545,7 @@ mod tests {
             false,
             None,
             None,
-            Some(Arc::new(UnrelatedEdgeUniqueViolation)),
+            crate::store::DatabaseOpenExtras::with_plugin(Arc::new(UnrelatedEdgeUniqueViolation)),
             Vec::new(),
             ConsumerSchema::none(),
         )

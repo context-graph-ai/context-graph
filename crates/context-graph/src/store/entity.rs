@@ -16,6 +16,7 @@ use super::encode::{
     get_json, get_optional_txid, get_text, get_txid, get_uuid, properties_from_json,
     properties_to_json, tags_from_json,
 };
+use super::graph_rows::GraphRows;
 use super::relationship::uuid_or_clause;
 
 impl Store {
@@ -127,25 +128,7 @@ impl Store {
 
     pub fn get_entity(&self, id: EntityId) -> Result<Option<Entity>> {
         self.observe_read("get_entity");
-        if !id.is_valid() {
-            return Err(CgError::InvalidIdentity {
-                context: "EntityId",
-            });
-        }
-        let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, entity_type, name, properties, tags, context_id, status, created_at FROM entities WHERE id = $id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        if result.rows.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_entity(&result.columns, &result.rows[0])?))
+        get_entity(self.as_graph_rows(), id)
     }
 
     pub fn list_entities(&self, filter: ListEntityFilter) -> Result<Vec<Entity>> {
@@ -1229,6 +1212,29 @@ fn entity_field_changes(
         }
     }
     changes
+}
+
+/// One entity by id, or the answered absence when the store holds no such row, as both doors
+/// answer it.
+///
+/// Reads `entities`.
+pub(crate) fn get_entity(rows: &dyn GraphRows, id: EntityId) -> Result<Option<Entity>> {
+    if !id.is_valid() {
+        return Err(CgError::InvalidIdentity {
+            context: "EntityId",
+        });
+    }
+    let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
+        .into_iter()
+        .collect();
+    let result = rows.query_rows(
+        "SELECT id, entity_type, name, properties, tags, context_id, status, created_at FROM entities WHERE id = $id",
+        &params,
+    )?;
+    if result.rows.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decode_entity(&result.columns, &result.rows[0])?))
 }
 
 fn decode_entity(columns: &[String], row: &[Value]) -> Result<Entity> {

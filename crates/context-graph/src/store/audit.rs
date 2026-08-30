@@ -12,80 +12,12 @@ use crate::types::*;
 use super::Store;
 use super::convert::{audit_operation_from_str, audit_operation_str, map_engine_err};
 use super::encode::{get_json, get_optional_text, get_text, get_txid, get_uuid};
+use super::graph_rows::GraphRows;
 
 impl Store {
     pub fn audit_query(&self, filter: AuditFilter) -> Result<Vec<AuditEntry>> {
         self.observe_read("audit_query");
-        let mut clauses: Vec<String> = Vec::new();
-        let mut params: HashMap<String, Value> = HashMap::new();
-        if let Some(ctx) = filter.context_id {
-            clauses.push("context_id = $context_id".to_string());
-            params.insert("context_id".to_string(), Value::Uuid(ctx.as_uuid()));
-        }
-        if let Some(since) = filter.since_txid {
-            clauses.push("txid >= $since_txid".to_string());
-            params.insert("since_txid".to_string(), Value::TxId(since));
-        }
-        if let Some(until) = filter.until_txid {
-            clauses.push("txid <= $until_txid".to_string());
-            params.insert("until_txid".to_string(), Value::TxId(until));
-        }
-        let mut sql = String::from(
-            "SELECT id, txid, operation, actor, reason, target_kind, target_id, context_id, payload FROM audit_log",
-        );
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
-        }
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
-        let mut all: Vec<AuditEntry> = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            all.push(decode_audit_entry(&result.columns, row)?);
-        }
-
-        let mut out: Vec<AuditEntry> = Vec::with_capacity(all.len());
-        for entry in all {
-            if let Some(did) = filter.decision_id {
-                match &entry.target {
-                    AuditTarget::Decision(d) if *d == did => {}
-                    AuditTarget::Outcome(d) if *d == did => {}
-                    _ => continue,
-                }
-            }
-            if let Some(iid) = filter.intention_id {
-                match &entry.target {
-                    AuditTarget::Intention(i) if *i == iid => {}
-                    _ => continue,
-                }
-            }
-            if let Some(eid) = filter.entity_id {
-                match &entry.target {
-                    AuditTarget::Entity(e) if *e == eid => {}
-                    _ => continue,
-                }
-            }
-            if let Some(target) = &filter.target
-                && &entry.target != target
-            {
-                continue;
-            }
-            if let Some(actor) = &filter.actor
-                && &entry.actor != actor
-            {
-                continue;
-            }
-            out.push(entry);
-        }
-        out.sort_by_key(|e| e.txid.0);
-        if let Some(after) = filter.after
-            && let Some(pos) = out.iter().position(|e| e.id == after)
-        {
-            out = out.split_off(pos + 1);
-        }
-        if let Some(limit) = filter.limit {
-            out.truncate(limit as usize);
-        }
-        Ok(out)
+        audit_query(self.as_graph_rows(), filter)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -144,6 +76,85 @@ impl Store {
             .map_err(map_engine_err)?;
         Ok(())
     }
+}
+
+/// The audit trail, as both doors answer it: the store-side filter goes into the statement, and
+/// everything the audit vocabulary itself decides — which target a row is about, which actor wrote
+/// it, where a caller paged from and how many rows it asked for — is applied to the decoded
+/// entries here, so the answer does not depend on which executor ran the read.
+///
+/// Reads `audit_log`.
+pub(crate) fn audit_query(rows: &dyn GraphRows, filter: AuditFilter) -> Result<Vec<AuditEntry>> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: HashMap<String, Value> = HashMap::new();
+    if let Some(ctx) = filter.context_id {
+        clauses.push("context_id = $context_id".to_string());
+        params.insert("context_id".to_string(), Value::Uuid(ctx.as_uuid()));
+    }
+    if let Some(since) = filter.since_txid {
+        clauses.push("txid >= $since_txid".to_string());
+        params.insert("since_txid".to_string(), Value::TxId(since));
+    }
+    if let Some(until) = filter.until_txid {
+        clauses.push("txid <= $until_txid".to_string());
+        params.insert("until_txid".to_string(), Value::TxId(until));
+    }
+    let mut sql = String::from(
+        "SELECT id, txid, operation, actor, reason, target_kind, target_id, context_id, payload FROM audit_log",
+    );
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    let result = rows.query_rows(&sql, &params)?;
+    let mut all: Vec<AuditEntry> = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        all.push(decode_audit_entry(&result.columns, row)?);
+    }
+
+    let mut out: Vec<AuditEntry> = Vec::with_capacity(all.len());
+    for entry in all {
+        if let Some(did) = filter.decision_id {
+            match &entry.target {
+                AuditTarget::Decision(d) if *d == did => {}
+                AuditTarget::Outcome(d) if *d == did => {}
+                _ => continue,
+            }
+        }
+        if let Some(iid) = filter.intention_id {
+            match &entry.target {
+                AuditTarget::Intention(i) if *i == iid => {}
+                _ => continue,
+            }
+        }
+        if let Some(eid) = filter.entity_id {
+            match &entry.target {
+                AuditTarget::Entity(e) if *e == eid => {}
+                _ => continue,
+            }
+        }
+        if let Some(target) = &filter.target
+            && &entry.target != target
+        {
+            continue;
+        }
+        if let Some(actor) = &filter.actor
+            && &entry.actor != actor
+        {
+            continue;
+        }
+        out.push(entry);
+    }
+    out.sort_by_key(|e| e.txid.0);
+    if let Some(after) = filter.after
+        && let Some(pos) = out.iter().position(|e| e.id == after)
+    {
+        out = out.split_off(pos + 1);
+    }
+    if let Some(limit) = filter.limit {
+        out.truncate(limit as usize);
+    }
+    Ok(out)
 }
 
 fn decode_audit_entry(columns: &[String], row: &[Value]) -> Result<AuditEntry> {

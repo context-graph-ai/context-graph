@@ -235,7 +235,7 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
     ] {
         let offenders = production_sources
             .iter()
-            .filter(|(_, source)| source.contains(removed_symbol))
+            .filter(|(_, source)| source_uses_removed_symbol(source, removed_symbol))
             .map(|(path, _)| path.display().to_string())
             .collect::<Vec<_>>();
         if !offenders.is_empty() {
@@ -273,6 +273,35 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "Context Graph sync declarations differ from the frozen table contract:\n{}",
         mismatches.join("\n")
     );
+}
+
+/// Does production source actually use a removed sync-authority symbol?
+///
+/// Identifier-shaped entries (`ConflictPolicy`, `SyncDirection`) count only on identifier
+/// boundaries, so they do not fire inside a larger identifier that merely ends in the same
+/// letters (`ParsedStatement::ShowSyncConflictPolicy`, the read surface's answer-shape tag). A
+/// standalone use of the removed identifier still counts. Call-shaped entries
+/// (`.set_conflict_policy(`) keep the plain substring scan.
+fn source_uses_removed_symbol(source: &str, removed_symbol: &str) -> bool {
+    fn is_identifier_char(character: char) -> bool {
+        character.is_ascii_alphanumeric() || character == '_'
+    }
+
+    let identifier_shaped = removed_symbol.chars().all(is_identifier_char);
+    if !identifier_shaped {
+        return source.contains(removed_symbol);
+    }
+    source.match_indices(removed_symbol).any(|(offset, _)| {
+        let preceded_by_identifier = source[..offset]
+            .chars()
+            .next_back()
+            .is_some_and(is_identifier_char);
+        let followed_by_identifier = source[offset + removed_symbol.len()..]
+            .chars()
+            .next()
+            .is_some_and(is_identifier_char);
+        !preceded_by_identifier && !followed_by_identifier
+    })
 }
 
 fn rust_sources_under(root: &Path) -> Vec<(PathBuf, String)> {

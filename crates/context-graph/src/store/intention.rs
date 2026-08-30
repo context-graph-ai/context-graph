@@ -18,6 +18,7 @@ use super::encode::{
     get_text, get_txid, get_uuid, intention_ids_from_json, properties_from_json,
     properties_to_json, tags_from_json,
 };
+use super::graph_rows::GraphRows;
 use super::relationship::uuid_or_clause;
 
 impl Store {
@@ -139,25 +140,7 @@ impl Store {
 
     pub fn get_intention(&self, id: IntentionId) -> Result<Option<Intention>> {
         self.observe_read("get_intention");
-        if !id.is_valid() {
-            return Err(CgError::InvalidIdentity {
-                context: "IntentionId",
-            });
-        }
-        let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE id = $id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        if result.rows.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(decode_intention(&result.columns, &result.rows[0])?))
+        get_intention(self.as_graph_rows(), id)
     }
 
     pub fn intention_tree(&self, intention_id: IntentionId) -> Result<IntentionTree> {
@@ -1363,6 +1346,29 @@ impl Store {
             })
             .collect()
     }
+}
+
+/// One intention by id, or the answered absence when the store holds no such row, as both doors
+/// answer it.
+///
+/// Reads `intentions`.
+pub(crate) fn get_intention(rows: &dyn GraphRows, id: IntentionId) -> Result<Option<Intention>> {
+    if !id.is_valid() {
+        return Err(CgError::InvalidIdentity {
+            context: "IntentionId",
+        });
+    }
+    let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
+        .into_iter()
+        .collect();
+    let result = rows.query_rows(
+        "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE id = $id",
+        &params,
+    )?;
+    if result.rows.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decode_intention(&result.columns, &result.rows[0])?))
 }
 
 pub(super) fn decode_intention(columns: &[String], row: &[Value]) -> Result<Intention> {

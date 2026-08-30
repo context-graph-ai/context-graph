@@ -15,6 +15,7 @@ use super::encode::{
     get_optional_txid, get_text, get_txid, get_uuid, intention_ids_from_json, properties_from_json,
     properties_to_json,
 };
+use super::graph_rows::GraphRows;
 use super::impact_analysis::decision_invalidation_context;
 use super::{
     distance_metric_from_str, evidence_kind_from_str, retention_status_from_str,
@@ -26,23 +27,7 @@ impl Store {
         &self,
         observation_id: ObservationId,
     ) -> Result<Vec<EvidenceRef>> {
-        let params = HashMap::from([(
-            "observation_id".to_string(),
-            Value::Uuid(observation_id.as_uuid()),
-        )]);
-        let result = self
-            .db
-            .execute(
-                evidence_select_sql("WHERE observation_id = $observation_id"),
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        let mut rows = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            rows.push(self.decode_evidence_with_latest_status(&result.columns, row)?);
-        }
-        rows.sort_by_key(|row| supply_order_for_evidence_id(&result, row.id).unwrap_or(i64::MAX));
-        Ok(rows)
+        list_evidence_for_observation(self.as_graph_rows(), observation_id)
     }
 
     pub fn get_evidence(&self, id: EvidenceId) -> Result<EvidenceRef> {
@@ -102,27 +87,7 @@ impl Store {
         &self,
         evidence_id: EvidenceId,
     ) -> Result<Vec<EvidenceAvailabilityLogRow>> {
-        let params = HashMap::from([(
-            "evidence_id".to_string(),
-            Value::Uuid(evidence_id.as_uuid()),
-        )]);
-        let result = self
-            .db
-            .execute(
-                "SELECT evidence_id, status, recorded_at_txid FROM evidence_availability_log WHERE evidence_id = $evidence_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        let mut rows = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            rows.push(EvidenceAvailabilityLogRow {
-                evidence_id: EvidenceId::from(get_uuid(row, &result.columns, "evidence_id")?),
-                status: retention_status_from_str(&get_text(row, &result.columns, "status")?)?,
-                recorded_at_txid: get_txid(row, &result.columns, "recorded_at_txid")?,
-            });
-        }
-        rows.sort_by_key(|row| row.recorded_at_txid);
-        Ok(rows)
+        evidence_availability_log(self.as_graph_rows(), evidence_id)
     }
 
     pub fn dereference_evidence(&self, evidence_id: EvidenceId) -> Result<EvidenceHandle> {
@@ -580,16 +545,7 @@ impl Store {
         columns: &[String],
         row: &[Value],
     ) -> Result<EvidenceRef> {
-        let mut evidence = decode_evidence(columns, row)?;
-        if let Some(status) = self.latest_evidence_status(evidence.id)? {
-            evidence.retention_status = status;
-        }
-        Ok(evidence)
-    }
-
-    fn latest_evidence_status(&self, evidence_id: EvidenceId) -> Result<Option<RetentionStatus>> {
-        let rows = self.evidence_availability_log(evidence_id)?;
-        Ok(rows.last().map(|row| row.status))
+        decode_evidence_with_latest_status(self.as_graph_rows(), columns, row)
     }
 
     pub(super) fn snapshot_by_id_at_read(
@@ -803,6 +759,89 @@ struct DecisionStatusAndContext {
     status: DecisionStatus,
     context_id: ContextId,
     confidence: Option<f64>,
+}
+
+/// The evidence one observation carries, in the order it was supplied, each row's retention status
+/// brought up to date from its availability log — as both doors answer it.
+///
+/// Reads `evidence` and `evidence_availability_log`.
+pub(super) fn list_evidence_for_observation(
+    source: &dyn GraphRows,
+    observation_id: ObservationId,
+) -> Result<Vec<EvidenceRef>> {
+    let params = HashMap::from([(
+        "observation_id".to_string(),
+        Value::Uuid(observation_id.as_uuid()),
+    )]);
+    let result = source.query_rows(
+        evidence_select_sql("WHERE observation_id = $observation_id"),
+        &params,
+    )?;
+    let mut rows = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        rows.push(decode_evidence_with_latest_status(
+            source,
+            &result.columns,
+            row,
+        )?);
+    }
+    rows.sort_by_key(|row| supply_order_for_evidence_id(&result, row.id).unwrap_or(i64::MAX));
+    Ok(rows)
+}
+
+/// Every retention status ever recorded for one piece of evidence, oldest first.
+///
+/// Reads `evidence_availability_log`.
+pub(super) fn evidence_availability_log(
+    source: &dyn GraphRows,
+    evidence_id: EvidenceId,
+) -> Result<Vec<EvidenceAvailabilityLogRow>> {
+    let params = HashMap::from([(
+        "evidence_id".to_string(),
+        Value::Uuid(evidence_id.as_uuid()),
+    )]);
+    let result = source.query_rows(
+        "SELECT evidence_id, status, recorded_at_txid FROM evidence_availability_log WHERE evidence_id = $evidence_id",
+        &params,
+    )?;
+    let mut rows = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        rows.push(EvidenceAvailabilityLogRow {
+            evidence_id: EvidenceId::from(get_uuid(row, &result.columns, "evidence_id")?),
+            status: retention_status_from_str(&get_text(row, &result.columns, "status")?)?,
+            recorded_at_txid: get_txid(row, &result.columns, "recorded_at_txid")?,
+        });
+    }
+    rows.sort_by_key(|row| row.recorded_at_txid);
+    Ok(rows)
+}
+
+/// One evidence row, with the retention status the availability log has last recorded for it. The
+/// stored column is the status the row was WRITTEN with; the log is what has happened to it since.
+///
+/// Reads `evidence_availability_log`.
+fn decode_evidence_with_latest_status(
+    source: &dyn GraphRows,
+    columns: &[String],
+    row: &[Value],
+) -> Result<EvidenceRef> {
+    let mut evidence = decode_evidence(columns, row)?;
+    if let Some(status) = latest_evidence_status(source, evidence.id)? {
+        evidence.retention_status = status;
+    }
+    Ok(evidence)
+}
+
+/// The most recently recorded retention status for one piece of evidence, if anything has been
+/// recorded at all.
+///
+/// Reads `evidence_availability_log`.
+fn latest_evidence_status(
+    source: &dyn GraphRows,
+    evidence_id: EvidenceId,
+) -> Result<Option<RetentionStatus>> {
+    let rows = evidence_availability_log(source, evidence_id)?;
+    Ok(rows.last().map(|row| row.status))
 }
 
 fn evidence_select_sql(where_clause: &str) -> &'static str {

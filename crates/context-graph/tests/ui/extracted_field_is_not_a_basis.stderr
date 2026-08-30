@@ -11,7 +11,7 @@ error[E0277]: the trait bound `String: From<ModelExtractedField>` is not satisfi
              `String` implements `From<Box<str>>`
              `String` implements `From<Cow<'_, str>>`
              `String` implements `From<char>`
-             `String` implements `From<compact_str::CompactString>`
-             `String` implements `From<der::asn1::utf8_string::Utf8StringRef<'_>>`
+             `String` implements `From<clap_builder::builder::str::Str>`
+             `String` implements `From<clap_builder::util::id::Id>`
            and $N others
    = note: required for `ModelExtractedField` to implement `Into<String>`

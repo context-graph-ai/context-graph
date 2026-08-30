@@ -134,6 +134,7 @@ fn run(args: Vec<String>) -> i32 {
     if let Some(message) = format_usage_error(&args) {
         return usage_error(&message);
     }
+    record_requested_format(&args);
     match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") => {
             print_help();
@@ -177,7 +178,7 @@ fn run(args: Vec<String>) -> i32 {
 
 fn print_help() {
     println!(
-        "Usage: cg <command>\n\nCommands:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  status                        Show model connection status\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n  worker [--poll-interval MS] [--budget N]\n                                Run this machine as a fabric understanding worker: dial the\n                                configured hub ticket, advertise capability, execute jobs other\n                                nodes submitted (needs cg/fabric.toml + a connected model)\n\nExamples:\n  cg model auth login --connection claude --consent\n  cg status\n  cg selftest\n  cg worker --poll-interval 2000 --budget 200000"
+        "Usage: cg <command>\n\nCommands:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  status                        Show model connection status and this machine's memory store\n                                state (a store that could not be read is reported as refused,\n                                never as an empty store)\n  sync <status|push|pull>       Sync this machine's memory store against a remote hub\n                                (--remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID)\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n  worker [--poll-interval MS] [--budget N]\n                                Run this machine as a fabric understanding worker: dial the\n                                configured hub ticket, advertise capability, execute jobs other\n                                nodes submitted (needs cg/fabric.toml + a connected model)\n\nExamples:\n  cg model auth login --connection claude --consent\n  cg status\n  cg selftest\n  cg worker --poll-interval 2000 --budget 200000"
     );
 }
 
@@ -3894,18 +3895,32 @@ fn handle_by_entity(args: &[String]) -> i32 {
 #[derive(Debug)]
 enum MemoryCliError {
     Store(String),
-    StoreLocked { holder_pid: u32, path: PathBuf },
+    /// A writer holds the store. The process id is optional because contextdb reports it only
+    /// when the holder published one: an unknown holder is reported unknown, never as pid 0.
+    StoreLocked {
+        holder_pid: Option<u64>,
+        path: PathBuf,
+    },
+    /// Direct readers are holding the store. Nothing is wrong with the machine — they finish and
+    /// the next attempt succeeds — and the condition already writes that for an operator: which
+    /// store, how many readers, each verified reader by name, and any holder it could not
+    /// identify. So the condition itself is carried, not a message rendered from it, and the
+    /// operator reads its own sentence rather than a Rust value.
+    StoreHeldByReaders(context_graph::CgError),
     Io(String),
     UseImportForSessionFiles,
 }
 
-/// Converts a store error into a CLI error, preserving the locked-store condition
-/// as a typed variant. A locked store is matched by type at the exit-code boundary,
-/// never by substring-matching the engine's Debug text.
+/// Converts a store failure — the open, or one of the reads that follows it — into a CLI error,
+/// preserving each busy condition as a typed variant. A busy store is matched by type at the
+/// exit-code boundary, never by substring-matching the engine's Debug text.
 fn map_store_open_err(err: context_graph::CgError) -> MemoryCliError {
     match err {
         context_graph::CgError::StoreLocked { holder_pid, path } => {
             MemoryCliError::StoreLocked { holder_pid, path }
+        }
+        held @ context_graph::CgError::StoreHeldByReaders { .. } => {
+            MemoryCliError::StoreHeldByReaders(held)
         }
         other => MemoryCliError::Store(format!("{other:?}")),
     }
@@ -3947,43 +3962,87 @@ struct FabricJobLine {
     receipt: Option<Value>,
 }
 
-fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot {
+/// The one post-open status read a test has asked to refuse.
+///
+/// `cg status` opening the store and THEN failing one of its metric reads is not reachable from
+/// outside the process, so what the CLI does with such a failure could not be pinned at all. This
+/// makes exactly the named read refuse and leaves the open itself untouched. It is compiled only
+/// under the `status-fault-injection` feature, which nothing but this package's dev-dependency on
+/// itself turns on — so a `cargo build` binary, debug or release, neither reads the variable nor
+/// contains its name.
+#[cfg(feature = "status-fault-injection")]
+fn injected_status_read_failure(read: &str) -> Result<(), MemoryCliError> {
+    match std::env::var("CG_FAIL_STATUS_METRIC_READ") {
+        Ok(named) if named == read => Err(map_store_open_err(context_graph::CgError::Engine(
+            format!("injected failure of the {read} status read"),
+        ))),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "status-fault-injection"))]
+fn injected_status_read_failure(_read: &str) -> Result<(), MemoryCliError> {
+    Ok(())
+}
+
+/// What `cg status` found, or why it could not look.
+///
+/// A refusal travels back as a typed error instead of being flattened into defaults: "goals: 0
+/// decisions: 0 observations: 0" is an ANSWER — it says the store was read and is empty — and
+/// printing it for a store that was never read tells a developer whose memory is intact that it is
+/// gone, and tells an agent deciding whether to capture that there is nothing to preserve.
+fn memory_status_snapshot(
+    root: &Path,
+    args: &[String],
+) -> Result<MemoryStatusSnapshot, MemoryCliError> {
     let db_path = memory_db_path(root);
     let context_label = memory_context_label(args);
     let mut context_id = None;
     let mut counts = HarvestCounts::default();
     let mut queue = tier0::QueueCounts::default();
     let mut raw = tier0::RawFootprint::default();
-    let mut raw_retention_days = None;
-    let mut last_understanding_run = None;
     let mut fabric = None;
     let mut fabric_jobs: Vec<FabricJobLine> = Vec::new();
     let last_injection = read_last_injection(root);
-    if let Ok(store) = open_memory_store(root) {
-        raw_retention_days = tier0::raw_retention_days(&store).unwrap_or(None);
-        last_understanding_run = tier0::get_local_setting(&store, LAST_UNDERSTANDING_RUN_KEY)
-            .ok()
-            .flatten()
+    let (raw_retention_days, last_understanding_run) = {
+        let store = open_memory_store(root)?;
+        injected_status_read_failure("retention")?;
+        let raw_retention_days = tier0::raw_retention_days(&store).map_err(map_store_open_err)?;
+        injected_status_read_failure("understanding_run")?;
+        // A store that HOLDS no last run says so by holding no row — that absence is an answer.
+        // A store that could not be asked is not that, and travels the same typed boundary every
+        // other status read does rather than being rendered as "never run".
+        let last_understanding_run = tier0::get_local_setting(&store, LAST_UNDERSTANDING_RUN_KEY)
+            .map_err(map_store_open_err)?
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
         // Fabric sharing posture — a renderer over library facts. Sharing ON is proven by input
         // material actually sitting in the outbound push set, never a displayed constant.
         if let Ok(Some(config)) = context_graph::fabric::FabricConfig::load(root) {
+            injected_status_read_failure("fabric_membership")?;
+            // Zero copies in the push set is a POSTURE an operator acts on — it says sharing is
+            // configured and nothing is queued. A read that failed is not that posture, so it is
+            // refused rather than displayed as one.
             let inputs_in_push_set =
-                context_graph::fabric::input_material_in_push_set(&store, &config).unwrap_or(0);
+                context_graph::fabric::input_material_in_push_set(&store, &config)
+                    .map_err(map_store_open_err)?;
             fabric = Some(FabricStatusLine {
                 sharing_on: config.sharing,
                 inputs_in_push_set,
             });
         }
-        if let Ok(contexts) = store.list_contexts()
-            && let Some(context) = contexts
-                .into_iter()
-                .find(|context| context.name == context_label)
+        if let Some(context) = store
+            .list_contexts()
+            .map_err(map_store_open_err)?
+            .into_iter()
+            .find(|context| context.name == context_label)
         {
             context_id = Some(context.id);
-            counts = memory_counts(&store, context.id).unwrap_or_default();
-            queue = queue_counts(&store, context.id).unwrap_or_default();
-            raw = raw_footprint(&store, context.id).unwrap_or_default();
+            injected_status_read_failure("counts")?;
+            counts = memory_counts(&store, context.id).map_err(map_store_open_err)?;
+            injected_status_read_failure("queue")?;
+            queue = queue_counts(&store, context.id).map_err(map_store_open_err)?;
+            injected_status_read_failure("raw")?;
+            raw = raw_footprint(&store, context.id).map_err(map_store_open_err)?;
             // Per-job fabric understanding state, read from the library under a REAL wall-clock: an
             // expired lease downgrades to pending in `job_statuses`, so the CLI must pass honest time
             // (never 0 or a stale value) or a dead worker's lease would masquerade as running.
@@ -3991,8 +4050,11 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_millis() as i64)
                 .unwrap_or(0);
+            injected_status_read_failure("fabric_jobs")?;
+            // "No fabric jobs" is what an operator reads when nothing was submitted. A ledger that
+            // could not be read says nothing about that, and must not be rendered as it.
             fabric_jobs = context_graph::fabric::job_statuses(&store, context.id, now_ms)
-                .unwrap_or_default()
+                .map_err(map_store_open_err)?
                 .into_iter()
                 .map(|status| FabricJobLine {
                     job_id: status.job_id,
@@ -4002,7 +4064,8 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
                 })
                 .collect();
         }
-    }
+        (raw_retention_days, last_understanding_run)
+    };
     let fabric_summary = fabric
         .as_ref()
         .map(|fabric| {
@@ -4052,7 +4115,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
         raw.chunk_count,
         raw.bytes,
     );
-    MemoryStatusSnapshot {
+    Ok(MemoryStatusSnapshot {
         db_path,
         context_label,
         context_id,
@@ -4065,7 +4128,7 @@ fn memory_status_snapshot(root: &Path, args: &[String]) -> MemoryStatusSnapshot 
         fabric,
         fabric_jobs,
         summary,
-    }
+    })
 }
 
 fn add_memory_status_fields(value: &mut Value, snapshot: &MemoryStatusSnapshot) {
@@ -5158,7 +5221,13 @@ fn print_memory_json(
         .get("rendered")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let summary = format_memory_summary_from_value(&value, context_label);
+    // A payload that already carries its own one-line summary keeps it. Deriving one from absent
+    // totals would print "goals: 0 decisions: 0 observations: 0" — the answer for a store that was
+    // read and is empty — over a payload that says the store was never read at all.
+    let summary = match value.get("summary").and_then(Value::as_str) {
+        Some(stated) => stated.to_string(),
+        None => format_memory_summary_from_value(&value, context_label),
+    };
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "store".to_string(),
@@ -5218,12 +5287,26 @@ fn memory_failure(
     context_label: &str,
     message: &str,
 ) -> i32 {
+    // The refusals are the answers an operator reads at the moment their memory looks gone, so
+    // they are the last answers that may ignore the format the caller asked for. Text carries the
+    // same three things the JSON document does — the condition a script branches on, the store the
+    // answer is about, and what happened — written as prose instead of as an escaped string field.
+    if requested_format() == OutputFormat::Text {
+        println!("condition: {condition}");
+        println!("store_path: {}", db_path.display());
+        println!("context: {context_label}");
+        println!("{message}");
+        return code;
+    }
     print_memory_json(
         json!({
             "ok": false,
             "condition": condition,
             "bucket": "memory",
             "message": message,
+            // The refusal IS the summary. A refused command has no totals, and a summary invented
+            // from their absence would tell a developer whose memory is intact that it is gone.
+            "summary": message,
         }),
         db_path,
         context_label,
@@ -5241,16 +5324,38 @@ fn memory_error(err: MemoryCliError, db_path: &Path, context_label: &str) -> i32
             context_label,
             "use `cg import` for session files",
         ),
-        MemoryCliError::StoreLocked { holder_pid, path } => memory_failure(
-            4,
-            "StoreBusy",
-            db_path,
-            context_label,
-            &format!(
-                "store busy / already in use: another process (pid {holder_pid}) holds {}",
-                path.display()
-            ),
-        ),
+        MemoryCliError::StoreLocked { holder_pid, path } => {
+            // An operator sent after "pid 0" goes looking for a process that is not there. When
+            // the holder published no process id, say so and leave them the store path, which is
+            // what they act on.
+            let holder = match holder_pid {
+                Some(holder_pid) => format!("another process (pid {holder_pid})"),
+                None => "another process (which has not published its pid)".to_string(),
+            };
+            memory_failure(
+                4,
+                "StoreBusy",
+                db_path,
+                context_label,
+                &format!(
+                    "store busy / already in use: {holder} holds {}",
+                    path.display()
+                ),
+            )
+        }
+        MemoryCliError::StoreHeldByReaders(condition) => {
+            // Handed on verbatim: the condition writes the whole sentence an operator acts on, so
+            // re-wording it here could only lose something. The exit code is the one this boundary
+            // already gives a refused command — a reader-held code of its own is a parked owner
+            // proposal, and inventing one here would settle it by accident.
+            memory_failure(
+                1,
+                "StoreHeldByReaders",
+                db_path,
+                context_label,
+                &condition.to_string(),
+            )
+        }
         MemoryCliError::Store(message) | MemoryCliError::Io(message) => {
             memory_failure(1, "MemoryError", db_path, context_label, &message)
         }
@@ -5618,7 +5723,7 @@ fn handle_model(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("--help") | Some("-h") => {
             println!(
-                "Usage: cg model <command>\n\nCommands:\n  connect       Register a named OpenAI-compatible BYOK endpoint\n  status        Show model connection status\n  selftest      Spend one consented proof call\n  auth login    Connect cg to an existing model host session\n  list          List registered models\n  show <id>     Show model metadata\n  fetch         Prefetch model artifacts into the local cache\n\nExamples:\n  cg model fetch --defaults\n  cg model connect openai --endpoint https://api.openai.com/v1 --api-key sk-... --consent\n  cg model status openai\n  cg model selftest openai"
+                "Usage: cg model <command>\n\nCommands:\n  connect       Register a named OpenAI-compatible BYOK endpoint\n  status        Show model connection status and this machine's memory store\n                state (a store that could not be read is reported as refused,\n                never as an empty store)\n  selftest      Spend one consented proof call\n  auth login    Connect cg to an existing model host session\n  list          List registered models\n  show <id>     Show model metadata\n  fetch         Prefetch model artifacts into the local cache\n\nExamples:\n  cg model fetch --defaults\n  cg model connect openai --endpoint https://api.openai.com/v1 --api-key sk-... --consent\n  cg model status openai\n  cg model selftest openai"
             );
             0
         }
@@ -6116,14 +6221,21 @@ fn raw_registration_entry(root: &Path, id: &str) -> Option<cg_catalog::CatalogEn
 fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
-            "Usage: cg status [CONNECTION] [--connection NAME] [--format json|text]\n\nExamples:\n  cg status\n  cg model status byok-openai --format text"
+            "Usage: cg status [CONNECTION] [--connection NAME] [--format json|text]\n\nReports two things in one command:\n  - whether cg is connected to a model, and\n  - the state of this machine's Context Graph memory store: context totals, the\n    understanding queue, the raw footprint and the fabric posture.\n\n`no model connection is active` is an answer about the model; the store beside it may\nbe perfectly healthy. An answer about the store carries \"bucket\": \"memory\" and the\nstore path it is about.\n\nWhen the store cannot be read, status says so and never prints `goals: 0 decisions: 0\nobservations: 0` — those totals mean the store WAS read and is empty. A store another\nprocess is writing is refused as `store busy / already in use` under condition\nStoreBusy with exit 4, naming the holder and the store. A store direct readers are\nstill holding is refused under condition StoreHeldByReaders. It names each\nverified reader by process id and name, and discloses any holder the store\nobserved and could not identify. Its numeric exit code is deliberately unsettled,\nso branch on the failure and the condition name rather than on a number.\n\nExamples:\n  cg status\n  cg model status byok-openai --format text"
         );
         return 0;
     }
     let format = output_format(args);
-    let memory_status = memory_status_snapshot(&data_root(), args);
-    let connection_args = strip_memory_args(args);
     let root = data_root();
+    let memory_status = match memory_status_snapshot(&root, args) {
+        Ok(snapshot) => snapshot,
+        // The store was not read, so there are no totals to print beside anything else: `cg status`
+        // gives the same typed answer here that every other command that opens the store gives.
+        Err(err) => {
+            return memory_error(err, &memory_db_path(&root), &memory_context_label(args));
+        }
+    };
+    let connection_args = strip_memory_args(args);
     if let Err(err) = try_load_provider_specs(&root, &[]) {
         return provider_spec_failure(&err);
     }
@@ -7493,6 +7605,14 @@ fn provider_spec_failure(error: &ProviderSpecLoadError) -> i32 {
 }
 
 fn failure(code: i32, condition: &str, bucket: &str, message: &str) -> i32 {
+    // `cg model status <connection> --format text` is one of the help text's own examples, and a
+    // refusal is an answer to it like any other.
+    if requested_format() == OutputFormat::Text {
+        println!("condition: {condition}");
+        println!("bucket: {bucket}");
+        println!("{message}");
+        return code;
+    }
     print_json(&json!({
         "condition": condition,
         "bucket": bucket,
@@ -7591,6 +7711,31 @@ fn model_id_is_available_for_connection(
 
 fn output_format(args: &[String]) -> OutputFormat {
     if flag_value(args, "--format").as_deref() == Some("text") {
+        OutputFormat::Text
+    } else {
+        OutputFormat::Json
+    }
+}
+
+/// Whether this invocation asked for prose.
+///
+/// `--format` is a request about the whole command line, not about one code path: an operator who
+/// asked for text asked for every answer in text, refusals included. The refusal renderers sit far
+/// below the argument parsing that reads the flag — `memory_failure` alone is reached from every
+/// command that opens the store — and threading the flag down each of those paths is what left the
+/// refusals rendering JSON at a text caller. The request is recorded once, where the command line
+/// is first seen, and read where an answer is written.
+static TEXT_RENDERING_WAS_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn record_requested_format(args: &[String]) {
+    TEXT_RENDERING_WAS_REQUESTED
+        .store(output_format(args) == OutputFormat::Text, Ordering::Relaxed);
+}
+
+/// The rendering this invocation asked for. JSON unless the command line said otherwise, which is
+/// also what a caller that never went through [`run`] gets.
+fn requested_format() -> OutputFormat {
+    if TEXT_RENDERING_WAS_REQUESTED.load(Ordering::Relaxed) {
         OutputFormat::Text
     } else {
         OutputFormat::Json
@@ -7740,6 +7885,23 @@ fn print_json(value: &Value) {
     );
 }
 
+/// Where cg keeps this machine's data.
+///
+/// One of the two LOCATIONS a `cg` install is configured with. `CG_DATA_ROOT` says where the data
+/// lives; contextdb's own `CONTEXTDB_OWNER_READ_RUNTIME_DIR` says which directory the owner channel
+/// lives in (see `context_graph::owner_control::owner_read_config`) — the one variable a container or a
+/// packaged service provisions so both sides of the owner plane meet in the same place. Those two
+/// are this binary's supported configuration surface: neither decides whether anything runs or
+/// what a read may spend, and `HOME` is read only to find `CG_DATA_ROOT`'s default.
+///
+/// This binary reads three further variables, and they are development affordances rather than
+/// configuration, named here rather than left for a reader to find: `CG_NO_UNDERSTAND_KICK`
+/// suppresses the background understanding worker (:870), `CG_USE_TEST_LEXICAL_EMBEDDER` swaps in
+/// the lexical mock embedder (:4249, :4281), and `CG_FAIL_STATUS_METRIC_READ` refuses one named
+/// `cg status` read. All three are inert unless set, and the last is compiled out of every build
+/// that is not a test build. The libraries below this binary take environment inputs of their own
+/// — the model cache root and the read-probe pair among them — so this list speaks for `main.rs`
+/// and claims nothing beyond it.
 fn data_root() -> PathBuf {
     env::var_os("CG_DATA_ROOT")
         .map(PathBuf::from)
@@ -7763,17 +7925,35 @@ mod tests {
     #[test]
     fn locked_store_maps_to_store_busy_exit_code() {
         let err = map_store_open_err(context_graph::CgError::StoreLocked {
-            holder_pid: 4242,
+            holder_pid: Some(4242),
             path: PathBuf::from("/data/cg/memory.db"),
         });
         assert!(matches!(
             err,
             MemoryCliError::StoreLocked {
-                holder_pid: 4242,
+                holder_pid: Some(4242),
                 ..
             }
         ));
         let code = memory_error(err, Path::new("/data/cg/memory.db"), "default");
         assert_eq!(code, 4);
+
+        // A holder that published no process id keeps the same exit code and the same typed
+        // variant: what is unknown stays unknown rather than being filled in.
+        let unknown = map_store_open_err(context_graph::CgError::StoreLocked {
+            holder_pid: None,
+            path: PathBuf::from("/data/cg/memory.db"),
+        });
+        assert!(matches!(
+            unknown,
+            MemoryCliError::StoreLocked {
+                holder_pid: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            memory_error(unknown, Path::new("/data/cg/memory.db"), "default"),
+            4
+        );
     }
 }

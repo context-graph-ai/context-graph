@@ -18,11 +18,13 @@ use super::encode::{
     properties_from_json, properties_to_json,
 };
 use super::evidence::{
-    embedding_target_uuid, producer_value, properties_value, validate_precomputed_embedding,
-    validate_space_kind, value_for_optional_evidence_id, value_for_optional_json,
-    value_for_optional_pair, value_for_optional_text, value_for_optional_timestamp,
-    value_for_optional_timestamp_nanos, value_for_optional_u64, vector_binding_for_target,
+    embedding_target_uuid, list_evidence_for_observation, producer_value, properties_value,
+    validate_precomputed_embedding, validate_space_kind, value_for_optional_evidence_id,
+    value_for_optional_json, value_for_optional_pair, value_for_optional_text,
+    value_for_optional_timestamp, value_for_optional_timestamp_nanos, value_for_optional_u64,
+    vector_binding_for_target,
 };
+use super::graph_rows::GraphRows;
 use super::impact_analysis::decision_invalidation_context;
 use super::{evidence_kind_str, retention_status_str};
 
@@ -308,55 +310,12 @@ impl Store {
         if self.read_observer.is_some() {
             self.observe_read_target("get_observation", Some(id.to_string()));
         }
-        if !id.is_valid() {
-            return Err(CgError::InvalidIdentity {
-                context: "ObservationId",
-            });
-        }
-        let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
-            .into_iter()
-            .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at FROM observations WHERE id = $id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        if result.rows.is_empty() {
-            return Err(CgError::NotFound {
-                id: Some(id.as_uuid().to_string()),
-                missing: Some("observation"),
-            });
-        }
-        let mut observation = decode_observation(&result.columns, &result.rows[0])?;
-        observation.evidence = self.list_evidence_for_observation(id)?;
-        Ok(observation)
+        get_observation(self.as_graph_rows(), id)
     }
 
     pub fn list_observations(&self, context_id: Option<ContextId>) -> Result<Vec<Observation>> {
         self.observe_read("list_observations");
-        let (sql, params) = if let Some(context_id) = context_id {
-            (
-                "SELECT id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at FROM observations WHERE context_id = $context_id",
-                HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
-            )
-        } else {
-            (
-                "SELECT id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at FROM observations",
-                HashMap::new(),
-            )
-        };
-        let result = self.db.execute(sql, &params).map_err(map_engine_err)?;
-        let mut observations = result
-            .rows
-            .iter()
-            .map(|row| decode_observation(&result.columns, row))
-            .collect::<Result<Vec<_>>>()?;
-        for observation in &mut observations {
-            observation.evidence = self.list_evidence_for_observation(observation.id)?;
-        }
-        Ok(observations)
+        list_observations(self.as_graph_rows(), context_id)
     }
 
     pub fn admin_overwrite_observation(
@@ -1738,6 +1697,68 @@ fn invalidation_severity_text(severity: InvalidationSeverity) -> &'static str {
         InvalidationSeverity::Warning => "warning",
         InvalidationSeverity::Critical => "critical",
     }
+}
+
+/// One observation by id, with the evidence it carries, as both doors answer it. An observation
+/// that is not in the store is a typed refusal rather than an absence: an observation is what a
+/// caller was pointed at, so "it is not there" is a fact about the pointer.
+///
+/// Reads `observations`, and through the evidence read `evidence` and
+/// `evidence_availability_log`.
+pub(crate) fn get_observation(rows: &dyn GraphRows, id: ObservationId) -> Result<Observation> {
+    if !id.is_valid() {
+        return Err(CgError::InvalidIdentity {
+            context: "ObservationId",
+        });
+    }
+    let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
+        .into_iter()
+        .collect();
+    let result = rows.query_rows(
+        "SELECT id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at FROM observations WHERE id = $id",
+        &params,
+    )?;
+    if result.rows.is_empty() {
+        return Err(CgError::NotFound {
+            id: Some(id.as_uuid().to_string()),
+            missing: Some("observation"),
+        });
+    }
+    let mut observation = decode_observation(&result.columns, &result.rows[0])?;
+    observation.evidence = list_evidence_for_observation(rows, id)?;
+    Ok(observation)
+}
+
+/// The observations in one context, or every observation in the store when no context is named,
+/// each with the evidence it carries.
+///
+/// Reads `observations`, and through the evidence read `evidence` and
+/// `evidence_availability_log`.
+pub(crate) fn list_observations(
+    rows: &dyn GraphRows,
+    context_id: Option<ContextId>,
+) -> Result<Vec<Observation>> {
+    let (sql, params) = if let Some(context_id) = context_id {
+        (
+            "SELECT id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at FROM observations WHERE context_id = $context_id",
+            HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
+        )
+    } else {
+        (
+            "SELECT id, observation_type, observed_properties, state_delta, properties, source, entity_id, context_id, timestamp, created_at FROM observations",
+            HashMap::new(),
+        )
+    };
+    let result = rows.query_rows(sql, &params)?;
+    let mut observations = result
+        .rows
+        .iter()
+        .map(|row| decode_observation(&result.columns, row))
+        .collect::<Result<Vec<_>>>()?;
+    for observation in &mut observations {
+        observation.evidence = list_evidence_for_observation(rows, observation.id)?;
+    }
+    Ok(observations)
 }
 
 fn decode_observation(columns: &[String], row: &[Value]) -> Result<Observation> {
