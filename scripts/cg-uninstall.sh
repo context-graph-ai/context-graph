@@ -2,7 +2,10 @@
 set -euo pipefail
 
 prefix="${CG_INSTALL_PREFIX:-/usr/local}"
-cache_root="${CG_MODEL_CACHE_ROOT:-$HOME/.cache/cg/models}"
+# The canonical resolver is context_graph::embedder::nomic::default_cache_root: the
+# override first, then $XDG_CACHE_HOME, then $HOME/.cache. Resolving it any other way
+# here would seed a directory cg never reads.
+cache_root="${CG_MODEL_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/cg/models}"
 cg_binary="${CG_BINARY:-$prefix/bin/cg}"
 
 clean_all_hooks() {

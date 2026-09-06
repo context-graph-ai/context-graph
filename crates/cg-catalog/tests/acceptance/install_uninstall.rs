@@ -6,6 +6,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// The environment variable the canonical model-cache resolver consults before `$HOME/.cache`.
+/// Every harness call below removes it, so a run on a machine that sets it exercises the same
+/// fallback the assertions describe rather than silently taking a different root.
+const XDG_CACHE_HOME_ENV: &str = "XDG_CACHE_HOME";
+
 const CG_HOOK_MARKER: &str = "# BEGIN cg-injected-hook-";
 const CLAUDE_AGENT: &str = "claude-code";
 const CURSOR_AGENT: &str = "cursor";
@@ -33,6 +38,7 @@ fn run_install(home: &Path, prefix: &Path, extra_args: &[&str]) -> Output {
         .args(extra_args)
         .env("HOME", home)
         .env_remove(CG_MODEL_CACHE_ROOT_ENV)
+        .env_remove(XDG_CACHE_HOME_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.output().expect("install script spawns")
@@ -44,6 +50,8 @@ fn run_uninstall(home: &Path, prefix: &Path, extra_args: &[&str]) -> Output {
     Command::new(uninstall)
         .args(extra_args)
         .env("HOME", home)
+        .env_remove(CG_MODEL_CACHE_ROOT_ENV)
+        .env_remove(XDG_CACHE_HOME_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -61,6 +69,8 @@ fn run_uninstall_with_stdin(
     let mut child = Command::new(uninstall)
         .args(extra_args)
         .env("HOME", home)
+        .env_remove(CG_MODEL_CACHE_ROOT_ENV)
+        .env_remove(XDG_CACHE_HOME_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -448,6 +458,94 @@ fn install_script_runs_on_linux_and_macos_and_emits_correct_cache_root_per_platf
         uninstall_content.contains(&expected_cache_root),
         "uninstall script should render platform-correct cache root {expected_cache_root}"
     );
+}
+
+/// What the installer seeds is what `cg` loads, on a machine that relocates its cache.
+///
+/// `XDG_CACHE_HOME` is set by default on Nix, on systemd-homed setups, and in containers that put
+/// caches on a mounted volume. The canonical resolver honours it; a script that hardcodes
+/// `$HOME/.cache` instead downloads 547 MB into a directory nothing reads, and then reports it
+/// removed the model cache while leaving the one in use on disk. The expectation here is the
+/// resolver's own answer under the same environment, never a literal, so the script and the
+/// library rule cannot drift apart again.
+#[test]
+fn the_installer_seeds_the_model_cache_root_the_library_reads_when_the_cache_home_is_relocated() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let xdg_cache = temp.path().join("xdg-cache");
+    let prefix = temp.path().join("prefix");
+    fs::create_dir_all(&home).expect("home created");
+    fs::create_dir_all(&xdg_cache).expect("xdg cache created");
+
+    let install = Command::new("bash")
+        .arg(install_script())
+        .arg("--prefix")
+        .arg(&prefix)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", &xdg_cache)
+        .env_remove(CG_MODEL_CACHE_ROOT_ENV)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("install script spawns");
+    assert_success(&install, "install with a relocated cache home");
+
+    let expected_root = cache_root_resolved_by_the_library(&home, Some(&xdg_cache));
+    assert_eq!(
+        expected_root,
+        xdg_cache.join("cg/models"),
+        "the library's own resolver must put the model cache under XDG_CACHE_HOME when it is set; \
+         if this changed, the installer expectation below has to change with it"
+    );
+
+    let uninstall_content =
+        fs::read_to_string(prefix.join("cg-uninstall.sh")).expect("uninstall script readable");
+    let expected_line = format!("CACHE_ROOT=\"{}\"", expected_root.display());
+    assert!(
+        uninstall_content.contains(&expected_line),
+        "the installer must seed, and the uninstaller it writes must remove, the exact directory \
+         the library reads ({}); otherwise a prefetch downloads the model twice and an uninstall \
+         leaves the copy in use behind. Uninstaller says:\n{uninstall_content}",
+        expected_root.display()
+    );
+}
+
+/// The model-cache root `cg_catalog::default_cache_root()` resolves under a given environment,
+/// read by calling it with that environment in place rather than by restating its rule.
+fn cache_root_resolved_by_the_library(home: &Path, xdg_cache_home: Option<&Path>) -> PathBuf {
+    static ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENVIRONMENT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let saved_home = std::env::var_os("HOME");
+    let saved_xdg = std::env::var_os(XDG_CACHE_HOME_ENV);
+    let saved_override = std::env::var_os(CG_MODEL_CACHE_ROOT_ENV);
+    // SAFETY: serialized by ENVIRONMENT_LOCK above and restored before returning.
+    unsafe {
+        std::env::set_var("HOME", home);
+        std::env::remove_var(CG_MODEL_CACHE_ROOT_ENV);
+        match xdg_cache_home {
+            Some(path) => std::env::set_var(XDG_CACHE_HOME_ENV, path),
+            None => std::env::remove_var(XDG_CACHE_HOME_ENV),
+        }
+    }
+    let resolved = cg_catalog::default_cache_root();
+    // SAFETY: same lock, restoring the exact prior state including "was unset".
+    unsafe {
+        match saved_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_xdg {
+            Some(value) => std::env::set_var(XDG_CACHE_HOME_ENV, value),
+            None => std::env::remove_var(XDG_CACHE_HOME_ENV),
+        }
+        match saved_override {
+            Some(value) => std::env::set_var(CG_MODEL_CACHE_ROOT_ENV, value),
+            None => std::env::remove_var(CG_MODEL_CACHE_ROOT_ENV),
+        }
+    }
+    resolved
 }
 
 #[test]

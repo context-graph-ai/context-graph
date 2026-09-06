@@ -1,0 +1,15 @@
+# The gate profile: one JUnit measurement per run, so the wall-clock arm has real seconds to
+# compare against `[gate_wall_seconds]` in
+# crates/context-graph/tests/fixtures/test_estate_baseline.toml. `scripts/gate.sh` and the CI
+# workflow both select it by name, so both produce the measurement the same way.
+[profile.gate]
+fail-fast = false
+# A test that never returns must not hold the run open forever: without a bound it runs until the
+# job's own limit kills everything, and the measurement this profile exists to produce is lost with
+# it. The slowest test that actually finishes takes 85.8s on the reference machine, so a test is
+# reported as slow at each minute and killed at ten — roughly seven times the slowest real test,
+# which leaves room for a slower machine while still bounding a hang.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[profile.gate.junit]
+path = "junit.xml"

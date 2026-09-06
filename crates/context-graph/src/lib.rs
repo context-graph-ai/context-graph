@@ -38,7 +38,9 @@ pub use consumer_read::graph::ConsumerGraphView;
 pub use consumer_read::{ConsumerDeclaration, ConsumerReader};
 pub use contextdb_core::{ScopeLabel, TxId};
 pub use embedder::{
-    Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput, ModelSource,
+    Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput,
+    EventSearchCapability, EventSearchEmbedder, EventSearchInference, EventSearchRole, ModelSource,
+    PreparedEventSearchDocument, PreparedEventSearchQuery,
     load_observer::{EmbedderLoadEvent, EmbedderLoadObserver},
 };
 pub use error::{CgError, ReaderIdentity};

@@ -98,11 +98,17 @@ const OPAQUE_INTERPRETER_COMMANDS: &[&str] = &[
 const SAFE_GITHUB_HOSTED_RUNNERS: &[&str] = &["ubuntu-latest", "macos-latest", "windows-latest"];
 const CONTEXT_GRAPH_WORKING_DIRECTORY: &str = "workspace/context-graph";
 const CONTEXT_GRAPH_CHECKOUT_PATH: &str = "workspace/context-graph";
+const CONTEXT_GRAPH_CHECKOUT_FETCH_DEPTH: i64 = 0;
 const CONTEXTDB_CHECKOUT_PATH: &str = "workspace/contextdb";
 const CONTEXTDB_REPOSITORY: &str = "context-graph-ai/contextdb";
 const CONTEXTDB_REF_EXPRESSION: &str =
     "${{ github.event_name == 'workflow_dispatch' && inputs.contextdb_sha || 'dev' }}";
-const AUDIT_TOOL_INSTALL_SPECS: &[&str] = &["cargo-deny@0.20.2", "cargo-expand@1.0.124"];
+const MODEL_CACHE_ROOT_REFERENCE: &str = "${{ env.CG_MODEL_CACHE_ROOT }}";
+const AUDIT_TOOL_INSTALL_SPECS: &[&str] = &[
+    "cargo-deny@0.20.2",
+    "cargo-expand@1.0.124",
+    "cargo-nextest@0.9.140",
+];
 const VETTED_AUDIT_RUN_LINES: &[&str] = &[
     "require_file_without_match() {",
     "local pattern=\"$1\"",
@@ -146,6 +152,41 @@ const EXACT_REVISION_VERIFIER_LINES: &[&str] = &[
     "fi",
     "printf 'Context Graph SHA: %s\\n' \"$context_graph_sha\"",
     "printf 'ContextDB SHA: %s\\n' \"$contextdb_sha\"",
+];
+const EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES: &[&str] = &[
+    "if [[ ! \"$CONTEXTDB_SHA\" =~ ^[0-9a-f]{40}$ ]]; then",
+    "echo \"contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA\" >&2",
+    "exit 1",
+    "fi",
+];
+const VETTED_COLD_MISS_MODEL_SEED_LINES: &[&str] = &[
+    "rustup run stable cargo run -p context-graph-cli --bin cg -- model fetch --defaults",
+    "rustup run stable cargo test -p context-graph --test nomic_document_preparer_adds_exactly_one_system_task_prefix",
+];
+const VETTED_OFFLINE_REAL_MODEL_PROOF_LINES: &[&str] = &[
+    "rustup run stable cargo test -p context-graph \\",
+    "--test nomic_document_preparer_adds_exactly_one_system_task_prefix \\",
+    "--test nomic_query_preparer_adds_exactly_one_system_task_prefix \\",
+    "--test event_search_uses_role_preparation_while_digest_record_and_evidence_paths_remain_byte_for_byte_unchanged",
+];
+const VETTED_DOCUMENTATION_CLAIM_VALIDATION_LINES: &[&str] = &[
+    "base=\"${DOCUMENTATION_BASE_SHA:-HEAD^}\"",
+    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
+    "base=\"HEAD^\"",
+    "fi",
+    "git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null",
+    "printf 'comparing the touched doc files against %s\\n' \"$base\"",
+    "python3 scripts/validate-doc-coverage.py --base \"$base\"",
+    "bash scripts/check-doc-validator-negative-control.sh",
+];
+const VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES: &[&str] = &[
+    "base=\"${DOCUMENTATION_BASE_SHA:-HEAD^}\"",
+    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
+    "base=\"HEAD^\"",
+    "fi",
+    "git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null",
+    "printf 'comparing the gate wall-clock baseline against %s\\n' \"$base\"",
+    "python3 scripts/check-gate-wall-clock.py --base \"$base\"",
 ];
 
 fn workspace_root() -> std::path::PathBuf {
@@ -399,6 +440,14 @@ fn yaml_explicit_false(value: &Value) -> bool {
     match value {
         Value::Bool(value) => !value,
         Value::String(value) => value.trim().eq_ignore_ascii_case("false"),
+        _ => false,
+    }
+}
+
+fn yaml_explicit_integer(value: &Value, expected: i64) -> bool {
+    match value {
+        Value::Number(value) => value.as_i64() == Some(expected),
+        Value::String(value) => value.trim().parse::<i64>().ok() == Some(expected),
         _ => false,
     }
 }
@@ -1246,7 +1295,7 @@ fn step_uses_can_mask_command_lookup(step: &Mapping) -> bool {
         None => false,
         Some("actions/checkout@v4") => checkout_inputs_can_shadow_workspace(step),
         Some("taiki-e/install-action@v2") => {
-            !step_tool_set_equals(step, &["cargo-deny", "cargo-expand"])
+            !step_tool_set_equals(step, &["cargo-deny", "cargo-expand", "cargo-nextest"])
         }
         Some("actions/cache@v4") => cache_inputs_can_shadow_workspace_or_command_lookup(step),
         Some("Swatinem/rust-cache@v2") => rust_cache_inputs_can_shadow_command_lookup(step),
@@ -1262,9 +1311,12 @@ fn checkout_inputs_can_shadow_workspace(step: &Mapping) -> bool {
 fn step_is_credential_free_context_graph_checkout(step: &Mapping) -> bool {
     step_uses(step) == Some("actions/checkout@v4")
         && step_with_fields(step).is_some_and(|with| {
-            with.len() == 2
+            with.len() == 3
                 && mapping_get(with, "path").and_then(yaml_string)
                     == Some(CONTEXT_GRAPH_CHECKOUT_PATH)
+                && mapping_get(with, "fetch-depth").is_some_and(|value| {
+                    yaml_explicit_integer(value, CONTEXT_GRAPH_CHECKOUT_FETCH_DEPTH)
+                })
                 && mapping_get(with, "persist-credentials").is_some_and(yaml_explicit_false)
         })
 }
@@ -1318,21 +1370,7 @@ fn cache_path_is_model_cache_only(value: &Value) -> bool {
 }
 
 fn allowed_model_cache_path(path: &str) -> bool {
-    [
-        "~/.cache/cg/embedders",
-        "~/AppData/Local/cg/embedders",
-        "~/Library/Caches/cg/embedders",
-        "$HOME/.cache/cg/embedders",
-        "${HOME}/.cache/cg/embedders",
-        "$HOME/AppData/Local/cg/embedders",
-        "${HOME}/AppData/Local/cg/embedders",
-        "$HOME/Library/Caches/cg/embedders",
-        "${HOME}/Library/Caches/cg/embedders",
-        "$LOCALAPPDATA/cg/embedders",
-        "${LOCALAPPDATA}/cg/embedders",
-    ]
-    .iter()
-    .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    path == MODEL_CACHE_ROOT_REFERENCE
 }
 
 fn collect_yaml_string_lines<'a>(value: &'a Value, lines: &mut Vec<&'a str>) {
@@ -1397,24 +1435,46 @@ fn step_working_directory_can_shadow_workspace(
             != Some(CONTEXT_GRAPH_WORKING_DIRECTORY)
 }
 
+/// Whether anything in the workflow can change what the shell resolves as `cargo` — anywhere, in
+/// any job, at any position.
+///
+/// A command-lookup mutation is not local to the step that carries it: once `GITHUB_PATH`, `PATH`
+/// or `BASH_ENV` is redirected, every command that runs afterwards resolves through the redirected
+/// directory, so format, lint and `cargo test --workspace` can all be faked green by a mutation
+/// dropped after the step this audit is guarding. The scan therefore covers the whole document and
+/// exempts only the exact vetted runs, matched line for line — never by name, prefix or substring.
 fn workflow_command_lookup_can_mask_failures(workflow: &Value) -> bool {
     if value_mapping_get(workflow, "env").is_some_and(env_overrides_command_lookup) {
         return true;
     }
 
-    workflow_step_contexts(workflow).iter().any(|(job, step)| {
+    workflow_job_steps(workflow).iter().any(|(job, steps)| {
         job_runtime_can_mask_command_lookup(job)
             || mapping_get(job, "env").is_some_and(env_overrides_command_lookup)
-            || mapping_get(step, "env").is_some_and(env_overrides_command_lookup)
-            || step_uses_can_mask_command_lookup(step)
-            || step_run(step).is_some_and(|run| {
-                !run_is_vetted_audit_run(run)
-                    && !run_is_exact_revision_verifier(run)
-                    && all_run_shell_lines(run)
-                        .into_iter()
-                        .any(shell_line_mutates_command_lookup)
+            || steps.iter().any(|step| {
+                mapping_get(step, "env").is_some_and(env_overrides_command_lookup)
+                    || step_uses_can_mask_command_lookup(step)
+                    || step_run(step).is_some_and(|run| {
+                        !run_is_vetted_command_lookup_run(run)
+                            && all_run_shell_lines(run)
+                                .into_iter()
+                                .any(shell_line_mutates_command_lookup)
+                    })
             })
     })
+}
+
+/// The exact runs allowed to carry a line the command-lookup scan would otherwise flag, matched as
+/// whole line sequences so a vetted run cannot be widened by editing one line inside it.
+fn run_is_vetted_command_lookup_run(run: &str) -> bool {
+    let lines = active_run_lines(run);
+    lines == EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES
+        || lines == EXACT_REVISION_VERIFIER_LINES
+        || lines == VETTED_AUDIT_RUN_LINES
+        || lines == VETTED_COLD_MISS_MODEL_SEED_LINES
+        || lines == VETTED_OFFLINE_REAL_MODEL_PROOF_LINES
+        || lines == VETTED_DOCUMENTATION_CLAIM_VALIDATION_LINES
+        || lines == VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES
 }
 
 fn job_runtime_can_mask_command_lookup(job: &Mapping) -> bool {
@@ -1561,9 +1621,14 @@ fn prior_steps_prepare_audit_tools(
         && prior_steps
             .iter()
             .any(|step| step_uses_safe_rust_cache(workflow, job, step))
-        && prior_steps
-            .iter()
-            .any(|step| step_installs_tools(workflow, job, step, &["cargo-deny", "cargo-expand"]))
+        && prior_steps.iter().any(|step| {
+            step_installs_tools(
+                workflow,
+                job,
+                step,
+                &["cargo-deny", "cargo-expand", "cargo-nextest"],
+            )
+        })
         && prior_steps
             .iter()
             .all(|step| prior_step_can_precede_audit(workflow, job, step))
@@ -1577,7 +1642,12 @@ fn prior_step_can_precede_audit(workflow: &Value, job: &Mapping, step: &Mapping)
         || step_pins_stable_rust_toolchain(workflow, job, step)
         || step_uses_safe_rust_cache(workflow, job, step)
         || step_uses_safe_model_cache(workflow, job, step)
-        || step_installs_tools(workflow, job, step, &["cargo-deny", "cargo-expand"])
+        || step_installs_tools(
+            workflow,
+            job,
+            step,
+            &["cargo-deny", "cargo-expand", "cargo-nextest"],
+        )
 }
 
 fn workflow_has_enforcing_audit_run_with_setup(
@@ -1765,12 +1835,12 @@ fn ci_workflow_model_cache_key_hashes_pinned_revision_constant_source_file_not_c
         .into_iter()
         .filter(|step| {
             step_with_field(step, "path")
-                .is_some_and(|path| yaml_field_contains(path, "cg/embedders"))
+                .is_some_and(|path| yaml_field_contains(path, MODEL_CACHE_ROOT_REFERENCE))
         })
         .collect::<Vec<_>>();
     assert!(
-        !model_cache_steps.is_empty(),
-        "workflow should define a visible embedder model cache"
+        model_cache_steps.len() == 1,
+        "workflow should define exactly one model cache at CG_MODEL_CACHE_ROOT"
     );
     for step in model_cache_steps {
         let key = step_with_field(step, "key").expect("model cache key");
@@ -1991,9 +2061,9 @@ fn deny_toml_exists_at_workspace_root_with_bans_licenses_advisories_sources_sect
                 &yaml,
                 job,
                 step,
-                &["cargo-deny", "cargo-expand"]
+                &["cargo-deny", "cargo-expand", "cargo-nextest"]
             )),
-        "workflow should install cargo-deny and cargo-expand through taiki-e/install-action@v2 in an unconditional failure-loud step"
+        "workflow should install cargo-deny, cargo-expand and cargo-nextest through taiki-e/install-action@v2 in an unconditional failure-loud step"
     );
     let steps = workflow_steps(&yaml);
     assert!(
@@ -2061,5 +2131,116 @@ fn cargo_deny_check_runs_clean_against_current_main_crate_dep_graph_and_fails_lo
         "cargo deny check with deny.toml failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The job step carrying the vetted dependency-audit run, together with the job it lives in.
+fn vetted_audit_step_context(workflow: &Value) -> (&Mapping, &Mapping) {
+    workflow_step_contexts(workflow)
+        .into_iter()
+        .find(|(_, step)| step_run(step).is_some_and(run_is_vetted_audit_run))
+        .expect("the workflow must carry the vetted dependency-audit run step")
+}
+
+/// A pull request must not be able to fake a green format, lint, or workspace-test run by changing
+/// what the shell resolves as `cargo`. The rule that makes that true is that the command-lookup
+/// audit inspects the WHOLE job: a `GITHUB_PATH` mutation dropped anywhere in the job — including
+/// after the dependency audit and immediately before `cargo test --workspace` — must blank the
+/// audit's guards and turn the suite red.
+///
+/// This drives the rule the only way it can be driven: it takes the real checked-in workflow,
+/// confirms the audit reads it as clean, injects exactly that mutation at the workspace-test
+/// position, and requires the audit to report the guarded audit step as maskable afterwards. An
+/// audit that stops scanning at the step it is guarding never sees the injected mutation and
+/// reports clean, which is the regression this proof exists to catch.
+#[test]
+fn ci_command_lookup_audit_covers_a_mutation_inserted_after_the_audit_step_and_before_workspace_tests()
+ {
+    let mut workflow = read_workflow_yaml();
+
+    // Panics unless the workflow carries the vetted dependency-audit run this proof injects around.
+    vetted_audit_step_context(&workflow);
+    assert!(
+        !workflow_command_lookup_can_mask_failures(&workflow),
+        "the checked-in workflow must start with no command-lookup mutation reported, so the \
+         injected one below is the only thing that can change the verdict"
+    );
+
+    let mutation_run = "printf '%s\\n' \"$RUNNER_TEMP/shadow-bin\" >> \"$GITHUB_PATH\"";
+    assert!(
+        shell_line_mutates_command_lookup(mutation_run),
+        "the audit's line classifier must recognize the injected GITHUB_PATH mutation"
+    );
+
+    let mut injected = false;
+    {
+        let jobs = workflow
+            .as_mapping_mut()
+            .and_then(|workflow| workflow.get_mut(Value::String("jobs".to_string())))
+            .and_then(Value::as_mapping_mut)
+            .expect("workflow jobs map");
+        for job_value in jobs.values_mut() {
+            let Some(steps) = job_value
+                .as_mapping_mut()
+                .and_then(|job| job.get_mut(Value::String("steps".to_string())))
+                .and_then(Value::as_sequence_mut)
+            else {
+                continue;
+            };
+            let audit_index = steps.iter().position(|step| {
+                step.as_mapping()
+                    .and_then(step_run)
+                    .is_some_and(run_is_vetted_audit_run)
+            });
+            let lint_index = steps.iter().position(|step| {
+                step.as_mapping().and_then(step_run).is_some_and(|run| {
+                    run.trim()
+                        == "rustup run stable cargo clippy --workspace --all-targets -- -D warnings"
+                })
+            });
+            let workspace_test_index = steps.iter().position(|step| {
+                step.as_mapping()
+                    .and_then(step_run)
+                    .is_some_and(|run| run.trim() == "rustup run stable cargo test --workspace")
+            });
+            let (Some(audit_index), Some(lint_index), Some(workspace_test_index)) =
+                (audit_index, lint_index, workspace_test_index)
+            else {
+                continue;
+            };
+            assert!(
+                audit_index < lint_index && lint_index < workspace_test_index,
+                "the real workflow must place the dependency audit before lint and the workspace \
+                 tests, otherwise this proof is injecting the mutation somewhere it would already \
+                 be scanned"
+            );
+
+            let mut mutation_step = Mapping::new();
+            mutation_step.insert(
+                Value::String("run".to_string()),
+                Value::String(mutation_run.to_string()),
+            );
+            steps.insert(workspace_test_index, Value::Mapping(mutation_step));
+            assert_eq!(
+                steps[workspace_test_index].as_mapping().and_then(step_run),
+                Some(mutation_run),
+                "the mutation must sit immediately before cargo test --workspace"
+            );
+            injected = true;
+            break;
+        }
+    }
+    assert!(
+        injected,
+        "the real workflow must expose one job containing the dependency audit, lint, and the \
+         workspace tests"
+    );
+
+    assert!(
+        workflow_command_lookup_can_mask_failures(&workflow),
+        "the command-lookup audit must inspect the whole job and reject a GITHUB_PATH mutation \
+         inserted after the dependency audit and between lint and cargo test --workspace; an \
+         audit that stops at the step it guards leaves format, lint and the workspace tests \
+         resolvable through an attacker-supplied directory"
     );
 }

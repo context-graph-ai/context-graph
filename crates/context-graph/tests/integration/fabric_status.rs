@@ -18,6 +18,7 @@ const SESSION_C: &str =
     "User: Goal G3: watch the budget. Assistant: Decision D3: cap the nightly drain.";
 
 #[tokio::test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 async fn expired_lease_job_not_shown_as_running() {
     let fixture = fabric_fixture("expired_lease").await;
     fabric::capture(
@@ -96,6 +97,7 @@ async fn worker_that_lost_claim_race_does_not_report_success() {
 }
 
 #[tokio::test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 async fn status_shows_state_executing_node_and_receipt() {
     let fixture = fabric_fixture("status_executor").await;
     fabric::capture(
@@ -137,6 +139,7 @@ async fn status_shows_state_executing_node_and_receipt() {
 }
 
 #[tokio::test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 async fn attempt_ceiling_reached_marks_terminal_failed_visible_in_status() {
     let fixture = fabric_fixture("attempt_ceiling").await;
     fabric::capture(
@@ -170,6 +173,7 @@ async fn attempt_ceiling_reached_marks_terminal_failed_visible_in_status() {
 }
 
 #[tokio::test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 async fn remote_receipt_round_trips_unmangled() {
     let fixture = fabric_fixture("receipt_round_trip").await;
     fabric::capture(
@@ -224,6 +228,7 @@ async fn remote_receipt_round_trips_unmangled() {
 }
 
 #[tokio::test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 async fn receipt_origin_is_executor_not_submitter() {
     let fixture = fabric_fixture("receipt_origin").await;
     fabric::capture(

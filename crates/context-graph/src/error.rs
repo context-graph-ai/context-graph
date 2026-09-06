@@ -185,6 +185,76 @@ pub enum CgError {
         space_id: String,
     },
     TextEmbedderDisabled,
+    /// An embedder was asked for role-aware event-search preparation (`prepare_document`,
+    /// `embed_prepared_document`, `prepare_query`, `embed_prepared_query`) and does not implement
+    /// it. The default trait methods answer this instead of silently falling back to plain-text
+    /// embedding, so a caller never gets an unlabelled vector back under an event-search space id.
+    EventSearchPreparationUnsupported {
+        embedding_space_id: String,
+    },
+    /// A prepared event-search document or query was sealed under one embedder's encoding
+    /// profile and handed to a different embedder's `embed_prepared_document`/`embed_prepared_query`.
+    /// Every embedder's own preparation stays honored; a mismatched profile is refused rather than
+    /// run through inference the sealing embedder never agreed to.
+    ///
+    /// The bundled text model answers the same way when inference authorized for another
+    /// embedder's encoding, or for the other role, is relayed into its own inference hooks: the
+    /// vector it would produce carries the reserved event-history identity, which promises tokens
+    /// this model itself prepared. Prepare and embed on one embedder — the text you meant to embed
+    /// under that encoding must go through that embedder's own `prepare_document`/`prepare_query`
+    /// first.
+    EventSearchPreparationProfileMismatch {
+        expected_profile: String,
+        actual_profile: String,
+    },
+    /// [`crate::embedder::nomic::EventHistoryTextEmbedder::over`]/`registration` refuse to build
+    /// the canonical event-history registration over an underlying embedder that cannot actually
+    /// serve it: a non-768 dimension, a config that can fetch, an explicitly non-canonical
+    /// revision pin, or a missing or invalid local artifact. Admission verifies the canonical
+    /// revision marker and local files directly and never fetches or loads the model solely to
+    /// decide registration. `reason` names which check failed.
+    EventHistoryEmbedderConstructionRefused {
+        reason: String,
+    },
+    /// `EventHistoryTextEmbedder::embed` (the plain, non-role [`crate::embedder::Embedder::embed`]
+    /// entrypoint) refuses to guess whether the caller meant the document or the query role — a
+    /// caller must go through the checked `prepare_document`/`embed_prepared_document` or
+    /// `prepare_query`/`embed_prepared_query` entrypoints of the sealed
+    /// [`crate::embedder::EventSearchEmbedder`] extension trait instead — bring it into scope with
+    /// `use context_graph::EventSearchEmbedder;` and call them on whatever embedder handle you
+    /// hold.
+    EventHistoryPlainEmbedRequiresExplicitRole,
+    /// [`crate::embedder::EventSearchDocumentBuilder::seal`]/
+    /// [`crate::embedder::EventSearchQueryBuilder::seal`] refuse to produce a structurally
+    /// invalid sealed value: an omitted `token_count`, omitted `payload`, omitted
+    /// `byte_boundaries` (document role only), or a `token_count` inconsistent with `payload`'s
+    /// length must each be reported here rather than panicking the host or silently defaulting.
+    /// `reason` names which check failed.
+    EventSearchPreparedValueInvalid {
+        reason: String,
+    },
+    /// Store registration and the checked `prepare_document`/`prepare_query` and
+    /// `embed_prepared_document`/`embed_prepared_query` entrypoints on the sealed
+    /// [`crate::embedder::EventSearchEmbedder`] extension trait refuse an
+    /// embedder that declares the canonical event-history profile without having the exact
+    /// library-controlled Nomic raw or event-history wrapper runtime type at canonical dimension.
+    /// Object layout and forwarding from a genuine embedder do not authorize another type.
+    /// `declared_profile` names the unverifiable declaration.
+    EventHistoryProfileIdentityUnverified {
+        declared_profile: String,
+    },
+    /// The checked, library-owned `embed_prepared_document`/`embed_prepared_query` entrypoints on
+    /// the sealed [`crate::embedder::EventSearchEmbedder`] extension trait refuse a prepared value
+    /// whose exact `token_count` exceeds that same
+    /// embedder's declared [`crate::embedder::Embedder::event_search_capability`] — enforced once,
+    /// for every embedder, before any implementer hook runs, rather than left to each hook's own
+    /// discretion. Role-neutral and distinct from the pre-existing
+    /// [`CgError::TranscriptTooLargeForModel`], which stays bound to the unrelated legacy
+    /// plain-embedding path.
+    PreparedInputExceedsModelLimit {
+        token_count: usize,
+        limit: usize,
+    },
     EmbedderModelNotAvailable {
         source: String,
         path: String,
@@ -457,6 +527,17 @@ impl fmt::Display for CgError {
             CgError::ReadOnlySurfaceRefusedWrite { statement } => write!(
                 f,
                 "this is a read-only reading surface and will not run a statement that changes the store: {statement}"
+            ),
+            CgError::EventSearchPreparationUnsupported { embedding_space_id } => write!(
+                f,
+                "the embedder for `{embedding_space_id}` does not do role-aware event-search preparation, so it cannot encode a passage or a search phrase for event history; it will not fall back to unlabelled plain-text embedding"
+            ),
+            CgError::EventSearchPreparationProfileMismatch {
+                expected_profile,
+                actual_profile,
+            } => write!(
+                f,
+                "this text was prepared for `{actual_profile}` and cannot be embedded by `{expected_profile}`; prepare it with the same embedder that will embed it"
             ),
             _ => write!(f, "{self:?}"),
         }

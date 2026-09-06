@@ -5767,8 +5767,15 @@ A staged copy next to the cache is seeded without re-downloading."
         return 0;
     }
     let format = output_format(args);
-    let root = data_root();
-    let catalog = match Catalog::open_with_scope_against_root(&root, CONNECTION_SCOPE) {
+    // Fetch reads registrations from the same place `cg model show` does — the data root — and
+    // places the artifact bytes it downloads under the canonical model-cache root the embedder
+    // later loads from offline. Those are two different locations whenever the operator sets them
+    // apart, so fetch is given both rather than resolving registrations through the cache root.
+    let catalog = match Catalog::open_with_scope_against_roots(
+        data_root(),
+        cg_catalog::default_cache_root(),
+        CONNECTION_SCOPE,
+    ) {
         Ok(catalog) => catalog,
         Err(err) => return failure(1, "catalog_open_failed", "config", &format!("{err:?}")),
     };

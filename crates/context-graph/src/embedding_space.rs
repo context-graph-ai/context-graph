@@ -10,6 +10,10 @@ impl BuiltinSpaceRegistry {
     pub const TEXT_DEFAULT_MODEL_NAME: &'static str = "nomic-embed-text-v1.5";
     pub const TEXT_DEFAULT_MODEL_VERSION: &'static str = "1.5";
     pub const TEXT_DEFAULT_DIMENSION: usize = 768;
+    /// The dedicated event-history search space: role-aware (document/query) Nomic preparation,
+    /// never compared with [`Self::TEXT_DEFAULT_ID`].
+    pub const EVENT_HISTORY_DOCUMENT_QUERY_ID: &'static str =
+        "event_history_nomic_v1_5_document_query_v1_768";
 
     pub(crate) fn text_space_id_for_dimension(dimension: usize) -> String {
         if dimension == Self::TEXT_DEFAULT_DIMENSION {
@@ -22,6 +26,31 @@ impl BuiltinSpaceRegistry {
 
 pub fn default_text_embedding_space() -> EmbeddingSpace {
     text_nomic_space(BuiltinSpaceRegistry::TEXT_DEFAULT_DIMENSION, true)
+}
+
+/// The canonical, production declaration of the dedicated event-history search space: 768
+/// dimensions, cosine metric, the same Nomic text-embedding model identity as
+/// [`default_text_embedding_space`], the `Text` evidence kind, and no default claim on any
+/// evidence kind (`default_for_evidence_kind: None`) — it is never the implicit destination for
+/// plain `Embedder::embed` calls, only for the role-aware event-search preparation surface.
+///
+/// Its bindings are empty here: the physical passage table this space eventually binds to
+/// (`event_search_passages.vector_text`) lands with that table in a later arc. Declaring it with
+/// no bindings now registers the space's identity and dimension without claiming ownership of any
+/// existing table's vector column, so it never contends with the Digest/Evidence
+/// [`default_text_embedding_space`] for `evidence.vector_text` or `digests.vector_text`.
+pub fn event_history_embedding_space() -> EmbeddingSpace {
+    EmbeddingSpace {
+        embedding_space_id: BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID.to_string(),
+        dimension: BuiltinSpaceRegistry::TEXT_DEFAULT_DIMENSION,
+        metric: DistanceMetric::Cosine,
+        model_family: BuiltinSpaceRegistry::TEXT_DEFAULT_MODEL_FAMILY.to_string(),
+        model_name: BuiltinSpaceRegistry::TEXT_DEFAULT_MODEL_NAME.to_string(),
+        model_version: BuiltinSpaceRegistry::TEXT_DEFAULT_MODEL_VERSION.to_string(),
+        supported_evidence_kinds: vec![EvidenceKind::Text],
+        default_for_evidence_kind: None,
+        bindings: Vec::new(),
+    }
 }
 
 pub(crate) fn text_nomic_space(dimension: usize, default_for_text: bool) -> EmbeddingSpace {

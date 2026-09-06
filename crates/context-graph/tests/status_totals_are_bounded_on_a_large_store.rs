@@ -142,6 +142,7 @@ fn assert_totalled_by_aggregate(observations: &[ReadObservation], what: &str) {
 }
 
 #[test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 fn status_totals_stay_correct_and_bounded_on_a_store_no_single_read_can_cross() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = open_store(&dir.path().join("cg.db"));

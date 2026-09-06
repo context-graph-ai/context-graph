@@ -33,11 +33,24 @@ Routing, in the words a change usually arrives in:
 - A new model to embed with — `candle-embeddinggemma` or `cg-vision-embedder`, or a crate of the
   consumer's own. Every embedder implements `context_graph::Embedder` and is registered into a
   store as an embedding space. Never author a second embedding abstraction beside that trait.
+- The **event-history search space** — `event_history_nomic_v1_5_document_query_v1_768`, where
+  imported history is encoded with Nomic's document/query task instruction — is declared in
+  `crates/context-graph/src/embedding_space.rs` (`event_history_embedding_space`) and answered for
+  by the thin wrapper `EventHistoryTextEmbedder` over the same loaded model, in
+  `crates/context-graph/src/embedder/nomic.rs`. It carries **no table binding yet**: the physical
+  passage target `event_search_passages.vector_text` lands in the same change as that table, and
+  until then the space is registrable but bound to nothing, which is what keeps it from contending
+  with the text-default space for `evidence.vector_text` or `digests.vector_text`. A change to
+  which prefix is added, to the space's identifier, or to that deferred binding is a change to
+  those two files.
 - The **bundled default** text embedder — `nomic-embed-text-v1.5`, the one a `cg` install gets
   without asking — is not a sibling crate: it lives inside `context-graph` itself, at
   `crates/context-graph/src/embedder/nomic.rs`, behind the default feature `nomic-embedder`
   (`crates/context-graph/Cargo.toml`). Changing which model ships by default, its space name, or
   how it fetches and caches its weights is a change to that file, not to `candle-embeddinggemma`.
+  Where those weights live is one rule in that same file, `default_cache_root`; `cg-catalog` and
+  the `cg model fetch` command delegate to it, so a second cache-root rule anywhere is the defect
+  that makes a fetched model unloadable.
 
 The core is what vigil and WASM targets link, so a node's ordinary on-disk work — reading a
 per-node config file, holding the worker lock — lives one layer out, in
@@ -60,6 +73,11 @@ here, or move the code. Note that a grep for `std::fs` does not find all of thes
 `crates/context-graph/src/embedder/nomic.rs` imports it as `fs as file_system`.
 
 ## Invariants
+
+### One embedding trait; roles ride it; sealing is the library's
+
+Owned by the `context-graph` crate. See `crates/context-graph/AGENTS.md` for the trait, its
+role-aware preparation hooks, the sealing mechanism, and every guarding test.
 
 ### Administrative requests go through the owner-only door
 
@@ -188,3 +206,49 @@ cg understanding is hosted (bring your own key). A proposal to add a local under
 a product decision, not an engineering choice: take it to the governing hosted-understanding
 product documents and the workspace model-and-runtime strategy reference, and name the fact that
 changed. Do not restate or re-derive that policy in this file.
+
+## Fast test command and gate
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace` are the gate every change passes before a commit, release, or "done"
+claim. `scripts/gate.sh` runs that sequence end to end and adds the checks that need a
+measurement or a base ref: it writes a JUnit file from its own test run, hands it to the
+wall-clock arm through `CG_GATE_JUNIT`, then runs `scripts/check-gate-wall-clock.py` in both
+modes, `scripts/validate-doc-coverage.py --base` (`GATE_BASE`, default `origin/dev`), and
+`scripts/check-doc-validator-negative-control.sh`, which requires that validator to still fail on
+a repository carrying a dead reference and an unbound claim.
+`cargo test --workspace` carries four mechanically-enforced arms alongside the ordinary
+behavior proofs:
+
+- **Test-estate ratchet** — `crates/context-graph/tests/test_estate_audit.rs` freezes the current
+  sleep/raw-clock call sites and the default-tier test count per crate. The two arms move in
+  different directions: sleep/raw-clock sites only ever decrease, and a new site fails the audit;
+  per-crate test counts track the estate exactly, so a change that adds tests raises the count in
+  the same change — which is what puts the new tests under the ratchet — and only a deliberate,
+  named removal lowers one.
+- **Documentation-claim binding** — `crates/context-graph/tests/doc_claim_bindings.rs` reimplements
+  the always-on, subprocess-free subset of `scripts/validate-doc-coverage.py`: it resolves every
+  `<!-- enforced by: `test_name` -->` tag in `README.md`, `crates/*/README.md`, `docs/*.md` (if
+  present), and `skills/**/SKILL.md` (if present) against a live default-tier Rust test function
+  (including parameterized Tokio tests), and enforces the unbound-claim rule for
+  `crates/context-graph/README.md`. The Python script is run separately by CI or humans with
+  `--changed-files` or `--base` for the repository-wide unbound-claim check on a changed-file/base
+  diff. They implement the same rule and must be updated together; the Rust test does not launch
+  the Python script.
+- **Agent-facing docs pointer check** —
+  `crates/context-graph/tests/agents_md_names_only_paths_that_exist.rs` requires every path this
+  file names to exist, and every path each crate's own `AGENTS.md` names, and requires the crate
+  table above to name every crate in `crates/` and no directory that is not one. It requires a
+  crate-level `AGENTS.md` from `cg-catalog` and `cg-cli` only; the other five crates carry none
+  yet, and adding one is how a crate joins that list.
+- **Gate wall-clock ratchet** — `[gate_wall_seconds]` in
+  `crates/context-graph/tests/fixtures/test_estate_baseline.toml` freezes the wall seconds each
+  test binary took, and `[gate_wall_seconds_policy]` declares how far a fresh measurement may
+  drift. The comparison never reads a clock: it reads seconds a JUnit file already recorded.
+  `scripts/gate.sh` runs `scripts/check-gate-wall-clock.py` in both modes: `--base <ref>` refuses
+  a baseline value that rose, and `--junit` refuses a binary over its ceiling. Both
+  `scripts/gate.sh` and `.github/workflows/ci.yml` run the ignored arm
+  `gate_wall_seconds_never_exceed_the_frozen_baseline` by name against the JUnit named in
+  `CG_GATE_JUNIT`. Both measure their own run with the `gate` nextest profile checked in at
+  `.config/nextest.toml`, so the arm always has real seconds to read; an unreadable measurement
+  fails the arm rather than passing it.

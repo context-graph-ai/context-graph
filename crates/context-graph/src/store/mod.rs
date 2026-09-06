@@ -924,6 +924,10 @@ fn validate_embedder_registrations(registrations: &[EmbedderRegistration]) -> Re
                 embedding_space_id: registration.space.embedding_space_id.clone(),
             });
         }
+        crate::embedder::verify_event_history_authority(
+            registration.embedder.as_ref(),
+            &registration.space.embedding_space_id,
+        )?;
     }
     Ok(())
 }
