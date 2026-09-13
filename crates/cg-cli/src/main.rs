@@ -31,13 +31,12 @@ use context_graph::harness::{
 use context_graph::ingest::{
     CaptureReport, CaptureRequest, ConversationExtractor, DecisionRelationClassification,
     DecisionRelationRequest, DecisionRelationSeed, ExtractionPriorDecision, ExtractionRequest,
-    HarvestCounts, ImportParser, StructuredHarvest, changed_since_context_cursor,
-    digest_source_ids_for_context, memory_counts, parser_for_format, standing_impact,
+    HarvestCounts, StructuredHarvest, changed_since_context_cursor, digest_source_ids_for_context,
+    memory_counts, standing_impact,
 };
 use context_graph::injection::{INJECTION_TOKEN_BUDGET, build_injection_index};
 use context_graph::tier0::{
-    self, ForgetReport, ForgetSelector, Tier0CaptureReport, Tier0CaptureRequest, bump_touch,
-    forget_raw, queue_counts, raw_footprint,
+    self, Tier0CaptureReport, Tier0CaptureRequest, bump_touch, queue_counts, raw_footprint,
 };
 use context_graph::understanding::{
     MAX_UNDERSTANDING_ATTEMPTS, claim_digest, list_pending_digests, mark_failed, mark_structured,
@@ -60,13 +59,9 @@ use fs4::fs_std::FileExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod history;
+
 const INGESTION_EXPECTATION: &str = "automatic capture is ready for cg record and cg import";
-const DEFAULT_IMPORT_MODEL_CONTEXT_TOKENS: usize = 131_072;
-const DEFAULT_IMPORT_CONTEXT_FRACTION: f32 = 0.5;
-const DEFAULT_IMPORT_CHUNK_WINDOW: usize = 16_000;
-const IMPORT_PROMPT_OVERHEAD_TOKENS: usize = 4_096;
-const IMPORT_OUTPUT_BUDGET_TOKENS: usize = 4_096;
-const IMPORT_RUNNING_STATE_CAP_TOKENS: usize = 4_096;
 const CONNECTION_SCOPE: &str = "connection-substrate";
 const RELATION_OUTPUT_SCHEMA: &str = r#"{
   "type": "object",
@@ -146,8 +141,13 @@ fn run(args: Vec<String>) -> i32 {
         }
         Some("model") => handle_model(&args[1..]),
         Some("record") => handle_record(&args[1..]),
-        Some("import") => handle_import(&args[1..]),
-        Some("forget") => handle_forget(&args[1..]),
+        Some("import") => history::handle_import(&args[1..]),
+        Some("find") => history::handle_find(&args[1..]),
+        Some("show") => history::handle_show(&args[1..]),
+        Some("forget") => history::handle_forget(&args[1..]),
+        Some(command) if command == history::WORKER_COMMAND => {
+            history::handle_event_search_worker(&args[1..])
+        }
         Some("understand") => handle_understand(&args[1..]),
         Some("worker") => handle_worker(&args[1..]),
         Some("query") => handle_query(&args[1..]),
@@ -156,7 +156,7 @@ fn run(args: Vec<String>) -> i32 {
         Some("changed") => handle_changed(&args[1..]),
         Some("by-intention") => handle_by_intention(&args[1..]),
         Some("by-entity") => handle_by_entity(&args[1..]),
-        Some("status") => handle_status(&args[1..], StatusSurface::HostSessionLegacy),
+        Some("status") => history::handle_status(&args[1..]),
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::HostSessionLegacy),
         Some("doctor") => handle_doctor(&args[1..]),
         Some("disconnect") => handle_disconnect(&args[1..]),
@@ -178,7 +178,7 @@ fn run(args: Vec<String>) -> i32 {
 
 fn print_help() {
     println!(
-        "Usage: cg <command>\n\nCommands:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  status                        Show model connection status and this machine's memory store\n                                state (a store that could not be read is reported as refused,\n                                never as an empty store)\n  sync <status|push|pull>       Sync this machine's memory store against a remote hub\n                                (--remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID)\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n  worker [--poll-interval MS] [--budget N]\n                                Run this machine as a fabric understanding worker: dial the\n                                configured hub ticket, advertise capability, execute jobs other\n                                nodes submitted (needs cg/fabric.toml + a connected model)\n\nExamples:\n  cg model auth login --connection claude --consent\n  cg status\n  cg selftest\n  cg worker --poll-interval 2000 --budget 200000"
+        "Usage: cg <command>\n\nModels and fabric:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  model status                  Show the model connection and the memory store it serves\n  sync <status|push|pull>       Sync this machine's memory store against a remote hub\n                                (--remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID)\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n  worker [--poll-interval MS] [--budget N]\n                                Run this machine as a fabric understanding worker: dial the\n                                configured hub ticket, advertise capability, execute jobs other\n                                nodes submitted (needs cg/fabric.toml + a connected model)\n\nConversation history (Claude Code sessions, stored in this machine's Context Graph store):\n  import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer]\n                                Capture a project's Claude Code history, then make it searchable\n  find <question> [--context NAME[,NAME...] | --all-contexts]\n                                Search imported history; returns passages, never an answer\n  show <passage-id>             Show the exact stored events behind one `cg find` passage\n  status [--context NAME[,NAME...] | --all-contexts]\n                                Read this machine's Context Graph memory store without changing\n                                it: graph memory, captured history and search readiness (the\n                                model connection is `cg model status`)\n  forget --session <ref> | --context NAME\n                                Delete imported history and everything derived from it\n\nEvery command writes JSON by default; --format text selects the human rendering.\n\nExamples:\n  cd ~/projects/my-app && cg import .\n  cg find \"why did we change the retry policy?\" --format text\n  cg show <passage-id> --format text\n  cg status --format text\n  cg forget --session <ref>\n  cg model auth login --connection claude --consent"
     );
 }
 
@@ -344,464 +344,6 @@ fn handle_record(args: &[String]) -> i32 {
         mark_first_capture_loaded(&root);
     }
     print_tier0_report(&report, elapsed, &db_path, &context_label, context.id);
-    maybe_kick_understanding_worker(args);
-    0
-}
-
-fn handle_import(args: &[String]) -> i32 {
-    let root = data_root();
-    let db_path = memory_db_path(&root);
-    let context_label = memory_context_label(args);
-    let Some(path) = memory_positional_args(args).first().map(PathBuf::from) else {
-        return usage_error("import requires one session file");
-    };
-    if memory_positional_args(args).len() > 1 {
-        return memory_failure(
-            2,
-            "ImportSingleFileOnly",
-            &db_path,
-            &context_label,
-            "single file only - bulk import is a later capability (Plan 22)",
-        );
-    }
-    if path.is_dir() {
-        // Directory sweep: import every *.jsonl under the folder at tier-0 (deterministic, $0). The
-        // daily-loop front door for a whole session folder — one aggregate receipt, understanding
-        // deferred to the queue.
-        return handle_import_directory(args, &root, &db_path, &context_label, &path);
-    }
-    if path.to_string_lossy().contains('*') {
-        return memory_failure(
-            2,
-            "ImportGlobUnsupported",
-            &db_path,
-            &context_label,
-            "glob patterns are not supported - pass a single file or a directory to sweep",
-        );
-    }
-    if !path.exists() {
-        return memory_failure(
-            2,
-            "ImportPathNotFound",
-            &db_path,
-            &context_label,
-            &format!("ImportPathNotFound: {}", path.display()),
-        );
-    }
-    let format = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default();
-    let parser = match parser_for_format(format) {
-        Ok(parser) => parser,
-        Err(err) => {
-            return memory_failure(
-                2,
-                "UnsupportedImportFormat",
-                &db_path,
-                &context_label,
-                &format!("UnsupportedImportFormat: {err:?}"),
-            );
-        }
-    };
-    let chunk_options = match import_chunk_options(args, &root) {
-        Ok(options) => options,
-        Err(message) => {
-            return memory_failure(
-                2,
-                "InvalidImportChunking",
-                &db_path,
-                &context_label,
-                &message,
-            );
-        }
-    };
-    if has_flag(args, "--estimate") {
-        // The estimate is zero-outbound. It reports both the tier-0 truth (the default capture is
-        // deterministic and free — zero model calls, $0) AND the projected cost of the opt-in eager
-        // (`--understand-now`) run, so a caller can preview what understanding would cost before
-        // spending. `provider_calls` is the estimate's own outbound count (always 0); the projected
-        // eager cost is in `projected_tokens` / `elapsed_ms`.
-        let mut chunks = 0usize;
-        let mut raw_bytes = 0u64;
-        if let Err(err) = stream_import_chunks(&path, parser.as_ref(), chunk_options, |chunk| {
-            chunks += 1;
-            raw_bytes += chunk.len() as u64;
-            Ok(())
-        }) {
-            return cg_failure(err, &db_path, &context_label);
-        }
-        let projected_tokens = chunks as u64 * 1290;
-        let projected_elapsed = Duration::from_millis(750) * chunks.max(1) as u32;
-        print_memory_json(
-            json!({
-                "ok": true,
-                "tier": "tier-0",
-                "estimate": {
-                    "chunks": chunks,
-                    "digests": chunks,
-                    "resolved_chunk_window": chunk_options.resolved_chunk_window,
-                    "model_context_tokens": chunk_options.model_context_tokens,
-                    "context_fraction": chunk_options.context_fraction,
-                    "model_calls": 0,
-                    "provider_calls": 0,
-                    "cost_usd": 0.0,
-                    "raw_bytes": raw_bytes,
-                    "projected_tokens": projected_tokens,
-                    "elapsed_ms": projected_elapsed.as_millis() as u64,
-                },
-                "captured": counts_json(&HarvestCounts::default()),
-                "totals": counts_json(&HarvestCounts::default()),
-                "message": "estimate: default tier-0 capture is zero model calls / $0; projected fields preview the --understand-now eager cost",
-                "rendered": format!(
-                    "import estimate: {chunks} chunks / {chunks} digests, 0 model calls on default, $0"
-                ),
-            }),
-            &db_path,
-            &context_label,
-            None,
-        );
-        return 0;
-    }
-    if has_flag(args, "--dry-run") {
-        let chunks = match stream_import_chunks(&path, parser.as_ref(), chunk_options, |_| Ok(())) {
-            Ok(chunks) => chunks,
-            Err(err) => return cg_failure(err, &db_path, &context_label),
-        };
-        print_memory_json(
-            json!({
-                "ok": true,
-                "dry_run": true,
-                "path": path.display().to_string(),
-                "chunks": chunks,
-                "resolved_chunk_window": chunk_options.resolved_chunk_window,
-                "model_context_tokens": chunk_options.model_context_tokens,
-                "context_fraction": chunk_options.context_fraction,
-                "captured": counts_json(&HarvestCounts::default()),
-                "totals": counts_json(&HarvestCounts::default()),
-                "message": "dry run: no writes",
-            }),
-            &db_path,
-            &context_label,
-            None,
-        );
-        return 0;
-    }
-    let store = match open_memory_store(&root) {
-        Ok(store) => store,
-        Err(err) => return memory_error(err, &db_path, &context_label),
-    };
-    let context = match ensure_cli_context(&store, &context_label) {
-        Ok(context) => context,
-        Err(err) => return cg_failure(err, &db_path, &context_label),
-    };
-    let no_share = has_flag(args, "--no-share");
-    let fabric_config = match FabricConfig::load(&root) {
-        Ok(config) => config,
-        Err(err) => return cg_failure(err, &db_path, &context_label),
-    };
-    // Eager opt-in (`--understand-now`): the SAME two-step understanding path the background worker
-    // runs, in the foreground. Deterministic tier-0 capture of the reconstructed session (N per-chunk
-    // verbatim digests + queue rows), THEN a blocking drain of exactly those digests through the
-    // queue drainer. One understanding implementation; no duplicate synchronous pipeline. Multi-chunk
-    // imports now keep N per-chunk digests each understood in its own pass — no rolling condensation,
-    // so both ends survive with no decay.
-    if has_flag(args, "--understand-now") {
-        let source_chunks =
-            match collect_import_source_chunks(&path, parser.as_ref(), chunk_options) {
-                Ok(chunks) => chunks,
-                Err(err) => return cg_failure(err, &db_path, &context_label),
-            };
-        let transcript = source_chunks.join("\n");
-        let request = Tier0CaptureRequest {
-            context_label: context_label.clone(),
-            session_ref: capture_session_ref(args, Some(&path)),
-            transcript,
-            source: "cg-import".to_string(),
-            chunk_window: chunk_options.max_chars,
-        };
-        let tier0 = match run_fabric_capture(&store, fabric_config.as_ref(), no_share, request) {
-            Ok(report) => report,
-            Err(err) => return cg_failure(err, &db_path, &context_label),
-        };
-        write_last_record_tx(
-            &root,
-            context.id,
-            max_pending_invalidation_tx(&store, context.id),
-        );
-        let import_chunks = Some(tier0.digest_ids.len().max(1));
-        let resolved_chunk_window = Some(chunk_options.resolved_chunk_window);
-        let model_context_tokens = Some(chunk_options.model_context_tokens);
-        if memory_capture_connection_name(&root).is_none() {
-            // No connected model: tier-0 kept the verbatim digests; nothing to understand.
-            print_understand_now_no_graph(
-                &store,
-                context.id,
-                "model-free capture: kept verbatim tier-0 digests, no derived graph",
-                import_chunks,
-                resolved_chunk_window,
-                model_context_tokens,
-                &db_path,
-                &context_label,
-            );
-            return 0;
-        }
-        return understand_now_foreground(
-            &root,
-            &store,
-            &context_label,
-            context.id,
-            &tier0.digest_ids,
-            import_chunks,
-            resolved_chunk_window,
-            model_context_tokens,
-            &db_path,
-        );
-    }
-    // `cg import` is a thin caller of the tier-0 library capture path, exactly like `cg record`. It
-    // reconstructs the session into bounded source chunks (clean word-boundary splits at the
-    // resolved chunk window), joins them into the capture transcript, and drives deterministic
-    // tier-0 capture: a verbatim digest + raw chunk + queue row per chunk, one atomic transaction,
-    // ZERO model calls even when a model is connected. Understanding is deferred to the queue
-    // drainer, so a whole session imports free and instantly.
-    let source_chunks = match collect_import_source_chunks(&path, parser.as_ref(), chunk_options) {
-        Ok(chunks) => chunks,
-        Err(err) => return cg_failure(err, &db_path, &context_label),
-    };
-    let started = Instant::now();
-    let transcript = source_chunks.join("\n");
-    let session_ref = capture_session_ref(args, Some(&path));
-    let request = Tier0CaptureRequest {
-        context_label: context_label.clone(),
-        session_ref,
-        transcript,
-        source: "cg-import".to_string(),
-        chunk_window: chunk_options.max_chars,
-    };
-    let report = match run_fabric_capture(&store, fabric_config.as_ref(), no_share, request) {
-        Ok(report) => report,
-        Err(err) => return cg_failure(err, &db_path, &context_label),
-    };
-    let elapsed = started.elapsed();
-    write_last_record_tx(
-        &root,
-        context.id,
-        max_pending_invalidation_tx(&store, context.id),
-    );
-    print_tier0_report(&report, elapsed, &db_path, &context_label, context.id);
-    maybe_kick_understanding_worker(args);
-    0
-}
-
-/// Recursively collect every `*.jsonl` file under `dir`, sorted for deterministic sweep order.
-fn collect_jsonl_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        for entry in fs::read_dir(&current)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-            {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-/// Sweep a whole session folder at tier-0: import every `*.jsonl` under the directory through the
-/// SAME deterministic capture path a single file uses, aggregating one receipt. Zero model calls,
-/// $0, idempotent (the per-file content-hash dedup means a re-sweep writes nothing new).
-/// `--estimate` sums the per-file zero-outbound projection. Understanding is deferred to the queue,
-/// so a `cg import <dir>` is followed by `cg understand`.
-fn handle_import_directory(
-    args: &[String],
-    root: &Path,
-    db_path: &Path,
-    context_label: &str,
-    dir: &Path,
-) -> i32 {
-    let parser = match parser_for_format("jsonl") {
-        Ok(parser) => parser,
-        Err(err) => {
-            return memory_failure(
-                2,
-                "UnsupportedImportFormat",
-                db_path,
-                context_label,
-                &format!("UnsupportedImportFormat: {err:?}"),
-            );
-        }
-    };
-    let chunk_options = match import_chunk_options(args, root) {
-        Ok(options) => options,
-        Err(message) => {
-            return memory_failure(2, "InvalidImportChunking", db_path, context_label, &message);
-        }
-    };
-    let files = match collect_jsonl_files(dir) {
-        Ok(files) => files,
-        Err(err) => {
-            return memory_failure(
-                2,
-                "ImportDirUnreadable",
-                db_path,
-                context_label,
-                &format!("could not read directory {}: {err}", dir.display()),
-            );
-        }
-    };
-    if files.is_empty() {
-        return memory_failure(
-            2,
-            "ImportDirNoSessions",
-            db_path,
-            context_label,
-            &format!("no .jsonl session files found under {}", dir.display()),
-        );
-    }
-
-    if has_flag(args, "--estimate") {
-        // Zero-outbound: sum each file's chunk/byte projection. Tier-0 sweep is always $0.
-        let mut files_counted = 0usize;
-        let mut chunks = 0usize;
-        let mut raw_bytes = 0u64;
-        for file in &files {
-            if let Err(err) = stream_import_chunks(file, parser.as_ref(), chunk_options, |chunk| {
-                chunks += 1;
-                raw_bytes += chunk.len() as u64;
-                Ok(())
-            }) {
-                return cg_failure(err, db_path, context_label);
-            }
-            files_counted += 1;
-        }
-        let projected_tokens = chunks as u64 * 1290;
-        let projected_elapsed = Duration::from_millis(750) * chunks.max(1) as u32;
-        print_memory_json(
-            json!({
-                "ok": true,
-                "tier": "tier-0",
-                "directory": dir.display().to_string(),
-                "estimate": {
-                    "files": files_counted,
-                    "chunks": chunks,
-                    "digests": chunks,
-                    "resolved_chunk_window": chunk_options.resolved_chunk_window,
-                    "model_context_tokens": chunk_options.model_context_tokens,
-                    "context_fraction": chunk_options.context_fraction,
-                    "model_calls": 0,
-                    "provider_calls": 0,
-                    "cost_usd": 0.0,
-                    "raw_bytes": raw_bytes,
-                    "projected_tokens": projected_tokens,
-                    "elapsed_ms": projected_elapsed.as_millis() as u64,
-                },
-                "captured": counts_json(&HarvestCounts::default()),
-                "totals": counts_json(&HarvestCounts::default()),
-                "message": "estimate: default tier-0 directory sweep is zero model calls / $0; projected fields preview the eager cost",
-                "rendered": format!(
-                    "import estimate: {files_counted} files / {chunks} chunks / {chunks} digests, 0 model calls, $0"
-                ),
-            }),
-            db_path,
-            context_label,
-            None,
-        );
-        return 0;
-    }
-
-    let store = match open_memory_store(root) {
-        Ok(store) => store,
-        Err(err) => return memory_error(err, db_path, context_label),
-    };
-    let context = match ensure_cli_context(&store, context_label) {
-        Ok(context) => context,
-        Err(err) => return cg_failure(err, db_path, context_label),
-    };
-    let no_share = has_flag(args, "--no-share");
-    let fabric_config = match FabricConfig::load(root) {
-        Ok(config) => config,
-        Err(err) => return cg_failure(err, db_path, context_label),
-    };
-    let started = Instant::now();
-    let mut files_imported = 0usize;
-    let mut digests_written = 0usize;
-    let mut chunks_kept = 0usize;
-    let mut skipped_existing = 0usize;
-    let mut skipped_noise = 0usize;
-    let mut raw_bytes = 0usize;
-    let mut pending_after = 0usize;
-    for file in &files {
-        let source_chunks = match collect_import_source_chunks(file, parser.as_ref(), chunk_options)
-        {
-            Ok(chunks) => chunks,
-            Err(err) => return cg_failure(err, db_path, context_label),
-        };
-        let transcript = source_chunks.join("\n");
-        let request = Tier0CaptureRequest {
-            context_label: context_label.to_string(),
-            session_ref: capture_session_ref(args, Some(file)),
-            transcript,
-            source: "cg-import".to_string(),
-            chunk_window: chunk_options.max_chars,
-        };
-        let report = match run_fabric_capture(&store, fabric_config.as_ref(), no_share, request) {
-            Ok(report) => report,
-            Err(err) => return cg_failure(err, db_path, context_label),
-        };
-        files_imported += 1;
-        digests_written += report.digests_written;
-        chunks_kept += report.chunks_kept;
-        skipped_existing += report.skipped_existing;
-        skipped_noise += report.skipped_noise;
-        raw_bytes += report.raw_bytes;
-        pending_after = report.pending_after;
-    }
-    let elapsed = started.elapsed();
-    write_last_record_tx(
-        root,
-        context.id,
-        max_pending_invalidation_tx(&store, context.id),
-    );
-    let rendered = format!(
-        "swept {files_imported} session files: captured {digests_written} digests ({chunks_kept} raw chunks kept, {skipped_existing} already present) — 0 model calls, $0, {pending_after} pending understanding"
-    );
-    print_memory_json(
-        json!({
-            "ok": true,
-            "tier": "tier-0",
-            "directory": dir.display().to_string(),
-            "receipt": {
-                "files": files_imported,
-                "model_calls": 0,
-                "cost_usd": 0.0,
-                "elapsed_ms": elapsed.as_millis() as u64,
-                "digests": digests_written,
-                "chunks_kept": chunks_kept,
-                "skipped_existing": skipped_existing,
-                "skipped_noise": skipped_noise,
-                "raw_bytes": raw_bytes,
-                "pending": pending_after,
-            },
-            "captured": counts_json(&HarvestCounts::default()),
-            "totals": counts_json(&HarvestCounts::default()),
-            "message": "deterministic tier-0 directory sweep: verbatim digests queued for understanding, 0 model calls",
-            "rendered": rendered,
-        }),
-        db_path,
-        context_label,
-        Some(context.id),
-    );
     maybe_kick_understanding_worker(args);
     0
 }
@@ -1902,127 +1444,6 @@ fn print_understand_report(
     );
 }
 
-/// `cg forget` — the raw-purge path. Raw source chunks are the local understanding substrate and
-/// never sync, so deleting them here is COMPLETE on this machine. Digests and derived graph rows are
-/// the synced, durable memory and are intentionally left in place. Also sets the raw-retention
-/// window (`--set-retention-days`), which `--expired` reads to purge raw older than the window.
-fn handle_forget(args: &[String]) -> i32 {
-    let root = data_root();
-    let db_path = memory_db_path(&root);
-    let context_label = memory_context_label(args);
-
-    if let Some(raw) = flag_value(args, "--set-retention-days") {
-        let days = match raw.trim().parse::<u64>() {
-            Ok(days) => days,
-            Err(_) => {
-                return memory_failure(
-                    2,
-                    "InvalidRetentionDays",
-                    &db_path,
-                    &context_label,
-                    "--set-retention-days requires a non-negative whole number of days",
-                );
-            }
-        };
-        let store = match open_memory_store(&root) {
-            Ok(store) => store,
-            Err(err) => return memory_error(err, &db_path, &context_label),
-        };
-        if let Err(err) = tier0::set_raw_retention_days(&store, days) {
-            return cg_failure(err, &db_path, &context_label);
-        }
-        print_memory_json(
-            json!({
-                "ok": true,
-                "raw_retention_days": days,
-                "message": format!("raw retention set to {days} days"),
-                "rendered": format!("raw retention set to {days} days"),
-            }),
-            &db_path,
-            &context_label,
-            None,
-        );
-        return 0;
-    }
-
-    let store = match open_memory_store(&root) {
-        Ok(store) => store,
-        Err(err) => return memory_error(err, &db_path, &context_label),
-    };
-    let context = match ensure_cli_context(&store, &context_label) {
-        Ok(context) => context,
-        Err(err) => return cg_failure(err, &db_path, &context_label),
-    };
-
-    let selector = if let Some(raw) = flag_value(args, "--digest") {
-        match uuid::Uuid::parse_str(raw.trim()) {
-            Ok(uuid) => ForgetSelector::Digest(context_graph::DigestId::from(uuid)),
-            Err(_) => {
-                return memory_failure(
-                    2,
-                    "InvalidDigestId",
-                    &db_path,
-                    &context_label,
-                    "--digest requires a digest UUID",
-                );
-            }
-        }
-    } else if let Some(session) = flag_value(args, "--session") {
-        ForgetSelector::Session(session)
-    } else if has_flag(args, "--all-raw") {
-        ForgetSelector::AllRaw
-    } else if has_flag(args, "--expired") {
-        let retention_days = match tier0::raw_retention_days(&store) {
-            Ok(days) => days,
-            Err(err) => return cg_failure(err, &db_path, &context_label),
-        };
-        ForgetSelector::Expired {
-            retention_days,
-            now_ms: now_millis(),
-        }
-    } else if has_flag(args, "--context") || flag_value(args, "--context").is_some() {
-        ForgetSelector::Context
-    } else {
-        return usage_error(
-            "forget requires one of --digest <id>, --session <ref>, --context, --expired, or --all-raw",
-        );
-    };
-
-    let report = match forget_raw(&store, Some(context.id), selector) {
-        Ok(report) => report,
-        Err(err) => return cg_failure(err, &db_path, &context_label),
-    };
-    print_forget_report(&report, &db_path, &context_label, context.id);
-    0
-}
-
-fn print_forget_report(
-    report: &ForgetReport,
-    db_path: &Path,
-    context_label: &str,
-    context_id: ContextId,
-) {
-    let rendered = format!(
-        "forgot {} raw chunks ({} bytes); {} pending queue rows marked skipped",
-        report.chunks_purged, report.bytes_purged, report.queue_rows_skipped,
-    );
-    print_memory_json(
-        json!({
-            "ok": true,
-            "forget": {
-                "chunks_purged": report.chunks_purged,
-                "bytes_purged": report.bytes_purged,
-                "queue_rows_skipped": report.queue_rows_skipped,
-            },
-            "message": "purged raw source chunks; synced digests and graph rows are retained",
-            "rendered": rendered,
-        }),
-        db_path,
-        context_label,
-        Some(context_id),
-    );
-}
-
 fn record_progress_chunk_window(args: &[String]) -> Result<usize, String> {
     flag_value(args, "--chunk-tokens")
         .map(|raw| parse_positive_usize_flag("--chunk-tokens", &raw))
@@ -2162,73 +1583,8 @@ fn render_capture_summary(report: &CaptureReport) -> String {
     lines.join("\n")
 }
 
-/// Stream a session file into bounded source chunks using the import parser, splitting at clean
-/// word boundaries no larger than the resolved chunk window. Each chunk is a faithful slice of the
-/// reconstructed session text; their concatenation is the whole session.
-fn collect_import_source_chunks(
-    path: &Path,
-    parser: &dyn ImportParser,
-    chunk_options: ImportChunkOptions,
-) -> context_graph::Result<Vec<String>> {
-    let mut chunks: Vec<String> = Vec::new();
-    stream_import_chunks(path, parser, chunk_options, |chunk| {
-        chunks.push(chunk.to_string());
-        Ok(())
-    })?;
-    Ok(chunks)
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ImportChunkOptions {
-    max_chars: usize,
-    /// Bytes of the previous chunk's tail carried into the next chunk (operator config
-    /// via capture.toml `chunk_overlap`; 0 = the shipped no-overlap behavior).
-    overlap_chars: usize,
-    resolved_chunk_window: usize,
-    model_context_tokens: usize,
-    context_fraction: f32,
-}
-
-fn import_chunk_options(args: &[String], root: &Path) -> Result<ImportChunkOptions, String> {
-    let explicit = match flag_value(args, "--chunk-tokens") {
-        Some(raw) => Some(parse_positive_usize_flag("--chunk-tokens", &raw)?),
-        None => None,
-    };
-    let context_fraction = match flag_value(args, "--context-fraction") {
-        Some(raw) => parse_context_fraction(&raw)?,
-        None => DEFAULT_IMPORT_CONTEXT_FRACTION,
-    };
-    let model_context_tokens = import_model_context_tokens(root);
-    let resolved_chunk_window = explicit.unwrap_or_else(|| {
-        let additive = model_context_tokens.saturating_sub(
-            IMPORT_PROMPT_OVERHEAD_TOKENS
-                + IMPORT_OUTPUT_BUDGET_TOKENS
-                + IMPORT_RUNNING_STATE_CAP_TOKENS,
-        );
-        let fractional = (model_context_tokens as f32 * context_fraction).floor() as usize;
-        additive
-            .min(fractional)
-            .clamp(1, DEFAULT_IMPORT_CHUNK_WINDOW)
-    });
-    // Operator capture config: capture.toml chunk_window applies when no
-    // explicit --chunk-tokens flag was given; chunk_overlap comes only from config. Overlap is
-    // clamped to a quarter-window so a misconfigured overlap can never stall chunk progress.
-    let capture_config = load_capture_config(root)?;
-    let resolved_chunk_window = match (explicit, capture_config.chunk_window) {
-        (None, Some(configured)) => configured.max(1),
-        _ => resolved_chunk_window,
-    };
-    let max_chars = resolved_chunk_window.max(1);
-    let overlap_chars = capture_config.chunk_overlap.unwrap_or(0).min(max_chars / 4);
-    Ok(ImportChunkOptions {
-        max_chars,
-        overlap_chars,
-        resolved_chunk_window,
-        model_context_tokens,
-        context_fraction,
-    })
-}
-
+/// Load the operator capture config from `<data_root>/cg/capture.toml`.
+/// Absent file → defaults (never an error); malformed file → loud error with the path named.
 fn parse_positive_usize_flag(flag: &str, raw: &str) -> Result<usize, String> {
     let value = raw
         .parse::<usize>()
@@ -2239,52 +1595,6 @@ fn parse_positive_usize_flag(flag: &str, raw: &str) -> Result<usize, String> {
     Ok(value)
 }
 
-fn parse_context_fraction(raw: &str) -> Result<f32, String> {
-    let value = raw
-        .parse::<f32>()
-        .map_err(|_| "--context-fraction must be a number between 0 and 1".to_string())?;
-    if !(value > 0.0 && value <= 1.0) {
-        return Err("--context-fraction must be greater than 0 and at most 1".to_string());
-    }
-    Ok(value)
-}
-
-fn import_model_context_tokens(root: &Path) -> usize {
-    let catalog = ModelConnectionCatalog::open(root);
-    let Some(connection_name) = catalog.active_connection_name() else {
-        return DEFAULT_IMPORT_MODEL_CONTEXT_TOKENS;
-    };
-    let Some(model) = catalog.model_for_connection(&connection_name) else {
-        return DEFAULT_IMPORT_MODEL_CONTEXT_TOKENS;
-    };
-    let model_name = model
-        .hosted_endpoint
-        .as_ref()
-        .map(|endpoint| endpoint.provider_model.as_str())
-        .unwrap_or(model.id.as_str());
-    known_model_context_tokens(model_name).unwrap_or(DEFAULT_IMPORT_MODEL_CONTEXT_TOKENS)
-}
-
-fn known_model_context_tokens(model_name: &str) -> Option<usize> {
-    let lower = model_name.to_ascii_lowercase();
-    if lower.contains("claude")
-        || lower.contains("haiku")
-        || lower.contains("sonnet")
-        || lower.contains("opus")
-    {
-        return Some(200_000);
-    }
-    if lower.contains("gpt-4.1") || lower.contains("gpt-5") || lower.contains("o4") {
-        return Some(1_000_000);
-    }
-    if lower.contains("gpt-4o") || lower.contains("o3") {
-        return Some(128_000);
-    }
-    None
-}
-
-/// Load the operator capture config from `<data_root>/cg/capture.toml`.
-/// Absent file → defaults (never an error); malformed file → loud error with the path named.
 fn load_capture_config(root: &Path) -> Result<CaptureHarnessConfig, String> {
     let path = root.join("cg/capture.toml");
     match fs::read_to_string(&path) {
@@ -2295,149 +1605,6 @@ fn load_capture_config(root: &Path) -> Result<CaptureHarnessConfig, String> {
         }
         Err(err) => Err(format!("{}: read failed: {err}", path.display())),
     }
-}
-
-fn stream_import_chunks<F>(
-    path: &Path,
-    parser: &dyn ImportParser,
-    options: ImportChunkOptions,
-    mut on_chunk: F,
-) -> context_graph::Result<usize>
-where
-    F: FnMut(&str) -> context_graph::Result<()>,
-{
-    // Whole-file two-phase parse: the selection policy needs lookahead —
-    // tool-result content survives only where the FOLLOWING assistant dialogue engages with it —
-    // which a per-line stream cannot express. Per-file memory is bounded by session size (MBs);
-    // directory imports remain file-at-a-time.
-    let raw =
-        fs::read(path).map_err(|err| CgError::Engine(format!("import read failed: {err}")))?;
-    let transcript = parser.parse(&raw)?;
-    let mut buffer = String::new();
-    let mut chunks = 0;
-    for segment in transcript.split_inclusive('\n') {
-        append_import_segment(
-            &mut buffer,
-            segment,
-            options.max_chars,
-            options.overlap_chars,
-            &mut chunks,
-            &mut on_chunk,
-        )?;
-    }
-    // The terminal flush never retains a tail — there is no next chunk.
-    flush_import_chunk(&mut buffer, &mut chunks, &mut on_chunk)?;
-    Ok(chunks)
-}
-
-fn append_import_segment<F>(
-    buffer: &mut String,
-    segment: &str,
-    max_chars: usize,
-    overlap_chars: usize,
-    chunks: &mut usize,
-    on_chunk: &mut F,
-) -> context_graph::Result<()>
-where
-    F: FnMut(&str) -> context_graph::Result<()>,
-{
-    let mut rest = segment;
-    while !rest.is_empty() {
-        if buffer.len() >= max_chars {
-            flush_import_chunk_with_overlap(buffer, chunks, on_chunk, overlap_chars)?;
-            continue;
-        }
-        let remaining = max_chars - buffer.len();
-        if rest.len() <= remaining {
-            buffer.push_str(rest);
-            break;
-        }
-        let split = import_chunk_boundary(rest, remaining);
-        if split == 0 {
-            flush_import_chunk_with_overlap(buffer, chunks, on_chunk, overlap_chars)?;
-            continue;
-        }
-        buffer.push_str(&rest[..split]);
-        flush_import_chunk_with_overlap(buffer, chunks, on_chunk, overlap_chars)?;
-        rest = &rest[split..];
-    }
-    Ok(())
-}
-
-fn flush_import_chunk<F>(
-    buffer: &mut String,
-    chunks: &mut usize,
-    on_chunk: &mut F,
-) -> context_graph::Result<()>
-where
-    F: FnMut(&str) -> context_graph::Result<()>,
-{
-    flush_import_chunk_with_overlap(buffer, chunks, on_chunk, 0)
-}
-
-/// Flush the buffer as one chunk; when `overlap_chars > 0`, the flushed chunk's tail (aligned
-/// to a line start) is retained as the next buffer's head, so a decision spanning a chunk
-/// boundary appears whole in one of the two chunks (the registered chunking lever).
-fn flush_import_chunk_with_overlap<F>(
-    buffer: &mut String,
-    chunks: &mut usize,
-    on_chunk: &mut F,
-    overlap_chars: usize,
-) -> context_graph::Result<()>
-where
-    F: FnMut(&str) -> context_graph::Result<()>,
-{
-    let chunk = buffer.trim();
-    if chunk.is_empty() {
-        buffer.clear();
-        return Ok(());
-    }
-    *chunks += 1;
-    let owned = chunk.to_string();
-    buffer.clear();
-    if overlap_chars > 0 && owned.len() > overlap_chars {
-        // Retain the flushed chunk's tail, aligned forward to a char boundary and then to the
-        // next line start where one exists, as the next buffer's head.
-        let mut start = owned.len() - overlap_chars;
-        while !owned.is_char_boundary(start) {
-            start += 1;
-        }
-        let tail = &owned[start..];
-        let aligned = tail.find('\n').map(|i| &tail[i + 1..]).unwrap_or(tail);
-        if !aligned.trim().is_empty() {
-            buffer.push_str(aligned);
-            buffer.push('\n');
-        }
-    }
-    on_chunk(&owned)
-}
-
-fn import_chunk_boundary(text: &str, max_bytes: usize) -> usize {
-    if max_bytes >= text.len() {
-        return text.len();
-    }
-    let mut last_boundary = 0;
-    let mut last_whitespace = None;
-    for (index, ch) in text.char_indices() {
-        let end = index + ch.len_utf8();
-        if end > max_bytes {
-            break;
-        }
-        last_boundary = end;
-        if ch.is_whitespace() {
-            last_whitespace = Some(end);
-        }
-    }
-    if let Some(whitespace) = last_whitespace.filter(|index| *index >= max_bytes / 2) {
-        return whitespace;
-    }
-    if last_boundary > 0 {
-        return last_boundary;
-    }
-    text.char_indices()
-        .nth(1)
-        .map(|(index, _)| index)
-        .unwrap_or(text.len())
 }
 
 fn handle_query(args: &[String]) -> i32 {
@@ -5767,8 +4934,15 @@ A staged copy next to the cache is seeded without re-downloading."
         return 0;
     }
     let format = output_format(args);
-    let root = data_root();
-    let catalog = match Catalog::open_with_scope_against_root(&root, CONNECTION_SCOPE) {
+    // Fetch reads registrations from the same place `cg model show` does — the data root — and
+    // places the artifact bytes it downloads under the canonical model-cache root the embedder
+    // later loads from offline. Those are two different locations whenever the operator sets them
+    // apart, so fetch is given both rather than resolving registrations through the cache root.
+    let catalog = match Catalog::open_with_scope_against_roots(
+        data_root(),
+        cg_catalog::default_cache_root(),
+        CONNECTION_SCOPE,
+    ) {
         Ok(catalog) => catalog,
         Err(err) => return failure(1, "catalog_open_failed", "config", &format!("{err:?}")),
     };
@@ -7892,7 +7066,9 @@ fn print_json(value: &Value) {
 /// lives in (see `context_graph::owner_control::owner_read_config`) — the one variable a container or a
 /// packaged service provisions so both sides of the owner plane meet in the same place. Those two
 /// are this binary's supported configuration surface: neither decides whether anything runs or
-/// what a read may spend, and `HOME` is read only to find `CG_DATA_ROOT`'s default.
+/// what a read may spend, and `HOME` is read only to find `CG_DATA_ROOT`'s default and, with
+/// `CLAUDE_CONFIG_DIR` (Claude Code's own configuration directory), where Claude Code keeps the local
+/// conversation history `cg import` reads.
 ///
 /// This binary reads three further variables, and they are development affordances rather than
 /// configuration, named here rather than left for a reader to find: `CG_NO_UNDERSTAND_KICK`

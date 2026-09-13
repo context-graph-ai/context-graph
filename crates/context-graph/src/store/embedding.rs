@@ -2114,3 +2114,252 @@ mod tests {
         }
     }
 }
+
+/// The dedicated event-history space and the existing text-default space are both registered,
+/// 768-dimensional, and never comparable: a cross-space query between them is refused with the
+/// exact declared space ids, even at equal dimension. Reaches `vector_search` and
+/// `VectorSearchFilters` directly as crate-internal items, so this runs in the default `cargo
+/// test -p context-graph --lib` tier rather than behind a cfg gate.
+///
+/// The event-history query vector is obtained by actually preparing and embedding a query
+/// through the real cached Nomic embedder's role-aware surface (`prepare_query` +
+/// `embed_prepared_query`), never a hand-built vector, so this proves the capability that feeds
+/// the space, not a same-dimension coincidence.
+#[cfg(test)]
+mod event_search_space_isolation_tests {
+    use super::*;
+    use crate::embedder::nomic::NomicTextEmbedder;
+    use crate::embedding_space::{
+        BuiltinSpaceRegistry, default_text_embedding_space, event_history_embedding_space,
+    };
+    use crate::{
+        DistanceMetric, EmbedderConfig, EmbeddingSpace, EmbeddingSpaceBinding, EventSearchEmbedder,
+        StoreConfig,
+    };
+
+    const EVENT_HISTORY_SPACE: &str = BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID;
+    const TEXT_DEFAULT_SPACE: &str = BuiltinSpaceRegistry::TEXT_DEFAULT_ID;
+    const NOMIC_MODEL_ID: &str = "nomic-embed-text-v1.5";
+
+    /// The canonical, already-installed model directory this crate's production code resolves a
+    /// cached Nomic model under: the one cache-root resolver, joined with the model id — called
+    /// here directly rather than re-derived (mirrors
+    /// `tests/common/nomic_real_model.rs::canonical_model_dir`, which an in-src `#[cfg(test)]`
+    /// module cannot reach — it lives in a separate integration test binary, not this crate's own
+    /// compiled unit).
+    fn canonical_nomic_model_dir() -> std::path::PathBuf {
+        crate::embedder::nomic::default_cache_root().join(NOMIC_MODEL_ID)
+    }
+
+    /// A local-source, offline, download-denying config over the canonical installed model
+    /// directory, pinned to the exact revision the reserved event-history identity names — never
+    /// `EmbedderConfig::default_nomic()`, which sources from Hugging Face and allows a network
+    /// download. Mirrors `tests/common/nomic_real_model.rs::local_offline_config`.
+    fn local_offline_nomic_config() -> EmbedderConfig {
+        EmbedderConfig {
+            source: crate::ModelSource::LocalPath(canonical_nomic_model_dir()),
+            offline: true,
+            cache_dir: None,
+            pinned_revision: Some(crate::embedder::NOMIC_DEFAULT_REVISION.to_string()),
+            network_policy: "deny-download".to_string(),
+        }
+    }
+
+    /// A store carrying BOTH spaces and a real text-default embedder.
+    ///
+    /// The embedder matters: `semantic_search` embeds the caller's text through whatever the store
+    /// registered for [`EvidenceKind::Text`] and short-circuits on `TextEmbedderDisabled` when
+    /// there is none, so a store without one can never reach the cross-space refusal the arms
+    /// below drive. It is the same offline, download-denying configuration over the canonical
+    /// installed model the rest of this module uses — never `default_nomic()`, which could fetch.
+    fn store_with_both_spaces() -> Store {
+        let dir = tempfile::tempdir().expect("store dir");
+        Store::open(StoreConfig {
+            db_path: dir.path().join("cg.db"),
+            extra_embedding_spaces: vec![event_history_embedding_space()],
+            default_text_embedder: Some(local_offline_nomic_config()),
+            ..Default::default()
+        })
+        .expect("open store with both spaces registered")
+    }
+
+    /// The canonical production declaration ([`event_history_embedding_space`]) binds only to the
+    /// dedicated event-history passage vector, never the `evidence`/`digests` population the
+    /// text-default space owns.
+    #[test]
+    fn canonical_event_history_declaration_has_only_the_passage_binding() {
+        let declaration = event_history_embedding_space();
+        assert_eq!(
+            declaration.bindings,
+            vec![EmbeddingSpaceBinding {
+                embedding_space_id: EVENT_HISTORY_SPACE.into(),
+                table_name: "event_search_passages".into(),
+                vector_column: "vector_text".into(),
+            }]
+        );
+        assert_eq!(declaration.default_for_evidence_kind, None);
+        assert_eq!(
+            declaration.embedding_space_id,
+            "event_history_nomic_v1_5_document_query_v1_768"
+        );
+    }
+
+    #[test]
+    fn dedicated_event_search_space_refuses_old_unlabelled_space_comparison() {
+        assert_eq!(
+            EVENT_HISTORY_SPACE,
+            "event_history_nomic_v1_5_document_query_v1_768"
+        );
+        assert_eq!(
+            default_text_embedding_space().dimension,
+            event_history_embedding_space().dimension
+        );
+        assert_eq!(
+            default_text_embedding_space().embedding_space_id,
+            TEXT_DEFAULT_SPACE
+        );
+
+        let embedder = NomicTextEmbedder::new(local_offline_nomic_config());
+        // `prepare_query`/`embed_prepared_query` come from the sealed `EventSearchEmbedder`
+        // extension trait, blanket-implemented for every embedder, so they are reached here on
+        // the concrete handle exactly as a caller holding one would reach them.
+        // The event-history query vector must come from the real role-aware preparation surface —
+        // never a hand-built same-dimension vector.
+        let prepared = embedder
+            .prepare_query("find the incident review from last quarter")
+            .unwrap_or_else(|err| {
+                panic!(
+                    "event-search query preparation must be supported over the bundled Nomic embedder, got {err:?}"
+                )
+            });
+        let query_output = embedder
+            .embed_prepared_query(&prepared)
+            .expect("embedding a prepared event-search query must succeed");
+        assert_eq!(
+            query_output.vector.len(),
+            BuiltinSpaceRegistry::TEXT_DEFAULT_DIMENSION
+        );
+
+        // The event-history space registers with no table binding at all (proved above), so
+        // isolation is proved through the Store-independent comparability seam
+        // (`compare_embedding_targets_across_spaces`) as well as through `vector_search` against
+        // a store that has both spaces registered — both must refuse by exact id and dimension,
+        // never by coincidence of a shared table.
+        let store = store_with_both_spaces();
+        let result = vector_search(
+            &store,
+            &query_output.vector,
+            EVENT_HISTORY_SPACE,
+            VectorSearchFilters {
+                candidate_embedding_space_ids: vec![TEXT_DEFAULT_SPACE.to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(CgError::CrossSpaceQueryRefused {
+                    query_space,
+                    candidate_space,
+                    query_dim: Some(768),
+                    candidate_dim: Some(768),
+                }) if query_space == EVENT_HISTORY_SPACE && candidate_space == TEXT_DEFAULT_SPACE
+            ),
+            "a query against the dedicated event-history space must refuse comparison with the \
+             unlabelled text-default space by exact id, got {result:?}"
+        );
+
+        // The other direction, and the one an application actually takes: `semantic_search` is
+        // the store's own text-query entrypoint. It embeds the caller's plain text through the
+        // store's text-default embedder and then compares — so a caller who names the
+        // event-history space as a candidate is asking for exactly the comparison this space
+        // exists to forbid, and gets it refused by exact id, not by dimension. Nothing else in the
+        // estate reaches the refusal site through `semantic_search`; a same-model, same-dimension
+        // shortcut added there would leave every other arm green.
+        let through_the_text_query_entrypoint = semantic_search(
+            &store,
+            "find the incident review from last quarter",
+            VectorSearchFilters {
+                candidate_embedding_space_ids: vec![EVENT_HISTORY_SPACE.to_string()],
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(
+                &through_the_text_query_entrypoint,
+                Err(CgError::CrossSpaceQueryRefused {
+                    query_space,
+                    candidate_space,
+                    query_dim: Some(768),
+                    candidate_dim: Some(768),
+                }) if query_space == TEXT_DEFAULT_SPACE && candidate_space == EVENT_HISTORY_SPACE
+            ),
+            "the store's own text-query entrypoint must refuse a candidate in the dedicated \
+             event-history space by exact id — the two spaces are the same width, so a check that \
+             compares only dimensions would let this through, got \
+             {through_the_text_query_entrypoint:?}"
+        );
+
+        // SMOKE, not a proof: `compare_embedding_targets_across_spaces` returns the refusal
+        // unconditionally for every input it is given, so this call cannot distinguish a working
+        // isolation rule from a broken one. It stays only to keep the seam's error shape wired up
+        // until it computes an answer; the two arms above are what prove the promise.
+        let store_independent_result = compare_embedding_targets_across_spaces(
+            &store,
+            EmbeddingTarget::Evidence(EvidenceId::from(uuid::Uuid::nil())),
+            EVENT_HISTORY_SPACE,
+            EmbeddingTarget::Evidence(EvidenceId::from(uuid::Uuid::nil())),
+            TEXT_DEFAULT_SPACE,
+            query_output.vector.len(),
+            BuiltinSpaceRegistry::TEXT_DEFAULT_DIMENSION,
+        );
+        assert!(
+            matches!(
+                &store_independent_result,
+                Err(CgError::CrossSpaceQueryRefused { .. })
+            ),
+            "the not-yet-computing comparability seam must still answer with the cross-space \
+             refusal shape, got {store_independent_result:?}"
+        );
+    }
+
+    /// A second, non-default owner of `evidence.vector_text` is refused at store open — the
+    /// existing owner guard the canonical event-history declaration above deliberately never
+    /// triggers because it carries no bindings at all.
+    #[test]
+    fn second_owner_of_evidence_vector_text_is_refused() {
+        let dir = tempfile::tempdir().expect("store dir");
+        let conflicting_space = EmbeddingSpace {
+            embedding_space_id: "conflicting_evidence_vector_text_owner".to_string(),
+            dimension: BuiltinSpaceRegistry::TEXT_DEFAULT_DIMENSION,
+            metric: DistanceMetric::Cosine,
+            model_family: BuiltinSpaceRegistry::TEXT_DEFAULT_MODEL_FAMILY.to_string(),
+            model_name: "conflicting-owner".to_string(),
+            model_version: "1".to_string(),
+            supported_evidence_kinds: vec![EvidenceKind::Text],
+            default_for_evidence_kind: None,
+            bindings: vec![EmbeddingSpaceBinding {
+                embedding_space_id: "conflicting_evidence_vector_text_owner".to_string(),
+                table_name: "evidence".to_string(),
+                vector_column: "vector_text".to_string(),
+            }],
+        };
+        let result = Store::open(StoreConfig {
+            db_path: dir.path().join("cg.db"),
+            extra_embedding_spaces: vec![conflicting_space],
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                &result,
+                Err(CgError::EmbeddingSpaceConfigMismatch {
+                    field: "bindings",
+                    ..
+                })
+            ),
+            "a second, non-default owner of evidence.vector_text must be refused at store open, \
+             got {result:?}"
+        );
+    }
+}

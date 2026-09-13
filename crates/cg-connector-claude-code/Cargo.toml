@@ -1,0 +1,25 @@
+[package]
+name = "cg-connector-claude-code"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Claude Code event-history connector for Context Graph"
+edition = "2024"
+
+[lib]
+name = "cg_connector_claude_code"
+path = "src/lib.rs"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+context-graph = { path = "../context-graph", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+contextdb-engine = { workspace = true, features = ["test-seams"] }
+tempfile.workspace = true

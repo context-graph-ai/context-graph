@@ -10,6 +10,98 @@ pub(crate) const PRECEDENT_MATCH_TRIGGER_DDL: &str =
 pub(crate) const OUTCOMES_DDL: &str = "CREATE TABLE outcomes (id UUID NOT NULL UNIQUE, decision_id UUID NOT NULL REFERENCES decisions(id), context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), success BOOLEAN NOT NULL, notes TEXT, recorded_at TXID NOT NULL, PRIMARY KEY (context_id, decision_id), UNIQUE (context_id, id), FOREIGN KEY (context_id, decision_id) REFERENCES decisions(context_id, id)) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 pub(crate) const INVALIDATIONS_DDL: &str = "CREATE TABLE invalidations (id UUID NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending', context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), affected_decision_id UUID NOT NULL REFERENCES decisions(id), trigger_observation_id UUID NOT NULL REFERENCES observations(id), reason TEXT, basis_diff JSON NOT NULL, cascade_from UUID REFERENCES decisions(id), severity TEXT NOT NULL, threatened_intention_ids JSON NOT NULL DEFAULT '[]', intention_now_un_served BOOLEAN NOT NULL DEFAULT false, detected_at TXID NOT NULL, resolved_at TXID, resolution_action TEXT, resolution_decision_id UUID, PRIMARY KEY (context_id, affected_decision_id), FOREIGN KEY (context_id, affected_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, trigger_observation_id) REFERENCES observations(context_id, id), FOREIGN KEY (context_id, cascade_from) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, resolution_decision_id) REFERENCES decisions(context_id, id)) STATE MACHINE (status: pending -> [acknowledged], acknowledged -> [resolved, dismissed]) SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
 pub(crate) const CONFLICTS_DDL: &str = "CREATE TABLE conflicts (id UUID NOT NULL UNIQUE, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), older_decision_id UUID NOT NULL REFERENCES decisions(id), newer_decision_id UUID NOT NULL REFERENCES decisions(id), threatened_intention_ids JSON NOT NULL DEFAULT '[]', intention_in_tension BOOLEAN NOT NULL, detected_at TXID NOT NULL, PRIMARY KEY (context_id, older_decision_id, newer_decision_id), FOREIGN KEY (context_id, older_decision_id) REFERENCES decisions(context_id, id), FOREIGN KEY (context_id, newer_decision_id) REFERENCES decisions(context_id, id)) IMMUTABLE SYNC TWO WAY SYNC CONFLICT KEEP FIRST";
+pub(crate) const EVENTS_LOCAL_DDL: &str = "CREATE TABLE events (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, adapter_version TEXT NOT NULL, anchor_declaration_version TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, source_event_key TEXT NOT NULL, source_position JSON NOT NULL, seq INTEGER NOT NULL, content_hash TEXT NOT NULL, anchor_count INTEGER NOT NULL, anchor_set_hash TEXT NOT NULL, occurred_at TIMESTAMP, author TEXT NOT NULL, kind TEXT NOT NULL, render_role TEXT NOT NULL, interaction_ref TEXT, text TEXT, payload JSON NOT NULL DEFAULT '{}', anchors JSON NOT NULL DEFAULT '{}', source_remainder JSON NOT NULL DEFAULT '{}', coverage TEXT NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, connector_id, session_ref, source_event_key), UNIQUE (context_id, connector_id, source_instance_ref, seq)) IMMUTABLE SYNC OFF SYNC CONFLICT KEEP FIRST";
+pub(crate) const EVENTS_TENANT_HUB_DDL: &str = "CREATE TABLE events (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, adapter_version TEXT NOT NULL, anchor_declaration_version TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, source_event_key TEXT NOT NULL, source_position JSON NOT NULL, seq INTEGER NOT NULL, content_hash TEXT NOT NULL, anchor_count INTEGER NOT NULL, anchor_set_hash TEXT NOT NULL, occurred_at TIMESTAMP, author TEXT NOT NULL, kind TEXT NOT NULL, render_role TEXT NOT NULL, interaction_ref TEXT, text TEXT, payload JSON NOT NULL DEFAULT '{}', anchors JSON NOT NULL DEFAULT '{}', source_remainder JSON NOT NULL DEFAULT '{}', coverage TEXT NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, connector_id, session_ref, source_event_key), UNIQUE (context_id, connector_id, source_instance_ref, seq)) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER event_anchors";
+pub(crate) const EVENT_ANCHORS_LOCAL_DDL: &str = "CREATE TABLE event_anchors (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), event_id UUID NOT NULL REFERENCES events(id), correlation_scope_hash TEXT NOT NULL, declaration_version TEXT NOT NULL, connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, render_role TEXT NOT NULL, interaction_ref TEXT, key TEXT NOT NULL, value TEXT NOT NULL, identity_value TEXT NOT NULL, original_value JSON NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, event_id, declaration_version, key, identity_value), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) IMMUTABLE SYNC OFF SYNC CONFLICT KEEP FIRST";
+pub(crate) const EVENT_ANCHORS_TENANT_HUB_DDL: &str = "CREATE TABLE event_anchors (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), event_id UUID NOT NULL REFERENCES events(id), correlation_scope_hash TEXT NOT NULL, declaration_version TEXT NOT NULL, connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, render_role TEXT NOT NULL, interaction_ref TEXT, key TEXT NOT NULL, value TEXT NOT NULL, identity_value TEXT NOT NULL, original_value JSON NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, event_id, declaration_version, key, identity_value), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE";
+pub(crate) const EVENT_LOCAL_COMMITS_DDL: &str = "CREATE TABLE event_local_commits (event_id UUID PRIMARY KEY REFERENCES events(id), context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), committed_at TXID NOT NULL, FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) IMMUTABLE SYNC OFF";
+
+pub(crate) const EVENT_TABLE_NAMES: &[&str] = &["events", "event_anchors", "event_local_commits"];
+
+/// Node-local interpretation and event-search state. These tables install only after the event
+/// parents exist, which keeps an unbound tenant Store free of event schema while giving both a
+/// local Store and an authenticated tenant Store the same `SYNC OFF` derived schema.
+pub(crate) const LOCAL_DERIVED_TABLES: &[TableSpec] = &[
+    TableSpec {
+        name: "adapter_coverage_gaps",
+        ddl: "CREATE TABLE adapter_coverage_gaps (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, captured_adapter_version TEXT NOT NULL, fingerprint_sha256 TEXT NOT NULL, first_seen_at TXID NOT NULL, last_seen_at TXID NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, connector_id, captured_adapter_version, fingerprint_sha256)) SYNC OFF",
+    },
+    TableSpec {
+        name: "adapter_coverage_gap_events",
+        ddl: "CREATE TABLE adapter_coverage_gap_events (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), gap_id UUID NOT NULL REFERENCES adapter_coverage_gaps(id), event_id UUID NOT NULL REFERENCES events(id), PRIMARY KEY (context_id, gap_id, event_id), FOREIGN KEY (context_id, gap_id) REFERENCES adapter_coverage_gaps(context_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) IMMUTABLE SYNC OFF",
+    },
+    TableSpec {
+        name: "event_interpretation_generations",
+        ddl: "CREATE TABLE event_interpretation_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, accepted_source_declarations JSON NOT NULL, target_interpretation_version TEXT NOT NULL, target_adapter_version TEXT NOT NULL, target_anchor_declaration_version TEXT NOT NULL, mapping_contract_id TEXT NOT NULL, mapping_contract_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, source_content_sha256 TEXT NOT NULL, capture_ordinal INTEGER NOT NULL DEFAULT 0, build_ordinal INTEGER NOT NULL DEFAULT 0, claim_end_ordinal INTEGER, claim_membership_sha256 TEXT, lease_epoch INTEGER NOT NULL DEFAULT 0, lease_token TEXT, lease_expires_at TIMESTAMP, state TEXT NOT NULL, eligible_event_count INTEGER NOT NULL DEFAULT 0, interpreted_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, effective_content_sha256 TEXT, sanitized_failure TEXT, started_at TXID NOT NULL, completed_at TXID, activated_at TXID, activation_receipt JSON, UNIQUE (context_id, id), UNIQUE (context_id, connector_id, id), UNIQUE (context_id, connector_id, target_interpretation_version, event_count, ordered_source_set_sha256)) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_interpretation_source_events",
+        ddl: "CREATE TABLE event_interpretation_source_events (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_interpretation_generations(id), ordinal INTEGER NOT NULL, event_id UUID NOT NULL REFERENCES events(id), source_instance_ref TEXT NOT NULL, source_sequence INTEGER NOT NULL, source_row_sha256 TEXT NOT NULL, PRIMARY KEY (context_id, generation_id, ordinal), UNIQUE (context_id, generation_id, event_id), FOREIGN KEY (context_id, generation_id) REFERENCES event_interpretation_generations(context_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) IMMUTABLE SYNC OFF",
+    },
+    TableSpec {
+        name: "event_interpretation_values",
+        ddl: "CREATE TABLE event_interpretation_values (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_interpretation_generations(id), event_id UUID NOT NULL REFERENCES events(id), captured_content_sha256 TEXT NOT NULL, occurred_at TIMESTAMP, author TEXT NOT NULL, kind TEXT NOT NULL, render_role TEXT NOT NULL, interaction_ref TEXT, text TEXT, payload JSON NOT NULL, anchors JSON NOT NULL, coverage TEXT NOT NULL, effective_sha256 TEXT NOT NULL, created_at TXID NOT NULL, PRIMARY KEY (context_id, generation_id, event_id), UNIQUE (context_id, generation_id, event_id), FOREIGN KEY (context_id, generation_id) REFERENCES event_interpretation_generations(context_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) IMMUTABLE SYNC OFF",
+    },
+    TableSpec {
+        name: "event_interpretation_anchors",
+        ddl: "CREATE TABLE event_interpretation_anchors (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_interpretation_generations(id), event_id UUID NOT NULL REFERENCES events(id), declaration_version TEXT NOT NULL, key TEXT NOT NULL, canonical_value TEXT NOT NULL, identity_value TEXT NOT NULL, original_value JSON NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, generation_id, event_id, declaration_version, key, identity_value), FOREIGN KEY (context_id, generation_id, event_id) REFERENCES event_interpretation_values(context_id, generation_id, event_id)) IMMUTABLE SYNC OFF",
+    },
+    TableSpec {
+        name: "event_interpretation_heads",
+        ddl: "CREATE TABLE event_interpretation_heads (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, generation_id UUID NOT NULL REFERENCES event_interpretation_generations(id), activated_at TXID NOT NULL, PRIMARY KEY (context_id, connector_id), FOREIGN KEY (context_id, connector_id, generation_id) REFERENCES event_interpretation_generations(context_id, connector_id, id)) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_context_revisions",
+        ddl: "CREATE TABLE event_context_revisions (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), revision_tx TXID NOT NULL) SYNC OFF",
+    },
+    // One current-state row per Context holding its captured-event totals, kept by the append
+    // transaction and rewritten after a forget, so search classification and status never count
+    // the events table. A missing row means "recount from events" (see event_search_read.rs).
+    TableSpec {
+        name: "event_context_counts",
+        ddl: "CREATE TABLE event_context_counts (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), captured_events INTEGER NOT NULL, complete_events INTEGER NOT NULL, opaque_events INTEGER NOT NULL, payload_refused_events INTEGER NOT NULL, source_declared_missing_events INTEGER NOT NULL) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_search_generations",
+        ddl: "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), interpretation_generation_id UUID, interpretation_snapshot JSON NOT NULL, interpretation_snapshot_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, source_content_sha256 TEXT NOT NULL DEFAULT '', capture_ordinal INTEGER NOT NULL DEFAULT 0, renderer_id TEXT NOT NULL, renderer_version TEXT NOT NULL, renderer_profile JSON NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), encoding_profile TEXT NOT NULL, state TEXT NOT NULL, eligible_event_count INTEGER NOT NULL DEFAULT 0, rendered_event_count INTEGER NOT NULL DEFAULT 0, embedded_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, passage_count INTEGER NOT NULL DEFAULT 0, started_at TXID NOT NULL, completed_at TXID, finalized_event_revision_tx TXID, sanitized_failure TEXT, UNIQUE (context_id, id), FOREIGN KEY (context_id, interpretation_generation_id) REFERENCES event_interpretation_generations(context_id, id)) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_search_source_events",
+        ddl: "CREATE TABLE event_search_source_events (membership_id UUID NOT NULL UNIQUE, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), ordinal INTEGER NOT NULL, event_id UUID NOT NULL REFERENCES events(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, source_sequence INTEGER NOT NULL, effective_interpretation_generation_id UUID, captured_source_sha256 TEXT NOT NULL, effective_source_sha256 TEXT NOT NULL, PRIMARY KEY (context_id, generation_id, ordinal), UNIQUE (context_id, generation_id, event_id), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id), FOREIGN KEY (context_id, effective_interpretation_generation_id, event_id) REFERENCES event_interpretation_values(context_id, generation_id, event_id)) IMMUTABLE SYNC OFF",
+    },
+    // The passage vector is partitioned by its write-once Context and generation, so a find
+    // searches only the (Context, active generation) layouts it selects and the engine merges them
+    // before one top-k. `is_current` stays an ordinary residual filter served by the declared
+    // candidate indexes below: retiring a tail passage or switching the head changes membership
+    // without moving a row between partitions. `SEARCH_MODE AUTO` compares a small allowed set
+    // exactly inside the reader's budget and uses the maintained graph above the engine's
+    // threshold; it never widens to an unbudgeted scan. `MAX_PARTITIONS` bounds the retained
+    // (Context, generation) layouts, old generations included, well above one per Context.
+    TableSpec {
+        name: "event_search_passages",
+        ddl: "CREATE TABLE event_search_passages (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, passage_ordinal INTEGER NOT NULL, first_event_sequence INTEGER NOT NULL, last_event_sequence INTEGER NOT NULL, rendered_text TEXT NOT NULL, content_sha256 TEXT NOT NULL, vector_text VECTOR(768) PARTITION_KEY (context_id, generation_id) MAX_PARTITIONS 4096 SEARCH_MODE AUTO, dimension INTEGER NOT NULL, is_current BOOLEAN NOT NULL, created_at TXID NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, generation_id, id), UNIQUE (context_id, generation_id, connector_id, source_instance_ref, passage_ordinal), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_search_passage_sources",
+        ddl: "CREATE TABLE event_search_passage_sources (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), passage_id UUID NOT NULL REFERENCES event_search_passages(id), event_id UUID NOT NULL REFERENCES events(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, source_order INTEGER NOT NULL, event_start_byte INTEGER, event_end_byte INTEGER, passage_start_byte INTEGER NOT NULL, passage_end_byte INTEGER NOT NULL, PRIMARY KEY (context_id, passage_id, source_order), FOREIGN KEY (context_id, generation_id, passage_id) REFERENCES event_search_passages(context_id, generation_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) IMMUTABLE SYNC OFF",
+    },
+    TableSpec {
+        name: "event_search_embedding_handles",
+        ddl: "CREATE TABLE event_search_embedding_handles (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), passage_id UUID NOT NULL REFERENCES event_search_passages(id), embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), produced_by JSON NOT NULL, producer_system TEXT NOT NULL, created_at TXID NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, passage_id, embedding_space_id), FOREIGN KEY (context_id, generation_id, passage_id) REFERENCES event_search_passages(context_id, generation_id, id)) IMMUTABLE SYNC OFF",
+    },
+    TableSpec {
+        name: "event_search_heads",
+        ddl: "CREATE TABLE event_search_heads (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), activated_at TXID NOT NULL, FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_search_cursors",
+        ddl: "CREATE TABLE event_search_cursors (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, committed_sequence INTEGER NOT NULL, open_tail_start_sequence INTEGER, open_tail_passage_id UUID, watermark_sha256 TEXT NOT NULL, updated_at TXID NOT NULL, PRIMARY KEY (context_id, generation_id, connector_id, source_instance_ref), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_search_leases",
+        ddl: "CREATE TABLE event_search_leases (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), owner_token TEXT NOT NULL, lease_epoch INTEGER NOT NULL, claimed_connector_id TEXT, claimed_source_instance_ref TEXT, claimed_start_sequence INTEGER, claimed_end_sequence INTEGER, cursor_sha256 TEXT NOT NULL, expires_at TIMESTAMP NOT NULL, PRIMARY KEY (context_id, generation_id), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF",
+    },
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct TableSpec {
@@ -39,6 +131,38 @@ pub const TABLES: &[TableSpec] = &[
     TableSpec {
         name: "contexts",
         ddl: "CREATE TABLE contexts (id UUID PRIMARY KEY CONTEXT_ID, name TEXT NOT NULL UNIQUE, labels JSON, properties JSON, created_at TXID NOT NULL) SYNC TWO WAY SYNC CONFLICT KEEP FIRST",
+    },
+    TableSpec {
+        name: "event_placement",
+        ddl: "CREATE TABLE event_placement (id INTEGER PRIMARY KEY, expected_policy TEXT NOT NULL, first_event_tx TXID, installation_table_baseline JSON) SYNC OFF",
+    },
+    TableSpec {
+        name: "context_bindings",
+        ddl: "CREATE TABLE context_bindings (namespace TEXT NOT NULL, opaque_reference TEXT NOT NULL, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), PRIMARY KEY (namespace, opaque_reference)) SYNC OFF",
+    },
+    TableSpec {
+        name: "events",
+        ddl: EVENTS_LOCAL_DDL,
+    },
+    TableSpec {
+        name: "event_anchors",
+        ddl: EVENT_ANCHORS_LOCAL_DDL,
+    },
+    TableSpec {
+        name: "event_local_commits",
+        ddl: EVENT_LOCAL_COMMITS_DDL,
+    },
+    TableSpec {
+        name: "event_source_locators",
+        ddl: "CREATE TABLE event_source_locators (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, source_locator_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, provisional_empty BOOLEAN NOT NULL, adapter_version TEXT NOT NULL, anchor_declaration_version TEXT NOT NULL, PRIMARY KEY (context_id, connector_id, source_locator_ref)) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_source_checkpoints",
+        ddl: "CREATE TABLE event_source_checkpoints (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, adapter_version TEXT NOT NULL, anchor_declaration_version TEXT NOT NULL, checkpoint JSON NOT NULL, source_position JSON NOT NULL, committed_byte_offset INTEGER NOT NULL, prefix_sha256 TEXT NOT NULL, observed_source_len INTEGER NOT NULL, latest_event_seq INTEGER, last_successful_tx TXID NOT NULL, PRIMARY KEY (context_id, connector_id, source_instance_ref)) SYNC OFF",
+    },
+    TableSpec {
+        name: "event_source_ordering",
+        ddl: "CREATE TABLE event_source_ordering (declaration_hash TEXT NOT NULL UNIQUE, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, adapter_version TEXT NOT NULL, source_position_order JSON NOT NULL, PRIMARY KEY (context_id, connector_id, source_instance_ref)) SYNC OFF",
     },
     TableSpec {
         name: "intentions",
@@ -277,6 +401,46 @@ pub const SUBSCRIPTION_EVENT_TYPE_DDL: &[&str] = &[
 
 pub const INDEXES: &[IndexSpec] = &[
     IndexSpec {
+        table: "events",
+        name: "idx_events_source_stream",
+        ddl: "CREATE INDEX idx_events_source_stream ON events (context_id, connector_id, source_instance_ref, seq)",
+    },
+    IndexSpec {
+        table: "events",
+        name: "idx_events_session",
+        ddl: "CREATE INDEX idx_events_session ON events (context_id, connector_id, session_ref, seq)",
+    },
+    IndexSpec {
+        table: "events",
+        name: "idx_events_source_key",
+        ddl: "CREATE INDEX idx_events_source_key ON events (context_id, connector_id, session_ref, source_event_key)",
+    },
+    IndexSpec {
+        table: "events",
+        name: "idx_events_source_time",
+        ddl: "CREATE INDEX idx_events_source_time ON events (context_id, connector_id, occurred_at, seq)",
+    },
+    IndexSpec {
+        table: "events",
+        name: "idx_events_author_kind",
+        ddl: "CREATE INDEX idx_events_author_kind ON events (context_id, author, kind, seq)",
+    },
+    IndexSpec {
+        table: "event_anchors",
+        name: "idx_event_anchors_exact",
+        ddl: "CREATE INDEX idx_event_anchors_exact ON event_anchors (context_id, key, value, identity_value)",
+    },
+    IndexSpec {
+        table: "event_anchors",
+        name: "idx_event_anchors_physical_correlation_scope",
+        ddl: "CREATE INDEX idx_event_anchors_physical_correlation_scope ON event_anchors (correlation_scope_hash, context_id, event_id)",
+    },
+    IndexSpec {
+        table: "event_anchors",
+        name: "idx_event_anchors_event",
+        ddl: "CREATE INDEX idx_event_anchors_event ON event_anchors (event_id, context_id, declaration_version, key, identity_value)",
+    },
+    IndexSpec {
         table: "edges",
         name: "idx_edges_source_context_type",
         ddl: "CREATE INDEX idx_edges_source_context_type ON edges (source_id, context_id, edge_type)",
@@ -305,6 +469,66 @@ pub const INDEXES: &[IndexSpec] = &[
         table: "digest_embedding_handles",
         name: "idx_digest_embedding_handles_producer_system",
         ddl: "CREATE INDEX idx_digest_embedding_handles_producer_system ON digest_embedding_handles (producer_system)",
+    },
+];
+
+/// Indexes over [`LOCAL_DERIVED_TABLES`]. They install with those tables, after the event parents
+/// exist, and every table they name is node-local derived state, so they stay out of the public
+/// [`INDEXES`], whose every table is one [`TABLES`] declares.
+pub(crate) const LOCAL_DERIVED_INDEXES: &[IndexSpec] = &[
+    IndexSpec {
+        table: "adapter_coverage_gaps",
+        name: "idx_adapter_coverage_gaps_page",
+        ddl: "CREATE INDEX idx_adapter_coverage_gaps_page ON adapter_coverage_gaps (context_id, connector_id, id)",
+    },
+    IndexSpec {
+        table: "event_interpretation_source_events",
+        name: "idx_event_interpretation_source_events_generation",
+        ddl: "CREATE INDEX idx_event_interpretation_source_events_generation ON event_interpretation_source_events (generation_id, context_id, ordinal)",
+    },
+    IndexSpec {
+        table: "event_interpretation_anchors",
+        name: "idx_event_interpretation_anchors_exact",
+        ddl: "CREATE INDEX idx_event_interpretation_anchors_exact ON event_interpretation_anchors (context_id, generation_id, key, canonical_value, identity_value)",
+    },
+    IndexSpec {
+        table: "event_search_source_events",
+        name: "idx_event_search_source_events_generation",
+        ddl: "CREATE INDEX idx_event_search_source_events_generation ON event_search_source_events (generation_id, context_id, ordinal)",
+    },
+    IndexSpec {
+        table: "event_search_passages",
+        name: "event_search_passages_active_idx",
+        ddl: "CREATE INDEX event_search_passages_active_idx ON event_search_passages (context_id, generation_id, is_current)",
+    },
+    IndexSpec {
+        table: "event_search_passages",
+        name: "event_search_passages_generation_ordinal_idx",
+        ddl: "CREATE INDEX event_search_passages_generation_ordinal_idx ON event_search_passages (generation_id, passage_ordinal)",
+    },
+    IndexSpec {
+        table: "event_search_passages",
+        name: "event_search_passages_connector_idx",
+        ddl: "CREATE INDEX event_search_passages_connector_idx ON event_search_passages (context_id, generation_id, is_current, connector_id)",
+    },
+    IndexSpec {
+        table: "event_search_passages",
+        name: "event_search_passages_session_idx",
+        ddl: "CREATE INDEX event_search_passages_session_idx ON event_search_passages (context_id, generation_id, is_current, session_ref)",
+    },
+    IndexSpec {
+        table: "event_search_passages",
+        name: "event_search_passages_source_idx",
+        ddl: "CREATE INDEX event_search_passages_source_idx ON event_search_passages (context_id, generation_id, is_current, source_instance_ref)",
+    },
+    // A passage's source links, read by `(context_id, passage_id)` for every find hit and for show.
+    // The engine at this pin probes the table's primary key only on its full key, so without this
+    // index the read falls to a one-column foreign-key index and walks every link of the Context.
+    // Matching both equality columns, this index outranks every one-column index by prefix depth.
+    IndexSpec {
+        table: "event_search_passage_sources",
+        name: "event_search_passage_sources_passage_idx",
+        ddl: "CREATE INDEX event_search_passage_sources_passage_idx ON event_search_passage_sources (passage_id, context_id, source_order)",
     },
 ];
 

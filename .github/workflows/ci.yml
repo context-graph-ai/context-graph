@@ -25,6 +25,10 @@ defaults:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    env:
+      # `cg_catalog::default_cache_root()` resolves this exact root on every
+      # platform. The fetch seed and local-only model proofs use it unchanged.
+      CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
     strategy:
       matrix:
         # windows-latest is intentionally excluded: the ContextDB substrate's
@@ -49,22 +53,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: workspace/context-graph
-          persist-credentials: false
-      - name: Check out ContextDB
-        uses: actions/checkout@v4
-        with:
-          repository: context-graph-ai/contextdb
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.contextdb_sha || 'dev' }}
-          path: workspace/contextdb
+          fetch-depth: 0
           persist-credentials: false
       - name: Print and verify checked revisions
         env:
           REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
         run: |
           context_graph_sha="$(git rev-parse HEAD)"
-          contextdb_sha="$(git -C ../contextdb rev-parse HEAD)"
+          contextdb_sha="$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)"
+          contextdb_sha="${contextdb_sha##*=}"
           if [[ ! "$context_graph_sha" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$contextdb_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "checkouts must resolve to immutable 40-character commit SHAs" >&2
+            echo "Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs" >&2
             exit 1
           fi
           if [[ "$context_graph_sha" != "$GITHUB_SHA" ]]; then
@@ -72,7 +71,7 @@ jobs:
             exit 1
           fi
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] && [[ "$contextdb_sha" != "$REQUESTED_CONTEXTDB_SHA" ]]; then
-            echo "checked-out ContextDB SHA does not match contextdb_sha" >&2
+            echo "locked ContextDB SHA does not match contextdb_sha" >&2
             exit 1
           fi
           printf 'Context Graph SHA: %s\n' "$context_graph_sha"
@@ -82,17 +81,9 @@ jobs:
         with:
           cache-bin: false
           workspaces: workspace/context-graph -> target
-      - uses: actions/cache@v4
-        with:
-          # The embedder cache directory. There is no Windows leg (see the
-          # matrix comment above), so no AppData path either. A runner that has
-          # never held the weights writes them to the sibling models/ directory,
-          # so set CG_MODEL_CACHE_ROOT to this path to seed a cold cache.
-          path: ~/.cache/cg/embedders
-          key: cg-nomic-${{ runner.os }}-${{ hashFiles('workspace/context-graph/crates/context-graph/src/embedder/nomic.rs') }}
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny@0.20.2,cargo-expand@1.0.124
+          tool: cargo-deny@0.20.2,cargo-expand@1.0.124,cargo-nextest@0.9.140
       - run: |
           require_file_without_match() {
             local pattern="$1"
@@ -118,6 +109,37 @@ jobs:
           cargo tree -p context-graph -e normal,build | tee "$RUNNER_TEMP/context-graph-tree.txt"
           test -s "$RUNNER_TEMP/context-graph-tree.txt"
           require_file_without_match '(^|[[:space:]])candle-embeddinggemma([[:space:]]|$)' "$RUNNER_TEMP/context-graph-tree.txt"
+      - uses: actions/cache@v4
+        id: nomic-model-cache
+        with:
+          # This is the root `cg_catalog::default_cache_root()` uses when the
+          # environment override is set, so the seed and offline proofs share
+          # the exact production model location.
+          path: ${{ env.CG_MODEL_CACHE_ROOT }}
+          key: cg-nomic-${{ runner.os }}-${{ hashFiles('workspace/context-graph/crates/context-graph/src/embedder/nomic.rs') }}
+      - name: Seed Nomic model cache on cold miss
+        if: steps.nomic-model-cache.outputs.cache-hit != 'true'
+        run: |
+          rustup run stable cargo run -p context-graph-cli --bin cg -- model fetch --defaults
+          rustup run stable cargo test -p context-graph --test nomic_document_preparer_adds_exactly_one_system_task_prefix
+      - name: Run offline real Nomic model proofs
+        run: |
+          rustup run stable cargo test -p context-graph \
+            --test nomic_document_preparer_adds_exactly_one_system_task_prefix \
+            --test nomic_query_preparer_adds_exactly_one_system_task_prefix \
+            --test event_search_uses_role_preparation_while_digest_record_and_evidence_paths_remain_byte_for_byte_unchanged
+      - name: Documented behavior claims name the test that enforces them, and that check still catches one that does not
+        env:
+          DOCUMENTATION_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base="${DOCUMENTATION_BASE_SHA:-HEAD^}"
+          if [[ -z "$base" ]] || [[ "$base" =~ ^0+$ ]] || ! git rev-parse --verify --quiet "${base}^{commit}" > /dev/null; then
+            base="HEAD^"
+          fi
+          git rev-parse --verify --quiet "${base}^{commit}" > /dev/null
+          printf 'comparing the touched doc files against %s\n' "$base"
+          python3 scripts/validate-doc-coverage.py --base "$base"
+          bash scripts/check-doc-validator-negative-control.sh
       - run: rustup run stable cargo fmt --all --check
       - run: rustup run stable cargo clippy --workspace --all-targets -- -D warnings
       - name: Free disk space
@@ -130,3 +152,25 @@ jobs:
           rm -rf /opt/az
           rm -rf /opt/ghc
       - run: rustup run stable cargo test --workspace
+      - name: Gate wall-clock baseline never rises without review
+        env:
+          DOCUMENTATION_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base="${DOCUMENTATION_BASE_SHA:-HEAD^}"
+          if [[ -z "$base" ]] || [[ "$base" =~ ^0+$ ]] || ! git rev-parse --verify --quiet "${base}^{commit}" > /dev/null; then
+            base="HEAD^"
+          fi
+          git rev-parse --verify --quiet "${base}^{commit}" > /dev/null
+          printf 'comparing the gate wall-clock baseline against %s\n' "$base"
+          python3 scripts/check-gate-wall-clock.py --base "$base"
+      - name: Measure this run's own test wall-clock
+        # The wall-clock arm compares seconds someone else already measured, so this run has to
+        # produce a measurement of its own. `cargo test` writes no JUnit; nextest does, under the
+        # `gate` profile checked in at .config/nextest.toml — the same profile scripts/gate.sh
+        # uses. Without this step the arm has nothing to read, which is a comparison against an
+        # empty measurement rather than a check.
+        run: rustup run stable cargo nextest run --workspace --no-fail-fast --profile gate
+      - name: Gate wall-clock stays inside the frozen baseline
+        env:
+          CG_GATE_JUNIT: ${{ github.workspace }}/workspace/context-graph/target/nextest/gate/junit.xml
+        run: rustup run stable cargo test -p context-graph --test test_estate_audit gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact

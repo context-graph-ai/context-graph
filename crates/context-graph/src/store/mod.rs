@@ -2,6 +2,7 @@ pub(crate) mod audit;
 mod conflict_detection;
 mod consumer_tables;
 pub(crate) mod context;
+mod context_binding;
 pub(crate) mod convert;
 pub(crate) mod decision;
 mod digest;
@@ -9,10 +10,19 @@ pub(crate) mod embedding;
 mod encode;
 pub(crate) mod entity;
 pub(crate) mod entity_reference_embeddings;
+pub(crate) mod event;
+mod event_correlation;
+mod event_forget;
+mod event_history_status;
+mod event_import;
+pub(crate) mod event_interpretation;
+pub(crate) mod event_search_projection;
+pub(crate) mod event_search_read;
 pub(crate) mod evidence;
 pub(crate) mod graph_rows;
 mod impact_analysis;
 pub(crate) mod intention;
+pub(crate) mod interpretation_build;
 mod invalidation_lifecycle;
 pub(crate) mod observation;
 mod outcome;
@@ -26,19 +36,22 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use contextdb_core::{ColumnType, Error as EngineError, ScopeLabel, TxId, Value};
+use contextdb_core::{
+    ColumnType, EdgeDiscardMode, Error as EngineError, ScopeLabel, SyncDirection, TxId, Value,
+};
 use contextdb_engine::{
     Database, DatabaseOpenOptions, OpenDisposition, QueryResult, plugin::DatabasePlugin,
+    work_ledger::WORK_LEDGER_TABLES,
 };
 
 use crate::Result;
 use crate::consumer_read::ConsumerDeclaration;
 use crate::embedding_space::default_text_embedding_space;
 use crate::error::CgError;
-use crate::owner_control::{ControlHandler, owner_read_config};
+use crate::owner_control::{ControlHandler, writable_owner_read_config};
 use crate::schema::{
-    ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, INDEXES, LOCAL_RUNTIME_TABLES,
-    SUBSCRIPTION_EVENT_TYPE_DDL, TABLES,
+    ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, EVENT_TABLE_NAMES, INDEXES, LOCAL_DERIVED_INDEXES,
+    LOCAL_DERIVED_TABLES, LOCAL_RUNTIME_TABLES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES,
 };
 use crate::types::*;
 use crate::{Embedder, EmbedderRegistration};
@@ -48,14 +61,33 @@ use crate::embedder::nomic::NomicTextEmbedder;
 
 use self::conflict_detection::register_conflict_detection_triggers;
 pub use self::consumer_tables::{ConsumerSchema, ConsumerTable};
+#[cfg(context_graph_internal_test_support)]
+#[doc(hidden)]
+pub use self::event_correlation::{
+    EventCorrelationObservationGuard, EventCorrelationTestObserver,
+    observe_public_store_resolver_for_test,
+};
+#[cfg(context_graph_internal_test_support)]
+#[doc(hidden)]
+pub use self::event_search_projection::pause_next_event_search_finalization_for_test;
 // The read door holds a declaration to the persisted table too, and must decide that the same way
 // this door does: one conversion from declared text to the store's own scope vocabulary.
 pub(crate) use self::consumer_tables::scope_label_kind;
-use self::consumer_tables::{install_consumer_schema, validate_consumer_schema};
+use self::consumer_tables::{
+    install_consumer_schema, validate_consumer_schema, validate_present_consumer_tables,
+};
 use self::convert::map_engine_err;
 use self::convert::{map_consumer_open_err, map_open_err};
 pub use self::digest::{DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit};
 pub use self::entity_reference_embeddings::{EntityMatch, EntityReferenceMatchOptions};
+pub use self::event_forget::{
+    ForgetReceipt, ForgetSelection, ForgetTableCount, RetiredInterpretation,
+};
+pub use self::event_history_status::{
+    EventHistoryContextStatus, EventHistoryInterpretationHead, EventHistoryMemoryCounts,
+    EventHistorySearchState, EventHistorySearchStatus, EventHistoryStatusSet,
+    EventSourcePrefixCheck, EventSourceStreamStatus, event_history_reader_declaration,
+};
 use self::impact_analysis::register_impact_analysis_trigger;
 pub use self::invalidation_lifecycle::ScopedStore;
 use self::precedent_match::register_precedent_match_trigger;
@@ -65,7 +97,9 @@ const _: fn() = embedding::production_primitive_anchor;
 
 const MAX_GRAPH_DEPTH: u8 = 10;
 const SCHEMA_BOOTSTRAP_VALIDATE_ATTEMPTS: usize = 256;
+const EVENT_PLACEMENT_TO_TENANT_HUB: &str = "transition_to_tenant_hub";
 static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
+static SCHEMA_INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) trait StoreReadObserver: Send + Sync {
     fn observe_read(&self, event: StoreReadEvent);
@@ -155,6 +189,8 @@ pub struct Store {
     default_text_embedder_disabled: bool,
     reindex_events: Arc<Mutex<Vec<ReindexEvent>>>,
     read_observer: Option<Arc<dyn StoreReadObserver>>,
+    schema_embedding_spaces: Arc<Vec<EmbeddingSpaceDecl>>,
+    schema_consumer_schema: Arc<ConsumerSchema>,
 }
 
 impl std::fmt::Debug for Store {
@@ -370,6 +406,23 @@ impl Store {
     }
 
     #[cfg(context_graph_internal_test_support)]
+    pub fn open_with_consumer_schema_and_database_plugin(
+        config: StoreConfig,
+        consumer_schema: ConsumerSchema,
+        plugin: Arc<dyn DatabasePlugin>,
+    ) -> Result<Self> {
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            None,
+            DatabaseOpenExtras::with_plugin(plugin),
+            Vec::new(),
+            consumer_schema,
+        )
+    }
+
+    #[cfg(context_graph_internal_test_support)]
     pub fn open_with_database_plugin_and_embedder_registrations(
         config: StoreConfig,
         plugin: Arc<dyn DatabasePlugin>,
@@ -445,11 +498,27 @@ impl Store {
         for registration in registrations.iter().take(explicit_registration_count) {
             let space_id = &registration.space.embedding_space_id;
             let is_builtin_default = *space_id == default_text_embedding_space().embedding_space_id;
-            let already_declared = config
+            let declared = config
                 .extra_embedding_spaces
                 .iter()
-                .any(|decl| decl.embedding_space_id == *space_id);
-            if !is_builtin_default && !already_declared && registration.space.bindings.is_empty() {
+                .find(|decl| decl.embedding_space_id == *space_id);
+            if let Some(declared) = declared {
+                // The configured entry wins, except that a bound registration names the vector
+                // columns it writes, and those must be exactly the columns the configured space
+                // binds.
+                if !registration.space.bindings.is_empty()
+                    && canonical_bindings(&declared.bindings)
+                        != canonical_bindings(&registration.space.bindings)
+                {
+                    let (expected, actual) =
+                        binding_mismatch_values(&declared.bindings, &registration.space.bindings);
+                    return Err(CgError::EmbeddingSpaceConfigMismatch {
+                        field: "bindings",
+                        expected,
+                        actual,
+                    });
+                }
+            } else if !is_builtin_default && registration.space.bindings.is_empty() {
                 config
                     .extra_embedding_spaces
                     .push(registration.space.clone());
@@ -503,6 +572,8 @@ impl Store {
             default_text_embedder_disabled,
             reindex_events: Arc::new(Mutex::new(Vec::new())),
             read_observer: StoreReadProbe::from_env(),
+            schema_embedding_spaces: Arc::new(config.extra_embedding_spaces.clone()),
+            schema_consumer_schema: Arc::new(consumer_schema),
         };
         store.set_trace(loader_trace);
         Ok(store)
@@ -537,6 +608,7 @@ impl Store {
     }
 
     pub(super) fn begin_tx(&self) -> Result<TxId> {
+        self.require_application_ready()?;
         self.db.begin().map_err(map_engine_err)
     }
 
@@ -594,6 +666,75 @@ impl Store {
         &self.db
     }
 
+    pub(crate) fn schema_db(&self) -> &Database {
+        self.resource_owner.as_deref().unwrap_or(&self.db)
+    }
+
+    pub(crate) fn require_application_ready(&self) -> Result<()> {
+        let db = self.schema_db();
+        if schema_version_is_published(db, CG_SCHEMA_VERSION)?
+            && reserved_schema_manifest_is_present(db)
+        {
+            return Ok(());
+        }
+        if persisted_event_policy(db)? == Some(EventPlacementPolicy::TenantHub) {
+            return Err(CgError::TenantPolicyBindingRequired {
+                expected: EventPlacementPolicy::TenantHub,
+            });
+        }
+        Err(CgError::LegacySchemaDetected {
+            found_version: 0,
+            expected_version: CG_SCHEMA_VERSION,
+        })
+    }
+
+    pub(super) fn install_authenticated_schema(
+        &self,
+        events_ddl: &str,
+        event_anchors_ddl: &str,
+        event_discard: EdgeDiscardMode,
+        anchor_discard: EdgeDiscardMode,
+    ) -> Result<()> {
+        let _install_guard = SCHEMA_INSTALL_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = self.schema_db();
+        let baseline = begin_installation_table_baseline(db)?;
+        let installed = (|| -> Result<()> {
+            initialize_schema(
+                db,
+                EventPlacementPolicy::TenantHub,
+                Some((events_ddl, event_anchors_ddl)),
+            )?;
+            ensure_entity_reference_embedding_tables(db, &self.schema_embedding_spaces)?;
+            seed_embedding_spaces_without_readiness(db, &self.schema_embedding_spaces)?;
+            ensure_event_placement_row(db, EventPlacementPolicy::TenantHub)?;
+            install_consumer_schema(db, &self.schema_consumer_schema)?;
+            register_store_triggers(db)?;
+            verify_complete_schema(
+                db,
+                &self.schema_embedding_spaces,
+                Some((event_discard, anchor_discard)),
+            )?;
+            publish_schema_readiness(db)?;
+            validate_schema_version_after_bootstrap(db, CG_SCHEMA_VERSION)
+        })();
+        if let Err(error) = installed {
+            if let Err(cleanup_error) =
+                cleanup_tables_created_since(db, &baseline, &self.schema_consumer_schema)
+                    .and_then(|()| db.complete_initialization().map_err(map_engine_err))
+                    .and_then(|()| clear_installation_table_baseline(db))
+            {
+                return Err(CgError::Engine(format!(
+                    "authenticated schema installation failed ({error}); cleanup failed ({cleanup_error})"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn sync_database(&self) -> Arc<Database> {
         Arc::clone(&self.db)
     }
@@ -608,6 +749,7 @@ impl Store {
     }
 
     pub fn register_embedding_space(&self, decl: EmbeddingSpaceDecl) -> Result<()> {
+        self.require_application_ready()?;
         validate_runtime_embedding_space_declaration(&decl)?;
         ensure_runtime_vector_columns(&self.db, &decl)?;
         ensure_entity_reference_embedding_tables(&self.db, std::slice::from_ref(&decl))?;
@@ -738,6 +880,8 @@ impl Store {
     }
 }
 
+// `Vec` is required because the enabled Nomic registration appends.
+#[cfg_attr(not(feature = "nomic-embedder"), allow(clippy::ptr_arg))]
 fn maybe_register_default_text_embedder(
     config: &StoreConfig,
     registrations: &mut Vec<EmbedderRegistration>,
@@ -773,6 +917,7 @@ fn maybe_register_default_text_embedder(
 
 impl graph_rows::GraphRows for Store {
     fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        self.require_application_ready()?;
         self.db.execute(sql, params).map_err(map_engine_err)
     }
 }
@@ -831,9 +976,9 @@ impl DatabaseOpenExtras {
         if let Some(plugin) = self.plugin.clone() {
             options.plugin = plugin;
         }
-        if let Some(handler) = self.owner_control.clone() {
-            options.owner_reads = owner_read_config(handler);
-        }
+        // Every writable open serves owner reads, so a read-only client is answered while a worker
+        // or an import holds the store; the handler only adds administrative frames.
+        options.owner_reads = writable_owner_read_config(self.owner_control.clone());
         options
     }
 
@@ -868,7 +1013,6 @@ fn open_bootstrapped_database(
         && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
     {
         bootstrap_schema(&existing, config, true, consumer_schema)?;
-        register_store_triggers(&existing)?;
         return Ok(narrowed_handle(existing, contexts, scope_labels));
     }
     // The open is the only place that knows WHICH store was refused, and readers still reading a
@@ -878,7 +1022,6 @@ fn open_bootstrapped_database(
             .map_err(|error| extras.map_refusal(db_path, error))?,
     );
     bootstrap_schema(&db, config, false, consumer_schema)?;
-    register_store_triggers(&db)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
     Ok(narrowed_handle(db, contexts, scope_labels))
 }
@@ -924,6 +1067,10 @@ fn validate_embedder_registrations(registrations: &[EmbedderRegistration]) -> Re
                 embedding_space_id: registration.space.embedding_space_id.clone(),
             });
         }
+        crate::embedder::verify_event_history_authority(
+            registration.embedder.as_ref(),
+            &registration.space.embedding_space_id,
+        )?;
     }
     Ok(())
 }
@@ -967,39 +1114,55 @@ fn default_embedding_space_map(extra: &[EmbeddingSpaceDecl]) -> HashMap<Evidence
 fn bootstrap_schema(
     db: &Database,
     config: &StoreConfig,
-    reused_shared_handle: bool,
+    _reused_shared_handle: bool,
     consumer_schema: &ConsumerSchema,
 ) -> Result<()> {
+    let _install_guard = SCHEMA_INSTALL_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     validate_embedding_space_declarations(&config.extra_embedding_spaces)?;
-    let mut bootstrapped_reused_handle = false;
-    let mut schema_was_empty = false;
-    match validate_schema_version(db, config.expected_schema_version) {
-        Ok(()) => {
-            schema_was_empty = db.table_names().is_empty();
-        }
-        Err(CgError::LegacySchemaDetected { .. })
-            if reused_shared_handle && schema_version_table_is_empty(db) =>
-        {
-            initialize_schema(db)?;
-            ensure_entity_reference_embedding_tables(db, &config.extra_embedding_spaces)?;
-            seed_embedding_spaces(db, &config.extra_embedding_spaces)?;
-            validate_schema_version_after_bootstrap(db, config.expected_schema_version)?;
-            bootstrapped_reused_handle = true;
-        }
-        Err(err) => return Err(err),
-    }
-    if !bootstrapped_reused_handle
-        && (!reused_shared_handle || schema_was_empty || !config.extra_embedding_spaces.is_empty())
+    let event_policy = resolve_event_bootstrap_policy(db, config.event_placement)?;
+
+    let published = schema_version_is_published(db, config.expected_schema_version)?;
+    if event_policy == EventPlacementPolicy::TenantHub
+        && (!published || !reserved_schema_manifest_is_present(db))
     {
-        initialize_schema(db)?;
-        ensure_entity_reference_embedding_tables(db, &config.extra_embedding_spaces)?;
-        seed_embedding_spaces(db, &config.extra_embedding_spaces)?;
-        validate_schema_version_after_bootstrap(db, config.expected_schema_version)?;
+        if published {
+            validate_schema_version(db, config.expected_schema_version)?;
+            if !reserved_non_event_schema_manifest_is_present(db) {
+                return Err(CgError::Engine(
+                    "a published tenant transition is missing existing non-event schema; recovery preserved it for diagnosis"
+                        .into(),
+                ));
+            }
+            recover_published_tenant_transition(db)?;
+            ensure_tenant_bootstrap(db)?;
+            register_store_triggers(db)?;
+        } else {
+            recover_tenant_bootstrap(db, consumer_schema)?;
+            ensure_tenant_bootstrap(db)?;
+            db.complete_initialization().map_err(map_engine_err)?;
+        }
+        return Ok(());
     }
+    if event_policy == EventPlacementPolicy::LocalOnly && !published && !db.table_names().is_empty()
+    {
+        validate_schema_version(db, config.expected_schema_version)?;
+    }
+
+    initialize_schema(db, event_policy, None)?;
+    ensure_entity_reference_embedding_tables(db, &config.extra_embedding_spaces)?;
+    seed_embedding_spaces_without_readiness(db, &config.extra_embedding_spaces)?;
+    ensure_event_placement_row(db, event_policy)?;
+    install_consumer_schema(db, consumer_schema)?;
+    register_store_triggers(db)?;
+    verify_complete_schema(db, &config.extra_embedding_spaces, None)?;
+    publish_schema_readiness(db)?;
+    validate_schema_version_after_bootstrap(db, config.expected_schema_version)?;
     // Consumer-owned tables land after context-graph's own schema is installed and
     // its version row seeded, so the version gate never opens on a store that holds
     // consumer tables and none of context-graph's.
-    install_consumer_schema(db, consumer_schema)?;
     Ok(())
 }
 
@@ -1011,30 +1174,388 @@ fn existing_shared_database(db_path: &Path) -> Option<Arc<Database>> {
     existing
 }
 
-fn initialize_schema(db: &Database) -> Result<()> {
+#[cfg(context_graph_internal_test_support)]
+#[doc(hidden)]
+pub fn database_is_live_for_test(db_path: &Path) -> bool {
+    // Store::open uses the configured path itself as the registry key. This read-only
+    // observation deliberately does the same: it neither creates the registry nor
+    // upgrades the Weak handle, so it cannot keep a Database alive.
+    REGISTRY
+        .get()
+        .and_then(|registry| {
+            registry
+                .lock()
+                .expect("store registry lock")
+                .get(db_path)
+                .map(Weak::strong_count)
+        })
+        .is_some_and(|strong_count| strong_count > 0)
+}
+
+fn schema_version_is_published(db: &Database, expected: u32) -> Result<bool> {
+    if db.table_meta("cg_schema_version").is_none() {
+        return Ok(false);
+    }
+    let result = db
+        .execute("SELECT version FROM cg_schema_version", &HashMap::new())
+        .map_err(map_engine_err)?;
+    if result.rows.is_empty() {
+        return Ok(false);
+    }
+    let found = if result.rows.len() == 1 {
+        match result.rows[0].first() {
+            Some(Value::Int64(version)) => u32::try_from(*version).unwrap_or(0),
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    if result.rows.len() != 1 || found != expected {
+        return Err(CgError::LegacySchemaDetected {
+            found_version: found,
+            expected_version: expected,
+        });
+    }
+    Ok(true)
+}
+
+fn reserved_schema_manifest_is_present(db: &Database) -> bool {
+    TABLES
+        .iter()
+        .all(|table| db.table_meta(table.name).is_some())
+        && LOCAL_DERIVED_TABLES
+            .iter()
+            .all(|table| db.table_meta(table.name).is_some())
+        && LOCAL_RUNTIME_TABLES
+            .iter()
+            .all(|table| db.table_meta(table.name).is_some())
+        && WORK_LEDGER_TABLES
+            .iter()
+            .all(|table| db.table_meta(table).is_some())
+}
+
+fn reserved_non_event_schema_manifest_is_present(db: &Database) -> bool {
+    TABLES
+        .iter()
+        .filter(|table| !EVENT_TABLE_NAMES.contains(&table.name))
+        .all(|table| db.table_meta(table.name).is_some())
+        && LOCAL_RUNTIME_TABLES
+            .iter()
+            .filter(|table| !EVENT_TABLE_NAMES.contains(&table.name))
+            .all(|table| db.table_meta(table.name).is_some())
+        && WORK_LEDGER_TABLES
+            .iter()
+            .all(|table| db.table_meta(table).is_some())
+}
+
+fn ensure_tenant_bootstrap(db: &Database) -> Result<()> {
+    if db.table_meta("event_placement").is_none() {
+        let placement = TABLES
+            .iter()
+            .find(|table| table.name == "event_placement")
+            .expect("event placement belongs to the reserved schema");
+        db.execute(placement.ddl, &HashMap::new())
+            .map_err(map_engine_err)?;
+    }
+    ensure_event_placement_row(db, EventPlacementPolicy::TenantHub)
+}
+
+fn recover_published_tenant_transition(db: &Database) -> Result<()> {
+    if event_capture_has_started(db)? {
+        return Err(CgError::Engine(
+            "a published tenant transition has a capture latch; recovery preserved its event tables for diagnosis"
+                .into(),
+        ));
+    }
+    for table in LOCAL_DERIVED_TABLES
+        .iter()
+        .rev()
+        .map(|table| table.name)
+        .chain(EVENT_TABLE_NAMES.iter().rev().copied())
+    {
+        if db.table_meta(table).is_some() {
+            db.execute(&drop_table_sql(table), &HashMap::new())
+                .map_err(map_engine_err)?;
+        }
+    }
+    Ok(())
+}
+
+fn recover_tenant_bootstrap(db: &Database, consumer_schema: &ConsumerSchema) -> Result<()> {
+    let current = db.table_names().into_iter().collect::<HashSet<_>>();
+    validate_present_consumer_tables(db, consumer_schema)?;
+    let persisted_baseline = installation_table_baseline(db)?;
+    let baseline = persisted_baseline.clone().unwrap_or_else(|| {
+        current
+            .into_iter()
+            .filter(|table| table == "event_placement" || !is_reserved_install_table(table))
+            .collect()
+    });
+    cleanup_tables_created_since(db, &baseline, consumer_schema)?;
+    if persisted_baseline.is_some() {
+        clear_installation_table_baseline(db)?;
+    }
+    Ok(())
+}
+
+fn installation_table_baseline(db: &Database) -> Result<Option<HashSet<String>>> {
+    if db.table_meta("event_placement").is_none() {
+        return Ok(None);
+    }
+    let result = db
+        .execute(
+            "SELECT installation_table_baseline FROM event_placement WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Int64(1))]),
+        )
+        .map_err(map_engine_err)?;
+    let Some(value) = result.rows.first().and_then(|row| row.first()) else {
+        return Ok(None);
+    };
+    let Value::Json(serde_json::Value::Array(names)) = value else {
+        return match value {
+            Value::Null => Ok(None),
+            other => Err(CgError::Engine(format!(
+                "invalid persisted installation table baseline: {other:?}"
+            ))),
+        };
+    };
+    let mut baseline = HashSet::with_capacity(names.len());
+    for name in names {
+        let Some(name) = name.as_str() else {
+            return Err(CgError::Engine(
+                "invalid persisted installation table baseline: every table name must be text"
+                    .into(),
+            ));
+        };
+        baseline.insert(name.to_string());
+    }
+    if !baseline.contains("event_placement") {
+        return Err(CgError::Engine(
+            "invalid persisted installation table baseline: event_placement is missing".into(),
+        ));
+    }
+    Ok(Some(baseline))
+}
+
+fn begin_installation_table_baseline(db: &Database) -> Result<HashSet<String>> {
+    if let Some(baseline) = installation_table_baseline(db)? {
+        return Ok(baseline);
+    }
+    let baseline = db.table_names().into_iter().collect::<HashSet<_>>();
+    let mut ordered = baseline.iter().cloned().collect::<Vec<_>>();
+    ordered.sort();
+    let tx = db.begin().map_err(map_engine_err)?;
+    let updated = db.execute_in_tx(
+        tx,
+        "UPDATE event_placement SET installation_table_baseline = $baseline WHERE id = $id AND installation_table_baseline IS NULL",
+        &HashMap::from([
+            ("id".to_string(), Value::Int64(1)),
+            (
+                "baseline".to_string(),
+                Value::Json(serde_json::json!(ordered)),
+            ),
+        ]),
+    );
+    let updated = match updated {
+        Ok(updated) => updated,
+        Err(error) => {
+            let _ = db.rollback(tx);
+            return Err(map_engine_err(error));
+        }
+    };
+    if updated.rows_affected != 1 {
+        let _ = db.rollback(tx);
+        return Err(CgError::Engine(
+            "the tenant bootstrap changed while recording its installation table baseline".into(),
+        ));
+    }
+    if let Err(error) = db.commit(tx) {
+        let _ = db.rollback(tx);
+        return Err(map_engine_err(error));
+    }
+    Ok(baseline)
+}
+
+fn clear_installation_table_baseline(db: &Database) -> Result<()> {
+    let tx = db.begin().map_err(map_engine_err)?;
+    if let Err(error) = clear_installation_table_baseline_in_tx(db, tx) {
+        let _ = db.rollback(tx);
+        return Err(error);
+    }
+    if let Err(error) = db.commit(tx) {
+        let _ = db.rollback(tx);
+        return Err(map_engine_err(error));
+    }
+    Ok(())
+}
+
+fn clear_installation_table_baseline_in_tx(db: &Database, tx: TxId) -> Result<()> {
+    let updated = db
+        .execute_in_tx(
+            tx,
+            "UPDATE event_placement SET installation_table_baseline = $baseline WHERE id = $id",
+            &HashMap::from([
+                ("id".to_string(), Value::Int64(1)),
+                ("baseline".to_string(), Value::Null),
+            ]),
+        )
+        .map_err(map_engine_err)?;
+    if updated.rows_affected != 1 {
+        return Err(CgError::Engine(
+            "the tenant bootstrap row disappeared while clearing its installation table baseline"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_reserved_install_table(table: &str) -> bool {
+    TABLES.iter().any(|spec| spec.name == table)
+        || LOCAL_DERIVED_TABLES.iter().any(|spec| spec.name == table)
+        || LOCAL_RUNTIME_TABLES.iter().any(|spec| spec.name == table)
+        || WORK_LEDGER_TABLES.contains(&table)
+        || table.starts_with(ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX)
+}
+
+fn cleanup_tables_created_since(
+    db: &Database,
+    baseline: &HashSet<String>,
+    consumer_schema: &ConsumerSchema,
+) -> Result<()> {
+    let mut pending = db
+        .table_names()
+        .into_iter()
+        .filter(|table| !baseline.contains(table))
+        .collect::<HashSet<_>>();
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let consumer_table_names = consumer_schema
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut preferred = consumer_schema
+        .tables
+        .iter()
+        .rev()
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    preferred.extend(
+        pending
+            .iter()
+            .filter(|table| {
+                !is_reserved_install_table(table) && !consumer_table_names.contains(table.as_str())
+            })
+            .cloned(),
+    );
+    preferred.extend(
+        pending
+            .iter()
+            .filter(|table| table.starts_with(ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX))
+            .cloned(),
+    );
+    preferred.extend(
+        LOCAL_RUNTIME_TABLES
+            .iter()
+            .rev()
+            .map(|table| table.name.to_string()),
+    );
+    preferred.extend(
+        LOCAL_DERIVED_TABLES
+            .iter()
+            .rev()
+            .map(|table| table.name.to_string()),
+    );
+    preferred.extend(TABLES.iter().rev().map(|table| table.name.to_string()));
+    preferred.extend(
+        WORK_LEDGER_TABLES
+            .iter()
+            .rev()
+            .map(|table| table.to_string()),
+    );
+
+    for table in preferred {
+        if !pending.contains(&table) || db.table_meta(&table).is_none() {
+            pending.remove(&table);
+            continue;
+        }
+        db.execute(&drop_table_sql(&table), &HashMap::new())
+            .map_err(map_engine_err)?;
+        pending.remove(&table);
+    }
+    if !pending.is_empty() {
+        return Err(CgError::Engine(format!(
+            "schema cleanup left installer tables behind: {}",
+            pending.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    if db.table_names().into_iter().collect::<HashSet<_>>() != *baseline {
+        return Err(CgError::Engine(
+            "schema cleanup did not restore the bootstrap table inventory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn drop_table_sql(table: &str) -> String {
+    format!("DROP TABLE \"{}\"", table.replace('"', "\"\""))
+}
+
+fn initialize_schema(
+    db: &Database,
+    event_policy: EventPlacementPolicy,
+    tenant_event_ddls: Option<(&str, &str)>,
+) -> Result<()> {
     // Install the shipped work-ledger schema (the seven append-only fabric tables) alongside cg's
     // own schema at store open. Idempotent — creates only missing tables — so reads of work_* hit an
     // empty table rather than erroring on a missing one. The fabric slice consumes this ledger; the
     // tables are inert on a single-node install.
     contextdb_engine::work_ledger::install_work_ledger_schema(db).map_err(map_engine_err)?;
+    let mut present = db.table_names().into_iter().collect::<HashSet<_>>();
+    let mut planned = Vec::new();
     for table in TABLES {
-        if db.table_meta(table.name).is_some() {
+        if present.contains(table.name) {
             continue;
         }
-        db.execute(table.ddl, &HashMap::new())
-            .map_err(map_engine_err)?;
+        let ddl = if event_policy == EventPlacementPolicy::TenantHub {
+            match table.name {
+                "events" => tenant_event_ddls.map(|(events, _)| events),
+                "event_anchors" => tenant_event_ddls.map(|(_, anchors)| anchors),
+                "event_local_commits" if tenant_event_ddls.is_some() => Some(table.ddl),
+                name if EVENT_TABLE_NAMES.contains(&name) => None,
+                _ => Some(table.ddl),
+            }
+        } else {
+            Some(table.ddl)
+        };
+        let Some(ddl) = ddl else {
+            continue;
+        };
+        planned.push(ddl);
+        present.insert(table.name.to_string());
+    }
+    if EVENT_TABLE_NAMES
+        .iter()
+        .all(|table| present.contains(*table))
+    {
+        for table in LOCAL_DERIVED_TABLES {
+            if present.insert(table.name.to_string()) {
+                planned.push(table.ddl);
+            }
+        }
     }
     // The per-device runtime tables (`SYNC OFF`) install here too, not lazily on first write: a
     // table created after a node has drained its push leaves that node reporting schema it still
     // owes the hub, so registering a runtime model would read as pending graph transport.
     for table in LOCAL_RUNTIME_TABLES {
-        if db.table_meta(table.name).is_some() {
-            continue;
+        if present.insert(table.name.to_string()) {
+            planned.push(table.ddl);
         }
-        db.execute(table.ddl, &HashMap::new())
-            .map_err(map_engine_err)?;
     }
-    for index in INDEXES {
+    install_startup_tables(db, &planned)?;
+    for index in INDEXES.iter().chain(LOCAL_DERIVED_INDEXES) {
         let Some(meta) = db.table_meta(index.table) else {
             continue;
         };
@@ -1051,6 +1572,362 @@ fn initialize_schema(db: &Database) -> Result<()> {
     for ddl in SUBSCRIPTION_EVENT_TYPE_DDL {
         db.execute(ddl, &HashMap::new()).map_err(map_engine_err)?;
     }
+    Ok(())
+}
+
+/// One startup `CREATE TABLE`, with what decides which schema commit it can join.
+struct StartupTable<'a> {
+    name: String,
+    ddl: &'a str,
+    parents: Vec<String>,
+    stageable: bool,
+}
+
+impl<'a> StartupTable<'a> {
+    fn parse(ddl: &'a str) -> Result<Self> {
+        let Ok(contextdb_parser::ast::Statement::CreateTable(table)) = contextdb_parser::parse(ddl)
+        else {
+            return Err(CgError::Engine(format!(
+                "a startup table declaration does not parse as CREATE TABLE: {ddl}"
+            )));
+        };
+        let parents = table
+            .columns
+            .iter()
+            .filter_map(|column| column.references.as_ref().map(|fk| fk.table.clone()))
+            .chain(
+                table
+                    .composite_foreign_keys
+                    .iter()
+                    .map(|fk| fk.parent_table.clone()),
+            )
+            .filter(|parent| *parent != table.name)
+            .collect();
+        // The engine's transactional schema staging refuses exactly these shapes.
+        let stageable = table.dag_edge_types.is_empty()
+            && table.columns.iter().all(|column| {
+                !matches!(column.data_type, contextdb_parser::ast::DataType::Vector(_))
+                    && column.rank_policy.is_none()
+            });
+        Ok(Self {
+            name: table.name,
+            ddl,
+            parents,
+            stageable,
+        })
+    }
+}
+
+/// Create the missing startup tables, in `ddls` order, with as few schema commits as the engine
+/// allows.
+///
+/// A peer replays every schema commit it receives over its whole schema, so a startup schema
+/// authored one statement per commit made a node's first push and pull cost the square of the
+/// schema size. The engine stages only tables without a vector, rank or DAG column in a
+/// transaction; each of those others commits on its own. Each round commits every stageable table
+/// whose foreign-key parents already exist as one transaction, then each other table whose parents
+/// exist, so creation still follows the parents.
+fn install_startup_tables(db: &Database, ddls: &[&str]) -> Result<()> {
+    let mut pending = ddls
+        .iter()
+        .map(|ddl| StartupTable::parse(ddl))
+        .collect::<Result<Vec<_>>>()?;
+    let mut created = db.table_names().into_iter().collect::<HashSet<_>>();
+    while !pending.is_empty() {
+        let before = pending.len();
+        for stageable in [true, false] {
+            let waiting = pending
+                .iter()
+                .map(|table| table.name.clone())
+                .collect::<HashSet<_>>();
+            let mut batch = Vec::new();
+            let mut index = 0;
+            while index < pending.len() {
+                let table = &pending[index];
+                let ready = table.stageable == stageable
+                    && table
+                        .parents
+                        .iter()
+                        .all(|parent| created.contains(parent) || !waiting.contains(parent));
+                if !ready {
+                    index += 1;
+                    continue;
+                }
+                let table = pending.remove(index);
+                if stageable {
+                    batch.push(table.ddl);
+                } else {
+                    db.execute(table.ddl, &HashMap::new())
+                        .map_err(map_engine_err)?;
+                }
+                created.insert(table.name);
+            }
+            execute_schema_transaction(db, &batch)?;
+        }
+        if pending.len() == before {
+            return Err(CgError::Engine(format!(
+                "startup tables wait on foreign-key parents that are never created: {}",
+                pending
+                    .iter()
+                    .map(|table| table.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Commit `statements` as one DDL-only transaction, or none of them.
+fn execute_schema_transaction(db: &Database, statements: &[&str]) -> Result<()> {
+    if statements.is_empty() {
+        return Ok(());
+    }
+    let tx = db.begin().map_err(map_engine_err)?;
+    for ddl in statements {
+        if let Err(error) = db.execute_in_tx(tx, ddl, &HashMap::new()) {
+            let _ = db.rollback(tx);
+            return Err(map_engine_err(error));
+        }
+    }
+    if let Err(error) = db.commit(tx) {
+        let _ = db.rollback(tx);
+        return Err(map_engine_err(error));
+    }
+    Ok(())
+}
+
+fn resolve_event_bootstrap_policy(
+    db: &Database,
+    configured: Option<EventPlacementPolicy>,
+) -> Result<EventPlacementPolicy> {
+    let persisted = match persisted_event_policy_value(db)?.as_deref() {
+        Some(EVENT_PLACEMENT_TO_TENANT_HUB) => Some(finish_event_placement_to_tenant_hub(db)?),
+        _ => persisted_event_policy(db)?,
+    };
+    if let (Some(expected), Some(actual)) = (configured, persisted)
+        && expected != actual
+    {
+        if expected == EventPlacementPolicy::TenantHub && actual == EventPlacementPolicy::LocalOnly
+        {
+            return transition_empty_local_store_to_tenant_hub(db);
+        }
+        return Err(CgError::EventPlacementPolicyMismatch {
+            expected,
+            actual: Some(actual),
+            reason: "the Store already has a different persisted event placement".into(),
+        });
+    }
+    Ok(persisted
+        .or(configured)
+        .unwrap_or(EventPlacementPolicy::LocalOnly))
+}
+
+pub(crate) fn persisted_event_policy(db: &Database) -> Result<Option<EventPlacementPolicy>> {
+    let Some(value) = persisted_event_policy_value(db)? else {
+        return Ok(None);
+    };
+    match value.as_str() {
+        "local_only" => Ok(Some(EventPlacementPolicy::LocalOnly)),
+        "tenant_hub" => Ok(Some(EventPlacementPolicy::TenantHub)),
+        other => Err(CgError::Engine(format!(
+            "invalid persisted event placement: {other}"
+        ))),
+    }
+}
+
+fn persisted_event_policy_value(db: &Database) -> Result<Option<String>> {
+    if db.table_meta("event_placement").is_none() {
+        return Ok(None);
+    }
+    let result = db
+        .execute(
+            "SELECT expected_policy FROM event_placement WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Int64(1))]),
+        )
+        .map_err(map_engine_err)?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    match row.first() {
+        Some(Value::Text(value)) => Ok(Some(value.clone())),
+        other => Err(CgError::Engine(format!(
+            "invalid persisted event placement: {other:?}"
+        ))),
+    }
+}
+
+fn transition_empty_local_store_to_tenant_hub(db: &Database) -> Result<EventPlacementPolicy> {
+    validate_local_event_schema_for_transition(db)?;
+    if !begin_event_placement_transition(db)? {
+        return Err(CgError::EventPlacementPolicyMismatch {
+            expected: EventPlacementPolicy::TenantHub,
+            actual: Some(EventPlacementPolicy::LocalOnly),
+            reason: "event capture has already begun, so the persisted placement is fixed".into(),
+        });
+    }
+
+    let resolved = finish_event_placement_to_tenant_hub(db)?;
+    if resolved != EventPlacementPolicy::TenantHub {
+        return Err(CgError::EventPlacementPolicyMismatch {
+            expected: EventPlacementPolicy::TenantHub,
+            actual: Some(resolved),
+            reason: "event capture committed while the empty-Store placement transition began"
+                .into(),
+        });
+    }
+    Ok(resolved)
+}
+
+/// Complete or safely unwind a transition whose durable fence survived an interrupted open.
+fn finish_event_placement_to_tenant_hub(db: &Database) -> Result<EventPlacementPolicy> {
+    if event_capture_has_started(db)? {
+        replace_event_policy_value(db, EVENT_PLACEMENT_TO_TENANT_HUB, "local_only")?;
+        return Ok(EventPlacementPolicy::LocalOnly);
+    }
+
+    for table in LOCAL_DERIVED_TABLES
+        .iter()
+        .rev()
+        .map(|table| table.name)
+        .chain(["event_local_commits", "event_anchors", "events"])
+    {
+        if db.table_meta(table).is_some() {
+            db.execute(&format!("DROP TABLE {table}"), &HashMap::new())
+                .map_err(map_engine_err)?;
+        }
+    }
+    replace_event_policy_value(db, EVENT_PLACEMENT_TO_TENANT_HUB, "tenant_hub")?;
+    Ok(EventPlacementPolicy::TenantHub)
+}
+
+fn validate_local_event_schema_for_transition(db: &Database) -> Result<()> {
+    let events = db.table_meta("events");
+    let anchors = db.table_meta("event_anchors");
+    let commits = db.table_meta("event_local_commits");
+    let local = events
+        .as_ref()
+        .is_some_and(|meta| meta.sync_direction == Some(SyncDirection::None) && meta.immutable)
+        && anchors
+            .as_ref()
+            .is_some_and(|meta| meta.sync_direction == Some(SyncDirection::None) && meta.immutable)
+        && commits
+            .as_ref()
+            .is_some_and(|meta| meta.sync_direction == Some(SyncDirection::None) && meta.immutable);
+    if !local {
+        return Err(CgError::EventPlacementPolicyMismatch {
+            expected: EventPlacementPolicy::LocalOnly,
+            actual: None,
+            reason: "the standalone event schema is incomplete or does not carry local-only policy"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn event_capture_has_started(db: &Database) -> Result<bool> {
+    let captured = db
+        .execute(
+            "SELECT first_event_tx FROM event_placement WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Int64(1))]),
+        )
+        .map_err(map_engine_err)?;
+    match captured.rows.first().and_then(|row| row.first()) {
+        Some(Value::TxId(_)) => Ok(true),
+        Some(Value::Null) => Ok(false),
+        other => Err(CgError::Engine(format!(
+            "invalid persisted first-event latch: {other:?}"
+        ))),
+    }
+}
+
+fn begin_event_placement_transition(db: &Database) -> Result<bool> {
+    let tx = db.begin().map_err(map_engine_err)?;
+    let updated = db.execute_in_tx(
+        tx,
+        "UPDATE event_placement SET expected_policy = $replacement WHERE id = $id AND expected_policy = $expected AND first_event_tx IS NULL",
+        &HashMap::from([
+            ("id".to_string(), Value::Int64(1)),
+            ("expected".to_string(), Value::Text("local_only".into())),
+            (
+                "replacement".to_string(),
+                Value::Text(EVENT_PLACEMENT_TO_TENANT_HUB.into()),
+            ),
+        ]),
+    );
+    let updated = match updated {
+        Ok(updated) => updated,
+        Err(error) => {
+            let _ = db.rollback(tx);
+            return Err(map_engine_err(error));
+        }
+    };
+    if updated.rows_affected != 1 {
+        let _ = db.rollback(tx);
+        return Ok(false);
+    }
+    if let Err(error) = db.commit(tx) {
+        let _ = db.rollback(tx);
+        return Err(map_engine_err(error));
+    }
+    Ok(true)
+}
+
+fn replace_event_policy_value(db: &Database, expected: &str, replacement: &str) -> Result<()> {
+    let tx = db.begin().map_err(map_engine_err)?;
+    let updated = db.execute_in_tx(
+        tx,
+        "UPDATE event_placement SET expected_policy = $replacement WHERE id = $id AND expected_policy = $expected",
+        &HashMap::from([
+            ("id".to_string(), Value::Int64(1)),
+            ("expected".to_string(), Value::Text(expected.to_string())),
+            (
+                "replacement".to_string(),
+                Value::Text(replacement.to_string()),
+            ),
+        ]),
+    );
+    let updated = match updated {
+        Ok(updated) => updated,
+        Err(error) => {
+            let _ = db.rollback(tx);
+            return Err(map_engine_err(error));
+        }
+    };
+    if updated.rows_affected != 1 {
+        let _ = db.rollback(tx);
+        return Err(CgError::Engine(
+            "the persisted event placement changed during transition".into(),
+        ));
+    }
+    if let Err(error) = db.commit(tx) {
+        let _ = db.rollback(tx);
+        return Err(map_engine_err(error));
+    }
+    Ok(())
+}
+
+fn ensure_event_placement_row(db: &Database, policy: EventPlacementPolicy) -> Result<()> {
+    if persisted_event_policy(db)?.is_some() {
+        return Ok(());
+    }
+    db.execute(
+        "INSERT INTO event_placement (id, expected_policy) VALUES ($id, $expected_policy)",
+        &HashMap::from([
+            ("id".to_string(), Value::Int64(1)),
+            (
+                "expected_policy".to_string(),
+                Value::Text(
+                    match policy {
+                        EventPlacementPolicy::LocalOnly => "local_only",
+                        EventPlacementPolicy::TenantHub => "tenant_hub",
+                    }
+                    .into(),
+                ),
+            ),
+        ]),
+    )
+    .map_err(map_engine_err)?;
     Ok(())
 }
 
@@ -1170,6 +2047,124 @@ fn register_store_triggers(db: &Database) -> Result<()> {
     Ok(())
 }
 
+fn verify_complete_schema(
+    db: &Database,
+    spaces: &[EmbeddingSpaceDecl],
+    authenticated_discard: Option<(EdgeDiscardMode, EdgeDiscardMode)>,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    for table in TABLES {
+        if db.table_meta(table.name).is_none() {
+            missing.push(table.name.to_string());
+        }
+    }
+    for table in LOCAL_DERIVED_TABLES {
+        if db.table_meta(table.name).is_none() {
+            missing.push(table.name.to_string());
+        }
+    }
+    for table in LOCAL_RUNTIME_TABLES {
+        if db.table_meta(table.name).is_none() {
+            missing.push(table.name.to_string());
+        }
+    }
+    for table in WORK_LEDGER_TABLES {
+        if db.table_meta(table).is_none() {
+            missing.push(table.to_string());
+        }
+    }
+    for dimension in spaces.iter().map(|space| space.dimension) {
+        if matches!(dimension, 0 | 128 | 256 | 512 | 768) || dimension > 4096 {
+            continue;
+        }
+        let table = format!("{ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX}{dimension}");
+        if db.table_meta(&table).is_none() {
+            missing.push(table);
+        }
+    }
+    if !missing.is_empty() {
+        return Err(CgError::Engine(format!(
+            "schema installation is incomplete; missing tables: {}",
+            missing.join(", ")
+        )));
+    }
+
+    for index in INDEXES.iter().chain(LOCAL_DERIVED_INDEXES) {
+        let meta = db
+            .table_meta(index.table)
+            .expect("the complete-table check ran first");
+        if !meta.indexes.iter().any(|actual| actual.name == index.name) {
+            return Err(CgError::Engine(format!(
+                "schema installation is incomplete; missing index {} on {}",
+                index.name, index.table
+            )));
+        }
+    }
+
+    let event_types = db.event_bus_status().event_types;
+    for ddl in SUBSCRIPTION_EVENT_TYPE_DDL {
+        let name = ddl
+            .split_whitespace()
+            .nth(3)
+            .expect("subscription event type DDL has a name");
+        if !event_types.iter().any(|event_type| event_type.name == name) {
+            return Err(CgError::Engine(format!(
+                "schema installation is incomplete; missing event type {name}"
+            )));
+        }
+    }
+
+    let triggers = db.list_triggers();
+    let callbacks = db.registered_trigger_callbacks();
+    for name in [
+        "impact_analysis_trigger",
+        "conflict_detection_on_decisions",
+        "conflict_detection_on_outcomes",
+        "precedent_match_on_decisions",
+    ] {
+        if !triggers.iter().any(|trigger| trigger.name == name)
+            || !callbacks.iter().any(|callback| callback == name)
+        {
+            return Err(CgError::Engine(format!(
+                "schema installation is incomplete; missing trigger or callback {name}"
+            )));
+        }
+    }
+
+    let default_space = default_text_embedding_space().embedding_space_id;
+    let seeded = db
+        .execute(
+            "SELECT embedding_space_id FROM embedding_spaces WHERE embedding_space_id = $embedding_space_id",
+            &HashMap::from([("embedding_space_id".into(), Value::Text(default_space))]),
+        )
+        .map_err(map_engine_err)?;
+    if seeded.rows.len() != 1 {
+        return Err(CgError::Engine(
+            "schema installation is incomplete; the default embedding space is not seeded".into(),
+        ));
+    }
+
+    if let Some((event_discard, anchor_discard)) = authenticated_discard {
+        for (table, expected) in [("events", event_discard), ("event_anchors", anchor_discard)] {
+            let actual = db
+                .table_meta(table)
+                .expect("the complete-table check ran first")
+                .edge_discard
+                .unwrap_or_default();
+            if actual != expected {
+                return Err(CgError::EventPlacementPolicyMismatch {
+                    expected: EventPlacementPolicy::TenantHub,
+                    actual: None,
+                    reason: format!(
+                        "authenticated {table} discard policy was not installed: expected {expected:?}, found {actual:?}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_schema_version(db: &Database, expected: u32) -> Result<()> {
     let existing: HashSet<String> = db.table_names().into_iter().collect();
     if existing.is_empty() {
@@ -1236,7 +2231,10 @@ fn has_legacy_digest_vector384(db: &Database) -> bool {
     })
 }
 
-fn seed_embedding_spaces(db: &Database, extra: &[EmbeddingSpaceDecl]) -> Result<()> {
+fn seed_embedding_spaces_without_readiness(
+    db: &Database,
+    extra: &[EmbeddingSpaceDecl],
+) -> Result<()> {
     validate_embedding_space_declarations(extra)?;
     let default = default_text_embedding_space();
     let mut defaults = HashSet::new();
@@ -1251,7 +2249,6 @@ fn seed_embedding_spaces(db: &Database, extra: &[EmbeddingSpaceDecl]) -> Result<
     for space in extra {
         seed_embedding_space(db, space)?;
     }
-    ensure_schema_version_row(db)?;
     Ok(())
 }
 
@@ -1316,6 +2313,7 @@ fn seed_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()>
                         .bindings
                         .iter()
                         .map(|binding| serde_json::json!({
+                            "embedding_space_id": binding.embedding_space_id,
                             "table_name": binding.table_name,
                             "vector_column": binding.vector_column
                         }))
@@ -1499,6 +2497,13 @@ fn validate_embedding_space_declarations(extra: &[EmbeddingSpaceDecl]) -> Result
             declared.insert(space.embedding_space_id.clone(), space.clone());
         }
         for binding in &space.bindings {
+            if binding.embedding_space_id != space.embedding_space_id {
+                return Err(CgError::EmbeddingSpaceConfigMismatch {
+                    field: "bindings",
+                    expected: space.embedding_space_id.clone(),
+                    actual: binding.embedding_space_id.clone(),
+                });
+            }
             match static_vector_column_dimension(&binding.table_name, &binding.vector_column) {
                 Some(dimension) if dimension == space.dimension => {}
                 Some(_) => {
@@ -1613,10 +2618,11 @@ fn validate_embedding_space_decl_matches(
         });
     }
     if canonical_bindings(&existing.bindings) != canonical_bindings(&supplied.bindings) {
+        let (expected, actual) = binding_mismatch_values(&existing.bindings, &supplied.bindings);
         return Err(CgError::EmbeddingSpaceConfigMismatch {
             field: "bindings",
-            expected: canonical_bindings(&existing.bindings).join(","),
-            actual: canonical_bindings(&supplied.bindings).join(","),
+            expected,
+            actual,
         });
     }
     Ok(())
@@ -1662,6 +2668,36 @@ fn canonical_default_kind(kind: Option<EvidenceKind>) -> String {
 fn canonical_bindings(bindings: &[EmbeddingSpaceBinding]) -> Vec<String> {
     let mut values = bindings
         .iter()
+        .map(|binding| {
+            format!(
+                "{}:{}:{}",
+                binding.embedding_space_id, binding.table_name, binding.vector_column
+            )
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn binding_mismatch_values(
+    expected: &[EmbeddingSpaceBinding],
+    actual: &[EmbeddingSpaceBinding],
+) -> (String, String) {
+    let expected_locations = canonical_binding_locations(expected);
+    let actual_locations = canonical_binding_locations(actual);
+    if expected_locations == actual_locations {
+        (
+            canonical_bindings(expected).join(","),
+            canonical_bindings(actual).join(","),
+        )
+    } else {
+        (expected_locations.join(","), actual_locations.join(","))
+    }
+}
+
+fn canonical_binding_locations(bindings: &[EmbeddingSpaceBinding]) -> Vec<String> {
+    let mut values = bindings
+        .iter()
         .map(|binding| format!("{}:{}", binding.table_name, binding.vector_column))
         .collect::<Vec<_>>();
     values.sort();
@@ -1697,9 +2733,10 @@ fn embedding_bindings_from_value(value: Option<&Value>) -> Option<Vec<String>> {
         })?
         .iter()
         .map(|value| {
+            let embedding_space_id = value.get("embedding_space_id")?.as_str()?;
             let table_name = value.get("table_name")?.as_str()?;
             let vector_column = value.get("vector_column")?.as_str()?;
-            Some(format!("{table_name}:{vector_column}"))
+            Some(format!("{embedding_space_id}:{table_name}:{vector_column}"))
         })
         .collect::<Option<Vec<_>>>()?;
     values.sort();
@@ -1711,6 +2748,7 @@ fn static_vector_column_dimension(table_name: &str, vector_column: &str) -> Opti
         ("evidence", "vector_text") => Some(768),
         ("evidence", "vector_vision") => Some(512),
         ("digests", "vector_text") => Some(768),
+        ("event_search_passages", "vector_text") => Some(768),
         _ => None,
     }
 }
@@ -1804,26 +2842,56 @@ fn validate_embedding_space_bindings(db: &Database, space: &EmbeddingSpaceDecl) 
     Ok(())
 }
 
-fn ensure_schema_version_row(db: &Database) -> Result<()> {
+fn publish_schema_readiness(db: &Database) -> Result<()> {
     let version = db
-        .execute("SELECT id FROM cg_schema_version", &HashMap::new())
+        .execute("SELECT id, version FROM cg_schema_version", &HashMap::new())
         .map_err(map_engine_err)?;
-    if version.rows.is_empty() {
-        let params = HashMap::from([
-            ("id".to_string(), Value::Int64(1)),
-            (
-                "version".to_string(),
-                Value::Int64(CG_SCHEMA_VERSION as i64),
-            ),
-            ("installed_at".to_string(), Value::TxId(crate::TxId(1))),
-        ]);
-        match db.execute(
-            "INSERT INTO cg_schema_version (id, version, installed_at) VALUES ($id, $version, $installed_at)",
-            &params,
-        ) {
-            Ok(_) | Err(EngineError::UniqueViolation { .. }) => {}
-            Err(err) => return Err(map_engine_err(err)),
+    if let Some(row) = version.rows.first() {
+        if version.rows.len() == 1
+            && row.first() == Some(&Value::Int64(1))
+            && row.get(1) == Some(&Value::Int64(CG_SCHEMA_VERSION as i64))
+        {
+            if installation_table_baseline(db)?.is_some() {
+                clear_installation_table_baseline(db)?;
+            }
+            return Ok(());
         }
+        return Err(CgError::LegacySchemaDetected {
+            found_version: row
+                .get(1)
+                .and_then(|value| match value {
+                    Value::Int64(value) => u32::try_from(*value).ok(),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            expected_version: CG_SCHEMA_VERSION,
+        });
+    }
+
+    let tx = db.begin().map_err(map_engine_err)?;
+    if let Err(error) = clear_installation_table_baseline_in_tx(db, tx) {
+        let _ = db.rollback(tx);
+        return Err(error);
+    }
+    let params = HashMap::from([
+        ("id".to_string(), Value::Int64(1)),
+        (
+            "version".to_string(),
+            Value::Int64(CG_SCHEMA_VERSION as i64),
+        ),
+        ("installed_at".to_string(), Value::TxId(tx)),
+    ]);
+    if let Err(error) = db.execute_in_tx(
+        tx,
+        "INSERT INTO cg_schema_version (id, version, installed_at) VALUES ($id, $version, $installed_at)",
+        &params,
+    ) {
+        let _ = db.rollback(tx);
+        return Err(map_engine_err(error));
+    }
+    if let Err(error) = db.commit(tx) {
+        let _ = db.rollback(tx);
+        return Err(map_engine_err(error));
     }
     Ok(())
 }

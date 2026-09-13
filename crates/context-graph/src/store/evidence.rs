@@ -1204,6 +1204,7 @@ pub(super) fn embedding_target_uuid(target: &EmbeddingTarget) -> uuid::Uuid {
         EmbeddingTarget::Evidence(id) => id.as_uuid(),
         EmbeddingTarget::EntityReference(id, _) => id.as_uuid(),
         EmbeddingTarget::Digest(id) => id.as_uuid(),
+        EmbeddingTarget::EventSearchPassage(id) => id.as_uuid(),
     }
 }
 

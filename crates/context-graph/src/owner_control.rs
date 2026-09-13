@@ -20,6 +20,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use contextdb_core::Error as DbError;
 use contextdb_core::read_contract::{
@@ -33,6 +34,19 @@ use contextdb_engine::{OwnerReadConfig, ReadSession, ReadSessionOptions};
 /// anything else above context-graph builds against context-graph's vocabulary, the same way
 /// [`ReaderIdentity`](crate::ReaderIdentity) spares them the substrate's reader record.
 pub use contextdb_core::read_contract::OwnerReadCancellation;
+
+/// How long a cg writer waits for a store's direct readers to let go before it stops waiting.
+///
+/// A direct reader publishes itself only for the span in which it LOADS a committed image — bounded
+/// work on a local file, measured in milliseconds. A minute is therefore far past any honest
+/// sequence of loads, including a status poll hitting the store several times a second for as long
+/// as a projection runs. Inside this allowance a refused writer waits, because the readers finish
+/// and the next attempt succeeds; past it the store is not busy, something is wrong, and the caller
+/// owes its user a recorded failure instead of an unbounded wait or a silent give-up.
+///
+/// It is one allowance, declared here, so every cg caller that can be refused by readers waits for
+/// the same span and no caller invents a timer of its own.
+pub const READER_RELEASE_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The namespace every context-graph administrative frame travels under. An owner request that
 /// names anything else is not this crate's and is refused by the handler.
@@ -62,20 +76,40 @@ pub(crate) fn owner_read_runtime_dir() -> Option<PathBuf> {
 /// What the live owner runs on an administrative frame, holding the store while it answers.
 pub type ControlHandler = Arc<dyn Fn(String) -> String + Send + Sync + 'static>;
 
+/// How long a context-graph reader waits out a writer that is opening or closing the store before
+/// it answers with the typed refusal.
+///
+/// A writer takes the store before its owner service answers and stops answering, cancelling the
+/// read in flight, before it lets the store go; a reader that arrives in either window is not being
+/// answered slowly, it is waiting for a transition. On this engine a writable open of a
+/// 10,000-passage store takes about 5 s and a close can take as long, and the detached projection
+/// worker reopens the store for every claim and commit, so the allowance is several transitions
+/// back to back. The reader's response time still governs a read an owner is answering.
+pub const WRITER_TRANSITION_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What one context-graph read of a context-graph store may spend.
 ///
 /// Public contract: these ceilings are declared once and nowhere else. Every session this crate
 /// opens — the administrative client, the bounded status totals — reads under them, so "what a cg
-/// read costs" has a single answer to read and a single place to change. They are the shipped
-/// contextdb ceilings written out rather than borrowed, because a read that does not fit is paged
-/// through a cursor; the limits are never raised to make a scan fit.
+/// read costs" has a single answer to read and a single place to change. Rows and bytes stay at the
+/// shipped contextdb ceilings, because a read that does not fit is paged through a cursor; the row
+/// and byte limits are never raised to make a scan fit.
+///
+/// `work` and `memory` are sized for the one statement that cannot be paged: event search's single
+/// top-k over the selected (Context, generation) vector partitions, which loads each partition's
+/// maintained graph and counts every candidate and graph step as work. Measured through the
+/// engine's completed-read totals (the event-history route benchmark, `vector_statement_read_totals`)
+/// at 10,000 passages: 27,377 units for one of 8 Contexts, 123,595 for one 10,000-passage Context,
+/// 257,352 for all 8 Contexts and 261,387 for all 64, about 26 units per passage in scope. 5,000,000
+/// covers the 100,000-passage all-Context scope (about 2.6 million) with room to spare; 1 GiB holds
+/// the graphs of that scope, where the shipped 16 MiB refused a single 1,250-passage partition.
 pub const fn context_graph_read_limits() -> ReadLimits {
     ReadLimits {
         result_rows: 500,
         result_bytes: ReadLimits::SHIPPED_RESULT_BYTES,
-        work: 50_000,
+        work: 5_000_000,
         active_ms: 5_000,
-        memory: ReadLimits::SHIPPED_MEMORY,
+        memory: 1024 * 1024 * 1024,
         cursor_page_rows: 100,
         cursor_page_bytes: ReadLimits::SHIPPED_CURSOR_PAGE_BYTES,
         cursor_idle_ms: 300_000,
@@ -257,6 +291,14 @@ pub fn owner_request_handler(handler: ControlHandler) -> Arc<dyn OwnerRequestHan
 /// place it — a container, a packaged service — places it once for the whole owner plane rather
 /// than once per side.
 pub fn owner_read_config(handler: ControlHandler) -> OwnerReadConfig {
+    writable_owner_read_config(Some(handler))
+}
+
+/// The owner-read configuration every writable context-graph open serves: reads enabled under
+/// this crate's read ceilings, in the one runtime directory clients look in. A readonly client is
+/// never refused as busy because a writer took the store; a writer opened without `handler`
+/// serves reads only and answers no administrative frame.
+pub(crate) fn writable_owner_read_config(handler: Option<ControlHandler>) -> OwnerReadConfig {
     OwnerReadConfig {
         enabled: true,
         limits: OwnerReadLimits {
@@ -264,7 +306,7 @@ pub fn owner_read_config(handler: ControlHandler) -> OwnerReadConfig {
             ..OwnerReadLimits::default()
         },
         runtime_dir: owner_read_runtime_dir(),
-        handler: Some(owner_request_handler(handler)),
+        handler: handler.map(owner_request_handler),
         ..OwnerReadConfig::default()
     }
 }
@@ -318,6 +360,40 @@ pub enum ReaderRelease {
 /// facts. A root that is absent, malformed, or unusable therefore does not affect the release
 /// verdict at all: it is an owner-channel misconfiguration, and it surfaces on its own as
 /// `owner_not_serving` when the channel fails to start.
+/// Wait for the store's direct readers to let go, but no longer than `deadline`.
+///
+/// [`wait_for_reader_release`] has no deadline of its own: it wakes when the last reader lets go, or
+/// when its cancellation token is cancelled, and otherwise waits forever. A caller that hands it a
+/// token nobody ever cancels therefore has no allowance at all — one reader that never finishes
+/// loading stops that caller for good. This is the bounded form every cg writer uses: it owns the
+/// token, cancels it the moment the allowance is spent, and answers `Stopped`.
+///
+/// The wake on release stays immediate — the deadline only ever ends a wait early, never delays one
+/// — and the timer is joined before this returns, so no waiter is left behind either way.
+pub fn wait_for_reader_release_within(path: &Path, deadline: Instant) -> ReaderRelease {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return ReaderRelease::Stopped;
+    }
+    let stop = OwnerReadCancellation::new();
+    let (finished, wait_over) = std::sync::mpsc::channel::<()>();
+    let expire = stop.clone();
+    let timer = std::thread::spawn(move || {
+        // Woken by the wait finishing (the sender is dropped), or by the allowance running out,
+        // which is the only case that cancels.
+        if wait_over
+            .recv_timeout(remaining)
+            .is_err_and(|error| matches!(error, std::sync::mpsc::RecvTimeoutError::Timeout))
+        {
+            expire.cancel();
+        }
+    });
+    let verdict = wait_for_reader_release(path, &stop);
+    drop(finished);
+    let _ = timer.join();
+    verdict
+}
+
 pub fn wait_for_reader_release(path: &Path, stop: &OwnerReadCancellation) -> ReaderRelease {
     // The operator's pathname goes down the root-taking door so this crate keeps ONE owner-channel
     // input, but the door neither resolves nor validates it: the verdict comes from the readers'

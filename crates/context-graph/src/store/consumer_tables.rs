@@ -35,19 +35,21 @@
 use std::collections::{BTreeMap, HashSet};
 
 use contextdb_core::{
-    ColumnDef as StoredColumn, ColumnType, Direction, PropagationRule, ScopeLabelKind, TableMeta,
-    VectorQuantization,
+    ColumnDef as StoredColumn, ColumnType, DEFAULT_VECTOR_MAX_PARTITIONS, Direction,
+    PropagationRule, ScopeLabelKind, TableMeta, VectorQuantization, VectorSearchMode,
 };
 use contextdb_engine::Database;
 use contextdb_parser::ast::{
     AstPropagationRule as DeclaredPropagationRule, ColumnDef as DeclaredColumn, CreateTable,
     DataType, ScopeLabelConstraint, Statement as ParsedStatement,
-    VectorQuantization as DeclaredQuantization,
+    VectorQuantization as DeclaredQuantization, VectorSearchMode as DeclaredSearchMode,
 };
 
 use crate::Result;
 use crate::error::CgError;
-use crate::schema::{ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, LOCAL_RUNTIME_TABLES, TABLES};
+use crate::schema::{
+    ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, LOCAL_DERIVED_TABLES, LOCAL_RUNTIME_TABLES, TABLES,
+};
 
 use super::convert::map_engine_err;
 
@@ -128,6 +130,7 @@ fn reserved_namespace(namespace: &str) -> bool {
 fn context_graph_owns(name: &str) -> bool {
     TABLES
         .iter()
+        .chain(LOCAL_DERIVED_TABLES)
         .chain(LOCAL_RUNTIME_TABLES)
         .any(|table| table.name == name)
         || name.starts_with(ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX)
@@ -260,6 +263,22 @@ pub(super) fn install_consumer_schema(db: &Database, schema: &ConsumerSchema) ->
     Ok(())
 }
 
+/// Validate every declared consumer table already present during an unpublished
+/// installation. Matching the declaration proves only that the consumer can use
+/// the table; it does not prove that this installation created or owns it.
+pub(super) fn validate_present_consumer_tables(
+    db: &Database,
+    schema: &ConsumerSchema,
+) -> Result<()> {
+    for table in &schema.tables {
+        let Some(existing) = db.table_meta(&table.name) else {
+            continue;
+        };
+        verify_existing_table(&table.name, &table.ddl, &existing)?;
+    }
+    Ok(())
+}
+
 /// Every difference between the declaration and the table already in the store,
 /// or `Ok(())` when they agree.
 ///
@@ -275,7 +294,8 @@ pub(super) fn install_consumer_schema(db: &Database, schema: &ConsumerSchema) ->
 /// `DAG`, `STATE MACHINE`, `PROPAGATE` rules (edge type, direction, states,
 /// depth and abort-on-failure, and the foreign-key rules written inside a
 /// column's own `REFERENCES` clause), `RETAIN` (window, declared unit and
-/// `SYNC SAFE`), `SYNC` direction, `SYNC CONFLICT` and `HISTORY`.
+/// `SYNC SAFE`), `SYNC` direction, `SYNC CONFLICT`, `HISTORY`, `DELIVERY
+/// MANIFEST` membership and `EDGE DISCARD` policy.
 ///
 /// **Not compared, and why:** a column `DEFAULT` and a `RANK POLICY` are stored
 /// in a form the engine derives from the expression, and the engine does not
@@ -328,6 +348,8 @@ fn table_mismatches(declared: &CreateTable, existing: &TableMeta) -> Vec<String>
         sync_direction,
         conflict_policy,
         history,
+        delivery_manifest_tables,
+        edge_discard,
     } = declared;
 
     let mut mismatches = Vec::new();
@@ -462,6 +484,18 @@ fn table_mismatches(declared: &CreateTable, existing: &TableMeta) -> Vec<String>
             existing.history_policy
         ));
     }
+    if delivery_manifest_tables != &existing.delivery_manifest_tables {
+        mismatches.push(format!(
+            "delivery manifest tables: declared {delivery_manifest_tables:?}, stored {:?}",
+            existing.delivery_manifest_tables
+        ));
+    }
+    if edge_discard != &existing.edge_discard {
+        mismatches.push(format!(
+            "edge discard: declared {edge_discard:?}, stored {:?}",
+            existing.edge_discard
+        ));
+    }
 
     mismatches
 }
@@ -497,6 +531,12 @@ fn column_mismatch(declared: &DeclaredColumn, stored: &StoredColumn, mismatches:
         expires,
         immutable,
         quantization,
+        partition_key_columns,
+        max_partitions,
+        search_mode,
+        auto_index_at,
+        hnsw,
+        consolidation,
         rank_policy,
         context_id,
         scope_label,
@@ -575,6 +615,67 @@ fn column_mismatch(declared: &DeclaredColumn, stored: &StoredColumn, mismatches:
             format!("{:?}", stored.quantization),
         );
     }
+    let declared_partition_key =
+        (!partition_key_columns.is_empty()).then(|| partition_key_columns.clone());
+    if declared_partition_key != stored.partition_key_columns {
+        differs(
+            "PARTITION_KEY",
+            format!("{declared_partition_key:?}"),
+            format!("{:?}", stored.partition_key_columns),
+        );
+    }
+    // An omitted MAX_PARTITIONS on a partitioned column is recorded as the engine default.
+    let declared_max_partitions = match max_partitions {
+        Some(limit) => Some(limit.clone()),
+        None => declared_partition_key
+            .as_ref()
+            .map(|_| DEFAULT_VECTOR_MAX_PARTITIONS.to_string()),
+    };
+    let stored_max_partitions = stored.max_partitions.map(|limit| limit.to_string());
+    if declared_max_partitions != stored_max_partitions {
+        differs(
+            "MAX_PARTITIONS",
+            format!("{declared_max_partitions:?}"),
+            format!("{stored_max_partitions:?}"),
+        );
+    }
+    let declared_search_mode = search_mode.map_or(VectorSearchMode::default(), vector_search_mode);
+    if declared_search_mode != stored.search_mode {
+        differs(
+            "SEARCH_MODE",
+            format!("{declared_search_mode:?}"),
+            format!("{:?}", stored.search_mode),
+        );
+    }
+    let stored_auto_index_at = stored.auto_index_at.map(|count| count.to_string());
+    if *auto_index_at != stored_auto_index_at {
+        differs(
+            "AUTO_INDEX_AT",
+            format!("{auto_index_at:?}"),
+            format!("{stored_auto_index_at:?}"),
+        );
+    }
+    let declared_hnsw =
+        hnsw.m.is_some() || hnsw.ef_construction.is_some() || hnsw.ef_search.is_some();
+    let stored_hnsw = stored.hnsw_m.is_some()
+        || stored.hnsw_ef_construction.is_some()
+        || stored.hnsw_ef_search.is_some();
+    if declared_hnsw != stored_hnsw {
+        differs("HNSW", declared_hnsw.to_string(), stored_hnsw.to_string());
+    }
+    let declared_consolidation = consolidation.disabled
+        || consolidation.change_percent.is_some()
+        || consolidation.tombstone_percent.is_some();
+    let stored_consolidation = stored.consolidation_disabled
+        || stored.consolidation_change_percent.is_some()
+        || stored.consolidation_tombstone_percent.is_some();
+    if declared_consolidation != stored_consolidation {
+        differs(
+            "CONSOLIDATION",
+            declared_consolidation.to_string(),
+            stored_consolidation.to_string(),
+        );
+    }
     if rank_policy.is_some() != stored.rank_policy.is_some() {
         differs(
             "RANK POLICY",
@@ -632,6 +733,14 @@ fn vector_quantization(declared: DeclaredQuantization) -> VectorQuantization {
         DeclaredQuantization::F32 => VectorQuantization::F32,
         DeclaredQuantization::SQ8 => VectorQuantization::SQ8,
         DeclaredQuantization::SQ4 => VectorQuantization::SQ4,
+    }
+}
+
+fn vector_search_mode(declared: DeclaredSearchMode) -> VectorSearchMode {
+    match declared {
+        DeclaredSearchMode::Auto => VectorSearchMode::Auto,
+        DeclaredSearchMode::Exact => VectorSearchMode::Exact,
+        DeclaredSearchMode::Indexed => VectorSearchMode::Indexed,
     }
 }
 

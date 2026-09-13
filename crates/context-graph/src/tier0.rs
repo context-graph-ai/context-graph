@@ -1022,13 +1022,27 @@ fn require_context(context_id: Option<ContextId>) -> Result<ContextId> {
 
 /// Read a local setting value (machine-local, never synced).
 pub fn get_local_setting(store: &Store, key: &str) -> Result<Option<String>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT value FROM cg_local_settings WHERE key = $key",
-            &HashMap::from([("key".to_string(), DbValue::Text(key.to_string()))]),
-        )
-        .map_err(map_engine)?;
+    local_setting(store.as_graph_rows(), key)
+}
+
+/// [`get_local_setting`] through the read-only reader; the reader must declare
+/// `cg_local_settings` (as [`crate::event_history_reader_declaration`] does).
+pub fn get_local_setting_read_only(
+    reader: &crate::ConsumerReader,
+    key: &str,
+) -> Result<Option<String>> {
+    local_setting(&reader.graph(), key)
+}
+
+/// The one local-setting read, authored once over the shared row seam.
+fn local_setting(
+    rows: &dyn crate::store::graph_rows::GraphRows,
+    key: &str,
+) -> Result<Option<String>> {
+    let result = rows.query_rows(
+        "SELECT value FROM cg_local_settings WHERE key = $key",
+        &HashMap::from([("key".to_string(), DbValue::Text(key.to_string()))]),
+    )?;
     Ok(result.rows.first().and_then(|row| match row.first() {
         Some(DbValue::Text(value)) => Some(value.clone()),
         _ => None,

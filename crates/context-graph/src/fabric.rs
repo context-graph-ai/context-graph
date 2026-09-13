@@ -124,7 +124,7 @@ pub use cg_node_fs::WorkerLock;
 /// when another worker already holds it — the second worker is then a no-op. The advisory lock
 /// itself lives in `cg-node-fs`, one layer out from the embeddable core.
 pub fn acquire_worker_lock(data_root: &Path) -> Option<WorkerLock> {
-    cg_node_fs::acquire_worker_lock(&data_root.join("understand-worker.lock"))
+    cg_node_fs::acquire_worker_lock(&data_root.join("understand-worker.lock")).ok()
 }
 
 /// A capture that submits its per-chunk understanding onto the fabric ledger rather than the old
@@ -542,11 +542,30 @@ pub fn movement_decision(ref_kind: &str, sharing_on: bool, is_submitter: bool) -
 /// not branch on it.
 pub fn input_material_in_push_set(store: &Store, config: &FabricConfig) -> Result<usize> {
     let _ = config;
-    let db = store.sync_database();
-    let rows = db
-        .scan("work_inputs", db.snapshot())
-        .map_err(crate::tier0::map_engine)?;
-    Ok(rows.len())
+    input_material_count(store.as_graph_rows())
+}
+
+/// [`input_material_in_push_set`] through the read-only reader; the reader must declare
+/// `work_inputs` (as [`crate::event_history_reader_declaration`] does).
+pub fn input_material_in_push_set_read_only(
+    reader: &crate::ConsumerReader,
+    config: &FabricConfig,
+) -> Result<usize> {
+    let _ = config;
+    input_material_count(&reader.graph())
+}
+
+/// The one push-set count, authored once over the shared row seam: every `work_inputs` row is an
+/// input copy in the push set.
+fn input_material_count(rows: &dyn crate::store::graph_rows::GraphRows) -> Result<usize> {
+    let answer = rows.query_rows("SELECT COUNT(*) AS n FROM work_inputs", &HashMap::new())?;
+    match answer.rows.first().and_then(|row| row.first()) {
+        Some(DbValue::Int64(count)) => usize::try_from(*count)
+            .map_err(|_| crate::CgError::Engine("push-set count is negative".into())),
+        other => Err(crate::CgError::Engine(format!(
+            "push-set count returned {other:?}"
+        ))),
+    }
 }
 
 /// Drain and locally execute pending understanding jobs for this node, applying each result onto its

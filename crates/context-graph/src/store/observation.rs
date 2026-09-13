@@ -221,6 +221,12 @@ impl Store {
                             return Err(err);
                         }
                     }
+                    EmbeddingTarget::EventSearchPassage(passage_id) => {
+                        let _ = self.db.rollback(tx);
+                        return Err(CgError::EventSearchPassageTargetRequiresProjection {
+                            passage_id,
+                        });
+                    }
                 }
             }
             if let Err(err) = self.insert_entity_reference_no_match_invalidations_in_tx(
@@ -634,6 +640,9 @@ impl Store {
                     vector_column: binding.vector_column,
                 })
             }
+            EmbeddingTarget::EventSearchPassage(passage_id) => {
+                Err(CgError::EventSearchPassageTargetRequiresProjection { passage_id })
+            }
         }
     }
 
@@ -837,6 +846,9 @@ impl Store {
                 Ok(Some(_)) => None,
                 Err(err) => Some(err),
             },
+            EmbeddingTarget::EventSearchPassage(passage_id) => {
+                Some(CgError::EventSearchPassageTargetRequiresProjection { passage_id })
+            }
         }
     }
 
@@ -1138,6 +1150,7 @@ impl Store {
             EmbeddingTarget::Evidence(_) => "evidence_embedding_handles",
             EmbeddingTarget::EntityReference(_, _) => "entity_reference_embedding_handles",
             EmbeddingTarget::Digest(_) => "digest_embedding_handles",
+            EmbeddingTarget::EventSearchPassage(_) => "event_search_embedding_handles",
         };
         self.db
             .execute_in_tx(

@@ -207,6 +207,9 @@ impl ScopedStore<'_> {
         F: Fn(&P) -> SubscriptionResult<()> + Send + Sync + 'static,
         B: Fn(&crate::store::Store, &SinkEvent) -> SubscriptionResult<P> + Send + Sync + 'static,
     {
+        self.store
+            .require_application_ready()
+            .map_err(subscription_cg_err)?;
         let effective_contexts = self.effective_contexts(&filter)?;
         let ddl_db = self.store.resource_owner.as_ref().unwrap_or(&self.store.db);
         let subscription_id = match existing_subscription_id {
@@ -311,6 +314,8 @@ impl CallbackStoreParts {
         let default_text_embedder_disabled = store.default_text_embedder_disabled;
         let reindex_events = Arc::clone(&store.reindex_events);
         let read_observer = store.read_observer.clone();
+        let schema_embedding_spaces = Arc::clone(&store.schema_embedding_spaces);
+        let schema_consumer_schema = Arc::clone(&store.schema_consumer_schema);
         let build = Arc::new(move |db| Store {
             db_path: db_path.clone(),
             db,
@@ -325,6 +330,8 @@ impl CallbackStoreParts {
             default_text_embedder_disabled,
             reindex_events: Arc::clone(&reindex_events),
             read_observer: read_observer.clone(),
+            schema_embedding_spaces: Arc::clone(&schema_embedding_spaces),
+            schema_consumer_schema: Arc::clone(&schema_consumer_schema),
         });
         Self {
             db: Arc::downgrade(&store.db),

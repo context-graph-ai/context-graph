@@ -38,7 +38,10 @@ if [ -z "$prefix" ]; then
   exit 2
 fi
 
-cache_root="${CG_MODEL_CACHE_ROOT:-$HOME/.cache/cg/models}"
+# The canonical resolver is context_graph::embedder::nomic::default_cache_root: the
+# override first, then $XDG_CACHE_HOME, then $HOME/.cache. Resolving it any other way
+# here would seed a directory cg never reads.
+cache_root="${CG_MODEL_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/cg/models}"
 source_override_config="$cache_root/cg/catalog-sources.toml"
 nomic_id="nomic-embed-text-v1.5"
 nomic_bytes="546938168"
@@ -52,9 +55,26 @@ mkdir -p "$prefix/bin" "$HOME/.config/cg"
 
 cg_bin="$prefix/bin/cg"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Cargo writes build output to CARGO_TARGET_DIR whenever it is set, so the installer must
+# look where the build actually landed rather than assuming <repo>/target. Cargo resolves a
+# RELATIVE CARGO_TARGET_DIR against the current working directory - not against the manifest
+# directory - so this resolves it the same way; anything else finds nothing and reports a
+# bare "No such file or directory" that names neither the cause nor the fix.
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  case "$CARGO_TARGET_DIR" in
+    /*) target_dir="$CARGO_TARGET_DIR" ;;
+    *) target_dir="$PWD/$CARGO_TARGET_DIR" ;;
+  esac
+  target_dir_origin="CARGO_TARGET_DIR"
+else
+  target_dir="$repo_root/target"
+  target_dir_origin="the default target directory; set CARGO_TARGET_DIR to redirect it"
+fi
+
 compiled_cg=""
-debug_cg="$repo_root/target/debug/cg"
-release_cg="$repo_root/target/release/cg"
+debug_cg="$target_dir/debug/cg"
+release_cg="$target_dir/release/cg"
 if [ -x "$release_cg" ] && { [ ! -x "$debug_cg" ] || [ "$release_cg" -nt "$debug_cg" ]; }; then
   compiled_cg="$release_cg"
 elif [ -x "$debug_cg" ]; then
@@ -69,11 +89,18 @@ if [ -z "$compiled_cg" ]; then
     cargo_cmd="$HOME/.cargo/bin/cargo"
   fi
   if [ -z "$cargo_cmd" ]; then
-    echo "could not find cargo and no prebuilt cg binary exists under target/" >&2
+    echo "no cg binary in $target_dir/release or $target_dir/debug ($target_dir_origin), and cargo is not on PATH" >&2
+    echo "install a Rust toolchain, or build cg first with: cargo build -p context-graph-cli --bin cg --release" >&2
     exit 1
   fi
   "$cargo_cmd" build --manifest-path "$repo_root/Cargo.toml" -p context-graph-cli --bin cg --release
-  compiled_cg="$repo_root/target/release/cg"
+  compiled_cg="$release_cg"
+fi
+if [ ! -x "$compiled_cg" ]; then
+  echo "no cg binary at $compiled_cg" >&2
+  echo "looked under $target_dir ($target_dir_origin)" >&2
+  echo "build it with: cargo build -p context-graph-cli --bin cg --release" >&2
+  exit 1
 fi
 install -m 755 "$compiled_cg" "$cg_bin"
 

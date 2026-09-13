@@ -51,12 +51,14 @@ pub mod graph;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use contextdb_core::read_contract::CursorPage;
 use contextdb_core::{ScopeLabel, ScopeLabelKind, Value};
 use contextdb_engine::{
     DirectScopeLabelKind, MetadataAnswer, MetadataBody, MetadataRequest, QueryResult, ReadCursor,
-    ReadSession,
+    ReadSession, ReadSessionOptions, work_ledger::WORK_LEDGER_TABLES,
 };
 use contextdb_parser::ast::{
     Cte, Expr, FromItem, MatchClause, ScopeLabelConstraint, SelectBody, SelectStatement,
@@ -65,10 +67,91 @@ use contextdb_parser::ast::{
 use contextdb_parser::{StatementEffect, parse, statement_effect};
 
 use crate::Result;
+use crate::embedder::{Embedder, EmbedderRegistration};
 use crate::error::CgError;
-use crate::owner_control::{context_graph_read_session_options, owner_read_runtime_dir};
+use crate::owner_control::{
+    WRITER_TRANSITION_ALLOWANCE, context_graph_read_session_options, owner_read_runtime_dir,
+};
+use crate::schema::{LOCAL_DERIVED_TABLES, LOCAL_RUNTIME_TABLES, TABLES};
 use crate::store::convert::{map_consumer_open_err, map_engine_err};
 use crate::store::{ConsumerSchema, scope_label_kind};
+use crate::types::{CG_SCHEMA_VERSION, EventPlacementPolicy};
+
+/// The words the engine answers in when a statement reaches a writer's handle after that writer
+/// closed it, which is what a reader sees when the owner it reached lets the store go mid-read.
+/// They arrive bare, or inside the owner's report that its read thread stopped on that handle.
+const CLOSED_OWNER_HANDLE: &str = "database handle is closed";
+
+/// Whether an answer says only that the owner this reader reached is starting, stopping or gone.
+///
+/// A writer takes the store before its owner service answers and stops answering before it lets
+/// the store go. A reader that arrives in either gap is told the owner is not serving; one whose
+/// owner leaves during the handshake or a statement is told it disconnected, or that its handle is
+/// closed. A stopping owner cancels the read in flight and reports it as timed out, before the
+/// reader's own response time has passed: that too is the owner leaving, not a slow answer. Each
+/// is transient by construction: the owner starts serving, or it releases the store and the file
+/// answers. No other answer is, and a time-out that comes after the reader waited its whole
+/// response time is the answer.
+fn owner_in_transition(
+    error: &contextdb_core::Error,
+    waited: Duration,
+    options: &ReadSessionOptions,
+) -> bool {
+    use contextdb_core::read_contract::ReadFailureKind;
+    owner_left(error)
+        || matches!(error, contextdb_core::Error::ReadFailure(failure)
+            if failure.kind() == ReadFailureKind::OwnerTimeout
+                && waited < Duration::from_millis(options.timeouts.response_ms))
+}
+
+/// Whether an answer says the owner this reader reached is not serving, went away, or closed its
+/// handle.
+fn owner_left(error: &contextdb_core::Error) -> bool {
+    use contextdb_core::read_contract::ReadFailureKind;
+    match error {
+        contextdb_core::Error::ReadFailure(failure) => matches!(
+            failure.kind(),
+            ReadFailureKind::OwnerNotServing | ReadFailureKind::OwnerDisconnected
+        ),
+        contextdb_core::Error::Other(reason) => reason.contains(CLOSED_OWNER_HANDLE),
+        _ => false,
+    }
+}
+
+/// How long this reader waits out a writer's open or close: context-graph's declared allowance
+/// for a writer transition ([`WRITER_TRANSITION_ALLOWANCE`]), not the response time, which bounds
+/// each answer an owner gives.
+fn transition_deadline() -> Instant {
+    Instant::now() + WRITER_TRANSITION_ALLOWANCE
+}
+
+/// Open a read session, waiting out a writer's own open or close until `deadline`.
+///
+/// The typed refusal comes back only when the owner neither begins serving nor lets go inside the
+/// bound. Every other answer, success or refusal, is returned at once.
+fn open_through_owner_transitions(
+    path: &Path,
+    options: ReadSessionOptions,
+    deadline: Instant,
+) -> std::result::Result<ReadSession, contextdb_core::Error> {
+    const FIRST_PAUSE: Duration = Duration::from_millis(2);
+    const LONGEST_PAUSE: Duration = Duration::from_millis(50);
+    let mut pause = FIRST_PAUSE;
+    loop {
+        let started = Instant::now();
+        match ReadSession::open_in_runtime_dir(path, options.clone(), owner_read_runtime_dir()) {
+            Err(error) if owner_in_transition(&error, started.elapsed(), &options) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(pause.min(deadline - now));
+                pause = (pause * 2).min(LONGEST_PAUSE);
+            }
+            answer => return answer,
+        }
+    }
+}
 
 /// The path a caller may hand either door meaning "no file at all".
 const IN_MEMORY_PATH: &str = ":memory:";
@@ -182,12 +265,16 @@ fn persisted_scope_label_kind(kind: &DirectScopeLabelKind) -> ScopeLabelKind {
 
 /// A genuinely read-only handle on a store, answering only what its declaration named.
 ///
-/// One [`contextdb_engine::ReadSession`], opened once. No polling, no timers, no second transport
-/// and no writable handle: the session is the whole of how this reader reaches the store.
+/// One [`contextdb_engine::ReadSession`] at a time, and no second transport and no writable handle:
+/// the session is the whole of how this reader reaches the store. A session whose owner lets the
+/// store go mid-read is replaced by a fresh one through the same route selection, inside the
+/// response time the reader declared, so a writer opening or closing the store never surfaces as a
+/// refused read.
 pub struct ConsumerReader {
     path: PathBuf,
-    session: ReadSession,
+    session: Mutex<ReadSession>,
     gate: ReaderGate,
+    event_search_embedders: HashMap<String, Arc<dyn Embedder>>,
 }
 
 impl std::fmt::Debug for ConsumerReader {
@@ -228,13 +315,16 @@ impl ConsumerReader {
         // unset because the cg declaration carries neither.
         options.scope_labels = (!gate.declaration.scope_labels.is_empty())
             .then(|| gate.declaration.scope_labels.clone());
-        let session = ReadSession::open_in_runtime_dir(path, options, owner_read_runtime_dir())
+        let deadline = transition_deadline();
+        let session = open_through_owner_transitions(path, options, deadline)
             .map_err(|error| map_consumer_open_err(path, error))?;
         let reader = Self {
             path: path.to_path_buf(),
-            session,
+            session: Mutex::new(session),
             gate,
+            event_search_embedders: HashMap::new(),
         };
+        verify_context_graph_readiness(&reader)?;
         // The store, not the caller's text, says what the declared tables are. This runs on the
         // session just opened — no second open, no writable handle — and a reader that fails it is
         // dropped here, so a declaration the store contradicts never answers a single row.
@@ -287,15 +377,12 @@ impl ConsumerReader {
     /// Returned in the store's own [`ScopeLabelKind`] vocabulary so it compares directly against
     /// what the declaration claimed, with no third shape in between.
     fn persisted_scope_column(&self, table: &str) -> Result<Option<ScopeLabelKind>> {
-        let answered = self
-            .session
-            .metadata(
-                MetadataRequest::Schema {
-                    table: table.to_string(),
-                },
-                None,
-            )
-            .map_err(map_engine_err)?;
+        let answered = self.raw_metadata(
+            MetadataRequest::Schema {
+                table: table.to_string(),
+            },
+            None,
+        )?;
         let MetadataBody::Schema { schema } = &answered.body else {
             return Err(CgError::Engine(format!(
                 "the store's schema for {table} came back as another kind of answer"
@@ -317,6 +404,22 @@ impl ConsumerReader {
         &self.gate.declaration
     }
 
+    pub(crate) fn attach_event_search_registrations(
+        &mut self,
+        registrations: Vec<EmbedderRegistration>,
+    ) -> Result<()> {
+        let registrations = crate::store::event_search_read::registration_map(registrations)?;
+        self.event_search_embedders.extend(registrations);
+        Ok(())
+    }
+
+    pub(crate) fn attached_event_search_embedder(
+        &self,
+        embedding_space_id: &str,
+    ) -> Option<Arc<dyn Embedder>> {
+        self.event_search_embedders.get(embedding_space_id).cloned()
+    }
+
     /// Run one read over the declared tables.
     ///
     /// Rows outside the declared scope labels never arrive — the engine's row gate decided that
@@ -325,7 +428,7 @@ impl ConsumerReader {
     /// with the declaration.
     pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         let shape = admit(&self.gate, sql, params)?;
-        let mut answered = self.session.execute(sql, params).map_err(map_engine_err)?;
+        let mut answered = self.raw_execute(sql, params)?;
         if let AnswerShape::TableKeyed(key) = shape {
             answered.rows = declared_rows(key, &self.gate.declared, answered.rows);
         }
@@ -342,8 +445,7 @@ impl ConsumerReader {
         params: &HashMap<String, Value>,
     ) -> Result<ConsumerCursor> {
         let shape = admit(&self.gate, sql, params)?;
-        self.session
-            .open_cursor(sql, params)
+        self.on_session(|session| session.open_cursor(sql, params))
             .map(|cursor| ConsumerCursor::new(cursor, shape, &self.gate))
             .map_err(map_engine_err)
     }
@@ -354,10 +456,7 @@ impl ConsumerReader {
         let mut named = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
-            let answer = self
-                .session
-                .metadata(MetadataRequest::Tables, continuation.as_deref())
-                .map_err(map_engine_err)?;
+            let answer = self.raw_metadata(MetadataRequest::Tables, continuation.as_deref())?;
             let MetadataBody::Tables { items, has_more } = &answer.body else {
                 return Err(CgError::Engine(
                     "the store's table inventory came back as another kind of answer".to_string(),
@@ -394,14 +493,12 @@ impl ConsumerReader {
     /// surface.
     pub fn table_schema(&self, table: &str) -> Result<MetadataAnswer> {
         self.gate.require_declared(table)?;
-        self.session
-            .metadata(
-                MetadataRequest::Schema {
-                    table: table.to_string(),
-                },
-                None,
-            )
-            .map_err(map_engine_err)
+        self.raw_metadata(
+            MetadataRequest::Schema {
+                table: table.to_string(),
+            },
+            None,
+        )
     }
 
     /// The typed graph reads, over this reader's session.
@@ -413,11 +510,165 @@ impl ConsumerReader {
         graph::ConsumerGraphView::new(self)
     }
 
+    /// Run one engine call on this reader's session, carrying it through an owner that lets the
+    /// store go mid-read.
+    ///
+    /// Reads change nothing, so an answer that says only that the owner is starting, stopping or
+    /// gone is answered by selecting the route again — the owner that took over, or the file once
+    /// nobody holds it — and asking the same question there. The wait is bounded by the declared
+    /// writer-transition allowance; past it the typed refusal is the answer.
+    fn on_session<T>(
+        &self,
+        call: impl Fn(&ReadSession) -> std::result::Result<T, contextdb_core::Error>,
+    ) -> std::result::Result<T, contextdb_core::Error> {
+        let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        let deadline = transition_deadline();
+        loop {
+            let started = Instant::now();
+            match call(&session) {
+                Err(error)
+                    if owner_in_transition(&error, started.elapsed(), &session.options())
+                        && Instant::now() < deadline =>
+                {
+                    *session =
+                        open_through_owner_transitions(&self.path, session.options(), deadline)?;
+                }
+                answer => return answer,
+            }
+        }
+    }
+
+    /// One statement on the session, before any declaration narrowing.
+    fn raw_execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        self.on_session(|session| session.execute(sql, params))
+            .map_err(map_engine_err)
+    }
+
+    /// One metadata question on the session, before any declaration narrowing.
+    fn raw_metadata(
+        &self,
+        request: MetadataRequest,
+        continuation: Option<&str>,
+    ) -> Result<MetadataAnswer> {
+        self.on_session(|session| session.metadata(request.clone(), continuation))
+            .map_err(map_engine_err)
+    }
+
     /// Let the session go.
     pub fn close(self) -> Result<()> {
         drop(self);
         Ok(())
     }
+}
+
+fn verify_context_graph_readiness(reader: &ConsumerReader) -> Result<()> {
+    let path = reader.path();
+    let tables = raw_table_inventory(reader)?;
+    if tables.contains("cg_schema_version") {
+        let versions =
+            reader.raw_execute("SELECT version FROM cg_schema_version", &HashMap::new())?;
+        let found = if versions.rows.len() == 1 {
+            match versions.rows[0].first() {
+                Some(Value::Int64(version)) => u32::try_from(*version).unwrap_or(0),
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        if versions.rows.len() == 1
+            && found == CG_SCHEMA_VERSION
+            && reserved_reader_manifest_is_present(&tables)
+        {
+            return Ok(());
+        }
+        if !versions.rows.is_empty() && found != CG_SCHEMA_VERSION {
+            return Err(CgError::LegacySchemaDetected {
+                found_version: found,
+                expected_version: CG_SCHEMA_VERSION,
+            });
+        }
+        return Err(CgError::StoreNeedsWritableRecovery {
+            path: path.to_path_buf(),
+            reason:
+                "the context-graph readiness row is absent or its reserved schema is incomplete"
+                    .into(),
+        });
+    }
+
+    if tables.contains("event_placement") {
+        let placement = reader.raw_execute(
+            "SELECT expected_policy FROM event_placement WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Int64(1))]),
+        )?;
+        let expected = placement
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|value| match value {
+                Value::Text(value) => Some(value.as_str()),
+                _ => None,
+            });
+        if matches!(expected, Some("tenant_hub" | "transition_to_tenant_hub")) && tables.len() == 1
+        {
+            let bindings = reader.raw_execute("SHOW SYNC BINDINGS", &HashMap::new())?;
+            if !bindings.rows.is_empty() {
+                return Err(CgError::StoreNeedsWritableRecovery {
+                    path: path.to_path_buf(),
+                    reason: "the authenticated tenant binding is durable but its application schema is not ready"
+                        .into(),
+                });
+            }
+            return Err(CgError::TenantPolicyBindingRequired {
+                expected: EventPlacementPolicy::TenantHub,
+            });
+        }
+        return Err(CgError::StoreNeedsWritableRecovery {
+            path: path.to_path_buf(),
+            reason: "the tenant bootstrap contains an incomplete unpublished application schema"
+                .into(),
+        });
+    }
+
+    Err(CgError::LegacySchemaDetected {
+        found_version: 0,
+        expected_version: CG_SCHEMA_VERSION,
+    })
+}
+
+fn raw_table_inventory(reader: &ConsumerReader) -> Result<BTreeSet<String>> {
+    let mut tables = BTreeSet::new();
+    let mut continuation = None;
+    loop {
+        let answer = reader.raw_metadata(MetadataRequest::Tables, continuation.as_deref())?;
+        let MetadataBody::Tables { items, has_more } = answer.body else {
+            return Err(CgError::Engine(
+                "the store's table inventory came back as another kind of answer".into(),
+            ));
+        };
+        tables.extend(items);
+        if !has_more {
+            return Ok(tables);
+        }
+        continuation = Some(answer.continuation.ok_or_else(|| {
+            CgError::Engine(
+                "the store's table inventory said more tables were waiting without a continuation"
+                    .into(),
+            )
+        })?);
+    }
+}
+
+fn reserved_reader_manifest_is_present(tables: &BTreeSet<String>) -> bool {
+    TABLES.iter().all(|table| tables.contains(table.name))
+        && LOCAL_DERIVED_TABLES
+            .iter()
+            .all(|table| tables.contains(table.name))
+        && LOCAL_RUNTIME_TABLES
+            .iter()
+            .all(|table| tables.contains(table.name))
+        && WORK_LEDGER_TABLES
+            .iter()
+            .all(|table| tables.contains(*table))
 }
 
 /// One bounded cursor a [`ConsumerReader`] opened.
@@ -507,7 +758,12 @@ impl ConsumerCursor {
             return Err(already_closed());
         };
         self.narrowed_first_page = None;
-        cursor.close().map_err(map_engine_err)
+        match cursor.close() {
+            // The owner that held this cursor's snapshot let the store go, and its snapshot with
+            // it: there is nothing left for this close to release.
+            Err(error) if owner_left(&error) => Ok(()),
+            closed => closed.map_err(map_engine_err),
+        }
     }
 }
 

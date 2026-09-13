@@ -61,3 +61,6 @@ ignore = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# ContextDB is the first-party event-custody input pinned in the
+# workspace manifest. All other git sources remain denied.
+allow-git = ["https://github.com/context-graph-ai/contextdb"]

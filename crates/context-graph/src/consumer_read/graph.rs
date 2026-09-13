@@ -31,6 +31,7 @@
 //! | [`ConsumerGraphView::get_intention`] | `intentions` |
 //! | [`ConsumerGraphView::get_decision`] | `decisions`, `edges`, `decision_basis_snapshots`, `outcomes` |
 //! | [`ConsumerGraphView::get_observation`], [`ConsumerGraphView::list_observations`] | `observations`, `evidence`, `evidence_availability_log` |
+//! | [`ConsumerGraphView::get_event`], [`ConsumerGraphView::list_stream_events`] | `events` |
 //!
 //! The nested tables are there because the ANSWERS are nested: a decision carries the intentions
 //! it serves, the precedents it cites, its basis snapshots and its outcome; an observation carries
@@ -63,9 +64,10 @@ use contextdb_engine::QueryResult;
 
 use crate::Result;
 use crate::store::graph_rows::GraphRows;
-use crate::store::{audit, context, decision, entity, intention, observation};
+use crate::store::{audit, context, decision, entity, event, intention, observation};
 use crate::types::{
-    AuditEntry, AuditFilter, Context, ContextId, Decision, DecisionId, Entity, EntityId, Intention,
+    AnchorKey, AnchorValue, AuditEntry, AuditFilter, Context, ContextId, ConversationEvent,
+    Decision, DecisionId, Entity, EntityId, EventId, EventRange, EventStreamSelector, Intention,
     IntentionId, Observation, ObservationId,
 };
 
@@ -148,6 +150,38 @@ impl<'reader> ConsumerGraphView<'reader> {
     /// Needs `observations`, `evidence` and `evidence_availability_log` declared.
     pub fn list_observations(&self, context_id: Option<ContextId>) -> Result<Vec<Observation>> {
         observation::list_observations(self, context_id)
+    }
+
+    /// One immutable event inside the supplied Context. Needs `events` declared.
+    pub fn get_event(
+        &self,
+        context_id: ContextId,
+        id: EventId,
+    ) -> Result<Option<ConversationEvent>> {
+        event::get_event(self, context_id, id)
+    }
+
+    /// One bounded source stream in Store-assigned order. Needs `events` declared.
+    pub fn list_stream_events(
+        &self,
+        stream: EventStreamSelector,
+        range: EventRange,
+    ) -> Result<Vec<ConversationEvent>> {
+        event::list_stream_events(self, stream, range)
+    }
+
+    /// Events in one Context whose effective exact anchors hold `key` = `value`, answered exactly
+    /// as [`crate::Store::list_events_by_anchor`] answers. Needs `events`, `event_anchors`,
+    /// `event_interpretation_heads`, `event_interpretation_source_events` and
+    /// `event_interpretation_anchors` declared.
+    pub fn list_events_by_anchor(
+        &self,
+        context_id: ContextId,
+        key: AnchorKey,
+        value: AnchorValue,
+        range: EventRange,
+    ) -> Result<Vec<ConversationEvent>> {
+        event::list_events_by_anchor(self, context_id, key, value, range)
     }
 }
 

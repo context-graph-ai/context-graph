@@ -40,7 +40,14 @@ pub type Result<T> = std::result::Result<T, CgCatalogError>;
 pub type ModelId = String;
 
 pub const CG_MODEL_CACHE_ROOT_ENV: &str = "CG_MODEL_CACHE_ROOT";
+/// Where the model cache lands on Linux and macOS when neither `CG_MODEL_CACHE_ROOT` nor
+/// `XDG_CACHE_HOME` is set. This is the LAST fallback in
+/// [`context_graph::embedder::nomic::default_cache_root`], not the answer whenever those are: with
+/// `XDG_CACHE_HOME` set, the root is `$XDG_CACHE_HOME/cg/models` instead. Call
+/// [`default_cache_root`] to learn the real root; use this only to describe the fallback.
 pub const DEFAULT_CACHE_ROOT_LINUX_MACOS: &str = "~/.cache/cg/models";
+/// The Windows counterpart of [`DEFAULT_CACHE_ROOT_LINUX_MACOS`], and the same caveat: it is the
+/// fallback, not the resolved root.
 pub const DEFAULT_CACHE_ROOT_WINDOWS: &str = "%LOCALAPPDATA%\\cg\\models";
 
 const NOMIC_ID: &str = "nomic-embed-text-v1.5";
@@ -324,6 +331,7 @@ struct StoreObservationRequest<'a> {
 
 #[derive(Clone, Default)]
 pub struct Catalog {
+    data_root: PathBuf,
     cache_root: PathBuf,
     scope_key: String,
     progress_observer: Option<Arc<ProgressObserver>>,
@@ -333,6 +341,7 @@ impl fmt::Debug for Catalog {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Catalog")
+            .field("data_root", &self.data_root)
             .field("cache_root", &self.cache_root)
             .field("scope_key", &self.scope_key)
             .field("progress_observer", &self.progress_observer.is_some())
@@ -481,19 +490,29 @@ impl Embedder for CatalogTextEmbedder {
 }
 
 impl Catalog {
-    pub fn open_with_scope(scope_key: impl Into<String>) -> Result<Self> {
-        Ok(Self {
-            cache_root: default_cache_root(),
-            scope_key: scope_key.into(),
-            progress_observer: None,
-        })
+    /// Opens with both locations collapsed onto one directory — the shape a self-contained
+    /// installation and every disposable test root use, where registrations and artifacts sit
+    /// side by side.
+    pub fn open_with_scope_against_root(
+        root: impl Into<PathBuf>,
+        scope_key: impl Into<String>,
+    ) -> Result<Self> {
+        let root = root.into();
+        Self::open_with_scope_against_roots(root.clone(), root, scope_key)
     }
 
-    pub fn open_with_scope_against_root(
+    /// Opens with the two locations held apart: `data_root` holds the registrations an operator
+    /// manages, `cache_root` holds the artifact bytes a fetch downloads. An operator who points
+    /// `CG_DATA_ROOT` and `CG_MODEL_CACHE_ROOT` at different directories gets this constructor,
+    /// and a registration written under the data root stays visible to every command that reads
+    /// it, whatever the cache root is set to.
+    pub fn open_with_scope_against_roots(
+        data_root: impl Into<PathBuf>,
         cache_root: impl Into<PathBuf>,
         scope_key: impl Into<String>,
     ) -> Result<Self> {
         Ok(Self {
+            data_root: data_root.into(),
             cache_root: cache_root.into(),
             scope_key: scope_key.into(),
             progress_observer: None,
@@ -501,12 +520,14 @@ impl Catalog {
     }
 
     pub fn open_with_entries_against_root(
-        cache_root: impl Into<PathBuf>,
+        root: impl Into<PathBuf>,
         scope_key: impl Into<String>,
         entries: Vec<CatalogEntry>,
     ) -> Result<Self> {
+        let root = root.into();
         let catalog = Self {
-            cache_root: cache_root.into(),
+            data_root: root.clone(),
+            cache_root: root,
             scope_key: scope_key.into(),
             progress_observer: None,
         };
@@ -2295,8 +2316,11 @@ impl Catalog {
         Ok(Some(registrations.entries))
     }
 
+    /// Registrations are DATA, not cache: they are what an operator registered, they survive a
+    /// cache wipe, and every command that reads a registration — `show`, `fetch`, the connection
+    /// catalog — resolves them here.
     fn registration_path(&self) -> PathBuf {
-        self.root().join("cg/catalog-registrations.toml")
+        self.data_root().join("cg/catalog-registrations.toml")
     }
 
     fn runtime_config_path(&self) -> PathBuf {
@@ -2324,12 +2348,23 @@ impl Catalog {
         }
     }
 
+    /// The CACHE root: where fetched artifact bytes are placed and where an offline load reads
+    /// them from. Wiping it costs a re-download and nothing else.
     fn root(&self) -> PathBuf {
         if self.cache_root.as_os_str().is_empty() {
             default_cache_root()
         } else {
             self.cache_root.clone()
         }
+    }
+
+    /// The DATA root: where the registrations an operator manages live. It comes from whoever
+    /// opened this catalog and from nowhere else. Registrations are the one thing on the machine
+    /// nothing can reconstruct, so a second rule for where they live is how a command ends up
+    /// reading an empty directory while the operator's entries sit somewhere else — this crate
+    /// therefore resolves nothing and reads no environment for it.
+    fn data_root(&self) -> PathBuf {
+        self.data_root.clone()
     }
 }
 
@@ -3293,18 +3328,15 @@ fn store_error(path: &Path, err: CgError) -> CgCatalogError {
     path_error(path, err.to_string())
 }
 
-fn default_cache_root() -> PathBuf {
-    if let Some(value) = std::env::var_os(CG_MODEL_CACHE_ROOT_ENV) {
-        return PathBuf::from(value);
-    }
-    if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .map(|root| root.join("cg").join("models"))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE_ROOT_WINDOWS))
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".cache/cg/models")
-    } else {
-        PathBuf::from(DEFAULT_CACHE_ROOT_LINUX_MACOS)
-    }
+/// The canonical model-cache root this catalog resolves against: `CG_MODEL_CACHE_ROOT` when set,
+/// else `$XDG_CACHE_HOME/cg/models` when that is set, else the platform default
+/// (`%LOCALAPPDATA%\cg\models` on Windows, `$HOME/.cache/cg/models` elsewhere).
+///
+/// One rule, owned one layer down by the bundled embedder that also loads from this directory
+/// (`context_graph::embedder::nomic::default_cache_root`). This name stays the catalog's public
+/// entry point and delegates, so what `cg model fetch` seeds and what an offline load reads can
+/// never be two different directories — and a caller that wants the installed model's directory
+/// calls this instead of hand-rolling the same env-var/XDG logic a second time.
+pub fn default_cache_root() -> PathBuf {
+    context_graph::embedder::nomic::default_cache_root()
 }

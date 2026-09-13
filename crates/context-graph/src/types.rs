@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::{BufRead, Read, Seek};
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -103,6 +105,11 @@ id_type!(EmbeddingId, nil_default);
 id_type!(EntitySnapshotId, nil_default);
 id_type!(IntentionSnapshotId, nil_default);
 id_type!(IntentionSnapshotLinkId, nil_default);
+id_type!(EventId);
+id_type!(AdapterCoverageGapId);
+id_type!(InterpretationGenerationId);
+id_type!(EventSearchGenerationId);
+id_type!(EventSearchPassageId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum IntentionStatus {
@@ -450,6 +457,7 @@ pub enum EmbeddingTarget {
     Evidence(EvidenceId),
     EntityReference(EntityId, Option<String>),
     Digest(DigestId),
+    EventSearchPassage(EventSearchPassageId),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -739,6 +747,22 @@ pub struct CreateContext {
     pub name: String,
     pub labels: Vec<String>,
     pub properties: BTreeMap<String, Value>,
+}
+
+/// A caller-owned, node-local reference to one Context.
+///
+/// Both fields are persisted byte-for-byte as text. The core deliberately assigns no filesystem,
+/// provider, account, site, or workspace meaning to either value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContextBindingKey {
+    pub namespace: String,
+    pub opaque_reference: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBindingReceipt {
+    pub context_id: ContextId,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1100,10 +1124,420 @@ pub struct AuditFilter {
     pub after: Option<AuditId>,
 }
 
-/// Schema 11 adds immutable history heads and predecessor links and keys the current outcome by
-/// its context and decision. A schema-10 root is deliberately refused rather than silently
-/// receiving a partial migration.
-pub const CG_SCHEMA_VERSION: u32 = 11;
+/// The provider-neutral role used to render an accepted conversation event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventRenderRole {
+    HumanMessage,
+    AgentMessage,
+    ToolRequest,
+    ToolResult,
+    System,
+    Attachment,
+    Metadata,
+    Opaque,
+}
+
+/// How completely an adapter represented the accepted source occurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventCoverage {
+    Complete,
+    Opaque,
+    PayloadRefused,
+    SourceDeclaredMissing,
+}
+
+/// One versioned, provider-owned conversion declaration consumed by the generic event core.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventAdapterDeclaration {
+    pub connector_id: String,
+    pub adapter_version: String,
+    pub anchor_declaration_version: String,
+    pub anchor_schema: Value,
+    /// Ordered RFC 6901 pointers whose unsigned integer values define source order.
+    pub source_position_order: Vec<String>,
+}
+
+/// The complete source scope within which an adapter may correlate an event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCorrelationScope {
+    pub context_id: ContextId,
+    pub connector_id: String,
+    pub source_instance_ref: String,
+    pub session_ref: String,
+    pub anchor_declaration_version: String,
+}
+
+/// A request for one declared anchor from a prior tool-request event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriorRequestAnchorQuery {
+    pub interaction_ref: String,
+    pub interaction_anchor_key: String,
+    pub projected_anchor_key: String,
+}
+
+/// Whether a prior request has exactly one distinct projected anchor value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CorrelationResolution {
+    Missing,
+    Unique(Value),
+    Ambiguous,
+}
+
+/// A bounded, source-scoped lookup available while an adapter assembles one record.
+pub trait EventCorrelationResolver {
+    fn resolve_prior_request_anchor(
+        &mut self,
+        query: &PriorRequestAnchorQuery,
+    ) -> crate::Result<CorrelationResolution>;
+}
+
+/// Adapter-supplied normalized content. Store-owned identity, sequence and hashes are absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventDraft {
+    pub session_ref: String,
+    pub source_event_key: String,
+    pub source_position: Value,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub author: String,
+    pub kind: String,
+    pub render_role: EventRenderRole,
+    pub interaction_ref: Option<String>,
+    pub text: Option<String>,
+    pub payload: Value,
+    pub anchors: Value,
+    pub source_remainder: Value,
+    pub coverage: EventCoverage,
+}
+
+/// An immutable normalized source occurrence returned by the Store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationEvent {
+    pub id: EventId,
+    pub context_id: ContextId,
+    pub connector_id: String,
+    pub adapter_version: String,
+    pub anchor_declaration_version: String,
+    pub source_instance_ref: String,
+    pub session_ref: String,
+    pub source_event_key: String,
+    pub source_position: Value,
+    pub seq: u64,
+    pub content_hash: String,
+    pub anchor_count: u64,
+    pub anchor_set_hash: String,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub author: String,
+    pub kind: String,
+    pub render_role: EventRenderRole,
+    pub interaction_ref: Option<String>,
+    pub text: Option<String>,
+    pub payload: Value,
+    pub anchors: Value,
+    pub source_remainder: Value,
+    pub coverage: EventCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendEventBatch {
+    pub context_id: ContextId,
+    pub declaration: EventAdapterDeclaration,
+    pub source_instance_ref: String,
+    pub drafts: Vec<EventDraft>,
+    pub source_commit: Option<SourceCommitBoundary>,
+}
+
+impl AppendEventBatch {
+    pub fn live(
+        context_id: ContextId,
+        declaration: EventAdapterDeclaration,
+        source_instance_ref: impl Into<String>,
+        drafts: Vec<EventDraft>,
+    ) -> Self {
+        Self {
+            context_id,
+            declaration,
+            source_instance_ref: source_instance_ref.into(),
+            drafts,
+            source_commit: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventAppendDisposition {
+    Inserted,
+    AlreadyPresent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventAppendResult {
+    pub event: ConversationEvent,
+    pub disposition: EventAppendDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EventCoverageCounts {
+    pub complete: u64,
+    pub opaque: u64,
+    pub payload_refused: u64,
+    pub source_declared_missing: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendEventReceipt {
+    pub events: Vec<EventAppendResult>,
+    pub inserted: u64,
+    pub already_present: u64,
+    pub coverage: EventCoverageCounts,
+    pub refused: u64,
+    pub failed: u64,
+    pub first_seq: Option<u64>,
+    pub last_seq: Option<u64>,
+    pub last_committed_source_key: Option<String>,
+    pub last_committed_checkpoint: Option<Value>,
+    pub transaction_id: Option<TxId>,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventStreamSelector {
+    pub context_id: ContextId,
+    pub connector_id: String,
+    pub source_instance_ref: String,
+}
+
+/// One declared exact-anchor key, such as `file`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AnchorKey(pub String);
+
+/// One exact-anchor value as the canonical JSON text capture writes for it: the string anchor
+/// `src/lib.rs` is `"src/lib.rs"` including its quotes, and the number 7 is `7`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AnchorValue(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventRange {
+    Count {
+        after_seq: Option<u64>,
+        limit: NonZeroU32,
+    },
+    Sequence {
+        first_seq: u64,
+        last_seq_inclusive: u64,
+        limit: NonZeroU32,
+    },
+    OccurredAt {
+        start_inclusive: DateTime<Utc>,
+        end_exclusive: DateTime<Utc>,
+        limit: NonZeroU32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSourceIdentity {
+    pub source_instance_ref: String,
+    pub session_ref: String,
+    pub provisional_empty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRecordPosition {
+    pub byte_offset: u64,
+    pub coordinate: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptedSourceRecord {
+    pub drafts: Vec<EventDraft>,
+    pub checkpoint_after_record: Value,
+    pub source_position_after_record: SourceRecordPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndOfSource {
+    Complete,
+    PendingTail { pending_bytes: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventSourceRead {
+    Record(AdaptedSourceRecord),
+    EndOfSource(EndOfSource),
+}
+
+pub trait EventSourceAdapter {
+    fn declaration(&self) -> &EventAdapterDeclaration;
+
+    fn identify_source(
+        &mut self,
+        reader: &mut dyn BufRead,
+        source_locator_ref: &str,
+        session_override: Option<&str>,
+    ) -> crate::Result<EventSourceIdentity>;
+
+    fn resume_source(
+        &mut self,
+        identity: &EventSourceIdentity,
+        checkpoint: &Value,
+        position: &SourceRecordPosition,
+    ) -> crate::Result<()>;
+
+    fn read_next_record(
+        &mut self,
+        reader: &mut dyn BufRead,
+        resolver: &mut dyn EventCorrelationResolver,
+    ) -> crate::Result<EventSourceRead>;
+}
+
+pub trait SeekableEventSource: Read + Seek {}
+impl<T: Read + Seek + ?Sized> SeekableEventSource for T {}
+
+/// A source checkpoint sealed by the core after adapter and byte-count agreement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCommitBoundary {
+    checkpoint_after_record: Value,
+    source_position_after_record: SourceRecordPosition,
+    prefix_sha256: String,
+    observed_source_len: u64,
+    source_locator_ref: String,
+    source_identity: EventSourceIdentity,
+}
+
+impl SourceCommitBoundary {
+    pub(crate) fn new(
+        checkpoint_after_record: Value,
+        source_position_after_record: SourceRecordPosition,
+        prefix_sha256: String,
+        observed_source_len: u64,
+        source_locator_ref: String,
+        source_identity: EventSourceIdentity,
+    ) -> Self {
+        Self {
+            checkpoint_after_record,
+            source_position_after_record,
+            prefix_sha256,
+            observed_source_len,
+            source_locator_ref,
+            source_identity,
+        }
+    }
+
+    pub fn checkpoint_after_record(&self) -> &Value {
+        &self.checkpoint_after_record
+    }
+
+    pub fn source_position_after_record(&self) -> &SourceRecordPosition {
+        &self.source_position_after_record
+    }
+
+    pub fn prefix_sha256(&self) -> &str {
+        &self.prefix_sha256
+    }
+
+    pub fn observed_source_len(&self) -> u64 {
+        self.observed_source_len
+    }
+
+    pub(crate) fn source_locator_ref(&self) -> &str {
+        &self.source_locator_ref
+    }
+
+    pub(crate) fn source_identity(&self) -> &EventSourceIdentity {
+        &self.source_identity
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBatchLimits {
+    pub max_events: NonZeroUsize,
+    pub max_normalized_bytes: NonZeroUsize,
+}
+
+impl Default for EventBatchLimits {
+    fn default() -> Self {
+        Self {
+            max_events: NonZeroUsize::new(512).expect("512 is nonzero"),
+            max_normalized_bytes: NonZeroUsize::new(4 * 1024 * 1024).expect("four MiB is nonzero"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportEventOptions {
+    pub context_id: ContextId,
+    pub source_locator_ref: String,
+    pub session_override: Option<String>,
+    pub batch_limits: EventBatchLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportEventReceipt {
+    pub source: EventSourceIdentity,
+    pub batch_count: u64,
+    pub inserted: u64,
+    pub already_present: u64,
+    pub coverage: EventCoverageCounts,
+    pub refused: u64,
+    pub failed: u64,
+    pub event_watermark: Option<u64>,
+    pub search_watermark: Option<u64>,
+    pub search_pending_count: u64,
+    pub pending_tail_records: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventPlacementPolicy {
+    LocalOnly,
+    TenantHub,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventPlacementState {
+    LocalOnly,
+    TenantHubUnbound,
+    TenantHubBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventDeliveryState {
+    Disabled,
+    Blocked,
+    Pending,
+    Refused,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantPolicyBindingReceipt {
+    pub state: EventPlacementState,
+    pub authoritative_hub_id: String,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventDeliveryStatus {
+    pub placement: EventPlacementState,
+    pub expected_policy: EventPlacementPolicy,
+    pub authoritative_policy: Option<EventPlacementPolicy>,
+    pub authoritative_hub_id: Option<String>,
+    pub state: EventDeliveryState,
+    pub eligible: u64,
+    pub accepted: u64,
+    pub equivalent: u64,
+    pub pending: u64,
+    pub refused: u64,
+}
+
+/// Schema 12 adds the policy-gated immutable event source, exact anchors and node-local source
+/// progress. A schema-11 root is deliberately refused rather than partially migrated.
+pub const CG_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreConfig {
@@ -1112,6 +1546,7 @@ pub struct StoreConfig {
     pub file_uri_allowed: bool,
     pub extra_embedding_spaces: Vec<EmbeddingSpaceDecl>,
     pub default_text_embedder: Option<EmbedderConfig>,
+    pub event_placement: Option<EventPlacementPolicy>,
     pub expected_schema_version: u32,
 }
 
@@ -1123,6 +1558,7 @@ impl Default for StoreConfig {
             file_uri_allowed: false,
             extra_embedding_spaces: Vec::new(),
             default_text_embedder: Some(EmbedderConfig::default_nomic()),
+            event_placement: None,
             expected_schema_version: CG_SCHEMA_VERSION,
         }
     }

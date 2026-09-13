@@ -37,7 +37,7 @@ chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 contextdb-parser.workspace = true
-contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh"], optional = true }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "46e99e2eefa20853b109ae17a60627d4d7202f5d", features = ["iroh"], optional = true }
 fs4.workspace = true
 pollster.workspace = true
 safetensors = { workspace = true, optional = true }
@@ -56,16 +56,10 @@ uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 # pull contextdb-server/tokio into the default `--edges normal,build` tree the purity guards check.
 context-graph = { path = ".", features = ["fabric-sync"] }
 candle-core.workspace = true
-# The README is this crate's front page, and a `#[cfg(doctest)]` item in `lib.rs` hands it to the
-# doctest harness so its example is compiled — without splicing the README text into the crate's
-# own docs. The example registers an EmbeddingGemma embedder, which is where that embedder lives.
-# A dev-only edge: `candle-embeddinggemma` depends on this crate in the ordinary direction, and
-# nothing here reaches it outside tests and doctests.
-candle-embeddinggemma = { path = "../candle-embeddinggemma" }
 candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }
-contextdb-server = { path = "../../../contextdb/crates/contextdb-server", features = ["iroh", "test-seams"] }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "46e99e2eefa20853b109ae17a60627d4d7202f5d", features = ["iroh", "test-seams"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }
@@ -99,3 +93,8 @@ path = "../../benches/cg_impact_analysis.rs"
 name = "cg_embedding_spaces"
 harness = false
 path = "benches/cg_embedding_spaces.rs"
+
+[[bench]]
+name = "cg_event_history"
+harness = false
+path = "benches/cg_event_history.rs"

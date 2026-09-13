@@ -18,20 +18,48 @@ pub struct WorkerLock {
     _file: std::fs::File,
 }
 
-/// Acquire the per-data-root worker lock at `lock_path`. Returns `None` when another worker already
-/// holds it (the second worker is then a no-op) or when the lockfile cannot be opened.
-pub fn acquire_worker_lock(lock_path: &Path) -> Option<WorkerLock> {
+/// Why the per-data-root worker lock was not taken.
+///
+/// The two variants are opposite answers to the only question a caller asks — "is my work going to
+/// be done?" — so they must never be collapsed into one. A lock somebody holds means a worker is
+/// running and this caller is a no-op. Anything else means no worker is running and none can be
+/// started, which the caller owes its user.
+#[derive(Debug)]
+pub enum WorkerLockRefusal {
+    /// Another worker holds the lock. It does the work; this caller stands down.
+    HeldByAnotherWorker,
+    /// The lockfile could not be opened, or the lock could not be asked for. Nothing holds it and
+    /// nothing is running because of this.
+    Unusable(std::io::Error),
+}
+
+impl std::fmt::Display for WorkerLockRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HeldByAnotherWorker => formatter.write_str("another worker holds the lock"),
+            Self::Unusable(error) => write!(formatter, "the lock file could not be used: {error}"),
+        }
+    }
+}
+
+/// Take the per-data-root worker lock at `lock_path`.
+///
+/// A caller that only wants to know whether it holds the lock reads the `Ok`; a caller that must
+/// tell a user whether its work was scheduled reads the refusal, because only
+/// [`WorkerLockRefusal::HeldByAnotherWorker`] means somebody else is doing it.
+pub fn acquire_worker_lock(lock_path: &Path) -> Result<WorkerLock, WorkerLockRefusal> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path)
-        .ok()?;
+        .map_err(WorkerLockRefusal::Unusable)?;
     use fs4::fs_std::FileExt;
     match file.try_lock_exclusive() {
-        Ok(true) => Some(WorkerLock { _file: file }),
-        _ => None,
+        Ok(true) => Ok(WorkerLock { _file: file }),
+        Ok(false) => Err(WorkerLockRefusal::HeldByAnotherWorker),
+        Err(error) => Err(WorkerLockRefusal::Unusable(error)),
     }
 }
 

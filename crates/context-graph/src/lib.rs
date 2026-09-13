@@ -14,11 +14,13 @@ pub mod embedder;
 pub mod embedding_space;
 pub mod embedding_target;
 pub mod error;
+mod event_search;
 pub mod fabric;
 pub mod grounding;
 pub mod harness;
 pub mod ingest;
 pub mod injection;
+pub mod interpretation;
 pub mod llm;
 pub mod messaging;
 pub mod overlay;
@@ -38,14 +40,21 @@ pub use consumer_read::graph::ConsumerGraphView;
 pub use consumer_read::{ConsumerDeclaration, ConsumerReader};
 pub use contextdb_core::{ScopeLabel, TxId};
 pub use embedder::{
-    Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput, ModelSource,
+    Embedder, EmbedderConfig, EmbedderRegistration, EmbeddingInput, EmbeddingOutput,
+    EventSearchCapability, EventSearchEmbedder, EventSearchInference, EventSearchRole, ModelSource,
+    PreparedEventSearchDocument, PreparedEventSearchQuery,
     load_observer::{EmbedderLoadEvent, EmbedderLoadObserver},
 };
-pub use error::{CgError, ReaderIdentity};
+pub use error::{
+    CgError, InterpretationActivationRefusalReason, InterpretationAdmissionRefusalReason,
+    InterpretationLeaseRefusalReason, ReaderIdentity, SourceHistoryDivergence,
+};
+pub use event_search::*;
 pub use injection::{
     INJECTION_TOKEN_BUDGET, InjectionIndex, InjectionLine, InjectionTier,
     VERBATIM_SIMILARITY_THRESHOLD, build_injection_index,
 };
+pub use interpretation::*;
 pub use llm::*;
 pub use messaging::{MessageBody, MismatchKind, OverrideFailureReason};
 pub use owner_control::{ControlHandler, OwnerControlError};
@@ -54,11 +63,33 @@ pub use store::{
     ConsumerSchema, ConsumerTable, DigestGraphWalkBoundary, DigestSearchFilter, DigestSearchHit,
     EntityMatch, EntityReferenceMatchOptions, ReindexEvent, ReindexOptions, Store,
 };
+pub use store::{
+    EventHistoryContextStatus, EventHistoryInterpretationHead, EventHistoryMemoryCounts,
+    EventHistorySearchState, EventHistorySearchStatus, EventHistoryStatusSet,
+    EventSourcePrefixCheck, EventSourceStreamStatus, ForgetReceipt, ForgetSelection,
+    ForgetTableCount, RetiredInterpretation, event_history_reader_declaration,
+};
 pub use types::*;
 
 #[cfg(context_graph_internal_test_support)]
 #[doc(hidden)]
 pub mod test_support {
+    /// Observes whether the store registry has a live `Database` owner for `path`.
+    ///
+    /// This only reports `Store`'s shared `Database` ownership. It cannot prove
+    /// that arbitrary engine-internal buffers have been released.
+    pub use crate::store::database_is_live_for_test as store_database_is_live_for_test;
+
+    /// Pauses inside the next event-search head-switch transaction on the calling thread.
+    pub use crate::store::pause_next_event_search_finalization_for_test;
+
+    pub mod event_correlation {
+        pub use crate::store::{
+            EventCorrelationObservationGuard, EventCorrelationTestObserver,
+            observe_public_store_resolver_for_test,
+        };
+    }
+
     pub mod embedding {
         pub use crate::store::embedding::{
             CompositeVectorClause, FusionPolicy, VectorSearchFilters, VectorSearchResult,

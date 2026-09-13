@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::{
-    ContextId, DecisionId, DecisionStatus, EvidenceId, IntentionId, IntentionSnapshotId,
-    IntentionStatus, InvalidationId, InvalidationStatus, TxId,
+    ContextBindingKey, ContextId, DecisionId, DecisionStatus, EventPlacementPolicy, EvidenceId,
+    IntentionId, IntentionSnapshotId, IntentionStatus, InvalidationId, InvalidationStatus, TxId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +19,87 @@ pub enum EngineError {
         column: String,
         ref_table: String,
     },
+}
+
+/// Why one attempt of an event append stopped: a domain refusal the caller receives as-is, or an
+/// engine error the append loop inspects before deciding whether to retry.
+pub(crate) enum AppendAttemptError {
+    Domain(CgError),
+    Engine(contextdb_core::Error),
+}
+
+impl From<CgError> for AppendAttemptError {
+    fn from(error: CgError) -> Self {
+        Self::Domain(error)
+    }
+}
+
+/// The concrete source-history invariant that a resumable import found broken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceHistoryDivergence {
+    ShorterThanCheckpoint {
+        checkpoint_offset: u64,
+        observed_len: u64,
+    },
+    PrefixHashMismatch {
+        checkpoint_offset: u64,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+    InvalidByteBoundary {
+        expected_offset: u64,
+        adapter_offset: u64,
+    },
+    AdapterVersionMismatch {
+        expected: String,
+        actual: String,
+    },
+    LocatorIdentityMismatch {
+        locator_ref: String,
+        expected_source_instance_ref: String,
+        actual_source_instance_ref: String,
+    },
+    OutOfOrderPosition {
+        committed_offset: u64,
+        candidate_offset: u64,
+    },
+    SourcePositionOrderMismatch {
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+    OutOfOrderSourcePosition {
+        committed: Vec<u64>,
+        candidate: Vec<u64>,
+    },
+}
+
+/// Why an interpretation candidate was refused before it became commit-capable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterpretationAdmissionRefusalReason {
+    ReleasedTargetUnauthorized,
+    ReleasedTargetUnpublished,
+    DeclarationMismatch,
+    InvalidCandidate,
+    PreservationContractRefused,
+    AnchorRefused,
+}
+
+/// Why an interpretation batch can no longer commit under its persisted claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterpretationLeaseRefusalReason {
+    StaleClaim,
+    ExpiredClaim,
+    SourceChanged,
+    MembershipChanged,
+}
+
+/// Why the requested interpretation/search head pair cannot be activated atomically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterpretationActivationRefusalReason {
+    PartialGeneration,
+    GenerationNotReady,
+    SourceWatermarkMismatch,
+    SearchInterpretationMismatch,
 }
 
 /// One reader that is holding a store open, as context-graph reports it.
@@ -53,6 +134,13 @@ pub enum CgError {
     UniqueViolation {
         entity: &'static str,
         id: Option<String>,
+    },
+    ContextAlreadyExists {
+        name: String,
+    },
+    ContextBindingConflict {
+        key: Box<ContextBindingKey>,
+        requested_context_id: ContextId,
     },
     MissingIntention,
     IntentionNotFound {
@@ -185,6 +273,115 @@ pub enum CgError {
         space_id: String,
     },
     TextEmbedderDisabled,
+    /// An embedder was asked for role-aware event-search preparation (`prepare_document`,
+    /// `embed_prepared_document`, `prepare_query`, `embed_prepared_query`) and does not implement
+    /// it. The default trait methods answer this instead of silently falling back to plain-text
+    /// embedding, so a caller never gets an unlabelled vector back under an event-search space id.
+    EventSearchPreparationUnsupported {
+        embedding_space_id: String,
+    },
+    /// A prepared event-search document or query was sealed under one embedder's encoding
+    /// profile and handed to a different embedder's `embed_prepared_document`/`embed_prepared_query`.
+    /// Every embedder's own preparation stays honored; a mismatched profile is refused rather than
+    /// run through inference the sealing embedder never agreed to.
+    ///
+    /// The bundled text model answers the same way when inference authorized for another
+    /// embedder's encoding, or for the other role, is relayed into its own inference hooks: the
+    /// vector it would produce carries the reserved event-history identity, which promises tokens
+    /// this model itself prepared. Prepare and embed on one embedder — the text you meant to embed
+    /// under that encoding must go through that embedder's own `prepare_document`/`prepare_query`
+    /// first.
+    EventSearchPreparationProfileMismatch {
+        expected_profile: String,
+        actual_profile: String,
+    },
+    /// Interpretation search is exposed before its persistence and execution exist. A scaffold
+    /// call always refuses explicitly; it never reports a successful no-op.
+    InterpretationSearchScaffoldOnly {
+        operation: &'static str,
+    },
+    InterpretationAdmissionRefused {
+        context_id: ContextId,
+        connector_id: String,
+        target_interpretation_version: String,
+        reason: InterpretationAdmissionRefusalReason,
+    },
+    InterpretationLeaseRefused {
+        context_id: ContextId,
+        connector_id: String,
+        generation_id: crate::InterpretationGenerationId,
+        reason: InterpretationLeaseRefusalReason,
+    },
+    InterpretationActivationRefused {
+        context_id: ContextId,
+        connector_id: String,
+        interpretation_generation_id: crate::InterpretationGenerationId,
+        search_generation_id: crate::EventSearchGenerationId,
+        reason: InterpretationActivationRefusalReason,
+    },
+    EmptyContextSelector,
+    EmptyEventSearchQuery,
+    EventSearchLimitExceeded {
+        requested: u32,
+        maximum: u32,
+    },
+    HistorySearchNotReady {
+        context_ids: Vec<ContextId>,
+    },
+    IncomparableEmbeddingSpaces {
+        embedding_space_ids: Vec<String>,
+    },
+    EventSearchPassageTargetRequiresProjection {
+        passage_id: crate::EventSearchPassageId,
+    },
+    /// [`crate::embedder::nomic::EventHistoryTextEmbedder::over`]/`registration` refuse to build
+    /// the canonical event-history registration over an underlying embedder that cannot actually
+    /// serve it: a non-768 dimension, a config that can fetch, an explicitly non-canonical
+    /// revision pin, or a missing or invalid local artifact. Admission verifies the canonical
+    /// revision marker and local files directly and never fetches or loads the model solely to
+    /// decide registration. `reason` names which check failed.
+    EventHistoryEmbedderConstructionRefused {
+        reason: String,
+    },
+    /// `EventHistoryTextEmbedder::embed` (the plain, non-role [`crate::embedder::Embedder::embed`]
+    /// entrypoint) refuses to guess whether the caller meant the document or the query role — a
+    /// caller must go through the checked `prepare_document`/`embed_prepared_document` or
+    /// `prepare_query`/`embed_prepared_query` entrypoints of the sealed
+    /// [`crate::embedder::EventSearchEmbedder`] extension trait instead — bring it into scope with
+    /// `use context_graph::EventSearchEmbedder;` and call them on whatever embedder handle you
+    /// hold.
+    EventHistoryPlainEmbedRequiresExplicitRole,
+    /// [`crate::embedder::EventSearchDocumentBuilder::seal`]/
+    /// [`crate::embedder::EventSearchQueryBuilder::seal`] refuse to produce a structurally
+    /// invalid sealed value: an omitted `token_count`, omitted `payload`, omitted
+    /// `byte_boundaries` (document role only), or a `token_count` inconsistent with `payload`'s
+    /// length must each be reported here rather than panicking the host or silently defaulting.
+    /// `reason` names which check failed.
+    EventSearchPreparedValueInvalid {
+        reason: String,
+    },
+    /// Store registration and the checked `prepare_document`/`prepare_query` and
+    /// `embed_prepared_document`/`embed_prepared_query` entrypoints on the sealed
+    /// [`crate::embedder::EventSearchEmbedder`] extension trait refuse an
+    /// embedder that declares the canonical event-history profile without having the exact
+    /// library-controlled Nomic raw or event-history wrapper runtime type at canonical dimension.
+    /// Object layout and forwarding from a genuine embedder do not authorize another type.
+    /// `declared_profile` names the unverifiable declaration.
+    EventHistoryProfileIdentityUnverified {
+        declared_profile: String,
+    },
+    /// The checked, library-owned `embed_prepared_document`/`embed_prepared_query` entrypoints on
+    /// the sealed [`crate::embedder::EventSearchEmbedder`] extension trait refuse a prepared value
+    /// whose exact `token_count` exceeds that same
+    /// embedder's declared [`crate::embedder::Embedder::event_search_capability`] — enforced once,
+    /// for every embedder, before any implementer hook runs, rather than left to each hook's own
+    /// discretion. Role-neutral and distinct from the pre-existing
+    /// [`CgError::TranscriptTooLargeForModel`], which stays bound to the unrelated legacy
+    /// plain-embedding path.
+    PreparedInputExceedsModelLimit {
+        token_count: usize,
+        limit: usize,
+    },
     EmbedderModelNotAvailable {
         source: String,
         path: String,
@@ -397,7 +594,51 @@ pub enum CgError {
     ReadOnlySurfaceRefusedWrite {
         statement: String,
     },
+    SourceEventDiverged {
+        context_id: ContextId,
+        connector_id: String,
+        session_ref: String,
+        source_event_key: String,
+        stored_hash: Box<String>,
+        candidate_hash: Box<String>,
+    },
+    SourceHistoryDiverged {
+        source_instance_ref: String,
+        cause: SourceHistoryDivergence,
+    },
+    SourceRecordMalformed {
+        connector_id: String,
+        session_ref: String,
+        position: serde_json::Value,
+        reason: String,
+    },
+    SourcePayloadWouldBeTruncated {
+        connector_id: String,
+        source_event_key: String,
+        reason: String,
+    },
+    InvalidSourceCommitBoundary {
+        reason: String,
+    },
+    AppendContention {
+        context_id: ContextId,
+        connector_id: String,
+        source_instance_ref: String,
+    },
+    TenantPolicyBindingRequired {
+        expected: EventPlacementPolicy,
+    },
+    EventPlacementPolicyMismatch {
+        expected: EventPlacementPolicy,
+        actual: Option<EventPlacementPolicy>,
+        reason: String,
+    },
     Engine(String),
+    /// Forgetting history on a tenant-hub Store needs the engine's edge-local discard, which this
+    /// build does not issue; nothing was erased.
+    EventHistoryForgetRequiresEdgeDiscard {
+        placement: crate::types::EventPlacementState,
+    },
 }
 
 impl fmt::Display for CgError {
@@ -458,8 +699,196 @@ impl fmt::Display for CgError {
                 f,
                 "this is a read-only reading surface and will not run a statement that changes the store: {statement}"
             ),
+            CgError::EventSearchPreparationUnsupported { embedding_space_id } => write!(
+                f,
+                "the embedder for `{embedding_space_id}` does not do role-aware event-search preparation, so it cannot encode a passage or a search phrase for event history; it will not fall back to unlabelled plain-text embedding"
+            ),
+            CgError::EventSearchPreparationProfileMismatch {
+                expected_profile,
+                actual_profile,
+            } => write!(
+                f,
+                "this text was prepared for `{actual_profile}` and cannot be embedded by `{expected_profile}`; prepare it with the same embedder that will embed it"
+            ),
+            CgError::InterpretationSearchScaffoldOnly { operation } => write!(
+                f,
+                "`{operation}` is a public step-5/6 scaffold; its persistence and execution are not implemented yet"
+            ),
+            CgError::InterpretationAdmissionRefused {
+                context_id,
+                connector_id,
+                target_interpretation_version,
+                reason,
+            } => write!(
+                f,
+                "interpretation release `{target_interpretation_version}` for connector `{connector_id}` was refused in Context `{context_id}`: {}; no candidate was admitted and no interpretation rows or head changed",
+                interpretation_admission_refusal_message(*reason),
+            ),
+            CgError::InterpretationLeaseRefused {
+                context_id,
+                connector_id,
+                generation_id,
+                reason,
+            } => write!(
+                f,
+                "interpretation generation `{generation_id}` for connector `{connector_id}` in Context `{context_id}` cannot commit its claimed batch: {}; no batch was committed",
+                interpretation_lease_refusal_message(*reason),
+            ),
+            CgError::InterpretationActivationRefused {
+                context_id,
+                connector_id,
+                interpretation_generation_id,
+                search_generation_id,
+                reason,
+            } => write!(
+                f,
+                "interpretation generation `{interpretation_generation_id}` and search generation `{search_generation_id}` for connector `{connector_id}` in Context `{context_id}` cannot be activated: {}; neither active head changed",
+                interpretation_activation_refusal_message(*reason),
+            ),
+            CgError::EmptyContextSelector => write!(
+                f,
+                "event-history operations require at least one explicitly selected Context"
+            ),
+            CgError::EmptyEventSearchQuery => {
+                write!(f, "event-history search requires a non-empty query")
+            }
+            CgError::EventSearchLimitExceeded { requested, maximum } => write!(
+                f,
+                "event-history search requested {requested} hits; the hard maximum is {maximum}"
+            ),
+            CgError::HistorySearchNotReady { context_ids } => write!(
+                f,
+                "event history has no ready search generation for the selected Contexts {context_ids:?}"
+            ),
+            CgError::IncomparableEmbeddingSpaces {
+                embedding_space_ids,
+            } => write!(
+                f,
+                "the selected ready event-history generations use incomparable embedding spaces {embedding_space_ids:?}"
+            ),
+            CgError::EventSearchPassageTargetRequiresProjection { passage_id } => write!(
+                f,
+                "event-search passage `{passage_id}` embeddings are written only by the event-search projection"
+            ),
+            CgError::SourceHistoryDiverged {
+                source_instance_ref,
+                ..
+            } => write!(
+                f,
+                "the source history for `{source_instance_ref}` no longer matches its committed checkpoint; this source was not changed by this attempt. Do not retry it until you restore the previously imported history or import it under a new source identity"
+            ),
+            CgError::SourceRecordMalformed {
+                connector_id,
+                session_ref,
+                position,
+                reason,
+            } => write!(
+                f,
+                "the record at {position} in {connector_id} session `{session_ref}` is malformed: {reason}. Fix the record before importing this source again; earlier committed batches remain available"
+            ),
+            CgError::TenantPolicyBindingRequired { .. } => write!(
+                f,
+                "this import requires an authenticated tenant-hub binding; no Context binding, event schema, or event row was written. Finish tenant enrollment, then retry import"
+            ),
+            CgError::EventPlacementPolicyMismatch {
+                expected, actual, ..
+            } => write!(
+                f,
+                "this import requires {}, but the store is configured for {}; it made no placement change. Use a store configured for {} rather than treating this as a migration",
+                event_placement_policy_name(*expected),
+                actual
+                    .as_ref()
+                    .map_or("no event placement policy", |actual| {
+                        event_placement_policy_name(*actual)
+                    }),
+                event_placement_policy_name(*expected),
+            ),
+            CgError::ContextBindingConflict { key, .. } => write!(
+                f,
+                "the project reference `{}/{}` is already linked to a different Context; this binding was not changed. Use the Context already linked to this reference or choose a different project reference",
+                key.namespace, key.opaque_reference,
+            ),
+            CgError::AppendContention {
+                source_instance_ref,
+                ..
+            } => write!(
+                f,
+                "another writer changed source `{source_instance_ref}` while this import was appending; no event batch was committed for this contention. Wait for the other writer to exit, then retry this batch"
+            ),
+            CgError::EmbedderModelNotAvailable { source, path } => write!(
+                f,
+                "the text-embedding model from {source} is not available at {path}. Install it with `cg model fetch --defaults`, then try the operation again"
+            ),
             _ => write!(f, "{self:?}"),
         }
+    }
+}
+
+fn interpretation_admission_refusal_message(
+    reason: InterpretationAdmissionRefusalReason,
+) -> &'static str {
+    match reason {
+        InterpretationAdmissionRefusalReason::ReleasedTargetUnauthorized => {
+            "the requested connector or target version does not match the installed release authority; supply the authorized connector and exact target version"
+        }
+        InterpretationAdmissionRefusalReason::ReleasedTargetUnpublished => {
+            "the installed objects do not publish the requested target; install a released mapper and preservation contract for that exact target"
+        }
+        InterpretationAdmissionRefusalReason::DeclarationMismatch => {
+            "the installed mapper and preservation contract declarations differ; install objects with identical release declarations"
+        }
+        InterpretationAdmissionRefusalReason::InvalidCandidate => {
+            "the mapper produced an invalid effective event; fix the released mapper output before rebuilding"
+        }
+        InterpretationAdmissionRefusalReason::PreservationContractRefused => {
+            "the installed preservation contract rejected the candidate; fix the mapping or contract before rebuilding"
+        }
+        InterpretationAdmissionRefusalReason::AnchorRefused => {
+            "the candidate anchor set is incomplete, invalid, or disagrees with the released declaration; produce the complete valid anchor set before rebuilding"
+        }
+    }
+}
+
+fn interpretation_lease_refusal_message(reason: InterpretationLeaseRefusalReason) -> &'static str {
+    match reason {
+        InterpretationLeaseRefusalReason::StaleClaim => {
+            "the claim token or epoch is no longer current; discard this mapped result and request a fresh claim"
+        }
+        InterpretationLeaseRefusalReason::ExpiredClaim => {
+            "the claim expired before commit; discard this mapped result and request a fresh claim"
+        }
+        InterpretationLeaseRefusalReason::SourceChanged => {
+            "a claimed captured event or anchor no longer matches its source hash; discard this mapped result and rebuild from a fresh source snapshot"
+        }
+        InterpretationLeaseRefusalReason::MembershipChanged => {
+            "the sealed generation membership no longer matches the claim; discard this mapped result and request a fresh claim"
+        }
+    }
+}
+
+fn interpretation_activation_refusal_message(
+    reason: InterpretationActivationRefusalReason,
+) -> &'static str {
+    match reason {
+        InterpretationActivationRefusalReason::PartialGeneration => {
+            "a generation's completed counts do not cover its sealed membership; finish or rebuild the incomplete generation"
+        }
+        InterpretationActivationRefusalReason::GenerationNotReady => {
+            "one or both generations are not ready; finish both generations before retrying activation"
+        }
+        InterpretationActivationRefusalReason::SourceWatermarkMismatch => {
+            "the generations do not match the current source watermark; rebuild them from the current source snapshot"
+        }
+        InterpretationActivationRefusalReason::SearchInterpretationMismatch => {
+            "the search generation was built from a different interpretation snapshot; build its replacement from the requested interpretation generation"
+        }
+    }
+}
+
+fn event_placement_policy_name(policy: EventPlacementPolicy) -> &'static str {
+    match policy {
+        EventPlacementPolicy::LocalOnly => "local only",
+        EventPlacementPolicy::TenantHub => "tenant hub",
     }
 }
 
