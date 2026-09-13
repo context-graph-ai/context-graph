@@ -608,7 +608,7 @@ fn cli_status_connection_slice_shows_name_quota_kind_of_spend_and_expectation() 
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "claude-host-session".to_string());
-    let status = harness.run(&["status"]);
+    let status = harness.run(&["model", "status"]);
     assert_eq!(status.code, 0, "connected status must exit successfully");
     let parsed = parse_single_json_object(&status.stdout);
     assert!(
@@ -661,7 +661,7 @@ fn cli_status_connection_slice_shows_name_quota_kind_of_spend_and_expectation() 
             .contains(harness.data_root.path().to_string_lossy().as_ref()),
         "status must name the data store path"
     );
-    let text = harness.run(&["status", "--format", "text"]);
+    let text = harness.run(&["model", "status", "--format", "text"]);
     assert!(
         parse_single_json(&text.stdout).is_err(),
         "status --format text must opt into prose"
@@ -676,8 +676,10 @@ fn cli_status_connection_slice_shows_name_quota_kind_of_spend_and_expectation() 
 
 #[test]
 fn cli_status_without_connection_says_so_and_points_at_connect() {
-    let output = CliHarness::new().run(&["status"]);
-    assert_eq!(output.code, 0);
+    let output = CliHarness::new().run(&["model", "status"]);
+    // `cg model status` reports a missing connection with its own settled exit code 4
+    // (`model_byok_status_exit_code`), where the retired top-level status exited 0.
+    assert_eq!(output.code, 4);
     let parsed = parse_single_json_object(&output.stdout);
     assert!(
         parsed.is_ok(),
@@ -1044,7 +1046,7 @@ fn model_auth_login_two_host_logins_require_explicit_choice() {
         PROBELESS_HOST_ACCOUNT,
         true,
     );
-    let status = harness.run(&["status"]);
+    let status = harness.run(&["model", "status"]);
     assert!(
         status.stdout.contains("codex") && status.stdout.contains(PROBELESS_HOST_ACCOUNT),
         "status must expose the selected provider and account-exposure state"
@@ -1280,7 +1282,7 @@ fn connect_persists_reference_not_credential_across_fresh_process() {
     ]);
     assert_host_session_catalog_row(harness.data_root.path(), "claude", "claude", &label, true);
     let status = run_cg(
-        &["status"],
+        &["model", "status"],
         harness.data_root.path(),
         &harness.providers.path_env(),
         None,
@@ -1837,7 +1839,7 @@ fn missing_host_tool_distinct_from_stale_login() {
     assert_eq!(output.code, 6);
     assert_condition(&output, "host_tool_missing");
     assert!(output.stdout.contains("tool is gone"));
-    let status = harness.run(&["status"]);
+    let status = harness.run(&["model", "status"]);
     assert!(status.stdout.contains("host_tool_missing"));
     assert_eq!(completion_count(&harness), 0);
     assert!(!output.stdout.contains("host_login_expired"));
@@ -1906,7 +1908,7 @@ fn corrupted_connections_file_fails_loud_and_typed() {
     seed_connection_model(harness.data_root.path(), "primary", "reasoning");
     let state_file = harness.data_root.path().join("cg/model-connections.toml");
     write_file(&state_file, "not valid toml {{{");
-    for args in [&["status"][..], &["selftest"][..]] {
+    for args in [&["model", "status"][..], &["selftest"][..]] {
         let output = harness.run(args);
         assert_eq!(output.code, 1);
         assert_condition(&output, "connections_file_unreadable");
@@ -2025,7 +2027,7 @@ fn cli_connection_resolves_through_shared_catalog_api() {
         "binary-created connection must be visible through ModelConnectionCatalog"
     );
     assert_host_session_catalog_row(harness.data_root.path(), "claude", "claude", &label, true);
-    let status = harness.run(&["status"]);
+    let status = harness.run(&["model", "status"]);
     assert!(
         status.stdout.contains(&label),
         "catalog spend owner and cg status must agree"

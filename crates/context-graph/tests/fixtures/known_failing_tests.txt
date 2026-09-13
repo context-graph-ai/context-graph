@@ -1,0 +1,30 @@
+# Tests that do not pass on this tree, re-frozen against its last full measurement.
+#
+# What it is for: a published documentation claim may not name a test on this list, because a
+# proof that does not pass proves nothing. It is NOT a live exclusion list — nothing here is
+# skipped on account of being listed, and adding a newly broken test instead of fixing it is not
+# what this file is for. It shrinks in the same change that makes one of these pass; it grows only
+# when the tree it is frozen against is measured again and something is genuinely still broken.
+#
+# Re-frozen after twenty-three of the previous thirty-seven names — every installer, prefetch and
+# edge-sync name — started passing, which was leaving valid proofs refused for a reason that had
+# stopped being true.
+#
+# Three fail outright:
+cg_multi_chunk_import_applies_skills_and_carries_harness_report
+ci_hardening::cargo_deny_check_runs_clean_against_current_main_crate_dep_graph_and_fails_loud_when_binary_absent
+learning_sync_split::teaching_events_sync_tenant_wide_order_free_set_union
+#
+# Eleven hang rather than fail: they never return, so the runner stops them at its terminate-after.
+# They carry #[ignore] under DL-CG-17 and stay listed here until the hang itself is fixed.
+fabric_exactly_once::work_tables_are_append_only_no_update
+fabric_exactly_once::worker_crash_mid_job_lease_expires_then_second_attempt_succeeds
+fabric_receipt_honesty::executor_receipt_carries_real_tokens_and_elapsed_not_input_byte_length
+fabric_retention::input_copies_deleted_on_executor_after_result_lands_plus_grace
+fabric_status::attempt_ceiling_reached_marks_terminal_failed_visible_in_status
+fabric_status::expired_lease_job_not_shown_as_running
+fabric_status::receipt_origin_is_executor_not_submitter
+fabric_status::remote_receipt_round_trips_unmangled
+fabric_status::status_shows_state_executing_node_and_receipt
+status_reports_whole_store_totals_on_a_context_larger_than_one_read
+status_totals_stay_correct_and_bounded_on_a_store_no_single_read_can_cross

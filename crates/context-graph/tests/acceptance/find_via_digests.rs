@@ -20,7 +20,7 @@ use context_graph::{
     IntentionId, IntentionOrigin, IntentionStatus, ObservationId, PrecomputedEmbedding,
     RecordObservation, Store, StoreConfig, TxId,
 };
-use contextdb_core::{Value, VectorIndexRef};
+use contextdb_core::{Value, VectorSearchMode};
 use contextdb_engine::Database;
 #[cfg(context_graph_internal_test_support)]
 use contextdb_engine::plugin::{DatabasePlugin, QueryOutcome};
@@ -375,11 +375,17 @@ fn raw_digest_vector_query(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let stats = db
-        .__debug_vector_hnsw_stats(VectorIndexRef::new("digests", "vector_text"))
-        .map(|stats| stats.point_count)
+    // The vectors the maintained (HNSW) route searched for this statement, as the engine's own
+    // query disclosure reports them; zero unless the statement resolved to the indexed route. The
+    // engine no longer exposes whole-index graph statistics once the index is partitioned.
+    let indexed_vectors = result
+        .trace
+        .vector_search
+        .as_ref()
+        .filter(|search| search.resolved_mode == VectorSearchMode::Indexed)
+        .and_then(|search| search.aggregate_allowed_vectors)
         .unwrap_or_default();
-    (ids, format!("{:?}", result.trace), stats)
+    (ids, format!("{:?}", result.trace), indexed_vectors)
 }
 
 fn raw_extracted_from_graph_walk(
@@ -657,7 +663,7 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
         &[goal.as_uuid(), entity.as_uuid(), decision.as_uuid()],
     );
     insert_extracted_from_edges(&db_path, context.id, near_decoy.id, &[goal.as_uuid()]);
-    let (raw_ids, raw_trace, hnsw_points) =
+    let (raw_ids, raw_trace, indexed_vectors) =
         raw_digest_vector_query(&db_path, context.id, unit_vector(40), 2);
     let (raw_graph_source_ids, raw_graph_trace) =
         raw_extracted_from_graph_walk(&db_path, context.id, target_digest.id);
@@ -679,7 +685,7 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
 
     assert!(
         raw_ids == vec![target_digest.id, near_decoy.id]
-            && hnsw_points >= 1010
+            && indexed_vectors >= 1010
             && raw_trace.contains("HNSWSearch")
             && raw_graph_trace.contains("AdjacencyProbe")
             && raw_graph_source_ids == expected_graph_source_ids
@@ -706,7 +712,7 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
                     && hit.graph_walk.engine_plan == raw_graph_trace)
             && public_trace.contains("digests.vector_text")
             && public_trace.contains(raw_trace.as_str()),
-        "digest retrieval must root at contextdb's digest vector index and then expose the contextdb GRAPH_TABLE EXTRACTED_FROM walk that completed the hit; hits={hits:?}, raw_ids={raw_ids:?}, raw_trace={raw_trace:?}, raw_graph_source_ids={raw_graph_source_ids:?}, raw_graph_trace={raw_graph_trace:?}, hnsw_points={hnsw_points}, public_trace={public_trace:?}"
+        "digest retrieval must root at contextdb's digest vector index and then expose the contextdb GRAPH_TABLE EXTRACTED_FROM walk that completed the hit; hits={hits:?}, raw_ids={raw_ids:?}, raw_trace={raw_trace:?}, raw_graph_source_ids={raw_graph_source_ids:?}, raw_graph_trace={raw_graph_trace:?}, indexed_vectors={indexed_vectors}, public_trace={public_trace:?}"
     );
 }
 

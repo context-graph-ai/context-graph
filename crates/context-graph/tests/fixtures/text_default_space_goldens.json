@@ -1,0 +1,99 @@
+[
+  {
+    "text": "the quarterly review meeting covered three open action items",
+    "mock_token_len_proxy": 60,
+    "mock_vector_sha256": "fc29f4d2e918062f3a27a95c27bfe40c069f23b6f93dbde1bee38b49445bcdb6",
+    "real_nomic_tokenizer_ids": [
+      101,
+      1996,
+      12174,
+      3319,
+      3116,
+      3139,
+      2093,
+      2330,
+      2895,
+      5167,
+      102
+    ],
+    "real_nomic_vector_sha256": "d1b7b72d4f0cde4c3157297742ad164139452a53f6cc624996b34e947658c2f9"
+  },
+  {
+    "text": "search_document: a literal prefix word sequence used as ordinary content",
+    "mock_token_len_proxy": 72,
+    "mock_vector_sha256": "d5744fb75ddb2099d558f8535a0d1fc1c55020235f7b56dc2dbc3111d35656ba",
+    "real_nomic_tokenizer_ids": [
+      101,
+      3945,
+      1035,
+      6254,
+      1024,
+      1037,
+      18204,
+      17576,
+      2773,
+      5537,
+      2109,
+      2004,
+      6623,
+      4180,
+      102
+    ],
+    "real_nomic_vector_sha256": "31a9263c2931aceb207ab60fe0329c0a3ecb64769cc513396a1edfa7a112e096"
+  },
+  {
+    "text": "café naïve résumé with combining é and stray 😀 emoji",
+    "mock_token_len_proxy": 61,
+    "mock_vector_sha256": "f2c6bb036f7cf4e8c19c476091fa80549acf43bae41916b6dabea75eb0facf2c",
+    "real_nomic_tokenizer_ids": [
+      101,
+      7668,
+      15743,
+      13746,
+      2007,
+      11566,
+      1041,
+      1998,
+      15926,
+      100,
+      7861,
+      29147,
+      2072,
+      102
+    ],
+    "real_nomic_vector_sha256": "62b24e27bc8d0ebb66c83138fb93d33a3dc72c9bdf40ed1060f1de4603c81b4f"
+  },
+  {
+    "text": "日本語のテキストを含む例文",
+    "mock_token_len_proxy": 39,
+    "mock_vector_sha256": "bf15eadbe378e7b415973e9f4b692506b4d61726e3318aef63927115ee35bc09",
+    "real_nomic_tokenizer_ids": [
+      101,
+      1864,
+      1876,
+      1950,
+      1671,
+      30239,
+      30227,
+      30233,
+      30240,
+      30216,
+      100,
+      1679,
+      100,
+      1861,
+      102
+    ],
+    "real_nomic_vector_sha256": "d46dd828845f154118ad862e8d876e34169e2ac7953406f63a05d6ba9d04f142"
+  },
+  {
+    "text": "",
+    "mock_token_len_proxy": 0,
+    "mock_vector_sha256": "f1d5c2c9bd250a5d4e1be0c63899ddfe22a0c9fc29f0f06d933b1e37a1d51e6f",
+    "real_nomic_tokenizer_ids": [
+      101,
+      102
+    ],
+    "real_nomic_vector_sha256": "3ce46bc8c3aa9b0a105498da84ecfa484d444ee4a36f894fd31504007e221185"
+  }
+]

@@ -1,0 +1,1 @@
+{"type":"user","uuid":"30000000-0000-4000-8000-000000000001","sessionId":"embedded-session","timestamp":"2026-09-02T09:00:00Z","message":{"id":"override-1","role":"user","content":"exact-file override keeps this embedded identity in payload"}}

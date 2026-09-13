@@ -1,0 +1,2 @@
+{"type":"user","uuid":"20000000-0000-4000-8000-000000000001","sessionId":"synthetic-session-malformed","timestamp":"2026-09-02T09:00:00Z","message":{"id":"valid-before-malformed","role":"user","content":"This record is committable before the malformed line."}}
+{"type":"assistant","uuid":"20000000-0000-4000-8000-000000000002","sessionId":"synthetic-session-malformed","message":{"id":"broken","content":"newline terminated malformed"

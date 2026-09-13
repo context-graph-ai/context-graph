@@ -1,0 +1,41 @@
+{
+  "event": {
+    "id": {"raw": "018f1e20-62f3-7c5e-8d1a-000000000001", "valid": true},
+    "context_id": {"raw": "018f1e20-62f3-7c5e-8d1a-000000000002", "valid": true},
+    "connector_id": "fixture-connector",
+    "adapter_version": "capture-v1",
+    "anchor_declaration_version": "anchors-v1",
+    "source_instance_ref": "fixture-source-instance",
+    "session_ref": "fixture-session",
+    "source_event_key": "fixture-event-1",
+    "source_position": {"line": 7},
+    "seq": 7,
+    "content_hash": "captured-content-sha256",
+    "anchor_count": 1,
+    "anchor_set_hash": "captured-anchor-set-sha256",
+    "occurred_at": "2024-01-02T03:04:05.678Z",
+    "author": "captured-author",
+    "kind": "captured-kind",
+    "render_role": "human_message",
+    "interaction_ref": "interaction-7",
+    "text": "captured text",
+    "payload": {"captured": true},
+    "anchors": [{"key": "file", "value": "src/lib.rs"}],
+    "source_remainder": {"unsupported_shape": {"private": "never-project"}},
+    "coverage": "opaque"
+  },
+  "anchors": [{
+    "context_id": {"raw": "018f1e20-62f3-7c5e-8d1a-000000000002", "valid": true},
+    "event_id": {"raw": "018f1e20-62f3-7c5e-8d1a-000000000001", "valid": true},
+    "declaration_version": "anchors-v1",
+    "connector_id": "fixture-connector",
+    "source_instance_ref": "fixture-source-instance",
+    "session_ref": "fixture-session",
+    "render_role": "human_message",
+    "interaction_ref": "interaction-7",
+    "key": "file",
+    "canonical_value": "src/lib.rs",
+    "identity_value": "\"src/lib.rs\"",
+    "original_value": "src/lib.rs"
+  }]
+}

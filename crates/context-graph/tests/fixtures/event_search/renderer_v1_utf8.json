@@ -1,0 +1,21 @@
+{
+  "events": [
+    {
+      "source_event_key": "human-1",
+      "author": "Renée",
+      "role": "human_message",
+      "text": "Keep café ☕ open."
+    },
+    {
+      "source_event_key": "tool-1",
+      "author": "agent:main",
+      "role": "tool_request",
+      "payload": { "z": 1, "a": "β" }
+    }
+  ],
+  "expected_passage": "User [author=\"Renée\"]: Keep café ☕ open.\nTool call [author=\"agent:main\"]: {\"a\":\"β\",\"z\":1}",
+  "expected_source_spans": [
+    { "event": "human-1", "event_start": 0, "event_end": 20, "passage_start": 24, "passage_end": 44 },
+    { "event": "tool-1", "event_start": 0, "event_end": 16, "passage_start": 78, "passage_end": 94 }
+  ]
+}

@@ -71,16 +71,23 @@ const OPAQUE_INTERPRETER_COMMANDS: &[&str] = &[
 const SAFE_GITHUB_HOSTED_RUNNERS: &[&str] = &["ubuntu-latest", "macos-latest", "windows-latest"];
 const CONTEXT_GRAPH_WORKING_DIRECTORY: &str = "workspace/context-graph";
 const CONTEXT_GRAPH_CHECKOUT_PATH: &str = "workspace/context-graph";
-const CONTEXTDB_CHECKOUT_PATH: &str = "workspace/contextdb";
-const CONTEXTDB_REPOSITORY: &str = "context-graph-ai/contextdb";
-const CONTEXTDB_REF_EXPRESSION: &str =
-    "${{ github.event_name == 'workflow_dispatch' && inputs.contextdb_sha || 'dev' }}";
-const AUDIT_TOOL_INSTALL_SPECS: &[&str] = &["cargo-deny@0.20.2", "cargo-expand@1.0.124"];
+const AUDIT_TOOL_INSTALL_SPECS: &[&str] = &[
+    "cargo-deny@0.20.2",
+    "cargo-expand@1.0.124",
+    "cargo-nextest@0.9.140",
+];
+const EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES: &[&str] = &[
+    "if [[ ! \"$CONTEXTDB_SHA\" =~ ^[0-9a-f]{40}$ ]]; then",
+    "echo \"contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA\" >&2",
+    "exit 1",
+    "fi",
+];
 const EXACT_REVISION_VERIFIER_LINES: &[&str] = &[
     "context_graph_sha=\"$(git rev-parse HEAD)\"",
-    "contextdb_sha=\"$(git -C ../contextdb rev-parse HEAD)\"",
+    "contextdb_sha=\"$(grep -o -m 1 -E 'contextdb[?]rev=[0-9a-f]{40}' Cargo.lock)\"",
+    "contextdb_sha=\"${contextdb_sha##*=}\"",
     "if [[ ! \"$context_graph_sha\" =~ ^[0-9a-f]{40}$ ]] || [[ ! \"$contextdb_sha\" =~ ^[0-9a-f]{40}$ ]]; then",
-    "echo \"checkouts must resolve to immutable 40-character commit SHAs\" >&2",
+    "echo \"Context Graph checkout and locked ContextDB revision must be immutable 40-character commit SHAs\" >&2",
     "exit 1",
     "fi",
     "if [[ \"$context_graph_sha\" != \"$GITHUB_SHA\" ]]; then",
@@ -88,7 +95,7 @@ const EXACT_REVISION_VERIFIER_LINES: &[&str] = &[
     "exit 1",
     "fi",
     "if [[ \"${{ github.event_name }}\" == \"workflow_dispatch\" ]] && [[ \"$contextdb_sha\" != \"$REQUESTED_CONTEXTDB_SHA\" ]]; then",
-    "echo \"checked-out ContextDB SHA does not match contextdb_sha\" >&2",
+    "echo \"locked ContextDB SHA does not match contextdb_sha\" >&2",
     "exit 1",
     "fi",
     "printf 'Context Graph SHA: %s\\n' \"$context_graph_sha\"",
@@ -119,6 +126,35 @@ const VETTED_AUDIT_RUN_LINES: &[&str] = &[
     "cargo tree -p context-graph -e normal,build | tee \"$RUNNER_TEMP/context-graph-tree.txt\"",
     "test -s \"$RUNNER_TEMP/context-graph-tree.txt\"",
     "require_file_without_match '(^|[[:space:]])candle-embeddinggemma([[:space:]]|$)' \"$RUNNER_TEMP/context-graph-tree.txt\"",
+];
+const VETTED_COLD_MISS_MODEL_SEED_LINES: &[&str] = &[
+    "rustup run stable cargo run -p context-graph-cli --bin cg -- model fetch --defaults",
+    "rustup run stable cargo test -p context-graph --test nomic_document_preparer_adds_exactly_one_system_task_prefix",
+];
+const VETTED_OFFLINE_REAL_MODEL_PROOF_LINES: &[&str] = &[
+    "rustup run stable cargo test -p context-graph \\",
+    "--test nomic_document_preparer_adds_exactly_one_system_task_prefix \\",
+    "--test nomic_query_preparer_adds_exactly_one_system_task_prefix \\",
+    "--test event_search_uses_role_preparation_while_digest_record_and_evidence_paths_remain_byte_for_byte_unchanged",
+];
+const VETTED_DOCUMENTATION_CLAIM_VALIDATION_LINES: &[&str] = &[
+    "base=\"${DOCUMENTATION_BASE_SHA:-HEAD^}\"",
+    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
+    "base=\"HEAD^\"",
+    "fi",
+    "git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null",
+    "printf 'comparing the touched doc files against %s\\n' \"$base\"",
+    "python3 scripts/validate-doc-coverage.py --base \"$base\"",
+    "bash scripts/check-doc-validator-negative-control.sh",
+];
+const VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES: &[&str] = &[
+    "base=\"${DOCUMENTATION_BASE_SHA:-HEAD^}\"",
+    "if [[ -z \"$base\" ]] || [[ \"$base\" =~ ^0+$ ]] || ! git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null; then",
+    "base=\"HEAD^\"",
+    "fi",
+    "git rev-parse --verify --quiet \"${base}^{commit}\" > /dev/null",
+    "printf 'comparing the gate wall-clock baseline against %s\\n' \"$base\"",
+    "python3 scripts/check-gate-wall-clock.py --base \"$base\"",
 ];
 
 fn crate_root() -> PathBuf {
@@ -185,6 +221,98 @@ pub(crate) fn default_build_tree(package: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("cargo tree output utf8")
+}
+
+/// Every optional dependency the bundled local text embedder pulls in. With the default features
+/// off, none of these may appear in the core library's build tree — `ureq` is the one that can
+/// open a socket, and the rest are the model runtime that only exists to serve it.
+const BUNDLED_EMBEDDER_DEPENDENCIES: &[&str] = &[
+    "candle-core",
+    "candle-nn",
+    "candle-transformers",
+    "safetensors",
+    "tokenizers",
+    "ureq",
+];
+
+/// The build tree of `package` with its default features turned off.
+fn build_tree_without_default_features(package: &str) -> String {
+    let output = Command::new("cargo")
+        .args([
+            "tree",
+            "-p",
+            package,
+            "--no-default-features",
+            "--edges",
+            "normal,build",
+        ])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run cargo tree for the default-features-off dependency audit");
+    assert!(
+        output.status.success(),
+        "cargo tree for {package} with default features off failed: status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("cargo tree output utf8")
+}
+
+/// A build directory of its own for the nested default-features-off compile, so it neither waits
+/// on nor invalidates the artifacts the surrounding test run is using. It sits under whatever
+/// build directory is already in effect, so it is disposable with the rest of them and stays warm
+/// between runs.
+fn nested_check_target_dir() -> PathBuf {
+    let ambient = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"));
+    ambient.join("no-default-features-check")
+}
+
+/// The published promise is that a consumer who turns the default features off gets a core that
+/// fetches nothing. Two things have to be true for that sentence to mean anything, and neither was
+/// checked anywhere: the crate has to actually BUILD in that shape, and the shape has to really
+/// drop the dependency that can open a socket. So this compiles it and reads its dependency tree,
+/// with the default tree as a positive control so a tree reader that silently found nothing cannot
+/// pass.
+#[test]
+fn the_core_library_builds_with_default_features_off_and_drops_every_bundled_embedder_dependency() {
+    let default_tree = default_build_tree("context-graph");
+    for dependency in BUNDLED_EMBEDDER_DEPENDENCIES {
+        assert!(
+            default_tree.contains(&format!("{dependency} v")),
+            "positive control: the DEFAULT build tree must contain {dependency}, otherwise the \
+             default-features-off assertions below prove nothing about what turning the features \
+             off removed"
+        );
+    }
+
+    let bare_tree = build_tree_without_default_features("context-graph");
+    for dependency in BUNDLED_EMBEDDER_DEPENDENCIES {
+        assert!(
+            !bare_tree.contains(&format!("{dependency} v")),
+            "with default features off the core library must pull in no {dependency}: a core that \
+             fetches nothing cannot carry the dependency that fetches, nor the model runtime that \
+             exists only to be fed by it\n{bare_tree}"
+        );
+    }
+
+    let target_dir = nested_check_target_dir();
+    let output = Command::new("cargo")
+        .args(["check", "-p", "context-graph", "--no-default-features"])
+        .current_dir(workspace_root())
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .output()
+        .expect("run cargo check with default features off");
+    assert!(
+        output.status.success(),
+        "the core library must compile with its default features off — a consumer told to turn \
+         them off for a core that fetches nothing must get a core that builds: status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_no_cargo_audit_aliases() {
@@ -481,7 +609,7 @@ fn step_uses_can_mask_command_lookup(step: &Mapping) -> bool {
         None => false,
         Some("actions/checkout@v4") => checkout_inputs_can_shadow_workspace(step),
         Some("taiki-e/install-action@v2") => {
-            !step_tool_set_equals(step, &["cargo-deny", "cargo-expand"])
+            !step_tool_set_equals(step, &["cargo-deny", "cargo-expand", "cargo-nextest"])
         }
         Some("actions/cache@v4") => cache_inputs_can_shadow_workspace_or_command_lookup(step),
         Some("Swatinem/rust-cache@v2") => rust_cache_inputs_can_shadow_command_lookup(step),
@@ -491,30 +619,16 @@ fn step_uses_can_mask_command_lookup(step: &Mapping) -> bool {
 
 fn checkout_inputs_can_shadow_workspace(step: &Mapping) -> bool {
     !step_is_credential_free_context_graph_checkout(step)
-        && !step_is_credential_free_contextdb_checkout(step)
 }
 
 fn step_is_credential_free_context_graph_checkout(step: &Mapping) -> bool {
     step_uses(step) == Some("actions/checkout@v4")
         && step_with_fields(step).is_some_and(|with| {
-            with.len() == 2
+            with.len() == 3
                 && mapping_get(with, "path").and_then(YamlValue::as_str)
                     == Some(CONTEXT_GRAPH_CHECKOUT_PATH)
                 && mapping_get(with, "persist-credentials").is_some_and(yaml_explicit_false)
-        })
-}
-
-fn step_is_credential_free_contextdb_checkout(step: &Mapping) -> bool {
-    step_uses(step) == Some("actions/checkout@v4")
-        && step_with_fields(step).is_some_and(|with| {
-            with.len() == 4
-                && mapping_get(with, "repository").and_then(YamlValue::as_str)
-                    == Some(CONTEXTDB_REPOSITORY)
-                && mapping_get(with, "ref").and_then(YamlValue::as_str)
-                    == Some(CONTEXTDB_REF_EXPRESSION)
-                && mapping_get(with, "path").and_then(YamlValue::as_str)
-                    == Some(CONTEXTDB_CHECKOUT_PATH)
-                && mapping_get(with, "persist-credentials").is_some_and(yaml_explicit_false)
+                && mapping_get(with, "fetch-depth").is_some_and(yaml_explicit_zero)
         })
 }
 
@@ -556,6 +670,7 @@ fn cache_path_is_model_cache_only(value: &YamlValue) -> bool {
 
 fn allowed_model_cache_path(path: &str) -> bool {
     [
+        "${{ env.CG_MODEL_CACHE_ROOT }}",
         "~/.cache/cg/embedders",
         "~/AppData/Local/cg/embedders",
         "~/Library/Caches/cg/embedders",
@@ -600,6 +715,14 @@ fn yaml_explicit_false(value: &YamlValue) -> bool {
     match value {
         YamlValue::Bool(value) => !value,
         YamlValue::String(value) => value.trim().eq_ignore_ascii_case("false"),
+        _ => false,
+    }
+}
+
+fn yaml_explicit_zero(value: &YamlValue) -> bool {
+    match value {
+        YamlValue::Number(value) => value.as_i64() == Some(0),
+        YamlValue::String(value) => value.trim() == "0",
         _ => false,
     }
 }
@@ -691,17 +814,18 @@ fn workflow_command_lookup_can_mask_failures(workflow: &YamlValue) -> bool {
         return true;
     }
 
-    workflow_step_contexts(workflow).iter().any(|(job, step)| {
+    workflow_job_steps(workflow).iter().any(|(job, steps)| {
         job_runtime_can_mask_command_lookup(job)
             || mapping_get(job, "env").is_some_and(env_overrides_command_lookup)
-            || mapping_get(step, "env").is_some_and(env_overrides_command_lookup)
-            || step_uses_can_mask_command_lookup(step)
-            || step_run(step).is_some_and(|run| {
-                !run_is_vetted_audit_run(run)
-                    && !run_is_exact_revision_verifier(run)
-                    && all_run_shell_lines(run)
-                        .into_iter()
-                        .any(shell_line_mutates_command_lookup)
+            || steps.iter().any(|step| {
+                mapping_get(step, "env").is_some_and(env_overrides_command_lookup)
+                    || step_uses_can_mask_command_lookup(step)
+                    || step_run(step).is_some_and(|run| {
+                        !run_is_vetted_command_lookup_run(run)
+                            && all_run_shell_lines(run)
+                                .into_iter()
+                                .any(shell_line_mutates_command_lookup)
+                    })
             })
     })
 }
@@ -827,17 +951,8 @@ fn step_is_exact_contextdb_sha_input_validation(step: &Mapping) -> bool {
             .and_then(|env| mapping_get(env, "CONTEXTDB_SHA"))
             .and_then(YamlValue::as_str)
             == Some("${{ inputs.contextdb_sha }}")
-        && step_run(step).is_some_and(|run| {
-            run_contains_consecutive_lines(
-                run,
-                &[
-                    "if [[ ! \"$CONTEXTDB_SHA\" =~ ^[0-9a-f]{40}$ ]]; then",
-                    "echo \"contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA\" >&2",
-                    "exit 1",
-                    "fi",
-                ],
-            )
-        })
+        && step_run(step)
+            .is_some_and(|run| active_run_lines(run) == EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES)
 }
 
 fn step_is_exact_revision_verification(step: &Mapping) -> bool {
@@ -853,11 +968,6 @@ fn step_is_exact_revision_verification(step: &Mapping) -> bool {
 
 fn step_is_context_graph_checkout(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
     step_is_credential_free_context_graph_checkout(step)
-        && action_step_can_enforce_failure(workflow, job, step)
-}
-
-fn step_is_contextdb_checkout(workflow: &YamlValue, job: &Mapping, step: &Mapping) -> bool {
-    step_is_credential_free_contextdb_checkout(step)
         && action_step_can_enforce_failure(workflow, job, step)
 }
 
@@ -892,9 +1002,14 @@ fn prior_steps_prepare_audit_tools(
         && prior_steps
             .iter()
             .any(|step| step_uses_safe_rust_cache(workflow, job, step))
-        && prior_steps
-            .iter()
-            .any(|step| step_installs_tools(workflow, job, step, &["cargo-deny", "cargo-expand"]))
+        && prior_steps.iter().any(|step| {
+            step_installs_tools(
+                workflow,
+                job,
+                step,
+                &["cargo-deny", "cargo-expand", "cargo-nextest"],
+            )
+        })
         && prior_steps
             .iter()
             .all(|step| prior_step_can_precede_audit(workflow, job, step))
@@ -904,11 +1019,15 @@ fn prior_step_can_precede_audit(workflow: &YamlValue, job: &Mapping, step: &Mapp
     step_is_exact_contextdb_sha_input_validation(step)
         || step_is_exact_revision_verification(step)
         || step_is_context_graph_checkout(workflow, job, step)
-        || step_is_contextdb_checkout(workflow, job, step)
         || step_pins_stable_rust_toolchain(workflow, job, step)
         || step_uses_safe_rust_cache(workflow, job, step)
         || step_uses_safe_model_cache(workflow, job, step)
-        || step_installs_tools(workflow, job, step, &["cargo-deny", "cargo-expand"])
+        || step_installs_tools(
+            workflow,
+            job,
+            step,
+            &["cargo-deny", "cargo-expand", "cargo-nextest"],
+        )
 }
 
 fn workflow_has_enforcing_audit_run_with_setup(
@@ -1567,6 +1686,21 @@ fn run_is_exact_revision_verifier(run: &str) -> bool {
     active_run_lines(run) == EXACT_REVISION_VERIFIER_LINES
 }
 
+fn run_is_vetted_command_lookup_run(run: &str) -> bool {
+    let lines = active_run_lines(run);
+    lines == EXACT_CONTEXTDB_SHA_INPUT_VALIDATION_LINES
+        || lines == EXACT_REVISION_VERIFIER_LINES
+        || lines == VETTED_AUDIT_RUN_LINES
+        || lines == VETTED_COLD_MISS_MODEL_SEED_LINES
+        || lines == VETTED_OFFLINE_REAL_MODEL_PROOF_LINES
+        || lines == VETTED_DOCUMENTATION_CLAIM_VALIDATION_LINES
+        || lines == VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES
+}
+
+fn run_is_vetted_gate_wall_clock_baseline_direction_run(run: &str) -> bool {
+    active_run_lines(run) == VETTED_GATE_WALL_CLOCK_BASELINE_DIRECTION_LINES
+}
+
 fn run_invokes_deny_against_workspace_config(run: &str) -> bool {
     if run_is_vetted_audit_run(run) {
         return true;
@@ -1684,6 +1818,94 @@ fn ci_runs_cargo_deny_and_cargo_expand_symbol_check() {
     for step in &steps {
         let _ = step_with_fields(step);
     }
+}
+
+#[test]
+fn ci_command_lookup_audit_covers_mutations_after_dependency_audit_and_before_workspace_tests() {
+    let mut yaml = read_workflow_yaml();
+    assert!(
+        !workflow_command_lookup_can_mask_failures(&yaml),
+        "the checked-in workflow must start without a command-lookup mutation"
+    );
+
+    let mutation_run = "printf '%s\\n' \"$RUNNER_TEMP/shadow-bin\" >> \"$GITHUB_PATH\"";
+    assert!(
+        shell_line_mutates_command_lookup(mutation_run),
+        "the audit's line classifier must recognize the injected GITHUB_PATH mutation"
+    );
+
+    let jobs = yaml
+        .as_mapping_mut()
+        .and_then(|workflow| workflow.get_mut(YamlValue::String("jobs".to_string())))
+        .and_then(YamlValue::as_mapping_mut)
+        .expect("workflow jobs map");
+    let mut injected = false;
+    for job_value in jobs.values_mut() {
+        let Some(steps) = job_value
+            .as_mapping_mut()
+            .and_then(|job| job.get_mut(YamlValue::String("steps".to_string())))
+            .and_then(YamlValue::as_sequence_mut)
+        else {
+            continue;
+        };
+        let audit_index = steps.iter().position(|step| {
+            step.as_mapping()
+                .and_then(step_run)
+                .is_some_and(run_is_vetted_audit_run)
+        });
+        let lint_index = steps.iter().position(|step| {
+            step.as_mapping().and_then(step_run).is_some_and(|run| {
+                run.trim()
+                    == "rustup run stable cargo clippy --workspace --all-targets -- -D warnings"
+            })
+        });
+        let workspace_test_index = steps.iter().position(|step| {
+            step.as_mapping()
+                .and_then(step_run)
+                .is_some_and(|run| run.trim() == "rustup run stable cargo test --workspace")
+        });
+        let (Some(audit_index), Some(lint_index), Some(workspace_test_index)) =
+            (audit_index, lint_index, workspace_test_index)
+        else {
+            continue;
+        };
+        assert!(
+            audit_index < lint_index && lint_index < workspace_test_index,
+            "the real workflow fixture must place dependency audit before lint and workspace tests"
+        );
+        let baseline_direction_index = steps.iter().position(|step| {
+            step.as_mapping()
+                .and_then(step_run)
+                .is_some_and(run_is_vetted_gate_wall_clock_baseline_direction_run)
+        });
+        assert!(
+            baseline_direction_index.is_some_and(|index| index > workspace_test_index),
+            "the real workflow fixture must run the gate wall-clock baseline-direction check \
+             (python3 scripts/check-gate-wall-clock.py --base) after cargo test --workspace"
+        );
+
+        let mut mutation_step = Mapping::new();
+        mutation_step.insert(
+            YamlValue::String("run".to_string()),
+            YamlValue::String(mutation_run.to_string()),
+        );
+        steps.insert(workspace_test_index, YamlValue::Mapping(mutation_step));
+        assert_eq!(
+            steps[workspace_test_index].as_mapping().and_then(step_run),
+            Some(mutation_run),
+            "the mutation must sit immediately before cargo test --workspace"
+        );
+        injected = true;
+        break;
+    }
+    assert!(
+        injected,
+        "the real workflow must expose one job containing dependency audit, lint, and workspace tests"
+    );
+    assert!(
+        workflow_command_lookup_can_mask_failures(&yaml),
+        "the command-lookup audit must inspect the whole job and reject a GITHUB_PATH mutation inserted after dependency audit and between lint and cargo test --workspace"
+    );
 }
 
 #[test]

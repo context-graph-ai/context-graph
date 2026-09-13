@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
@@ -248,6 +248,12 @@ impl Embedder for RecordingVisionConcurrencyEmbedder {
                 producer: producer_for_space(IMAGE_SPACE, "new"),
                 vector: expected_reindexed_image_vector(&uri),
             }),
+            EmbeddingInput::ImageBytes(bytes) => Ok(EmbeddingOutput {
+                embedding_space_id: IMAGE_SPACE.to_string(),
+                dimension: 512,
+                producer: producer_for_space(IMAGE_SPACE, "new"),
+                vector: expected_reindexed_image_bytes_vector(&bytes),
+            }),
             EmbeddingInput::Text(_) => Err(CgError::UnsupportedEvidenceKind {
                 kind: EvidenceKind::Text,
             }),
@@ -408,7 +414,7 @@ fn reindex_cursor_extra_history_idx() -> usize {
     3
 }
 
-fn reindex_cursor_seeded_from_env(db_path: &PathBuf) -> Vec<(EvidenceId, String)> {
+fn reindex_cursor_seeded_from_env(db_path: &Path) -> Vec<(EvidenceId, String)> {
     std::env::var("CG_REINDEX_CURSOR_EVIDENCE_IDS")
         .expect("evidence ids env")
         .split(',')
@@ -480,6 +486,20 @@ fn expected_reindexed_vector(source_text: &str) -> Vec<f32> {
 fn expected_reindexed_image_vector(source_ref: &str) -> Vec<f32> {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in source_ref.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let primary = 50 + (hash as usize % 350);
+    let secondary = 430 + ((hash >> 16) as usize % 70);
+    let mut vector = vec![0.0; 512];
+    vector[primary] = 0.7;
+    vector[secondary] = 0.7;
+    vector
+}
+
+fn expected_reindexed_image_bytes_vector(image_bytes: &[u8]) -> Vec<f32> {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in image_bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -603,6 +623,7 @@ fn seed_active_basis_decisions(store: &Store, rows: usize) -> Vec<ActiveBasisDec
                 context_id: context.id,
                 properties: Default::default(),
                 tags: Vec::new(),
+                blueprint_catalog_id: None,
             })
             .expect("fleet intention");
         let entity = store
@@ -642,7 +663,7 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
-fn open_raw_database(db_path: &PathBuf) -> Database {
+fn open_raw_database(db_path: &Path) -> Database {
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
         match Database::open(db_path) {
@@ -659,15 +680,15 @@ fn open_raw_database(db_path: &PathBuf) -> Database {
 }
 
 fn execute_query(
-    db_path: &PathBuf,
+    db_path: &Path,
     sql: &str,
     params: &HashMap<String, Value>,
 ) -> contextdb_engine::QueryResult {
-    let store = open_reindex_store(db_path.clone()).expect("query store opens");
+    let store = open_reindex_store(db_path.to_path_buf()).expect("query store opens");
     store.execute_sql_for_test(sql, params).expect("query")
 }
 
-fn count(db_path: &PathBuf, sql: &str, params: &HashMap<String, Value>) -> i64 {
+fn count(db_path: &Path, sql: &str, params: &HashMap<String, Value>) -> i64 {
     let result = execute_query(db_path, sql, params);
     assert_eq!(result.rows.len(), 1);
     assert!(
@@ -681,7 +702,7 @@ fn count(db_path: &PathBuf, sql: &str, params: &HashMap<String, Value>) -> i64 {
     }
 }
 
-fn cursor_count(db_path: &PathBuf, space: &str) -> i64 {
+fn cursor_count(db_path: &Path, space: &str) -> i64 {
     count(
         db_path,
         "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space",
@@ -689,7 +710,7 @@ fn cursor_count(db_path: &PathBuf, space: &str) -> i64 {
     )
 }
 
-fn cursor_at(db_path: &PathBuf, space: &str, expected_cursor: i64) -> i64 {
+fn cursor_at(db_path: &Path, space: &str, expected_cursor: i64) -> i64 {
     count(
         db_path,
         "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space AND last_committed_cursor = $cursor",
@@ -729,7 +750,7 @@ fn store_cursor_at(store: &Store, space: &str, expected_cursor: i64) -> i64 {
     )
 }
 
-fn lease_owner_run_id(db_path: &PathBuf, space: &str) -> Option<String> {
+fn lease_owner_run_id(db_path: &Path, space: &str) -> Option<String> {
     let result = execute_query(
         db_path,
         "SELECT owner_run_id FROM reindex_cursors WHERE embedding_space_id = $space",
@@ -741,7 +762,7 @@ fn lease_owner_run_id(db_path: &PathBuf, space: &str) -> Option<String> {
     })
 }
 
-fn durable_in_progress_lease_at(db_path: &PathBuf, space: &str, expected_cursor: i64) -> i64 {
+fn durable_in_progress_lease_at(db_path: &Path, space: &str, expected_cursor: i64) -> i64 {
     let Some(owner_run_id) = lease_owner_run_id(db_path, space) else {
         return 0;
     };
@@ -762,7 +783,7 @@ fn durable_in_progress_lease_at(db_path: &PathBuf, space: &str, expected_cursor:
     )
 }
 
-fn raw_conditional_lease_takeover_rejected(db_path: &PathBuf, space: &str) -> bool {
+fn raw_conditional_lease_takeover_rejected(db_path: &Path, space: &str) -> bool {
     let Some(owner_run_id) = lease_owner_run_id(db_path, space) else {
         return false;
     };
@@ -773,7 +794,7 @@ fn raw_conditional_lease_takeover_rejected(db_path: &PathBuf, space: &str) -> bo
         return false;
     }
     let available_status_result = {
-        let store = open_reindex_store(db_path.clone()).expect("lease contender store opens");
+        let store = open_reindex_store(db_path.to_path_buf()).expect("lease contender store opens");
         store.execute_sql_for_test(
         "UPDATE reindex_cursors SET owner_run_id = $owner, lease_epoch = $next_epoch WHERE embedding_space_id = $space AND status = $available",
         &params(vec![
@@ -785,7 +806,7 @@ fn raw_conditional_lease_takeover_rejected(db_path: &PathBuf, space: &str) -> bo
         )
     };
     let stale_owner_result = {
-        let store = open_reindex_store(db_path.clone()).expect("lease contender store opens");
+        let store = open_reindex_store(db_path.to_path_buf()).expect("lease contender store opens");
         store.execute_sql_for_test(
         "UPDATE reindex_cursors SET owner_run_id = $owner, lease_epoch = $next_epoch WHERE embedding_space_id = $space AND status = $status AND owner_run_id = $stale_owner AND lease_epoch = $epoch",
         &params(vec![
@@ -805,7 +826,7 @@ fn raw_conditional_lease_takeover_rejected(db_path: &PathBuf, space: &str) -> bo
 }
 
 fn vector_score_for(
-    db_path: &PathBuf,
+    db_path: &Path,
     evidence_id: EvidenceId,
     column: &str,
     query: Vec<f32>,
@@ -834,7 +855,7 @@ fn vector_score_for(
     })
 }
 
-fn stored_text_vector(db_path: &PathBuf, evidence_id: EvidenceId) -> Option<Vec<f32>> {
+fn stored_text_vector(db_path: &Path, evidence_id: EvidenceId) -> Option<Vec<f32>> {
     let db = open_raw_database(db_path);
     let snapshot = db.snapshot();
     let row_id = db
@@ -850,7 +871,7 @@ fn stored_text_vector(db_path: &PathBuf, evidence_id: EvidenceId) -> Option<Vec<
         .map(|entry| entry.vector)
 }
 
-fn evidence_text_projection(db_path: &PathBuf, evidence_id: EvidenceId) -> Option<String> {
+fn evidence_text_projection(db_path: &Path, evidence_id: EvidenceId) -> Option<String> {
     let db = open_raw_database(db_path);
     let result = db
         .execute(
@@ -906,15 +927,11 @@ fn insert_extra_historical_handle(store: &Store, evidence_id: EvidenceId) -> boo
     matches!(result, Ok(query) if query.rows_affected == 1)
 }
 
-fn text_vector_matches_exactly(
-    db_path: &PathBuf,
-    evidence_id: EvidenceId,
-    expected: &[f32],
-) -> bool {
+fn text_vector_matches_exactly(db_path: &Path, evidence_id: EvidenceId, expected: &[f32]) -> bool {
     stored_text_vector(db_path, evidence_id).is_some_and(|stored| stored == expected)
 }
 
-fn producer_rows(db_path: &PathBuf, producer: EvidenceProducer) -> i64 {
+fn producer_rows(db_path: &Path, producer: EvidenceProducer) -> i64 {
     count(
         db_path,
         "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE produced_by = $producer",
@@ -925,7 +942,7 @@ fn producer_rows(db_path: &PathBuf, producer: EvidenceProducer) -> i64 {
     )
 }
 
-fn producer_rows_for_space(db_path: &PathBuf, space: &str, producer: EvidenceProducer) -> i64 {
+fn producer_rows_for_space(db_path: &Path, space: &str, producer: EvidenceProducer) -> i64 {
     count(
         db_path,
         "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE embedding_space_id = $space AND produced_by = $producer",
@@ -939,7 +956,7 @@ fn producer_rows_for_space(db_path: &PathBuf, space: &str, producer: EvidencePro
     )
 }
 
-fn handle_rows_for_target_space(db_path: &PathBuf, evidence_id: EvidenceId, space: &str) -> i64 {
+fn handle_rows_for_target_space(db_path: &Path, evidence_id: EvidenceId, space: &str) -> i64 {
     count(
         db_path,
         "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id AND embedding_space_id = $space",
@@ -951,7 +968,7 @@ fn handle_rows_for_target_space(db_path: &PathBuf, evidence_id: EvidenceId, spac
 }
 
 fn handle_rows_for_target_producer(
-    db_path: &PathBuf,
+    db_path: &Path,
     evidence_id: EvidenceId,
     space: &str,
     producer: EvidenceProducer,
@@ -971,7 +988,7 @@ fn handle_rows_for_target_producer(
 }
 
 fn target_handle_lineage_matches(
-    db_path: &PathBuf,
+    db_path: &Path,
     seeded: &[(EvidenceId, String)],
     seed_versions: &[&str],
     pause_processed_rows: usize,
@@ -1020,7 +1037,7 @@ fn target_handle_lineage_matches(
     )
 }
 
-fn all_reindexed_vectors_visible(db_path: &PathBuf, seeded: &[(EvidenceId, String)]) -> bool {
+fn all_reindexed_vectors_visible(db_path: &Path, seeded: &[(EvidenceId, String)]) -> bool {
     seeded.iter().all(|(evidence_id, source_text)| {
         vector_score_for(
             db_path,
@@ -1043,7 +1060,7 @@ fn phase_call_vectors_are_not_text_formula(calls: &[PhaseReindexCall]) -> bool {
 }
 
 fn reindex_cursor_pause_vectors_visible(
-    db_path: &PathBuf,
+    db_path: &Path,
     seeded: &[(EvidenceId, String)],
     pause_salt: u64,
 ) -> bool {
@@ -1055,7 +1072,7 @@ fn reindex_cursor_pause_vectors_visible(
 }
 
 fn phase_output_vectors_visible_for_seeded_range(
-    db_path: &PathBuf,
+    db_path: &Path,
     seeded: &[(EvidenceId, String)],
     start_idx: usize,
     calls: &[PhaseReindexCall],
@@ -1071,7 +1088,7 @@ fn phase_output_vectors_visible_for_seeded_range(
 }
 
 fn phase_output_vectors_indexed_for_seeded_range(
-    db_path: &PathBuf,
+    db_path: &Path,
     seeded: &[(EvidenceId, String)],
     start_idx: usize,
     calls: &[PhaseReindexCall],
@@ -1122,7 +1139,7 @@ fn phase_output_vectors_indexed_for_seeded_range_in_store(
     )
 }
 
-fn all_reindexed_image_vectors_visible(db_path: &PathBuf, seeded: &[(EvidenceId, String)]) -> bool {
+fn all_reindexed_image_vectors_visible(db_path: &Path, seeded: &[(EvidenceId, String)]) -> bool {
     seeded.iter().all(|(evidence_id, source_ref)| {
         vector_score_for(
             db_path,
@@ -1395,6 +1412,7 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
             context_id: context.id,
             properties: Default::default(),
             tags: Vec::new(),
+            blueprint_catalog_id: None,
         })
         .expect("positive control intention");
     let basis_fields = HashMap::from([(entity.id, vec!["state".to_string()])]);

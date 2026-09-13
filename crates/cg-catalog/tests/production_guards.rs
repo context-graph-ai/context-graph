@@ -76,3 +76,58 @@ fn normal_test_binary_rejects_embeddinggemma_fixture_artifacts_as_production_man
         "normal binaries must reject every committed fixture artifact as non-production Gemma bytes: {result:?}"
     );
 }
+
+/// Where an operator's registrations live is decided once, by the command the operator ran, and
+/// handed down. A second rule inside this crate is how `cg model show` comes back empty while the
+/// entries the operator wrote sit in another directory — this crate has shipped that defect once
+/// already for the model-cache root. So the crate's own sources must not resolve the data root at
+/// all: no `CG_DATA_ROOT` read, no `$HOME/.cg` fallback, no `default_data_root`. The root arrives
+/// through `Catalog::open_with_scope_against_root`/`_roots` and is used as given.
+#[test]
+fn the_catalog_never_resolves_the_data_root_for_itself() {
+    let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut files = Vec::new();
+    collect_rust_sources(&sources, &mut files);
+    assert!(
+        !files.is_empty(),
+        "the crate's src/ directory must contain Rust sources to scan"
+    );
+    for file in &files {
+        let content = std::fs::read_to_string(file)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", file.display()));
+        for (index, line) in content.lines().enumerate() {
+            let code = line.split_once("//").map_or(line, |(before, _)| before);
+            for needle in ["CG_DATA_ROOT", "default_data_root", "\".cg\""] {
+                if code.contains(needle) {
+                    offenders.push(format!(
+                        "{}:{}: {} — {}",
+                        file.display(),
+                        index + 1,
+                        needle,
+                        code.trim()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "this crate must take the data root from its caller and resolve none of its own; found:\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}

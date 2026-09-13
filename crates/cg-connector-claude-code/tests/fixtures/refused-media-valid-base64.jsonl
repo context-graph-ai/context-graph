@@ -1,0 +1,1 @@
+{"type":"assistant","uuid":"60000000-0000-4000-8000-000000000001","sessionId":"synthetic-session-valid-media","timestamp":"2026-09-06T09:00:00Z","cwd":"/workspace/media-proof","message":{"id":"valid-media-1","role":"assistant","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"Rk9SQklEREVOX1ZBTElEX01FRElBX0JZVEVTXzdjOTI="}}]}}

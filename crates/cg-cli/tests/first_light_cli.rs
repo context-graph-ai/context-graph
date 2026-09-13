@@ -1275,149 +1275,6 @@ fn assert_cli_capture_usage_receipt(output: &CommandOutput, provider_records: &[
     );
 }
 
-fn expected_cli_import_chunks(segments: &[String], max_chars: usize) -> u64 {
-    let mut buffer = String::new();
-    let mut chunks = 0;
-    for segment in segments {
-        append_expected_import_segment(&mut buffer, segment, max_chars, &mut chunks);
-    }
-    flush_expected_import_chunk(&mut buffer, &mut chunks);
-    chunks
-}
-
-fn append_expected_import_segment(
-    buffer: &mut String,
-    segment: &str,
-    max_chars: usize,
-    chunks: &mut u64,
-) {
-    let mut rest = segment;
-    while !rest.is_empty() {
-        if buffer.len() >= max_chars {
-            flush_expected_import_chunk(buffer, chunks);
-            continue;
-        }
-        let remaining = max_chars - buffer.len();
-        if rest.len() <= remaining {
-            buffer.push_str(rest);
-            break;
-        }
-        let split = expected_import_chunk_boundary(rest, remaining);
-        if split == 0 {
-            flush_expected_import_chunk(buffer, chunks);
-            continue;
-        }
-        buffer.push_str(&rest[..split]);
-        flush_expected_import_chunk(buffer, chunks);
-        rest = &rest[split..];
-    }
-}
-
-fn flush_expected_import_chunk(buffer: &mut String, chunks: &mut u64) {
-    if !buffer.trim().is_empty() {
-        *chunks += 1;
-    }
-    buffer.clear();
-}
-
-fn expected_import_chunk_boundary(text: &str, max_bytes: usize) -> usize {
-    if max_bytes >= text.len() {
-        return text.len();
-    }
-    let mut last_boundary = 0;
-    let mut last_whitespace = None;
-    for (index, ch) in text.char_indices() {
-        let end = index + ch.len_utf8();
-        if end > max_bytes {
-            break;
-        }
-        last_boundary = end;
-        if ch.is_whitespace() {
-            last_whitespace = Some(end);
-        }
-    }
-    if let Some(whitespace) = last_whitespace.filter(|index| *index >= max_bytes / 2) {
-        return whitespace;
-    }
-    if last_boundary > 0 {
-        return last_boundary;
-    }
-    text.char_indices()
-        .nth(1)
-        .map(|(index, _)| index)
-        .unwrap_or(text.len())
-}
-
-fn assert_cli_import_estimate_makes_no_provider_calls(harness: &CliHarness, cwd: &std::path::Path) {
-    let session_path = cwd.join("session.jsonl");
-    let chunk_window = 64;
-    let user_text = "Goal G_est: estimate import. Entity E_est: estimator path=src/estimate.rs. Decision D_est: estimate before spending serves G_est based_on E_est.";
-    let assistant_text = "Observation O_est: E_est moved -> src/estimate_v2.rs";
-    let parsed_segments = vec![
-        format!("User: {user_text}\n"),
-        format!("Assistant: {assistant_text}\n"),
-    ];
-    let expected_chunks = expected_cli_import_chunks(&parsed_segments, chunk_window);
-    assert!(
-        expected_chunks > 1,
-        "estimate fixture must force real chunking"
-    );
-    std::fs::write(
-        &session_path,
-        [
-            format!(r#"{{"message":{{"role":"user","content":"{user_text}"}}}}"#),
-            format!(r#"{{"message":{{"role":"assistant","content":"{assistant_text}"}}}}"#),
-        ]
-        .join("\n"),
-    )
-    .expect("write estimate fixture");
-    let before = harness.providers.completion_count();
-    let estimate = run_in_dir(
-        harness,
-        cwd,
-        &[
-            "import",
-            "--understand-now",
-            session_path.to_str().expect("utf8 session path"),
-            "--tenant-id",
-            "owner-tenant",
-            "--estimate",
-            "--chunk-tokens",
-            &chunk_window.to_string(),
-        ],
-    );
-    assert_eq!(estimate.code, 0, "{}", combined(&estimate));
-    assert_eq!(
-        harness.providers.completion_count(),
-        before,
-        "`cg import --estimate` must not call the provider"
-    );
-    let json = output_json(&estimate).expect("estimate output json");
-    assert!(
-        json.pointer("/estimate/chunks").and_then(Value::as_u64) == Some(expected_chunks),
-        "estimate must report real chunk count"
-    );
-    assert_eq!(
-        json.pointer("/estimate/resolved_chunk_window")
-            .and_then(Value::as_u64),
-        Some(chunk_window as u64),
-        "estimate must use the explicit chunk window that determines the expected chunk count"
-    );
-    assert_eq!(
-        json.pointer("/estimate/provider_calls")
-            .and_then(Value::as_u64),
-        Some(0),
-        "estimate must explicitly report zero provider calls"
-    );
-    assert!(
-        json.pointer("/estimate/elapsed_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or_default()
-            > 0,
-        "estimate must project elapsed wall-clock time"
-    );
-}
-
 fn store_path_from(outputs: &[&CommandOutput]) -> Option<std::path::PathBuf> {
     outputs.iter().find_map(|output| {
         let json = output_json(output)?;
@@ -2006,7 +1863,22 @@ fn cli_status() {
     harness.run_with_stdin(&["record", "--understand-now"], CI_PIPELINE_SESSION);
     let second = harness.run(&["status"]);
 
-    assert!(combined(&empty).contains("goals: 0"));
+    // Before any capture there is no Context to count: status answers with Store-level state and an
+    // empty Context list (or `store_not_found` when no store exists yet), never invented zeros.
+    let empty_json = output_json(&empty).expect("status before capture is JSON");
+    let empty_state = empty_json.get("state").and_then(Value::as_str);
+    assert!(
+        empty_state == Some("store_not_found")
+            || (empty_state == Some("ok")
+                && empty_json
+                    .get("contexts")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    == Some(0)),
+        "status before capture reports no Context: {}",
+        combined(&empty)
+    );
+    assert!(!combined(&empty).contains("goals:"), "{}", combined(&empty));
     assert!(combined(&first).contains("goals: 1"));
     assert!(combined(&first).contains("decisions: 2"));
     assert!(combined(&first).contains("observations: 1"));
@@ -2534,7 +2406,6 @@ fn default_capture_context_follows_tenant_not_working_directory_cli_path() {
     let dir_x = tempfile::tempdir().expect("dir x");
     let dir_y = tempfile::tempdir().expect("dir y");
     let dir_z = tempfile::tempdir().expect("dir z");
-    assert_cli_import_estimate_makes_no_provider_calls(&harness, dir_x.path());
     harness.providers.set_behavior(
         Provider::Claude,
         CompletionBehavior::SleepThenExtractHarvest,

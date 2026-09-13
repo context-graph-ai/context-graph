@@ -2921,6 +2921,7 @@ fn by_entity_supersedes_chain_does_not_cross_anchor() {
 
 // A reader racing a supersede sees either the old active set or the new active set, never both.
 #[test]
+#[ignore = "contextdb a5f5b3a: four-subquery graph query overflows a 2 MiB thread; upstream gap 10"]
 fn discovery_pull_side_returns_consistent_view_under_concurrent_writer() {
     assert_contextdb_pinned_discovery_graph_composition();
 

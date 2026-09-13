@@ -1,11 +1,11 @@
-//! Fabric first-light — the schema version constant.
+//! Event-backed import — the schema version constant.
 
 use context_graph::types::CG_SCHEMA_VERSION;
 
 #[test]
-fn schema_version_is_eleven() {
+fn schema_version_is_twelve() {
     assert_eq!(
-        CG_SCHEMA_VERSION, 11,
-        "immutable history and context/decision-keyed outcomes require schema 11"
+        CG_SCHEMA_VERSION, 12,
+        "immutable event history, node-local bindings, and placement policy require schema 12"
     );
 }

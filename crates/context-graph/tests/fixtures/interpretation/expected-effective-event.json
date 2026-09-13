@@ -1,0 +1,11 @@
+{
+  "occurred_at": "2024-01-02T03:04:05.678Z",
+  "author": "released-author",
+  "kind": "released-kind",
+  "render_role": "agent_message",
+  "interaction_ref": "released-interaction-7",
+  "text": "released text",
+  "payload": {"released": true, "source": "fixture"},
+  "anchors": [{"key": "file", "canonical_value": "src/lib.rs", "original_value": "src/lib.rs"}],
+  "coverage": "complete"
+}

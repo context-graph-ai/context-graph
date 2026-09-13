@@ -504,6 +504,21 @@ fn text_default_space_id_resolves_to_text_default_nomic_v1_5_768_after_default_s
             .any(|space| space.embedding_space_id == NOMIC_TEXT_DEFAULT_ID),
         "store metadata must expose the same bundled default id"
     );
+
+    // The dedicated event-history space is opt-in, never something a plain store open conjures.
+    // A store that listed it without being asked would advertise a space nothing in that store can
+    // serve, and would make the two 768-dimensional spaces look interchangeable to anyone reading
+    // the store's own metadata.
+    assert!(
+        !spaces.iter().any(|space| space.embedding_space_id
+            == BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID),
+        "a default store open must register no event-history space; the dedicated space is only \
+         ever registered by a caller that asked for it, and the store listed {:?}",
+        spaces
+            .iter()
+            .map(|space| space.embedding_space_id.as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -726,6 +741,47 @@ fn nomic_bert_forward_pass_graph_shape_cache_contract_fixtures_match_main_crate(
     assert!(
         matched == expected_shape_terms.len(),
         "main crate must carry Nomic-specific forward-pass shape fixtures"
+    );
+}
+
+/// Every checked-in golden text in `tests/fixtures/text_default_space_goldens.json` is 11-15
+/// tokens, nowhere near the plain-embedding truncation ceiling, so that fixture alone cannot
+/// catch a change to the ceiling: lowering it would silently move every real Digest/Record/
+/// Evidence vector longer than the new ceiling while the golden suite stayed green. This pins
+/// the private ceiling constant's value and proves the plain-text `forward()` path still spends
+/// it to truncate from the right before the tokens ever reach the model — a rename, a value
+/// change, or a path that stops truncating with this exact constant all fail here.
+#[test]
+fn plain_text_embedding_truncates_at_its_frozen_token_ceiling_and_never_silently_moves() {
+    let nomic_source = read_crate_file("src/embedder/nomic.rs");
+
+    assert!(
+        nomic_source.contains("const NOMIC_PLAIN_EMBED_MAX_SEQUENCE_TOKENS: usize = 8192;"),
+        "the plain-embedding truncation ceiling must stay exactly 8192 tokens; a change here \
+         moves every real Digest/Record/Evidence vector longer than the new ceiling without any \
+         golden fixture noticing, since every golden text is 11-15 tokens"
+    );
+
+    let forward_marker =
+        "fn forward(&self, loaded: &LoadedNomicModel, text: &str) -> Result<Vec<f32>> {";
+    let forward_start = nomic_source
+        .find(forward_marker)
+        .expect("the plain-text forward() method must still exist under its known signature");
+    let after_marker = forward_start + forward_marker.len();
+    let forward_end = nomic_source[after_marker..]
+        .find("\n    fn ")
+        .map(|offset| after_marker + offset)
+        .expect("forward() must still be followed by another impl method");
+    let forward_body = &nomic_source[forward_start..forward_end];
+
+    assert!(
+        forward_body.contains("encoding.truncate(")
+            && forward_body.contains("NOMIC_PLAIN_EMBED_MAX_SEQUENCE_TOKENS")
+            && forward_body.contains("TruncationDirection::Right"),
+        "the plain-text forward() path must truncate its tokenizer encoding with the frozen \
+         NOMIC_PLAIN_EMBED_MAX_SEQUENCE_TOKENS ceiling, from the right, before the model ever \
+         sees the tokens — not a different constant, not a hardcoded literal, and not silently \
+         removed"
     );
 }
 
@@ -1223,40 +1279,49 @@ fn vigil_pattern_extra_embedding_space_declares_face_reid_v1_under_dim_512_entit
 }
 
 #[test]
-fn cg_github_actions_workflow_runs_on_matrix_of_windows_latest_macos_latest_ubuntu_latest_explicitly_declared_in_yaml()
+fn cg_github_actions_workflow_runs_on_matrix_of_macos_latest_ubuntu_latest_and_documents_the_deliberate_windows_exclusion()
  {
     let workflow = read_workspace_file(".github/workflows/ci.yml");
     assert!(
         serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&workflow).is_ok(),
         "CI workflow must be valid YAML"
     );
-    for os in ["windows-latest", "macos-latest", "ubuntu-latest"] {
-        assert!(workflow.contains(os), "CI matrix missing {os}");
-    }
+    assert!(
+        workflow.contains("os: [macos-latest, ubuntu-latest]"),
+        "the CI matrix's os list must declare exactly macos-latest and ubuntu-latest, in that \
+         order, with no windows-latest leg"
+    );
+    assert!(
+        workflow.contains("windows-latest is intentionally excluded"),
+        "the workflow must document why windows-latest is excluded from the matrix"
+    );
     assert!(workflow.contains("cargo test --workspace"));
 }
 
 #[test]
-fn cg_readme_ci_section_documents_three_runner_matrix_and_actions_cache_snippet_keyed_off_cargo_lock_for_embedder_cache_path()
+fn cg_readme_ci_section_documents_two_runner_matrix_and_shared_model_cache_root_keyed_off_embedder_source()
  {
     let readme = read_crate_file("README.md");
     let lower = readme.to_lowercase();
 
     assert!(lower.contains("continuous integration") || lower.contains("## ci"));
-    for os in ["windows-latest", "macos-latest", "ubuntu-latest"] {
-        assert!(readme.contains(os), "README CI section missing {os}");
-    }
+    assert!(readme.contains("on `macos-latest` and `ubuntu-latest`."));
+    assert!(readme.contains("`windows-latest` is excluded deliberately"));
+    assert!(readme.contains("CG_MODEL_CACHE_ROOT` at runner scratch space"));
     assert!(readme.contains("actions/cache"));
-    assert!(readme.contains("Cargo.lock"));
-    assert!(readme.contains("~/.cache/cg/embedders"));
-    assert!(
-        readme.contains("LOCALAPPDATA")
-            || readme.contains("%LOCALAPPDATA%")
-            || readme.contains("cg/embedders")
-    );
+    assert!(readme.contains("falls back to `~/.cache/cg/models`"));
+    assert!(readme.contains("$XDG_CACHE_HOME` replacing `~/.cache` when set"));
+    assert!(readme.contains("Key the cache on the embedder"));
+    assert!(readme.contains("source file rather than on `Cargo.lock`"));
+    assert!(readme.contains(
+        "hashFiles('workspace/context-graph/crates/context-graph/src/embedder/nomic.rs')"
+    ));
 }
 
 const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
+    // Event-history surface (cg-event-backed-import intent §8: event placement, adapter and
+    // import, event read, Context binding; §9 `cg import --dry-run` for the prefix check). The
+    // `_for_test` hooks are internal-support seams like the `admin_raw_*` ones.
     "add_relationship",
     "admin_overwrite_digest",
     "admin_overwrite_observation",
@@ -1271,16 +1336,21 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "admin_raw_scan",
     "admin_raw_scan_intention_rows",
     "admin_raw_update_decision_immutable_fields",
+    "append_event_batch",
     "archive_decision",
     "archive_entity",
     "archive_intention",
     "audit_query",
     "basis_diff",
+    "bind_authenticated_tenant_policy",
+    "bind_context",
     "by_entity_decisions",
     "by_entity_intentions",
     "by_intention",
+    "check_event_source_prefix",
     "count_vectors_in_space",
     "create_context",
+    "create_context_with_binding",
     "create_decision",
     "create_digest",
     "create_entity",
@@ -1301,12 +1371,17 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "entity_history",
     "entity_history_graph",
     "entity_neighborhood",
+    "event_delivery_status",
+    "event_history_status",
+    "event_placement_state",
     "evidence_availability_log",
     "find_via_digests",
+    "forget_event_history",
     "get_context",
     "get_decision",
     "get_digest",
     "get_entity",
+    "get_event",
     "get_evidence",
     "get_intention",
     "get_observation",
@@ -1314,6 +1389,7 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     // retained generic edge, so consumers need one explicit relationship read.
     "has_outcome_relationship",
     "history",
+    "import_event_stream",
     "incoming_supersedes",
     "initialize_fresh",
     "intention_at",
@@ -1326,10 +1402,13 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "list_embedding_spaces",
     "list_entities",
     "list_entity_reference_embeddings_for_entity",
+    "list_events_by_anchor",
     "list_evidence_for_observation",
     "list_intentions_in_context",
     "list_invalidations",
     "list_observations",
+    "list_stream_events",
+    "maintain_event_search_vectors_for_test",
     "match_entity_reference",
     "open",
     "open_existing_for_change",
@@ -1348,6 +1427,9 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "render_decision_producer_audit_paragraph",
     "render_school_gate_message_body",
     "replay",
+    "resolve_context_binding",
+    "retire_event_context_counts_for_test",
+    "retire_event_search_head_for_test",
     // Idempotent additive SERVES routing (reconciliation writer).
     "route_decision_to_intention",
     "snapshot_at",
@@ -1368,6 +1450,72 @@ const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[
     "with_system_principal",
 ];
 
+/// Every public trait `source` declares, in declaration order — the mechanical reading of "how
+/// many embedding abstractions does this file define".
+fn declared_public_trait_names(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .map(str::trim_start)
+        .filter_map(|line| line.strip_prefix("pub trait "))
+        .map(|rest| {
+            rest.split(|character: char| !(character.is_alphanumeric() || character == '_'))
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// How many times `source` implements the sealed extension trait — one blanket impl is the
+/// contract, and any second implementation is a per-type divergence.
+fn blanket_extension_impl_count(source: &str) -> usize {
+    source.matches("EventSearchEmbedder for ").count()
+}
+
+/// The one-embedding-abstraction guard above is only worth its line count if it actually fires, so
+/// this drives both of its detectors over source text that carries the defect. Without this, a
+/// detector that silently reported nothing would leave the guard passing on any tree at all.
+#[test]
+fn the_one_embedding_abstraction_guard_reports_a_second_trait_and_a_second_blanket_impl() {
+    let source_with_a_second_embedding_trait = "\
+pub trait Embedder: Send + Sync + Any {}
+
+pub trait EventSearchEmbedder: Embedder + sealed::Sealed {}
+
+pub trait EventEmbedder {
+    fn embed_event(&self, text: &str) -> Result<EmbeddingOutput>;
+}
+";
+    assert_eq!(
+        declared_public_trait_names(source_with_a_second_embedding_trait),
+        vec![
+            "Embedder".to_string(),
+            "EventSearchEmbedder".to_string(),
+            "EventEmbedder".to_string()
+        ],
+        "a second embedding abstraction added beside `Embedder` must be reported, which is what \
+         makes the exact-set assertion in the public-surface guard fail instead of passing"
+    );
+
+    let source_with_a_second_blanket_impl = "\
+impl<T: Embedder + ?Sized> EventSearchEmbedder for T {}
+
+impl EventSearchEmbedder for MyOwnEmbedder {}
+";
+    assert_eq!(
+        blanket_extension_impl_count(source_with_a_second_blanket_impl),
+        2,
+        "a per-type implementation of the sealed extension trait must be counted, which is what \
+         makes the exactly-one assertion in the public-surface guard fail instead of passing"
+    );
+
+    // And both detectors read the shipped file as clean, so the guard's green is a real reading of
+    // real source, not an empty scan.
+    let embedder_source = read_crate_file("src/embedder.rs");
+    assert_eq!(declared_public_trait_names(&embedder_source).len(), 2);
+    assert_eq!(blanket_extension_impl_count(&embedder_source), 1);
+}
+
 #[test]
 fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures_and_allowed_moves()
 {
@@ -1375,6 +1523,7 @@ fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures
     let embedder_source = read_crate_file("src/embedder.rs");
     let observer_source = read_crate_file("src/embedder/load_observer.rs");
     let nomic_source = read_crate_file("src/embedder/nomic.rs");
+    let error_source = read_crate_file("src/error.rs");
     let types_source = read_crate_file("src/types.rs");
     let store_source = read_store_public_api_sources();
     let public_sources = format!(
@@ -1416,13 +1565,80 @@ fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures
         );
     }
 
-    assert!(embedder_source.contains("pub trait Embedder: Send + Sync"));
+    assert!(embedder_source.contains("pub trait Embedder: Send + Sync + Any"));
     assert!(
         embedder_source
             .contains("fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput>;")
     );
     assert!(embedder_source.contains("fn supported_inputs(&self) -> Vec<EvidenceKind>;"));
     assert!(embedder_source.contains("fn embedding_space(&self) -> EmbeddingSpace;"));
+
+    // The four checked event-search entrypoints must be callable on any embedder handle a caller
+    // happens to be holding — an embedder's own concrete type included, not only through a
+    // `dyn Embedder` handle. So they move off an inherent `impl dyn Embedder` block — which no
+    // `Embedder` implementation could ever reach directly on its own concrete type — into a
+    // sealed extension trait with a single blanket impl. This pins the new shape and the retired
+    // one by exact source string, the same technique this test already uses throughout.
+    assert!(
+        !embedder_source.contains("impl dyn Embedder"),
+        "the four checked event-search entrypoints must no longer live in an inherent `impl dyn \
+         Embedder` block — that shape is reachable only through a `dyn Embedder` handle, never \
+         directly on an embedder's own concrete type"
+    );
+    assert!(
+        embedder_source.contains("pub trait EventSearchEmbedder"),
+        "embedder.rs must declare `pub trait EventSearchEmbedder`, the sealed extension trait \
+         that makes the four checked entrypoints callable on any embedder handle, re-exported \
+         beside `Embedder`"
+    );
+    assert!(
+        embedder_source.contains("trait Sealed") && !embedder_source.contains("pub trait Sealed"),
+        "`EventSearchEmbedder` must be sealed by a private `Sealed` supertrait, never a public \
+         one, so no outside crate can implement it"
+    );
+    assert!(
+        embedder_source.contains("impl<T: Embedder + ?Sized>"),
+        "`EventSearchEmbedder` must be granted through exactly one blanket impl over every \
+         `Embedder`, `impl<T: Embedder + ?Sized> EventSearchEmbedder for T`, never a per-type \
+         impl an implementer could diverge from"
+    );
+
+    // There is exactly ONE embedding abstraction in this crate, and a second one is a defect, not
+    // an extension: two traits mean two ways to produce a vector, two places a caller can be
+    // handed an embedder, and no single point where the event-history identity is vouched for.
+    // The invariant `crates/context-graph/AGENTS.md` publishes is that `Embedder` is the only
+    // embedding trait and `EventSearchEmbedder` its one sealed, library-owned extension — so this
+    // asserts the exact set of `pub trait` declarations in the file, not merely that the two
+    // expected ones are present. Adding a third public trait here fails until either the trait is
+    // removed or the invariant is deliberately renegotiated.
+    let declared_public_traits = declared_public_trait_names(&embedder_source);
+    assert_eq!(
+        declared_public_traits,
+        vec!["Embedder".to_string(), "EventSearchEmbedder".to_string()],
+        "src/embedder.rs must declare exactly two public traits — the one embedding trait \
+         `Embedder` and its one sealed extension `EventSearchEmbedder`. A third embedding \
+         abstraction beside them is the defect this guard exists to catch; found {declared_public_traits:?}"
+    );
+
+    // The public error documentation is the surface a consumer reads at the moment one of these
+    // refusals fires, so it has to name the receiver the caller actually needs. `&dyn Embedder` is
+    // the retired shape: the checked entrypoints moved onto the sealed extension trait, and a
+    // caller who coerces to a trait object without `use context_graph::EventSearchEmbedder;` still
+    // does not have them. Sending them to a coercion they do not need, and never naming the import
+    // they do, is what this pins.
+    assert!(
+        !error_source.contains("&dyn Embedder"),
+        "src/error.rs must not describe the checked event-search entrypoints as living on          `&dyn Embedder`: they are methods of the sealed `EventSearchEmbedder` extension trait,          reachable on any embedder handle once that trait is in scope"
+    );
+
+    let blanket_extension_impls = blanket_extension_impl_count(&embedder_source);
+    assert_eq!(
+        blanket_extension_impls, 1,
+        "src/embedder.rs must grant `EventSearchEmbedder` through exactly one blanket impl; a \
+         second impl of it is a per-type implementation an embedder could diverge from, which is \
+         precisely what sealing the trait is meant to make impossible; found \
+         {blanket_extension_impls}"
+    );
 
     assert_eq!(
         vec![
@@ -1435,14 +1651,17 @@ fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures
         public_struct_fields(&embedder_source, "EmbedderConfig")
     );
     assert_eq!(
-        vec!["default_nomic", "disabled"],
+        vec!["default_nomic", "default_nomic_offline", "disabled"],
         public_inherent_methods(&embedder_source, "EmbedderConfig")
     );
 
+    // `event_placement` is the event-placement surface's frozen `StoreConfig` field
+    // (cg-event-backed-import intent §8, "Event-placement surface").
     assert_eq!(
         vec![
             "db_path",
             "default_text_embedder",
+            "event_placement",
             "expected_schema_version",
             "extra_embedding_spaces",
             "file_uri_allowed",

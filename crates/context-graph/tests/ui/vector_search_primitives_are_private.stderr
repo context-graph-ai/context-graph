@@ -6,3 +6,19 @@ error[E0432]: unresolved imports `context_graph::evidence_search`, `context_grap
   |                     |                |
   |                     |                no `semantic_search` in the root
   |                     no `evidence_search` in the root
+  |
+help: a similar name exists in the module
+  |
+1 - use context_graph::{evidence_search, semantic_search, vector_search};
+1 + use context_graph::{event_search, semantic_search, vector_search};
+  |
+help: a similar name exists in the module
+  |
+1 - use context_graph::{evidence_search, semantic_search, vector_search};
+1 + use context_graph::{evidence_search, event_search, vector_search};
+  |
+help: a similar name exists in the module
+  |
+1 - use context_graph::{evidence_search, semantic_search, vector_search};
+1 + use context_graph::{evidence_search, semantic_search, event_search};
+  |

@@ -1,7 +1,7 @@
 #[cfg(context_graph_internal_test_support)]
 use candle_core::{D, DType, Device, Tensor};
 #[cfg(context_graph_internal_test_support)]
-use candle_embeddinggemma::EmbeddingGemmaTextEmbedder;
+use cg_catalog::embeddinggemma_test_support::EmbeddingGemmaTextEmbedder;
 #[cfg(context_graph_internal_test_support)]
 use chrono::Utc;
 use context_graph::EmbedderConfig;

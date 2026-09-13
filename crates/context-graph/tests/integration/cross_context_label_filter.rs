@@ -344,14 +344,14 @@ fn vector_search_supports_cross_context_label_filter_via_candidate_set_restricti
     let forbidden_direct_vector_query_sources = production_sources
         .iter()
         .filter_map(|(path, source)| {
-            let compact = compact_source(&source);
+            let compact = compact_source(source);
             contains_forbidden_direct_vector_query(&compact).then_some(path.clone())
         })
         .collect::<Vec<_>>();
     let forbidden_planner_explain_sources = production_sources
         .iter()
         .filter_map(|(path, source)| {
-            let compact = compact_source(&source);
+            let compact = compact_source(source);
             contains_forbidden_planner_explain(&compact).then_some(path.clone())
         })
         .collect::<Vec<_>>();

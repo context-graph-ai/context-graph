@@ -16,6 +16,21 @@ use context_graph::{CreateContext, StoreConfig};
 
 use crate::fake_extractor::open_store_with_lexical_embedder;
 
+const DUPLICATE_SYNC_AUTHORITY_MARKERS: &[&str] = &[
+    "context_graph_sync_table_contract",
+    "ContextGraphSyncTablePolicy",
+    "sync_policy_for_table",
+    "context_graph_sync_conflict_policies",
+    "register_context_graph_sync_client",
+    "ContextGraphSyncRegistration",
+    "work_ledger_conflict_policy_entries",
+    "LOCAL_ONLY_RUNTIME_SYNC_TABLES",
+    "ConflictPolicies",
+    ".set_default_conflict_policy(",
+    ".set_table_direction(",
+    ".set_conflict_policy(",
+];
+
 #[test]
 fn no_transport_name_in_ledger_or_payload_sources() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -94,6 +109,11 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "cg_overlay_entries",
         "cg_compensation_events",
     ];
+    // This fixture opens the default LocalOnly Store. The approved event-placement policy
+    // resolves these immutable shared rows to SYNC OFF locally while retaining their
+    // first-writer arbitration; authenticated TenantHub binding is the only route that
+    // changes their direction to SYNC PUSH ONLY.
+    const LOCAL_ONLY_KEEP_FIRST: &[&str] = &["events", "event_anchors"];
     const SYNC_OFF: &[&str] = &[
         "audit_log",
         "cg_skill_firing_trace",
@@ -105,6 +125,12 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "cg_local_settings",
         "cg_changed_cursors",
         "cg_runtime_models",
+        "context_bindings",
+        "event_placement",
+        "event_local_commits",
+        "event_source_checkpoints",
+        "event_source_locators",
+        "event_source_ordering",
     ];
     const ENGINE_OWNED: &[&str] = &[
         "work_jobs",
@@ -118,7 +144,8 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
 
     assert_eq!(KEEP_LATEST.len(), 9);
     assert_eq!(KEEP_FIRST.len(), 33);
-    assert_eq!(SYNC_OFF.len(), 10);
+    assert_eq!(LOCAL_ONLY_KEEP_FIRST.len(), 2);
+    assert_eq!(SYNC_OFF.len(), 16);
     assert_eq!(ENGINE_OWNED.len(), 7);
 
     let mut expected = BTreeMap::new();
@@ -132,6 +159,13 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
     for table in KEEP_FIRST {
         assert_eq!(
             expected.insert(*table, ("SYNC TWO WAY", Some("SYNC CONFLICT KEEP FIRST")),),
+            None,
+            "table {table} must have one declaration"
+        );
+    }
+    for table in LOCAL_ONLY_KEEP_FIRST {
+        assert_eq!(
+            expected.insert(*table, ("SYNC OFF", Some("SYNC CONFLICT KEEP FIRST")),),
             None,
             "table {table} must have one declaration"
         );
@@ -217,22 +251,7 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
     let cli_source_root = manifest_root.join("../cg-cli/src");
     let mut production_sources = rust_sources_under(&source_root);
     production_sources.extend(rust_sources_under(&cli_source_root));
-    for removed_symbol in [
-        "context_graph_sync_table_contract",
-        "ContextGraphSyncTablePolicy",
-        "sync_policy_for_table",
-        "context_graph_sync_conflict_policies",
-        "register_context_graph_sync_client",
-        "ContextGraphSyncRegistration",
-        "work_ledger_conflict_policy_entries",
-        "LOCAL_ONLY_RUNTIME_SYNC_TABLES",
-        "ConflictPolicies",
-        "ConflictPolicy",
-        "SyncDirection",
-        ".set_default_conflict_policy(",
-        ".set_table_direction(",
-        ".set_conflict_policy(",
-    ] {
+    for removed_symbol in DUPLICATE_SYNC_AUTHORITY_MARKERS {
         let offenders = production_sources
             .iter()
             .filter(|(_, source)| source_uses_removed_symbol(source, removed_symbol))
@@ -277,10 +296,8 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
 
 /// Does production source actually use a removed sync-authority symbol?
 ///
-/// Identifier-shaped entries (`ConflictPolicy`, `SyncDirection`) count only on identifier
-/// boundaries, so they do not fire inside a larger identifier that merely ends in the same
-/// letters (`ParsedStatement::ShowSyncConflictPolicy`, the read surface's answer-shape tag). A
-/// standalone use of the removed identifier still counts. Call-shaped entries
+/// Identifier-shaped entries count only on identifier boundaries, so they do not fire inside a
+/// larger identifier that merely ends in the same letters. Call-shaped entries
 /// (`.set_conflict_policy(`) keep the plain substring scan.
 fn source_uses_removed_symbol(source: &str, removed_symbol: &str) -> bool {
     fn is_identifier_char(character: char) -> bool {
@@ -302,6 +319,34 @@ fn source_uses_removed_symbol(source: &str, removed_symbol: &str) -> bool {
             .is_some_and(is_identifier_char);
         !preceded_by_identifier && !followed_by_identifier
     })
+}
+
+#[test]
+fn sync_authority_scanner_allows_engine_metadata_reads_and_rejects_duplicate_authority() {
+    assert!(
+        !DUPLICATE_SYNC_AUTHORITY_MARKERS.iter().any(|marker| {
+            source_uses_removed_symbol(
+                "meta.sync_direction == Some(SyncDirection::Push) && meta.conflict_policy == Some(ConflictPolicy::KEEP_FIRST)",
+                marker,
+            )
+        }),
+        "ContextDB metadata comparisons inspect the declared policy; they do not create a local authority"
+    );
+    assert!(
+        DUPLICATE_SYNC_AUTHORITY_MARKERS.iter().any(|marker| {
+            source_uses_removed_symbol(
+                "builder.set_conflict_policy(ConflictPolicy::KEEP_FIRST)",
+                marker,
+            )
+        }),
+        "a local setter remains duplicate sync authority"
+    );
+    assert!(
+        DUPLICATE_SYNC_AUTHORITY_MARKERS.iter().any(|marker| {
+            source_uses_removed_symbol("struct ContextGraphSyncTablePolicy;", marker)
+        }),
+        "a local policy definition remains duplicate sync authority"
+    );
 }
 
 fn rust_sources_under(root: &Path) -> Vec<(PathBuf, String)> {

@@ -1,0 +1,10 @@
+error[E0624]: associated function `new` is private
+  --> tests/ui/event_search_seal_has_no_public_constructor.rs:13:34
+   |
+13 |     let _seal = EventSearchSeal::new("attacker_profile".to_string(), true);
+   |                                  ^^^ private associated function
+   |
+  ::: src/embedder.rs
+   |
+   |     fn new(encoding_profile_id: String, canonical_authority: bool) -> Self {
+   |     ---------------------------------------------------------------------- private associated function defined here

@@ -1,0 +1,75 @@
+{
+  "event_count": 7,
+  "checks": [
+    {
+      "query": "Account A-17 transfer review notice period",
+      "expected_events": [
+        {
+          "kind": "user_message",
+          "render_role": "human_message",
+          "text": "Account A-17 needs a transfer review. Is the notice period enforceable?\n\tPlease preserve this exact tab and café 東京.",
+          "requires_decoded_newline_and_tab": true,
+          "coverage": "complete"
+        },
+        {
+          "kind": "assistant_message",
+          "render_role": "agent_message",
+          "text": "I will inspect the draft before changing it.",
+          "coverage": "complete"
+        },
+        {
+          "kind": "file_edit",
+          "render_role": "tool_request",
+          "interaction_ref": "tool-edit-1",
+          "required_payload_values": [
+            {"tool_use_id": "tool-edit-1"},
+            {"tool_name": "Edit"},
+            {"input": {
+              "file_path": "/workspace/notice.md",
+              "old_string": "seven days",
+              "new_string": "fourteen days",
+              "reason": "retain the negotiated notice period"
+            }},
+            "synthetic-session-amber"
+          ],
+          "coverage": "complete"
+        },
+        {
+          "kind": "assistant_message",
+          "render_role": "agent_message",
+          "text": "The edit request is separate from this conclusion: the decisive sentence after the former preview boundary says the account notice remains effective until a signed amendment replaces it.\n```text\nsearch_document: literal source prefix, not an embedding instruction\n```\nA tab follows:\tΩ.",
+          "requires_decoded_newline_and_tab": true,
+          "coverage": "complete"
+        },
+        {
+          "kind": "tool_result",
+          "render_role": "tool_result",
+          "interaction_ref": "tool-edit-1",
+          "required_payload_values": [
+            {"tool_use_id": "tool-edit-1"},
+            {"content": "Updated notice.md without changing account A-17."},
+            "synthetic-session-amber"
+          ],
+          "coverage": "complete"
+        }
+      ]
+    },
+    {
+      "query": "Which transport keeps the direct-peer explanation?",
+      "expected_events": [
+        {
+          "kind": "assistant_message",
+          "render_role": "agent_message",
+          "text": "Iroh carries the state over direct peers; NATS routes messages through a broker.",
+          "coverage": "complete"
+        },
+        {
+          "kind": "user_message",
+          "render_role": "human_message",
+          "text": "Which transport keeps the direct-peer explanation? search_query: compare the two synthetic transports.",
+          "coverage": "complete"
+        }
+      ]
+    }
+  ]
+}

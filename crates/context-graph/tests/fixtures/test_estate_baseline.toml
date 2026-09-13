@@ -1,0 +1,334 @@
+# Test-estate discipline audit baseline (see AGENTS.md "Fast test command and gate").
+#
+# Three ratchet arms `test_estate_audit.rs` enforces, and the two counted arms move in different
+# directions: `[sleep_and_clock_sites]` entries only ever lower — raising one back up requires the
+# same owner-approved exception any other ratchet raise does; `[default_tier_test_count]` entries
+# track the estate exactly and move with it in the same change that changes the estate — a change
+# that adds tests raises the entry, a change that deliberately removes tests lowers it and says
+# why.
+
+[sleep_and_clock_sites]
+# file (repo-relative) -> the frozen maximum count of std::thread::sleep(/tokio::time::sleep(/
+# SystemTime::now(/Instant::now(/Utc::now( call sites in that file, outside the seamed
+# contextdb_core::Wallclock::now(). A new site, in a listed file or a new one, fails the audit;
+# removing a site lowers the count in the same change.
+"crates/candle-embeddinggemma/src/embeddinggemma.rs" = 1
+"crates/cg-catalog/src/lib.rs" = 2
+"crates/cg-catalog/src/model_connection.rs" = 5
+"crates/cg-catalog/tests/acceptance/concurrency.rs" = 8
+"crates/cg-catalog/tests/acceptance/generic_llm_endpoint.rs" = 1
+"crates/cg-catalog/tests/acceptance/license_gate.rs" = 1
+"crates/cg-catalog/tests/acceptance/prefetch_first_touch.rs" = 3
+"crates/cg-catalog/tests/acceptance/swap.rs" = 6
+"crates/cg-catalog/tests/acceptance/sync_arrival.rs" = 3
+"crates/cg-catalog/tests/acceptance/update_check.rs" = 3
+# Event-history production wait and timing sites, granted as a manager exception pending owner
+# confirmation. None synchronizes a test or persists a timestamp:
+#   history/import.rs:133 Instant::now — the import's elapsed time reported in its receipt
+#   history/import.rs:667 Instant::now — search_ms for a background search kick, in the receipt
+#   history/import.rs:697 Instant::now — search_ms for a foreground search run, in the receipt
+#   history/worker.rs:54 Instant::now — remaining time left in the reader-release deadline before waiting
+#   history/worker.rs:62 thread::sleep — bounded backoff after an unobservable reader wait, capped at the remaining allowance
+#   history/worker.rs:98 Instant::now — start of the reader-release allowance for the pending-work check
+#   history/worker.rs:195 Instant::now — start of the reader-release allowance for a context's search catch-up attempts
+#   history/worker.rs:273 thread::sleep — 200 ms backoff while the worker lock is held by another worker
+"crates/cg-cli/src/history/import.rs" = 3
+"crates/cg-cli/src/history/worker.rs" = 5
+"crates/cg-cli/src/main.rs" = 12
+# Bounded poll of a separate process's observable state with a deadline (manager ruling):
+#   :995 thread::sleep — 250 ms pause between reads of `cg status` while a background search build
+#   runs, bounded by the outer `wait_for_search_ready` deadline the caller already holds
+"crates/cg-cli/tests/event_history.rs" = 1
+"crates/cg-cli/tests/cli_acceptance.rs" = 2
+"crates/cg-cli/tests/cli_model_byok.rs" = 1
+# Bounded polls of a separate process's observable state with a deadline (manager ruling):
+#   :212/:224/:231 Instant::now, Instant::now, sleep — wait for the child `cg` to print its terminal prompt (60 s)
+#   :268/:281/:287 Instant::now, Instant::now, sleep — poll `cg status` until the background worker reports search ready (600 s)
+#   :295/:300/:306 Instant::now, Instant::now, sleep — poll until the detached worker process releases its data-root lock (120 s)
+"crates/cg-cli/tests/event_support/mod.rs" = 9
+"crates/cg-cli/tests/first_light_cli.rs" = 2
+"crates/cg-cli/tests/support/mod.rs" = 5
+"crates/context-graph/src/capture_sync_status.rs" = 4
+# consumer_read.rs, the read-only reader's bounded wait across a writer opening or closing the store
+# (same manager exception):
+#   :125 Instant::now — the writer-transition deadline (WRITER_TRANSITION_ALLOWANCE)
+#   :141 Instant::now — start of one reopen attempt
+#   :144 Instant::now — deadline check before backing off
+#   :148 thread::sleep — backoff between reopen attempts, capped at the deadline
+#   :527 Instant::now — start of one session call, to tell an owner hand-over from a slow answer
+#   :531 Instant::now — deadline check before replacing the session
+"crates/context-graph/src/consumer_read.rs" = 6
+"crates/context-graph/src/embedder/nomic.rs" = 1
+"crates/context-graph/src/ingest.rs" = 6
+# owner_control.rs, the bounded reader-release wait every cg writer uses (same manager exception):
+#   :374 Instant::now — remaining time left before the deadline, checked before waiting at all
+"crates/context-graph/src/owner_control.rs" = 1
+"crates/context-graph/src/store/embedding.rs" = 2
+"crates/context-graph/src/store/evidence.rs" = 1
+"crates/context-graph/src/store/observation.rs" = 2
+# event_search_projection.rs, the bounded reader-release wait a projection build takes before it can
+# run (same manager exception):
+#   :51 Instant::now — start of the reader-release allowance
+#   :56 Instant::now — remaining time left before the deadline, checked before waiting
+#   :67 thread::sleep — backoff between reopen attempts, capped at the remaining allowance
+"crates/context-graph/src/store/event_search_projection.rs" = 3
+"crates/context-graph/src/tier0.rs" = 2
+"crates/context-graph/tests/a_closed_cursor_answers_its_first_page_by_type_not_by_panic.rs" = 2
+"crates/context-graph/tests/a_graph_read_past_the_read_ceiling_answers_what_the_writable_store_answers.rs" = 2
+"crates/context-graph/tests/a_stopped_store_answers_the_typed_graph_reads_without_changing.rs" = 6
+"crates/context-graph/tests/acceptance/capture_progress.rs" = 6
+"crates/context-graph/tests/acceptance/context_isolation.rs" = 2
+"crates/context-graph/tests/acceptance/crud.rs" = 3
+"crates/context-graph/tests/acceptance/discovery.rs" = 3
+"crates/context-graph/tests/acceptance/evidence.rs" = 8
+"crates/context-graph/tests/acceptance/find_via_digests.rs" = 2
+"crates/context-graph/tests/acceptance/full_ontology_extraction.rs" = 2
+"crates/context-graph/tests/acceptance/graph_context_isolation.rs" = 1
+"crates/context-graph/tests/acceptance/graph_entity_neighborhood.rs" = 1
+"crates/context-graph/tests/acceptance/graph_intention_tree.rs" = 3
+"crates/context-graph/tests/acceptance/graph_precedent_chain.rs" = 1
+"crates/context-graph/tests/acceptance/impact_analysis.rs" = 2
+"crates/context-graph/tests/acceptance/impact_cascade_consolidation.rs" = 2
+"crates/context-graph/tests/acceptance/llm_runtime.rs" = 2
+"crates/context-graph/tests/acceptance/local_entity_face_match_override.rs" = 1
+"crates/context-graph/tests/acceptance/nomic_loads.rs" = 2
+"crates/context-graph/tests/acceptance/producer_lineage_audit_render.rs" = 2
+"crates/context-graph/tests/acceptance/school_gate_entity_alert_render.rs" = 1
+"crates/context-graph/tests/acceptance/screenshot_memory_distinguishability.rs" = 1
+"crates/context-graph/tests/acceptance/screenshot_memory_review.rs" = 3
+"crates/context-graph/tests/acceptance/subscriptions.rs" = 13
+"crates/context-graph/tests/acceptance/temporal.rs" = 1
+"crates/context-graph/tests/acceptance/tier0_capture.rs" = 2
+"crates/context-graph/tests/common/capture_sync_common.rs" = 2
+"crates/context-graph/tests/common/invalidation_fixtures.rs" = 2
+"crates/context-graph/tests/compile-fail/fabric_receipt_not_basis.rs" = 1
+# Bounded poll of a separate process's observable state with a deadline (manager ruling):
+#   :333/:335 Instant::now ×2 — the reopening child process loops until the parent's stop file appears or REOPEN_WINDOW ends
+"crates/context-graph/tests/event_search_read_during_projection.rs" = 2
+# waiting_for_readers_never_outlasts_the_allowance: building the deadlines the bounded wait takes
+# (its API is an Instant deadline); nothing measures elapsed time, sleeps, or waits on a lease:
+#   :800 Instant::now — a deadline already spent, to assert an immediate answer
+#   :826 Instant::now — the deadline for one allowance under churning readers
+"crates/context-graph/tests/event_search_projection_correctness.rs" = 2
+"crates/context-graph/tests/integration/capture_pipeline.rs" = 3
+"crates/context-graph/tests/integration/cluster_aggregate_substrate.rs" = 2
+"crates/context-graph/tests/integration/composite_query_edge_cases.rs" = 3
+"crates/context-graph/tests/integration/concurrent_probes_evidence.rs" = 2
+"crates/context-graph/tests/integration/cross_space_refusal.rs" = 1
+"crates/context-graph/tests/integration/decision_reasoning_chain_metadata.rs" = 3
+"crates/context-graph/tests/integration/embedder_metadata.rs" = 3
+"crates/context-graph/tests/integration/engine_probes/embedder_concurrency.rs" = 5
+"crates/context-graph/tests/integration/explain_introspection.rs" = 1
+"crates/context-graph/tests/integration/impact_analysis_engine_capabilities.rs" = 3
+"crates/context-graph/tests/integration/impact_cascade_probes.rs" = 2
+"crates/context-graph/tests/integration/intra_space_modality_agnostic.rs" = 1
+"crates/context-graph/tests/integration/precomputed_embedding_edge_cases.rs" = 2
+"crates/context-graph/tests/integration/precomputed_embedding_ingest.rs" = 1
+"crates/context-graph/tests/integration/producer_diagnostic.rs" = 4
+"crates/context-graph/tests/integration/reindex.rs" = 4
+"crates/context-graph/tests/integration/reindex_concurrency.rs" = 12
+"crates/context-graph/tests/integration/schema.rs" = 1
+"crates/context-graph/tests/integration/store_open_runtime_config.rs" = 8
+"crates/context-graph/tests/integration/subscriptions_engine_capabilities.rs" = 10
+"crates/context-graph/tests/one_writable_open_carries_the_owner_handler_and_the_embedders.rs" = 1
+"crates/context-graph/tests/ui/byok_reply_phrasing_is_not_a_basis.rs" = 1
+"crates/context-graph/tests/ui/no_observation_data_field.rs" = 1
+"crates/context-graph/tests/ui/no_record_observation_data_field.rs" = 1
+"crates/context-graph/tests/ui/usage_is_not_a_basis_input.rs" = 1
+"crates/context-graph/tests/unit/mock_embedder.rs" = 1
+
+[default_tier_test_count]
+# crate (Cargo.toml package name) -> the exact number of #[test]/#[tokio::test] functions in the
+# default tier: excludes anything gated behind #[cfg(context_graph_internal_test_support)] and
+# anything carrying #[ignore]. This entry moves with the estate in the same change: a change that
+# adds tests raises the entry to match in the same change, so the ratchet protects the tests it
+# just added; a change that deliberately removes tests lowers the entry in the same change and
+# says why. The audit fails if a crate's live count differs from its baseline in either direction
+# without that same-change update. Every crate the tree ships carries a row: a crate with no
+# default-tier tests declares 0 rather than omitting the row, because a crate with no row is a
+# crate outside the ratchet, and the audit reports it rather than exempting it.
+"candle-embeddinggemma" = 7
+"cg-bench" = 10
+"cg-catalog" = 109
+"cg-cli-conventions" = 0
+"cg-connector-claude-code" = 23
+"cg-node-fs" = 0
+"cg-vision-embedder" = 5
+"context-graph" = 1214
+# 190 -> 184: the status tests for answers read-only status no longer gives were removed with that
+# change, and the retired chunked-import, estimate and raw-chunk forget routes took their tests.
+# 184 -> 187: coverage for the reader-wait allowance and the foreground import's unusable-lock
+# report was added with that change.
+# 187 -> 189: proofs that the default data root is ~/.cg and that find over a Context with no
+# imported history answers no_matching_history.
+"context-graph-cli" = 189
+
+[gate_wall_seconds_policy]
+# A test binary's ceiling is `recorded seconds * tolerance_factor + slack_seconds`. Both terms are
+# needed because a fresh measurement drifts from a frozen one in two unrelated ways, and neither
+# term can absorb the other's.
+#
+# The multiplicative term covers drift that scales with the binary: the same tests run against a
+# busier machine, more of them waiting on the same disk and the same cores. The additive term
+# covers the part that does NOT scale — one process spawn per test under nextest, and the first
+# read of a file that a later run finds in the page cache. On a binary whose whole run is a few
+# spawns that fixed cost is many times the binary's own seconds, so a purely relative ceiling
+# reports the machine's scheduling as a runtime regression.
+#
+# The pool a measurement is taken in is part of the measurement. A baseline captured from a
+# full-workspace gate and a measurement taken from a smaller selection are two different amounts of
+# contention over the same cores and the same disk, so they are not directly comparable numbers.
+# The gate cannot re-run the baseline's pool, so the allowance above is what makes the comparison
+# survive that difference. This is the reason the additive term exists at all.
+#
+# Both values come from the preserved gate measurements, not from taste. Across thirteen preserved
+# gate JUnits, 84 test binaries carry the identical test-name set the tree carries now, giving 919
+# (recorded value, fresh measurement) pairs of unchanged code once two binaries are set aside whose
+# implementation genuinely changed underneath a stable test name.
+#   * The rate is fitted where the fixed cost is negligible — binaries of 1s or more, 556 pairs.
+#     The worst movement there is 2.534x: a 4.358s row measured at 11.044s. Its p90 is 1.310x and
+#     its p99 1.766x, so one further decade of rarity costs 0.457x, and 2.534 + 0.457 = 2.991.
+#   * The fixed term is fitted where the rate is negligible — binaries of 0.25s or less, 271 pairs.
+#     The worst overshoot there is +0.160s: a 0.082s row measured at 0.242s. Its p90 is 0.032s and
+#     its p99 0.107s, so one further decade costs 0.075s, and 0.160 + 0.075 = 0.235.
+# Against the whole corpus the worst measurement then sits at 0.832 of its ceiling, so the rule
+# carries margin over every drift these thirteen runs have ever shown rather than only just
+# clearing the largest one.
+#
+# `slack_seconds` replaces the earlier `floor_seconds`, which applied the same absolute allowance
+# only to binaries whose relative ceiling fell under it. The measurements show the fixed cost
+# landing on binaries well above that threshold too — +0.160s on a 0.082s binary, +0.151s on a
+# 0.171s one, +0.120s on a 0.099s one — so the allowance is added to every binary's ceiling instead
+# of switching on below a threshold. Adding it everywhere is strictly the wider of the two rules,
+# so nothing the floor used to spare is refused now.
+#
+# Both values only ever LOWER. Raising either buys room for a regression instead of describing the
+# machine, and takes the same owner-approved exception any other ratchet raise does.
+tolerance_factor = 2.991
+slack_seconds = 0.235
+
+[gate_wall_seconds]
+# test binary (nextest testsuite name, crate::binary, or a finer classname the junit itself
+# reports) -> wall seconds captured from one full gate's own junit on the reference machine,
+# 2026-09-05, TMPDIR on that machine's local disk-backed filesystem. The live
+# arm (gate_wall_seconds_never_exceed_the_frozen_baseline, run with CG_GATE_JUNIT set) fails a
+# binary whose fresh wall seconds exceed this value times [gate_wall_seconds_policy]
+# tolerance_factor plus its slack_seconds. A binary the gate ran that has no row here is reported
+# too: an unratcheted binary has no ceiling at all, so a row is added in the same change that adds
+# the binary and is removed only in the change that removes the binary. Each value is the sum of
+# that binary's per-test seconds in the gate's own junit. This table only ever lowers as measured
+# performance improves — the ordinary move on a regression is to fix it, not raise the ceiling.
+# The twenty event-history binaries' rows came from one full gate-profile junit on 2026-09-13,
+# on a 4-core host started at load 1.64 with no other Cargo process, TMPDIR on local ext4.
+"candle-embeddinggemma::acceptance" = 0.171
+"cg-bench::bench_contract" = 0.096
+"cg-bench::driver_contract" = 0.612
+"cg-catalog::acceptance" = 359.561
+"cg-catalog::production_guards" = 0.022
+"cg-connector-claude-code::history_prefix" = 0.040
+"cg-connector-claude-code::source_fidelity" = 27.387
+"cg-vision-embedder::siglip" = 0.082
+"context-graph" = 36.976
+"context-graph-cli::a_busy_store_is_told_to_the_operator" = 1.322
+"context-graph-cli::a_failed_status_read_is_never_rendered_as_an_answer" = 3.365
+"context-graph-cli::a_reader_the_store_could_not_name_is_still_a_holder" = 0.076
+"context-graph-cli::a_refusal_answers_in_the_format_the_caller_asked_for" = 0.514
+"context-graph-cli::bin/cg" = 0.013
+"context-graph-cli::cg_model_fetch_finds_a_registration_that_cg_model_show_reads_when_data_and_cache_roots_differ" = 0.086
+"context-graph-cli::cg_status_never_reports_a_refused_store_as_empty" = 1.583
+"context-graph-cli::cli_acceptance" = 18.253
+"context-graph-cli::cli_model_byok" = 2.271
+"context-graph-cli::event_forget_terminal" = 2.328
+"context-graph-cli::event_history" = 327.404
+"context-graph-cli::event_import_roundtrip" = 332.844
+"context-graph-cli::event_import_terminal" = 12.295
+"context-graph-cli::every_environment_read_is_in_the_declared_inventory" = 0.081
+"context-graph-cli::extraction_prompt_delegation" = 0.013
+"context-graph-cli::fabric_cli_surface" = 0.666
+"context-graph-cli::fabric_status_cli" = 0.885
+"context-graph-cli::first_light_cli" = 80.04
+"context-graph-cli::help_names_every_readme_documented_command" = 0.019
+"context-graph-cli::import_cli" = 24.918
+"context-graph-cli::injection_hook_cli" = 4.893
+"context-graph-cli::llm_client_refactor_cli" = 20.356
+"context-graph-cli::session_reconciliation_wiring" = 0.013
+"context-graph-cli::skills_add_export_cli" = 1.688
+"context-graph-cli::status_help_says_it_reads_memory_too" = 0.056
+"context-graph-cli::status_is_bounded" = 600.139
+"context-graph-cli::tier0_cli" = 2.766
+"context-graph-cli::understand_cli" = 8.265
+"context-graph-cli::worker_cli_surface" = 0.099
+"context-graph::a_busy_store_never_reads_as_an_unexplained_engine_failure" = 0.049
+"context-graph::a_closed_cursor_answers_its_first_page_by_type_not_by_panic" = 9.178
+"context-graph::a_crash_dirty_store_still_answers_that_no_owner_is_running" = 4.877
+"context-graph::a_failed_status_fold_leaves_no_cursor_open" = 8.199
+"context-graph::a_graph_read_past_the_read_ceiling_answers_what_the_writable_store_answers" = 44.907
+"context-graph::a_read_declaration_is_verified_against_the_persisted_table" = 5.25
+"context-graph::a_read_only_consumer_sees_only_what_it_declared" = 9.294
+"context-graph::a_real_store_open_is_refused_by_the_readers_holding_it" = 0.796
+"context-graph::a_refusal_with_no_owner_alive_never_names_a_live_owner" = 1.484
+"context-graph::a_stopped_store_answers_the_typed_graph_reads_without_changing" = 2.709
+"context-graph::a_store_that_needs_a_writable_reopen_is_not_told_it_is_unreadable" = 2.476
+"context-graph::a_writer_held_off_by_hydrating_readers_is_told_so_by_type" = 0.021
+"context-graph::acceptance" = 1806.191
+# Re-measured because the binary itself changed, not because it got slower: it carried one test
+# when 0.019 was captured and carries four now, and under the gate profile each test is its own
+# process.
+"context-graph::agents_md_names_only_paths_that_exist" = 0.060
+"context-graph::an_edit_door_changes_an_existing_store_or_refuses" = 3.786
+"context-graph::an_owner_ask_with_no_owner_never_touches_the_store_file" = 1.871
+"context-graph::catalog_and_offline_nomic_embedder_disagree_on_the_model_cache_root" = 19.126
+"context-graph::checked_entrypoints_enforce_the_token_limit_for_every_embedder_even_when_the_hook_does_not" = 0.028
+"context-graph::ci_hardening" = 0.042
+"context-graph::compile_fail" = 46.151
+"context-graph::context_bindings" = 10.188
+"context-graph::default_nomic_configuration_reports_a_missing_model_as_not_installed_and_never_fetches" = 1.891
+"context-graph::doc_claim_bindings" = 0.449
+# Re-measured for the same reason: two tests when 0.016 was captured, three now.
+"context-graph::embedder_without_exact_preparation_answers_unsupported_and_never_delegates_to_plain_embed" = 0.045
+"context-graph::event_anchor_head_read" = 8.841
+"context-graph::event_capture" = 54.793
+"context-graph::event_checkpoint_count_contract" = 4.036
+"context-graph::event_core_policy_recovery" = 20.161
+"context-graph::event_core_regressions" = 5.125
+"context-graph::event_coverage_receipts" = 2.899
+"context-graph::event_forget" = 18.165
+"context-graph::event_history_registration_reuses_the_loaded_model_and_refuses_an_unfit_underlying_embedder" = 18.691
+"context-graph::event_history_status" = 11.939
+"context-graph::event_history_wrapper_names_the_actual_unsupported_input_kind" = 0.554
+"context-graph::event_history_wrapper_refuses_plain_text_embedding_without_an_explicit_role" = 0.254
+"context-graph::event_import_receipt_context" = 3.930
+"context-graph::event_interpretation" = 2.110
+"context-graph::event_search_inference_forwarded_from_a_plug_in_is_refused_by_the_bundled_model" = 0.078
+"context-graph::event_search_preparation_hook_supports_external_embedders" = 0.048
+"context-graph::event_search_role_methods_are_callable_on_any_embedder_handle" = 38.881
+"context-graph::event_search_sealing_rejects_an_invalid_prepared_value_without_panicking" = 0.067
+"context-graph::event_search_uses_role_preparation_while_digest_record_and_evidence_paths_remain_byte_for_byte_unchanged" = 46.342
+"context-graph::import_error_display" = 0.036
+"context-graph::integration" = 6052.362
+"context-graph::interpretation_foundation_regression" = 0.051
+"context-graph::literal_source_and_query_text_starting_with_nomic_prefix_words_is_preserved_and_searchable" = 42.811
+# Replaced, as the note here asked, with this binary's seconds from a full gate junit; the value
+# it replaces came from a solo run with the model cache already warm.
+"context-graph::an_oversized_event_search_query_is_prepared_in_full_and_refused_only_at_embed_time" = 3.687
+"context-graph::nomic_document_preparer_adds_exactly_one_system_task_prefix" = 61.784
+"context-graph::nomic_query_preparer_adds_exactly_one_system_task_prefix" = 61.047
+"context-graph::nomic_real_model_helper_refuses_locally_on_an_empty_cache_and_never_reaches_the_network" = 0.101
+"context-graph::offline_nomic_handle_recovers_after_installation_and_refuses_a_noncanonical_one" = 4.031
+"context-graph::one_runtime_root_reaches_both_sides_of_the_owner_plane" = 1.382
+"context-graph::one_writable_open_carries_the_owner_handler_and_the_embedders" = 3.829
+"context-graph::oversized_event_split_uses_selected_tokenizer_and_has_utf8_safe_exact_bidirectional_source_offsets" = 4.328
+"context-graph::prepared_event_search_document_debug_output_contains_no_token_payload" = 0.048
+"context-graph::prepared_event_search_document_sealed_under_a_different_profile_is_refused_even_by_an_embedder_designed_to_bypass_the_check" = 0.031
+"context-graph::queue_counts_include_only_queued_digests" = 2.194
+"context-graph::raw_nomic_preparation_over_noncanonical_same_dimension_weights_refuses_the_reserved_identity" = 0.497
+"context-graph::reading_pass_through_replaces_the_control_socket" = 4.111
+"context-graph::registration_plus_many_preparations_reads_the_weights_once" = 1.892
+"context-graph::regression_guards" = 40.242
+"context-graph::role_prepared_values_share_one_event_history_profile_across_the_raw_embedder_and_its_wrapper" = 28.507
+"context-graph::startup_schema_is_one_commit" = 2.003
+"context-graph::status_totals_are_bounded_on_a_large_store" = 600.208
+"context-graph::test_estate_audit" = 0.241
+"context-graph::unit" = 3.843
+"context-graph::what_a_status_total_examined_is_reported_honestly" = 4.358
+"context-graph::who_holds_the_store_is_carried_back_losslessly" = 3.218

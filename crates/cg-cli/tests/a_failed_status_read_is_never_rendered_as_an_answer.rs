@@ -38,15 +38,10 @@ const FAULT_ENV: &str = "CG_FAIL_STATUS_METRIC_READ";
 /// to be reached at all. Keeping the whole set here — rather than one test per branch — is what
 /// makes a NEW unguarded read visible: it will not be in this list, and the roster assertion below
 /// says so.
-const REFUSABLE_READS: [&str; 7] = [
-    "retention",
-    "understanding_run",
-    "fabric_membership",
-    "counts",
-    "queue",
-    "raw",
-    "fabric_jobs",
-];
+// `retention` and `raw` are retired with the raw-retention setting (intent :301-302, :2380-2382);
+// `queue` and `fabric_jobs` are not reported by the read-only status until the engine exposes the
+// work ledger's job state to read-only clients (upstream-gaps.md gap 2).
+const REFUSABLE_READS: [&str; 3] = ["understanding_run", "fabric_membership", "counts"];
 
 /// The context label `cg` uses when none is named, so the fixture's captured rows are the ones a
 /// bare `cg status` looks for.
@@ -223,17 +218,13 @@ fn a_store_that_really_holds_nothing_still_answers_with_its_absences() {
         "a store that was read and holds nothing is a successful answer, not a failure: {said}"
     );
     assert!(
-        said.contains("goals: 0 decisions: 0 observations: 0"),
-        "an empty store really is empty and says so: {said}"
+        said.contains("\"contexts\":[]"),
+        "a store with no Context answers with an empty Context list, never invented zeros: {said}"
     );
     assert!(
-        said.contains("\"retention_days\":null"),
-        "no configured retention is an ANSWER — `Ok(None)` from the setting read stays an \
+        said.contains("\"last_understanding_run\":null"),
+        "understanding that never ran is an ANSWER — `Ok(None)` from the setting read stays an \
          absence and does not become a refusal: {said}"
-    );
-    assert!(
-        said.contains("\"fabric_jobs\":[]"),
-        "a store nobody submitted a job to answers with an empty job list: {said}"
     );
     assert!(
         !said.contains("injected"),
@@ -252,19 +243,8 @@ fn a_captured_store_answers_with_its_real_totals_when_no_read_refuses() {
         "every read succeeded, so `cg status` answers: {said}"
     );
     assert!(
-        said.contains("fabric jobs: 8 (0 done)"),
-        "tier-0 capture submits one understanding job per chunk, so this store has eight of them \
-         and says eight — the same field that must read `[]` on a store nobody submitted to, and \
-         must read neither on a store whose ledger could not be asked: {said}"
-    );
-    assert!(
         said.contains("fabric: sharing on"),
         "the fabric posture is rendered when a config is present: {said}"
-    );
-    assert!(
-        said.contains("raw kept: 8 chunks"),
-        "the raw footprint is the fixture's real one, so a passing refusal test cannot have been \
-         bought by suppressing the answer: {said}"
     );
 }
 
@@ -280,7 +260,7 @@ fn an_unmatched_branch_name_leaves_the_status_alone() {
         answered.said
     );
     assert!(
-        answered.said.contains("raw kept: 8 chunks"),
+        answered.said.contains("fabric: sharing on"),
         "the ordinary answer is unchanged: {}",
         answered.said
     );

@@ -34,10 +34,14 @@ use std::path::{Path, PathBuf};
 
 /// The complete set of environment variables the `cg` sources may read, and what each one is for.
 /// A name reaching the source without reaching this list is the failure this file exists to cause.
-const DECLARED_INVENTORY: [(&str, &str); 5] = [
+const DECLARED_INVENTORY: [(&str, &str); 6] = [
     (
         "CG_DATA_ROOT",
         "location: where this machine's cg data lives",
+    ),
+    (
+        "CLAUDE_CONFIG_DIR",
+        "location: Claude Code's configuration directory, where its local history lives",
     ),
     (
         "HOME",
@@ -220,6 +224,7 @@ fn the_binary_reads_exactly_the_environment_it_declares() {
             FAULT_ENV.to_string(),
             "CG_NO_UNDERSTAND_KICK".to_string(),
             "CG_USE_TEST_LEXICAL_EMBEDDER".to_string(),
+            "CLAUDE_CONFIG_DIR".to_string(),
             "HOME".to_string(),
         ],
         "the whole environment surface of the cg binary, with read counts {read:?}"

@@ -10,6 +10,7 @@ fn compile_fail_ui_tests() {
     trybuild.compile_fail("tests/ui/no_update_observation.rs");
     trybuild.compile_fail("tests/ui/cluster_aggregate_member_vectors_private.rs");
     trybuild.compile_fail("tests/ui/test_support_embedding_not_public.rs");
+    trybuild.compile_fail("tests/ui/event_search_seal_has_no_public_constructor.rs");
     trybuild.compile_fail("tests/ui/composite_query_without_fusion_policy.rs");
     trybuild.compile_fail("tests/ui/composite_query_single_clause_without_fusion_policy.rs");
     trybuild.compile_fail("tests/ui/embedding_module_is_private.rs");

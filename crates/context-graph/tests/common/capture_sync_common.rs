@@ -344,7 +344,8 @@ pub async fn ticketed_memory_fixture(test_name: &str) -> TicketedMemoryFixture {
 }
 
 pub async fn within<F: std::future::Future>(future: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(30), future)
+    // The test guard must exceed the engine's 60-second request ceiling.
+    tokio::time::timeout(Duration::from_secs(90), future)
         .await
         .expect("bounded authenticated sync operation")
 }
@@ -1219,9 +1220,22 @@ fn expected_sync_table_policies() -> BTreeMap<&'static str, (&'static str, Optio
     let write_once = ("SYNC TWO WAY", Some("SYNC CONFLICT KEEP FIRST"));
     let keep_latest = ("SYNC TWO WAY", Some("SYNC CONFLICT KEEP LATEST"));
     let local_only = ("SYNC OFF", None);
+    // Captured event history declares its local placement in `TABLES`: the event tables keep the
+    // write-once conflict policy they carry when a tenant hub binding installs them, and the
+    // placement, binding, locator, checkpoint and ordering tables stay node-local in both modes
+    // (cg-event-backed-import intent §6, "context_bindings, event_source_checkpoints, …").
+    let local_event_capture = ("SYNC OFF", Some("SYNC CONFLICT KEEP FIRST"));
     BTreeMap::from([
         ("cg_schema_version", write_once),
         ("contexts", write_once),
+        ("event_placement", local_only),
+        ("context_bindings", local_only),
+        ("events", local_event_capture),
+        ("event_anchors", local_event_capture),
+        ("event_local_commits", local_only),
+        ("event_source_locators", local_only),
+        ("event_source_checkpoints", local_only),
+        ("event_source_ordering", local_only),
         ("intentions", keep_latest),
         ("decisions", keep_latest),
         ("entities", keep_latest),

@@ -1,0 +1,2 @@
+{"type":"user","uuid":"40000000-0000-4000-8000-000000000001","sessionId":"embedded-first","timestamp":"2026-09-03T09:00:00Z","message":{"id":"mixed-1","role":"user","content":"first embedded identity"}}
+{"type":"assistant","uuid":"40000000-0000-4000-8000-000000000002","sessionId":"embedded-second","timestamp":"2026-09-03T09:01:00Z","message":{"id":"mixed-2","role":"assistant","content":"mixed identity is refused"}}

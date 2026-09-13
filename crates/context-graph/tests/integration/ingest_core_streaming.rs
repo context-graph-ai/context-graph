@@ -17,6 +17,9 @@ use contextdb_engine::Database;
 
 use super::fake_extractor::open_store_with_lexical_embedder;
 
+#[path = "../common/nomic_real_model.rs"]
+mod nomic_real_model;
+
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = open_store_with_lexical_embedder(StoreConfig {
@@ -209,6 +212,46 @@ struct CapturingSequenceEmbedder {
     space_id: &'static str,
     max_sequence: usize,
     seen_lengths: Arc<Mutex<Vec<usize>>>,
+}
+
+struct RecordingNomicDigestEmbedder {
+    ordinary_limit: usize,
+    inputs: Arc<Mutex<Vec<String>>>,
+}
+
+impl Embedder for RecordingNomicDigestEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
+        let EmbeddingInput::Text(text) = input else {
+            unreachable!("Digest embedding seam supplies text")
+        };
+        self.inputs
+            .lock()
+            .expect("recorded digest inputs")
+            .push(text);
+        Ok(EmbeddingOutput {
+            embedding_space_id: "recording-nomic-digest".to_string(),
+            dimension: 1,
+            producer: Default::default(),
+            vector: vec![1.0],
+        })
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        vec![EvidenceKind::Text]
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpace {
+        EmbeddingSpace {
+            embedding_space_id: "recording-nomic-digest".to_string(),
+            dimension: 1,
+            supported_evidence_kinds: vec![EvidenceKind::Text],
+            ..Default::default()
+        }
+    }
+
+    fn max_sequence_length(&self) -> usize {
+        self.ordinary_limit
+    }
 }
 
 impl Embedder for CapturingSequenceEmbedder {
@@ -466,6 +509,45 @@ fn chunk_window_derives_from_connected_model_context_default_haiku_overridable()
             true,
             Some(777),
         )
+    );
+}
+
+/// Digest embedding uses Nomic's ordinary embedding declaration, not its event-search-only
+/// ceiling. The production model is constructed only to read that ordinary declaration; the
+/// recording embedder then drives the Digest seam without running real inference, so a ceiling
+/// accidentally reintroduced into `max_sequence_length` cannot hide behind a mock or a returned
+/// summary value.
+#[test]
+fn nomic_event_search_limit_cannot_truncate_digest_embedding_text() {
+    let full = "incident review summary paragraph ".repeat(500);
+    assert!(
+        full.len() > 8_192,
+        "the fixture must actually exceed 8,192 characters for this regression to prove anything; \
+         got {} characters",
+        full.len()
+    );
+    let inputs = Arc::new(Mutex::new(Vec::new()));
+    let model = context_graph::embedder::nomic::NomicTextEmbedder::new(
+        nomic_real_model::local_offline_config(nomic_real_model::canonical_model_dir()),
+    );
+    let ordinary_limit = model.max_sequence_length();
+    let embedder = RecordingNomicDigestEmbedder {
+        ordinary_limit,
+        inputs: Arc::clone(&inputs),
+    };
+    let (embedded, outputs) = embed_digest_summary_for_connected_embedders(&full, &[&embedder])
+        .expect("embedding seam returns");
+
+    assert_eq!(
+        (
+            ordinary_limit,
+            embedded,
+            inputs.lock().expect("recorded digest inputs").clone(),
+            outputs.len(),
+        ),
+        (usize::MAX, full.clone(), vec![full], 1),
+        "Nomic's event-search limit must never become its ordinary Digest embedding limit: the \
+         cached real model must receive the full Digest input byte-for-byte"
     );
 }
 

@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"uuid-fallback-session","timestamp":"2026-09-04T09:00:00Z","message":{"id":"fallback-1","role":"user","content":[{"type":"text","text":"first nonblank raw record supplies source identity when uuid is absent"},{"type":"text","text":"the second item proves the fallback item ordinal"}]}}
+{"type":"assistant","sessionId":"uuid-fallback-session","timestamp":"2026-09-04T09:01:00Z","message":{"id":"fallback-2","role":"assistant","content":[{"type":"text","text":"second UUID-less complete record proves its nonzero source byte offset"}]}}

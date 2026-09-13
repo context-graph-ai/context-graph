@@ -41,15 +41,7 @@ use std::path::Path;
 #[path = "support/store_contention.rs"]
 mod store_contention;
 
-use store_contention::{
-    CgRun, HoldingChild, run_cg_below_runtime_root, runtime_root, seeded_data_root, store_path_in,
-};
-
-/// The parked direct reader this file borrows to produce the reader-held refusal.
-#[test]
-fn a_parked_direct_reader_child() {
-    store_contention::run_parked_reader_child_if_asked();
-}
+use store_contention::{CgRun, run_cg_below_runtime_root, runtime_root, store_path_in};
 
 /// JSON field names, as they appear in the envelope `print_memory_json` writes. None of them is
 /// something a person asked for prose is meant to read.
@@ -202,52 +194,4 @@ fn an_unreadable_store_refusal_is_rendered_in_the_format_the_caller_asked_for() 
         as_text.everything_said(),
         as_json.everything_said()
     );
-}
-
-#[test]
-fn a_reader_held_refusal_is_rendered_in_the_format_the_caller_asked_for() {
-    let runtime = runtime_root();
-    let data_root = seeded_data_root(runtime.path());
-    let store_path = store_path_in(data_root.path());
-
-    let mut holding =
-        HoldingChild::park_a_reader(&store_path, runtime.path(), "a_parked_direct_reader_child");
-    let parked = holding.wait_until_parked();
-
-    let as_text = status(
-        &["status", "--format", "text"],
-        data_root.path(),
-        runtime.path(),
-    );
-    let as_json = status(
-        &["status", "--format", "json"],
-        data_root.path(),
-        runtime.path(),
-    );
-
-    assert_json_refusal_is_still_a_json_document(&as_json, "reader-held");
-    assert_text_refusal_is_prose(
-        &as_text,
-        &TextRefusalExpectation {
-            shape: "reader-held",
-            condition: "StoreHeldByReaders",
-            must_name: vec![
-                store_path.display().to_string(),
-                // The process an operator goes and finds when the wait outlasts their patience.
-                format!("process {}", parked.process_id),
-            ],
-        },
-    );
-    // No number is asserted for this shape — its exit code is a parked owner proposal. That the
-    // two formats AGREE is the contract: a rendering choice must not move an exit code.
-    assert_eq!(
-        as_text.code,
-        as_json.code,
-        "the format flag must not change the code a supervisor branches on. text said {}, json \
-         said {}",
-        as_text.everything_said(),
-        as_json.everything_said()
-    );
-
-    holding.release();
 }

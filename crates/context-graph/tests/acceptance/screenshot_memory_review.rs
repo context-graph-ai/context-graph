@@ -136,6 +136,13 @@ struct AxisTextEmbedder {
     query_axis: usize,
 }
 
+type AxisTextEmbedderProbe = (
+    Store,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<Vec<f32>>>>,
+);
+
 impl AxisTextEmbedder {
     fn new(query_token: String, query_axis: usize) -> Self {
         Self {
@@ -179,9 +186,11 @@ impl Embedder for AxisTextEmbedder {
                     vector,
                 })
             }
-            EmbeddingInput::ImageFrame { .. } => Err(CgError::UnsupportedEvidenceKind {
-                kind: EvidenceKind::ImageFrame,
-            }),
+            EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
+                Err(CgError::UnsupportedEvidenceKind {
+                    kind: EvidenceKind::ImageFrame,
+                })
+            }
             EmbeddingInput::AudioSegment { .. } => Err(CgError::UnsupportedEvidenceKind {
                 kind: EvidenceKind::AudioSegment,
             }),
@@ -229,12 +238,7 @@ fn open_store_with_axis_text_embedder_and_probe(
     probe: Arc<VectorPrimitiveQueryProbe>,
     query_token: String,
     query_axis: usize,
-) -> (
-    Store,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<String>>>,
-    Arc<Mutex<Vec<Vec<f32>>>>,
-) {
+) -> AxisTextEmbedderProbe {
     let embedder = AxisTextEmbedder::new(query_token, query_axis);
     let calls = Arc::clone(&embedder.calls);
     let inputs = Arc::clone(&embedder.inputs);
@@ -442,12 +446,7 @@ fn reopen_store_with_axis_text_embedder_and_probe(
     probe: Arc<VectorPrimitiveQueryProbe>,
     query_token: String,
     query_axis: usize,
-) -> (
-    Store,
-    Arc<AtomicUsize>,
-    Arc<Mutex<Vec<String>>>,
-    Arc<Mutex<Vec<Vec<f32>>>>,
-) {
+) -> AxisTextEmbedderProbe {
     open_store_with_axis_text_embedder_and_probe(
         db_path.to_path_buf(),
         probe,
@@ -1207,6 +1206,23 @@ fn collect_production_static_and_macro_names() -> (BTreeSet<String>, BTreeSet<St
                 continue;
             }
             let start = keyword_start + "const ".len();
+            let const_item = source[start..].trim_start();
+            if const_item.starts_with("_:") {
+                idx = source[start..]
+                    .find(';')
+                    .map(|end| start + end + 1)
+                    .unwrap_or(source.len());
+                continue;
+            }
+            if const_item.starts_with("fn")
+                && const_item
+                    .as_bytes()
+                    .get(2)
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
+                idx = start + source[start..].len() - const_item.len() + "fn".len();
+                continue;
+            }
             let Some(name_start_offset) =
                 source[start..].find(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
             else {
@@ -1332,6 +1348,25 @@ fn source_item_initializer_names_function(source: &str, function_names: &BTreeSe
     function_names
         .iter()
         .any(|function_name| source_references_production_function(initializer, function_name))
+}
+
+fn assert_static_and_const_scanner_handles_anonymous_and_named_function_pointers() {
+    let function_names = BTreeSet::from(["hidden_vector_bypass".to_string()]);
+    let named_dispatch = "const DIRECT_DISPATCH: fn() = hidden_vector_bypass;";
+    assert!(source_item_can_hide_vector_bypass(
+        named_dispatch,
+        &BTreeSet::new()
+    ));
+    assert!(source_item_initializer_names_function(
+        named_dispatch,
+        &function_names
+    ));
+
+    let (static_names, _) = collect_production_static_and_macro_names();
+    assert!(
+        !static_names.contains("fn"),
+        "anonymous const assertions and const fn items must not be scanned as a dispatch named fn: {static_names:?}"
+    );
 }
 
 fn source_references_production_function(source: &str, identifier: &str) -> bool {
@@ -1734,6 +1769,7 @@ fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
 fn vector_primitive_source_forbidden_bypass_markers(root: &str) -> Vec<String> {
     assert_source_without_comments_preserves_string_literal_tail();
     assert_source_references_production_function_preserves_hidden_helper_guard();
+    assert_static_and_const_scanner_handles_anonymous_and_named_function_pointers();
     let functions = collect_production_function_sources();
     let source = function_sources_for_markers(&functions, root);
     let raw_functions = collect_raw_production_function_sources();
@@ -1778,11 +1814,8 @@ fn vector_primitive_source_forbidden_bypass_markers(root: &str) -> Vec<String> {
         ("manual indexed vector loop", "for i in 0.."),
     ]
     .into_iter()
-    .filter_map(|(label, needle)| {
-        source
-            .contains(&needle.to_ascii_lowercase())
-            .then(|| label.to_string())
-    })
+    .filter(|(_, needle)| source.contains(&needle.to_ascii_lowercase()))
+    .map(|(label, _)| label.to_string())
     .collect::<Vec<_>>();
     for (label, needle) in [
         ("raw Database open", "Database::open("),

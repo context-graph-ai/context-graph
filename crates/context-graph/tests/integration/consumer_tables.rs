@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 use context_graph::{
     CG_SCHEMA_VERSION, CgError, ConsumerSchema, ConsumerTable, ScopeLabel, Store, StoreConfig,
 };
-use contextdb_core::{Error as EngineError, Value};
+use contextdb_core::{EdgeDiscardMode, Error as EngineError, Value};
 use contextdb_engine::{Database, natural_key_columns_for_meta};
 
 const SETTINGS_DDL: &str = "CREATE TABLE vigil_settings (name TEXT PRIMARY KEY, requested TEXT, source TEXT) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
@@ -765,6 +765,26 @@ const CONSUMER_TABLES_AS_SHIPPED: &[(&str, &str)] = &[
 /// here rather than on a consumer's second start.
 const EVERY_CLAUSE_DDL: &str = "CREATE TABLE vigil_every_clause (id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE, weight REAL DEFAULT 1.0, tags JSON, seen TIMESTAMP, embedding VECTOR(4) WITH (quantization = 'SQ8'), holder TEXT CONTEXT_ID, scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('server'), UNIQUE (name, holder)) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP LATEST HISTORY CURRENT ONLY";
 
+const CUSTODY_POLICY_DDL: &str = "CREATE TABLE vigil_custody (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER vigil_custody_parts EDGE DISCARD AFTER OUTCOME";
+
+fn custody_drift_refusal(
+    dir: &tempfile::TempDir,
+    created_with: &str,
+    reopened_with: &str,
+) -> (String, String) {
+    let store = open_with(config(dir), schema_with("vigil_custody", created_with))
+        .expect("the earlier custody declaration creates the table");
+    drop(store);
+
+    let err = open_with(config(dir), schema_with("vigil_custody", reopened_with)).expect_err(
+        "a custody declaration that no longer describes the table in the store must be refused",
+    );
+    match err {
+        CgError::ConsumerTableDrifted { table, mismatch } => (table, mismatch),
+        other => panic!("custody declaration drift must be refused by name, got {other:?}"),
+    }
+}
+
 fn reopens_cleanly(schema: ConsumerSchema) {
     let dir = tempfile::tempdir().expect("consumer tempdir");
     drop(open_with(config(&dir), schema.clone()).expect("first open creates the declared tables"));
@@ -792,6 +812,59 @@ fn the_declarations_the_settings_consumer_ships_reopen_the_store_they_created() 
 #[test]
 fn a_declaration_carrying_every_clause_the_check_compares_reopens_the_table_it_created() {
     reopens_cleanly(schema_with("vigil_every_clause", EVERY_CLAUSE_DDL));
+}
+
+#[test]
+fn a_declaration_carrying_custody_policies_reopens_with_the_engine_metadata_it_declared() {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let schema = schema_with("vigil_custody", CUSTODY_POLICY_DDL);
+    let store = open_with(config(&dir), schema.clone()).expect("create the custody declaration");
+    let meta = store
+        .sync_database()
+        .table_meta("vigil_custody")
+        .expect("the consumer custody table exists");
+
+    assert_eq!(
+        Some(vec!["vigil_custody_parts".to_string()]),
+        meta.delivery_manifest_tables,
+        "the engine metadata must retain every manifest member the consumer declared"
+    );
+    assert_eq!(
+        Some(EdgeDiscardMode::AfterOutcome),
+        meta.edge_discard,
+        "the engine metadata must retain the consumer's edge discard policy"
+    );
+    drop(store);
+
+    open_with(config(&dir), schema)
+        .expect("the declaration that created custody policy metadata reopens the same table");
+}
+
+#[test]
+fn a_declaration_that_changes_delivery_manifest_members_is_refused_on_the_existing_consumer_table()
+{
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let changed = "CREATE TABLE vigil_custody (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER vigil_custody_parts, vigil_custody_attachments EDGE DISCARD AFTER OUTCOME";
+    let (table, mismatch) = custody_drift_refusal(&dir, CUSTODY_POLICY_DDL, changed);
+
+    assert_eq!("vigil_custody", table);
+    assert!(
+        mismatch.contains("delivery manifest tables"),
+        "the refusal must name the manifest membership that differs: {mismatch}"
+    );
+}
+
+#[test]
+fn a_declaration_that_changes_edge_discard_policy_is_refused_on_the_existing_consumer_table() {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let changed = "CREATE TABLE vigil_custody (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER vigil_custody_parts EDGE DISCARD NEVER";
+    let (table, mismatch) = custody_drift_refusal(&dir, CUSTODY_POLICY_DDL, changed);
+
+    assert_eq!("vigil_custody", table);
+    assert!(
+        mismatch.contains("edge discard"),
+        "the refusal must name the discard policy that differs: {mismatch}"
+    );
 }
 
 /// The clauses the engine records somewhere other than the column list — a state

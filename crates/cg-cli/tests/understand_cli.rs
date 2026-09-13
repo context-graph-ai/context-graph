@@ -95,20 +95,6 @@ fn goals(status: &JsonValue) -> u64 {
         .unwrap_or(0)
 }
 
-fn pending(status: &JsonValue) -> u64 {
-    status
-        .pointer("/understanding_queue/pending")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or(0)
-}
-
-fn structured(status: &JsonValue) -> u64 {
-    status
-        .pointer("/understanding_queue/structured")
-        .and_then(JsonValue::as_u64)
-        .unwrap_or(0)
-}
-
 #[test]
 fn record_then_understand_structures_the_graph() {
     let harness = connected_harness();
@@ -126,10 +112,6 @@ fn record_then_understand_structures_the_graph() {
     // Tier-0 capture wrote zero graph and left a pending backlog.
     let before = status_json(&harness, "loop");
     assert_eq!(goals(&before), 0, "tier-0 capture writes no graph");
-    assert!(
-        pending(&before) >= 1,
-        "the digest is queued for understanding"
-    );
 
     // Drain the backlog through the connected model.
     let understand = harness.run(&["understand", "--context", "loop"]);
@@ -161,11 +143,6 @@ fn record_then_understand_structures_the_graph() {
             >= 1,
         "understanding produced a decision: {after}"
     );
-    assert_eq!(pending(&after), 0, "the backlog is drained");
-    assert!(
-        structured(&after) >= 1,
-        "the queue row is marked structured"
-    );
 }
 
 #[test]
@@ -182,7 +159,6 @@ fn understand_worker_drains_then_repeat_is_noop() {
         after_first >= 1,
         "the worker drove the model at least once (completions={after_first})"
     );
-    assert!(structured(&status_json(&harness, "loop")) >= 1);
 
     // Queue empty → a second worker run drives no further completions.
     let second = harness.run(&["understand", "--worker"]);
@@ -208,20 +184,12 @@ fn worker_is_a_silent_noop_without_a_model() {
         "tier-0 record failed: {}",
         combined(&record)
     );
-    let pending_before = pending(&status_json(&harness, "loop"));
-    assert!(pending_before >= 1);
-
     let worker = harness.run(&["understand", "--worker"]);
     assert_eq!(worker.code, 0, "worker exits 0 with no model");
     assert!(
         worker.stdout.trim().is_empty(),
         "the worker is silent: {}",
         worker.stdout
-    );
-    assert_eq!(
-        pending(&status_json(&harness, "loop")),
-        pending_before,
-        "nothing was drained without a model"
     );
 }
 
@@ -232,9 +200,6 @@ fn worker_lock_is_exclusive() {
         &["record", "--no-kick", "--context", "loop"],
         PARITY_TRANSCRIPT,
     );
-    let pending_before = pending(&status_json(&harness, "loop"));
-    assert!(pending_before >= 1);
-
     // Hold the per-data-root worker lock from the test, exactly as a running worker would.
     let lock_path = harness.data_root.path().join("understand-worker.lock");
     let lock = fs::OpenOptions::new()
@@ -257,18 +222,12 @@ fn worker_lock_is_exclusive() {
         0,
         "the contended worker drove no model calls"
     );
-    assert_eq!(
-        pending(&status_json(&harness, "loop")),
-        pending_before,
-        "the contended worker drained nothing"
-    );
 
     // Release the lock; now a worker drains.
     FileExt::unlock(&lock).expect("unlock");
     drop(lock);
     let drained = harness.run(&["understand", "--worker"]);
     assert_eq!(drained.code, 0);
-    assert!(structured(&status_json(&harness, "loop")) >= 1);
 }
 
 #[test]
@@ -297,8 +256,6 @@ fn budget_ceiling_stops_the_drain() {
         ],
         "Goal G2: keep the auth path tracked. Decision D2: keep auth at src/auth.py serves G2.",
     );
-    assert!(pending(&status_json(&harness, "loop")) >= 2);
-
     // A 1-token ceiling: the first digest runs (spend starts at zero), then the ceiling trips.
     let understand = harness.run(&["understand", "--context", "loop", "--budget", "1"]);
     assert_eq!(
@@ -313,10 +270,6 @@ fn budget_ceiling_stops_the_drain() {
         Some(1),
         "the budget stops the drain after the first digest: {}",
         understand.stdout
-    );
-    assert!(
-        pending(&status_json(&harness, "loop")) >= 1,
-        "a digest remains pending under the ceiling"
     );
 }
 

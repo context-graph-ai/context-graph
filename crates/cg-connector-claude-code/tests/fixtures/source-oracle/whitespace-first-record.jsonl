@@ -1,0 +1,3 @@
+ 	 
+
+{"type":"user","uuid":"40000000-0000-4000-8000-000000000001","sessionId":"synthetic-session-whitespace","timestamp":"2026-09-04T09:00:00Z","message":{"id":"first-after-whitespace","role":"user","content":"The first record follows an unchanged whitespace prefix."}}

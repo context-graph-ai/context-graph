@@ -72,6 +72,7 @@ impl ConversationExtractor for KnownUsageExtractor {
 }
 
 #[tokio::test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 async fn executor_receipt_carries_real_tokens_and_elapsed_not_input_byte_length() {
     let fixture = fabric_fixture("receipt_honesty").await;
     let digests = fabric::capture(

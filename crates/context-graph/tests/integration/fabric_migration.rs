@@ -186,15 +186,17 @@ fn old_schema_ten_root_is_refused_without_data_loss() {
         db_path: path.clone(),
         ..Default::default()
     });
+    // The binary's own schema version moved past 11 when event capture reserved the next one
+    // (cg-event-backed-import intent §6); the refusal names whatever version this binary expects.
     assert!(
         matches!(
             result,
             Err(CgError::LegacySchemaDetected {
                 found_version: 10,
-                expected_version: 11,
-            })
+                expected_version,
+            }) if expected_version == context_graph::CG_SCHEMA_VERSION
         ),
-        "opening a genuine schema-10 root under the schema-11 binary yields the typed legacy-schema error, not a crash or wipe: {result:?}"
+        "opening a genuine schema-10 root under the current binary yields the typed legacy-schema error, not a crash or wipe: {result:?}"
     );
 
     let raw = Database::open(&path).expect("raw database open after refused schema-11 open");

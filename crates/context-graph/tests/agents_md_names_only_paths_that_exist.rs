@@ -109,3 +109,125 @@ fn every_path_the_root_agents_file_names_is_in_the_tree() {
         checked.len()
     );
 }
+
+/// The crate table routes a contributor to the crate that owns a change, so a crate missing from
+/// it is unreachable through the one document a fresh reader is handed — and a row naming a
+/// directory that is gone sends them nowhere. Neither shows up in the existence walk above: that
+/// one reads the guide and checks the tree, and nothing reads the tree and checks the guide.
+#[test]
+fn the_root_crate_table_names_every_crate_in_the_tree_and_no_directory_that_is_not_one() {
+    let root = repository_root();
+    let agents = std::fs::read_to_string(root.join("AGENTS.md")).expect("root AGENTS.md readable");
+
+    let mut named: Vec<String> = Vec::new();
+    for span in backticked_spans(&agents) {
+        let candidate = without_line_citation(span);
+        let Some(rest) = candidate.strip_prefix("crates/") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix('/') else {
+            continue;
+        };
+        if name.is_empty() || name.contains('/') || named.iter().any(|seen| seen == name) {
+            continue;
+        }
+        named.push(name.to_string());
+    }
+    named.sort();
+
+    let mut in_tree: Vec<String> = std::fs::read_dir(root.join("crates"))
+        .expect("crates directory readable")
+        .filter_map(|entry| {
+            let entry = entry.expect("crates directory entry readable");
+            let path = entry.path();
+            (path.join("Cargo.toml").exists())
+                .then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    in_tree.sort();
+
+    let unlisted: Vec<&String> = in_tree
+        .iter()
+        .filter(|name| !named.contains(name))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "the crate table in AGENTS.md names no row for {unlisted:?}. A contributor routed by that          table cannot reach a crate it does not mention, so a new crate joins the table in the          change that adds it. Named: {named:?}"
+    );
+
+    let phantom: Vec<&String> = named
+        .iter()
+        .filter(|name| !in_tree.contains(name))
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "the crate table in AGENTS.md names {phantom:?}, which is not a crate in `crates/`. A row          for a crate that is gone routes a reader to nothing. In the tree: {in_tree:?}"
+    );
+}
+
+/// The three crates a contributor is routed to by name for the work that arrives most often —
+/// store and ontology behavior, a command or its output, a model registration or connection —
+/// each carry their own guide. A contributor sent to one of them finds the invariants of the crate
+/// they are about to edit in that crate, not only in the root guide, because a rule kept one level
+/// away from the code it governs is a rule a reader has to already know exists.
+#[test]
+fn the_crates_a_contributor_is_routed_to_by_name_carry_their_own_agent_guide() {
+    let root = repository_root();
+    for crate_name in ["context-graph", "cg-catalog", "cg-cli"] {
+        let path = root.join("crates").join(crate_name).join("AGENTS.md");
+        assert!(
+            path.exists(),
+            "crates/{crate_name}/AGENTS.md must exist: a contributor to {crate_name} deserves the \
+             same routing and invariant guide a contributor to context-graph already has at \
+             crates/context-graph/AGENTS.md"
+        );
+    }
+}
+
+/// The pointer-existence rule this file enforces for the root `AGENTS.md` must hold for every
+/// crate guide, not only the root one — a crate guide's own stale pointer is exactly as costly to
+/// its reader.
+#[test]
+fn every_path_every_crate_agents_file_names_is_in_the_tree() {
+    let root = repository_root();
+    let crates_dir = root.join("crates");
+    let mut total_checked = 0usize;
+    for entry in std::fs::read_dir(&crates_dir)
+        .expect("crates/ directory must exist")
+        .flatten()
+    {
+        let crate_dir = entry.path();
+        if !crate_dir.is_dir() {
+            continue;
+        }
+        let agents_path = crate_dir.join("AGENTS.md");
+        if !agents_path.exists() {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&agents_path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", agents_path.display()));
+        for span in backticked_spans(&contents) {
+            let candidate = without_line_citation(span);
+            if !looks_like_a_repository_path(candidate) {
+                continue;
+            }
+            let trimmed = candidate.trim_end_matches('/');
+            // A crate guide names its own paths crate-relative (`src/embedder.rs`) or
+            // repository-relative (`crates/context-graph/src/embedder.rs`); either resolves.
+            let resolves = crate_dir.join(trimmed).exists() || root.join(trimmed).exists();
+            assert!(
+                resolves,
+                "{} sends a contributor to `{candidate}`, which is not in the tree (checked \
+                 relative to the crate and to the repository root). Repoint it or drop it.",
+                agents_path.display()
+            );
+            total_checked += 1;
+        }
+    }
+    assert!(
+        total_checked > 0,
+        "at least one crate AGENTS.md must exist and name at least one repository path to check \
+         (found {total_checked}) — every crate this change touches gets a guide that routes to \
+         real files"
+    );
+}

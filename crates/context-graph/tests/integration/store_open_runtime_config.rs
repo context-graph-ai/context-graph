@@ -736,9 +736,7 @@ fn expected_embedding_for_text(model_dir: &Path, text: &str) -> (Vec<u32>, Vec<f
         .encode(text, false)
         .expect("fixture tokenization")
         .get_ids()
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
+        .to_vec();
     let token_indexes = token_ids.iter().map(|id| *id as usize).collect::<Vec<_>>();
     let weights = mini_weights_from_safetensors(&model_dir.join("model.safetensors"));
     let vector = normalized_768(&candle_mini_gemma_golden_projection(

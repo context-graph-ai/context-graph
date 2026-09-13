@@ -805,6 +805,14 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
         "let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));",
         "let mut guard = registry.lock().expect(\"store registry lock\");",
         "let _outcome_guard = self.outcome_mutex.lock().expect(\"outcome mutex poisoned\");",
+        "use std::sync::{Arc, Mutex};",
+        // `ConsumerReader` keeps its one read session behind a per-reader mutex so the session
+        // can be replaced in place when the store's owner changes hands. It is that reader's own
+        // session, never shared between readers, and it serializes no evidence or decision write.
+        "use std::sync::{Arc, Mutex, PoisonError};",
+        "session: Mutex<ReadSession>,",
+        "session: Mutex::new(session),",
+        "let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);",
     ];
     let forbidden = [
         "Mutex",
@@ -832,12 +840,35 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("core source");
+        // Sanctioned: `src/store/event_correlation.rs` (the correlation proof observer) and
+        // `src/store/event_search_projection.rs` (the finalization pause) each keep one test hook
+        // in a `thread_local!` slot that only `context_graph_internal_test_support` builds compile.
+        // A hook acts on the production path on that one test thread; it holds no product state,
+        // serializes no contention, and no default build contains it.
+        let sanctioned_test_hook_slot = file == crate_dir.join("src/store/event_correlation.rs")
+            || file == crate_dir.join("src/store/event_search_projection.rs");
+        // Sanctioned: `src/store/mod.rs` serializes schema installation inside one process with
+        // `SCHEMA_INSTALL_LOCK`, the process-local role the store `REGISTRY` already plays: store
+        // handles on one path share one Database, and two of them must not interleave DDL. It
+        // guards bootstrap and authenticated schema installation only, never an evidence or
+        // decision write. A bare `.lock()` line is sanctioned only directly after its receiver.
+        let store_module = file == crate_dir.join("src/store/mod.rs");
+        let mut previous = "";
         for line in text.lines() {
             let trimmed = line.trim();
+            let after = std::mem::replace(&mut previous, trimmed);
+            let sanctioned_schema_install_lock = store_module
+                && (trimmed
+                    == "static SCHEMA_INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();"
+                    || trimmed == ".get_or_init(|| Mutex::new(()))"
+                    || (trimmed == ".lock()"
+                        && (after == ".get_or_init(|| Mutex::new(()))" || after == "registry")));
             let global_hash_state = trimmed.contains("static ")
                 && (trimmed.contains("HashMap") || trimmed.contains("BTreeMap"));
             if (global_hash_state || forbidden.iter().any(|forbidden| line.contains(forbidden)))
                 && !allowed_lines.iter().any(|allowed| line.trim() == *allowed)
+                && !(sanctioned_test_hook_slot && trimmed == "thread_local! {")
+                && !sanctioned_schema_install_lock
             {
                 panic!(
                     "{context}: core source must not serialize evidence/decision contention or hold product state with app-side globals in {}: {line}",
@@ -870,11 +901,20 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
             // Telling a caller's observer what a bounded database read did is not fetching bytes
             // off a disk; it is the status totals reporting their own cost.
             let allowed_read_observation = trimmed.contains("observer.read(");
+            // Sanctioned: `src/store/event_import.rs` hashes the committed prefix of the
+            // caller-owned `SeekableEventSource` the public import and prefix-check calls are
+            // handed. Core reads only that reader; it never opens, reopens or dereferences a path
+            // or source ref, so no byte arrives from anywhere the caller did not give it.
+            let allowed_caller_reader = file == crate_dir.join("src/store/event_import.rs")
+                && trimmed == ".read(&mut buffer[..wanted])";
             // Asking the already-open read session for a typed metadata answer is a database
-            // read, not a filesystem probe.
+            // read, not a filesystem probe — whether directly or through the reader's
+            // `raw_metadata`, which only re-asks the same session after an owner hand-over.
             let allowed_session_metadata = file == crate_dir.join("src/consumer_read.rs")
                 && (trimmed == ".metadata("
-                    || trimmed == ".metadata(MetadataRequest::Tables, continuation.as_deref())");
+                    || trimmed == ".metadata(MetadataRequest::Tables, continuation.as_deref())"
+                    || trimmed.contains("raw_metadata(")
+                    || trimmed.contains("session.metadata("));
             for forbidden in [
                 "std::fs",
                 "fs::read",
@@ -898,7 +938,8 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
                     !trimmed.contains(forbidden)
                         || allowed_store_rebuild
                         || allowed_read_observation
-                        || allowed_session_metadata,
+                        || allowed_session_metadata
+                        || allowed_caller_reader,
                     "core source must not fetch or probe evidence bytes in {}: {line}",
                     file.display()
                 );

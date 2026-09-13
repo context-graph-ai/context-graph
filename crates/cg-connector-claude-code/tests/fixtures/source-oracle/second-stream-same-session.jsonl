@@ -1,0 +1,1 @@
+{"type":"user","uuid":"10000000-0000-4000-8000-000000000001","sessionId":"synthetic-session-amber","timestamp":"2026-09-01T10:00:00Z","message":{"id":"second-stream-1","role":"user","content":"A second selected stream shares this session identifier but has its own source checkpoint."}}

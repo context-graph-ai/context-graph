@@ -113,6 +113,7 @@ fn record(
     let evidence_id = match embedding.target {
         EmbeddingTarget::Evidence(id) => id,
         EmbeddingTarget::EntityReference(_, _) | EmbeddingTarget::Digest(_) => EvidenceId::new_v7(),
+        EmbeddingTarget::EventSearchPassage(_) => EvidenceId::new_v7(),
     };
     fixture.store.record_observation(RecordObservation {
         id: context_graph::ObservationId::new_v7(),

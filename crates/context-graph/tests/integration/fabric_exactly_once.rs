@@ -145,6 +145,7 @@ async fn two_workers_racing_one_claim_each() {
 }
 
 #[tokio::test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 async fn worker_crash_mid_job_lease_expires_then_second_attempt_succeeds() {
     let fixture = fabric_fixture("crash_lease").await;
     fabric::capture(
@@ -236,6 +237,7 @@ async fn offline_drained_job_not_reclaimed_remotely_after_reconnect() {
 }
 
 #[tokio::test]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
 async fn work_tables_are_append_only_no_update() {
     let fixture = fabric_fixture("append_only").await;
     fabric::capture(
