@@ -36,13 +36,15 @@ use std::collections::{BTreeMap, HashSet};
 
 use contextdb_core::{
     ColumnDef as StoredColumn, ColumnType, DEFAULT_VECTOR_MAX_PARTITIONS, Direction,
-    PropagationRule, ScopeLabelKind, TableMeta, VectorQuantization, VectorSearchMode,
+    MaintainedCounts, PropagationRule, ScopeLabelKind, TableMeta, VectorQuantization,
+    VectorSearchMode,
 };
 use contextdb_engine::Database;
 use contextdb_parser::ast::{
     AstPropagationRule as DeclaredPropagationRule, ColumnDef as DeclaredColumn, CreateTable,
-    DataType, ScopeLabelConstraint, Statement as ParsedStatement,
-    VectorQuantization as DeclaredQuantization, VectorSearchMode as DeclaredSearchMode,
+    DataType, MaintainedCountsDecl, ScopeLabelConstraint, SortDirection as DeclaredSortDirection,
+    Statement as ParsedStatement, VectorQuantization as DeclaredQuantization,
+    VectorSearchMode as DeclaredSearchMode,
 };
 
 use crate::Result;
@@ -295,7 +297,7 @@ pub(super) fn validate_present_consumer_tables(
 /// depth and abort-on-failure, and the foreign-key rules written inside a
 /// column's own `REFERENCES` clause), `RETAIN` (window, declared unit and
 /// `SYNC SAFE`), `SYNC` direction, `SYNC CONFLICT`, `HISTORY`, `DELIVERY
-/// MANIFEST` membership and `EDGE DISCARD` policy.
+/// MANIFEST` membership, `EDGE DISCARD` policy and `MAINTAIN COUNT` policy.
 ///
 /// **Not compared, and why:** a column `DEFAULT` and a `RANK POLICY` are stored
 /// in a form the engine derives from the expression, and the engine does not
@@ -350,6 +352,7 @@ fn table_mismatches(declared: &CreateTable, existing: &TableMeta) -> Vec<String>
         history,
         delivery_manifest_tables,
         edge_discard,
+        maintained_counts,
     } = declared;
 
     let mut mismatches = Vec::new();
@@ -497,7 +500,64 @@ fn table_mismatches(declared: &CreateTable, existing: &TableMeta) -> Vec<String>
         ));
     }
 
+    let declared_maintained_counts = maintained_counts
+        .as_ref()
+        .map(core_maintained_counts_of_declaration);
+    if declared_maintained_counts.as_ref() != existing.maintained_counts.as_ref() {
+        mismatches.push(format!(
+            "MAINTAIN COUNT: declared {declared_maintained_counts:?}, stored {:?}",
+            existing.maintained_counts
+        ));
+    }
+
     mismatches
+}
+
+/// The engine's own projection of a `MAINTAIN COUNT` declaration, the same one
+/// `CREATE TABLE` applies when it persists the table: undeclared (`None`) on
+/// both sides is silence, not [`contextdb_core::DEFAULT_MAINTAINED_COUNTS`],
+/// so an undeclared table always compares equal to itself. `DEFAULT` never
+/// reaches a `CreateTable` — the parser refuses it there, only an `ALTER`
+/// clears a declaration with it — so this never has to render one.
+fn core_maintained_counts_of_declaration(declared: &MaintainedCountsDecl) -> MaintainedCounts {
+    match declared {
+        MaintainedCountsDecl::None => MaintainedCounts::None,
+        MaintainedCountsDecl::AllPrefixes => MaintainedCounts::AllPrefixes,
+        MaintainedCountsDecl::Lists(lists) => MaintainedCounts::Lists(
+            lists
+                .iter()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|(column, direction)| {
+                            (
+                                column.clone(),
+                                core_sort_direction_of_declaration(*direction),
+                            )
+                        })
+                        .collect()
+                })
+                .collect(),
+        ),
+        MaintainedCountsDecl::Default => unreachable!(
+            "a CreateTable never carries MAINTAIN COUNT DEFAULT; the parser refuses it there"
+        ),
+    }
+}
+
+/// A `MAINTAIN COUNT` column list only ever carries `ASC`/`DESC`; a
+/// `CosineDistance` direction cannot reach this position through the grammar
+/// that builds it.
+fn core_sort_direction_of_declaration(
+    direction: DeclaredSortDirection,
+) -> contextdb_core::SortDirection {
+    match direction {
+        DeclaredSortDirection::Asc => contextdb_core::SortDirection::Asc,
+        DeclaredSortDirection::Desc => contextdb_core::SortDirection::Desc,
+        DeclaredSortDirection::CosineDistance => {
+            unreachable!("a MAINTAIN COUNT column list never carries a cosine-distance direction")
+        }
+    }
 }
 
 fn column_mismatches(
@@ -848,6 +908,159 @@ fn stored_propagation_rule(rule: &PropagationRule) -> String {
         ),
         PropagationRule::VectorExclusion { trigger_state } => {
             format!("vector exclusion {trigger_state}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod the_event_tables_declare_the_counts_their_reads_ask_for {
+    use super::verify_existing_table;
+    use crate::schema::{
+        EVENT_ANCHORS_LOCAL_DDL, EVENT_LOCAL_COMMITS_DDL, EVENTS_LOCAL_DDL, LOCAL_DERIVED_TABLES,
+        LOCAL_RUNTIME_TABLES, TABLES,
+    };
+    use contextdb_engine::Database;
+
+    /// The events declaration with its maintained-count clause taken off — what a store built
+    /// before this schema declared one holds. Greenfield: such a store is moved aside and
+    /// recreated, and this is the comparison that has to say so rather than run on it silently.
+    pub(super) fn without_the_clause(ddl: &str) -> String {
+        let (head, clause) = ddl
+            .split_once(" MAINTAIN COUNT ")
+            .expect("every event table declares a maintained-count policy");
+        assert!(
+            !clause.contains(')') || clause.starts_with('('),
+            "the clause is the tail of the declaration"
+        );
+        head.to_string()
+    }
+
+    /// The event tables reference the Context they belong to and the event they hang off, so the
+    /// parents go in first and the table under test replaces its own shipped declaration.
+    pub(super) fn shipped_ddl(name: &str) -> &'static str {
+        TABLES
+            .iter()
+            .chain(LOCAL_DERIVED_TABLES)
+            .chain(LOCAL_RUNTIME_TABLES)
+            .find(|table| table.name == name)
+            .map(|table| table.ddl)
+            .unwrap_or_else(|| panic!("{name} is a shipped table"))
+    }
+
+    pub(super) fn stored_meta(ddl: &str, table: &str) -> contextdb_core::TableMeta {
+        let db = Database::open(":memory:").expect("a scratch store to install the table in");
+        let empty = std::collections::HashMap::new();
+        let parents = [
+            ("contexts", shipped_ddl("contexts")),
+            ("entities", shipped_ddl("entities")),
+            ("intentions", shipped_ddl("intentions")),
+            ("decisions", shipped_ddl("decisions")),
+            ("observations", shipped_ddl("observations")),
+            (
+                "adapter_coverage_gaps",
+                shipped_ddl("adapter_coverage_gaps"),
+            ),
+            ("events", EVENTS_LOCAL_DDL),
+            ("event_anchors", EVENT_ANCHORS_LOCAL_DDL),
+            ("event_local_commits", EVENT_LOCAL_COMMITS_DDL),
+        ];
+        for (name, shipped) in parents {
+            let text = if name == table { ddl } else { shipped };
+            db.execute(text, &empty)
+                .unwrap_or_else(|error| panic!("install {name}: {error}"));
+            if name == table {
+                break;
+            }
+        }
+        db.table_meta(table).expect("the table was installed")
+    }
+
+    pub(super) fn mismatch(declared: &str, stored_ddl: &str, table: &str) -> String {
+        let stored = stored_meta(stored_ddl, table);
+        match verify_existing_table(table, declared, &stored) {
+            Err(crate::error::CgError::ConsumerTableDrifted { mismatch, .. }) => mismatch,
+            other => panic!("the comparison accepted a table it should have refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_store_whose_events_table_predates_the_declaration_is_named_as_no_longer_matching() {
+        let reported = mismatch(
+            EVENTS_LOCAL_DDL,
+            &without_the_clause(EVENTS_LOCAL_DDL),
+            "events",
+        );
+        assert!(
+            reported.contains("MAINTAIN COUNT"),
+            "a store that keeps no total for the counts these reads issue must be named as such, \
+             not run on silently: {reported}"
+        );
+    }
+
+    #[test]
+    fn a_store_whose_anchor_tables_predate_the_declaration_are_named_as_no_longer_matching() {
+        for (declared, table) in [
+            (EVENT_ANCHORS_LOCAL_DDL, "event_anchors"),
+            (EVENT_LOCAL_COMMITS_DDL, "event_local_commits"),
+        ] {
+            let reported = mismatch(declared, &without_the_clause(declared), table);
+            assert!(
+                reported.contains("MAINTAIN COUNT"),
+                "{table}: declaring that no total is kept is a declaration like any other, and a \
+                 store that never recorded it is a different store: {reported}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_event_declarations_match_the_tables_they_create() {
+        for (ddl, table) in [
+            (EVENTS_LOCAL_DDL, "events"),
+            (EVENT_ANCHORS_LOCAL_DDL, "event_anchors"),
+            (EVENT_LOCAL_COMMITS_DDL, "event_local_commits"),
+        ] {
+            verify_existing_table(table, ddl, &stored_meta(ddl, table)).unwrap_or_else(|error| {
+                panic!("{table} must reopen on the declaration that created it: {error}")
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod the_tables_a_status_read_counts_declare_the_total_it_asks_for {
+    use super::the_event_tables_declare_the_counts_their_reads_ask_for::{
+        mismatch, shipped_ddl, stored_meta, without_the_clause,
+    };
+    use super::verify_existing_table;
+
+    /// Every table whose `(context_id)` total a read asks for, and which therefore declares one.
+    const DECLARED_FOR_A_READ: [&str; 4] = [
+        "intentions",
+        "decisions",
+        "observations",
+        "adapter_coverage_gaps",
+    ];
+
+    #[test]
+    fn a_store_whose_counted_tables_predate_the_declaration_is_named_as_no_longer_matching() {
+        for table in DECLARED_FOR_A_READ {
+            let declared = shipped_ddl(table);
+            let reported = mismatch(declared, &without_the_clause(declared), table);
+            assert!(
+                reported.contains("MAINTAIN COUNT"),
+                "{table}: a store that keeps no total for the count a status read issues must be \
+                 named as such, not run on silently: {reported}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_declarations_match_the_tables_they_create() {
+        for table in DECLARED_FOR_A_READ {
+            let ddl = shipped_ddl(table);
+            verify_existing_table(table, ddl, &stored_meta(ddl, table)).unwrap_or_else(|error| {
+                panic!("{table} must reopen on the declaration that created it: {error}")
+            });
         }
     }
 }

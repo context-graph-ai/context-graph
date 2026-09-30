@@ -72,7 +72,7 @@ fn typed_import_errors_explain_the_failure_boundary_and_next_step() {
         &[
             "requires tenant hub, but the store is configured for local only",
             "made no placement change",
-            "rather than treating this as a migration",
+            "and retry the import",
         ],
         "EventPlacementPolicyMismatch",
     );

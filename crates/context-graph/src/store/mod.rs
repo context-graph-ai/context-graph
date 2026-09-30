@@ -25,6 +25,7 @@ pub(crate) mod intention;
 pub(crate) mod interpretation_build;
 mod invalidation_lifecycle;
 pub(crate) mod observation;
+pub(crate) mod open_retry;
 mod outcome;
 mod precedent_match;
 mod reindex;
@@ -51,7 +52,8 @@ use crate::error::CgError;
 use crate::owner_control::{ControlHandler, writable_owner_read_config};
 use crate::schema::{
     ENTITY_REFERENCE_EMBEDDING_TABLE_PREFIX, EVENT_TABLE_NAMES, INDEXES, LOCAL_DERIVED_INDEXES,
-    LOCAL_DERIVED_TABLES, LOCAL_RUNTIME_TABLES, SUBSCRIPTION_EVENT_TYPE_DDL, TABLES,
+    LOCAL_DERIVED_TABLES, LOCAL_RUNTIME_TABLES, STORE_TRIGGER_DDL, SUBSCRIPTION_EVENT_TYPE_DDL,
+    TABLES,
 };
 use crate::types::*;
 use crate::{Embedder, EmbedderRegistration};
@@ -67,9 +69,24 @@ pub use self::event_correlation::{
     EventCorrelationObservationGuard, EventCorrelationTestObserver,
     observe_public_store_resolver_for_test,
 };
-#[cfg(context_graph_internal_test_support)]
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 #[doc(hidden)]
 pub use self::event_search_projection::pause_next_event_search_finalization_for_test;
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub use self::event_search_projection::{
+    EventSearchDiscoveryObservation,
+    after_next_event_search_attempt_commit_before_readback_for_test,
+    after_next_event_search_completion_commit_before_readback_for_test,
+    before_next_event_search_attempt_commit_for_test,
+    before_next_event_search_completion_commit_for_test,
+    before_next_event_search_failure_record_for_test,
+    clear_event_search_discovery_observations_for_test,
+    event_search_discovery_observations_for_test, event_search_store_opens_for_test,
+    fail_next_event_search_membership_capture_for_test,
+    fail_next_event_search_membership_capture_with_error_for_test,
+    take_event_search_membership_captures_for_test,
+};
 // The read door holds a declaration to the persisted table too, and must decide that the same way
 // this door does: one conversion from declared text to the store's own scope vocabulary.
 pub(crate) use self::consumer_tables::scope_label_kind;
@@ -176,6 +193,8 @@ impl StoreReadObserver for StoreReadProbe {
 /// the lock — route the request to the owner.
 #[derive(Clone)]
 pub struct Store {
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+    read_active_time_ms: std::num::NonZeroU64,
     db_path: PathBuf,
     db: Arc<Database>,
     resource_owner: Option<Arc<Database>>,
@@ -389,7 +408,7 @@ impl Store {
         Self::open_with_config_inner(config, false, Some(contexts))
     }
 
-    #[cfg(context_graph_internal_test_support)]
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     pub fn open_with_database_plugin(
         config: StoreConfig,
         plugin: Arc<dyn DatabasePlugin>,
@@ -405,7 +424,7 @@ impl Store {
         )
     }
 
-    #[cfg(context_graph_internal_test_support)]
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     pub fn open_with_consumer_schema_and_database_plugin(
         config: StoreConfig,
         consumer_schema: ConsumerSchema,
@@ -422,7 +441,7 @@ impl Store {
         )
     }
 
-    #[cfg(context_graph_internal_test_support)]
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     pub fn open_with_database_plugin_and_embedder_registrations(
         config: StoreConfig,
         plugin: Arc<dyn DatabasePlugin>,
@@ -555,6 +574,8 @@ impl Store {
             &consumer_schema,
         )?;
         let store = Self {
+            read_memory_limit_bytes: config.read_memory_limit_bytes,
+            read_active_time_ms: config.read_active_time_ms,
             db_path,
             db,
             resource_owner,
@@ -577,6 +598,14 @@ impl Store {
         };
         store.set_trace(loader_trace);
         Ok(store)
+    }
+
+    /// Effective read ceilings for this Store, including shared database handles.
+    pub(crate) fn read_limits(&self) -> contextdb_engine::ReadLimits {
+        crate::owner_control::context_graph_read_limits_with_budgets(
+            self.read_memory_limit_bytes,
+            self.read_active_time_ms,
+        )
     }
 
     pub fn db_path(&self) -> &Path {
@@ -800,7 +829,7 @@ impl Store {
         self
     }
 
-    #[cfg(context_graph_internal_test_support)]
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     pub fn execute_sql_for_test(
         &self,
         sql: &str,
@@ -809,7 +838,7 @@ impl Store {
         self.db.execute(sql, params).map_err(map_engine_err)
     }
 
-    #[cfg(context_graph_internal_test_support)]
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     pub fn evidence_vector_visibility_counts_for_test(
         &self,
         evidence_ids: &[uuid::Uuid],
@@ -918,7 +947,7 @@ fn maybe_register_default_text_embedder(
 impl graph_rows::GraphRows for Store {
     fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         self.require_application_ready()?;
-        self.db.execute(sql, params).map_err(map_engine_err)
+        self.read_query(sql, params)
     }
 }
 
@@ -936,7 +965,10 @@ pub(crate) struct DatabaseOpenExtras {
 }
 
 impl DatabaseOpenExtras {
-    #[cfg(any(test, context_graph_internal_test_support))]
+    #[cfg(any(
+        test,
+        any(context_graph_internal_test_support, feature = "test-support")
+    ))]
     pub(crate) fn with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Self {
         Self {
             plugin: Some(plugin),
@@ -968,9 +1000,21 @@ impl DatabaseOpenExtras {
         self.plugin.is_none() && self.owner_control.is_none()
     }
 
-    fn open_options(&self) -> DatabaseOpenOptions {
+    /// `read_memory_limit` bounds what one owner read may hold, and `read_active_time_ms` bounds
+    /// one statement's active work; `write_memory_limit` is the whole
+    /// handle's working-memory ceiling, so a write that cannot fit is refused in words instead of
+    /// the kernel killing cg part-way through it. The write ceiling is an OPEN option and is never
+    /// written into the store: it describes the machine cg is running on right now, and the same
+    /// store opened on a smaller machine gets that machine's number.
+    fn open_options(
+        &self,
+        read_memory_limit: std::num::NonZeroUsize,
+        read_active_time_ms: std::num::NonZeroU64,
+        write_memory_limit: std::num::NonZeroUsize,
+    ) -> DatabaseOpenOptions {
         let mut options = DatabaseOpenOptions {
             open_disposition: self.open_disposition,
+            memory_limit: Some(write_memory_limit.get()),
             ..DatabaseOpenOptions::default()
         };
         if let Some(plugin) = self.plugin.clone() {
@@ -978,7 +1022,11 @@ impl DatabaseOpenExtras {
         }
         // Every writable open serves owner reads, so a read-only client is answered while a worker
         // or an import holds the store; the handler only adds administrative frames.
-        options.owner_reads = writable_owner_read_config(self.owner_control.clone());
+        options.owner_reads = writable_owner_read_config(
+            self.owner_control.clone(),
+            read_memory_limit,
+            read_active_time_ms,
+        );
         options
     }
 
@@ -1004,24 +1052,30 @@ fn open_bootstrapped_database(
     consumer_schema: &ConsumerSchema,
 ) -> Result<(Arc<Database>, Option<Arc<Database>>)> {
     let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = registry.lock().expect("store registry lock");
-    // A handle opened for one caller's plugin or for one caller's owner handler answers to that
-    // caller alone: sharing it would hand a second opener a database serving somebody else's
-    // administrative frames.
-    if extras.is_plain()
-        && !replace_shared_handle
-        && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
-    {
-        bootstrap_schema(&existing, config, true, consumer_schema)?;
-        return Ok(narrowed_handle(existing, contexts, scope_labels));
-    }
-    // The open is the only place that knows WHICH store was refused, and readers still reading a
-    // store are reported by the substrate without one — so the path is supplied here.
-    let db = Arc::new(
-        Database::open_with_options(db_path, extras.open_options())
-            .map_err(|error| extras.map_refusal(db_path, error))?,
-    );
-    bootstrap_schema(&db, config, false, consumer_schema)?;
+    let (mut guard, db, reused) =
+        open_retry::retry(db_path, open_retry::Contention::Readers, || {
+            // Each attempt reacquires and rechecks. A reader wait must never own the registry mutex.
+            let guard = registry.lock().expect("store registry lock");
+            if extras.is_plain()
+                && !replace_shared_handle
+                && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
+            {
+                return Ok((guard, existing, true));
+            }
+            let db = Arc::new(
+                Database::open_with_options(
+                    db_path,
+                    extras.open_options(
+                        config.read_memory_limit_bytes,
+                        config.read_active_time_ms,
+                        config.write_memory_limit_bytes,
+                    ),
+                )
+                .map_err(|error| extras.map_refusal(db_path, error))?,
+            );
+            Ok((guard, db, false))
+        })?;
+    bootstrap_schema(&db, config, reused, consumer_schema)?;
     guard.insert(db_path.to_path_buf(), Arc::downgrade(&db));
     Ok(narrowed_handle(db, contexts, scope_labels))
 }
@@ -1174,7 +1228,7 @@ fn existing_shared_database(db_path: &Path) -> Option<Arc<Database>> {
     existing
 }
 
-#[cfg(context_graph_internal_test_support)]
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 #[doc(hidden)]
 pub fn database_is_live_for_test(db_path: &Path) -> bool {
     // Store::open uses the configured path itself as the registry key. This read-only
@@ -1508,17 +1562,15 @@ fn initialize_schema(
     event_policy: EventPlacementPolicy,
     tenant_event_ddls: Option<(&str, &str)>,
 ) -> Result<()> {
-    // Install the shipped work-ledger schema (the seven append-only fabric tables) alongside cg's
-    // own schema at store open. Idempotent — creates only missing tables — so reads of work_* hit an
-    // empty table rather than erroring on a missing one. The fabric slice consumes this ledger; the
-    // tables are inert on a single-node install.
-    contextdb_engine::work_ledger::install_work_ledger_schema(db).map_err(map_engine_err)?;
-    let mut present = db.table_names().into_iter().collect::<HashSet<_>>();
-    let mut planned = Vec::new();
+    let mut plan = StartupSchemaPlan::new(db);
+    // The shipped work-ledger schema (the seven append-only fabric tables and their two keyed
+    // history indexes) is declared alongside cg's own, so a fresh store's whole startup schema
+    // becomes visible in one commit. The fabric slice consumes this ledger; the tables are inert
+    // on a single-node install.
+    for ddl in contextdb_engine::work_ledger::LEDGER_TABLE_DECLARATIONS {
+        plan.declare(ddl)?;
+    }
     for table in TABLES {
-        if present.contains(table.name) {
-            continue;
-        }
         let ddl = if event_policy == EventPlacementPolicy::TenantHub {
             match table.name {
                 "events" => tenant_event_ddls.map(|(events, _)| events),
@@ -1533,168 +1585,148 @@ fn initialize_schema(
         let Some(ddl) = ddl else {
             continue;
         };
-        planned.push(ddl);
-        present.insert(table.name.to_string());
+        plan.declare_table(table.name, ddl);
     }
-    if EVENT_TABLE_NAMES
-        .iter()
-        .all(|table| present.contains(*table))
-    {
+    if EVENT_TABLE_NAMES.iter().all(|table| plan.carries(table)) {
         for table in LOCAL_DERIVED_TABLES {
-            if present.insert(table.name.to_string()) {
-                planned.push(table.ddl);
-            }
+            plan.declare_table(table.name, table.ddl);
         }
     }
     // The per-device runtime tables (`SYNC OFF`) install here too, not lazily on first write: a
     // table created after a node has drained its push leaves that node reporting schema it still
     // owes the hub, so registering a runtime model would read as pending graph transport.
     for table in LOCAL_RUNTIME_TABLES {
-        if present.insert(table.name.to_string()) {
-            planned.push(table.ddl);
-        }
+        plan.declare_table(table.name, table.ddl);
     }
-    install_startup_tables(db, &planned)?;
     for index in INDEXES.iter().chain(LOCAL_DERIVED_INDEXES) {
-        let Some(meta) = db.table_meta(index.table) else {
-            continue;
-        };
-        if meta
-            .indexes
-            .iter()
-            .any(|existing| existing.name == index.name)
-        {
-            continue;
-        }
-        db.execute(index.ddl, &HashMap::new())
-            .map_err(map_engine_err)?;
+        plan.declare_index(index.table, index.name, index.ddl);
     }
     for ddl in SUBSCRIPTION_EVENT_TYPE_DDL {
-        db.execute(ddl, &HashMap::new()).map_err(map_engine_err)?;
+        plan.declare(ddl)?;
     }
-    Ok(())
-}
-
-/// One startup `CREATE TABLE`, with what decides which schema commit it can join.
-struct StartupTable<'a> {
-    name: String,
-    ddl: &'a str,
-    parents: Vec<String>,
-    stageable: bool,
-}
-
-impl<'a> StartupTable<'a> {
-    fn parse(ddl: &'a str) -> Result<Self> {
-        let Ok(contextdb_parser::ast::Statement::CreateTable(table)) = contextdb_parser::parse(ddl)
-        else {
-            return Err(CgError::Engine(format!(
-                "a startup table declaration does not parse as CREATE TABLE: {ddl}"
-            )));
-        };
-        let parents = table
-            .columns
-            .iter()
-            .filter_map(|column| column.references.as_ref().map(|fk| fk.table.clone()))
-            .chain(
-                table
-                    .composite_foreign_keys
-                    .iter()
-                    .map(|fk| fk.parent_table.clone()),
-            )
-            .filter(|parent| *parent != table.name)
-            .collect();
-        // The engine's transactional schema staging refuses exactly these shapes.
-        let stageable = table.dag_edge_types.is_empty()
-            && table.columns.iter().all(|column| {
-                !matches!(column.data_type, contextdb_parser::ast::DataType::Vector(_))
-                    && column.rank_policy.is_none()
-            });
-        Ok(Self {
-            name: table.name,
-            ddl,
-            parents,
-            stageable,
-        })
+    // The store's own triggers are part of the startup schema a peer replays, so they are declared
+    // here rather than after it. Attaching each trigger's Rust callback stays a live-process
+    // registration and happens separately.
+    for ddl in STORE_TRIGGER_DDL {
+        plan.declare(ddl)?;
     }
+    plan.install()
 }
 
-/// Create the missing startup tables, in `ddls` order, with as few schema commits as the engine
-/// allows.
+/// The startup declarations a store does not carry yet, collected so they install together.
 ///
 /// A peer replays every schema commit it receives over its whole schema, so a startup schema
 /// authored one statement per commit made a node's first push and pull cost the square of the
-/// schema size. The engine stages only tables without a vector, rank or DAG column in a
-/// transaction; each of those others commits on its own. Each round commits every stageable table
-/// whose foreign-key parents already exist as one transaction, then each other table whose parents
-/// exist, so creation still follows the parents.
-fn install_startup_tables(db: &Database, ddls: &[&str]) -> Result<()> {
-    let mut pending = ddls
-        .iter()
-        .map(|ddl| StartupTable::parse(ddl))
-        .collect::<Result<Vec<_>>>()?;
-    let mut created = db.table_names().into_iter().collect::<HashSet<_>>();
-    while !pending.is_empty() {
-        let before = pending.len();
-        for stageable in [true, false] {
-            let waiting = pending
-                .iter()
-                .map(|table| table.name.clone())
-                .collect::<HashSet<_>>();
-            let mut batch = Vec::new();
-            let mut index = 0;
-            while index < pending.len() {
-                let table = &pending[index];
-                let ready = table.stageable == stageable
-                    && table
-                        .parents
-                        .iter()
-                        .all(|parent| created.contains(parent) || !waiting.contains(parent));
-                if !ready {
-                    index += 1;
-                    continue;
-                }
-                let table = pending.remove(index);
-                if stageable {
-                    batch.push(table.ddl);
-                } else {
-                    db.execute(table.ddl, &HashMap::new())
-                        .map_err(map_engine_err)?;
-                }
-                created.insert(table.name);
-            }
-            execute_schema_transaction(db, &batch)?;
-        }
-        if pending.len() == before {
-            return Err(CgError::Engine(format!(
-                "startup tables wait on foreign-key parents that are never created: {}",
-                pending
-                    .iter()
-                    .map(|table| table.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-    }
-    Ok(())
+/// schema size. Every missing declaration -- the tables carrying a vector column, a rank policy or
+/// DAG edges included, every index and every subscription event type -- joins one transaction, so
+/// a fresh store's whole startup schema becomes visible at once or not at all.
+struct StartupSchemaPlan<'a> {
+    db: &'a Database,
+    /// The tables the store holds on disk.
+    installed: HashSet<String>,
+    /// The tables this plan creates. An index or event type on one of them is new by definition.
+    creating: HashSet<String>,
+    statements: Vec<&'a str>,
 }
 
-/// Commit `statements` as one DDL-only transaction, or none of them.
-fn execute_schema_transaction(db: &Database, statements: &[&str]) -> Result<()> {
-    if statements.is_empty() {
-        return Ok(());
-    }
-    let tx = db.begin().map_err(map_engine_err)?;
-    for ddl in statements {
-        if let Err(error) = db.execute_in_tx(tx, ddl, &HashMap::new()) {
-            let _ = db.rollback(tx);
-            return Err(map_engine_err(error));
+impl<'a> StartupSchemaPlan<'a> {
+    fn new(db: &'a Database) -> Self {
+        Self {
+            db,
+            installed: db.table_names().into_iter().collect(),
+            creating: HashSet::new(),
+            statements: Vec::new(),
         }
     }
-    if let Err(error) = db.commit(tx) {
-        let _ = db.rollback(tx);
-        return Err(map_engine_err(error));
+
+    /// Whether the store carries `table` once this plan is installed.
+    fn carries(&self, table: &str) -> bool {
+        self.installed.contains(table) || self.creating.contains(table)
     }
-    Ok(())
+
+    /// Declare a statement whose subject is read from the statement itself.
+    fn declare(&mut self, ddl: &'a str) -> Result<()> {
+        match contextdb_parser::parse(ddl) {
+            Ok(contextdb_parser::ast::Statement::CreateTable(table)) => {
+                self.declare_table_owned(table.name, ddl);
+                Ok(())
+            }
+            Ok(contextdb_parser::ast::Statement::CreateIndex(index)) => {
+                self.declare_index(&index.table, &index.name, ddl);
+                Ok(())
+            }
+            // An event type exists exactly when its table does, so one is new exactly when this
+            // plan creates that table.
+            Ok(contextdb_parser::ast::Statement::CreateEventType { table, .. }) => {
+                if self.creating.contains(&table) {
+                    self.statements.push(ddl);
+                }
+                Ok(())
+            }
+            Ok(contextdb_parser::ast::Statement::CreateTrigger { name, .. }) => {
+                if !self
+                    .db
+                    .list_triggers()
+                    .iter()
+                    .any(|trigger| trigger.name == name)
+                {
+                    self.statements.push(ddl);
+                }
+                Ok(())
+            }
+            _ => Err(CgError::Engine(format!(
+                "a startup declaration is not a table, index, event type or trigger: {ddl}"
+            ))),
+        }
+    }
+
+    /// Declare a table under the name the caller knows it by: a table whose shipped declaration is
+    /// rewritten by placement policy is still the same table.
+    fn declare_table(&mut self, name: &str, ddl: &'a str) {
+        self.declare_table_owned(name.to_string(), ddl);
+    }
+
+    fn declare_table_owned(&mut self, name: String, ddl: &'a str) {
+        if self.installed.contains(&name) || !self.creating.insert(name) {
+            return;
+        }
+        self.statements.push(ddl);
+    }
+
+    /// Declare an index, unless its table will not exist -- a placement policy that installs no
+    /// event tables installs no index on one -- or the store already carries it.
+    fn declare_index(&mut self, table: &str, name: &str, ddl: &'a str) {
+        if self.creating.contains(table) {
+            self.statements.push(ddl);
+            return;
+        }
+        let Some(meta) = self.db.table_meta(table) else {
+            return;
+        };
+        if meta.indexes.iter().any(|existing| existing.name == name) {
+            return;
+        }
+        self.statements.push(ddl);
+    }
+
+    /// Commit every missing declaration as one DDL-only transaction, or none of them.
+    fn install(self) -> Result<()> {
+        if self.statements.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin().map_err(map_engine_err)?;
+        for ddl in &self.statements {
+            if let Err(error) = self.db.execute_in_tx(tx, ddl, &HashMap::new()) {
+                let _ = self.db.rollback(tx);
+                return Err(map_engine_err(error));
+            }
+        }
+        if let Err(error) = self.db.commit(tx) {
+            let _ = self.db.rollback(tx);
+            return Err(map_engine_err(error));
+        }
+        Ok(())
+    }
 }
 
 fn resolve_event_bootstrap_policy(

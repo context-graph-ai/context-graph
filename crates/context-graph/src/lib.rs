@@ -34,6 +34,7 @@ pub mod store;
 pub mod tier0;
 pub mod types;
 pub mod understanding;
+pub mod write_budget;
 
 pub use capture_sync_status::*;
 pub use consumer_read::graph::ConsumerGraphView;
@@ -71,7 +72,7 @@ pub use store::{
 };
 pub use types::*;
 
-#[cfg(context_graph_internal_test_support)]
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support {
     /// Observes whether the store registry has a live `Database` owner for `path`.
@@ -79,10 +80,51 @@ pub mod test_support {
     /// This only reports `Store`'s shared `Database` ownership. It cannot prove
     /// that arbitrary engine-internal buffers have been released.
     pub use crate::store::database_is_live_for_test as store_database_is_live_for_test;
+    #[cfg(feature = "test-support")]
+    pub use crate::store::event_search_projection::{
+        observe_embedding_waves_for_test, take_claim_loads_for_test,
+    };
+    #[cfg(feature = "test-support")]
+    pub use crate::store::open_retry::{
+        observe_store_open_retries_for_test, set_store_open_retry_allowance_for_test,
+    };
 
     /// Pauses inside the next event-search head-switch transaction on the calling thread.
     pub use crate::store::pause_next_event_search_finalization_for_test;
 
+    pub use crate::store::event_search_projection::{
+        after_next_event_search_membership_read_page_for_test,
+        observe_event_search_batch_admission_for_test,
+        set_event_search_projection_read_deadline_ms_for_test,
+    };
+    /// How many Stores the event-search runner has opened on the calling thread.
+    pub use crate::store::event_search_store_opens_for_test;
+
+    /// Every statement the event-history reads issue on this thread, so a proof can assert what a
+    /// `find`, a `status` or a projection pass COSTS in statements -- never how long it took.
+    pub use crate::store::event_search_read::{
+        record_event_history_statements_for_test, take_recorded_event_history_statements_for_test,
+    };
+
+    /// Failure-ownership controls for the projection's internal regression suite.
+    pub use crate::store::{
+        after_next_event_search_attempt_commit_before_readback_for_test,
+        after_next_event_search_completion_commit_before_readback_for_test,
+        before_next_event_search_attempt_commit_for_test,
+        before_next_event_search_completion_commit_for_test,
+        before_next_event_search_failure_record_for_test,
+        fail_next_event_search_membership_capture_for_test,
+        fail_next_event_search_membership_capture_with_error_for_test,
+        take_event_search_membership_captures_for_test,
+    };
+
+    /// Consumer-side row and cursor work performed by each pending-stream discovery pass.
+    pub use crate::store::{
+        EventSearchDiscoveryObservation, clear_event_search_discovery_observations_for_test,
+        event_search_discovery_observations_for_test,
+    };
+
+    #[cfg(context_graph_internal_test_support)]
     pub mod event_correlation {
         pub use crate::store::{
             EventCorrelationObservationGuard, EventCorrelationTestObserver,
@@ -90,6 +132,7 @@ pub mod test_support {
         };
     }
 
+    #[cfg(context_graph_internal_test_support)]
     pub mod embedding {
         pub use crate::store::embedding::{
             CompositeVectorClause, FusionPolicy, VectorSearchFilters, VectorSearchResult,

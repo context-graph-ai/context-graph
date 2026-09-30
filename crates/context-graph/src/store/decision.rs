@@ -533,10 +533,7 @@ impl Store {
         let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
             .into_iter()
             .collect();
-        let result = self
-            .db
-            .execute("SELECT context_id FROM decisions WHERE id = $id", &params)
-            .map_err(map_engine_err)?;
+        let result = self.read_query("SELECT context_id FROM decisions WHERE id = $id", &params)?;
         match result.rows.first().and_then(|r| r.first()) {
             Some(Value::Uuid(u)) => Ok(Some(ContextId::from(*u))),
             Some(_) => Err(CgError::Engine("decisions.context_id non-uuid".to_string())),
@@ -566,13 +563,10 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT source_id FROM edges WHERE target_id = $target_id AND edge_type = $edge_type",
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT source_id FROM edges WHERE target_id = $target_id AND edge_type = $edge_type",
+            &params,
+        )?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             if let Some(Value::Uuid(u)) = row.first() {
@@ -590,13 +584,10 @@ impl Store {
             [("decision_id".to_string(), Value::Uuid(id.as_uuid()))]
                 .into_iter()
                 .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT entity_id FROM decision_basis_snapshots WHERE decision_id = $decision_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT entity_id FROM decision_basis_snapshots WHERE decision_id = $decision_id",
+            &params,
+        )?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             if let Some(Value::Uuid(u)) = row.first() {
@@ -1435,13 +1426,10 @@ impl Store {
             ]
             .into_iter()
             .collect();
-            let result = self
-                .db
-                .execute(
+            let result = self.read_query(
                     "SELECT target_id FROM edges WHERE source_id = $source_id AND edge_type = $edge_type",
                     &params,
-                )
-                .map_err(map_engine_err)?;
+                )?;
             match result.rows.first().and_then(|r| r.first()) {
                 Some(Value::Uuid(u)) => cursor = DecisionId::from(*u),
                 _ => break,
@@ -1584,13 +1572,10 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         Ok(!result.rows.is_empty())
     }
 
@@ -1610,13 +1595,10 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         Ok(!result.rows.is_empty())
     }
 
@@ -1636,13 +1618,10 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         Ok(!result.rows.is_empty())
     }
 
@@ -1656,13 +1635,10 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT source_id FROM edges WHERE target_id = $target_id AND edge_type = $edge_type",
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT source_id FROM edges WHERE target_id = $target_id AND edge_type = $edge_type",
+            &params,
+        )?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             if let Some(Value::Uuid(u)) = row.first() {

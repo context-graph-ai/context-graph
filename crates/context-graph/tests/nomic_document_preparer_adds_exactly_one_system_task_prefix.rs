@@ -1,4 +1,4 @@
-//! C1 — document preparation over the real cached Nomic embedder adds exactly one system-added
+//! Document preparation over the real cached Nomic embedder adds exactly one system-added
 //! `search_document: ` task prefix outside the untouched content.
 //!
 //! The proof compares VECTORS, not a token-count proxy or a space label: for each fixed
@@ -21,6 +21,11 @@ const EVENT_HISTORY_SPACE_ID: &str = "event_history_nomic_v1_5_document_query_v1
 fn nomic_document_preparer_adds_exactly_one_system_task_prefix() {
     let embedder = nomic_real_model::nomic_live_embedder();
     let tokenizer = nomic_real_model::nomic_tokenizer();
+    assert_eq!(
+        embedder.event_search_slice_token_loss_bound("User: "),
+        Some(200)
+    );
+    assert_eq!(embedder.event_search_slice_token_loss_bound("User:"), None);
 
     for content in [
         "the quarterly review meeting covered three open action items",

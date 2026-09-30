@@ -217,7 +217,8 @@ async fn skills_sync_tenant_wide_hub_arbitrated() {
     // The synced skill must also appear via list_skills_in_store (the public surface).
     // Placeholder returns empty → this assertion fails, proving the listing reads from
     // the real table, not a HashMap.
-    let listed = context_graph::skill_store::list_skills_in_store(&fixture.edge2.store);
+    let listed = context_graph::skill_store::list_skills_in_store(&fixture.edge2.store)
+        .expect("read succeeds");
     assert_eq!(
         listed.len(),
         1,
@@ -302,7 +303,8 @@ async fn teaching_events_sync_tenant_wide_order_free_set_union() {
 
     // list_teaching_events_in_store must surface all 4 events from the persisted table.
     // Placeholder returns empty → this assertion fails.
-    let listed = context_graph::skill_store::list_teaching_events_in_store(&fixture.edge2.store);
+    let listed = context_graph::skill_store::list_teaching_events_in_store(&fixture.edge2.store)
+        .expect("read succeeds");
     assert_eq!(
         listed.len(),
         4,

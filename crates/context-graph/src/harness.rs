@@ -1094,7 +1094,7 @@ pub fn run_capture_into_digest_with_completion(
         &request.transcript,
         config.skills_enabled,
         config.review_mode,
-    );
+    )?;
 
     // Anchor every capture that produced structured memory but named no entity to a single
     // scope entity for the context, so each capture has a structural anchor and observations

@@ -309,6 +309,7 @@ fn try_run_request(
         contexts: context_graph::ContextSelector::one(context_id),
         embedder: embedder.registration(),
         profile,
+        embedding_workers: NonZeroUsize::MIN,
         max_events_per_batch: NonZeroU32::new(max_events_per_batch).unwrap(),
         max_passages_per_batch: NonZeroU32::new(32).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
@@ -891,4 +892,484 @@ fn matching_wrong_binding_owner_is_refused_before_persistence_and_corrected_decl
         vec![corrected_embedder.declared_registration()],
     )
     .expect("the corrected declaration must reopen without poisoned rows");
+}
+
+#[test]
+fn an_overlap_tail_that_leaves_no_room_for_the_next_event_shrinks_instead_of_failing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = bound_config(root.path().join("overlap-shrink.db"));
+    let embedder = Arc::new(RoleAwareEmbedder::with_token_limit(256));
+    let store =
+        Store::open_with_embedder_registrations(config.clone(), vec![embedder.registration()])
+            .expect("open explicit bound store");
+    let context_id = create_context(&store);
+    // Three 31-scalar tool results total 195 prepared tokens. The fourth, a 120-scalar tool
+    // result, prepares to 245 tokens on its own, so it is a legal ordinary unit, but even the
+    // last retained overlap event beside it (309 tokens) exceeds the 256 hard limit.
+    let large = "α".repeat(90);
+    let captured = store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            SOURCE,
+            vec![
+                draft("result-one", 1, EventRenderRole::ToolResult, "α"),
+                draft("result-two", 2, EventRenderRole::ToolResult, "β"),
+                draft("result-three", 3, EventRenderRole::ToolResult, "γ"),
+                draft("result-large", 4, EventRenderRole::ToolResult, &large),
+            ],
+        ))
+        .expect("public capture")
+        .events;
+    let keys = captured
+        .iter()
+        .map(|captured| (captured.event.id, captured.event.source_event_key.clone()))
+        .collect::<HashMap<_, _>>();
+    drop(store);
+    try_run_request(
+        config.clone(),
+        context_id,
+        &embedder,
+        ordinary_overlap_three_profile(),
+        4,
+    )
+    .expect("an overlap tail must shrink rather than fail projection on legal input");
+    let reopened = Store::open_with_embedder_registrations(config, vec![embedder.registration()])
+        .expect("reopen explicit bound store");
+    let passages = all_passages(&reopened, context_id);
+    for passage in &passages {
+        assert!(
+            embedder
+                .prepare_document(&passage.text)
+                .expect("independent exact preparation")
+                .token_count()
+                <= 256,
+            "every passage stays within the hard limit"
+        );
+    }
+    let sources = passages
+        .iter()
+        .map(|passage| {
+            passage
+                .sources
+                .iter()
+                .map(|source| keys[&source.event_id].as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sources,
+        vec![
+            vec!["result-one", "result-two", "result-three"],
+            vec!["result-large"],
+        ],
+        "the overlap shrinks below the configured three events so the large event fits"
+    );
+}
+
+#[test]
+fn the_default_passage_profile_is_version_two_and_version_one_stays_selectable() {
+    let current = EventSearchProfile::default();
+    assert_eq!(current.target_passage_tokens.get(), 256);
+    assert_eq!(current.hard_passage_tokens.get(), 384);
+    assert_eq!(current.ordinary_overlap_events.get(), 1);
+    assert_eq!(current.oversized_event_overlap_tokens.get(), 32);
+    assert_eq!(
+        current.preferred_boundary,
+        context_graph::EventSearchPreferredBoundary::BeforeHumanMessage
+    );
+    assert_eq!(current, EventSearchProfile::version_2());
+
+    let original = EventSearchProfile::version_1();
+    assert_eq!(original.target_passage_tokens.get(), 1_024);
+    assert_eq!(original.hard_passage_tokens.get(), 1_536);
+    assert_eq!(original.ordinary_overlap_events.get(), 1);
+    assert_eq!(original.oversized_event_overlap_tokens.get(), 128);
+    assert_eq!(original.preferred_boundary, current.preferred_boundary);
+}
+
+/// Delegates everything to [`RoleAwareEmbedder`] and records the shape of every embed call: the
+/// size of each batched document call, and how many single-document calls were made.
+struct BatchRecordingEmbedder {
+    inner: RoleAwareEmbedder,
+    batches: Mutex<Vec<usize>>,
+    single_calls: Mutex<usize>,
+}
+
+impl Embedder for BatchRecordingEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput> {
+        self.inner.embed(input)
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        self.inner.supported_inputs()
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpace {
+        self.inner.embedding_space()
+    }
+
+    fn event_search_capability(&self) -> Option<EventSearchCapability> {
+        self.inner.event_search_capability()
+    }
+
+    fn prepare_document_hook(
+        &self,
+        text: &str,
+        seal: &EventSearchSeal,
+    ) -> Result<PreparedEventSearchDocument> {
+        self.inner.prepare_document_hook(text, seal)
+    }
+
+    fn prepare_query_hook(
+        &self,
+        text: &str,
+        seal: &EventSearchSeal,
+    ) -> Result<PreparedEventSearchQuery> {
+        self.inner.prepare_query_hook(text, seal)
+    }
+
+    fn embed_prepared_document_hook(
+        &self,
+        inference: &EventSearchInference,
+    ) -> Result<EmbeddingOutput> {
+        *self.single_calls.lock().expect("single call count") += 1;
+        self.inner.embed_prepared_document_hook(inference)
+    }
+
+    fn embed_prepared_documents_hook(
+        &self,
+        inferences: &[EventSearchInference],
+    ) -> Result<Vec<EmbeddingOutput>> {
+        self.batches
+            .lock()
+            .expect("batch log")
+            .push(inferences.len());
+        inferences
+            .iter()
+            .map(|inference| self.inner.embed_prepared_document_hook(inference))
+            .collect()
+    }
+
+    fn embed_prepared_query_hook(
+        &self,
+        inference: &EventSearchInference,
+    ) -> Result<EmbeddingOutput> {
+        self.inner.embed_prepared_query_hook(inference)
+    }
+}
+
+#[test]
+fn a_claims_passages_are_embedded_through_bounded_forward_calls_of_the_batch_entrypoint() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = bound_config(root.path().join("batched.db"));
+    let embedder = Arc::new(BatchRecordingEmbedder {
+        inner: RoleAwareEmbedder::new(),
+        batches: Mutex::new(Vec::new()),
+        single_calls: Mutex::new(0),
+    });
+    let registration = EmbedderRegistration {
+        space: RoleAwareEmbedder::space(),
+        embedder: embedder.clone(),
+    };
+    let store = Store::open_with_embedder_registrations(config.clone(), vec![registration.clone()])
+        .expect("open explicit bound store");
+    let context_id = create_context(&store);
+    // Each user message is 55 prepared tokens, so beside any retained overlap it exceeds the 64
+    // hard limit: every one of the twenty events becomes its own passage, all in one claim.
+    store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            SOURCE,
+            (1..=20)
+                .map(|ordinal| {
+                    draft(
+                        &format!("user-{ordinal}"),
+                        ordinal,
+                        EventRenderRole::HumanMessage,
+                        "α",
+                    )
+                })
+                .collect(),
+        ))
+        .expect("public capture");
+    drop(store);
+    let receipt = EventSearchProjectionRunner::catch_up(EventSearchRunRequest {
+        store: config,
+        contexts: context_graph::ContextSelector::one(context_id),
+        embedder: registration,
+        profile: profile(),
+        embedding_workers: NonZeroUsize::MIN,
+        max_events_per_batch: NonZeroU32::new(32).unwrap(),
+        max_passages_per_batch: NonZeroU32::new(32).unwrap(),
+        max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
+        lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
+    })
+    .expect("the projection commits");
+    assert_eq!(receipt.passage_count, 20);
+    assert_eq!(
+        *embedder.single_calls.lock().expect("single call count"),
+        0,
+        "no passage is embedded through a one-document call"
+    );
+    // One document per forward call for now: a sixteen-document padded forward pass through the
+    // debug-built Nomic model ran past the claim lease, so multi-document batches wait until that
+    // cost is understood. Every passage still goes through the batch entrypoint.
+    assert_eq!(
+        *embedder.batches.lock().expect("batch log"),
+        vec![1; 20],
+        "each of the claim's twenty passages goes through its own bounded forward call"
+    );
+}
+
+#[test]
+fn a_claim_that_would_render_more_passages_than_the_bound_leaves_later_events_for_the_next_claim() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = bound_config(root.path().join("passage-bound.db"));
+    let embedder = Arc::new(RoleAwareEmbedder::new());
+    let store =
+        Store::open_with_embedder_registrations(config.clone(), vec![embedder.registration()])
+            .expect("open explicit bound store");
+    let context_id = create_context(&store);
+    // Forty user messages, each its own 55-token passage under the 64-token hard limit: forty
+    // passages from far fewer events than the event bound allows in one claim.
+    let captured = store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            SOURCE,
+            (1..=40)
+                .map(|ordinal| {
+                    draft(
+                        &format!("user-{ordinal}"),
+                        ordinal,
+                        EventRenderRole::HumanMessage,
+                        "α",
+                    )
+                })
+                .collect(),
+        ))
+        .expect("public capture")
+        .events;
+    let keys = captured
+        .iter()
+        .map(|captured| (captured.event.id, captured.event.source_event_key.clone()))
+        .collect::<HashMap<_, _>>();
+    drop(store);
+    let receipt = EventSearchProjectionRunner::catch_up(EventSearchRunRequest {
+        store: config.clone(),
+        contexts: context_graph::ContextSelector::one(context_id),
+        embedder: embedder.registration(),
+        profile: profile(),
+        embedding_workers: NonZeroUsize::MIN,
+        max_events_per_batch: NonZeroU32::new(256).unwrap(),
+        max_passages_per_batch: NonZeroU32::new(32).unwrap(),
+        max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
+        lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
+    })
+    .expect("a claim over the passage bound is narrowed, never refused");
+    assert_eq!(receipt.passage_count, 40);
+
+    let reopened = Store::open_with_embedder_registrations(config, vec![embedder.registration()])
+        .expect("reopen explicit bound store");
+    // Each claim commits its passages in one transaction, so passages sharing a commit are one
+    // claim's output.
+    let rows = reopened
+        .execute_sql_for_test(
+            "SELECT created_at FROM event_search_passages WHERE context_id = $context_id",
+            &HashMap::from([(
+                "context_id".to_string(),
+                contextdb_core::Value::Uuid(context_id.as_uuid()),
+            )]),
+        )
+        .expect("inspect passage commits")
+        .rows;
+    let mut per_commit = HashMap::<String, usize>::new();
+    for row in &rows {
+        *per_commit.entry(format!("{:?}", row[0])).or_default() += 1;
+    }
+    assert!(
+        per_commit.values().all(|count| *count <= 32),
+        "no claim commits more than the passage bound: {per_commit:?}"
+    );
+    assert!(per_commit.len() >= 2, "the stream took more than one claim");
+
+    let mut covered = all_passages(&reopened, context_id)
+        .into_iter()
+        .flat_map(|passage| {
+            passage
+                .sources
+                .iter()
+                .map(|source| keys[&source.event_id].clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    covered.sort();
+    let mut expected = keys.values().cloned().collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(covered, expected, "every event is covered exactly once");
+}
+
+/// Delegates to [`RoleAwareEmbedder`] and counts document preparations.
+struct PreparationCountingEmbedder {
+    inner: RoleAwareEmbedder,
+    preparations: Mutex<usize>,
+}
+
+impl Embedder for PreparationCountingEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> Result<EmbeddingOutput> {
+        self.inner.embed(input)
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        self.inner.supported_inputs()
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpace {
+        self.inner.embedding_space()
+    }
+
+    fn event_search_capability(&self) -> Option<EventSearchCapability> {
+        self.inner.event_search_capability()
+    }
+
+    fn prepare_document_hook(
+        &self,
+        text: &str,
+        seal: &EventSearchSeal,
+    ) -> Result<PreparedEventSearchDocument> {
+        *self.preparations.lock().expect("preparation count") += 1;
+        self.inner.prepare_document_hook(text, seal)
+    }
+
+    fn prepare_query_hook(
+        &self,
+        text: &str,
+        seal: &EventSearchSeal,
+    ) -> Result<PreparedEventSearchQuery> {
+        self.inner.prepare_query_hook(text, seal)
+    }
+
+    fn embed_prepared_document_hook(
+        &self,
+        inference: &EventSearchInference,
+    ) -> Result<EmbeddingOutput> {
+        self.inner.embed_prepared_document_hook(inference)
+    }
+
+    fn embed_prepared_query_hook(
+        &self,
+        inference: &EventSearchInference,
+    ) -> Result<EmbeddingOutput> {
+        self.inner.embed_prepared_query_hook(inference)
+    }
+}
+
+// Every refused claim costs a render and, in a worker, reopening the store, which leaks in the
+// engine. Once a claim has been narrowed to fit the passage bound, the following claims start from
+// that narrowed size instead of overflowing again from the full event bound.
+#[test]
+fn a_narrowed_claim_size_carries_to_the_next_claims_instead_of_overflowing_every_time() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = bound_config(root.path().join("narrowed.db"));
+    let embedder = Arc::new(PreparationCountingEmbedder {
+        inner: RoleAwareEmbedder::new(),
+        preparations: Mutex::new(0),
+    });
+    let registration = EmbedderRegistration {
+        space: RoleAwareEmbedder::space(),
+        embedder: embedder.clone(),
+    };
+    let store = Store::open_with_embedder_registrations(config.clone(), vec![registration.clone()])
+        .expect("open explicit bound store");
+    let context_id = create_context(&store);
+    let events = 240_usize;
+    store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            SOURCE,
+            (1..=events as u64)
+                .map(|ordinal| {
+                    draft(
+                        &format!("user-{ordinal}"),
+                        ordinal,
+                        EventRenderRole::HumanMessage,
+                        "α",
+                    )
+                })
+                .collect(),
+        ))
+        .expect("public capture");
+    drop(store);
+    let receipt = EventSearchProjectionRunner::catch_up(EventSearchRunRequest {
+        store: config,
+        contexts: context_graph::ContextSelector::one(context_id),
+        embedder: registration,
+        profile: profile(),
+        embedding_workers: NonZeroUsize::MIN,
+        max_events_per_batch: NonZeroU32::new(256).unwrap(),
+        max_passages_per_batch: NonZeroU32::new(32).unwrap(),
+        max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
+        lease_duration_ms: NonZeroU64::new(60_000).unwrap(),
+    })
+    .expect("the projection commits");
+    assert_eq!(receipt.passage_count, events as u64);
+    let preparations = *embedder.preparations.lock().expect("preparation count");
+    // Rendering one event costs a few preparations; re-rendering every remaining event after each
+    // commit costs several times the event count.
+    assert!(
+        preparations <= 8 * events,
+        "{preparations} preparations for {events} events: claims keep overflowing the passage bound"
+    );
+}
+
+// Every writable store open leaks in the engine today, so the standalone runner spends one open per
+// committed claim: the open that commits a claim also takes the next one.
+#[test]
+fn the_standalone_runner_opens_the_store_once_per_committed_claim() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = bound_config(root.path().join("opens.db"));
+    let embedder = Arc::new(RoleAwareEmbedder::new());
+    let store =
+        Store::open_with_embedder_registrations(config.clone(), vec![embedder.registration()])
+            .expect("open explicit bound store");
+    let context_id = create_context(&store);
+    store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            SOURCE,
+            (1..=64)
+                .map(|ordinal| {
+                    draft(
+                        &format!("user-{ordinal}"),
+                        ordinal,
+                        EventRenderRole::HumanMessage,
+                        "α",
+                    )
+                })
+                .collect(),
+        ))
+        .expect("public capture");
+    drop(store);
+    let before = context_graph::test_support::event_search_store_opens_for_test();
+    // Eight events per claim, each its own passage, well inside the passage bound: eight claims.
+    EventSearchProjectionRunner::catch_up(EventSearchRunRequest {
+        store: config,
+        contexts: context_graph::ContextSelector::one(context_id),
+        embedder: embedder.registration(),
+        profile: profile(),
+        embedding_workers: NonZeroUsize::MIN,
+        max_events_per_batch: NonZeroU32::new(8).unwrap(),
+        max_passages_per_batch: NonZeroU32::new(32).unwrap(),
+        max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
+        lease_duration_ms: NonZeroU64::new(60_000).unwrap(),
+    })
+    .expect("the projection commits");
+    let opens = context_graph::test_support::event_search_store_opens_for_test() - before;
+    // One open prepares the generation and one per claim; the open after the eighth commit finds
+    // no work and finishes the generation.
+    assert_eq!(opens, 1 + 8, "store opens for eight committed claims");
 }

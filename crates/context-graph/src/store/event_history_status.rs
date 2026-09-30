@@ -28,6 +28,7 @@ const EVENT_HISTORY_READ_TABLES: &[&str] = &[
     "event_placement",
     "events",
     "event_context_counts",
+    "event_context_sessions",
     "event_anchors",
     "event_source_checkpoints",
     "event_source_locators",
@@ -40,10 +41,18 @@ const EVENT_HISTORY_READ_TABLES: &[&str] = &[
     "event_interpretation_source_events",
     "event_interpretation_anchors",
     "event_search_generations",
+    "event_search_source_events",
+    "event_search_session_progress",
     "event_search_passages",
     "event_search_passage_sources",
     "event_search_embedding_handles",
     "event_search_heads",
+    "event_search_work_policies",
+    "event_search_request_selections",
+    "event_search_request_headers",
+    "event_search_refusal_headers",
+    "event_search_refusal_frontiers",
+    "event_search_cursors",
     "event_search_leases",
     "cg_local_settings",
     "work_inputs",
@@ -123,12 +132,37 @@ pub enum EventHistorySearchState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventHistorySearchStatus {
     pub state: EventHistorySearchState,
+    /// The Context's persisted session-selection policy, used for every retry action.
+    pub work_policy: crate::EventSearchWorkPolicy,
     pub active_generation_id: Option<EventSearchGenerationId>,
     pub embedding_space_id: Option<String>,
     pub renderer_id: Option<String>,
     pub renderer_version: Option<String>,
+    /// The passage profile the active generation was rendered with.
+    pub profile: Option<crate::EventSearchProfile>,
     pub covered_events: u64,
     pub pending_events: u64,
+    /// Captured events outside the latest accepted session-selection policy.
+    #[serde(default)]
+    pub outside_scope_events: u64,
+    /// Outside-scope events that remain searchable from prior accepted work.
+    #[serde(default)]
+    pub outside_scope_indexed_events: u64,
+    /// Selected events whose completed sessions produced no searchable passage membership.
+    #[serde(default)]
+    pub no_searchable_text_events: u64,
+    /// The generation currently accumulating committed projection work, if any.
+    #[serde(default)]
+    pub building_generation_id: Option<EventSearchGenerationId>,
+    /// The profile of the actual nonactive building generation.
+    #[serde(default)]
+    pub building_profile: Option<crate::EventSearchProfile>,
+    /// Captured events sealed by the building generation at or below their stream cursor.
+    #[serde(default)]
+    pub building_covered_events: u64,
+    /// Captured events not yet sealed by the building generation.
+    #[serde(default)]
+    pub building_pending_events: u64,
     pub live_projection_lease: bool,
     pub last_failure: Option<String>,
 }
@@ -315,8 +349,8 @@ pub(crate) fn event_history_status(
     })
 }
 
-fn context_names(
-    source: &dyn EventHistoryStatusSource,
+pub(crate) fn context_names(
+    source: &dyn EventSearchRows,
     selected: &[ContextId],
 ) -> Result<HashMap<ContextId, String>> {
     let mut names = HashMap::new();
@@ -536,8 +570,14 @@ fn search_status(
     now_ms: i64,
 ) -> Result<EventHistorySearchStatus> {
     let params = context_params(context_id);
+    let work_policy = super::event_search_projection::persisted_work_policy(source, context_id)?;
+    let selected_sessions = super::event_search_projection::selected_captured_session_work(
+        source,
+        context_id,
+        work_policy,
+    )?;
     let head = source.query_rows(
-        "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+        "SELECT generation_id, activated_at FROM event_search_heads WHERE context_id = $context_id",
         &params,
     )?;
     let active_generation_id = match head.rows.first() {
@@ -552,9 +592,14 @@ fn search_status(
     let mut embedding_space_id = None;
     let mut renderer_id = None;
     let mut renderer_version = None;
+    let mut profile = None;
+    let mut pending_events = selected_sessions.selected_events();
+    let mut outside_scope_events = captured_events.saturating_sub(pending_events);
+    let mut outside_scope_indexed_events = 0;
+    let mut no_searchable_text_events = 0;
     if let Some(generation_id) = active_generation_id {
         let generation = source.query_rows(
-            "SELECT event_count, embedding_space_id, renderer_id, renderer_version, state FROM event_search_generations WHERE id = $id AND context_id = $context_id",
+            "SELECT event_count, embedding_space_id, renderer_id, renderer_version, renderer_profile, state FROM event_search_generations WHERE id = $id AND context_id = $context_id",
             &HashMap::from([
                 ("id".to_string(), Value::Uuid(generation_id.as_uuid())),
                 ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
@@ -565,57 +610,127 @@ fn search_status(
                 "the active event-search head names missing generation {generation_id}"
             ))
         })?;
-        if text(row, &generation.columns, "state")? != "ready" {
+        let generation_state = text(row, &generation.columns, "state")?;
+        if generation_state != "ready" && generation_state != "building" {
             return Err(CgError::Engine(format!(
-                "the active event-search head names generation {generation_id}, which is not ready"
+                "the active event-search head names generation {generation_id}, which is neither ready nor building"
             )));
         }
-        covered_events = unsigned(row, &generation.columns, "event_count")?;
+        let coverage = super::event_search_projection::policy_coverage(
+            source,
+            context_id,
+            generation_id,
+            &selected_sessions,
+            captured_events,
+        )?;
+        covered_events = coverage.covered_events;
+        pending_events = coverage.pending_events;
+        outside_scope_events = coverage.outside_scope_events;
+        outside_scope_indexed_events = coverage.outside_scope_indexed_events;
+        no_searchable_text_events = coverage.no_searchable_text_events;
         embedding_space_id = Some(text(row, &generation.columns, "embedding_space_id")?);
         renderer_id = Some(text(row, &generation.columns, "renderer_id")?);
         renderer_version = Some(text(row, &generation.columns, "renderer_version")?);
+        profile = Some(
+            match row.get(column(&generation.columns, "renderer_profile")?) {
+                Some(Value::Json(value)) => {
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        CgError::Engine(format!("column renderer_profile: {error}"))
+                    })?
+                }
+                other => {
+                    return Err(CgError::Engine(format!(
+                        "column renderer_profile: expected JSON, got {other:?}"
+                    )));
+                }
+            },
+        );
     }
-    let pending_events = captured_events.checked_sub(covered_events).ok_or_else(|| {
-        CgError::Engine(format!(
-            "the active event-search generation covers more events than Context {context_id} retains"
-        ))
-    })?;
-
-    let leases = source.query_rows(
-        "SELECT expires_at FROM event_search_leases WHERE context_id = $context_id",
-        &params,
-    )?;
-    let mut live_projection_lease = false;
-    for row in &leases.rows {
-        if timestamp(row, &leases.columns, "expires_at")? > now_ms {
-            live_projection_lease = true;
-        }
-    }
-
+    let live_projection_lease =
+        super::event_search_projection::live_projection_lease(source, context_id, now_ms)?;
+    let activated_at = head
+        .rows
+        .first()
+        .map(|row| txid(row, &head.columns, "activated_at"))
+        .transpose()?;
+    // SELECT * reads generation metadata while allowing the attempt column to be absent.
     let generations = source.query_rows(
-        "SELECT id, state, sanitized_failure, started_at FROM event_search_generations WHERE context_id = $context_id",
+        "SELECT * FROM event_search_generations WHERE context_id = $context_id",
         &params,
     )?;
-    let mut latest: Option<(u64, String, Option<String>)> = None;
+    let mut building = None;
+    let mut latest_attempt: Option<(u64, EventSearchGenerationId, Option<String>)> = None;
     for row in &generations.rows {
         let id = EventSearchGenerationId::from(uuid(row, &generations.columns, "id")?);
-        if Some(id) == active_generation_id {
+        let state = text(row, &generations.columns, "state")?;
+        if state == "retired" {
             continue;
         }
-        let started = txid(row, &generations.columns, "started_at")?;
-        if latest.as_ref().is_none_or(|(seen, _, _)| started > *seen) {
-            latest = Some((
-                started,
-                text(row, &generations.columns, "state")?,
-                optional_text(row, &generations.columns, "sanitized_failure")?,
-            ));
+        let attempt = last_attempt_or_creation(row, &generations.columns)?;
+        let failure = optional_text(row, &generations.columns, "sanitized_failure")?
+            .or_else(|| (state == "failed").then(|| "projection failed".into()));
+        let active = Some(id) == active_generation_id;
+        // Activation supersedes other older attempts. An active generation may record its own
+        // failure after activation (for example during vector maintenance); activation itself
+        // clears prior failures. Its coverage remains Ready independently of that failure.
+        if active || activated_at.is_none_or(|activated| attempt > activated) {
+            let relevant_at = if active {
+                attempt.max(activated_at.unwrap_or(0))
+            } else {
+                attempt
+            };
+            if latest_attempt
+                .as_ref()
+                .is_none_or(|(seen, seen_id, _)| (relevant_at, id) > (*seen, *seen_id))
+            {
+                latest_attempt = Some((relevant_at, id, failure));
+            }
+        }
+        if !active
+            && state == "building"
+            && building
+                .as_ref()
+                .is_none_or(|(seen, seen_id, _)| (attempt, id) > (*seen, *seen_id))
+        {
+            let profile = match row.get(column(&generations.columns, "renderer_profile")?) {
+                Some(Value::Json(value)) => {
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        CgError::Engine(format!("column renderer_profile: {error}"))
+                    })?
+                }
+                other => {
+                    return Err(CgError::Engine(format!(
+                        "column renderer_profile: expected JSON, got {other:?}"
+                    )));
+                }
+            };
+            building = Some((attempt, id, profile));
         }
     }
-    let last_failure = latest.and_then(|(_, state, failure)| match (state.as_str(), failure) {
-        ("failed", failure) => Some(failure.unwrap_or_else(|| "projection failed".into())),
-        ("building", Some(failure)) => Some(failure),
-        _ => None,
-    });
+    let last_failure = latest_attempt.and_then(|(_, _, failure)| failure);
+    let (
+        building_generation_id,
+        building_profile,
+        building_covered_events,
+        building_pending_events,
+    ) = match building {
+        Some((_, generation_id, profile)) => {
+            let coverage = super::event_search_projection::policy_coverage(
+                source,
+                context_id,
+                generation_id,
+                &selected_sessions,
+                captured_events,
+            )?;
+            (
+                Some(generation_id),
+                Some(profile),
+                coverage.covered_events,
+                coverage.pending_events,
+            )
+        }
+        None => (None, None, 0, 0),
+    };
 
     let state = if pending_events == 0 {
         EventHistorySearchState::Ready
@@ -628,15 +743,35 @@ fn search_status(
     };
     Ok(EventHistorySearchStatus {
         state,
+        work_policy,
         active_generation_id,
         embedding_space_id,
         renderer_id,
         renderer_version,
+        profile,
         covered_events,
         pending_events,
+        outside_scope_events,
+        outside_scope_indexed_events,
+        no_searchable_text_events,
+        building_generation_id,
+        building_profile,
+        building_covered_events,
+        building_pending_events,
         live_projection_lease,
         last_failure,
     })
+}
+
+fn last_attempt_or_creation(row: &[Value], columns: &[String]) -> Result<u64> {
+    match row.get(column(columns, "last_attempt_at")?) {
+        Some(Value::TxId(value)) => Ok(value.0),
+        // A current-build generation can legitimately have no resumed attempt yet.
+        Some(Value::Null) => txid(row, columns, "started_at"),
+        other => Err(CgError::Engine(format!(
+            "column last_attempt_at: expected txid|null, got {other:?}"
+        ))),
+    }
 }
 
 fn latest_failure(answer: &contextdb_engine::QueryResult) -> Result<Option<String>> {
@@ -694,15 +829,6 @@ fn unsigned(row: &[Value], columns: &[String], name: &str) -> Result<u64> {
             .map_err(|_| CgError::Engine(format!("column {name}: negative integer"))),
         other => Err(CgError::Engine(format!(
             "column {name}: expected integer, got {other:?}"
-        ))),
-    }
-}
-
-fn timestamp(row: &[Value], columns: &[String], name: &str) -> Result<i64> {
-    match row.get(column(columns, name)?) {
-        Some(Value::Timestamp(value)) => Ok(*value),
-        other => Err(CgError::Engine(format!(
-            "column {name}: expected timestamp, got {other:?}"
         ))),
     }
 }

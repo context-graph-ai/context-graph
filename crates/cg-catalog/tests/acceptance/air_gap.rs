@@ -460,6 +460,120 @@ fn air_gap_pre_populated_cache_reads_with_zero_outbound_network_on_first_load() 
 }
 
 #[test]
+fn explicit_fetch_makes_a_complete_artifact_only_cache_usable() {
+    // A cache copied into an air-gapped host may have every artifact but no catalog metadata yet.
+    // The partial-cache and corrupt-cache refusals remain covered below.
+    let corrupt = tempfile::tempdir().expect("tempdir");
+    let corrupt_model_dir = corrupt.path().join(NOMIC_ID);
+    std::fs::create_dir_all(&corrupt_model_dir).expect("corrupt artifact-only cache directory");
+    for file in [
+        "model.safetensors",
+        "tokenizer.json",
+        "config.json",
+        "REVISION",
+    ] {
+        std::fs::copy(
+            fixture_dir("nomic").join(file),
+            corrupt_model_dir.join(file),
+        )
+        .unwrap_or_else(|error| panic!("copy corrupt-control artifact {file}: {error}"));
+    }
+    std::fs::write(
+        corrupt_model_dir.join("model.safetensors"),
+        b"corrupt complete artifact-only cache bytes\n",
+    )
+    .expect("corrupt complete artifact-only model written");
+    assert!(
+        !corrupt_model_dir.join("catalog.toml").exists(),
+        "the corrupt control has complete artifacts but no catalog metadata"
+    );
+    write_source_override(
+        corrupt.path(),
+        NOMIC_ID,
+        "file:///unavailable-air-gapped-source",
+        NOMIC_REVISION,
+    );
+    let corrupt_catalog = catalog_at(corrupt.path(), "host-A");
+    assert_eq!(
+        corrupt_catalog
+            .show(NOMIC_ID)
+            .expect("corrupt artifact-only cache remains inspectable")
+            .cache_status,
+        CacheStatus::NotCached,
+        "missing catalog metadata must not make corrupt bytes look cached"
+    );
+    let corrupt_result = corrupt_catalog.fetch(None, NOMIC_ID, OutputMode::Interactive);
+    assert!(
+        matches!(
+            &corrupt_result,
+            Err(CgCatalogError::ArtifactValidationFailed { file, .. })
+                if file == "model.safetensors"
+        ),
+        "complete corrupt artifact-only cache refuses with the typed checksum error: {corrupt_result:?}"
+    );
+    assert!(
+        !corrupt_model_dir.join("catalog.toml").exists(),
+        "a checksum refusal must not create catalog metadata"
+    );
+    assert_eq!(
+        corrupt_catalog
+            .show(NOMIC_ID)
+            .expect("corrupt artifact-only cache remains inspectable after refusal")
+            .cache_status,
+        CacheStatus::NotCached,
+        "checksum refusal leaves the artifact-only cache not cached"
+    );
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = fixture_dir("nomic");
+    let model_dir = temp.path().join(NOMIC_ID);
+    std::fs::create_dir_all(&model_dir).expect("artifact-only cache directory");
+    for file in [
+        "model.safetensors",
+        "tokenizer.json",
+        "config.json",
+        "REVISION",
+    ] {
+        std::fs::copy(source.join(file), model_dir.join(file))
+            .unwrap_or_else(|error| panic!("copy complete cached artifact {file}: {error}"));
+    }
+    write_source_override(
+        temp.path(),
+        NOMIC_ID,
+        "file:///unavailable-air-gapped-source",
+        NOMIC_REVISION,
+    );
+
+    let catalog = catalog_at(temp.path(), "host-A");
+    catalog
+        .fetch(None, NOMIC_ID, OutputMode::Interactive)
+        .expect("explicit fetch validates a complete local cache without reaching its source");
+
+    validate_artifact_identity(NOMIC_ID, &model_dir)
+        .expect("the complete artifact-only cache remains identity-valid");
+    let manifest_path = model_dir.join("catalog.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .expect("explicit fetch restores durable cache metadata");
+    let manifest = toml::from_str::<toml::Value>(&manifest).expect("restored manifest parses");
+    assert_eq!(
+        manifest.get("model_id").and_then(toml::Value::as_str),
+        Some(NOMIC_ID),
+        "restored metadata belongs to the validated model"
+    );
+    let shown = catalog
+        .show(NOMIC_ID)
+        .expect("complete cache becomes usable");
+    assert_eq!(shown.cache_status, CacheStatus::Cached);
+    assert!(
+        shown
+            .artifact_filenames
+            .iter()
+            .any(|file| file == "catalog.toml"),
+        "restored metadata is visible through the catalog"
+    );
+}
+
+#[test]
 fn air_gap_with_partial_cache_and_no_network_returns_typed_artifact_missing_error_does_not_silently_attempt_fetch()
  {
     // Partial caches in air-gapped mode should be explicit errors, not hidden network attempts.

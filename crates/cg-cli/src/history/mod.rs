@@ -14,14 +14,16 @@ mod worker;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use context_graph::embedder::nomic::{EventHistoryTextEmbedder, NomicTextEmbedder};
-use context_graph::embedding_space::event_history_embedding_space;
+use context_graph::embedding_space::{BuiltinSpaceRegistry, event_history_embedding_space};
 use context_graph::{
     CgError, ConsumerReader, ContextBindingKey, ContextId, EmbedderConfig, EmbedderRegistration,
-    EventPlacementPolicy, StoreConfig, event_history_reader_declaration,
+    EventPlacementPolicy, EventSearchOrder, EventSearchProfile, EventSearchSessionScope,
+    EventSearchWorkPolicy, EventSearchWorkSpec, StoreConfig, event_history_reader_declaration,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,7 +33,76 @@ use super::OutputFormat;
 pub(crate) use forget::handle_forget;
 pub(crate) use import::handle_import;
 pub(crate) use read::{handle_find, handle_show, handle_status};
+#[cfg(feature = "event-search-test-support")]
+pub(crate) use worker::apply_store_open_retry_allowance_for_test;
 pub(crate) use worker::{WORKER_COMMAND, handle_event_search_worker};
+
+/// Render a pasteable POSIX-shell import retry from separate argv tokens. The target can be an
+/// operator's actual source path or the documented receipt placeholder; either way it is never
+/// combined with flags before quoting.
+pub(crate) fn import_retry_command(
+    target: &str,
+    context: Option<&str>,
+    mode: Option<&str>,
+    work_policy: EventSearchWorkPolicy,
+    embedding_workers: Option<NonZeroUsize>,
+) -> String {
+    let sessions = match work_policy.sessions {
+        EventSearchSessionScope::All => "all".to_string(),
+        EventSearchSessionScope::Recent(limit) => limit.get().to_string(),
+    };
+    let order = match work_policy.order {
+        EventSearchOrder::Newest => "newest",
+        EventSearchOrder::Oldest => "oldest",
+    };
+    let mut tokens = vec![
+        "cg".to_string(),
+        "import".to_string(),
+        posix_shell_quote(target),
+    ];
+    if let Some(context) = context {
+        tokens.push("--context".to_string());
+        tokens.push(posix_shell_quote(context));
+    }
+    if let Some(mode) = mode {
+        tokens.push("--search".to_string());
+        tokens.push(mode.to_string());
+    }
+    tokens.push("--search-sessions".to_string());
+    tokens.push(sessions);
+    tokens.push("--search-order".to_string());
+    tokens.push(order.to_string());
+    if let Some(workers) = embedding_workers {
+        tokens.push("--embedding-workers".to_string());
+        tokens.push(workers.get().to_string());
+    }
+    tokens.join(" ")
+}
+
+/// Quote one literal POSIX-shell token without evaluating or otherwise interpreting it.
+fn posix_shell_quote(token: &str) -> String {
+    if !token.is_empty()
+        && token.bytes().all(|byte| {
+            matches!(byte,
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'+' | b',' | b'-'
+                    | b'.' | b'/' | b':' | b'=' | b'@'
+            )
+        })
+    {
+        return token.to_string();
+    }
+    format!("'{}'", token.replace('\'', "'\"'\"'"))
+}
+
+/// Canonical metadata identity; Nomic's document/query wrapper uses this ID for both the space
+/// and encoding. Constructing the request does not load or inspect a model artifact.
+pub(crate) fn search_work_spec(profile: &EventSearchProfile) -> EventSearchWorkSpec {
+    EventSearchWorkSpec {
+        profile: profile.clone(),
+        embedding_space_id: BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID.into(),
+        encoding_profile_id: BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID.into(),
+    }
+}
 
 /// The versioned namespace of workspace-to-Context bindings. The reference beside it is an opaque
 /// digest of the resolved project root; no path or basename is stored.
@@ -143,7 +214,7 @@ pub(crate) fn usage(format: OutputFormat, command: &str, message: &str) -> i32 {
 pub(crate) fn command_usage(command: &str) -> &'static str {
     match command {
         "import" => {
-            "cg import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer] [--session REF] [--dry-run] [--format json|text]"
+            "cg import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer] [--embedding-workers N] [--search-order newest|oldest] [--search-sessions N|all] [--session REF] [--dry-run] [--format json|text]"
         }
         "find" => {
             "cg find <question> [--context NAME[,NAME...] | --all-contexts | --tenant-id TENANT] [--limit N] [--format json|text]"
@@ -198,10 +269,14 @@ pub(crate) fn store_not_found(format: OutputFormat, db_path: &Path, with_next: b
 /// Map a library refusal that is not command-specific to its CLI state and exit code.
 pub(crate) fn library_refusal(format: OutputFormat, error: &CgError) -> i32 {
     let (code, state) = match error {
-        CgError::StoreLocked { .. } | CgError::StoreHeldByReaders { .. } => (4, "store_busy"),
+        CgError::StoreLocked { .. } => (4, "store_busy"),
+        CgError::StoreHeldByReaders { .. } => (1, "store_held_by_readers"),
+        CgError::ReaderCoordinationUnavailable { .. } => (1, "reader_coordination_unavailable"),
+        CgError::ReadActiveTimeExceeded { .. } => (1, "read_active_time_limit"),
         CgError::LegacySchemaDetected { .. } => (1, "schema_mismatch"),
         CgError::StoreUnreadable { .. } => (1, "store_unreadable"),
         CgError::StoreNeedsWritableRecovery { .. } => (1, "store_needs_recovery"),
+        CgError::WriteDidNotFitTheMemoryLimit { .. } => (1, "write_memory_limit"),
         CgError::TenantPolicyBindingRequired { .. } => (1, "tenant_policy_blocked"),
         CgError::EventPlacementPolicyMismatch { .. } => (1, "tenant_policy_blocked"),
         _ => (1, "error"),
@@ -218,6 +293,10 @@ pub(crate) fn library_refusal(format: OutputFormat, error: &CgError) -> i32 {
         ("schema_mismatch", _) => format!(
             "{error}. The old database is untouched; point CG_DATA_ROOT at a new empty directory to start a fresh store"
         ),
+        ("store_needs_recovery", _) => format!(
+            "{error}. Run `cg import <project-directory> --search defer` to recover the store"
+        ),
+        (_, CgError::Engine(_)) => error.to_string(),
         _ => error.to_string(),
     };
     // The condition name is the CLI's settled vocabulary for a store refusal, carried in both
@@ -225,7 +304,11 @@ pub(crate) fn library_refusal(format: OutputFormat, error: &CgError) -> i32 {
     let condition = match error {
         CgError::StoreLocked { .. } => "StoreBusy",
         CgError::StoreHeldByReaders { .. } => "StoreHeldByReaders",
-        CgError::StoreUnreadable { .. }
+        CgError::ReaderCoordinationUnavailable { .. } => "ReaderCoordinationUnavailable",
+        CgError::ReadActiveTimeExceeded { .. } => "ReadActiveTimeExceeded",
+        CgError::WriteDidNotFitTheMemoryLimit { .. } => "WriteDidNotFitTheMemoryLimit",
+        CgError::Engine(_)
+        | CgError::StoreUnreadable { .. }
         | CgError::StoreNeedsWritableRecovery { .. }
         | CgError::LegacySchemaDetected { .. } => "MemoryError",
         _ => "Error",
@@ -248,17 +331,25 @@ pub(crate) fn db_path(root: &Path) -> PathBuf {
 
 /// The Store configuration every event-history writer uses. `placement` is the optional expected
 /// policy from `<data-root>/cg/fabric.toml`; `None` preserves an existing Store's persisted policy.
-pub(crate) fn store_config(root: &Path, placement: Option<EventPlacementPolicy>) -> StoreConfig {
+pub(crate) fn store_config(
+    root: &Path,
+    placement: Option<EventPlacementPolicy>,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> StoreConfig {
     StoreConfig {
         db_path: db_path(root),
         extra_embedding_spaces: vec![event_history_embedding_space()],
         event_placement: placement,
+        read_memory_limit_bytes,
+        read_active_time_ms: crate::read_config::active_time_in_force(),
+        write_memory_limit_bytes: crate::write_config::in_force().bytes,
         ..StoreConfig::default()
     }
 }
 
 /// The optional `event_placement` value from the existing fabric configuration.
-pub(crate) fn configured_placement(root: &Path) -> Result<Option<EventPlacementPolicy>, String> {
+/// This machine's cg configuration file and its parsed contents, or `None` when there is none.
+pub(crate) fn cg_config(root: &Path) -> Result<Option<(PathBuf, toml::Value)>, String> {
     let path = root
         .join("cg")
         .join(context_graph::fabric::FABRIC_CONFIG_FILE);
@@ -269,6 +360,341 @@ pub(crate) fn configured_placement(root: &Path) -> Result<Option<EventPlacementP
     };
     let value: toml::Value =
         toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(Some((path, value)))
+}
+
+pub(crate) fn resolved_embedding_workers(
+    root: &Path,
+    cli_value: Option<&str>,
+) -> Result<std::num::NonZeroUsize, String> {
+    let cli_value = cli_value
+        .map(|value| parse_embedding_workers(value, "--embedding-workers"))
+        .transpose()?;
+    let configured = configured_embedding_workers(root)?;
+    if let Some(value) = cli_value.or(configured) {
+        return Ok(value);
+    }
+    available_embedding_workers()
+}
+
+pub(crate) fn resolved_search_work_policy(
+    root: &Path,
+    cli_order: Option<&str>,
+    cli_sessions: Option<&str>,
+) -> Result<EventSearchWorkPolicy, String> {
+    let configured = cg_config(root)?;
+    let search = configured
+        .as_ref()
+        .and_then(|(_, value)| value.get("search"));
+    let config_path = configured.as_ref().map(|(path, _)| path);
+    let configured_order = match search.and_then(|search| search.get("order")) {
+        None => EventSearchOrder::Newest,
+        Some(toml::Value::String(value)) => parse_search_order(value, "search.order")
+            .map_err(|message| format!("{}: {message}", config_path.unwrap().display()))?,
+        Some(value) => {
+            return Err(format!(
+                "{}: search.order must be newest or oldest, found {value}",
+                config_path.unwrap().display()
+            ));
+        }
+    };
+    let order = cli_order
+        .map(|value| parse_search_order(value, "--search-order"))
+        .transpose()?
+        .unwrap_or(configured_order);
+    let configured_sessions = match search.and_then(|search| search.get("sessions")) {
+        None => EventSearchSessionScope::Recent(
+            std::num::NonZeroUsize::new(10).expect("default session bound is positive"),
+        ),
+        Some(toml::Value::String(value)) if value == "all" => EventSearchSessionScope::All,
+        Some(toml::Value::Integer(value)) => usize::try_from(*value)
+            .ok()
+            .and_then(std::num::NonZeroUsize::new)
+            .map(EventSearchSessionScope::Recent)
+            .ok_or_else(|| {
+                format!(
+                    "{}: search.sessions must be a positive whole number or all, found {value}",
+                    config_path.unwrap().display()
+                )
+            })?,
+        Some(value) => {
+            return Err(format!(
+                "{}: search.sessions must be a positive whole number or all, found {value}",
+                config_path.unwrap().display()
+            ));
+        }
+    };
+    let sessions = cli_sessions
+        .map(|value| parse_search_sessions(value, "--search-sessions"))
+        .transpose()?
+        .unwrap_or(configured_sessions);
+    Ok(EventSearchWorkPolicy { order, sessions })
+}
+
+pub(crate) fn parse_search_order(value: &str, source: &str) -> Result<EventSearchOrder, String> {
+    match value {
+        "newest" => Ok(EventSearchOrder::Newest),
+        "oldest" => Ok(EventSearchOrder::Oldest),
+        _ => Err(format!(
+            "{source} must be newest or oldest, found `{value}`"
+        )),
+    }
+}
+
+pub(crate) fn parse_search_sessions(
+    value: &str,
+    source: &str,
+) -> Result<EventSearchSessionScope, String> {
+    if value == "all" {
+        return Ok(EventSearchSessionScope::All);
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .and_then(std::num::NonZeroUsize::new)
+        .map(EventSearchSessionScope::Recent)
+        .ok_or_else(|| format!("{source} must be a positive whole number or all, found `{value}`"))
+}
+
+fn configured_embedding_workers(root: &Path) -> Result<Option<std::num::NonZeroUsize>, String> {
+    let Some((path, value)) = cg_config(root)? else {
+        return Ok(None);
+    };
+    let Some(configured) = value
+        .get("search")
+        .and_then(|search| search.get("embedding_workers"))
+    else {
+        return Ok(None);
+    };
+    match configured {
+        toml::Value::Integer(value) => usize::try_from(*value)
+            .ok()
+            .and_then(std::num::NonZeroUsize::new)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "{}: search.embedding_workers must be a positive whole number, found {value}",
+                    path.display()
+                )
+            }),
+        other => Err(format!(
+            "{}: search.embedding_workers must be a positive whole number, found {other}",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn parse_embedding_workers(
+    value: &str,
+    source: &str,
+) -> Result<std::num::NonZeroUsize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .and_then(std::num::NonZeroUsize::new)
+        .ok_or_else(|| format!("{source} must be a positive whole number, found `{value}`"))
+}
+
+fn available_embedding_workers() -> Result<std::num::NonZeroUsize, String> {
+    std::thread::available_parallelism()
+        .map_err(|error| format!("available CPU parallelism could not be determined: {error}"))
+}
+
+#[cfg(test)]
+mod embedding_worker_policy_red {
+    use super::{resolved_embedding_workers, resolved_search_work_policy};
+    use context_graph::{EventSearchOrder, EventSearchSessionScope};
+
+    fn write_config(root: &std::path::Path, body: &str) {
+        let directory = root.join("cg");
+        std::fs::create_dir_all(&directory).expect("create isolated config directory");
+        std::fs::write(directory.join("fabric.toml"), body)
+            .expect("write isolated worker-count config");
+    }
+
+    #[test]
+    fn omitted_worker_policy_resolves_to_rust_available_parallelism() {
+        let root = tempfile::tempdir().expect("isolated config root");
+        assert_eq!(
+            resolved_embedding_workers(root.path(), None).expect("resolve default worker count"),
+            std::thread::available_parallelism().expect("host parallelism is available")
+        );
+    }
+
+    #[test]
+    fn configured_worker_policy_is_used_when_the_cli_is_silent() {
+        let root = tempfile::tempdir().expect("isolated config root");
+        let mut observed = Vec::new();
+        for cap in [1, 2] {
+            write_config(
+                root.path(),
+                &format!("[search]\nembedding_workers = {cap}\n"),
+            );
+            observed.push(
+                resolved_embedding_workers(root.path(), None)
+                    .expect("configured positive cap resolves")
+                    .get(),
+            );
+        }
+        assert_eq!(observed, [1, 2], "configured caps were not delivered");
+    }
+
+    #[test]
+    fn explicit_cli_worker_policy_wins_over_configuration_in_both_directions() {
+        let root = tempfile::tempdir().expect("isolated config root");
+        let mut observed = Vec::new();
+        for (configured, cli) in [(1, "2"), (2, "1")] {
+            write_config(
+                root.path(),
+                &format!("[search]\nembedding_workers = {configured}\n"),
+            );
+            observed.push(
+                resolved_embedding_workers(root.path(), Some(cli))
+                    .expect("positive CLI cap resolves")
+                    .get(),
+            );
+        }
+        assert_eq!(observed, [2, 1], "CLI caps did not override configuration");
+    }
+
+    #[test]
+    fn resolver_refuses_zero_negative_and_non_number_values_from_each_input() {
+        let root = tempfile::tempdir().expect("isolated config root");
+        let cli_refusals = ["0", "-1", "many"]
+            .map(|value| resolved_embedding_workers(root.path(), Some(value)).is_err());
+        let mut config_refusals = Vec::new();
+        for value in ["0", "-1", "\"many\""] {
+            write_config(
+                root.path(),
+                &format!("[search]\nembedding_workers = {value}\n"),
+            );
+            config_refusals.push(resolved_embedding_workers(root.path(), None).is_err());
+        }
+        assert_eq!(cli_refusals, [true; 3], "invalid CLI caps were accepted");
+        assert_eq!(
+            config_refusals, [true; 3],
+            "invalid configured caps were accepted"
+        );
+    }
+
+    #[test]
+    fn search_work_policy_defaults_to_newest_ten_and_cli_overrides_config() {
+        let root = tempfile::tempdir().expect("isolated config root");
+        let defaults = resolved_search_work_policy(root.path(), None, None)
+            .expect("resolve default search policy");
+        assert_eq!(defaults.order, EventSearchOrder::Newest);
+        assert_eq!(
+            defaults.sessions,
+            EventSearchSessionScope::Recent(std::num::NonZeroUsize::new(10).unwrap())
+        );
+
+        write_config(root.path(), "[search]\norder = \"oldest\"\nsessions = 3\n");
+        let configured = resolved_search_work_policy(root.path(), None, None)
+            .expect("resolve configured search policy");
+        assert_eq!(configured.order, EventSearchOrder::Oldest);
+        assert_eq!(
+            configured.sessions,
+            EventSearchSessionScope::Recent(std::num::NonZeroUsize::new(3).unwrap())
+        );
+        let overridden = resolved_search_work_policy(root.path(), Some("newest"), Some("all"))
+            .expect("CLI policy overrides configuration");
+        assert_eq!(overridden.order, EventSearchOrder::Newest);
+        assert_eq!(overridden.sessions, EventSearchSessionScope::All);
+    }
+
+    #[test]
+    fn invalid_search_config_is_refused_even_when_cli_values_are_present() {
+        let root = tempfile::tempdir().expect("isolated config root");
+        for body in [
+            "[search]\norder = \"sideways\"\nsessions = 10\n",
+            "[search]\norder = \"newest\"\nsessions = 0\n",
+            "[search]\norder = \"newest\"\nsessions = \"many\"\n",
+        ] {
+            write_config(root.path(), body);
+            assert!(
+                resolved_search_work_policy(root.path(), Some("oldest"), Some("all")).is_err(),
+                "invalid configuration reached the write path: {body}"
+            );
+        }
+    }
+}
+
+/// The passage profile new search generations use: the library default, with `target_tokens` and
+/// `hard_tokens` overridden by an optional `[search.passages]` section of the cg configuration
+/// file. An override must be positive integers with the hard limit at least the target.
+pub(crate) fn configured_passage_profile(root: &Path) -> Result<EventSearchProfile, String> {
+    let mut profile = EventSearchProfile::default();
+    let capability =
+        context_graph::embedder::nomic::NomicTextEmbedder::declared_event_search_capability();
+    let Some((path, value)) = cg_config(root)? else {
+        return profile
+            .validate_for(capability)
+            .map(|()| profile)
+            .map_err(|error| format!("default event-search passage profile: {error}"));
+    };
+    let Some(passages) = value
+        .get("search")
+        .and_then(|search| search.get("passages"))
+    else {
+        return profile
+            .validate_for(capability)
+            .map(|()| profile)
+            .map_err(|error| format!("{}: {error}", path.display()));
+    };
+    let tokens = |key: &str| -> Result<Option<std::num::NonZeroU32>, String> {
+        match passages.get(key) {
+            None => Ok(None),
+            Some(toml::Value::Integer(value)) => u32::try_from(*value)
+                .ok()
+                .and_then(std::num::NonZeroU32::new)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "{}: search.passages.{key} must be a positive whole number of tokens, found {value}",
+                        path.display()
+                    )
+                }),
+            Some(other) => Err(format!(
+                "{}: search.passages.{key} must be a positive whole number of tokens, found {other}",
+                path.display()
+            )),
+        }
+    };
+    if let Some(target) = tokens("target_tokens")? {
+        profile.target_passage_tokens = target;
+    }
+    if let Some(hard) = tokens("hard_tokens")? {
+        profile.hard_passage_tokens = hard;
+    }
+    profile.validate_for(capability).map_err(|error| match error {
+        context_graph::CgError::EventSearchProfileInvalid { .. } => format!(
+            "{}: search.passages.hard_tokens ({}) must be at least target_tokens ({})",
+            path.display(),
+            profile.hard_passage_tokens,
+            profile.target_passage_tokens
+        ),
+        context_graph::CgError::EventSearchOverlapInvalid { .. } => format!(
+            "{}: search.passages.hard_tokens ({}) must exceed the oversized-event overlap ({})",
+            path.display(),
+            profile.hard_passage_tokens,
+            profile.oversized_event_overlap_tokens
+        ),
+        context_graph::CgError::EventSearchProfileExceedsCapability {
+            requested_hard_passage_tokens,
+            maximum_prepared_tokens,
+        } => format!(
+            "{}: search.passages.hard_tokens ({requested_hard_passage_tokens}) exceeds the bundled event-history model's declared prepared-token maximum ({maximum_prepared_tokens})",
+            path.display()
+        ),
+        _ => format!("{}: {error}", path.display()),
+    })?;
+    Ok(profile)
+}
+
+pub(crate) fn configured_placement(root: &Path) -> Result<Option<EventPlacementPolicy>, String> {
+    let Some((path, value)) = cg_config(root)? else {
+        return Ok(None);
+    };
     let section = value.get("fabric").unwrap_or(&value);
     match section.get("event_placement") {
         None => Ok(None),
@@ -285,8 +711,16 @@ pub(crate) fn configured_placement(root: &Path) -> Result<Option<EventPlacementP
     }
 }
 
-pub(crate) fn open_reader(root: &Path) -> Result<ConsumerReader, CgError> {
-    ConsumerReader::open(db_path(root), event_history_reader_declaration())
+pub(crate) fn open_reader(
+    root: &Path,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> Result<ConsumerReader, CgError> {
+    ConsumerReader::open_with_read_limits(
+        db_path(root),
+        event_history_reader_declaration(),
+        read_memory_limit_bytes,
+        crate::read_config::active_time_in_force(),
+    )
 }
 
 fn nomic_model() -> Arc<NomicTextEmbedder> {

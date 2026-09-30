@@ -18,6 +18,7 @@
 //! being hydrated, locked, inspected or created.
 
 use std::fmt;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -67,7 +68,7 @@ const OWNER_READ_RUNTIME_DIR_ENV: &str = "CONTEXTDB_OWNER_READ_RUNTIME_DIR";
 /// A container or a packaged service has no per-user runtime directory to fall back on, so it
 /// provisions this ONE variable and both halves of the owner plane line up on it. Empty is the
 /// same as unset: an operator who exported nothing has said nothing.
-pub(crate) fn owner_read_runtime_dir() -> Option<PathBuf> {
+pub fn owner_read_runtime_dir() -> Option<PathBuf> {
     std::env::var_os(OWNER_READ_RUNTIME_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -103,13 +104,36 @@ pub const WRITER_TRANSITION_ALLOWANCE: std::time::Duration = std::time::Duration
 /// 257,352 for all 8 Contexts and 261,387 for all 64, about 26 units per passage in scope. 5,000,000
 /// covers the 100,000-passage all-Context scope (about 2.6 million) with room to spare; 1 GiB holds
 /// the graphs of that scope, where the shipped 16 MiB refused a single 1,250-passage partition.
+pub const fn default_read_memory_limit_bytes() -> NonZeroUsize {
+    NonZeroUsize::new(1_073_741_824).unwrap()
+}
+
+/// Default per-statement active-time allowance, in milliseconds.
+pub const fn default_read_active_time_ms() -> NonZeroU64 {
+    NonZeroU64::new(5_000).unwrap()
+}
+
+/// Read limits with the default memory and active-time budgets.
 pub const fn context_graph_read_limits() -> ReadLimits {
+    context_graph_read_limits_with_memory_limit(default_read_memory_limit_bytes())
+}
+
+/// Read limits for one caller's memory budget with the default active-time allowance.
+pub const fn context_graph_read_limits_with_memory_limit(memory_limit: NonZeroUsize) -> ReadLimits {
+    context_graph_read_limits_with_budgets(memory_limit, default_read_active_time_ms())
+}
+
+/// Read limits for one caller's memory and per-statement active-time allowances.
+pub const fn context_graph_read_limits_with_budgets(
+    memory_limit: NonZeroUsize,
+    active_time_ms: NonZeroU64,
+) -> ReadLimits {
     ReadLimits {
         result_rows: 500,
         result_bytes: ReadLimits::SHIPPED_RESULT_BYTES,
         work: 5_000_000,
-        active_ms: 5_000,
-        memory: 1024 * 1024 * 1024,
+        active_ms: active_time_ms.get(),
+        memory: memory_limit.get() as u64,
         cursor_page_rows: 100,
         cursor_page_bytes: ReadLimits::SHIPPED_CURSOR_PAGE_BYTES,
         cursor_idle_ms: 300_000,
@@ -119,8 +143,24 @@ pub const fn context_graph_read_limits() -> ReadLimits {
 
 /// The session options every context-graph read opens with.
 pub fn context_graph_read_session_options() -> ReadSessionOptions {
+    context_graph_read_session_options_with_memory_limit(default_read_memory_limit_bytes())
+}
+
+/// Apply one caller budget to loaded file state and to reads on either route.
+pub fn context_graph_read_session_options_with_memory_limit(
+    memory_limit: NonZeroUsize,
+) -> ReadSessionOptions {
+    context_graph_read_session_options_with_budgets(memory_limit, default_read_active_time_ms())
+}
+
+/// Apply immutable caller budgets to loaded file state and reads on either route.
+pub fn context_graph_read_session_options_with_budgets(
+    memory_limit: NonZeroUsize,
+    active_time_ms: NonZeroU64,
+) -> ReadSessionOptions {
     ReadSessionOptions {
-        limits: context_graph_read_limits(),
+        limits: context_graph_read_limits_with_budgets(memory_limit, active_time_ms),
+        memory_limit: Some(memory_limit.get()),
         ..ReadSessionOptions::default()
     }
 }
@@ -257,13 +297,37 @@ impl std::error::Error for OwnerControlError {}
 /// [`OwnerControlError::NoStore`]. A caller that wants the store's committed rows opens a session
 /// of its own, which reads the file exactly as it always has.
 pub fn request_owner(store_path: &Path, frame: &str) -> Result<String, OwnerControlError> {
+    request_owner_with_memory_limit(store_path, frame, default_read_memory_limit_bytes())
+}
+
+/// Ask the running owner under this caller's memory budget and default active-time allowance.
+pub fn request_owner_with_memory_limit(
+    store_path: &Path,
+    frame: &str,
+    memory_limit: NonZeroUsize,
+) -> Result<String, OwnerControlError> {
+    request_owner_with_budgets(
+        store_path,
+        frame,
+        memory_limit,
+        default_read_active_time_ms(),
+    )
+}
+
+/// Ask the running owner under this caller's memory and active-time allowances.
+pub fn request_owner_with_budgets(
+    store_path: &Path,
+    frame: &str,
+    memory_limit: NonZeroUsize,
+    active_time_ms: NonZeroU64,
+) -> Result<String, OwnerControlError> {
     // The same one root both sides of this plane meet on: the owner puts its channel where
     // `owner_read_config` was told to, and this asks in exactly that directory. A client in a
     // container or a packaged service, where there is no per-user runtime directory to fall back
     // on, would otherwise be told nobody owns the store — about the very owner it was pointed at.
     let session = ReadSession::open_owner_only_in_runtime_dir(
         store_path,
-        context_graph_read_session_options(),
+        context_graph_read_session_options_with_budgets(memory_limit, active_time_ms),
         owner_read_runtime_dir(),
     )
     .map_err(|error| classify(store_path, error))?;
@@ -284,25 +348,33 @@ pub fn owner_request_handler(handler: ControlHandler) -> Arc<dyn OwnerRequestHan
 
 /// The owner-read configuration a writable open takes to serve `handler`.
 ///
-/// The ceilings the owner enforces are the ones this crate declares, so what a client is told the
-/// owner will spend and what the owner actually spends are the same numbers from the same place.
+/// The default entrypoint uses the default read ceilings. A Store supplies its configured
+/// owner admission budget; each live Store read also supplies its own per-session limit.
 ///
 /// Where the channel is put comes from `CONTEXTDB_OWNER_READ_RUNTIME_DIR`, so an operator who has to
 /// place it — a container, a packaged service — places it once for the whole owner plane rather
 /// than once per side.
 pub fn owner_read_config(handler: ControlHandler) -> OwnerReadConfig {
-    writable_owner_read_config(Some(handler))
+    writable_owner_read_config(
+        Some(handler),
+        default_read_memory_limit_bytes(),
+        default_read_active_time_ms(),
+    )
 }
 
 /// The owner-read configuration every writable context-graph open serves: reads enabled under
 /// this crate's read ceilings, in the one runtime directory clients look in. A readonly client is
 /// never refused as busy because a writer took the store; a writer opened without `handler`
 /// serves reads only and answers no administrative frame.
-pub(crate) fn writable_owner_read_config(handler: Option<ControlHandler>) -> OwnerReadConfig {
+pub(crate) fn writable_owner_read_config(
+    handler: Option<ControlHandler>,
+    memory_limit: NonZeroUsize,
+    active_time_ms: NonZeroU64,
+) -> OwnerReadConfig {
     OwnerReadConfig {
         enabled: true,
         limits: OwnerReadLimits {
-            limits: context_graph_read_limits(),
+            limits: context_graph_read_limits_with_budgets(memory_limit, active_time_ms),
             ..OwnerReadLimits::default()
         },
         runtime_dir: owner_read_runtime_dir(),

@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,109 @@ pub struct Output {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// Own one asynchronous fixture process until it is reaped. Failure cleanup targets only the
+/// child returned by its spawn, including when an assertion unwinds before a rendezvous release.
+pub struct TestChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl TestChild {
+    pub fn new(child: Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.reaped |= status.is_some();
+        Ok(status)
+    }
+
+    pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        drop(self.child.stdin.take());
+        // Drain both pipes concurrently while retaining the Child in this owner: delegating to
+        // Child::wait_with_output would consume it before an I/O failure could run cleanup.
+        let stdout_reader = self.child.stdout.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes).map(|_| bytes)
+            })
+        });
+        let mut stderr = Vec::new();
+        let stderr_result = match self.child.stderr.take() {
+            Some(mut pipe) => pipe.read_to_end(&mut stderr).map(|_| ()),
+            None => Ok(()),
+        };
+        if stderr_result.is_err() {
+            // Make the stdout reader finish before joining it on this failure path.
+            let _ = self.kill();
+            let _ = self.wait();
+        }
+        let stdout = match stdout_reader {
+            Some(reader) => reader
+                .join()
+                .map_err(|_| std::io::Error::other("fixture stdout reader panicked"))??,
+            None => Vec::new(),
+        };
+        stderr_result?;
+        let status = self.wait()?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Observe state until it completes, errors, or spends its bounded allowance.
+pub fn wait_for_state<T, E>(
+    allowance: Duration,
+    interval: Duration,
+    mut observe: impl FnMut() -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    assert!(
+        !interval.is_zero(),
+        "state wait polling interval must be non-zero"
+    );
+    let started = Instant::now();
+    loop {
+        if let Some(value) = observe()? {
+            return Ok(Some(value));
+        }
+        let remaining = allowance.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(interval.min(remaining));
+    }
 }
 
 impl Output {
@@ -119,6 +222,43 @@ impl Machine {
     /// Run cg with no controlling terminal at all.
     pub fn run(&self, cwd: &Path, args: &[&str]) -> Output {
         let mut command = self.command(cwd, args);
+        Self::run_command(&mut command)
+    }
+
+    /// Run cg with one internal test environment value while preserving the ordinary journey.
+    pub fn run_with_env(&self, cwd: &Path, args: &[&str], key: &str, value: &Path) -> Output {
+        let mut command = self.command(cwd, args);
+        command.env(key, value);
+        Self::run_command(&mut command)
+    }
+
+    /// Start one ordinary CLI journey while the caller observes an existing internal rendezvous.
+    /// The command uses the same isolated roots and session setup as `run_with_env`.
+    pub fn spawn_with_env(&self, cwd: &Path, args: &[&str], key: &str, value: &Path) -> TestChild {
+        self.spawn_with_envs(cwd, args, &[(key, value)])
+    }
+
+    /// Start a journey with multiple existing internal rendezvous directories.
+    pub fn spawn_with_envs(&self, cwd: &Path, args: &[&str], envs: &[(&str, &Path)]) -> TestChild {
+        let mut command = self.command(cwd, args);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: setsid is async-signal-safe and only detaches the child from any terminal.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        TestChild::new(command.spawn().expect("start the compiled cg binary"))
+    }
+
+    fn run_command(command: &mut Command) -> Output {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -209,27 +349,24 @@ impl Machine {
         let mut master_writer = fs::File::from(master);
         let mut seen = 0_usize;
         for (index, (prompt, reply)) in answers.iter().enumerate() {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            loop {
+            let found = wait_for_state(Duration::from_secs(60), Duration::from_millis(20), || {
                 let found = {
                     let text = transcript.lock().expect("transcript lock");
                     text[seen..]
                         .find(prompt)
                         .map(|index| seen + index + prompt.len())
                 };
-                if let Some(end) = found {
-                    seen = end;
-                    break;
-                }
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!(
-                        "cg never wrote the terminal prompt {prompt:?}; transcript so far: {:?}",
-                        transcript.lock().expect("transcript lock")
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+                Ok::<_, ()>(found)
+            })
+            .expect("prompt observation cannot fail");
+            let Some(end) = found else {
+                let _ = child.kill();
+                panic!(
+                    "cg never wrote the terminal prompt {prompt:?}; transcript so far: {:?}",
+                    transcript.lock().expect("transcript lock")
+                );
+            };
+            seen = end;
             before_reply(index);
             master_writer
                 .write_all(reply.as_bytes())
@@ -265,46 +402,50 @@ impl Machine {
 
     /// Poll `cg status` until the named Context's search is ready.
     pub fn wait_for_search_ready(&self, cwd: &Path, context: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(600);
-        loop {
+        let mut last_status = None;
+        let ready = wait_for_state(Duration::from_secs(600), Duration::from_millis(250), || {
             let status = self.run(cwd, &["status", "--context", context]);
-            if status.code == 0 {
+            let ready = if status.code == 0 {
                 let value = status.json();
                 if value
                     .pointer("/history/search/status")
                     .and_then(Value::as_str)
                     == Some("ready")
                 {
-                    return value;
+                    Some(value)
+                } else {
+                    None
                 }
-            }
-            if Instant::now() > deadline {
-                panic!(
-                    "search never became ready for {context}; last status {}",
-                    status.describe()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
+            } else {
+                None
+            };
+            last_status = Some(status);
+            Ok::<_, ()>(ready)
+        })
+        .expect("status observation cannot fail");
+        ready.unwrap_or_else(|| {
+            panic!(
+                "search never became ready for {context}; last status {}",
+                last_status
+                    .expect("at least one status observation")
+                    .describe()
+            )
+        })
     }
 
     /// Poll until the detached search worker process has exited: its per-data-root lock can be
     /// taken again. The worker is another process, so its lock is the state there is to observe.
     pub fn wait_for_search_worker_exit(&self) {
         let lock_path = self.data_root.join("event-search-worker.lock");
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            if cg_node_fs::acquire_worker_lock(&lock_path).is_ok() {
-                return;
-            }
-            if Instant::now() > deadline {
-                panic!(
-                    "the detached search worker still holds {} after 120 s",
-                    lock_path.display()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let released = wait_for_state(Duration::from_secs(120), Duration::from_millis(100), || {
+            Ok::<_, ()>(cg_node_fs::acquire_worker_lock(&lock_path).ok())
+        })
+        .expect("worker-lock observation cannot fail");
+        assert!(
+            released.is_some(),
+            "the detached search worker still holds {} after 120 s",
+            lock_path.display()
+        );
     }
 }
 

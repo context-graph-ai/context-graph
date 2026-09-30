@@ -908,6 +908,10 @@ impl Catalog {
             drop(lock);
             return Err(err);
         }
+        if self.complete_artifact_only_cache(&spec)? {
+            drop(lock);
+            return Ok(FetchResult::Completed);
+        }
 
         self.fetch_to_temp_and_publish(spec.clone())?;
         drop(lock);
@@ -1424,11 +1428,31 @@ impl Catalog {
         if !has_artifact_payload {
             return Ok(());
         }
+        if !has_manifest && self.artifact_files_present(id) {
+            return validate_artifact_identity(id, &model_dir);
+        }
         let missing_files = self.missing_files(id);
         if !missing_files.is_empty() {
             return Err(CgCatalogError::CacheIncomplete { missing_files });
         }
         validate_artifact_identity(id, &model_dir)
+    }
+
+    /// An explicit fetch may adopt a complete, identity-valid local cache into catalog metadata.
+    /// Validation happens before the manifest write so arbitrary bytes never become trusted.
+    fn complete_artifact_only_cache(&self, spec: &ModelSpec) -> Result<bool> {
+        let model_dir = self.model_dir(spec.id);
+        if self.manifest_path(spec.id).is_file() || !self.artifact_files_present(spec.id) {
+            return Ok(false);
+        }
+        validate_artifact_identity(spec.id, &model_dir)?;
+        let revision = self
+            .source_override(spec.id)?
+            .map(|source| source.revision)
+            .unwrap_or_else(|| spec.revision.to_string());
+        let shas = shas_from_artifact_dir(&model_dir)?;
+        self.write_manifest(spec, &revision, None, &shas)?;
+        Ok(true)
     }
 
     fn partial_manifest(&self, id: &str) -> Result<bool> {

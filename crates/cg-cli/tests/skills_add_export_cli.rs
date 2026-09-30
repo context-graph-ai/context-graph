@@ -121,7 +121,8 @@ fn cg_skills_json_preserves_unknown_apply_strategy_verbatim() {
                 fire_right: 0,
                 fire_wrong: 0,
             },
-        ),
+        )
+        .expect("read succeeds"),
         "persisting a row with an unsupported apply_strategy must succeed (never rejected)"
     );
     drop(store);

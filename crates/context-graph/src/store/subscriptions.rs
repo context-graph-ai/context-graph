@@ -190,6 +190,7 @@ impl ScopedStore<'_> {
             delivered: metrics.delivered,
             queued: metrics.queued,
             retried: metrics.retried,
+            uncertain: metrics.uncertain,
             permanent_failures: metrics.permanent_failures,
         })
     }
@@ -241,21 +242,27 @@ impl ScopedStore<'_> {
         let handler = Arc::new(handler);
         let callback_store = CallbackStoreParts::from_store(self.store);
         let filter_for_callback = filter.clone();
+        let sink_name = subscription_id.sink_name().to_string();
         let deliver = move |event: &SinkEvent| {
             let Some(store) = callback_store.to_store() else {
                 return Err(SinkError::Transient(
                     "context graph store is closed".to_string(),
                 ));
             };
+            if has_subscription_receipt(&store.db, &sink_name, event.action_id)? {
+                return Ok(());
+            }
             let payload = build_payload(&store, event)
                 .map_err(|err| SinkError::Permanent(err.to_string()))?;
             if !payload
                 .matches_filter(&store, &filter_for_callback)
                 .map_err(|err| SinkError::Permanent(err.to_string()))?
             {
-                return Ok(());
+                return record_subscription_receipt(&store.db, &sink_name, event.action_id);
             }
-            handler(&payload).map_err(subscription_error_to_sink_error)
+            deliver_with_receipt(&store.db, &sink_name, event.action_id, || {
+                handler(&payload).map_err(subscription_error_to_sink_error)
+            })
         };
         match &effective_contexts {
             Some(contexts) if Some(contexts) != self.store.authorized_contexts.as_ref() => {
@@ -304,6 +311,8 @@ struct CallbackStoreParts {
 impl CallbackStoreParts {
     fn from_store(store: &Store) -> Self {
         let db_path = store.db_path.clone();
+        let read_memory_limit_bytes = store.read_memory_limit_bytes;
+        let read_active_time_ms = store.read_active_time_ms;
         let https_allowed_hosts = store.https_allowed_hosts.clone();
         let file_uri_allowed = store.file_uri_allowed;
         let trace = Arc::clone(&store.trace);
@@ -317,6 +326,8 @@ impl CallbackStoreParts {
         let schema_embedding_spaces = Arc::clone(&store.schema_embedding_spaces);
         let schema_consumer_schema = Arc::clone(&store.schema_consumer_schema);
         let build = Arc::new(move |db| Store {
+            read_memory_limit_bytes,
+            read_active_time_ms,
             db_path: db_path.clone(),
             db,
             resource_owner: None,
@@ -521,6 +532,7 @@ fn build_new_decision_payload(
     let served_intention_ids = decision.intention_ids.clone();
     let served_intention_descriptions = intention_descriptions(store, &served_intention_ids)?;
     Ok(NewDecisionPayload {
+        action_id: event.action_id,
         decision,
         served_intention_ids,
         served_intention_descriptions,
@@ -555,6 +567,7 @@ fn build_invalidation_detected_payload(
     let threatened_intention_descriptions =
         intention_descriptions(store, &invalidation.threatened_intention_ids)?;
     Ok(InvalidationDetectedPayload {
+        action_id: event.action_id,
         cascade_from: invalidation.cascade_from,
         invalidation,
         decision_description: decision.description,
@@ -576,6 +589,7 @@ fn build_conflict_detected_payload(
     let threatened_intention_descriptions =
         intention_descriptions(store, &threatened_intention_ids)?;
     Ok(ConflictDetectedPayload {
+        action_id: event.action_id,
         context_id,
         older_decision_id,
         newer_decision_id,
@@ -597,6 +611,7 @@ fn build_precedent_match_payload(
     let served_intention_descriptions = intention_descriptions(store, &served_intention_ids)?;
     let matched_precedent_outcome_success = event_bool(event, "matched_precedent_outcome_success")?;
     Ok(PrecedentMatchPayload {
+        action_id: event.action_id,
         context_id,
         new_decision_id,
         precedent_decision_id,
@@ -712,9 +727,73 @@ fn event_intention_ids(event: &SinkEvent, column: &str) -> SubscriptionResult<Ve
 
 fn subscription_error_to_sink_error(err: SubscriptionError) -> SinkError {
     match err {
-        SubscriptionError::HandlerFailed(message) => SinkError::Permanent(message),
-        other => SinkError::Permanent(other.to_string()),
+        // A handler may have produced an external effect before it returned an error.
+        // Retrying with the same action identity lets a receiver deduplicate it.
+        SubscriptionError::HandlerFailed(message) => SinkError::OutcomeUncertain(message),
+        other => SinkError::OutcomeUncertain(other.to_string()),
     }
+}
+
+fn receipt_params(sink_name: &str, action_id: u64) -> HashMap<String, Value> {
+    HashMap::from([
+        ("sink_name".to_string(), Value::Text(sink_name.to_string())),
+        ("action_id".to_string(), Value::Text(action_id.to_string())),
+    ])
+}
+
+fn deliver_with_receipt(
+    db: &Database,
+    sink_name: &str,
+    action_id: u64,
+    effect: impl FnOnce() -> std::result::Result<(), SinkError>,
+) -> std::result::Result<(), SinkError> {
+    if has_subscription_receipt(db, sink_name, action_id)? {
+        return Ok(());
+    }
+    effect()?;
+    record_subscription_receipt(db, sink_name, action_id)
+}
+
+fn has_subscription_receipt(
+    db: &Database,
+    sink_name: &str,
+    action_id: u64,
+) -> std::result::Result<bool, SinkError> {
+    db.execute(
+        "SELECT action_id FROM cg_subscription_receipts WHERE sink_name = $sink_name AND action_id = $action_id",
+        &receipt_params(sink_name, action_id),
+    )
+    .map(|result| !result.rows.is_empty())
+    .map_err(|error| SinkError::Transient(error.to_string()))
+}
+
+fn record_subscription_receipt(
+    db: &Database,
+    sink_name: &str,
+    action_id: u64,
+) -> std::result::Result<(), SinkError> {
+    let tx = db.begin().map_err(|error| {
+        SinkError::OutcomeUncertain(format!(
+            "action {action_id} may have taken effect; its receipt could not start: {error}"
+        ))
+    })?;
+    let mut params = receipt_params(sink_name, action_id);
+    params.insert("recorded_at".to_string(), Value::TxId(tx));
+    if let Err(error) = db.execute_in_tx(
+        tx,
+        "INSERT INTO cg_subscription_receipts (sink_name, action_id, recorded_at) VALUES ($sink_name, $action_id, $recorded_at)",
+        &params,
+    ) {
+        let _ = db.rollback(tx);
+        return Err(SinkError::OutcomeUncertain(format!(
+            "action {action_id} may have taken effect; its receipt was refused: {error}"
+        )));
+    }
+    db.commit(tx).map_err(|error| {
+        SinkError::OutcomeUncertain(format!(
+            "action {action_id} may have taken effect; its receipt did not commit: {error}"
+        ))
+    })
 }
 
 fn subscription_cg_err(err: CgError) -> SubscriptionError {
@@ -727,5 +806,51 @@ fn subscription_engine_err(err: contextdb_core::Error) -> SubscriptionError {
             SubscriptionError::SinkDdlMissing(message)
         }
         other => SubscriptionError::Engine(map_engine_err(other).to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_redelivered_action_keeps_one_visible_effect_and_one_receipt_after_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("subscriptions.db");
+        let db = Database::open(&path).expect("open");
+        db.execute(crate::schema::SUBSCRIPTION_RECEIPTS_DDL, &HashMap::new())
+            .expect("create receipt ledger");
+
+        let mut visible_events = Vec::new();
+        deliver_with_receipt(&db, "subscriber-a", 17, || {
+            visible_events.push("visible");
+            Ok(())
+        })
+        .expect("first delivery");
+        drop(db);
+
+        let reopened = Database::open(&path).expect("reopen");
+        deliver_with_receipt(&reopened, "subscriber-a", 17, || {
+            visible_events.push("duplicate");
+            Ok(())
+        })
+        .expect("redelivery acknowledges the existing receipt");
+        assert_eq!(visible_events, ["visible"]);
+        deliver_with_receipt(&reopened, "subscriber-b", 17, || {
+            visible_events.push("second subscriber");
+            Ok(())
+        })
+        .expect("the same action reaches another subscriber");
+        assert_eq!(visible_events, ["visible", "second subscriber"]);
+        let rows = reopened
+            .execute(
+                "SELECT action_id FROM cg_subscription_receipts WHERE sink_name = $sink_name",
+                &HashMap::from([(
+                    "sink_name".to_string(),
+                    Value::Text("subscriber-a".to_string()),
+                )]),
+            )
+            .expect("read receipts");
+        assert_eq!(rows.rows.len(), 1);
     }
 }

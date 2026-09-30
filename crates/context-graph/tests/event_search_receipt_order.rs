@@ -1,6 +1,6 @@
 //! The receipt fold requires the declared ordinal index to preserve order.
 
-#![cfg(context_graph_internal_test_support)]
+#![cfg(feature = "test-support")]
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -52,7 +52,7 @@ fn small_limits() -> ReadLimits {
 fn insert_generation(store: &Store, context_id: uuid::Uuid, id: uuid::Uuid) {
     store
         .execute_sql_for_test(
-            "INSERT INTO event_search_generations (id, context_id, interpretation_snapshot, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, failed_event_count, passage_count, started_at) VALUES ($id, $context_id, $snapshot, $snapshot_sha256, $zero, $ordered_sha256, $source_sha256, $zero, $renderer_id, $renderer_version, $profile, $space, $encoding, $state, $zero, $zero, $zero, $zero, $zero, $zero, $started_at)",
+            "INSERT INTO event_search_generations (id, context_id, interpretation_snapshot, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, failed_event_count, passage_count, started_at, last_attempt_token) VALUES ($id, $context_id, $snapshot, $snapshot_sha256, $zero, $ordered_sha256, $source_sha256, $zero, $renderer_id, $renderer_version, $profile, $space, $encoding, $state, $zero, $zero, $zero, $zero, $zero, $zero, $started_at, $id)",
             &HashMap::from([
                 ("id".into(), Value::Uuid(id)),
                 ("context_id".into(), Value::Uuid(context_id)),

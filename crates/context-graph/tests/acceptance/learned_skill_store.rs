@@ -116,7 +116,7 @@ fn learned_skill_is_inspectable_skill_md_shaped_row_with_provenance() {
     }
 
     // The placeholder returns empty — this assertion fails.
-    let skills = list_skills_in_store(&store);
+    let skills = list_skills_in_store(&store).expect("read succeeds");
     assert_eq!(
         skills.len(),
         3,
@@ -163,6 +163,7 @@ fn legacy_skill_row_derives_effect_and_default_strategy_from_rule() {
     );
 
     let skill = list_skills_in_store(&store)
+        .expect("read succeeds")
         .into_iter()
         .find(|skill| skill.id == "sk-legacy-retype")
         .expect("legacy skill row must load");
@@ -200,16 +201,18 @@ fn pre_extraction_strategy_is_not_silently_applied_by_post_harvest_retype() {
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        )
+        .expect("read succeeds"),
         "pre-extraction fixture skill must persist"
     );
 
-    let pre = select_pre_extraction_guidance_skills_for_chunk(&store, transcript, true, false);
+    let pre = select_pre_extraction_guidance_skills_for_chunk(&store, transcript, true, false)
+        .expect("read succeeds");
     assert!(
         pre.iter().any(|skill| skill.id == "sk-pre-extraction"),
         "the pre-extraction selector must find the generation-time skill"
     );
-    let post = select_skills_for_chunk(&store, transcript, true, false);
+    let post = select_skills_for_chunk(&store, transcript, true, false).expect("read succeeds");
     assert!(
         post.iter().all(|skill| skill.id != "sk-pre-extraction"),
         "the post-harvest selector must not silently apply a pre-extraction strategy skill"
@@ -263,6 +266,7 @@ fn unknown_apply_strategy_is_withheld_not_applied_and_surfaces_diagnostic() {
 
     // Store round-trip: the raw strategy string must survive a read exactly, never coerced.
     let reloaded = list_skills_in_store(&store)
+        .expect("read succeeds")
         .into_iter()
         .find(|skill| skill.id == "sk-future-strategy")
         .expect("row with an unsupported apply_strategy must still be readable");
@@ -320,7 +324,8 @@ fn a_correction_is_a_label_not_a_skill() {
     let (_dir, store) = fresh_store();
 
     // Apply a single correction (no skill linked yet).
-    let result = apply_correction(&store, "item-abc", "technology_choice", None);
+    let result =
+        apply_correction(&store, "item-abc", "technology_choice", None).expect("read succeeds");
 
     // The correction should report as applied.
     assert!(result.applied, "correction must report as applied");
@@ -626,7 +631,7 @@ fn learned_skill_is_visible_via_skills_listing() {
         );
     }
 
-    let skills = list_skills_in_store(&store);
+    let skills = list_skills_in_store(&store).expect("read succeeds");
     // The placeholder returns empty.
     assert_eq!(
         skills.len(),
@@ -857,7 +862,9 @@ fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
     );
     // Promotion is still recorded (the skill is listed even while held).
     assert_eq!(
-        list_skills_in_store(&store_on).len(),
+        list_skills_in_store(&store_on)
+            .expect("read succeeds")
+            .len(),
         1,
         "review-on: the freshly promoted skill must still be recorded/listed even while held"
     );

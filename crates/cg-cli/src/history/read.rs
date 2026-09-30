@@ -16,9 +16,9 @@ use context_graph::{
 use serde_json::{Value, json};
 
 use super::{
-    OutputFormat, Selection, db_path, grouped, library_refusal, open_reader, parse, print_json,
-    refuse, resolve_selection, search_artifact_available, search_registration, selection_refusal,
-    store_not_found, usage,
+    OutputFormat, Selection, db_path, grouped, import_retry_command, library_refusal, open_reader,
+    parse, print_json, refuse, resolve_selection, search_artifact_available, search_registration,
+    selection_refusal, store_not_found, usage,
 };
 
 /// Open the read-only reader, or answer for a store that is not there.
@@ -26,8 +26,9 @@ fn reader_or_refusal(
     format: OutputFormat,
     root: &Path,
     with_next: bool,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
 ) -> Result<ConsumerReader, i32> {
-    match open_reader(root) {
+    match open_reader(root, read_memory_limit_bytes) {
         Ok(reader) => Ok(reader),
         Err(CgError::StoreMissing { .. }) => {
             Err(store_not_found(format, &db_path(root), with_next))
@@ -58,7 +59,10 @@ fn placement_name(placement: EventPlacementState) -> &'static str {
 // cg status
 // ---------------------------------------------------------------------------------------------
 
-pub(crate) fn handle_status(args: &[String]) -> i32 {
+pub(crate) fn handle_status(
+    args: &[String],
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> i32 {
     let format = super::super::output_format(args);
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{STATUS_HELP}");
@@ -82,7 +86,7 @@ pub(crate) fn handle_status(args: &[String]) -> i32 {
         );
     }
     let root = super::super::data_root();
-    let reader = match open_reader(&root) {
+    let reader = match open_reader(&root, read_memory_limit_bytes) {
         Ok(reader) => reader,
         Err(CgError::StoreMissing { .. }) => {
             return store_not_found(format, &db_path(&root), false);
@@ -121,7 +125,7 @@ pub(crate) fn handle_status(args: &[String]) -> i32 {
         Err(error) => return selection_refusal(format, "status", error),
     };
     let db_path_text = db_path(&root).display().to_string();
-    let set = match ContextSelector::new(selection.contexts.iter().map(|(id, _)| *id)) {
+    let mut set = match ContextSelector::new(selection.contexts.iter().map(|(id, _)| *id)) {
         Ok(selector) => match injected_read_failure("counts")
             .and_then(|()| reader.event_history_status(selector))
         {
@@ -130,6 +134,18 @@ pub(crate) fn handle_status(args: &[String]) -> i32 {
         },
         Err(_) => None,
     };
+    let refusals = match super::worker::background_memory_refusals(&root) {
+        Ok(refusals) => refusals,
+        Err(error) => return library_refusal(format, &CgError::Engine(error)),
+    };
+    if let Some(set) = &mut set {
+        for context in &mut set.contexts {
+            if let Some(refusal) = refusals.get(&context.context_id.to_string()) {
+                context.search.state = EventHistorySearchState::Failed;
+                context.search.last_failure = Some(refusal.message());
+            }
+        }
+    }
     let placement = match &set {
         Some(set) => (set.placement, set.expected_policy),
         None => match reader.event_history_placement() {
@@ -170,6 +186,7 @@ pub(crate) fn handle_status(args: &[String]) -> i32 {
         .as_deref()
         .and_then(helper_transcripts_not_imported);
 
+    let writer_memory = crate::write_config::in_force();
     if format == OutputFormat::Text {
         render_status_text(&selection, set.as_ref(), placement.0, helpers);
         if let Some(fabric) = &fabric {
@@ -179,6 +196,14 @@ pub(crate) fn handle_status(args: &[String]) -> i32 {
                 fabric["inputs_in_push_set"]
             );
         }
+        // What one write on this machine is allowed to hold, and which of the three answers set
+        // it: an operator whose import was refused for want of memory reads the number they have
+        // to raise right here.
+        println!(
+            "write memory: {} — {}",
+            context_graph::write_budget::human_bytes(writer_memory.bytes.get() as u64),
+            writer_memory.origin()
+        );
         return 0;
     }
     let contexts = set
@@ -197,6 +222,8 @@ pub(crate) fn handle_status(args: &[String]) -> i32 {
             "db_path": db_path(&root).display().to_string(),
             "placement": placement_name(placement.0),
             "expected_policy": serde_json::to_value(placement.1).unwrap_or(Value::Null),
+            "write_memory_limit_bytes": writer_memory.bytes.get(),
+            "write_memory_limit_source": writer_memory.origin(),
         },
         "selection": selection.json(),
         "contexts": contexts,
@@ -258,13 +285,24 @@ fn helper_transcripts_not_imported(project: &Path) -> Option<usize> {
         .map(|resolved| resolved.helper_transcripts_not_imported)
 }
 
-fn search_next(context: &EventHistoryContextStatus) -> Option<&'static str> {
+fn search_retry(context: &EventHistoryContextStatus) -> String {
+    import_retry_command(
+        "<project-directory>",
+        Some(&context.context_name),
+        Some("wait"),
+        context.search.work_policy,
+        None,
+    )
+}
+
+fn search_next(context: &EventHistoryContextStatus) -> Option<String> {
     match context.search.state {
-        EventHistorySearchState::Blocked => {
-            Some("cg model fetch --defaults, then cg import <project-directory> --search wait")
-        }
+        EventHistorySearchState::Blocked => Some(format!(
+            "cg model fetch --defaults && {}",
+            search_retry(context)
+        )),
         EventHistorySearchState::Pending | EventHistorySearchState::Failed => {
-            Some("cg import <project-directory> --search wait")
+            Some(search_retry(context))
         }
         _ => None,
     }
@@ -350,13 +388,22 @@ fn context_status_json(
             "delivery": delivery,
             "search": {
                 "status": state_name(context.search.state),
+                "work_policy": context.search.work_policy,
                 "covered_events": context.search.covered_events,
                 "pending_events": context.search.pending_events,
+                "outside_scope_events": context.search.outside_scope_events,
+                "outside_scope_indexed_events": context.search.outside_scope_indexed_events,
+                "no_searchable_text_events": context.search.no_searchable_text_events,
                 "active_generation_id": context.search.active_generation_id.map(|id| id.to_string()),
+                "building_generation_id": context.search.building_generation_id.map(|id| id.to_string()),
+                "building_profile": context.search.building_profile,
+                "building_covered_events": context.search.building_covered_events,
+                "building_pending_events": context.search.building_pending_events,
                 "embedding_space_id": context.search.embedding_space_id,
                 "renderer": {
                     "id": context.search.renderer_id,
                     "version": context.search.renderer_version,
+                    "profile": context.search.profile,
                 },
                 "live_projection_lease": context.search.live_projection_lease,
                 "last_failure": context.search.last_failure,
@@ -444,6 +491,32 @@ fn render_status_text(
             ),
         };
         println!("  search: {line}");
+        if search.outside_scope_events > 0 || search.no_searchable_text_events > 0 {
+            println!(
+                "  search scope: {} outside current build scope ({} already indexed) / {} with no searchable text",
+                grouped(search.outside_scope_events),
+                grouped(search.outside_scope_indexed_events),
+                grouped(search.no_searchable_text_events)
+            );
+        }
+        if let Some(generation_id) = search.building_generation_id {
+            println!(
+                "  building search generation {generation_id}: {} events covered / {} pending",
+                grouped(search.building_covered_events),
+                grouped(search.building_pending_events)
+            );
+        }
+        if let Some(profile) = &search.building_profile {
+            println!(
+                "  building passage profile: target {} tokens / hard limit {} tokens",
+                profile.target_passage_tokens, profile.hard_passage_tokens
+            );
+        }
+        if search.state != EventHistorySearchState::Failed
+            && let Some(failure) = &search.last_failure
+        {
+            println!("  last search attempt failed: {failure}");
+        }
         if let Some(next) = search_next(context) {
             println!("  next: {next}");
         }
@@ -454,7 +527,7 @@ fn render_status_text(
 // cg find
 // ---------------------------------------------------------------------------------------------
 
-pub(crate) fn handle_find(args: &[String]) -> i32 {
+pub(crate) fn handle_find(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let format = super::super::output_format(args);
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{FIND_HELP}");
@@ -510,7 +583,7 @@ pub(crate) fn handle_find(args: &[String]) -> i32 {
         );
     }
     let root = super::super::data_root();
-    let mut reader = match reader_or_refusal(format, &root, true) {
+    let mut reader = match reader_or_refusal(format, &root, true, read_memory_limit_bytes) {
         Ok(reader) => reader,
         Err(code) => return code,
     };
@@ -539,15 +612,61 @@ pub(crate) fn handle_find(args: &[String]) -> i32 {
     let result = match reader.find_event_history(selector, &query, filter) {
         Ok(result) => result,
         Err(CgError::HistorySearchNotReady { .. }) => {
-            let names = selection
-                .contexts
+            let selector = ContextSelector::new(selection.contexts.iter().map(|(id, _)| *id))
+                .expect("the selected Context set was non-empty before the search");
+            let statuses = match reader.event_history_status(selector) {
+                Ok(statuses) => statuses.contexts,
+                Err(error) => return library_refusal(format, &error),
+            };
+            // A worker can finish after the rejected search but before this status read. Keep the
+            // original selected Context actions in that race rather than rendering an empty name
+            // list and a null retry.
+            let not_ready = statuses
                 .iter()
-                .map(|(_, name)| name.clone())
+                .filter(|context| context.search.state != EventHistorySearchState::Ready)
                 .collect::<Vec<_>>();
-            let message = format!(
-                "captured history in {} is not searchable yet; nothing was searched. Make it searchable with `cg import <project-directory> --search wait` for each Context, or wait for the background worker (`cg status`)",
-                names.join(", ")
-            );
+            let actions = not_ready
+                .iter()
+                .copied()
+                .chain(not_ready.is_empty().then_some(()).into_iter().flat_map(|_| statuses.iter()))
+                .map(|context| {
+                    json!({
+                        "context": {"id": context.context_id.to_string(), "name": context.context_name},
+                        "retry": search_retry(context),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let names = not_ready
+                .iter()
+                .copied()
+                .chain(
+                    not_ready
+                        .is_empty()
+                        .then_some(())
+                        .into_iter()
+                        .flat_map(|_| statuses.iter()),
+                )
+                .map(|context| context.context_name.clone())
+                .collect::<Vec<_>>();
+            let retry = if actions.len() == 1 {
+                actions[0]["retry"].clone()
+            } else {
+                Value::Null
+            };
+            let message = if actions.len() == 1 {
+                format!(
+                    "captured history in {} is not searchable yet; nothing was searched. Make it searchable with `{}` or wait for the background worker (`cg status`)",
+                    names.join(", "),
+                    actions[0]["retry"]
+                        .as_str()
+                        .expect("retry action is a string"),
+                )
+            } else {
+                format!(
+                    "captured history in {} is not searchable yet; nothing was searched. Each Context action carries that Context's persisted search policy, so run each action or wait for the background worker (`cg status`)",
+                    names.join(", "),
+                )
+            };
             return refuse(
                 format,
                 1,
@@ -556,7 +675,8 @@ pub(crate) fn handle_find(args: &[String]) -> i32 {
                     "state": "history_search_not_ready",
                     "selection": selection.json(),
                     "not_ready_contexts": names,
-                    "retry": "cg import <project-directory> --search wait",
+                    "retry": retry,
+                    "retry_actions": actions,
                     "message": message,
                 }),
                 &format!("error: {message}"),
@@ -604,6 +724,13 @@ pub(crate) fn handle_find(args: &[String]) -> i32 {
                 ),
                 _ => {}
             }
+            if coverage.outside_scope_event_count > 0 {
+                println!(
+                    "note: \"{name}\" has {} events outside the current build scope; {} of them remain indexed",
+                    grouped(coverage.outside_scope_event_count),
+                    grouped(coverage.outside_scope_indexed_event_count)
+                );
+            }
         }
         if result.hits.is_empty() {
             println!("no matching history");
@@ -642,6 +769,9 @@ pub(crate) fn handle_find(args: &[String]) -> i32 {
             "captured_events": coverage.captured_event_count,
             "searchable_events": coverage.searchable_event_count,
             "pending_events": coverage.pending_event_count,
+            "outside_scope_events": coverage.outside_scope_event_count,
+            "outside_scope_indexed_events": coverage.outside_scope_indexed_event_count,
+            "no_searchable_text_events": coverage.no_searchable_text_event_count,
             "source_watermark": coverage.source_watermark.as_ref().map(|watermark| json!({
                 "event_count": watermark.event_count,
                 "ordered_source_set_sha256": watermark.ordered_source_set_sha256,
@@ -714,7 +844,7 @@ fn hit_json(hit: &EventSearchHit, selection: &Selection) -> Value {
 // cg show
 // ---------------------------------------------------------------------------------------------
 
-pub(crate) fn handle_show(args: &[String]) -> i32 {
+pub(crate) fn handle_show(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let format = super::super::output_format(args);
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{SHOW_HELP}");
@@ -751,7 +881,7 @@ pub(crate) fn handle_show(args: &[String]) -> i32 {
         );
     }
     let root = super::super::data_root();
-    let reader = match reader_or_refusal(format, &root, true) {
+    let reader = match reader_or_refusal(format, &root, true, read_memory_limit_bytes) {
         Ok(reader) => reader,
         Err(code) => return code,
     };
@@ -916,6 +1046,9 @@ selected Context is reported separately.
 
 Search is exactly one of: ready (caught up), running (a projection holds a live lease), pending
 (no worker is running), blocked (the local Nomic model is not installed) or failed.
+A background write that exceeds its request's persisted ceiling is failed with the needed and
+allowed memory, even if the store could not record that failure. Retry import with an affordable
+--write-memory-limit-bytes value.
 
 A store that does not exist is reported as store_not_found (exit 1) and nothing is created. A
 store that exists and cannot be read is reported by its typed condition, never as an empty store.

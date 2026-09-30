@@ -23,8 +23,8 @@ use contextdb_tx::WriteSet;
 
 const FACE_REFERENCE_SPACE: &str = "face_reference_v1";
 
-fn store() -> Store {
-    fixture("entity-reference-edge").store
+fn store() -> Fixture {
+    fixture("entity-reference-edge")
 }
 
 struct Fixture {
@@ -363,9 +363,9 @@ fn entity_reference_embedding_query_for_unknown_entity_returns_empty_vec_not_err
 
 #[test]
 fn entity_reference_enrollment_dimension_validated_against_space_at_write_time() {
-    let store = store();
-    let entity = seed_entity(&store, "Kumar");
-    let result = store.enroll_entity_reference(
+    let fixture = store();
+    let entity = seed_entity(&fixture.store, "Kumar");
+    let result = fixture.store.enroll_entity_reference(
         entity.id,
         FACE_REFERENCE_SPACE,
         None,
@@ -394,7 +394,8 @@ fn entity_reference_enrollment_for_unknown_entity_id_rejected_with_typed_fk_erro
     #[cfg(not(context_graph_internal_test_support))]
     {
         let unknown_entity_id = EntityId::new_v7();
-        let result = store().enroll_entity_reference(
+        let fixture = store();
+        let result = fixture.store.enroll_entity_reference(
             unknown_entity_id,
             FACE_REFERENCE_SPACE,
             None,

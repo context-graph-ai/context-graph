@@ -1010,6 +1010,8 @@ pub struct Invalidation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvalidationDetectedPayload {
+    /// Stable engine action identity; receivers may use it to deduplicate retries.
+    pub action_id: u64,
     pub invalidation: Invalidation,
     pub decision_description: String,
     pub entity_name: String,
@@ -1020,6 +1022,8 @@ pub struct InvalidationDetectedPayload {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewDecisionPayload {
+    /// Stable engine action identity; receivers may use it to deduplicate retries.
+    pub action_id: u64,
     pub decision: Decision,
     pub served_intention_ids: Vec<IntentionId>,
     pub served_intention_descriptions: BTreeMap<IntentionId, String>,
@@ -1028,6 +1032,8 @@ pub struct NewDecisionPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictDetectedPayload {
+    /// Stable engine action identity; receivers may use it to deduplicate retries.
+    pub action_id: u64,
     pub context_id: ContextId,
     pub older_decision_id: DecisionId,
     pub newer_decision_id: DecisionId,
@@ -1039,6 +1045,8 @@ pub struct ConflictDetectedPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrecedentMatchPayload {
+    /// Stable engine action identity; receivers may use it to deduplicate retries.
+    pub action_id: u64,
     pub context_id: ContextId,
     pub new_decision_id: DecisionId,
     pub precedent_decision_id: DecisionId,
@@ -1084,6 +1092,8 @@ pub struct SubscriptionMetrics {
     pub delivered: u64,
     pub queued: u64,
     pub retried: u64,
+    /// Attempts whose external effect may have happened without an acknowledgement.
+    pub uncertain: u64,
     pub permanent_failures: u64,
 }
 
@@ -1092,6 +1102,7 @@ pub enum SubscriptionError {
     UnknownSubscription(SubscriptionId),
     SinkDdlMissing(String),
     ContextNotAuthorized(ContextId),
+    /// The handler could have applied its effect before failing; delivery remains pending.
     HandlerFailed(String),
     Engine(String),
 }
@@ -1535,12 +1546,24 @@ pub struct EventDeliveryStatus {
     pub refused: u64,
 }
 
-/// Schema 12 adds the policy-gated immutable event source, exact anchors and node-local source
-/// progress. A schema-11 root is deliberately refused rather than partially migrated.
+/// Schema 12 requires the policy-gated immutable event source, exact anchors and node-local source
+/// progress. A store with another schema version is refused.
 pub const CG_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreConfig {
+    /// Immutable memory ceiling for reads made by this Store.
+    #[serde(default = "crate::owner_control::default_read_memory_limit_bytes")]
+    pub read_memory_limit_bytes: std::num::NonZeroUsize,
+    /// Immutable per-statement active-time allowance for reads, in milliseconds.
+    #[serde(default = "crate::owner_control::default_read_active_time_ms")]
+    pub read_active_time_ms: std::num::NonZeroU64,
+    /// Working-memory ceiling for everything this Store writes. A write that does not fit is
+    /// refused in words with nothing half-written behind it, rather than the machine killing cg
+    /// part-way through an import. Unset anywhere, it is what
+    /// [`crate::write_budget::WriterMemoryLimit::derived`] reads off this machine.
+    #[serde(default = "crate::write_budget::default_write_memory_limit_bytes")]
+    pub write_memory_limit_bytes: std::num::NonZeroUsize,
     pub db_path: std::path::PathBuf,
     pub https_allowed_hosts: Vec<String>,
     pub file_uri_allowed: bool,
@@ -1553,6 +1576,9 @@ pub struct StoreConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         Self {
+            read_memory_limit_bytes: crate::owner_control::default_read_memory_limit_bytes(),
+            read_active_time_ms: crate::owner_control::default_read_active_time_ms(),
+            write_memory_limit_bytes: crate::write_budget::default_write_memory_limit_bytes(),
             db_path: std::env::temp_dir().join("context-graph.db"),
             https_allowed_hosts: Vec::new(),
             file_uri_allowed: false,

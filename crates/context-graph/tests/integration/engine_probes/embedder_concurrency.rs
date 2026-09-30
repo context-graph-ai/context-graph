@@ -15,6 +15,7 @@ use context_graph::{
 };
 use contextdb_core::{Error as EngineError, RowId, TxId, Value, VectorIndexRef};
 use contextdb_engine::Database;
+use contextdb_engine::memory_accounting::MemoryAccountant;
 use contextdb_engine::plugin::{CommitSource, DatabasePlugin};
 use contextdb_tx::WriteSet;
 use contextdb_vector::test_seam::PauseWindow;
@@ -969,15 +970,25 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
 
     let (text_done_tx, text_done_rx) = mpsc::channel();
     let text_db = Arc::clone(&db);
+    let text_store = vector_store.clone();
     thread::spawn(move || {
-        let result = first_hit_id(&text_db, text_index(), text_vector(7))
-            .ok_or_else(|| "missing text hit".to_string());
+        let result = text_store
+            .run_hnsw_maintenance_for_index_for_test(
+                &text_index(),
+                Arc::new(MemoryAccountant::no_limit()),
+            )
+            .map_err(|error| format!("{error:?}"))
+            .and_then(|_| {
+                first_hit_id(&text_db, text_index(), text_vector(7))
+                    .ok_or_else(|| "missing text hit".to_string())
+            });
         text_done_tx.send(result).expect("send text result");
     });
     let text_reached = text_pause.wait_until_reached(ENGINE_PROBE_TIMEOUT);
 
     let (vision_done_tx, vision_done_rx) = mpsc::channel();
     let vision_db = Arc::clone(&db);
+    let vision_store = vector_store.clone();
     let vision_row_for_thread = vision_row_id;
     thread::spawn(move || {
         let result = vision_row_for_thread
@@ -987,6 +998,12 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
                     .map_err(|err| format!("{err:?}"))
             })
             .and_then(|()| {
+                vision_store
+                    .run_hnsw_maintenance_for_index_for_test(
+                        &vision_index(),
+                        Arc::new(MemoryAccountant::no_limit()),
+                    )
+                    .map_err(|error| format!("{error:?}"))?;
                 first_hit_id(&vision_db, vision_index(), vector(4))
                     .ok_or_else(|| "missing vision hit".to_string())
             });

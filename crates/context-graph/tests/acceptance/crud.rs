@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+#[cfg(context_graph_internal_test_support)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use chrono::Utc;
+#[cfg(context_graph_internal_test_support)]
+use context_graph::OutcomeId;
 use context_graph::schema::DIGEST_VECTOR_DIMENSION;
 use context_graph::{
     AuditFilter, AuditTarget, CgError, ContextId, CreateContext, CreateDecision, CreateDigest,
@@ -16,6 +20,8 @@ use context_graph::{
 };
 use contextdb_core::{TxId, Value as DbValue};
 use contextdb_engine::Database;
+#[cfg(context_graph_internal_test_support)]
+use contextdb_engine::DatabasePlugin;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -2160,7 +2166,11 @@ fn outcome_record_concurrent_serializable() {
     let store = reopen(&db_path);
     let fetched = ok!(store.get_decision(decision.id), "get decision").expect("decision");
     let persisted = fetched.outcome.expect("persisted outcome");
-    assert!(persisted == outcome_a || persisted == outcome_b);
+    assert!(
+        persisted == outcome_a || persisted == outcome_b,
+        "reopened outcome differs from both concurrent returns: returned_a={outcome_a:?}, \
+         returned_b={outcome_b:?}, persisted={persisted:?}"
+    );
     assert!(persisted.notes == Some("a".to_string()) || persisted.notes == Some("b".to_string()));
     assert!(persisted.success || persisted.notes != Some("a".to_string()));
     assert!(!persisted.success || persisted.notes != Some("b".to_string()));
@@ -2178,6 +2188,25 @@ fn outcome_record_concurrent_serializable() {
         }),
         "audit query"
     );
+    for returned in [&outcome_a, &outcome_b] {
+        let own_audit = audit
+            .iter()
+            .find(|entry| {
+                entry
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|value| value.id == returned.id)
+            })
+            .expect("each caller's unique Outcome is retained in its own audit row");
+        assert_eq!(
+            returned,
+            own_audit
+                .outcome
+                .as_ref()
+                .expect("typed Outcome audit payload"),
+            "each caller receives its own canonical values"
+        );
+    }
     let loser = if persisted == outcome_a {
         &outcome_b
     } else {
@@ -2187,6 +2216,127 @@ fn outcome_record_concurrent_serializable() {
         matches!(entry.target, AuditTarget::Outcome(id) if id == decision.id)
             && entry.outcome.as_ref() == Some(loser)
     }));
+}
+
+#[cfg(context_graph_internal_test_support)]
+struct PauseOutcomeAuditRead {
+    armed: AtomicBool,
+    entered: Barrier,
+    release: Barrier,
+}
+
+#[cfg(context_graph_internal_test_support)]
+impl DatabasePlugin for PauseOutcomeAuditRead {
+    fn on_query(&self, sql: &str) -> contextdb_core::Result<()> {
+        if sql == "SELECT txid FROM audit_log WHERE id = $id AND context_id = $context_id"
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            self.entered.wait();
+            self.release.wait();
+        }
+        Ok(())
+    }
+}
+
+// Use case: a caller-owned transaction replaces the current Outcome after another caller commits
+// but before its return read; the first caller still receives its own canonical committed values.
+#[cfg(context_graph_internal_test_support)]
+#[test]
+fn outcome_return_uses_immutable_own_audit_anchor() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let db_path = tempdir.path().join("context-graph.db");
+    let plugin = Arc::new(PauseOutcomeAuditRead {
+        armed: AtomicBool::new(false),
+        entered: Barrier::new(2),
+        release: Barrier::new(2),
+    });
+    let store = Store::open_with_database_plugin(
+        StoreConfig {
+            db_path,
+            ..Default::default()
+        },
+        plugin.clone(),
+    )
+    .expect("open with audit-read pause");
+    let context = store
+        .create_context(context_input("anchor-race"))
+        .expect("context");
+    let intention = store
+        .create_intention(create_intention_input(context.id, "anchor race"))
+        .expect("intention");
+    let decision = store
+        .create_decision(create_decision_input(
+            context.id,
+            "anchor race",
+            vec![intention.id],
+            vec![],
+        ))
+        .expect("decision");
+    plugin.armed.store(true, Ordering::SeqCst);
+    let caller = store.clone();
+    let returned =
+        thread::spawn(move || caller.record_outcome(decision.id, true, Some("caller".to_string())));
+    plugin.entered.wait();
+
+    let replacement_id = OutcomeId::new_v7();
+    let db = store.sync_database();
+    let tx = db.begin().expect("replacement transaction");
+    db.execute_in_tx(
+        tx,
+        "DELETE FROM outcomes WHERE decision_id = $decision_id",
+        &HashMap::from([(
+            "decision_id".to_string(),
+            DbValue::Uuid(decision.id.as_uuid()),
+        )]),
+    )
+    .expect("delete current Outcome");
+    db.execute_in_tx(
+        tx,
+        "INSERT INTO outcomes (id, context_id, decision_id, success, notes, recorded_at) VALUES ($id, $context_id, $decision_id, $success, $notes, $recorded_at)",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Uuid(replacement_id.as_uuid())),
+            ("context_id".to_string(), DbValue::Uuid(context.id.as_uuid())),
+            ("decision_id".to_string(), DbValue::Uuid(decision.id.as_uuid())),
+            ("success".to_string(), DbValue::Bool(false)),
+            ("notes".to_string(), DbValue::Text("replacement".to_string())),
+            ("recorded_at".to_string(), DbValue::TxId(tx)),
+        ]),
+    )
+    .expect("insert replacement Outcome");
+    db.commit(tx).expect("commit replacement Outcome");
+    plugin.release.wait();
+
+    let returned = returned
+        .join()
+        .expect("caller thread")
+        .expect("caller Outcome");
+    let current = store
+        .admin_raw_outcomes_for_decision(decision.id)
+        .expect("current Outcome");
+    assert_eq!(current.len(), 1);
+    assert_eq!(
+        current[0].id, replacement_id,
+        "replacement happened before own read"
+    );
+    let audit = store
+        .audit_query(AuditFilter {
+            target: Some(AuditTarget::Outcome(decision.id)),
+            ..AuditFilter::default()
+        })
+        .expect("Outcome audit");
+    let own = audit
+        .iter()
+        .find(|entry| {
+            entry
+                .outcome
+                .as_ref()
+                .is_some_and(|value| value.id == returned.id)
+        })
+        .expect("caller's immutable audit anchor");
+    assert_eq!(
+        &returned,
+        own.outcome.as_ref().expect("typed Outcome audit payload")
+    );
 }
 
 // Use case: an agent with a stale Decision id tries to record an outcome; the engine refuses so no dangling Outcome row or HAS_OUTCOME edge ever appears pointing at a non-existent Decision.

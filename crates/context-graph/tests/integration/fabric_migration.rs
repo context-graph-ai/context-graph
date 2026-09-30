@@ -1,9 +1,8 @@
-//! Immutable intention history — schema 10 → 11 and the old-root migration discipline.
+//! Immutable intention history — refusal of unsupported schema contents.
 //!
 //! At schema 11 intention-history pointers and predecessor links make every wording immutable.
-//! Opening an old schema-10 root with the new binary loses no captured data: it is refused with a
-//! typed legacy-schema error while the raw and memory it holds survive on disk, re-derivable under
-//! the pre-release re-import discipline.
+//! Opening a root with unsupported schema contents is refused without mutation. Earlier-build
+//! data is moved aside before recreating the store.
 
 use std::collections::{BTreeMap, HashMap};
 

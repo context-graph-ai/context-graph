@@ -66,26 +66,33 @@ fn steering_block_caps_and_dedups_matched_guidance() {
     let store = fresh_store(dir.path());
     // Seven distinct matching guidance rules plus one duplicate rule — all share the token "sqlite".
     for index in 0..7 {
-        assert!(persist_skill(
+        assert!(
+            persist_skill(
+                &store,
+                &guidance_skill(
+                    &format!("guide-{index}"),
+                    "guidance about the sqlite cache",
+                    &format!("prefer the sqlite cache decision variant {index}"),
+                ),
+            )
+            .expect("read succeeds")
+        );
+    }
+    assert!(
+        persist_skill(
             &store,
             &guidance_skill(
-                &format!("guide-{index}"),
+                "guide-dup",
                 "guidance about the sqlite cache",
-                &format!("prefer the sqlite cache decision variant {index}"),
+                "prefer the sqlite cache decision variant 0",
             ),
-        ));
-    }
-    assert!(persist_skill(
-        &store,
-        &guidance_skill(
-            "guide-dup",
-            "guidance about the sqlite cache",
-            "prefer the sqlite cache decision variant 0",
-        ),
-    ));
+        )
+        .expect("read succeeds")
+    );
 
     let chunk = "User: we chose the sqlite cache for the local store";
     let block = assemble_pre_extraction_steering(&store, chunk, true, false)
+        .expect("read succeeds")
         .expect("matched guidance produces a steering block");
     let item_count = block.matches("\n- ").count();
     assert!(
@@ -109,19 +116,26 @@ fn steering_block_caps_and_dedups_matched_guidance() {
 fn steering_is_empty_when_skills_are_off_or_nothing_matches() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = fresh_store(dir.path());
-    assert!(persist_skill(
-        &store,
-        &guidance_skill(
-            "guide-1",
-            "guidance about the sqlite cache",
-            "prefer the sqlite cache decision",
-        ),
-    ));
+    assert!(
+        persist_skill(
+            &store,
+            &guidance_skill(
+                "guide-1",
+                "guidance about the sqlite cache",
+                "prefer the sqlite cache decision",
+            ),
+        )
+        .expect("read succeeds")
+    );
     let chunk = "User: we chose the sqlite cache for the local store";
 
     // Master switch off → no steering, even with a matching rule.
     set_skills_enabled(&store, false);
-    assert!(assemble_pre_extraction_steering(&store, chunk, true, false).is_none());
+    assert!(
+        assemble_pre_extraction_steering(&store, chunk, true, false)
+            .expect("read succeeds")
+            .is_none()
+    );
 
     // Back on, but an unrelated chunk matches nothing.
     set_skills_enabled(&store, true);
@@ -132,10 +146,19 @@ fn steering_is_empty_when_skills_are_off_or_nothing_matches() {
             true,
             false
         )
+        .expect("read succeeds")
         .is_none()
     );
     // The caller can also gate it off directly.
-    assert!(assemble_pre_extraction_steering(&store, chunk, false, false).is_none());
+    assert!(
+        assemble_pre_extraction_steering(&store, chunk, false, false)
+            .expect("read succeeds")
+            .is_none()
+    );
     // And a matching chunk with skills on does produce a block.
-    assert!(assemble_pre_extraction_steering(&store, chunk, true, false).is_some());
+    assert!(
+        assemble_pre_extraction_steering(&store, chunk, true, false)
+            .expect("read succeeds")
+            .is_some()
+    );
 }

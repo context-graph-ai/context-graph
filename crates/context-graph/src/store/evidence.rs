@@ -32,10 +32,7 @@ impl Store {
 
     pub fn get_evidence(&self, id: EvidenceId) -> Result<EvidenceRef> {
         let params = HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]);
-        let result = self
-            .db
-            .execute(evidence_select_sql("WHERE id = $id"), &params)
-            .map_err(map_engine_err)?;
+        let result = self.read_query(evidence_select_sql("WHERE id = $id"), &params)?;
         let Some(row) = result.rows.first() else {
             return Err(CgError::NotFound {
                 id: Some(id.as_uuid().to_string()),
@@ -104,13 +101,10 @@ impl Store {
     }
 
     pub fn list_embedding_spaces(&self) -> Result<Vec<EmbeddingSpace>> {
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings FROM embedding_spaces",
                 &HashMap::new(),
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut spaces = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             let embedding_space_id = get_text(row, &result.columns, "embedding_space_id")?;
@@ -423,7 +417,7 @@ impl Store {
         let sql = format!(
             "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations{where_clause}"
         );
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let result = self.read_query(&sql, &params)?;
         let mut rows = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             rows.push(decode_invalidation(&result.columns, row)?);
@@ -437,9 +431,7 @@ impl Store {
         context_id: ContextId,
         observation_id: ObservationId,
     ) -> Result<Vec<Invalidation>> {
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE context_id = $context_id AND trigger_observation_id = $trigger_observation_id",
                 &HashMap::from([
                     ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
@@ -448,8 +440,7 @@ impl Store {
                         Value::Uuid(observation_id.as_uuid()),
                     ),
                 ]),
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut rows = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             rows.push(decode_invalidation(&result.columns, row)?);
@@ -464,13 +455,10 @@ impl Store {
     }
 
     pub(crate) fn invalidation_by_id(&self, id: InvalidationId) -> Result<Option<Invalidation>> {
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE id = $id",
                 &HashMap::from([("id".to_string(), Value::Uuid(id.as_uuid()))]),
-            )
-            .map_err(map_engine_err)?;
+            )?;
         result
             .rows
             .first()
@@ -514,16 +502,13 @@ impl Store {
     }
 
     fn bindings_for_space(&self, embedding_space_id: &str) -> Result<Vec<EmbeddingSpaceBinding>> {
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT embedding_space_id, table_name, vector_column FROM embedding_space_bindings WHERE embedding_space_id = $embedding_space_id",
                 &HashMap::from([(
                     "embedding_space_id".to_string(),
                     Value::Text(embedding_space_id.to_string()),
                 )]),
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut bindings = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             bindings.push(EmbeddingSpaceBinding {
@@ -648,13 +633,10 @@ impl Store {
     }
 
     pub(super) fn entity_context(&self, entity_id: EntityId) -> Result<Option<ContextId>> {
-        let result = self
-            .db
-            .execute(
-                "SELECT context_id FROM entities WHERE id = $id",
-                &HashMap::from([("id".to_string(), Value::Uuid(entity_id.as_uuid()))]),
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT context_id FROM entities WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(entity_id.as_uuid()))]),
+        )?;
         result
             .rows
             .first()
@@ -666,13 +648,10 @@ impl Store {
         &self,
         decision_id: DecisionId,
     ) -> Result<DecisionStatusAndContext> {
-        let result = self
-            .db
-            .execute(
-                "SELECT status, context_id, confidence FROM decisions WHERE id = $id",
-                &HashMap::from([("id".to_string(), Value::Uuid(decision_id.as_uuid()))]),
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT status, context_id, confidence FROM decisions WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(decision_id.as_uuid()))]),
+        )?;
         let Some(row) = result.rows.first() else {
             return Err(CgError::NotFound {
                 id: Some(decision_id.as_uuid().to_string()),
@@ -687,13 +666,10 @@ impl Store {
     }
 
     fn observation_context(&self, observation_id: ObservationId) -> Result<ContextId> {
-        let result = self
-            .db
-            .execute(
-                "SELECT context_id FROM observations WHERE id = $id",
-                &HashMap::from([("id".to_string(), Value::Uuid(observation_id.as_uuid()))]),
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT context_id FROM observations WHERE id = $id",
+            &HashMap::from([("id".to_string(), Value::Uuid(observation_id.as_uuid()))]),
+        )?;
         let Some(row) = result.rows.first() else {
             return Err(CgError::NotFound {
                 id: Some(observation_id.as_uuid().to_string()),

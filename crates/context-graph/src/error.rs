@@ -321,6 +321,26 @@ pub enum CgError {
     },
     EmptyContextSelector,
     EmptyEventSearchQuery,
+    /// The requested target passage length exceeds the hard passage ceiling. The projection
+    /// runner owns refusing this before it creates a generation or writes a capture result.
+    EventSearchProfileInvalid {
+        target_passage_tokens: u32,
+        hard_passage_tokens: u32,
+    },
+    /// The oversized-event overlap must leave at least one token of forward progress under the
+    /// hard passage ceiling. The projection runner owns refusing this before it creates a
+    /// generation or writes a capture result.
+    EventSearchOverlapInvalid {
+        hard_passage_tokens: u32,
+        oversized_event_overlap_tokens: u32,
+    },
+    /// A requested passage profile exceeds the selected embedder's declared prepared-token
+    /// ceiling. Refuse before creating a generation, recording failure state, or writing a
+    /// passage; never silently narrow the requested profile.
+    EventSearchProfileExceedsCapability {
+        requested_hard_passage_tokens: u32,
+        maximum_prepared_tokens: usize,
+    },
     EventSearchLimitExceeded {
         requested: u32,
         maximum: u32,
@@ -375,9 +395,8 @@ pub enum CgError {
     /// whose exact `token_count` exceeds that same
     /// embedder's declared [`crate::embedder::Embedder::event_search_capability`] — enforced once,
     /// for every embedder, before any implementer hook runs, rather than left to each hook's own
-    /// discretion. Role-neutral and distinct from the pre-existing
-    /// [`CgError::TranscriptTooLargeForModel`], which stays bound to the unrelated legacy
-    /// plain-embedding path.
+    /// discretion. Role-neutral and distinct from [`CgError::TranscriptTooLargeForModel`],
+    /// which applies to the plain-embedding path.
     PreparedInputExceedsModelLimit {
         token_count: usize,
         limit: usize,
@@ -510,6 +529,17 @@ pub enum CgError {
     EngineFault {
         source: EngineError,
     },
+    /// The work this write needed did not fit the memory cg is allowed on this machine, and
+    /// nothing was written.
+    ///
+    /// Its own variant rather than prose inside [`CgError::Engine`] because the three things an
+    /// operator does about it are different from every other refusal: see how much was asked for,
+    /// see the ceiling in force, and raise the ceiling with one of the two knobs. `cg status`
+    /// prints the same ceiling and says which knob (or the machine) set it.
+    WriteDidNotFitTheMemoryLimit {
+        requested_bytes: usize,
+        limit_bytes: usize,
+    },
     /// The store is already open and held by a writer; the caller is told which
     /// store, and which process holds it when the holder published one. A distinct,
     /// recoverable condition — callers match this variant instead of
@@ -542,6 +572,17 @@ pub enum CgError {
         observed_direct_readers: u64,
         readers: Vec<ReaderIdentity>,
         path: std::path::PathBuf,
+    },
+    /// One statement exhausted its declared active-time allowance. The failed read releases
+    /// its resources; a caller may resume committed work under the same allowance.
+    ReadActiveTimeExceeded {
+        limit_ms: u64,
+    },
+    /// Reader presence could not be verified, so the requested operation was refused safely.
+    ReaderCoordinationUnavailable {
+        operation: String,
+        path: String,
+        reason: String,
     },
     /// There is no store at `path`, and the door that was asked for it created nothing.
     ///
@@ -666,6 +707,30 @@ impl fmt::Display for CgError {
                 },
                 describe_readers(*observed_direct_readers, readers)
             ),
+            // Nothing is damaged and nothing was half-written: the machine would not give cg the
+            // working memory this write needed. The operator is told what it asked for, what it
+            // is allowed, and the two knobs that change the second number.
+            CgError::ReadActiveTimeExceeded { limit_ms } => {
+                write!(f, "a read exceeded its {limit_ms} ms active-time allowance")
+            }
+            CgError::ReaderCoordinationUnavailable {
+                operation,
+                path,
+                reason,
+            } => write!(
+                f,
+                "{operation} cannot safely coordinate readers through {path}: {reason}"
+            ),
+            CgError::WriteDidNotFitTheMemoryLimit {
+                requested_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "that write needed {} of working memory and cg is allowed {} on this machine, so nothing was written; {}",
+                crate::write_budget::human_bytes(*requested_bytes as u64),
+                crate::write_budget::human_bytes(*limit_bytes as u64),
+                crate::write_budget::how_to_raise_the_writer_budget()
+            ),
             CgError::StoreMissing { path } => write!(
                 f,
                 "there is no store at {}: this door was asked to work on a store that already exists, so it created nothing — point it at an existing store, or open it with a creating door if a new one is wanted",
@@ -752,6 +817,27 @@ impl fmt::Display for CgError {
             CgError::EmptyEventSearchQuery => {
                 write!(f, "event-history search requires a non-empty query")
             }
+            CgError::EventSearchProfileInvalid {
+                target_passage_tokens,
+                hard_passage_tokens,
+            } => write!(
+                f,
+                "event-history passage target {target_passage_tokens} must not exceed hard passage limit {hard_passage_tokens}"
+            ),
+            CgError::EventSearchOverlapInvalid {
+                hard_passage_tokens,
+                oversized_event_overlap_tokens,
+            } => write!(
+                f,
+                "event-history passage hard limit {hard_passage_tokens} must exceed oversized-event overlap {oversized_event_overlap_tokens} so oversized events make forward progress"
+            ),
+            CgError::EventSearchProfileExceedsCapability {
+                requested_hard_passage_tokens,
+                maximum_prepared_tokens,
+            } => write!(
+                f,
+                "event-history passage hard limit {requested_hard_passage_tokens} exceeds the selected embedder's declared prepared-token maximum {maximum_prepared_tokens}"
+            ),
             CgError::EventSearchLimitExceeded { requested, maximum } => write!(
                 f,
                 "event-history search requested {requested} hits; the hard maximum is {maximum}"
@@ -794,7 +880,7 @@ impl fmt::Display for CgError {
                 expected, actual, ..
             } => write!(
                 f,
-                "this import requires {}, but the store is configured for {}; it made no placement change. Use a store configured for {} rather than treating this as a migration",
+                "this import requires {}, but the store is configured for {}; it made no placement change. Use a store configured for {} and retry the import",
                 event_placement_policy_name(*expected),
                 actual
                     .as_ref()

@@ -45,7 +45,7 @@ pub enum SkillProvenance {
 }
 
 /// The value-level effect a learned post-generation-repair skill applies to a harvest. Serde-tagged
-/// so new kinds are additive (a new arm needs no migration; the fold seam is designed for this). Each
+/// so each kind has a distinct stored representation. Each
 /// kind is a deterministic repair a learned correction encodes; matching is literal-text keyed
 /// (identity-based matching is a named deferred item, not claimed here).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,11 +79,9 @@ pub enum SkillApplyStrategy {
     #[default]
     PostHarvestRetype,
     PreExtractionGuidance,
-    /// An apply-strategy string this build does not implement, held verbatim. Forward
-    /// compatibility: an older edge must be able to store and relay a newer edge's rule without
-    /// corrupting it, so an unrecognized string is never coerced to an implemented strategy. A
-    /// skill carrying this variant is withheld on the capture path (never applied, never counted
-    /// as applied) and surfaces as a diagnostic instead.
+    /// An unrecognized apply-strategy string, held verbatim rather than coerced to an implemented
+    /// strategy. A skill carrying this variant is withheld on the capture path (never applied,
+    /// never counted as applied) and surfaces as a diagnostic instead.
     Unknown(String),
 }
 
@@ -289,31 +287,27 @@ fn kind_from_str(s: &str) -> TeachingEventKind {
 // ─── Store-backed functions ────────────────────────────────────────────────────
 
 /// Read every skill row from `cg_learned_skills`.
-pub fn list_skills_in_store(store: &Store) -> Vec<LearnedSkill> {
-    let db = store.sync_database();
-    let snapshot = db.snapshot();
-    let rows = match db.scan(SKILL_TABLE, snapshot) {
-        Ok(rows) => rows,
-        Err(_) => return vec![],
-    };
-    rows.into_iter()
+pub fn list_skills_in_store(store: &Store) -> crate::Result<Vec<LearnedSkill>> {
+    Ok(store
+        .read_table(SKILL_TABLE)?
+        .into_iter()
         .map(|row| skill_from_row(&row.values))
-        .collect()
+        .collect())
 }
 
 /// Persist a learned skill row exactly as supplied. Returns false when the id already exists
 /// or the insert fails.
-pub fn persist_skill(store: &Store, skill: &LearnedSkill) -> bool {
-    if skill_exists(store, &skill.id) {
-        return false;
+pub fn persist_skill(store: &Store, skill: &LearnedSkill) -> crate::Result<bool> {
+    if skill_exists(store, &skill.id)? {
+        return Ok(false);
     }
-    insert_skill_row(store, skill)
+    Ok(insert_skill_row(store, skill))
 }
 
-fn skill_exists(store: &Store, skill_id: &str) -> bool {
-    list_skills_in_store(store)
+fn skill_exists(store: &Store, skill_id: &str) -> crate::Result<bool> {
+    Ok(list_skills_in_store(store)?
         .into_iter()
-        .any(|skill| skill.id == skill_id)
+        .any(|skill| skill.id == skill_id))
 }
 
 fn insert_skill_row(store: &Store, skill: &LearnedSkill) -> bool {
@@ -470,8 +464,8 @@ fn retype_skill_id(key: &RetypeLessonKey) -> String {
     )
 }
 
-fn retype_skill_from_key(store: &Store, key: &RetypeLessonKey) -> LearnedSkill {
-    LearnedSkill {
+fn retype_skill_from_key(store: &Store, key: &RetypeLessonKey) -> crate::Result<LearnedSkill> {
+    Ok(LearnedSkill {
         id: retype_skill_id(key),
         description: format!(
             "retype {} from {} to {} when future captures mention this entity",
@@ -489,30 +483,32 @@ fn retype_skill_from_key(store: &Store, key: &RetypeLessonKey) -> LearnedSkill {
         apply_strategy: SkillApplyStrategy::PostHarvestRetype,
         provenance: SkillProvenance::HumanCorrection,
         active: true,
-        held_for_review: review_hold_active(store),
+        held_for_review: review_hold_active(store)?,
         fire_right: 0,
         fire_wrong: 0,
-    }
+    })
 }
 
 fn llm_retype_skill_from_key(
     store: &Store,
     key: &RetypeLessonKey,
     proposal: LlmSkillProposal,
-) -> Option<LearnedSkill> {
+) -> crate::Result<Option<LearnedSkill>> {
     let description = proposal.description.trim();
     let rule = proposal.rule.trim();
     if description.is_empty() || rule.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let effect = parse_retype_effect(rule)?;
+    let Some(effect) = parse_retype_effect(rule) else {
+        return Ok(None);
+    };
     if !effect.entity_name.eq_ignore_ascii_case(&key.entity_name)
         || !effect.from_type.eq_ignore_ascii_case(&key.from_type)
         || !effect.to_type.eq_ignore_ascii_case(&key.to_type)
     {
-        return None;
+        return Ok(None);
     }
-    Some(LearnedSkill {
+    Ok(Some(LearnedSkill {
         id: retype_skill_id(key),
         description: description.to_string(),
         rule: rule.to_string(),
@@ -524,10 +520,10 @@ fn llm_retype_skill_from_key(
         apply_strategy: SkillApplyStrategy::PostHarvestRetype,
         provenance: SkillProvenance::LlmAuthored,
         active: true,
-        held_for_review: review_hold_active(store),
+        held_for_review: review_hold_active(store)?,
         fire_right: 0,
         fire_wrong: 0,
-    })
+    }))
 }
 
 fn entity_type_label_for_skill(entity_type: crate::EntityType) -> &'static str {
@@ -690,7 +686,7 @@ fn propose_llm_retype_skill<C: crate::LlmClient>(
     training: &[TeachingEvent],
     context_id: crate::ContextId,
     client: &C,
-) -> Option<LearnedSkill> {
+) -> crate::Result<Option<LearnedSkill>> {
     let request = crate::llm::UnderstandingRequest {
         context_id,
         consumer: crate::llm::UnderstandingConsumer::SkillProposal,
@@ -718,11 +714,15 @@ fn propose_llm_retype_skill<C: crate::LlmClient>(
             },
         )
     };
-    let reply = pollster::block_on(client.understand(&invocation)).ok()?;
+    let Ok(reply) = pollster::block_on(client.understand(&invocation)) else {
+        return Ok(None);
+    };
     if reply.malformed {
-        return None;
+        return Ok(None);
     }
-    let proposal = parse_llm_skill_proposal_reply(&reply.phrasing)?;
+    let Some(proposal) = parse_llm_skill_proposal_reply(&reply.phrasing) else {
+        return Ok(None);
+    };
     llm_retype_skill_from_key(store, key, proposal)
 }
 
@@ -741,9 +741,12 @@ fn parse_llm_skill_proposal_reply(reply: &str) -> Option<LlmSkillProposal> {
         })
 }
 
-fn incumbent_retype_skill(store: &Store, key: &RetypeLessonKey) -> Option<LearnedSkill> {
+fn incumbent_retype_skill(
+    store: &Store,
+    key: &RetypeLessonKey,
+) -> crate::Result<Option<LearnedSkill>> {
     let expected_id = retype_skill_id(key);
-    list_skills_in_store(store).into_iter().find(|skill| {
+    Ok(list_skills_in_store(store)?.into_iter().find(|skill| {
         if skill.id == expected_id {
             return true;
         }
@@ -752,7 +755,7 @@ fn incumbent_retype_skill(store: &Store, key: &RetypeLessonKey) -> Option<Learne
                 && effect.from_type.eq_ignore_ascii_case(&key.from_type)
                 && effect.to_type.eq_ignore_ascii_case(&key.to_type)
         })
-    })
+    }))
 }
 
 fn run_heldout_promotion_gate(
@@ -760,29 +763,29 @@ fn run_heldout_promotion_gate(
     key: &RetypeLessonKey,
     candidate: LearnedSkill,
     heldout: &[TeachingEvent],
-) -> PromotionResult {
+) -> crate::Result<PromotionResult> {
     let candidate_score = evaluate_on_heldout(&candidate, heldout).score;
     let incumbent_score =
-        incumbent_retype_skill(store, key).map(|skill| evaluate_on_heldout(&skill, heldout).score);
+        incumbent_retype_skill(store, key)?.map(|skill| evaluate_on_heldout(&skill, heldout).score);
     let baseline = incumbent_score.unwrap_or(0.5);
     let promoted = candidate_score > baseline;
-    PromotionResult {
+    Ok(PromotionResult {
         promoted,
         skill: if promoted { Some(candidate) } else { None },
         heldout_score: candidate_score,
         heldout_gate_invocations: 1,
-    }
+    })
 }
 
 fn promote_skills_from_teaching_events_with_candidate<F>(
     store: &Store,
     mut candidate_for: F,
-) -> StorePromotionResult
+) -> crate::Result<StorePromotionResult>
 where
-    F: FnMut(&Store, &RetypeLessonKey, &[TeachingEvent]) -> Option<LearnedSkill>,
+    F: FnMut(&Store, &RetypeLessonKey, &[TeachingEvent]) -> crate::Result<Option<LearnedSkill>>,
 {
     let mut grouped: BTreeMap<RetypeLessonKey, Vec<TeachingEvent>> = BTreeMap::new();
-    for event in list_teaching_events_in_store(store) {
+    for event in list_teaching_events_in_store(store)? {
         if !event.skill_id.is_empty() {
             continue;
         }
@@ -798,21 +801,21 @@ where
         }
         let split_at = events.len() - 1;
         let (training, heldout) = events.split_at(split_at);
-        let Some(candidate) = candidate_for(store, &key, training) else {
+        let Some(candidate) = candidate_for(store, &key, training)? else {
             continue;
         };
-        let gate = run_heldout_promotion_gate(store, &key, candidate, heldout);
+        let gate = run_heldout_promotion_gate(store, &key, candidate, heldout)?;
         result.heldout_gate_invocations += gate.heldout_gate_invocations;
         if let Some(skill) = gate.skill {
-            result.created |= persist_skill(store, &skill);
+            result.created |= persist_skill(store, &skill)?;
         }
     }
-    result
+    Ok(result)
 }
 
-fn promote_skills_from_teaching_events(store: &Store) -> StorePromotionResult {
+fn promote_skills_from_teaching_events(store: &Store) -> crate::Result<StorePromotionResult> {
     promote_skills_from_teaching_events_with_candidate(store, |store, key, _training| {
-        Some(retype_skill_from_key(store, key))
+        Ok(Some(retype_skill_from_key(store, key)?))
     })
 }
 
@@ -820,15 +823,15 @@ fn promote_skills_from_teaching_events_with_llm_client<C: crate::LlmClient>(
     store: &Store,
     context_id: crate::ContextId,
     client: &C,
-) -> StorePromotionResult {
+) -> crate::Result<StorePromotionResult> {
     let mut proposal_invocations = 0;
     let mut result =
         promote_skills_from_teaching_events_with_candidate(store, |store, key, training| {
             proposal_invocations += 1;
             propose_llm_retype_skill(store, key, training, context_id, client)
-        });
+        })?;
     result.skill_proposal_model_invocations = proposal_invocations;
-    result
+    Ok(result)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1003,7 +1006,7 @@ pub fn apply_correction(
     item_id: &str,
     new_value: &str,
     skill_id: Option<&str>,
-) -> CorrectionResult {
+) -> crate::Result<CorrectionResult> {
     apply_correction_internal(store, item_id, new_value, skill_id, |_| {
         promote_skills_from_teaching_events(store)
     })
@@ -1015,9 +1018,9 @@ fn apply_correction_internal<F>(
     new_value: &str,
     skill_id: Option<&str>,
     promote: F,
-) -> CorrectionResult
+) -> crate::Result<CorrectionResult>
 where
-    F: FnOnce(&Store) -> StorePromotionResult,
+    F: FnOnce(&Store) -> crate::Result<StorePromotionResult>,
 {
     let event_id = uuid::Uuid::new_v4().to_string();
     let skill_id_str = skill_id.unwrap_or("").to_string();
@@ -1025,13 +1028,13 @@ where
     let Some(label_targets) =
         firing_label_targets_for_correction(store, item_id, new_value, skill_id)
     else {
-        return CorrectionResult {
+        return Ok(CorrectionResult {
             applied: false,
             teaching_event: None,
             new_skill_created: false,
             heldout_gate_invocations: 0,
             skill_proposal_model_invocations: 0,
-        };
+        });
     };
 
     if !insert_correction_and_labels(
@@ -1042,13 +1045,13 @@ where
         new_value,
         &label_targets,
     ) {
-        return CorrectionResult {
+        return Ok(CorrectionResult {
             applied: false,
             teaching_event: None,
             new_skill_created: false,
             heldout_gate_invocations: 0,
             skill_proposal_model_invocations: 0,
-        };
+        });
     }
 
     let teaching_event = TeachingEvent {
@@ -1059,18 +1062,18 @@ where
         content: new_value.to_string(),
     };
     let promotion = if skill_id.is_none() {
-        promote(store)
+        promote(store)?
     } else {
         StorePromotionResult::default()
     };
 
-    CorrectionResult {
+    Ok(CorrectionResult {
         applied: true,
         teaching_event: Some(teaching_event),
         new_skill_created: promotion.created,
         heldout_gate_invocations: promotion.heldout_gate_invocations,
         skill_proposal_model_invocations: promotion.skill_proposal_model_invocations,
-    }
+    })
 }
 
 /// Apply a correction with a model available for skill proposal.
@@ -1081,7 +1084,7 @@ pub fn apply_correction_with_llm_client<C: crate::LlmClient>(
     skill_id: Option<&str>,
     context_id: crate::ContextId,
     client: &C,
-) -> CorrectionResult {
+) -> crate::Result<CorrectionResult> {
     apply_correction_internal(store, item_id, new_value, skill_id, |_| {
         promote_skills_from_teaching_events_with_llm_client(store, context_id, client)
     })
@@ -1150,16 +1153,12 @@ fn insert_correction_and_labels(
 }
 
 /// Read all teaching events from `cg_teaching_events`.
-pub fn list_teaching_events_in_store(store: &Store) -> Vec<TeachingEvent> {
-    let db = store.sync_database();
-    let snapshot = db.snapshot();
-    let rows = match db.scan(TEACHING_EVENT_TABLE, snapshot) {
-        Ok(rows) => rows,
-        Err(_) => return vec![],
-    };
-    rows.into_iter()
+pub fn list_teaching_events_in_store(store: &Store) -> crate::Result<Vec<TeachingEvent>> {
+    Ok(store
+        .read_table(TEACHING_EVENT_TABLE)?
+        .into_iter()
         .map(|row| teaching_event_from_row(&row.values))
-        .collect()
+        .collect())
 }
 
 /// Re-derive each skill's active flag from its teaching-events log: a skill that carries a
@@ -1344,7 +1343,7 @@ pub fn select_skills_for_chunk(
     chunk: &str,
     skills_on: bool,
     review_mode: bool,
-) -> Vec<LearnedSkill> {
+) -> crate::Result<Vec<LearnedSkill>> {
     select_skills_for_chunk_with_strategy(
         store,
         chunk,
@@ -1364,7 +1363,7 @@ pub fn select_pre_extraction_guidance_skills_for_chunk(
     chunk: &str,
     skills_on: bool,
     review_mode: bool,
-) -> Vec<LearnedSkill> {
+) -> crate::Result<Vec<LearnedSkill>> {
     select_skills_for_chunk_with_strategy(
         store,
         chunk,
@@ -1421,16 +1420,16 @@ pub fn assemble_pre_extraction_steering(
     chunk: &str,
     skills_on: bool,
     review_mode: bool,
-) -> Option<String> {
-    if !(skills_on && skills_enabled(store)) {
-        return None;
+) -> crate::Result<Option<String>> {
+    if !(skills_on && skills_enabled(store)?) {
+        return Ok(None);
     }
     let mut items: Vec<String> = Vec::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     // Matched generation-time guidance rules first (the human/LLM-authored steering).
     for skill in
-        select_pre_extraction_guidance_skills_for_chunk(store, chunk, skills_on, review_mode)
+        select_pre_extraction_guidance_skills_for_chunk(store, chunk, skills_on, review_mode)?
     {
         let text = skill.rule.trim().to_string();
         if text.is_empty() || !seen.insert(text.to_ascii_lowercase()) {
@@ -1444,7 +1443,7 @@ pub fn assemble_pre_extraction_steering(
 
     // Then retrieved few-shot correction examples routed to generation-time and relevant to the chunk.
     if items.len() < MAX_STEERING_ITEMS {
-        for event in list_teaching_events_in_store(store) {
+        for event in list_teaching_events_in_store(store)? {
             if route_teaching_event(&event.kind) != ApplyLayer::GenerationTime {
                 continue;
             }
@@ -1463,7 +1462,7 @@ pub fn assemble_pre_extraction_steering(
     }
 
     if items.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut block = String::from(
         "Apply these learned corrections when extracting (use them to guide your output; do not restate them):",
@@ -1472,7 +1471,7 @@ pub fn assemble_pre_extraction_steering(
         block.push_str("\n- ");
         block.push_str(&item);
     }
-    Some(block)
+    Ok(Some(block))
 }
 
 /// The base match: active, not held under the review gate, description matches the chunk, and any
@@ -1484,17 +1483,17 @@ fn base_matching_skills_for_chunk(
     chunk: &str,
     skills_on: bool,
     review_mode: bool,
-) -> Vec<LearnedSkill> {
+) -> crate::Result<Vec<LearnedSkill>> {
     if !skills_on {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    list_skills_in_store(store)
+    Ok(list_skills_in_store(store)?
         .into_iter()
         .filter(|skill| skill.active)
         .filter(|skill| !(review_mode && skill.held_for_review))
         .filter(|skill| skill_description_matches_chunk(&skill.description, chunk))
         .filter(|skill| retype_skill_scope_matches_chunk(skill, chunk))
-        .collect()
+        .collect())
 }
 
 fn select_skills_for_chunk_with_strategy(
@@ -1503,11 +1502,13 @@ fn select_skills_for_chunk_with_strategy(
     skills_on: bool,
     review_mode: bool,
     strategy: SkillApplyStrategy,
-) -> Vec<LearnedSkill> {
-    base_matching_skills_for_chunk(store, chunk, skills_on, review_mode)
-        .into_iter()
-        .filter(|skill| skill.apply_strategy == strategy)
-        .collect()
+) -> crate::Result<Vec<LearnedSkill>> {
+    Ok(
+        base_matching_skills_for_chunk(store, chunk, skills_on, review_mode)?
+            .into_iter()
+            .filter(|skill| skill.apply_strategy == strategy)
+            .collect(),
+    )
 }
 
 pub(crate) struct SelectedSkillApplication {
@@ -1537,10 +1538,10 @@ pub(crate) fn select_and_apply_learned_skills(
     chunk: &str,
     config_skills_enabled: bool,
     config_review_mode: bool,
-) -> SelectedSkillApplication {
-    let skills_on = config_skills_enabled && skills_enabled(store);
-    let review_mode = config_review_mode || review_hold_active(store);
-    let matched = base_matching_skills_for_chunk(store, chunk, skills_on, review_mode);
+) -> crate::Result<SelectedSkillApplication> {
+    let skills_on = config_skills_enabled && skills_enabled(store)?;
+    let review_mode = config_review_mode || review_hold_active(store)?;
+    let matched = base_matching_skills_for_chunk(store, chunk, skills_on, review_mode)?;
 
     let mut selected = Vec::new();
     let mut withheld_skill_ids = Vec::new();
@@ -1555,11 +1556,11 @@ pub(crate) fn select_and_apply_learned_skills(
     }
 
     if selected.is_empty() {
-        return SelectedSkillApplication {
+        return Ok(SelectedSkillApplication {
             applied_skill_ids: Vec::new(),
             firing_records: Vec::new(),
             withheld_skill_ids,
-        };
+        });
     }
 
     let mut entity_types_by_key: HashMap<String, (String, String)> = harvest
@@ -1628,11 +1629,11 @@ pub(crate) fn select_and_apply_learned_skills(
         .filter(|id| effective_skill_ids.contains(id))
         .collect();
 
-    SelectedSkillApplication {
+    Ok(SelectedSkillApplication {
         applied_skill_ids,
         firing_records,
         withheld_skill_ids,
-    }
+    })
 }
 
 /// Whether a skill carries one of the generalized post-generation effect kinds (recategorize / drop /
@@ -1906,32 +1907,27 @@ pub fn set_skills_enabled(store: &Store, enabled: bool) -> bool {
 
 /// Read the global skills master switch. Defaults to enabled (true) when never set, so a fresh
 /// store applies promoted skills by default.
-pub fn skills_enabled(store: &Store) -> bool {
+pub fn skills_enabled(store: &Store) -> crate::Result<bool> {
     read_review_cursor_flag(store, "skills_enabled", true)
 }
 
 /// Read the review-hold flag (opt-in `cg skills review`). Defaults to off (false) when never set,
 /// so a promoted skill auto-applies unless review is explicitly turned on.
-pub fn review_hold_active(store: &Store) -> bool {
+pub fn review_hold_active(store: &Store) -> crate::Result<bool> {
     read_review_cursor_flag(store, "review_hold", false)
 }
 
 /// Read a boolean flag persisted on the `cg_review_cursor` settings lane (`position` 1/0), falling
 /// back to `default` when the row is absent.
-fn read_review_cursor_flag(store: &Store, id: &str, default: bool) -> bool {
-    let db = store.sync_database();
-    let snapshot = db.snapshot();
-    let rows = db.scan(REVIEW_CURSOR_TABLE, snapshot).unwrap_or_default();
-    let row = rows.iter().find(
-        |row| matches!(row.values.get("id"), Some(contextdb_core::Value::Text(rid)) if rid == id),
-    );
-    match row {
-        Some(row) => match row.values.get("position") {
-            Some(contextdb_core::Value::Int64(v)) => *v != 0,
-            _ => default,
-        },
-        None => default,
-    }
+fn read_review_cursor_flag(store: &Store, id: &str, default: bool) -> crate::Result<bool> {
+    let rows = store.read_query(
+        "SELECT position FROM cg_review_cursor WHERE id = $id",
+        &HashMap::from([("id".into(), contextdb_core::Value::Text(id.into()))]),
+    )?;
+    Ok(match rows.rows.first().and_then(|row| row.first()) {
+        Some(contextdb_core::Value::Int64(v)) => *v != 0,
+        _ => default,
+    })
 }
 
 /// Enable or disable the review-hold (opt-in `cg skills review`).
@@ -1991,13 +1987,10 @@ pub fn acknowledge_skill(store: &Store, skill_id: &str) {
 /// Derives the verdict per-skill from the persisted firing-trace rows. A skill
 /// whose traces show more wrong fires than right fires produces exactly one alert
 /// (deduped by skill id — one row per bad skill, not one per trace).
-pub fn list_drift_alerts(store: &Store) -> Vec<DriftAlert> {
-    let skills = list_skills_in_store(store);
-    let db = store.sync_database();
-    let snapshot = db.snapshot();
-    let all_traces: Vec<_> = db
-        .scan(FIRING_TRACE_TABLE, snapshot)
-        .unwrap_or_default()
+pub fn list_drift_alerts(store: &Store) -> crate::Result<Vec<DriftAlert>> {
+    let skills = list_skills_in_store(store)?;
+    let all_traces: Vec<_> = store
+        .read_table(FIRING_TRACE_TABLE)?
         .into_iter()
         .map(|row| firing_trace_from_row(&row.values))
         .collect();
@@ -2013,7 +2006,7 @@ pub fn list_drift_alerts(store: &Store) -> Vec<DriftAlert> {
             alerts.push(alert);
         }
     }
-    alerts
+    Ok(alerts)
 }
 
 fn firing_trace_from_row(values: &HashMap<String, contextdb_core::Value>) -> FiringTrace {

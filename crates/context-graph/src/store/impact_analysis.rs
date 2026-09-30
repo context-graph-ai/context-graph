@@ -29,7 +29,7 @@ pub(super) fn register_impact_analysis_trigger(db: &Database) -> Result<()> {
         .iter()
         .any(|name| name == IMPACT_ANALYSIS_TRIGGER)
     {
-        db.register_trigger_callback(IMPACT_ANALYSIS_TRIGGER, run_impact_analysis)
+        db.register_transactional_trigger_callback(IMPACT_ANALYSIS_TRIGGER, run_impact_analysis)
             .map_err(map_engine_err)?;
         db.complete_initialization().map_err(map_engine_err)?;
     }

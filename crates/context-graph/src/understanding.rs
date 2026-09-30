@@ -242,13 +242,10 @@ pub fn mark_failed(
 /// The highest attempt number any claim row records for a job — the attempt a just-claimed worker
 /// currently holds.
 fn highest_claim_attempt(store: &Store, job_id: &str) -> Result<i64> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT attempt FROM work_claims WHERE job_id = $job_id",
-            &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT attempt FROM work_claims WHERE job_id = $job_id",
+        &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
+    )?;
     Ok(result
         .rows
         .iter()
@@ -264,13 +261,10 @@ fn highest_claim_attempt(store: &Store, job_id: &str) -> Result<i64> {
 /// How many failures have been recorded for a job — the attempt count the retired queue tracked in
 /// its `attempts` column.
 fn failure_count(store: &Store, job_id: &str) -> Result<u32> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT attempt FROM work_failures WHERE job_id = $job_id",
-            &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT attempt FROM work_failures WHERE job_id = $job_id",
+        &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
+    )?;
     Ok(result.rows.len() as u32)
 }
 
@@ -280,27 +274,21 @@ fn failure_count(store: &Store, job_id: &str) -> Result<u32> {
 // --- internal read helpers --------------------------------------------------------------------
 
 fn completion_exists(store: &Store, digest_text: &str) -> Result<bool> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT id FROM cg_understanding_completions WHERE id = $id",
-            &HashMap::from([("id".to_string(), DbValue::Text(digest_text.to_string()))]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT id FROM cg_understanding_completions WHERE id = $id",
+        &HashMap::from([("id".to_string(), DbValue::Text(digest_text.to_string()))]),
+    )?;
     Ok(!result.rows.is_empty())
 }
 
 fn chunk_text_for_digest(store: &Store, digest_text: &str) -> Result<Option<String>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT content FROM cg_source_chunks WHERE digest_id = $digest_id",
-            &HashMap::from([(
-                "digest_id".to_string(),
-                DbValue::Text(digest_text.to_string()),
-            )]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT content FROM cg_source_chunks WHERE digest_id = $digest_id",
+        &HashMap::from([(
+            "digest_id".to_string(),
+            DbValue::Text(digest_text.to_string()),
+        )]),
+    )?;
     Ok(result.rows.first().and_then(|row| match row.first() {
         Some(DbValue::Text(content)) => Some(content.clone()),
         _ => None,
@@ -308,16 +296,13 @@ fn chunk_text_for_digest(store: &Store, digest_text: &str) -> Result<Option<Stri
 }
 
 fn touch_count_for_digest(store: &Store, digest_text: &str) -> Result<u64> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT touch_count FROM cg_retrieval_touches WHERE digest_id = $digest_id",
-            &HashMap::from([(
-                "digest_id".to_string(),
-                DbValue::Text(digest_text.to_string()),
-            )]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT touch_count FROM cg_retrieval_touches WHERE digest_id = $digest_id",
+        &HashMap::from([(
+            "digest_id".to_string(),
+            DbValue::Text(digest_text.to_string()),
+        )]),
+    )?;
     Ok(result
         .rows
         .first()

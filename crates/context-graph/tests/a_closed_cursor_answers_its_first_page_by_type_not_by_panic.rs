@@ -188,3 +188,23 @@ fn a_closed_cursor_refuses_its_first_page_exactly_as_it_refuses_a_fetch() {
 
     reader.close().expect("let the read session go");
 }
+
+#[test]
+fn dropping_an_unfinished_cursor_releases_the_session_cursor_slot() {
+    let directory = tempfile::tempdir().expect("scratch directory");
+    let store_path = seeded_store(directory.path());
+    let reader = ConsumerReader::open(&store_path, cursor_declaration())
+        .expect("the read-only surface opens the stopped store");
+    {
+        let cursor = reader
+            .open_cursor("SELECT id FROM observations", &HashMap::new())
+            .expect("open the first cursor");
+        assert!(cursor.first_page().expect("first page").has_more);
+    }
+    let mut next = reader
+        .open_cursor("SELECT id FROM observations", &HashMap::new())
+        .expect("dropping the first cursor releases the engine's one active cursor slot");
+    assert!(next.is_live());
+    next.close().expect("close the second cursor");
+    reader.close().expect("close the reader");
+}

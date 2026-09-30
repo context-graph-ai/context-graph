@@ -207,13 +207,10 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT source_id FROM edges WHERE target_id = $target_id AND context_id = $context_id AND edge_type = $edge_type",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             if let Some(Value::Uuid(u)) = row.first() {
@@ -290,7 +287,7 @@ impl Store {
         let sql = format!(
             "SELECT id, decision_id, success, notes, recorded_at FROM outcomes WHERE {clause}"
         );
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let result = self.read_query(&sql, &params)?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             out.push(decode_outcome(&result.columns, row)?);
@@ -314,7 +311,7 @@ impl Store {
         let sql = format!(
             "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE status = $status AND ({clause})"
         );
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let result = self.read_query(&sql, &params)?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             out.push(decode_invalidation(&result.columns, row)?);
@@ -848,13 +845,10 @@ impl Store {
             [("intention_id".to_string(), Value::Uuid(id.as_uuid()))]
                 .into_iter()
                 .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, intention_id, description, status, origin, properties, tags, valid_from, valid_to FROM intention_snapshots WHERE intention_id = $intention_id",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut snaps: Vec<IntentionSnapshot> = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             snaps.push(decode_intention_snapshot(&result.columns, row)?);
@@ -1036,13 +1030,10 @@ impl Store {
             [("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]
                 .into_iter()
                 .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE context_id = $context_id ORDER BY created_at ASC",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             let mut intention = decode_intention(&result.columns, row)?;
@@ -1287,16 +1278,13 @@ impl Store {
                 context: "IntentionId",
             });
         }
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, intention_id, predecessor_snapshot_id, successor_snapshot_id, created_at FROM intention_snapshot_links WHERE intention_id = $intention_id",
                 &HashMap::from([(
                     "intention_id".to_string(),
                     Value::Uuid(intention_id.as_uuid()),
                 )]),
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut links = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             links.push(IntentionSnapshotLink {
@@ -1323,10 +1311,10 @@ impl Store {
         &self,
         intention_id: IntentionId,
     ) -> Result<Vec<(IntentionSnapshotId, IntentionSnapshotId)>> {
-        let result = self.db.execute(
+        let result = self.read_query(
             "SELECT predecessor_snapshot_id, successor_snapshot_id FROM intention_snapshot_links WHERE intention_id = $intention_id",
             &HashMap::from([("intention_id".to_string(), Value::Uuid(intention_id.as_uuid()))]),
-        ).map_err(map_engine_err)?;
+        )?;
         result
             .rows
             .iter()

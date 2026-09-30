@@ -1,8 +1,8 @@
-//! C2 — query preparation over the real cached Nomic embedder adds exactly one system-added
-//! `search_query: ` task prefix outside the untouched content, mirroring C1 for the query role.
+//! Query preparation over the real cached Nomic embedder adds exactly one system-added
+//! `search_query: ` task prefix outside the untouched content, mirroring the document role.
 //!
-//! The proof compares VECTORS, not a token-count proxy or a space label — see C1's
-//! module doc for the rationale.
+//! The proof compares VECTORS, not a token-count proxy or a space label. The document
+//! preparation proof explains the comparison.
 
 use context_graph::EmbeddingInput;
 use context_graph::EventSearchEmbedder;

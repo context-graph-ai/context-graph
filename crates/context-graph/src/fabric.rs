@@ -464,13 +464,10 @@ fn resolve_anchor_digest(store: &Store, job_id: &str) -> Result<Option<DigestId>
 
 /// The context (id + label) a digest was captured under, or `None` if the digest is absent.
 fn digest_context(store: &Store, digest_id: DigestId) -> Result<Option<(ContextId, String)>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT context_id FROM digests WHERE id = $id",
-            &HashMap::from([("id".to_string(), DbValue::Uuid(digest_id.as_uuid()))]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT context_id FROM digests WHERE id = $id",
+        &HashMap::from([("id".to_string(), DbValue::Uuid(digest_id.as_uuid()))]),
+    )?;
     let Some(DbValue::Uuid(context_uuid)) = result.rows.first().and_then(|row| row.first()) else {
         return Ok(None);
     };
@@ -486,16 +483,13 @@ fn digest_context(store: &Store, digest_id: DigestId) -> Result<Option<(ContextI
 
 /// The kept raw chunk text for a digest (the understanding substrate), or `None` if purged.
 fn chunk_text_for_digest(store: &Store, digest_text: &str) -> Result<Option<String>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT content FROM cg_source_chunks WHERE digest_id = $digest_id",
-            &HashMap::from([(
-                "digest_id".to_string(),
-                DbValue::Text(digest_text.to_string()),
-            )]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT content FROM cg_source_chunks WHERE digest_id = $digest_id",
+        &HashMap::from([(
+            "digest_id".to_string(),
+            DbValue::Text(digest_text.to_string()),
+        )]),
+    )?;
     Ok(result.rows.first().and_then(|row| match row.first() {
         Some(DbValue::Text(content)) => Some(content.clone()),
         _ => None,

@@ -34,6 +34,57 @@ const MAX_APPEND_ATTEMPTS: usize = 4;
 
 type AppendAttemptResult<T> = std::result::Result<T, AppendAttemptError>;
 
+#[cfg(context_graph_internal_test_support)]
+fn wait_before_internal_capture_commit(
+    store: &Store,
+    input: &AppendEventBatch,
+    receipt: &AppendEventReceipt,
+) {
+    let selected_source = std::env::var("CONTEXT_GRAPH_INTERNAL_CAPTURE_CRASH_SOURCE_INSTANCE_REF");
+    let selected_prior =
+        std::env::var("CONTEXT_GRAPH_INTERNAL_CAPTURE_CRASH_PRIOR_COMMITTED_EVENTS");
+    let (selected_source, selected_prior) = match (selected_source, selected_prior) {
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => return,
+        (Ok(source), Ok(prior)) => {
+            let prior = prior
+                .parse::<u64>()
+                .expect("internal capture crash prior committed events is a u64");
+            (source, prior)
+        }
+        _ => panic!("internal capture crash selection requires source and prior committed events"),
+    };
+    if input.source_instance_ref != selected_source || receipt.inserted == 0 {
+        return;
+    }
+
+    let committed = stored_event_context_counts(store, &[input.context_id])
+        .expect("internal capture crash reads committed Context event count");
+    let prior_committed_events = committed
+        .get(&input.context_id)
+        .expect("internal capture crash selected Context has a committed event count")
+        .captured;
+    if prior_committed_events != selected_prior {
+        return;
+    }
+
+    let witness = json!({
+        "context_id": input.context_id,
+        "connector_id": input.declaration.connector_id,
+        "source_instance_ref": input.source_instance_ref,
+        "first_seq": receipt.first_seq,
+        "last_seq": receipt.last_seq,
+        "inserted": receipt.inserted,
+        "already_present": receipt.already_present,
+        "prior_committed_events": prior_committed_events,
+    });
+    eprintln!("CONTEXT_GRAPH_INTERNAL_CAPTURE_PRECOMMIT {witness}");
+
+    let (sender, receiver) = std::sync::mpsc::channel::<()>();
+    let wait_result = receiver.recv();
+    drop(sender);
+    panic!("internal capture crash wait returned unexpectedly: {wait_result:?}");
+}
+
 #[derive(Debug, Clone)]
 struct PreparedAnchor {
     id: Uuid,
@@ -75,22 +126,26 @@ impl Store {
         for attempt in 1..=MAX_APPEND_ATTEMPTS {
             let tx = self.begin_tx()?;
             match append_event_attempt(self, tx, placement, &input, &prepared) {
-                Ok((mut receipt, true)) => match self.db.commit(tx) {
-                    Ok(()) => {
-                        receipt.transaction_id = Some(tx);
-                        return Ok(receipt);
-                    }
-                    Err(error) => {
-                        let _ = self.db.rollback(tx);
-                        if is_retryable_append_error(&error) {
-                            if attempt == MAX_APPEND_ATTEMPTS {
-                                return Err(append_contention(&input));
-                            }
-                            continue;
+                Ok((mut receipt, true)) => {
+                    #[cfg(context_graph_internal_test_support)]
+                    wait_before_internal_capture_commit(self, &input, &receipt);
+                    match self.db.commit(tx) {
+                        Ok(()) => {
+                            receipt.transaction_id = Some(tx);
+                            return Ok(receipt);
                         }
-                        return Err(map_engine_err(error));
+                        Err(error) => {
+                            let _ = self.db.rollback(tx);
+                            if is_retryable_append_error(&error) {
+                                if attempt == MAX_APPEND_ATTEMPTS {
+                                    return Err(append_contention(&input));
+                                }
+                                continue;
+                            }
+                            return Err(map_engine_err(error));
+                        }
                     }
-                },
+                }
                 Ok((mut receipt, false)) => {
                     self.db.rollback(tx).map_err(map_engine_err)?;
                     receipt.transaction_id = None;
@@ -514,6 +569,7 @@ fn append_event_attempt(
         None => false,
     };
     if inserted > 0 {
+        update_event_context_sessions_in_tx(store, tx, &results)?;
         bump_event_context_revision_in_tx(store, tx, input.context_id)?;
         let mut added = CapturedEventCounts::default();
         for result in &results {
@@ -564,6 +620,143 @@ fn append_event_attempt(
     Ok((receipt, changed))
 }
 
+/// Add this batch's inserted events to their captured-session summaries inside the append
+/// transaction. [`add_event_context_counts_in_tx`] guards the one Context-wide count row later in
+/// this same append transaction, so concurrent appends cannot commit overlapping summary updates:
+/// the loser retries the whole append from the current session row.
+fn update_event_context_sessions_in_tx(
+    store: &Store,
+    tx: crate::TxId,
+    results: &[EventAppendResult],
+) -> AppendAttemptResult<()> {
+    let mut additions = BTreeMap::<(ContextId, String, String), (u64, Option<i64>)>::new();
+    for result in results {
+        if result.disposition != EventAppendDisposition::Inserted {
+            continue;
+        }
+        let key = (
+            result.event.context_id,
+            result.event.connector_id.clone(),
+            result.event.session_ref.clone(),
+        );
+        let entry = additions.entry(key).or_insert((0, None));
+        entry.0 = entry.0.checked_add(1).ok_or_else(|| {
+            AppendAttemptError::Domain(CgError::Engine(
+                "captured session event count exhausted u64".into(),
+            ))
+        })?;
+        if let Some(occurred_at) = result.event.occurred_at {
+            let occurred_at = occurred_at.timestamp_millis();
+            entry.1 = Some(
+                entry
+                    .1
+                    .map_or(occurred_at, |current| current.max(occurred_at)),
+            );
+        }
+    }
+
+    for ((context_id, connector_id, session_ref), (added, added_latest)) in additions {
+        let mut params = HashMap::from([
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("connector_id".into(), Value::Text(connector_id)),
+            ("session_ref".into(), Value::Text(session_ref)),
+        ]);
+        let existing = store
+            .db
+            .execute(
+                "SELECT event_count, latest_occurred_at FROM event_context_sessions WHERE context_id = $context_id AND connector_id = $connector_id AND session_ref = $session_ref",
+                &params,
+            )
+            .map_err(AppendAttemptError::Engine)?;
+        match existing.rows.as_slice() {
+            [] => {
+                params.insert("event_count".into(), u64_db_value(added, "session count")?);
+                params.insert(
+                    "latest".into(),
+                    added_latest.map_or(Value::Null, Value::Timestamp),
+                );
+                store
+                    .db
+                    .execute_in_tx(
+                        tx,
+                        "INSERT INTO event_context_sessions (context_id, connector_id, session_ref, event_count, latest_occurred_at) VALUES ($context_id, $connector_id, $session_ref, $event_count, $latest)",
+                        &params,
+                    )
+                    .map_err(AppendAttemptError::Engine)?;
+            }
+            [row] => {
+                let count_index = existing
+                    .columns
+                    .iter()
+                    .position(|column| column == "event_count")
+                    .ok_or_else(|| {
+                        AppendAttemptError::Domain(CgError::Engine(
+                            "captured session summary has no event_count".into(),
+                        ))
+                    })?;
+                let latest_index = existing
+                    .columns
+                    .iter()
+                    .position(|column| column == "latest_occurred_at")
+                    .ok_or_else(|| {
+                        AppendAttemptError::Domain(CgError::Engine(
+                            "captured session summary has no latest_occurred_at".into(),
+                        ))
+                    })?;
+                let current = match row.get(count_index) {
+                    Some(Value::Int64(value)) => u64::try_from(*value).map_err(|_| {
+                        AppendAttemptError::Domain(CgError::Engine(
+                            "captured session summary has a negative event count".into(),
+                        ))
+                    })?,
+                    other => {
+                        return Err(AppendAttemptError::Domain(CgError::Engine(format!(
+                            "captured session summary has invalid event_count {other:?}"
+                        ))));
+                    }
+                };
+                let current_latest = match row.get(latest_index) {
+                    Some(Value::Timestamp(value)) => Some(*value),
+                    Some(Value::Null) => None,
+                    other => {
+                        return Err(AppendAttemptError::Domain(CgError::Engine(format!(
+                            "captured session summary has invalid latest_occurred_at {other:?}"
+                        ))));
+                    }
+                };
+                let next = current.checked_add(added).ok_or_else(|| {
+                    AppendAttemptError::Domain(CgError::Engine(
+                        "captured session event count exhausted u64".into(),
+                    ))
+                })?;
+                let next_latest = match (current_latest, added_latest) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+                params.insert("event_count".into(), u64_db_value(next, "session count")?);
+                params.insert(
+                    "latest".into(),
+                    next_latest.map_or(Value::Null, Value::Timestamp),
+                );
+                store
+                    .db
+                    .execute_in_tx(
+                        tx,
+                        "UPDATE event_context_sessions SET event_count = $event_count, latest_occurred_at = $latest WHERE context_id = $context_id AND connector_id = $connector_id AND session_ref = $session_ref",
+                        &params,
+                    )
+                    .map_err(AppendAttemptError::Engine)?;
+            }
+            _ => {
+                return Err(AppendAttemptError::Domain(CgError::Engine(
+                    "captured session summary primary key returned more than one row".into(),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn is_retryable_append_error(error: &EngineError) -> bool {
     match error {
         EngineError::ConditionalUpdateConflict { .. } => true,
@@ -571,6 +764,7 @@ fn is_retryable_append_error(error: &EngineError) -> bool {
             (table == "events" && (column == "context_id" || column == "id"))
                 || (table == "event_context_revisions" && column == "context_id")
                 || (table == EVENT_CONTEXT_COUNTS_TABLE && column == "context_id")
+                || (table == "event_context_sessions" && column == "context_id")
         }
         _ => false,
     }

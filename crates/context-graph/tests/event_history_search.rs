@@ -25,6 +25,12 @@ use context_graph::{
 use contextdb_engine::plugin::{DatabasePlugin, QueryOutcome};
 use serde_json::json;
 
+const EVENT_CONTEXT_SESSIONS_DDL: &str = "CREATE TABLE event_context_sessions (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, event_count INTEGER NOT NULL, latest_occurred_at TIMESTAMP, PRIMARY KEY (context_id, connector_id, session_ref)) SYNC OFF";
+const EVENT_CONTEXT_COUNTS_DDL: &str = "CREATE TABLE event_context_counts (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), captured_events INTEGER NOT NULL, complete_events INTEGER NOT NULL, opaque_events INTEGER NOT NULL, payload_refused_events INTEGER NOT NULL, source_declared_missing_events INTEGER NOT NULL) SYNC OFF";
+const EVENT_SEARCH_SESSION_PROGRESS_DDL: &str = "CREATE TABLE event_search_session_progress (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, event_count INTEGER NOT NULL, committed_event_count INTEGER NOT NULL DEFAULT 0, eligible_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, searchable_event_count INTEGER NOT NULL DEFAULT 0, no_searchable_text_event_count INTEGER NOT NULL DEFAULT 0, is_required BOOLEAN NOT NULL DEFAULT false, is_published BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (context_id, generation_id, connector_id, session_ref), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF";
+const EVENT_SEARCH_WORK_POLICIES_DDL: &str = "CREATE TABLE event_search_work_policies (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), search_order TEXT NOT NULL, search_sessions INTEGER) SYNC OFF";
+const EVENT_SEARCH_CURSORS_DDL: &str = "CREATE TABLE event_search_cursors (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, committed_sequence INTEGER NOT NULL, open_tail_start_sequence INTEGER, open_tail_members JSON NOT NULL, open_tail_passage_id UUID, watermark_sha256 TEXT NOT NULL, updated_at TXID NOT NULL, PRIMARY KEY (context_id, generation_id, connector_id, source_instance_ref, session_ref), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF";
+
 #[derive(Default)]
 struct QueryRecorder {
     enabled: AtomicBool,
@@ -224,8 +230,8 @@ impl Embedder for ReadinessEmbedder {
 
 fn search_declaration() -> ConsumerDeclaration {
     const EVENTS: &str = "CREATE TABLE events (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, adapter_version TEXT NOT NULL, anchor_declaration_version TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, source_event_key TEXT NOT NULL, source_position JSON NOT NULL, seq INTEGER NOT NULL, content_hash TEXT NOT NULL, anchor_count INTEGER NOT NULL, anchor_set_hash TEXT NOT NULL, occurred_at TIMESTAMP, author TEXT NOT NULL, kind TEXT NOT NULL, render_role TEXT NOT NULL, interaction_ref TEXT, text TEXT, payload JSON NOT NULL DEFAULT '{}', anchors JSON NOT NULL DEFAULT '{}', source_remainder JSON NOT NULL DEFAULT '{}', coverage TEXT NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, connector_id, session_ref, source_event_key), UNIQUE (context_id, connector_id, source_instance_ref, seq)) IMMUTABLE SYNC OFF SYNC CONFLICT KEEP FIRST";
-    const GENERATIONS: &str = "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), interpretation_generation_id UUID, interpretation_snapshot JSON NOT NULL, interpretation_snapshot_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, renderer_id TEXT NOT NULL, renderer_version TEXT NOT NULL, renderer_profile JSON NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), encoding_profile TEXT NOT NULL, state TEXT NOT NULL, eligible_event_count INTEGER NOT NULL DEFAULT 0, rendered_event_count INTEGER NOT NULL DEFAULT 0, embedded_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, passage_count INTEGER NOT NULL DEFAULT 0, started_at TXID NOT NULL, completed_at TXID, sanitized_failure TEXT, UNIQUE (context_id, id), FOREIGN KEY (context_id, interpretation_generation_id) REFERENCES event_interpretation_generations(context_id, id)) SYNC OFF";
-    const PASSAGES: &str = "CREATE TABLE event_search_passages (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, passage_ordinal INTEGER NOT NULL, first_event_sequence INTEGER NOT NULL, last_event_sequence INTEGER NOT NULL, rendered_text TEXT NOT NULL, content_sha256 TEXT NOT NULL, vector_text VECTOR(768), dimension INTEGER NOT NULL, is_current BOOLEAN NOT NULL, created_at TXID NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, generation_id, id), UNIQUE (context_id, generation_id, connector_id, source_instance_ref, passage_ordinal), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, generation_id)) SYNC OFF";
+    const GENERATIONS: &str = "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), interpretation_generation_id UUID, interpretation_snapshot JSON NOT NULL, interpretation_snapshot_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, source_content_sha256 TEXT NOT NULL DEFAULT '', capture_ordinal INTEGER NOT NULL DEFAULT 0, renderer_id TEXT NOT NULL, renderer_version TEXT NOT NULL, renderer_profile JSON NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), encoding_profile TEXT NOT NULL, state TEXT NOT NULL, required_event_count INTEGER NOT NULL DEFAULT 0, searchable_event_count INTEGER NOT NULL DEFAULT 0, searchable_excluded_event_count INTEGER NOT NULL DEFAULT 0, eligible_event_count INTEGER NOT NULL DEFAULT 0, rendered_event_count INTEGER NOT NULL DEFAULT 0, embedded_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, passage_count INTEGER NOT NULL DEFAULT 0, started_at TXID NOT NULL, completed_at TXID, finalized_event_revision_tx TXID, last_attempt_at TXID, last_attempt_token UUID NOT NULL, sanitized_failure TEXT, UNIQUE (context_id, id), FOREIGN KEY (context_id, interpretation_generation_id) REFERENCES event_interpretation_generations(context_id, id)) SYNC OFF";
+    const PASSAGES: &str = "CREATE TABLE event_search_passages (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, passage_ordinal INTEGER NOT NULL, first_event_sequence INTEGER NOT NULL, last_event_sequence INTEGER NOT NULL, rendered_text TEXT NOT NULL, content_sha256 TEXT NOT NULL, vector_text VECTOR(768), dimension INTEGER NOT NULL, is_current BOOLEAN NOT NULL, is_searchable BOOLEAN NOT NULL DEFAULT true, created_at TXID NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, generation_id, id), UNIQUE (context_id, generation_id, connector_id, source_instance_ref, passage_ordinal), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, generation_id)) HISTORY CURRENT ONLY SYNC OFF";
     const SOURCES: &str = "CREATE TABLE event_search_passage_sources (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), passage_id UUID NOT NULL REFERENCES event_search_passages(id), event_id UUID NOT NULL REFERENCES events(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, source_order INTEGER NOT NULL, event_start_byte INTEGER, event_end_byte INTEGER, passage_start_byte INTEGER NOT NULL, passage_end_byte INTEGER NOT NULL, PRIMARY KEY (context_id, passage_id, source_order), FOREIGN KEY (context_id, generation_id, passage_id) REFERENCES event_search_passages(context_id, generation_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) IMMUTABLE SYNC OFF";
     const HEADS: &str = "CREATE TABLE event_search_heads (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), activated_at TXID NOT NULL, FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF";
     let local = [
@@ -243,6 +249,23 @@ fn search_declaration() -> ConsumerDeclaration {
                     name: name.into(),
                     ddl: ddl.into(),
                 }))
+                .chain(
+                    [
+                        ("event_context_counts", EVENT_CONTEXT_COUNTS_DDL),
+                        ("event_context_sessions", EVENT_CONTEXT_SESSIONS_DDL),
+                        (
+                            "event_search_session_progress",
+                            EVENT_SEARCH_SESSION_PROGRESS_DDL,
+                        ),
+                        ("event_search_work_policies", EVENT_SEARCH_WORK_POLICIES_DDL),
+                        ("event_search_cursors", EVENT_SEARCH_CURSORS_DDL),
+                    ]
+                    .into_iter()
+                    .map(|(name, ddl)| ConsumerTable {
+                        name: name.into(),
+                        ddl: ddl.into(),
+                    }),
+                )
                 .collect(),
         },
         scope_labels: BTreeSet::new(),
@@ -266,6 +289,7 @@ fn project_ready(store: &Store, context_id: ContextId, embedder: &Arc<ReadinessE
             context_id,
             embedder: embedder.registration(),
             profile: EventSearchProfile::default(),
+            embedding_workers: NonZeroUsize::MIN,
             max_events_per_batch: NonZeroU32::new(1).unwrap(),
             max_passages_per_batch: NonZeroU32::new(1).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(4_096).unwrap(),

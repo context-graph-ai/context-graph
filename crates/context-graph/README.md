@@ -22,10 +22,13 @@ Prerequisites: Git and Rust 1.94.1 via rustup.
 rustup toolchain install 1.94.1
 ```
 
-From an empty parent directory:
+The current workspace pins ContextDB
+`5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9` on the contextdb `dev` branch; Cargo
+fetches that exact revision from the public repository. Create an application
+from an empty parent directory:
+<!-- enforced by: `manifests_lockfile_and_readme_name_the_same_exact_contextdb_revision`, `ci_workflow_validates_and_verifies_the_exact_contextdb_revision` -->
 
 ```sh
-git clone https://github.com/context-graph-ai/contextdb.git
 git clone https://github.com/context-graph-ai/context-graph.git
 cargo +1.94.1 new my-app
 cd my-app
@@ -83,6 +86,21 @@ administrative reads reach that process over contextdb's local owner channel,
 which is selected from the store path and the runtime root rather than from any
 address a caller supplies; there is no second transport in this repository.<!-- enforced by: `the_crate_carries_no_socket_transport_and_no_path_taking_control_api`, `a_live_owner_answers_a_control_frame_addressed_only_by_the_store_path`, `one_provisioned_root_reaches_the_owner_and_a_separate_read_only_command` -->
 
+Subscriptions deliver after the transaction commits. The store's observation,
+decision, and outcome triggers prepare related records inside the transaction;
+a failed transaction emits no subscription event. Every subscription payload
+carries the engine's stable `action_id`, which remains the same on retry and
+reopen. After a handler succeeds, cg records a receipt under its subscriber ID
+before acknowledging delivery. A redelivery whose receipt exists skips the
+handler.<!-- enforced by: `subscription_does_not_fire_when_observation_transaction_rolls_back`, `a_redelivered_action_keeps_one_visible_effect_and_one_receipt_after_reopen` -->
+
+An arbitrary subscription handler can call an external endpoint. A handler error or lost
+acknowledgement leaves the action pending: delivery retries with the same `action_id` and the
+subscription's `uncertain` metric counts it. An error constructing the payload or evaluating its
+filter ends delivery without retry and counts as a permanent failure. The endpoint must deduplicate
+by `action_id` to avoid a repeated effect; cg cannot make the endpoint's effect and its local
+receipt one transaction.<!-- enforced by: `lost_subscription_acknowledgement_retries_one_identity_and_one_receiver_effect`, `external_handler_without_dedup_reports_uncertain_delivery`, `engine_callback_returning_sink_error_permanent_drops_event_without_retry_metrics_distinguish` -->
+
 ## Capturing normalized event history
 
 Schema 12 adds a provider-neutral immutable event journal. An adapter supplies an
@@ -130,6 +148,8 @@ nothing.<!-- enforced by: `text_default_space_id_resolves_to_text_default_nomic_
 
 ### Encoding event history for search
 
+Derived event-search passages declare `HISTORY CURRENT ONLY`, allowing superseded row versions from open-tail retirements and publication updates to be reclaimed during maintenance while immutable captured events and their session identities retain full history. A consumer cursor can continue fetching unread passage versions from its original snapshot while maintenance defers reclamation until that cursor closes.<!-- enforced by: `old_conversations_remain_searchable_after_superseded_passage_reclaim`, `consumer_cursor_fetches_unread_passage_versions_across_currency_maintenance` -->
+
 Nomic answers differently depending on whether text is being *stored* or *asked
 for*, so the same embedder offers both roles: `prepare_document` then
 `embed_prepared_document` for a passage of history you want found later, and
@@ -155,6 +175,17 @@ ceiling carried by the embedder's `event_search_capability`, never silently
 truncated. No capability means exact event-search preparation is unsupported.
 <!-- enforced by: `oversized_event_split_uses_selected_tokenizer_and_has_utf8_safe_exact_bidirectional_source_offsets` -->
 <!-- enforced by: `an_oversized_event_search_query_is_prepared_in_full_and_refused_only_at_embed_time` -->
+
+For oversized-event preparation, an embedder can optionally implement
+`event_search_slice_token_loss_bound(prefix)`. Its default is `None`; a declaration
+of `Some(loss)` certifies that preparing a prefixed source slice retains at least
+the number of wholly contained original token spans minus `loss` tokens (saturating
+at zero). The renderer uses that bound to exclude impossible ends, then checks exact
+preparation in reverse order to retain the maximal fitting cut. The bundled cached
+Bert/WordPiece tokenizer declares `Some(200)` for labels ending in ASCII space;
+unsupported tokenizer configurations retain exhaustive selection. Counts, UTF-8
+source offsets and overlap remain exact.
+<!-- enforced by: `external_embedder_implements_preparation_through_the_hook_and_produces_a_prepared_value`, `nomic_document_preparer_adds_exactly_one_system_task_prefix`, `oversized_event_split_uses_selected_tokenizer_and_has_utf8_safe_exact_bidirectional_source_offsets` -->
 
 These vectors live in their own space,
 `event_history_nomic_v1_5_document_query_v1_768`, registered through
@@ -315,9 +346,123 @@ Capture is durable and model-free. What happens to search afterwards is `--searc
 
 A caught-up import returns `complete` under every mode. When the local model is not installed,
 `background` and `wait` still capture, return `captured_search_behind` (exit 1) and name
-`cg model fetch --defaults` followed by the same import with `--search wait`; nothing is downloaded.
+`cg model fetch --defaults` followed by the receipt's `--search wait` template; replace its
+whole quoted `<project-directory>` or `<session.jsonl>` token with the original input quoted
+independently for your shell. Nothing is downloaded.
 A projection that fails after capture leaves every captured event durable and also returns
 `captured_search_behind`.<!-- enforced by: `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight`, `cg_import_search_wait_embedding_failure_returns_durable_capture_receipt_and_typed_behind_status`, `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
+
+An import's `search.covered_events` and `search.pending_events` describe the requested projection:
+its renderer, passage profile, embedding space, encoding profile and current interpretation.
+Coverage from a different projection is excluded. Committed replacement progress can reach zero
+pending before activation; completion still waits for that replacement to become the active head.
+`Store::event_search_work` and `ConsumerReader::event_search_work` expose this same metadata
+assessment without loading model artifacts.<!-- enforced by: `a_changed_passage_override_rebuilds_the_ready_default_generation_on_the_next_wait_import`, `status_separates_capture_from_search_coverage_per_selected_context` -->
+
+By default, projection selects the 10 most recent sessions by their actual event timestamps and
+processes the newest selected session first. `--search-sessions N|all` and
+`--search-order newest|oldest` override `[search].sessions` and `[search].order`; `oldest` selects
+the oldest scope and processes it oldest first, while `newest` selects and processes the newest
+scope first. Scope and order
+are work policy, so widening adds only newly selected work and narrowing leaves every committed
+passage searchable. The receipt reports `outside_scope_events` separately from pending work and
+`no_searchable_text_events`; `covered_events` describes all indexed coverage that search can
+actually read. Outside scope means outside the current build selection, and
+`outside_scope_indexed_events` reports the retained indexed subset. Building all sessions on first
+import can take much longer. Command-line choices apply only to that invocation; `[search]` choices
+persist for the data root.<!-- enforced by: `recent_session_scope_builds_the_ten_most_recent_newest_first_and_widens_without_reembedding`, `oldest_order_builds_the_ten_oldest_sessions_oldest_first`, `newest_complete_session_is_findable_before_any_older_session_is_embedded`, `invalid_search_config_is_refused_even_when_cli_values_are_present` -->
+
+```toml
+[search]
+order = "newest"
+sessions = 10 # or "all"
+```
+
+`search.local_embedding_calls` counts inference API invocations attempted by this foreground
+projection, including calls that fail. It does not count covered events: grouped events can share
+one call, opaque events need none, and split events can require several. Capture, scheduling,
+defer and an already complete import report zero calls they did not make. A failed foreground
+run refreshes requested coverage when readable and discloses a failed refresh.<!-- enforced by: `cg_import_search_wait_embedding_failure_returns_durable_capture_receipt_and_typed_behind_status` -->
+
+### Embedding worker control
+
+Passage embedding uses available CPU parallelism by default. To choose a positive limit for one
+import, use `--embedding-workers N`:
+<!-- enforced by: `omitted_worker_policy_resolves_to_rust_available_parallelism`, `resolver_refuses_zero_negative_and_non_number_values_from_each_input` -->
+
+```text
+cg import <project-directory> --context <name> --search wait --embedding-workers 4
+```
+
+To set the limit for this data root, add it to `$CG_DATA_ROOT/cg/fabric.toml` (or
+`~/.cg/cg/fabric.toml` when `CG_DATA_ROOT` is unset):
+<!-- enforced by: `configured_worker_policy_is_used_when_the_cli_is_silent` -->
+
+```toml
+[search]
+embedding_workers = 4
+```
+
+The command-line value takes precedence over `[search].embedding_workers`; without either, cg
+uses available CPU parallelism. `N` and the configured value must be positive. Setting either to
+`1` makes the passage embedding calls serial, though Candle may use internal threads during each
+call. This bounds simultaneous local Nomic passage calls; when more than one call is active, each
+call uses a reusable local one-thread Rayon helper pool. It does not assign CPU affinity or reserve
+memory, and it does not change the search profile, passage identity, or imported history.
+Changing the cap therefore does not invalidate a ready generation or re-embed unchanged history.
+There is no `--fast` or `--slow` mode.<!-- enforced by: `explicit_cli_worker_policy_wins_over_configuration_in_both_directions`, `embedding_worker_cap_one_keeps_the_second_call_out_until_the_first_returns`, `concurrent_embedding_calls_run_with_one_rayon_helper_each_for_standalone_and_held_store`, `serial_and_concurrent_runs_commit_identical_passages_vectors_order_and_coverage` -->
+
+Library callers set the same positive `embedding_workers` field on
+`EventSearchBuildRequest` and `EventSearchRebuildRequest`; call
+`default_event_search_embedding_workers()` for the CPU default. Those held-Store methods preserve
+their projection lease while the bounded embedding calls run.<!-- enforced by: `held_store_cap_two_overlaps_two_calls_while_its_claim_lease_stays_live`, `held_store_cap_one_serializes_calls_while_its_claim_lease_stays_live` -->
+
+For `--search wait`, the chosen invocation-resolved limit stays fixed for that foreground
+projection. For the default `--search background`, each import that has pending search publishes
+its selected limit to the existing background worker, which adopts the latest valid selection
+before its next batch. An import with `--search defer`, or an unchanged import with caught-up
+search, leaves another active worker's request alone; neither starts a worker nor re-embeds
+passages. `cg forget` also leaves a live worker's limit alone. When forget starts a new worker, it
+uses the current configuration/default rather than an earlier one-off import limit.<!-- enforced by: `claim_callback_rereads_the_worker_policy_file_before_the_next_two_passage_batch`, `deferred_import_never_creates_or_changes_the_active_worker_policy`, `already_caught_up_import_does_not_change_an_active_worker_request`, `later_requesting_import_without_a_flag_replaces_the_one_off_override` -->
+
+If foreground `--search wait` holds the worker turn, a pending background import or forget leaves
+one coalesced handoff request. Foreground releases its turn before handing that request to the
+ordinary detached worker, so later captured history becomes searchable without a second command.
+The foreground projection keeps its fixed limit. The handoff keeps a queued normal import's
+selection when forget joins it; a queued forget with no import selection uses the configuration or
+CPU default resolved when forget ran. A newer request cannot be cleared by the older pass it raced.
+<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `requesting_import_publishes_the_cli_cap_to_the_existing_worker_handoff`, `later_requesting_import_without_a_flag_replaces_the_one_off_override` -->
+
+Writable Store admission waits for a hydrating reader through the existing 60-second allowance.
+A real second writer is still refused immediately. A projection's own claim, renewal or commit
+reopen can wait through the existing 30-second writer allowance while retaining its claim and
+rendered batch. Exhaustion preserves the typed refusal.<!-- enforced by: `a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store`, `projection_retries_real_writer_at_claim_renewal_and_commit_without_reembedding`, `shared_store_returns_real_writer_busy_immediately_and_projection_exhaustion_stays_typed` -->
+
+Continuation reloads only the unfinished passage's text members; a long metadata-only suffix
+adds no replay payload. Worker count preserves passage order, text, vectors and source spans.
+<!-- enforced by: `open_tail_loads_only_text_members_across_a_long_metadata_suffix`, `missing_or_mismatched_open_tail_member_ids_are_refused_before_embedding`, `serial_and_concurrent_runs_commit_identical_passages_vectors_order_and_coverage` -->
+
+### Passage configuration
+
+New search generations use the version-2 passage profile by default: a 256-token target and a
+384-token hard stop. To change those two limits, put this in
+`$CG_DATA_ROOT/cg/fabric.toml` (or `~/.cg/cg/fabric.toml` when `CG_DATA_ROOT` is unset). <!-- enforced by: `the_default_passage_profile_is_version_two_and_version_one_stays_selectable`, `a_passage_override_is_recorded_on_the_generation_and_reported_by_status`, `with_no_data_root_override_the_store_lives_at_dot_cg_under_home` -->
+
+```toml
+[search.passages]
+target_tokens = 256
+hard_tokens = 384
+```
+
+Both values are positive whole-token counts. `target_tokens` must be no greater than
+`hard_tokens`, and `hard_tokens` must be greater than the profile's 32-token oversized-event
+overlap and no greater than the bundled event-history model's declared 8,192 prepared-token maximum.
+That ceiling admission does not promise every source fits: author text, tokenizer cuts and overlap
+progress can still produce an observable projection failure for a particular source. An invalid
+file returns `config_error` before `cg import` creates the data root or writes the store, Context,
+or events; correct the file and rerun the import.<!-- enforced by: `passage_profile_capability_ceiling_is_pure_and_preserves_admitted_values`, `dry_run_refuses_invalid_placement_before_new_or_existing_store_writes_or_model_access`, `an_invalid_passage_override_is_refused_before_any_write`, `a_hard_passage_ceiling_refuses_each_import_mode_before_new_or_existing_store_writes`, `a_hard_limit_equal_to_the_oversized_overlap_is_refused_before_any_write`, `a_passage_override_is_recorded_on_the_generation_and_reported_by_status` -->
+
+Changing these settings makes the next import rebuild search under the new profile while the prior ready head remains available until the replacement is ready. A running worker adopts a different valid profile between passes and retains the last valid profile if a later config edit is invalid. It releases and rechecks for further work; successful new work does not consume a pass limit.<!-- enforced by: `a_changed_passage_override_rebuilds_the_ready_default_generation_on_the_next_wait_import` -->
 
 A malformed or divergent file stops only itself: every other selected file is captured, the failed
 file's committed prefix stays durable, no worker starts, and the receipt returns `source_partial`
@@ -325,7 +470,16 @@ file's committed prefix stays durable, no worker starts, and the receipt returns
 
 The JSON receipt carries `ok`, `state`, the Context and whether it came from the project binding or
 an explicit name, separate `capture` and `search` objects, pending counts and a `retry` command. It
-contains no source text and no source path.<!-- enforced by: `cg_import_project_directory_never_sweeps_working_tree_jsonl_or_imports_other_project_history`, `explicit_context_import_defers_search_and_keeps_source_facts_out_of_its_receipt` -->
+contains no source text and no source path. A retry repeats the resolved session scope and order;
+it repeats `--embedding-workers` only when that import supplied the command-line flag, because
+`[search]` configuration remains the data-root default.<!-- enforced by: `cg_import_project_directory_never_sweeps_working_tree_jsonl_or_imports_other_project_history`, `explicit_context_import_defers_search_and_keeps_source_facts_out_of_its_receipt`, `interrupted_all_scope_retry_resumes_all_sessions_in_the_same_oldest_order`, `missing_model_retry_keeps_the_resolved_scope_without_a_hosted_or_downloaded_fallback` -->
+
+Receipt targets remain the quoted `<project-directory>` or `<session.jsonl>` placeholder: replace
+the whole quoted placeholder token, including its quotes, with the original target quoted
+independently for your shell before pasting the command. The remaining printed tokens are the
+resolved retry policy. `cg status` and an unavailable `cg find` use the persisted
+policy for each Context; a multi-Context read gives one action per Context when it cannot state one
+shared retry.<!-- enforced by: `retry_commands_quote_actual_paths_contexts_and_refusals`, `receipt_placeholder_substitution_and_read_retries_preserve_persisted_scope` -->
 
 ### `cg find` and `cg show`
 
@@ -340,7 +494,9 @@ Context in the store, ranked together. Each hit carries its Context and the `pas
 `cg show` accepts verbatim. An unknown name fails the whole selection before anything is read.
 History captured but not yet searchable is named as omitted, and when no selected Context is
 searchable the command returns `history_search_not_ready`; `find` never starts or waits for
-projection.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
+projection. Its coverage reports current published searchable events, selected work still pending,
+events outside the latest accepted session scope, and completed selected events with no searchable
+text as separate counts.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `status_and_find_report_published_coverage_while_the_selected_scope_is_mid_build` -->
 
 `cg show` expands a passage to the exact stored events behind it, in order, from the database — the
 original session file is not needed. A passage outside the selected Contexts returns
@@ -349,11 +505,27 @@ original session file is not needed. A passage outside the selected Contexts ret
 ### `cg status`
 
 `cg status` reads the existing store through the read-only reader and never opens it for writing,
-so it answers while an import or a projection worker holds the store. For each selected Context it
+so it answers while an import or a projection worker holds the store. If the previous writer died
+and the store needs writable recovery, it instead returns `store_needs_recovery` (exit 1) and
+directs the user to run `cg import <project-directory> --search defer`; that import is the
+writable recovery path. For each selected Context it
 reports graph memory totals and history separately: captured events, source files and sessions,
 coverage, event placement and search. Search is exactly one of `ready`, `running` (only while a
 projection holds a live lease), `pending`, `blocked` (the local model is not installed) or
-`failed`.<!-- enforced by: `status_separates_capture_from_search_coverage_per_selected_context`, `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight` -->
+`failed`.<!-- enforced by: `status_separates_capture_from_search_coverage_per_selected_context`, `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight`, `import_recovers_a_store_that_needs_a_writable_open_and_status_names_that_command` -->
+
+The `search` object separates an active readable head from a replacement that is still building.
+A first-build head can be active and `building` while required selected sessions remain; completing
+that required scope makes it `ready`. `active_generation_id`, `covered_events`, `pending_events`,
+`outside_scope_events`, `outside_scope_indexed_events`, and `no_searchable_text_events` report its
+published coverage under the last policy accepted by the worker. `building_generation_id`,
+`building_profile`, `building_covered_events`, and `building_pending_events` describe independently
+committed progress for an actual nonactive building generation, including a first build that has no
+readable head yet. The latest relevant attempt determines `last_failure`; a newer unfailed attempt
+or a later head activation supersedes older errors. An active head keeps its coverage if its own
+extension fails, and status shows that failure separately. The observed runner exposes whether its
+exact attempt durably recorded a failure, could not record it, or became stale; callers do not start
+another generation attempt to infer that result.<!-- enforced by: `building_progress_is_visible_without_replacing_the_ready_head`, `a_projection_run_that_fails_records_why_and_a_later_successful_run_clears_it`, `a_stale_attempt_failure_cannot_overwrite_a_newer_owned_refusal`, `recent_session_scope_builds_the_ten_most_recent_newest_first_and_widens_without_reembedding`, `cli_status_reports_bounded_session_scope_from_the_persisted_worker_policy` -->
 
 When the store does not exist, `cg status` writes nothing and creates nothing. Text output is
 exactly two lines on stderr, and JSON is exactly
@@ -377,20 +549,38 @@ generations summarise a whole Context, so forgetting one session also clears tha
 index. `cg forget` then schedules the re-indexing of the remaining history on the same background
 worker a background import uses, and says so in its receipt; without the local model it reports the
 rebuild as blocked with `cg model fetch --defaults` as the next action. `cg status` shows that
-Context as pending, running and then ready. The Context and its project binding remain.<!-- enforced by: `forgetting_a_session_erases_its_events_and_everything_derived_while_keeping_the_context`, `forgetting_a_context_erases_all_of_its_history_and_the_next_capture_lands_in_the_same_context`, `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `cg_forget_confirms_on_the_terminal_and_enter_changes_nothing` -->
+Context as pending, running and then ready. If the passage configuration is invalid or the worker
+cannot start, the erasure can still succeed while the receipt reports `rebuild_not_started`; fix
+the configuration and rerun `cg import <project-directory> --search wait` to resume the rebuild.
+The Context and its project binding remain.<!-- enforced by: `forgetting_a_session_erases_its_events_and_everything_derived_while_keeping_the_context`, `forgetting_a_context_erases_all_of_its_history_and_the_next_capture_lands_in_the_same_context`, `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `cg_forget_confirms_on_the_terminal_and_enter_changes_nothing`, `forget_reports_a_configured_profile_refusal_after_erasing_without_starting_a_worker` -->
+
+Forgetting an entire Context erases its captured session identities and frontiers while preserving any queued refusal's empty completion identity, so a later caught-up import acknowledges and reclaims it without error.<!-- enforced by: `retired_refusal_remains_acknowledgeable_across_context_forget` -->
 
 On a terminal it asks `Forget <N> sessions (<M> events) from "<context>"? [y/N]` and Enter means
 no; without a terminal it requires `--yes` and otherwise returns `confirmation_required` (exit 2)
-with the exact retry command. A store that places events at a tenant hub is refused as
+with the exact retry command. When the selected history has no events, checkpoints or source
+locators, forget returns `nothing_to_forget` from read-only inspection without opening a writable
+store. A whitespace-only source can have a checkpoint and locator with zero events; its selection
+still requires confirmation and a writable open before erasure. Erasure uses the writer memory
+limit shown by `cg status`, including a machine-derived share, without requiring the capture proof
+floor. If the actual erasure cannot fit that limit, `purge_refused` carries
+`WriteDidNotFitTheMemoryLimit`, names the needed and allowed memory, and leaves history unchanged.
+The operator can use `--write-memory-limit-bytes <BYTES>` for one attempt or set
+`[write] memory_limit_bytes` in `cg/fabric.toml`.<!-- enforced by: `empty_history_can_be_forgotten_with_a_small_container_writer_share`, `whitespace_only_session_forget_erases_checkpoint_and_locator`, `whitespace_only_context_forget_erases_checkpoint_and_locator` -->
+A store that places events at a tenant hub is refused as
 `discard_denied`; this build does not issue the engine's edge-local discard.<!-- enforced by: `cg_forget_confirms_on_the_terminal_and_enter_changes_nothing`, `a_tenant_hub_store_is_refused_rather_than_purged_from_an_edge` -->
 
 ### When a writing command meets a held store
 
-`cg import` and `cg forget` open the store for writing. When another process is writing it they
+`cg import` and `cg forget` with events or source state to erase open the store for writing. When another process is writing it they
 return `store_busy`, name the holder and the store, and exit 4. When direct readers are holding it
 they print the sentence the condition writes: which store, how many readers were observed, and each
 verified reader by process id and process name; a reader that was observed and published no
 identity is disclosed rather than left out.<!-- enforced by: `the_crate_readme_promises_only_the_readers_the_store_could_verify`, `a_command_refused_by_a_reader_held_store_names_the_readers_it_waits_on` -->
+
+If the store opens but cannot verify reader safety for erasure, `cg forget` returns
+`reader_coordination_unavailable` with condition `ReaderCoordinationUnavailable`. Its message names
+the operation, coordination path and explanation; the history stays unchanged.<!-- enforced by: `forget_keeps_the_reader_coordination_condition_when_erasure_is_refused` -->
 
 ### Asking a running context-graph a question
 
@@ -404,7 +594,44 @@ open, and which single door in-process totals go through) are stated once, in
 `AGENTS.md` at the repository root. They are not repeated here; this file is the
 operator's and the library consumer's.<!-- enforced by: `a_live_owner_answers_a_control_frame_addressed_only_by_the_store_path`, `every_path_the_root_agents_file_names_is_in_the_tree`, `the_agents_routing_file_promises_only_the_readers_the_store_could_verify` -->
 
+### Writer memory limit
+
+The writer setting limits working memory for writable capture. An invocation's
+`--write-memory-limit-bytes <BYTES>` takes precedence over `[write] memory_limit_bytes` in
+`<CG_DATA_ROOT>/cg/fabric.toml`; otherwise cg derives a quarter of the detected machine memory.
+`cg status` displays the resolved bytes and their source, even when the derived value is below
+the memory needed for capture. That low derived value refuses writable capture with guidance to
+raise the writer setting. It does not prevent top-level help, `cg status`, `cg show`, or other read-only
+inspection.<!-- enforced by: `a_small_container_allows_inspection_but_refuses_writable_capture`, `a_small_writer_setting_does_not_block_help_status_or_show`, `status_names_the_write_budget_in_force_and_which_of_the_three_answers_set_it` -->
+A pending background request keeps its selected write-memory ceiling across restart. Work shared
+by pending requests uses the lower ceiling. Read memory and per-statement time are configured
+separately under `[read]`; raising the writer ceiling does not raise either read allowance.
+If the selected work does not fit, `cg status` reports
+`failed` with the needed and allowed memory. Captured history remains available; retry the import
+with an affordable ceiling.
+<!-- enforced by: `overlapping_imports_keep_each_contexts_write_ceiling`, `shared_pending_work_resumes_under_the_lower_persisted_ceiling_without_reprojection`, `the_next_batch_refuses_an_insufficient_persisted_ceiling_and_keeps_its_request` -->
+
+A background search request keeps its accepted read active-time allowance across restart. A
+temporary active-time refusal releases the failed read, waits briefly, and resumes from committed
+progress without repeating completed passages or raising any limit. Three consecutive active-time
+refusals without committed coverage progress end that request as `failed`; the no-progress count
+survives restart. `cg status` reports the failure with an instruction to run the same import with
+`--search wait` again. Foreground `--search wait` applies the same bound to assessment and projection reads, and keeps a terminal refusal visible in `cg status` even when no generation started. Captured events and completed search batches remain saved.<!-- enforced by: `a_typed_active_time_refusal_retains_committed_passages_and_resumes`, `a_transient_typed_active_time_refusal_resumes_selected_work_without_reprojecting_the_completed_prefix`, `consecutive_typed_active_time_refusals_exhaust_one_selected_request_allowance`, `active_time_recovery_restart_keeps_the_selected_allowance_and_no_progress_count`, `assessment_active_time_refusals_resume_or_leave_a_retryable_failed_status`, `an_active_time_refusal_keeps_its_original_frontier_until_a_complete_retry`, `a_refused_aggregate_charges_only_its_assessed_low_active_time_selections`, `foreground_active_time_refusals_stop_when_capture_changes_without_coverage_progress`, `prior_committed_coverage_does_not_extend_a_new_requests_active_time_allowance`, `foreground_assessment_active_time_refusals_recover_and_exhaust_with_durable_status`, `foreground_selection_timeout_exhaustion_stays_failed_until_full_context_completion`, `large_foreground_selections_and_repeated_failures_keep_bounded_durable_status` -->
+
 ## Reading a store you must not change
+
+Reads default to a 1 GiB memory budget and a 5,000 ms active-time allowance per statement.
+Set `[read].memory_limit_bytes` and `[read].active_time_ms` to positive integers in
+`<CG_DATA_ROOT>/cg/fabric.toml` to choose those budgets for a CLI invocation. Omission uses
+`1073741824` bytes and `5000` milliseconds; malformed configuration is refused as
+`config_error` before store access. File loading and owner-routed reads use the same declared
+budgets.<!-- enforced by: `default_store_config_declares_the_one_gib_read_memory_ceiling`, `read_active_time_defaults_to_five_seconds_and_accepts_only_positive_milliseconds`, `cg_status_uses_the_default_and_a_valid_custom_read_budget_then_refuses_an_actual_low_budget`, `invalid_read_config_is_a_config_error_before_status_can_open_or_write_the_store` -->
+
+Library callers use `StoreConfig.read_memory_limit_bytes: NonZeroUsize` and
+`StoreConfig.read_active_time_ms: NonZeroU64`, `ConsumerReader::open_with_read_limits`, or
+`owner_control::request_owner_with_budgets`. The memory-only entrypoints use the default active-time
+allowance. Each Store and reader keeps its own budgets; list reads page through the complete answer.
+The existing cursor idle and lifetime ceilings remain five and thirty minutes.<!-- enforced by: `default_store_config_declares_the_one_gib_read_memory_ceiling`, `file_and_live_owner_reads_honor_per_instance_memory_budgets_without_losing_a_601_row_result` -->
 
 A runtime that cannot take the store — another process owns it, or its own job
 forbids it to risk changing one — still opens it read-only through
@@ -434,6 +661,11 @@ per read, run over whichever handle you reached it through, so the read-only
 answer cannot drift from the writable one. No writable handle is anywhere in the
 path, so no sequence of view reads changes the store file, its companions, or
 the directory they sit in.<!-- enforced by: `each_typed_graph_read_answers_what_the_writable_store_answered`, `the_whole_graph_read_set_leaves_the_stopped_store_byte_identical`, `an_observation_list_bigger_than_one_answer_is_the_writable_store_s_list`, `an_audit_trail_bigger_than_one_answer_is_the_writable_store_s_trail` -->
+
+An Outcome snapshot in that audit trail keeps its `recorded_at` transaction in
+the audit row's typed `outcome_recorded_at` column. Its JSON snapshot carries
+the other Outcome fields without a duplicate timestamp; the shared audit
+decoder restores the same public Outcome for writable and read-only readers.<!-- enforced by: `outcome_audit_snapshot_keeps_typed_committed_time_across_store_reopen_and_reader` -->
 
 The declaration is the whole of what the view may reach: a read whose table you
 did not declare is refused as `UndeclaredTableRefused` naming that table, before

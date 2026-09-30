@@ -27,3 +27,59 @@ pub(crate) trait GraphRows {
     /// rather than reaching for a handle of its own.
     fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult>;
 }
+
+impl crate::Store {
+    /// Read an ordinary statement through this Store's live session, preserving complete lists.
+    pub(crate) fn read_query(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<QueryResult> {
+        let session = self
+            .internal_db()
+            .read_session(self.read_limits())
+            .map_err(super::convert::map_engine_err)?;
+        let mut cursor = session
+            .open_cursor(sql, params)
+            .map_err(super::convert::map_engine_err)?;
+        let paged = (|| -> Result<QueryResult> {
+            let first = cursor.first_page();
+            let mut answer = QueryResult {
+                columns: first.columns.clone(),
+                rows: first.rows.clone(),
+                ..QueryResult::empty()
+            };
+            let mut has_more = first.has_more;
+            while has_more {
+                let page = cursor.fetch(None).map_err(super::convert::map_engine_err)?;
+                if answer.columns.is_empty() {
+                    answer.columns = page.columns;
+                }
+                answer.rows.extend(page.rows);
+                has_more = page.has_more;
+            }
+            Ok(answer)
+        })();
+        let closed = cursor.close().map_err(super::convert::map_engine_err);
+        let answer = paged?;
+        closed?;
+        Ok(answer)
+    }
+}
+
+/// A decoded row for the existing library table readers.
+pub(crate) struct ReadRow {
+    pub(crate) values: HashMap<String, Value>,
+}
+impl crate::Store {
+    pub(crate) fn read_table(&self, table: &str) -> Result<Vec<ReadRow>> {
+        let answer = self.read_query(&format!("SELECT * FROM {table}"), &HashMap::new())?;
+        Ok(answer
+            .rows
+            .into_iter()
+            .map(|row| ReadRow {
+                values: answer.columns.iter().cloned().zip(row).collect(),
+            })
+            .collect())
+    }
+}

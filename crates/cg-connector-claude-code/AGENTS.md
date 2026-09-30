@@ -1,35 +1,49 @@
-# AGENTS.md — `cg-connector-claude-code` crate
+# `cg-connector-claude-code`
 
-The Claude Code connector: it finds a project's Claude Code history on this machine
-(`src/history.rs`), decodes each JSONL record into the canonical Claude occurrence
-(`src/jsonl.rs`, `src/occurrence.rs`) and assembles the ordered `EventDraft` group the generic
-event core stores (`src/assembler.rs`). Carries no product intent — what context-graph is for lives
-in the root product documents.
+Purpose: locate Claude Code project history, decode JSONL occurrences, and assemble provider-neutral
+`EventDraft` groups for the event core.
 
-## What this crate owns, and must not own
+**Owns:** Claude field navigation, project-store keys, connector and adapter declarations, and
+provider-to-render-role/kind mapping.
+**Must not own:** event identity, sequence, hashing, checkpoints, bindings, projection, search or
+store opens. Those belong to `context-graph`, which never depends on this connector.
 
-Owns: Claude-specific field navigation, the Claude project-store key, the connector id, adapter
-and anchor-declaration versions (`src/declaration.rs`), and the mapping from a Claude record to
-provider-neutral render roles and kinds.
+## Seams and where a change lives
 
-Must not own: event identity, sequence, hashing, checkpoints, bindings, projection or search. Those
-belong to `context-graph`, which never depends on this crate; a future Codex or other connector uses
-the same generic event tables and APIs.
+| Change | Entry point / boundary |
+|---|---|
+| History-root and project-file selection | `src/history.rs`: `effective_history_root`, `ClaudeHistoryLocator::resolve_project`; CLI supplies paths and opens selected source files |
+| JSONL record navigation and source identity | `src/jsonl.rs`: `ClaudeCodeJsonlAdapter` implements core `EventSourceAdapter`; `src/occurrence.rs`: `decode_jsonl_record` produces `ClaudeOccurrence` |
+| Historical or typed occurrence mapping | `src/assembler.rs`: `ClaudeOccurrenceAssembler::assemble`, with `ClaudeAssemblyContext`, returns the same ordered draft groups for both inputs |
+| Prior tool-request correlation | Core `EventCorrelationResolver` is passed into the adapter/assembler; consume its typed answers rather than opening a store or writing SQL |
+| Mapping/anchor version and connector id | `src/declaration.rs`: `event_adapter_declaration`, `ADAPTER_VERSION`, `ANCHOR_DECLARATION_VERSION`, `CONNECTOR_ID` |
 
-## Rules for maintenance
+The CLI caller lives in `crates/cg-cli/src/history/`; Claude JSON navigation stays here. The core
+owns append, checkpoint and interpretation behavior. This crate consumes no ContextDB owner or
+consumer read route directly, and no embedding trait.
 
-- Provider mapping and declaration versions stay in this crate. A changed mapping is a new adapter
-  or anchor-declaration version, never an edit to events already stored.
-- Fixtures are independently authored and synthetic. No owner transcript, machine path or private
-  label becomes a fixture, default or constant.
-- A record's retained `source_remainder` is data, never code vocabulary: nothing read from captured
-  content may create a new mapping, kind or repair rule.
-- Historical JSONL and a future live front end both decode to the same canonical occurrence and call
-  the one assembler; neither builds `EventDraft` values itself.
-- The CLI (`crates/cg-cli/src/history/`) opens files and calls this crate; it navigates no Claude
-  JSON of its own.
+## Invariants and guarding tests
 
-## Fast test command
+Test paths below are relative to this crate.
 
-`cargo test -p cg-connector-claude-code` and
-`cargo clippy -p cg-connector-claude-code --all-targets -- -D warnings`.
+| Invariant | Guard (file and test) |
+|---|---|
+| Only matching immediate regular project JSONL files are selected in name order | `tests/source_fidelity/history_and_reuse.rs::history_locator_selects_only_matching_immediate_regular_jsonl_in_name_order` |
+| Introductory records do not hide the first project cwd | `tests/history_prefix.rs::history_locator_finds_the_first_cwd_after_introductory_records` |
+| Historical and typed occurrences use one assembler and persist equivalent events | `tests/source_fidelity/history_and_reuse.rs::typed_occurrences_use_the_same_assembler_then_append_to_fresh_stores` |
+| Mapping preserves source facts, order and resolver-backed correlation | `tests/source_fidelity/mapping.rs::mapping_preserves_oracle_facts_one_through_nine_in_order` |
+| Refused inline media retains descriptors without leaking raw bytes | `tests/source_fidelity/capture_regressions.rs::nested_media_with_text_refuses_all_inline_encodings_without_losing_descriptor` |
+| Exact-file session overrides reject conflicting embedded identities | `tests/source_fidelity/identity_recovery.rs::exact_file_override_rejects_mixed_embedded_ids_and_reader_preserves_variants` |
+
+## Authoring rules requiring review
+
+These architectural constraints require code review; the tests above do not mechanically enforce
+them. When changing a mapping, advance the adapter or anchor declaration version and leave stored
+events unchanged. Author synthetic fixtures; do not copy owner transcripts, machine paths or private
+labels into fixtures, defaults or constants. Treat retained `source_remainder` as data; do not derive
+new mapping vocabulary, event kinds or repair rules from it.
+
+Fast check: `cargo test -p cg-connector-claude-code`. For history selection alone:
+`cargo test -p cg-connector-claude-code --test history_prefix`.
+Lint: `cargo clippy -p cg-connector-claude-code --all-targets -- -D warnings`.
+Full gate: `scripts/gate.sh` at repository root.

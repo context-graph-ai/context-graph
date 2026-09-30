@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(feature = "test-support")]
+use std::time::Duration;
 use std::time::Instant;
 use std::{
     fs as file_system, io,
@@ -42,6 +44,10 @@ const EVENT_SEARCH_DOCUMENT_PREFIX: &str = "search_document: ";
 /// The query-side counterpart of [`EVENT_SEARCH_DOCUMENT_PREFIX`].
 const EVENT_SEARCH_QUERY_PREFIX: &str = "search_query: ";
 const CG_MODEL_CACHE_ROOT_ENV: &str = "CG_MODEL_CACHE_ROOT";
+/// Test-support-only directory: a prepared event-search embedding creates the reached marker and
+/// waits for the release marker. It is absent from ordinary builds.
+#[cfg(feature = "test-support")]
+const NOMIC_PREPARED_EMBEDDING_RENDEZVOUS_ENV: &str = "CG_NOMIC_TEST_PREPARED_EMBEDDING_BARRIER";
 
 const NOMIC_REQUIRED_TENSORS: &[(&str, &[usize])] = &[
     ("embeddings.word_embeddings.weight", &[30_528, 768]),
@@ -95,6 +101,17 @@ impl std::fmt::Debug for NomicTextEmbedder {
 }
 
 impl NomicTextEmbedder {
+    /// The bundled event-history encoding's declared prepared-token ceiling. This is pure model
+    /// metadata: it does not inspect the cache, initialize an embedder, load weights, or prepare
+    /// source text. Callers may use it to reject an incoherent requested passage profile before
+    /// deferred capture writes anything.
+    pub const fn declared_event_search_capability() -> EventSearchCapability {
+        match EventSearchCapability::new(NOMIC_EVENT_SEARCH_MAX_SEQUENCE_TOKENS) {
+            Some(capability) => capability,
+            None => panic!("the bundled event-search ceiling is non-zero"),
+        }
+    }
+
     pub fn new(config: EmbedderConfig) -> Self {
         Self::new_for_dimension(config, NOMIC_DEFAULT_DIMENSION)
     }
@@ -355,6 +372,57 @@ impl NomicTextEmbedder {
         Ok(vector)
     }
 
+    /// The batched inference path: several token-id sequences right-padded to the longest, with
+    /// an attention mask that zeroes the padding, through one forward pass. Masked mean pooling
+    /// keeps every row's vector equal to what [`NomicTextEmbedder::forward_token_ids`] answers for
+    /// that sequence alone.
+    fn forward_token_id_batch(
+        &self,
+        loaded: &LoadedNomicModel,
+        sequences: &[&[u32]],
+    ) -> Result<Vec<Vec<f32>>> {
+        let width = sequences.iter().map(|ids| ids.len()).max().unwrap_or(0);
+        let mut ids = Vec::with_capacity(sequences.len() * width);
+        let mut mask = Vec::with_capacity(sequences.len() * width);
+        for sequence in sequences {
+            ids.extend_from_slice(sequence);
+            ids.resize(ids.len() + width - sequence.len(), 0);
+            mask.resize(mask.len() + sequence.len(), 1u32);
+            mask.resize(mask.len() + width - sequence.len(), 0u32);
+        }
+        let shape = (sequences.len(), width);
+        let input_ids = Tensor::from_vec(ids, shape, &loaded.device).map_err(candle_err)?;
+        let attention_mask = Tensor::from_vec(mask, shape, &loaded.device).map_err(candle_err)?;
+        let hidden = loaded
+            .model
+            .forward(&input_ids, None, Some(&attention_mask))
+            .map_err(candle_err)?;
+        let pooled = mean_pooling(&hidden, &attention_mask).map_err(candle_err)?;
+        let normalized = candle_l2_normalize(&pooled).map_err(candle_err)?;
+        let rows = normalized.to_vec2::<f32>().map_err(candle_err)?;
+        if rows.len() != sequences.len() {
+            return Err(CgError::Engine(format!(
+                "nomic model returned {} rows for a batch of {}",
+                rows.len(),
+                sequences.len()
+            )));
+        }
+        rows.into_iter()
+            .map(|full| {
+                if self.dimension > full.len() {
+                    return Err(CgError::EmbeddingDimensionMismatch {
+                        space_id: text_space_id_for_dimension(self.dimension),
+                        expected: full.len() as u32,
+                        found: self.dimension as u32,
+                    });
+                }
+                let mut vector = full[..self.dimension].to_vec();
+                l2_normalize(&mut vector);
+                Ok(vector)
+            })
+            .collect()
+    }
+
     /// What this embedder's artifact is, as far as the canonical event-history encoding is
     /// concerned — the exact admission [`EventHistoryTextEmbedder::over`] applies at registration,
     /// shared with raw role-aware preparation so both judge the reserved identity on the same
@@ -478,6 +546,11 @@ impl NomicTextEmbedder {
     ) -> Result<TokenizedEventSearchInput> {
         let loaded = self.load_model_admitted_for_event_search()?;
         let model_input = format!("{prefix}{text}");
+        #[cfg(all(test, context_graph_internal_test_support))]
+        PREPARATION_WORK.with(|work| {
+            let (calls, bytes) = work.get();
+            work.set((calls + 1, bytes + model_input.len()));
+        });
         let encoding = loaded
             .tokenizer
             .encode(model_input.as_str(), true)
@@ -548,6 +621,8 @@ impl NomicTextEmbedder {
             });
         }
         let loaded = self.load_model_admitted_for_event_search()?;
+        #[cfg(feature = "test-support")]
+        pause_prepared_embedding_for_test();
         let attention_mask = vec![1u32; token_ids.len()];
         let vector = self.forward_token_ids(&loaded, token_ids, &attention_mask)?;
         Ok(EmbeddingOutput {
@@ -556,6 +631,44 @@ impl NomicTextEmbedder {
             producer: nomic_producer(),
             vector,
         })
+    }
+
+    /// [`NomicTextEmbedder::embed_prepared_token_ids`] over several authorized inferences at
+    /// once: the same ceiling refusal for each, then one batched forward pass.
+    fn embed_prepared_token_id_batch(
+        &self,
+        inferences: &[EventSearchInference],
+    ) -> Result<Vec<EmbeddingOutput>> {
+        self.require_event_search_capability()?;
+        for inference in inferences {
+            if inference.token_count() > NOMIC_EVENT_SEARCH_MAX_SEQUENCE_TOKENS {
+                return Err(CgError::PreparedInputExceedsModelLimit {
+                    token_count: inference.token_count(),
+                    limit: NOMIC_EVENT_SEARCH_MAX_SEQUENCE_TOKENS,
+                });
+            }
+        }
+        if inferences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let loaded = self.load_model_admitted_for_event_search()?;
+        #[cfg(feature = "test-support")]
+        pause_prepared_embedding_for_test();
+        let sequences = inferences
+            .iter()
+            .map(|inference| inference.token_ids())
+            .collect::<Vec<_>>();
+        Ok(self
+            .forward_token_id_batch(&loaded, &sequences)?
+            .into_iter()
+            .map(|vector| EmbeddingOutput {
+                embedding_space_id: BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID
+                    .to_string(),
+                dimension: self.dimension,
+                producer: nomic_producer(),
+                vector,
+            })
+            .collect())
     }
 }
 
@@ -610,10 +723,7 @@ impl Embedder for NomicTextEmbedder {
         (self.dimension == NOMIC_DEFAULT_DIMENSION
             && !matches!(self.config.source, ModelSource::Disabled)
             && self.artifact_admits_event_search())
-        .then(|| {
-            EventSearchCapability::new(NOMIC_EVENT_SEARCH_MAX_SEQUENCE_TOKENS)
-                .expect("the bundled event-search ceiling is non-zero")
-        })
+        .then(Self::declared_event_search_capability)
     }
 
     /// Role-aware preparation from this embedder answers under the one canonical event-history
@@ -628,6 +738,17 @@ impl Embedder for NomicTextEmbedder {
         } else {
             text_space_id_for_dimension(self.dimension)
         }
+    }
+
+    fn event_search_slice_token_loss_bound(&self, prefix: &str) -> Option<usize> {
+        if !prefix.ends_with(' ') {
+            return None;
+        }
+        // This is the same immutable tokenizer used by preparation, inspected once at load.
+        // An unsupported pipeline declines the optimization without changing admission.
+        self.load_model_admitted_for_event_search()
+            .ok()?
+            .slice_token_loss_bound
     }
 
     fn prepare_document_hook(
@@ -654,6 +775,16 @@ impl Embedder for NomicTextEmbedder {
     ) -> Result<EmbeddingOutput> {
         self.authorize_inference(inference, EventSearchRole::Document)?;
         self.embed_prepared_token_ids(inference.token_count(), inference.token_ids())
+    }
+
+    fn embed_prepared_documents_hook(
+        &self,
+        inferences: &[EventSearchInference],
+    ) -> Result<Vec<EmbeddingOutput>> {
+        for inference in inferences {
+            self.authorize_inference(inference, EventSearchRole::Document)?;
+        }
+        self.embed_prepared_token_id_batch(inferences)
     }
 
     fn prepare_query_hook(
@@ -861,6 +992,10 @@ impl Embedder for EventHistoryTextEmbedder {
         self.model.event_search_capability()
     }
 
+    fn event_search_slice_token_loss_bound(&self, prefix: &str) -> Option<usize> {
+        self.model.event_search_slice_token_loss_bound(prefix)
+    }
+
     /// The same one canonical event-history identity the underlying model answers under for
     /// role-aware preparation — wrapper and raw model are one encoding, so a value either
     /// prepares is embeddable by the other.
@@ -883,6 +1018,13 @@ impl Embedder for EventHistoryTextEmbedder {
         self.model.embed_prepared_document_hook(inference)
     }
 
+    fn embed_prepared_documents_hook(
+        &self,
+        inferences: &[EventSearchInference],
+    ) -> Result<Vec<EmbeddingOutput>> {
+        self.model.embed_prepared_documents_hook(inferences)
+    }
+
     fn prepare_query_hook(
         &self,
         text: &str,
@@ -902,8 +1044,203 @@ impl Embedder for EventHistoryTextEmbedder {
 struct LoadedNomicModel {
     model: NomicBertModel,
     tokenizer: Tokenizer,
+    // Cached beside its tokenizer, both private and immutable behind the loaded model's Arc.
+    // Plain embedding truncates its resulting Encoding, never this preparation tokenizer.
+    slice_token_loss_bound: Option<usize>,
     tokenizer_path: String,
     device: Device,
+}
+
+/// Certify only the boundary-local Bert/WordPiece pipeline we can prove.
+///
+/// Bert cleaning, scalar lowercasing/accent removal and Chinese-character separation followed
+/// by Bert whitespace/punctuation splitting leave complete interior pre-tokenized units
+/// unchanged. Only the two cut units can resegment. A WordPiece unit contributes at most its
+/// character limit's tokens, or one UNK; each of these fixed raw added tokens contributes one.
+/// None spans whitespace, so a prefix ending in ASCII space cannot join the first source unit.
+/// The single-sequence postprocessor preserves A exactly once and adds only fixed CLS/SEP.
+/// Thus at most `2 * max(1, limit)` original spans can disappear. No vocabulary serialization
+/// or inspection happens per slice, and unsupported configurations still prepare normally.
+fn bert_wordpiece_slice_token_loss_bound(tokenizer: &Tokenizer) -> Option<usize> {
+    use serde_json::{json, to_value};
+    use tokenizers::{Model, models::ModelWrapper};
+
+    if tokenizer.get_truncation().is_some()
+        || tokenizer.get_padding().is_some()
+        || tokenizer.get_encode_special_tokens()
+    {
+        return None;
+    }
+    let ModelWrapper::WordPiece(model) = tokenizer.get_model() else {
+        return None;
+    };
+    if model.unk_token != "[UNK]" || model.continuing_subword_prefix != "##" {
+        return None;
+    }
+    if to_value(tokenizer.get_normalizer()?).ok()?
+        != json!({"type": "BertNormalizer", "clean_text": true,
+            "handle_chinese_chars": true, "strip_accents": null, "lowercase": true})
+        || to_value(tokenizer.get_pre_tokenizer()?).ok()? != json!({"type": "BertPreTokenizer"})
+    {
+        return None;
+    }
+    let added = tokenizer.get_added_vocabulary().get_added_tokens_decoder();
+    let expected = [
+        (0, "[PAD]"),
+        (100, "[UNK]"),
+        (101, "[CLS]"),
+        (102, "[SEP]"),
+        (103, "[MASK]"),
+    ];
+    if added.len() != expected.len() {
+        return None;
+    }
+    for (id, content) in expected {
+        let token = added.get(&id)?;
+        if token.content != content
+            || !token.special
+            || token.normalized
+            || token.single_word
+            || token.lstrip
+            || token.rstrip
+            || model.token_to_id(content) != Some(id)
+        {
+            return None;
+        }
+    }
+    let processor = to_value(tokenizer.get_post_processor()?).ok()?;
+    if processor["type"] != "TemplateProcessing"
+        || processor["single"]
+            != json!([
+                {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+            ])
+        || processor["special_tokens"]
+            != json!({
+                "[CLS]": {"id": "[CLS]", "ids": [101], "tokens": ["[CLS]"]},
+                "[SEP]": {"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}
+            })
+    {
+        return None;
+    }
+    model.max_input_chars_per_word.max(1).checked_mul(2)
+}
+
+/// Test-only process rendezvous at the actual prepared event-search model invocation. A CLI
+/// integration test supplies a directory through `CG_NOMIC_TEST_PREPARED_EMBEDDING_BARRIER`; this
+/// writes `reached` after model admission and before the forward pass, then waits for `release`.
+/// The feature gate keeps both environment read and synchronization out of ordinary builds.
+#[cfg(feature = "test-support")]
+fn pause_prepared_embedding_for_test() {
+    let Some(directory) = std::env::var_os(NOMIC_PREPARED_EMBEDDING_RENDEZVOUS_ENV) else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    if file_system::write(directory.join("reached"), b"prepared embedding reached\n").is_err() {
+        return;
+    }
+    while !directory.join("release").exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(test, context_graph_internal_test_support))]
+thread_local! {
+    static PREPARATION_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(all(test, context_graph_internal_test_support))]
+pub(crate) fn take_preparation_work_for_test() -> (usize, usize) {
+    PREPARATION_WORK.with(|work| work.replace((0, 0)))
+}
+
+#[cfg(all(test, context_graph_internal_test_support))]
+mod bounded_preparation_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    #[cfg(context_graph_internal_test_support)]
+    fn bounded_preparation_nomic_validates_actual_pipeline_and_declines_variations() {
+        let tokenizer = Tokenizer::from_file(
+            default_cache_root()
+                .join(NOMIC_MODEL_ID)
+                .join("tokenizer.json"),
+        )
+        .expect("offline cached tokenizer required");
+        assert_eq!(bert_wordpiece_slice_token_loss_bound(&tokenizer), Some(200));
+        let original = serde_json::to_value(&tokenizer).unwrap();
+        for (path, value) in [
+            ("/normalizer/clean_text", json!(false)),
+            ("/normalizer/handle_chinese_chars", json!(false)),
+            ("/normalizer/strip_accents", json!(false)),
+            ("/normalizer/lowercase", json!(false)),
+            ("/normalizer", Value::Null),
+            ("/pre_tokenizer", json!({"type": "Whitespace"})),
+            ("/pre_tokenizer", Value::Null),
+            ("/model/type", json!("WordLevel")),
+            ("/model/unk_token", json!("other")),
+            ("/model/continuing_subword_prefix", json!("other")),
+            ("/model/max_input_chars_per_word", json!(usize::MAX)),
+            ("/added_tokens/0/content", json!("different")),
+            ("/added_tokens/0/single_word", json!(true)),
+            ("/added_tokens/0/lstrip", json!(true)),
+            ("/added_tokens/0/rstrip", json!(true)),
+            ("/added_tokens/0/normalized", json!(true)),
+            ("/added_tokens/0/special", json!(false)),
+            ("/added_tokens", json!([])),
+            ("/post_processor", Value::Null),
+            (
+                "/post_processor",
+                json!({"type":"BertProcessing", "sep":["[SEP]",102], "cls":["[CLS]",101]}),
+            ),
+            ("/post_processor/single/1/Sequence/id", json!("B")),
+            (
+                "/post_processor/special_tokens/[CLS]/ids",
+                json!([101, 101]),
+            ),
+            (
+                "/post_processor/special_tokens/[CLS]/tokens",
+                json!(["different"]),
+            ),
+        ] {
+            let mut variant = original.clone();
+            *variant.pointer_mut(path).unwrap() = value;
+            let variant = Tokenizer::from_bytes(serde_json::to_vec(&variant).unwrap())
+                .unwrap_or_else(|error| panic!("variant must load, {path}: {error}"));
+            assert_eq!(
+                bert_wordpiece_slice_token_loss_bound(&variant),
+                None,
+                "{path}"
+            );
+        }
+        let mut variant = tokenizer.clone();
+        variant.with_padding(Some(tokenizers::PaddingParams::default()));
+        assert_eq!(bert_wordpiece_slice_token_loss_bound(&variant), None);
+        let mut variant = tokenizer.clone();
+        variant
+            .with_truncation(Some(tokenizers::TruncationParams::default()))
+            .unwrap();
+        assert_eq!(bert_wordpiece_slice_token_loss_bound(&variant), None);
+        let mut variant = tokenizer.clone();
+        variant.set_encode_special_tokens(true);
+        assert_eq!(bert_wordpiece_slice_token_loss_bound(&variant), None);
+        let mut variant = tokenizer.clone();
+        variant
+            .add_special_tokens([tokenizers::AddedToken::from("extra", true)])
+            .unwrap();
+        assert_eq!(bert_wordpiece_slice_token_loss_bound(&variant), None);
+        for (limit, expected) in [(0, 2), (1, 2), (50, 100), (100, 200)] {
+            let mut variant = original.clone();
+            variant["model"]["max_input_chars_per_word"] = json!(limit);
+            let variant = Tokenizer::from_bytes(serde_json::to_vec(&variant).unwrap()).unwrap();
+            assert_eq!(
+                bert_wordpiece_slice_token_loss_bound(&variant),
+                Some(expected)
+            );
+        }
+    }
 }
 
 /// Everything that can be established about an installed artifact WITHOUT reading the 547 MB
@@ -1111,6 +1448,7 @@ fn load_nomic_artifacts(model_dir: &Path) -> Result<LoadedNomicModel> {
         })?;
     Ok(LoadedNomicModel {
         model,
+        slice_token_loss_bound: bert_wordpiece_slice_token_loss_bound(&tokenizer),
         tokenizer,
         tokenizer_path: tokenizer_path.display().to_string(),
         device,
@@ -1229,9 +1567,8 @@ fn config_can_fetch(config: &EmbedderConfig) -> bool {
 /// `cg_catalog::default_cache_root()` keeps its public name and delegates here. That is what makes
 /// "fetch once, then load offline" hold without a second download or a hidden path override.
 ///
-/// There is no second location and nothing to migrate: weights an older build left beside this
-/// root, under a sibling `cg/embedders` directory, are not consulted, and `cg model fetch
-/// --defaults` re-seeds the canonical root.
+/// Only this `cg/models` cache root is consulted; `cg/embedders` is outside the lookup.
+/// `cg model fetch --defaults` populates the root for offline loading.
 pub fn default_cache_root() -> PathBuf {
     if let Some(path) = std::env::var_os(CG_MODEL_CACHE_ROOT_ENV) {
         return PathBuf::from(path);

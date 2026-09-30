@@ -1,4 +1,4 @@
-//! Independent regressions for event-core recovery defects accepted in arc 2.
+//! Event history recovery preserves captured data across interrupted work.
 //!
 //! These tests use the public Store surface except where an unbound tenant is
 //! deliberately unreadable through the application gate. That state is checked

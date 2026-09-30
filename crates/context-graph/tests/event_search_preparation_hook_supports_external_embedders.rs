@@ -138,6 +138,7 @@ impl Embedder for DeterministicEventSearchEmbedder {
 fn external_embedder_implements_preparation_through_the_hook_and_produces_a_prepared_value() {
     let embedder = DeterministicEventSearchEmbedder::new("a");
     let embedder: &dyn Embedder = &embedder;
+    assert_eq!(embedder.event_search_slice_token_loss_bound("User: "), None);
     let prepared = embedder
         .prepare_document("hello event")
         .expect("preparation through the implementer-facing hook must succeed");

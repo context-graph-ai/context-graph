@@ -408,7 +408,8 @@ fn corrected_intention_that_was_a_decision_stays_reversible_and_logs_a_lesson() 
 
     // apply_correction must log a teaching event.
     let correction_result =
-        apply_correction(&_store, decision_item_id, new_type, Some("skill-001"));
+        apply_correction(&_store, decision_item_id, new_type, Some("skill-001"))
+            .expect("read succeeds");
     assert!(
         correction_result.teaching_event.is_some(),
         "apply_correction must log a teaching event for a wrong-type correction; wrong stub returns None"

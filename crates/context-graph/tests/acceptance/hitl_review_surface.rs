@@ -148,7 +148,7 @@ fn cg_review_summary_reports_true_per_category_counts() {
         position: 0,
         is_local: true,
     };
-    let summary = gather_review_summary(&store, &cursor);
+    let summary = gather_review_summary(&store, &cursor).expect("read succeeds");
 
     // The capture-produced flagged item must appear under UNCERTAIN, and the uncertain count must
     // reflect the store (≥ 1). HEAD's gather returns empty → both fail.
@@ -206,7 +206,7 @@ fn pending_item_persists_in_every_window_until_acted_on() {
     // Gather review TWICE WITHOUT acting — the item must appear each window, gathered from store
     // state (not registered-on-first-query). HEAD gathers empty → fails.
     for window in 0..2 {
-        let summary = gather_review_summary(&store, &cursor);
+        let summary = gather_review_summary(&store, &cursor).expect("read succeeds");
         assert!(
             summary
                 .uncertain_items
@@ -220,7 +220,7 @@ fn pending_item_persists_in_every_window_until_acted_on() {
 
     // Act on it via the drop action seam; it must no longer appear.
     act_on_item(&store, &item_id, &ReviewVerb::Drop);
-    let after = gather_review_summary(&store, &cursor);
+    let after = gather_review_summary(&store, &cursor).expect("read succeeds");
     assert!(
         !after
             .uncertain_items
@@ -270,7 +270,7 @@ fn pending_item_persists_through_an_intervening_confident_capture() {
 
     // X must STILL be surfaced by the store-gathered review (the confident capture did not age it
     // out). HEAD gathers empty → fails.
-    let summary = gather_review_summary(&store, &cursor);
+    let summary = gather_review_summary(&store, &cursor).expect("read succeeds");
     assert!(
         summary
             .uncertain_items
@@ -283,7 +283,7 @@ fn pending_item_persists_through_an_intervening_confident_capture() {
 
     // Act on it via the drop action seam; it must no longer appear.
     act_on_item(&store, &item_id, &ReviewVerb::Drop);
-    let after = gather_review_summary(&store, &cursor);
+    let after = gather_review_summary(&store, &cursor).expect("read succeeds");
     assert!(
         !after
             .uncertain_items

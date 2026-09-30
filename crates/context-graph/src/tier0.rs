@@ -633,16 +633,13 @@ pub(crate) fn context_digests(
     store: &Store,
     context_id: ContextId,
 ) -> Result<Vec<(DigestId, i128)>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT id, created_at FROM digests WHERE context_id = $context_id",
-            &HashMap::from([(
-                "context_id".to_string(),
-                DbValue::Uuid(context_id.as_uuid()),
-            )]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT id, created_at FROM digests WHERE context_id = $context_id",
+        &HashMap::from([(
+            "context_id".to_string(),
+            DbValue::Uuid(context_id.as_uuid()),
+        )]),
+    )?;
     Ok(result
         .rows
         .iter()
@@ -656,24 +653,18 @@ pub(crate) fn context_digests(
 }
 
 pub(crate) fn job_exists(store: &Store, job_id: &str) -> Result<bool> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT job_id FROM work_jobs WHERE job_id = $job_id",
-            &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT job_id FROM work_jobs WHERE job_id = $job_id",
+        &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
+    )?;
     Ok(!result.rows.is_empty())
 }
 
 pub(crate) fn completion_exists_local(store: &Store, digest_text: &str) -> Result<bool> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT id FROM cg_understanding_completions WHERE id = $id",
-            &HashMap::from([("id".to_string(), DbValue::Text(digest_text.to_string()))]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT id FROM cg_understanding_completions WHERE id = $id",
+        &HashMap::from([("id".to_string(), DbValue::Text(digest_text.to_string()))]),
+    )?;
     Ok(!result.rows.is_empty())
 }
 
@@ -748,16 +739,13 @@ pub fn retrieval_touch_count(store: &Store, digest_id: DigestId) -> Result<u64> 
 }
 
 fn retrieval_touch_count_in(store: &Store, digest_id: DigestId) -> Result<u64> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT touch_count FROM cg_retrieval_touches WHERE digest_id = $digest_id",
-            &HashMap::from([(
-                "digest_id".to_string(),
-                DbValue::Text(digest_id.to_string()),
-            )]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT touch_count FROM cg_retrieval_touches WHERE digest_id = $digest_id",
+        &HashMap::from([(
+            "digest_id".to_string(),
+            DbValue::Text(digest_id.to_string()),
+        )]),
+    )?;
     let count = result.rows.first().and_then(|row| match row.first() {
         Some(DbValue::Int64(count)) => Some((*count).max(0) as u64),
         _ => None,
@@ -767,13 +755,10 @@ fn retrieval_touch_count_in(store: &Store, digest_id: DigestId) -> Result<u64> {
 
 /// The `kind` marker on a digest (e.g. "verbatim" for a tier-0 digest), or `None` if absent.
 pub fn digest_kind(store: &Store, digest_id: DigestId) -> Result<Option<String>> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT kind FROM digests WHERE id = $id",
-            &HashMap::from([("id".to_string(), DbValue::Uuid(digest_id.as_uuid()))]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT kind FROM digests WHERE id = $id",
+        &HashMap::from([("id".to_string(), DbValue::Uuid(digest_id.as_uuid()))]),
+    )?;
     Ok(result.rows.first().and_then(|row| match row.first() {
         Some(DbValue::Text(kind)) => Some(kind.clone()),
         _ => None,
@@ -950,10 +935,7 @@ fn query_chunk_targets(
     } else {
         format!("SELECT id, digest_id, byte_len FROM cg_source_chunks WHERE {clause}")
     };
-    let result = store
-        .internal_db()
-        .execute(&sql, &params)
-        .map_err(map_engine)?;
+    let result = store.read_query(&sql, &params)?;
     Ok(result
         .rows
         .iter()
@@ -1002,10 +984,7 @@ fn digest_ids_for_session(
         );
     }
     let sql = format!("SELECT id FROM digests WHERE {clause}");
-    let result = store
-        .internal_db()
-        .execute(&sql, &params)
-        .map_err(map_engine)?;
+    let result = store.read_query(&sql, &params)?;
     Ok(result
         .rows
         .iter()
@@ -1120,19 +1099,16 @@ fn deterministic_digest_uuid(
 }
 
 fn digest_exists(store: &Store, context_id: ContextId, digest_uuid: uuid::Uuid) -> Result<bool> {
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT id FROM digests WHERE id = $id AND context_id = $context_id",
-            &HashMap::from([
-                ("id".to_string(), DbValue::Uuid(digest_uuid)),
-                (
-                    "context_id".to_string(),
-                    DbValue::Uuid(context_id.as_uuid()),
-                ),
-            ]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT id FROM digests WHERE id = $id AND context_id = $context_id",
+        &HashMap::from([
+            ("id".to_string(), DbValue::Uuid(digest_uuid)),
+            (
+                "context_id".to_string(),
+                DbValue::Uuid(context_id.as_uuid()),
+            ),
+        ]),
+    )?;
     Ok(!result.rows.is_empty())
 }
 

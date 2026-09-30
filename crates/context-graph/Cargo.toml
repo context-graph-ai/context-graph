@@ -13,6 +13,8 @@ path = "src/lib.rs"
 
 [features]
 default = ["nomic-embedder"]
+# Private controls: activated by this crate's dev dependency, never by release defaults.
+test-support = []
 nomic-embedder = [
     "dep:candle-core",
     "dep:candle-nn",
@@ -37,9 +39,10 @@ chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 contextdb-parser.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "46e99e2eefa20853b109ae17a60627d4d7202f5d", features = ["iroh"], optional = true }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9", features = ["iroh"], optional = true }
 fs4.workspace = true
 pollster.workspace = true
+rayon.workspace = true
 safetensors = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -54,12 +57,13 @@ uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 # Enable the fabric-sync worker seam for THIS crate's own integration tests (the frozen fabric
 # tests call `fabric::run_worker_once`). This is a test/example/bench-only activation: it does NOT
 # pull contextdb-server/tokio into the default `--edges normal,build` tree the purity guards check.
-context-graph = { path = ".", features = ["fabric-sync"] }
+context-graph = { path = ".", features = ["fabric-sync", "test-support"] }
 candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "46e99e2eefa20853b109ae17a60627d4d7202f5d", features = ["iroh", "test-seams"] }
+cg-connector-claude-code.workspace = true
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9", features = ["iroh", "test-seams"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }

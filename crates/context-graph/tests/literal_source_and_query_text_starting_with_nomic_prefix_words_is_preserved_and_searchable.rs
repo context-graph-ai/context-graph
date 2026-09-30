@@ -1,9 +1,9 @@
-//! C5 (assertion 74, preparer arm) — source or query text that itself begins with the literal
+//! Source or query text that begins with the literal
 //! words `search_document:` / `search_query:` is never inspected or rejected for that reason: the
 //! preparer still adds exactly one system-added prefix outside the untouched content, so the
 //! literal words end up appearing twice in the model input — the system-added instruction first,
 //! the caller's own content second. A later retrieval proof covers the "searchable" half end to
-//! end; here the arm is the preparer never special-casing this content.
+//! end; the preparer never special-cases this content.
 //!
 //! The proof compares VECTORS, not a token-count proxy: `embed_prepared_*`'s output must
 //! equal the same cached model's plain `embed` output over the exact reference string (one

@@ -21,10 +21,9 @@
 //! hub's rows alongside the edge's. That is silent widening: nothing fails, nothing is logged, and
 //! a consumer that asked to see one role's rows is quietly shown both.
 //!
-//! The declaration need not be malicious to do this. A consumer whose deployment was migrated, a
-//! service running last release's DDL constant, or a caller that copied a declaration from a
-//! sibling table all arrive at the same place — a declaration that no longer describes the table
-//! it names.
+//! The declaration need not be malicious to do this. A caller can supply a DDL constant for the
+//! wrong table or copy a declaration from a sibling table. Either way, the declaration fails to
+//! describe the persisted table it names.
 //!
 //! ## What the writable door already does
 //!

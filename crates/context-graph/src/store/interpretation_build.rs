@@ -254,6 +254,8 @@ fn reopen_after_mapping(config: crate::StoreConfig) -> Result<Store> {
         .is_some_and(|embedder| matches!(embedder.source, crate::ModelSource::Disabled));
     let schema_embedding_spaces = Arc::new(config.extra_embedding_spaces.clone());
     Ok(Store {
+        read_memory_limit_bytes: config.read_memory_limit_bytes,
+        read_active_time_ms: config.read_active_time_ms,
         db_path: config.db_path,
         db,
         resource_owner: None,
@@ -396,7 +398,7 @@ fn scan_source(
 ) -> Result<SourceSnapshot> {
     let session = store
         .internal_db()
-        .read_session(read_limits(bounds))
+        .read_session(read_limits(store, bounds))
         .map_err(map_engine_err)?;
     let mut cursor = session
         .open_cursor(
@@ -1703,16 +1705,13 @@ fn load_receipt(
     generation_id: InterpretationGenerationId,
 ) -> Result<InterpretationBuildReceipt> {
     let store = Store::open(request.store.clone())?;
-    let result = store
-        .internal_db()
-        .execute(
+    let result = store.read_query(
             "SELECT accepted_source_declarations, target_interpretation_version, target_adapter_version, target_anchor_declaration_version, mapping_contract_id, mapping_contract_sha256, event_count, ordered_source_set_sha256, source_content_sha256, effective_content_sha256, eligible_event_count, interpreted_event_count, failed_event_count, state, completed_at, sanitized_failure FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
             &HashMap::from([
                 ("context_id".into(), Value::Uuid(request.context_id.as_uuid())),
                 ("id".into(), Value::Uuid(generation_id.as_uuid())),
             ]),
-        )
-        .map_err(map_engine_err)?;
+        )?;
     let row = result.rows.first().ok_or_else(|| CgError::NotFound {
         id: Some(generation_id.to_string()),
         missing: Some("interpretation generation"),
@@ -1879,7 +1878,7 @@ fn read_anchors(
 ) -> Result<CapturedAnchorRows> {
     let session = store
         .internal_db()
-        .read_session(read_limits(bounds))
+        .read_session(read_limits(store, bounds))
         .map_err(map_engine_err)?;
     let mut cursor = session
         .open_cursor(
@@ -1984,15 +1983,15 @@ fn query_rows(
 ) -> Result<contextdb_engine::QueryResult> {
     let session = store
         .internal_db()
-        .read_session(read_limits(bounds))
+        .read_session(read_limits(store, bounds))
         .map_err(map_engine_err)?;
     let result = session.execute(sql, params).map_err(map_engine_err);
     drop(session);
     result
 }
 
-fn read_limits(bounds: BuildBounds) -> ReadLimits {
-    let mut limits = crate::owner_control::context_graph_read_limits();
+fn read_limits(store: &Store, bounds: BuildBounds) -> ReadLimits {
+    let mut limits = store.read_limits();
     let rows = u64::try_from(bounds.events).unwrap_or(u64::MAX);
     let bytes = u64::try_from(bounds.bytes).unwrap_or(u64::MAX);
     limits.result_rows = limits.result_rows.min(rows).max(1);

@@ -511,7 +511,10 @@ fn strip_internal_test_support_items(source: &str) -> String {
     while idx < lines.len() {
         let line = lines[idx];
         let compact_cfg_attr = compact_source(line);
-        if compact_cfg_attr == "#[cfg(context_graph_internal_test_support)]" {
+        if compact_cfg_attr == "#[cfg(context_graph_internal_test_support)]"
+            || compact_cfg_attr
+                == "#[cfg(any(context_graph_internal_test_support,feature=\"test-support\"))]"
+        {
             idx += 1;
             while idx < lines.len() && lines[idx].trim_start().starts_with("#[") {
                 idx += 1;

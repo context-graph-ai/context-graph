@@ -1,14 +1,13 @@
-error[E0433]: failed to resolve: could not find `test_support` in `context_graph`
- --> tests/ui/test_support_embedding_not_public.rs:1:20
+error[E0432]: unresolved import `context_graph::test_support::embedding`
+ --> tests/ui/test_support_embedding_not_public.rs:1:34
   |
 1 | use context_graph::test_support::embedding::vector_search;
-  |                    ^^^^^^^^^^^^ could not find `test_support` in `context_graph`
+  |                                  ^^^^^^^^^ could not find `embedding` in `test_support`
   |
 note: found an item that was configured out
  --> src/lib.rs
   |
-  | #[cfg(context_graph_internal_test_support)]
-  |       ----------------------------------- the item is gated here
-  | #[doc(hidden)]
-  | pub mod test_support {
-  |         ^^^^^^^^^^^^
+  |     #[cfg(context_graph_internal_test_support)]
+  |           ----------------------------------- the item is gated here
+  |     pub mod embedding {
+  |             ^^^^^^^^^

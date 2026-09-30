@@ -26,7 +26,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use contextdb_core::Value as DbValue;
 use contextdb_engine::{ReadPhase, ReadProgress, ReadProgressObserver, ReadSession};
 
-use crate::owner_control::context_graph_read_limits;
 use crate::tier0::map_engine;
 use crate::{Result, Store};
 
@@ -120,7 +119,7 @@ impl<'observer> StatusReads<'observer> {
         let session = store
             .internal_db()
             .read_session_with_progress(
-                context_graph_read_limits(),
+                store.read_limits(),
                 Arc::new(ExaminedItems { reports }) as Arc<dyn ReadProgressObserver>,
             )
             .map_err(map_engine)?;

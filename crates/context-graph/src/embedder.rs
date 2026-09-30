@@ -701,6 +701,21 @@ pub trait Embedder: Send + Sync + Any {
         None
     }
 
+    /// A certified upper bound on tokens lost when slicing a prepared document's source.
+    ///
+    /// `Some(loss)` promises that, for every UTF-8 source slice containing `m` original
+    /// nonzero token spans wholly inside it (including duplicate spans), preparing
+    /// `prefix + slice` yields at least `m.saturating_sub(loss)` tokens. The declaration
+    /// must hold for the actual preparation pipeline throughout its use, including task
+    /// instructions, normalization, added tokens and postprocessing. It permits pruning
+    /// impossible candidate ends; exact preparation still selects the maximal fitting end.
+    ///
+    /// The default `None` makes no such promise and retains exhaustive candidate selection.
+    /// Token counts themselves need not be monotone under slicing.
+    fn event_search_slice_token_loss_bound(&self, _prefix: &str) -> Option<usize> {
+        None
+    }
+
     /// This embedder's encoding-profile id: what two embedders must share for one's event-search
     /// preparation to be honored by the other's `embed_prepared_*`. Defaults to this embedder's
     /// declared [`EmbeddingSpace::embedding_space_id`], which already encodes model identity,
@@ -745,6 +760,22 @@ pub trait Embedder: Send + Sync + Any {
         Err(CgError::EventSearchPreparationUnsupported {
             embedding_space_id: self.embedding_space().embedding_space_id,
         })
+    }
+
+    /// Implementer hook: embed several values this same embedder prepared through the checked
+    /// `prepare_document` entrypoint, in one call, answering one output per inference in the same
+    /// order. Reached only through [`EventSearchEmbedder::embed_prepared_documents`], which checks
+    /// every prepared value exactly as the single-document entrypoint does. The default embeds one
+    /// by one through [`Embedder::embed_prepared_document_hook`]; a model that can run one padded,
+    /// masked forward pass over the whole batch overrides it.
+    fn embed_prepared_documents_hook(
+        &self,
+        inferences: &[EventSearchInference],
+    ) -> Result<Vec<EmbeddingOutput>> {
+        inferences
+            .iter()
+            .map(|inference| self.embed_prepared_document_hook(inference))
+            .collect()
     }
 
     /// Implementer hook: prepare a plain query as an event-search query, mirroring
@@ -876,6 +907,51 @@ pub trait EventSearchEmbedder: Embedder + sealed::Sealed {
             prepared.has_canonical_authority(),
         );
         self.embed_prepared_document_hook(&inference)
+    }
+
+    /// Embeds several prepared documents in one hook call, checking each exactly as
+    /// [`EventSearchEmbedder::embed_prepared_document`] does before any inference runs, and
+    /// refusing an implementation that answers a different number of outputs than it was given.
+    fn embed_prepared_documents(
+        &self,
+        prepared: &[PreparedEventSearchDocument],
+    ) -> Result<Vec<EmbeddingOutput>> {
+        let capability = require_event_search_capability(self)?;
+        let expected = self.encoding_profile_id();
+        let mut inferences = Vec::with_capacity(prepared.len());
+        for document in prepared {
+            verify_event_history_identity(
+                self,
+                &expected,
+                document.encoding_profile_id(),
+                document.has_canonical_authority(),
+            )?;
+            if document.encoding_profile_id() != expected {
+                return Err(CgError::EventSearchPreparationProfileMismatch {
+                    expected_profile: expected,
+                    actual_profile: document.encoding_profile_id().to_string(),
+                });
+            }
+            verify_prepared_token_count(capability, document.token_count())?;
+            inferences.push(EventSearchInference::new(
+                document.payload.clone(),
+                EventSearchRole::Document,
+                expected.clone(),
+                document.has_canonical_authority(),
+            ));
+        }
+        if inferences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let outputs = self.embed_prepared_documents_hook(&inferences)?;
+        if outputs.len() != inferences.len() {
+            return Err(CgError::Engine(format!(
+                "a batched event-search embed answered {} outputs for {} documents",
+                outputs.len(),
+                inferences.len()
+            )));
+        }
+        Ok(outputs)
     }
 
     /// Mirrors [`EventSearchEmbedder::embed_prepared_document`] above for the query role.

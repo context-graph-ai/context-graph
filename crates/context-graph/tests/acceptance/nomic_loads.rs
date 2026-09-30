@@ -1666,6 +1666,9 @@ fn embedder_trait_and_storeconfig_public_surface_diff_keeps_surviving_signatures
             "extra_embedding_spaces",
             "file_uri_allowed",
             "https_allowed_hosts",
+            "read_active_time_ms",
+            "read_memory_limit_bytes",
+            "write_memory_limit_bytes",
         ],
         public_struct_fields(&types_source, "StoreConfig")
     );

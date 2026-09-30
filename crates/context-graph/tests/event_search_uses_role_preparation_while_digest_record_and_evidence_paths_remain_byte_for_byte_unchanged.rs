@@ -1,15 +1,15 @@
-//! C3 (assertion 34, capability arm) — two proofs in one test:
+//! Role-aware event search keeps the existing text embedding path intact:
 //!
-//! 1. Unchanged half: the existing `Embedder::embed` text path, for the same fixed texts recorded
+//! 1. Existing text path: the existing `Embedder::embed` text path, for the same fixed texts recorded
 //!    in the checked-in golden fixture `tests/fixtures/text_default_space_goldens.json`, still
 //!    produces byte-for-byte identical model input (tokenizer ids) and vectors through the mock
 //!    and the real cached Nomic embedder. Digest/Record/Evidence embedding never moves.
-//! 2. Capability half: the real Nomic embedder answers role-aware event-search preparation
+//! 2. Event search path: the real Nomic embedder answers role-aware event-search preparation
 //!    end-to-end (`prepare_document` -> `embed_prepared_document`) and the resulting vector
 //!    equals the same cached model's plain `embed` output over the exact reference string
 //!    (`search_document: ` + content) — proved by vector equality, not just a label — and is
 //!    reported under the dedicated event-history space id, never the unlabelled text-default one.
-//!    A later import projection re-proves this half through the full ingest path.
+//!    Import projection also exercises this behavior through the full ingest path.
 //!
 //! The checked-in golden fixture is treated as an immutable oracle: this test verifies
 //! its recorded sha256 before trusting its contents, and never writes to it or to any other path
@@ -32,7 +32,7 @@ mod nomic_real_model;
 /// baseline or a silent replacement by the regression it is supposed to catch — must be a
 /// deliberate, reviewed edit to this constant, never a side effect of running `cargo test`.
 const GOLDEN_FIXTURE_SHA256: &str =
-    "cfa8ff0f6f6637590f7920f261c5e6d7f1b4506a00895e6f70ff7c85a824645c";
+    "aba4629616a919e6a9bb6bacf6a4f7eb614935c78dead8f48292a97eee457bf7";
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct GoldenEntry {
@@ -41,6 +41,12 @@ struct GoldenEntry {
     mock_vector_sha256: String,
     real_nomic_tokenizer_ids: Vec<u32>,
     real_nomic_vector_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct GoldenFixture {
+    model_artifacts_sha256: String,
+    entries: Vec<GoldenEntry>,
 }
 
 fn sha256_of_vector(vector: &[f32]) -> String {
@@ -68,14 +74,20 @@ fn event_search_uses_role_preparation_while_digest_record_and_evidence_paths_rem
          mismatch means the immutable oracle moved outside a deliberate, reviewed edit to \
          GOLDEN_FIXTURE_SHA256"
     );
-    let expected: Vec<GoldenEntry> =
+    let expected: GoldenFixture =
         serde_json::from_str(&fixture_json).expect("parse golden fixture");
+
+    assert_eq!(
+        nomic_real_model::model_artifacts_sha256(),
+        expected.model_artifacts_sha256,
+        "the installed Nomic model artifacts must match the artifacts that produced the golden vectors"
+    );
 
     let mock = MockEmbedder::new("text_default_nomic_v1_5_768", 768);
     let real = nomic_real_model::nomic_live_embedder();
     let tokenizer = nomic_real_model::nomic_tokenizer();
 
-    for entry in &expected {
+    for entry in &expected.entries {
         let mock_out = mock
             .embed(EmbeddingInput::Text(entry.text.clone()))
             .expect("mock embed");
@@ -90,13 +102,13 @@ fn event_search_uses_role_preparation_while_digest_record_and_evidence_paths_rem
 
         assert_eq!(
             ids, entry.real_nomic_tokenizer_ids,
-            "existing embed path must tokenize {:?} identically to the pre-arc golden",
+            "existing embed path must tokenize {:?} identically to the artifact-bound golden",
             entry.text
         );
         assert_eq!(
             sha256_of_vector(&mock_out.vector),
             entry.mock_vector_sha256,
-            "mock embed path must be byte-for-byte unchanged for {:?}",
+            "mock embed path must match the artifact-bound golden for {:?}",
             entry.text
         );
         assert_eq!(

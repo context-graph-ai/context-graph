@@ -592,6 +592,7 @@ fn positive_activation_retry_is_idempotent() {
             interpretation_generation_id: Some(interpretation.generation_id),
             embedder: registration.clone(),
             profile: EventSearchProfile::default(),
+            embedding_workers: NonZeroUsize::MIN,
             max_events_per_batch: NonZeroU32::new(1).unwrap(),
             max_passages_per_batch: NonZeroU32::new(1).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(4096).unwrap(),

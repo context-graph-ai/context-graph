@@ -804,6 +804,7 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
         "static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();",
         "let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));",
         "let mut guard = registry.lock().expect(\"store registry lock\");",
+        "let guard = registry.lock().expect(\"store registry lock\");",
         "let _outcome_guard = self.outcome_mutex.lock().expect(\"outcome mutex poisoned\");",
         "use std::sync::{Arc, Mutex};",
         // `ConsumerReader` keeps its one read session behind a per-reader mutex so the session
@@ -846,7 +847,15 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
         // A hook acts on the production path on that one test thread; it holds no product state,
         // serializes no contention, and no default build contains it.
         let sanctioned_test_hook_slot = file == crate_dir.join("src/store/event_correlation.rs")
-            || file == crate_dir.join("src/store/event_search_projection.rs");
+            || file == crate_dir.join("src/store/event_search_projection.rs")
+            // Private admission observer, compiled only by the dev-only test-support feature.
+            || file == crate_dir.join("src/store/open_retry.rs")
+            // `src/store/event_search_read.rs` keeps one slot holding the statements the
+            // event-history reads issued on the calling thread, so a proof can assert what a
+            // `find` or a `status` COSTS in statements rather than how long it took. It records
+            // what a read DID; it holds no product state, serializes nothing -- a thread's own
+            // `RefCell`, never a lock -- and only the dev-only test-support feature compiles it.
+            || file == crate_dir.join("src/store/event_search_read.rs");
         // Sanctioned: `src/store/mod.rs` serializes schema installation inside one process with
         // `SCHEMA_INSTALL_LOCK`, the process-local role the store `REGISTRY` already plays: store
         // handles on one path share one Database, and two of them must not interleave DDL. It

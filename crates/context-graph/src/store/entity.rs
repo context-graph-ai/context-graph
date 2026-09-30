@@ -145,7 +145,7 @@ impl Store {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let result = self.read_query(&sql, &params)?;
         let mut trace = String::new();
         if filter.entity_type.is_some() {
             trace.push_str("entity_type;");
@@ -204,25 +204,19 @@ impl Store {
                 context: "EntityId",
             });
         }
-        let result = self
-            .db
-            .execute(
-                "SELECT snapshot_id FROM entity_current_snapshots WHERE entity_id = $entity_id",
-                &HashMap::from([("entity_id".to_string(), Value::Uuid(id.as_uuid()))]),
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT snapshot_id FROM entity_current_snapshots WHERE entity_id = $entity_id",
+            &HashMap::from([("entity_id".to_string(), Value::Uuid(id.as_uuid()))]),
+        )?;
         let Some(row) = result.rows.first() else {
             return Ok(None);
         };
         let snapshot_id = EntitySnapshotId::from(get_uuid(row, &result.columns, "snapshot_id")?);
         let params = HashMap::from([("id".to_string(), Value::Uuid(snapshot_id.as_uuid()))]);
-        let snapshot = self
-            .db
-            .execute(
-                "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE id = $id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let snapshot = self.read_query(
+            "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE id = $id",
+            &params,
+        )?;
         let snapshot = snapshot
             .rows
             .first()
@@ -327,13 +321,10 @@ impl Store {
             });
         }
         let params = HashMap::from([("entity_id".to_string(), Value::Uuid(id.as_uuid()))]);
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut snapshots = Vec::with_capacity(result.rows.len());
         let mut archived_heads = BTreeSet::new();
         for row in &result.rows {
@@ -345,13 +336,10 @@ impl Store {
         }
         snapshots.sort_by_key(|snapshot| (snapshot.valid_from.0, snapshot.id.as_uuid()));
 
-        let links_result = self
-            .db
-            .execute(
+        let links_result = self.read_query(
                 "SELECT predecessor_snapshot_id, successor_snapshot_id, created_at FROM entity_snapshot_links WHERE entity_id = $entity_id",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut links = Vec::with_capacity(links_result.rows.len());
         let mut predecessors = BTreeSet::new();
         for row in &links_result.rows {
@@ -545,13 +533,10 @@ impl Store {
         let params: HashMap<String, Value> = [("entity_id".to_string(), Value::Uuid(id.as_uuid()))]
             .into_iter()
             .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut snaps: Vec<EntitySnapshot> = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             let snapshot = decode_snapshot(&result.columns, row)?;
@@ -922,7 +907,7 @@ impl Store {
         let sql = format!(
             "SELECT source_id, target_id FROM edges WHERE context_id = $context_id AND (({source_clause}) OR ({target_clause}))"
         );
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let result = self.read_query(&sql, &params)?;
         let mut out = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             let source = match row.first() {
@@ -958,7 +943,7 @@ impl Store {
         let sql = format!(
             "SELECT source_id FROM edges WHERE context_id = $context_id AND edge_type = $edge_type AND ({target_clause})"
         );
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let result = self.read_query(&sql, &params)?;
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for row in &result.rows {
@@ -1042,13 +1027,10 @@ impl Store {
             [("entity_id".to_string(), Value::Uuid(entity_id.as_uuid()))]
                 .into_iter()
                 .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, entity_id, data, valid_from, valid_to FROM entity_snapshots WHERE entity_id = $entity_id",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut snaps = Vec::new();
         for row in &result.rows {
             let snap = decode_snapshot(&result.columns, row)?;
@@ -1136,16 +1118,13 @@ impl Store {
         entity_id: EntityId,
         snapshot_id: EntitySnapshotId,
     ) -> Result<Vec<ObservationId>> {
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT observation_id, observation_order FROM entity_snapshot_observations WHERE entity_id = $entity_id AND snapshot_id = $snapshot_id",
                 &HashMap::from([
                     ("entity_id".to_string(), Value::Uuid(entity_id.as_uuid())),
                     ("snapshot_id".to_string(), Value::Uuid(snapshot_id.as_uuid())),
                 ]),
-            )
-            .map_err(map_engine_err)?;
+            )?;
         ordered_observation_ids(&result.columns, &result.rows)
     }
 }

@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -9,16 +10,18 @@ use cg_connector_claude_code::{
     ClaudeCodeJsonlAdapter, ClaudeHistoryLocator, effective_history_root,
 };
 use context_graph::{
-    CgError, ContextId, ContextSelector, CreateContext, EventCoverageCounts,
-    EventHistoryContextStatus, EventPlacementState, EventSourcePrefixCheck, ImportEventOptions,
-    Store,
+    CgError, ContextId, ContextSelector, CreateContext, EventCoverageCounts, EventPlacementState,
+    EventSearchWorkAssessment, EventSearchWorkPolicy, EventSourceAdapter, EventSourcePrefixCheck,
+    ImportEventOptions, Store,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    OutputFormat, SelectionSource, Terminal, configured_placement, grouped, library_refusal,
-    nearest_binding, open_reader, parse, print_json, refuse, search_artifact_available,
+    OutputFormat, SelectionSource, Terminal, configured_passage_profile, configured_placement,
+    grouped, import_retry_command, library_refusal, nearest_binding, open_reader, parse,
+    parse_embedding_workers, parse_search_order, parse_search_sessions, print_json, refuse,
+    resolved_embedding_workers, resolved_search_work_policy, search_artifact_available,
     store_config, usage, worker, workspace_binding_key,
 };
 
@@ -37,6 +40,20 @@ impl SearchMode {
             SearchMode::Defer => "defer",
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct EmbeddingWorkerRequest {
+    resolved: NonZeroUsize,
+    explicit: Option<NonZeroUsize>,
+}
+
+struct ProjectContextOptions {
+    read_only: bool,
+    format: OutputFormat,
+    read_memory_limit_bytes: NonZeroUsize,
+    work_policy: EventSearchWorkPolicy,
+    embedding_workers: EmbeddingWorkerRequest,
 }
 
 /// One selected source file.
@@ -65,7 +82,10 @@ struct FailedSource {
     reason: String,
 }
 
-pub(crate) fn handle_import(args: &[String]) -> i32 {
+pub(crate) fn handle_import(
+    args: &[String],
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> i32 {
     let format = super::super::output_format(args);
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{}", IMPORT_HELP);
@@ -73,7 +93,15 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
     }
     let parsed = match parse(
         args,
-        &["--context", "--search", "--session", "--format"],
+        &[
+            "--context",
+            "--search",
+            "--embedding-workers",
+            "--search-order",
+            "--search-sessions",
+            "--session",
+            "--format",
+        ],
         &["--dry-run"],
     ) {
         Ok(parsed) => parsed,
@@ -130,6 +158,78 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
         }
     };
     let root = super::super::data_root();
+    let explicit_embedding_workers = match parsed.value("--embedding-workers") {
+        Some(value) => match parse_embedding_workers(value, "--embedding-workers") {
+            Ok(value) => Some(value),
+            Err(message) => return usage(format, "import", &message),
+        },
+        None => None,
+    };
+    if let Some(value) = parsed.value("--search-order")
+        && let Err(message) = parse_search_order(value, "--search-order")
+    {
+        return usage(format, "import", &message);
+    }
+    if let Some(value) = parsed.value("--search-sessions")
+        && let Err(message) = parse_search_sessions(value, "--search-sessions")
+    {
+        return usage(format, "import", &message);
+    }
+    let embedding_workers =
+        match resolved_embedding_workers(&root, parsed.value("--embedding-workers")) {
+            Ok(value) => value,
+            Err(message) => {
+                return refuse(
+                    format,
+                    1,
+                    json!({"ok": false, "state": "config_error", "message": message}),
+                    &format!("error: {message}"),
+                );
+            }
+        };
+    let embedding_worker_request = EmbeddingWorkerRequest {
+        resolved: embedding_workers,
+        explicit: explicit_embedding_workers,
+    };
+    let work_policy = match resolved_search_work_policy(
+        &root,
+        parsed.value("--search-order"),
+        parsed.value("--search-sessions"),
+    ) {
+        Ok(policy) => policy,
+        Err(message) => {
+            return refuse(
+                format,
+                1,
+                json!({"ok": false, "state": "config_error", "message": message}),
+                &format!("error: {message}"),
+            );
+        }
+    };
+    // Placement and passage profile are pure configuration admission. Keep them beside the
+    // worker-cap check so even a real import refuses before project planning can recover a store.
+    let placement = match configured_placement(&root) {
+        Ok(placement) => placement,
+        Err(message) => {
+            return refuse(
+                format,
+                1,
+                json!({"ok": false, "state": "config_error", "message": message}),
+                &format!("error: {message}"),
+            );
+        }
+    };
+    let desired_profile = match configured_passage_profile(&root) {
+        Ok(profile) => profile,
+        Err(message) => {
+            return refuse(
+                format,
+                1,
+                json!({"ok": false, "state": "config_error", "message": message}),
+                &format!("error: {message}"),
+            );
+        }
+    };
     let started = Instant::now();
 
     // Resolve the sources before any Context or binding decision.
@@ -193,8 +293,19 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
                 source_locator_ref: source.source_locator_ref,
             })
             .collect::<Vec<_>>();
-        let plan = match project_context_plan(&root, &project, explicit.as_deref(), target, format)
-        {
+        let plan = match project_context_plan(
+            &root,
+            &project,
+            explicit.as_deref(),
+            target,
+            ProjectContextOptions {
+                read_only: parsed.has("--dry-run"),
+                format,
+                read_memory_limit_bytes,
+                work_policy,
+                embedding_workers: embedding_worker_request,
+            },
+        ) {
             Ok(plan) => plan,
             Err(code) => return code,
         };
@@ -244,20 +355,17 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
     let session_override = parsed.value("--session").map(str::to_string);
 
     if parsed.has("--dry-run") {
-        return dry_run(format, &root, &sources, helpers, &plan, mode);
+        return dry_run(
+            format,
+            &root,
+            &sources,
+            helpers,
+            &plan,
+            mode,
+            read_memory_limit_bytes,
+        );
     }
 
-    let placement = match configured_placement(&root) {
-        Ok(placement) => placement,
-        Err(message) => {
-            return refuse(
-                format,
-                1,
-                json!({"ok": false, "state": "config_error", "message": message}),
-                &format!("error: {message}"),
-            );
-        }
-    };
     let artifact_available = mode != SearchMode::Defer && search_artifact_available();
     if mode != SearchMode::Defer && !artifact_available && format == OutputFormat::Text {
         eprintln!(
@@ -274,7 +382,7 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
             &format!("error: {message}"),
         );
     }
-    let store = match Store::open(store_config(&root, placement)) {
+    let store = match Store::open(store_config(&root, placement, read_memory_limit_bytes)) {
         Ok(store) => store,
         Err(error) => return library_refusal(format, &error),
     };
@@ -284,7 +392,7 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
             return refuse(
                 format,
                 1,
-                json!({"ok": false, "state": "tenant_policy_blocked", "capture": {"status": "not_run"}, "search": {"status": "not_run"}, "retry": format!("cg import {target}"), "message": message}),
+                json!({"ok": false, "state": "tenant_policy_blocked", "capture": {"status": "not_run"}, "search": {"status": "not_run"}, "retry": retry_import(target, explicit.as_deref(), None, work_policy, embedding_worker_request), "message": message}),
                 &format!("error: {message}"),
             );
         }
@@ -296,10 +404,21 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
         match apply_context_plan(&store, &plan, project.as_deref()) {
             Ok(applied) => applied,
             Err(CgError::ContextBindingConflict { .. }) => {
-                return binding_conflict(format, target);
+                return binding_conflict(format, target, work_policy, embedding_worker_request);
             }
             Err(error) => return library_refusal(format, &error),
         };
+
+    // Capture receipts and later read retries must retain the selection this invocation resolved,
+    // even when defer or a missing model means no projection runner writes it.
+    if let Err(error) = store.persist_event_search_work_policy(context_id, work_policy) {
+        return library_refusal(format, &error);
+    }
+
+    let captured_before = match store.event_history_status(ContextSelector::one(context_id)) {
+        Ok(status) => status.contexts[0].captured_events,
+        Err(error) => return library_refusal(format, &error),
+    };
 
     // Capture every selected source in order. A malformed or divergent file stops only itself.
     let mut totals = EventCoverageCounts::default();
@@ -372,6 +491,87 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
                     position: Value::Null,
                     reason: error.to_string(),
                 }),
+                CgError::WriteDidNotFitTheMemoryLimit {
+                    requested_bytes,
+                    limit_bytes,
+                } => {
+                    let captured_after =
+                        match store.event_history_status(ContextSelector::one(context_id)) {
+                            Ok(status) => status.contexts[0].captured_events,
+                            Err(error) => return library_refusal(format, &error),
+                        };
+                    let current_committed_bytes = match store.check_event_source_prefix(
+                        context_id,
+                        adapter.declaration(),
+                        &source.source_locator_ref,
+                        &mut file,
+                    ) {
+                        Ok(EventSourcePrefixCheck::Unchanged { committed_bytes })
+                        | Ok(EventSourcePrefixCheck::Appended {
+                            committed_bytes, ..
+                        })
+                        | Ok(EventSourcePrefixCheck::Diverged {
+                            committed_bytes, ..
+                        }) => committed_bytes,
+                        Ok(EventSourcePrefixCheck::New { .. }) => 0,
+                        Err(error) => return library_refusal(format, &error),
+                    };
+                    let position = if current_committed_bytes > 0 || captured_sources.is_empty() {
+                        json!({"file": file_name, "committed_bytes": current_committed_bytes})
+                    } else {
+                        let previous = captured_sources.last().expect("nonempty checked above");
+                        json!({
+                            "source_instance_ref": previous["source_instance_ref"],
+                            "last_seq": previous["last_seq"],
+                        })
+                    };
+                    let Some(committed_this_import) = captured_after.checked_sub(captured_before)
+                    else {
+                        return library_refusal(
+                            format,
+                            &CgError::Engine(
+                                "captured event count decreased during import".to_string(),
+                            ),
+                        );
+                    };
+                    let message = format!(
+                        "cg import stopped because its next write needed another {} of working \
+                         memory and could not fit under the {} writer memory limit in force. \
+                         Earlier committed events remain in the store; the refused write changed \
+                         nothing. To continue, {}, then retry the same import; cg resumes from \
+                         committed progress.",
+                        context_graph::write_budget::human_bytes(*requested_bytes as u64),
+                        context_graph::write_budget::human_bytes(*limit_bytes as u64),
+                        context_graph::write_budget::how_to_raise_the_writer_budget(),
+                    );
+                    drop(store);
+                    return refuse(
+                        format,
+                        1,
+                        json!({
+                            "ok": false,
+                            "state": "write_memory_limit",
+                            "condition": "WriteDidNotFitTheMemoryLimit",
+                            "message": message,
+                            "requested_bytes": requested_bytes,
+                            "limit_bytes": limit_bytes,
+                            "context": {"id": context_id.to_string(), "name": context_name},
+                            "capture": {
+                                "status": "partial",
+                                "events": {
+                                    "inserted": committed_this_import,
+                                    "already_present": already_present,
+                                    "refused": refused,
+                                    "failed": failed_events,
+                                },
+                                "last_committed_position": position,
+                                "sources": captured_sources,
+                            },
+                            "search": {"status": "not_run"},
+                        }),
+                        &format!("error: {message}"),
+                    );
+                }
                 _ => {
                     drop(store);
                     return library_refusal(format, &error);
@@ -387,16 +587,65 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
         Err(error) => return library_refusal(format, &error),
     };
     let delivery = snapshot.delivery.clone();
+    let work = match store.event_search_work_with_policy(
+        ContextSelector::one(context_id),
+        &super::search_work_spec(&desired_profile),
+        work_policy,
+    ) {
+        Ok(mut assessments) => assessments.remove(0),
+        Err(error) => return library_refusal(format, &error),
+    };
+    let background_request = if mode == SearchMode::Background
+        && work.work_required
+        && artifact_available
+        && failed.is_empty()
+    {
+        match store.select_event_search_work(context_id, work_policy) {
+            Ok(selected) => Some(worker::accept_background_work(
+                &root,
+                &store,
+                context_id,
+                embedding_worker_request.resolved,
+                work_policy,
+                &selected,
+                &super::search_work_spec(&desired_profile),
+            )),
+            Err(error) => return library_refusal(format, &error),
+        }
+    } else {
+        None
+    };
+    let observed_memory_refusals =
+        if failed.is_empty() && !work.work_required && mode != SearchMode::Defer {
+            match worker::completed_memory_refusals(
+                &root,
+                &store,
+                context_id,
+                work_policy,
+                &desired_profile,
+            ) {
+                Ok(observed) => observed,
+                Err(error) => return library_refusal(format, &error),
+            }
+        } else {
+            Vec::new()
+        };
     drop(store);
+    #[cfg(any(
+        context_graph_internal_test_support,
+        feature = "event-search-test-support"
+    ))]
+    worker::pause_before_import_acknowledgement();
 
     // A receipt carries no source path: its retry names the input by kind.
     let retry_target = if project.is_some() {
         "<project-directory>".to_string()
     } else {
-        format!("<session.jsonl> --context {}", context_name)
+        "<session.jsonl>".to_string()
     };
     let receipt = ImportReceipt {
         target: retry_target,
+        retry_context: project.is_none().then(|| context_name.clone()),
         mode,
         context_id,
         context_name,
@@ -416,6 +665,8 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
         captured_sources,
         failed,
         capture_ms,
+        background_request,
+        observed_memory_refusals,
         delivery: delivery
             .map(|delivery| {
                 json!({
@@ -429,7 +680,16 @@ pub(crate) fn handle_import(args: &[String]) -> i32 {
             })
             .unwrap_or(Value::Null),
     };
-    finish(format, &root, receipt, snapshot, artifact_available)
+    finish(
+        format,
+        (&root, read_memory_limit_bytes),
+        receipt,
+        work,
+        &desired_profile,
+        artifact_available,
+        embedding_worker_request,
+        work_policy,
+    )
 }
 
 /// `--dry-run`: resolve the sources and the Context, verify every committed prefix through the
@@ -441,13 +701,14 @@ fn dry_run(
     helpers: usize,
     plan: &ContextPlan,
     mode: SearchMode,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
 ) -> i32 {
     let (name, selection_source) = match plan {
         ContextPlan::Bound { name, .. } => (name.clone(), SelectionSource::ProjectBinding),
         ContextPlan::Bind { name, source } => (name.clone(), *source),
         ContextPlan::Named { name } => (name.clone(), SelectionSource::Explicit),
     };
-    let reader = match open_reader(root) {
+    let reader = match open_reader(root, read_memory_limit_bytes) {
         Ok(reader) => Some(reader),
         Err(CgError::StoreMissing { .. }) => None,
         Err(error) => return library_refusal(format, &error),
@@ -561,6 +822,7 @@ fn dry_run(
 
 struct ImportReceipt {
     target: String,
+    retry_context: Option<String>,
     mode: SearchMode,
     context_id: ContextId,
     context_name: String,
@@ -580,7 +842,9 @@ struct ImportReceipt {
     captured_sources: Vec<Value>,
     failed: Vec<FailedSource>,
     capture_ms: u64,
+    background_request: Option<Result<worker::PendingBackgroundRequest, String>>,
     delivery: Value,
+    observed_memory_refusals: Vec<String>,
 }
 
 struct SearchOutcome {
@@ -591,37 +855,78 @@ struct SearchOutcome {
     worker: &'static str,
     pending: u64,
     covered: u64,
+    outside_scope: u64,
+    outside_scope_indexed: u64,
+    no_searchable_text: u64,
     embedded: u64,
     reason: Option<String>,
     retry: Value,
     search_ms: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     format: OutputFormat,
-    root: &Path,
+    (root, read_memory_limit_bytes): (&Path, std::num::NonZeroUsize),
     receipt: ImportReceipt,
-    snapshot: EventHistoryContextStatus,
+    work: EventSearchWorkAssessment,
+    desired_profile: &context_graph::EventSearchProfile,
     artifact_available: bool,
+    embedding_worker_request: EmbeddingWorkerRequest,
+    work_policy: EventSearchWorkPolicy,
 ) -> i32 {
-    let pending = snapshot.search.pending_events;
-    let covered = snapshot.search.covered_events;
-    let wait_retry = format!("cg import {} --search wait", receipt.target);
+    if receipt.failed.is_empty()
+        && !work.work_required
+        && receipt.mode != SearchMode::Defer
+        && let Err(error) = worker::acknowledge_completed_memory_refusal(
+            root,
+            receipt.context_id,
+            &receipt.observed_memory_refusals,
+            read_memory_limit_bytes,
+        )
+    {
+        return library_refusal(format, &error);
+    }
+    let pending = work.pending_events;
+    let covered = work.covered_events;
+    let outside_scope = work.outside_scope_events;
+    let outside_scope_indexed = work.outside_scope_indexed_events;
+    let no_searchable_text = work.no_searchable_text_events;
+    let wait_retry = retry_import(
+        &receipt.target,
+        receipt.retry_context.as_deref(),
+        Some(SearchMode::Wait),
+        work_policy,
+        embedding_worker_request,
+    );
     let outcome = if !receipt.failed.is_empty() {
         SearchOutcome {
             state: "source_partial",
             ok: false,
             code: 1,
-            search_status: if pending == 0 { "ready" } else { "pending" },
+            search_status: if work.work_required {
+                "pending"
+            } else {
+                "ready"
+            },
             worker: "not_started",
             pending,
             covered,
+            outside_scope,
+            outside_scope_indexed,
+            no_searchable_text,
             embedded: 0,
             reason: None,
-            retry: json!(format!("cg import {}", receipt.target)),
+            retry: json!(retry_import(
+                &receipt.target,
+                receipt.retry_context.as_deref(),
+                None,
+                work_policy,
+                embedding_worker_request,
+            )),
             search_ms: 0,
         }
-    } else if pending == 0 {
+    } else if !work.work_required {
         SearchOutcome {
             state: "complete",
             ok: true,
@@ -630,6 +935,9 @@ fn finish(
             worker: "not_started",
             pending,
             covered,
+            outside_scope,
+            outside_scope_indexed,
+            no_searchable_text,
             embedded: 0,
             reason: None,
             retry: Value::Null,
@@ -644,6 +952,9 @@ fn finish(
             worker: "not_started",
             pending,
             covered,
+            outside_scope,
+            outside_scope_indexed,
+            no_searchable_text,
             embedded: 0,
             reason: None,
             retry: json!(wait_retry),
@@ -658,6 +969,9 @@ fn finish(
             worker: "not_started",
             pending,
             covered,
+            outside_scope,
+            outside_scope_indexed,
+            no_searchable_text,
             embedded: 0,
             reason: Some("the local Nomic search model is not installed".to_string()),
             retry: json!(format!("cg model fetch --defaults && {wait_retry}")),
@@ -665,7 +979,13 @@ fn finish(
         }
     } else if receipt.mode == SearchMode::Background {
         let started = Instant::now();
-        match worker::kick(root) {
+        match receipt
+            .background_request
+            .clone()
+            .expect("background pending work was accepted")
+            .and_then(|request| {
+                worker::kick_accepted_background_work(root, desired_profile, request)
+            }) {
             Ok(worker) => SearchOutcome {
                 state: "captured_search_scheduled",
                 ok: true,
@@ -674,6 +994,9 @@ fn finish(
                 worker,
                 pending,
                 covered,
+                outside_scope,
+                outside_scope_indexed,
+                no_searchable_text,
                 embedded: 0,
                 reason: None,
                 retry: Value::Null,
@@ -687,6 +1010,9 @@ fn finish(
                 worker: "spawn_failed",
                 pending,
                 covered,
+                outside_scope,
+                outside_scope_indexed,
+                no_searchable_text,
                 embedded: 0,
                 reason: Some(reason),
                 retry: json!(wait_retry),
@@ -695,16 +1021,28 @@ fn finish(
         }
     } else {
         let started = Instant::now();
-        match worker::run_in_foreground(root, receipt.context_id) {
-            Ok(after) => SearchOutcome {
+        let after = worker::run_in_foreground(
+            root,
+            receipt.context_id,
+            desired_profile,
+            embedding_worker_request.resolved,
+            work_policy,
+            read_memory_limit_bytes,
+        );
+        let coverage = after.work.as_ref().unwrap_or(&work);
+        match after.result {
+            Ok(()) => SearchOutcome {
                 state: "complete",
                 ok: true,
                 code: 0,
                 search_status: "ready",
                 worker: "foreground",
-                pending: after.pending_events,
-                covered: after.covered_events,
-                embedded: after.covered_events.saturating_sub(covered),
+                pending: coverage.pending_events,
+                covered: coverage.covered_events,
+                outside_scope: coverage.outside_scope_events,
+                outside_scope_indexed: coverage.outside_scope_indexed_events,
+                no_searchable_text: coverage.no_searchable_text_events,
+                embedded: after.embedding_invocations,
                 reason: None,
                 retry: Value::Null,
                 search_ms: started.elapsed().as_millis() as u64,
@@ -715,9 +1053,12 @@ fn finish(
                 code: 1,
                 search_status: "failed",
                 worker: "foreground",
-                pending,
-                covered,
-                embedded: 0,
+                pending: coverage.pending_events,
+                covered: coverage.covered_events,
+                outside_scope: coverage.outside_scope_events,
+                outside_scope_indexed: coverage.outside_scope_indexed_events,
+                no_searchable_text: coverage.no_searchable_text_events,
+                embedded: after.embedding_invocations,
                 reason: Some(reason),
                 retry: json!(wait_retry),
                 search_ms: started.elapsed().as_millis() as u64,
@@ -777,6 +1118,9 @@ fn finish(
             "worker": outcome.worker,
             "covered_events": outcome.covered,
             "pending_events": outcome.pending,
+            "outside_scope_events": outcome.outside_scope,
+            "outside_scope_indexed_events": outcome.outside_scope_indexed,
+            "no_searchable_text_events": outcome.no_searchable_text,
             "local_embedding_calls": outcome.embedded,
             "elapsed_ms": outcome.search_ms,
         },
@@ -839,19 +1183,49 @@ fn render_text(receipt: &ImportReceipt, outcome: &SearchOutcome) {
         ),
     };
     println!("{search}");
+    if outcome.outside_scope > 0 || outcome.no_searchable_text > 0 {
+        println!(
+            "search coverage: {} events indexed; {} outside this build scope ({} already indexed); {} have no searchable text",
+            grouped(outcome.covered),
+            grouped(outcome.outside_scope),
+            grouped(outcome.outside_scope_indexed),
+            grouped(outcome.no_searchable_text)
+        );
+    }
     if let Some(retry) = outcome.retry.as_str() {
         println!("next: {retry}");
     }
 }
 
-fn binding_conflict(format: OutputFormat, target: &str) -> i32 {
+fn retry_import(
+    target: &str,
+    context: Option<&str>,
+    mode: Option<SearchMode>,
+    work_policy: EventSearchWorkPolicy,
+    embedding_workers: EmbeddingWorkerRequest,
+) -> String {
+    import_retry_command(
+        target,
+        context,
+        mode.map(SearchMode::as_str),
+        work_policy,
+        embedding_workers.explicit,
+    )
+}
+
+fn binding_conflict(
+    format: OutputFormat,
+    target: &str,
+    work_policy: EventSearchWorkPolicy,
+    embedding_workers: EmbeddingWorkerRequest,
+) -> i32 {
     let message = format!(
         "`{target}` is already linked to a different Context; no Context, binding, event or projection row changed. Import it without --context to use its linked Context"
     );
     refuse(
         format,
         2,
-        json!({"ok": false, "state": "context_binding_conflict", "message": message, "retry": format!("cg import {target}")}),
+        json!({"ok": false, "state": "context_binding_conflict", "message": message, "retry": retry_import(target, None, None, work_policy, embedding_workers)}),
         &format!("error: {message}"),
     )
 }
@@ -862,11 +1236,35 @@ fn project_context_plan(
     project: &Path,
     explicit: Option<&str>,
     target: &str,
-    format: OutputFormat,
+    options: ProjectContextOptions,
 ) -> Result<ContextPlan, i32> {
+    let ProjectContextOptions {
+        read_only,
+        format,
+        read_memory_limit_bytes,
+        work_policy,
+        embedding_workers,
+    } = options;
     let mut existing_names = Vec::new();
     let mut bound = None;
-    match open_reader(root) {
+    // Planning reads read-only so an unbound, unattended import writes nothing. A store whose
+    // last writer died refuses every read-only open until a writable open settles it. Ordinary
+    // import recovers there; a dry-run must return that typed refusal without opening the store
+    // writable.
+    let reader = match open_reader(root, read_memory_limit_bytes) {
+        Err(error @ CgError::StoreNeedsWritableRecovery { .. }) if read_only => {
+            return Err(library_refusal(format, &error));
+        }
+        Err(CgError::StoreNeedsWritableRecovery { .. }) => {
+            match Store::open(store_config(root, None, read_memory_limit_bytes)) {
+                Ok(store) => drop(store),
+                Err(error) => return Err(library_refusal(format, &error)),
+            }
+            open_reader(root, read_memory_limit_bytes)
+        }
+        other => other,
+    };
+    match reader {
         Ok(reader) => {
             match nearest_binding(&reader, project) {
                 Ok(Some((context_id, _))) => {
@@ -896,7 +1294,12 @@ fn project_context_plan(
         if let Some(explicit) = explicit
             && explicit != name
         {
-            return Err(binding_conflict(format, target));
+            return Err(binding_conflict(
+                format,
+                target,
+                work_policy,
+                embedding_workers,
+            ));
         }
         return Ok(ContextPlan::Bound { context_id, name });
     }
@@ -912,7 +1315,13 @@ fn project_context_plan(
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "default".to_string());
     let required = |format: OutputFormat| {
-        let retry = format!("cg import {target} --context {suggested}");
+        let retry = retry_import(
+            target,
+            Some(&suggested),
+            None,
+            work_policy,
+            embedding_workers,
+        );
         let message = format!(
             "no Context is linked to this project and there is no terminal to ask on; nothing was written. Run `{retry}`"
         );
@@ -1022,7 +1431,7 @@ fn apply_context_plan(
     }
 }
 
-const IMPORT_HELP: &str = "Usage: cg import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer] [--session REF] [--dry-run] [--format json|text]
+const IMPORT_HELP: &str = "Usage: cg import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer] [--embedding-workers N] [--search-order newest|oldest] [--search-sessions N|all] [--session REF] [--dry-run] [--format json|text]
 
 Example:
   cd ~/projects/my-app && cg import .
@@ -1044,10 +1453,28 @@ Capture is durable and model-free. Search is then made ready according to --sear
   wait                  build the search index before returning
   defer                 capture only; start no search work
 
+Pass --embedding-workers N to bound simultaneous passage embedding calls for this request. N must
+be positive; the flag overrides [search].embedding_workers, and omission uses that setting or
+available CPU parallelism. This execution limit does not create a generation or rebuild unchanged
+history. A deferred or already-caught-up import does not change active work. A foreground wait
+keeps its resolved limit, publishes that choice, and starts no background worker unless a later
+request is queued.
+
+The selected --write-memory-limit-bytes ceiling stays with pending background work across restart.
+Different Contexts keep their own ceilings; shared pending work uses the lower ceiling. The worker
+releases writable state before reopening under a changed ceiling and refuses if it does not fit.
+This limits engine write working memory, not total process RAM. `cg status` reports a refused
+background write with its needed and allowed memory; retry with an affordable ceiling.
+
+Pass --search-order newest|oldest to choose processing order and --search-sessions N|all to bound
+embedding to the N sessions chosen by --search-order (default: the 10 most recent). These flags override [search].order and
+[search].sessions for this invocation; set [search] to make a choice persistent. `all` can make
+the first search build much longer.
+
 background and wait need the local Nomic model (`cg model fetch --defaults`); nothing is
 downloaded by import. JSON is the default output; --format text prints a human summary.
 --dry-run resolves the sources and the Context and writes nothing.
 
 Exit: 0 complete / scheduled / deferred; 1 captured_search_behind, source_partial,
-schema_mismatch, tenant_policy_blocked; 2 project_history_not_found, context_binding_required,
-context_binding_conflict, usage error; 4 store_busy.";
+schema_mismatch, store_needs_recovery, tenant_policy_blocked, config_error; 2 project_history_not_found,
+context_binding_required, context_binding_conflict, usage_error; 4 store_busy.";

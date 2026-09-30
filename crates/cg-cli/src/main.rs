@@ -53,13 +53,15 @@ use context_graph::{
     usage_receipt_from_calls, usage_receipt_json,
 };
 use contextdb_core::{Lsn, TenantId, Value as DbValue};
-use contextdb_engine::{Database, sync_types::ApplyResult};
+use contextdb_engine::{ReadSession, sync_types::ApplyResult};
 use contextdb_server::{FabricIdentity, SyncClient};
 use fs4::fs_std::FileExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 mod history;
+mod read_config;
+mod write_config;
 
 const INGESTION_EXPECTATION: &str = "automatic capture is ready for cg record and cg import";
 const CONNECTION_SCOPE: &str = "connection-substrate";
@@ -126,10 +128,47 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> i32 {
+    #[cfg(feature = "event-search-test-support")]
+    history::apply_store_open_retry_allowance_for_test();
+    // The writer's working-memory ceiling is one setting for the whole invocation, not a flag each
+    // command admits, so it comes off the argument list before any command parses its own.
+    let (args, write_memory_limit_switch) = match write_config::take_switch(args) {
+        Ok(taken) => taken,
+        Err(message) => {
+            print_json(&json!({"ok": false, "state": "config_error", "message": message}));
+            return 1;
+        }
+    };
     if let Some(message) = format_usage_error(&args) {
         return usage_error(&message);
     }
     record_requested_format(&args);
+    let read_memory_limit_bytes = match read_config::load_memory_limit(&data_root()) {
+        Ok(limit) => limit,
+        Err(message) => {
+            print_json(&json!({"ok": false, "state": "config_error", "message": message}));
+            return 1;
+        }
+    };
+    match read_config::load_active_time(&data_root()) {
+        Ok(active_time) => read_config::install_active_time(active_time),
+        Err(message) => {
+            print_json(&json!({"ok": false, "state": "config_error", "message": message}));
+            return 1;
+        }
+    }
+    match write_config::resolve(&data_root(), write_memory_limit_switch) {
+        Ok(limit) => write_config::install(limit),
+        Err(message) => {
+            print_json(&json!({"ok": false, "state": "config_error", "message": message}));
+            return 1;
+        }
+    }
+    if let Some(message) = write_config::capture_admission_refusal(&args, &write_config::in_force())
+    {
+        print_json(&json!({"ok": false, "state": "config_error", "message": message}));
+        return 1;
+    }
     match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") => {
             print_help();
@@ -139,38 +178,38 @@ fn run(args: Vec<String>) -> i32 {
             println!("cg {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        Some("model") => handle_model(&args[1..]),
-        Some("record") => handle_record(&args[1..]),
-        Some("import") => history::handle_import(&args[1..]),
-        Some("find") => history::handle_find(&args[1..]),
-        Some("show") => history::handle_show(&args[1..]),
-        Some("forget") => history::handle_forget(&args[1..]),
+        Some("model") => handle_model(&args[1..], read_memory_limit_bytes),
+        Some("record") => handle_record(&args[1..], read_memory_limit_bytes),
+        Some("import") => history::handle_import(&args[1..], read_memory_limit_bytes),
+        Some("find") => history::handle_find(&args[1..], read_memory_limit_bytes),
+        Some("show") => history::handle_show(&args[1..], read_memory_limit_bytes),
+        Some("forget") => history::handle_forget(&args[1..], read_memory_limit_bytes),
         Some(command) if command == history::WORKER_COMMAND => {
-            history::handle_event_search_worker(&args[1..])
+            history::handle_event_search_worker(&args[1..], read_memory_limit_bytes)
         }
-        Some("understand") => handle_understand(&args[1..]),
-        Some("worker") => handle_worker(&args[1..]),
-        Some("query") => handle_query(&args[1..]),
-        Some("sync") => handle_sync(&args[1..]),
-        Some("impact") => handle_impact(&args[1..]),
-        Some("changed") => handle_changed(&args[1..]),
-        Some("by-intention") => handle_by_intention(&args[1..]),
-        Some("by-entity") => handle_by_entity(&args[1..]),
-        Some("status") => history::handle_status(&args[1..]),
+        Some("understand") => handle_understand(&args[1..], read_memory_limit_bytes),
+        Some("worker") => handle_worker(&args[1..], read_memory_limit_bytes),
+        Some("query") => handle_query(&args[1..], read_memory_limit_bytes),
+        Some("sync") => handle_sync(&args[1..], read_memory_limit_bytes),
+        Some("impact") => handle_impact(&args[1..], read_memory_limit_bytes),
+        Some("changed") => handle_changed(&args[1..], read_memory_limit_bytes),
+        Some("by-intention") => handle_by_intention(&args[1..], read_memory_limit_bytes),
+        Some("by-entity") => handle_by_entity(&args[1..], read_memory_limit_bytes),
+        Some("status") => history::handle_status(&args[1..], read_memory_limit_bytes),
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::HostSessionLegacy),
         Some("doctor") => handle_doctor(&args[1..]),
         Some("disconnect") => handle_disconnect(&args[1..]),
         Some("connect") => handle_connect(&args[1..]),
-        Some("hook") => handle_hook(&args[1..]),
+        Some("hook") => handle_hook(&args[1..], read_memory_limit_bytes),
         // The six item-action verbs + the review/why lenses (additive to the retrieval/capture
         // commands above; the action surface is exactly these, an unknown token rejected).
-        Some("fix") => handle_fix(&args[1..]),
-        Some("drop") => handle_drop(&args[1..]),
-        Some("group") => handle_group(&args[1..]),
-        Some("undo") => handle_undo(&args[1..]),
-        Some("skills") => handle_skills(&args[1..]),
-        Some("review") => handle_review(&args[1..]),
-        Some("why") => handle_why(&args[1..]),
+        Some("fix") => handle_fix(&args[1..], read_memory_limit_bytes),
+        Some("drop") => handle_drop(&args[1..], read_memory_limit_bytes),
+        Some("group") => handle_group(&args[1..], read_memory_limit_bytes),
+        Some("undo") => handle_undo(&args[1..], read_memory_limit_bytes),
+        Some("skills") => handle_skills(&args[1..], read_memory_limit_bytes),
+        Some("review") => handle_review(&args[1..], read_memory_limit_bytes),
+        Some("why") => handle_why(&args[1..], read_memory_limit_bytes),
         Some("auth") => usage_error("top-level auth is not available; use `cg model auth login`"),
         Some(other) => usage_error(&format!("unknown command `{other}`")),
     }
@@ -178,7 +217,7 @@ fn run(args: Vec<String>) -> i32 {
 
 fn print_help() {
     println!(
-        "Usage: cg <command>\n\nModels and fabric:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  model status                  Show the model connection and the memory store it serves\n  sync <status|push|pull>       Sync this machine's memory store against a remote hub\n                                (--remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID)\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n  worker [--poll-interval MS] [--budget N]\n                                Run this machine as a fabric understanding worker: dial the\n                                configured hub ticket, advertise capability, execute jobs other\n                                nodes submitted (needs cg/fabric.toml + a connected model)\n\nConversation history (Claude Code sessions, stored in this machine's Context Graph store):\n  import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer]\n                                Capture a project's Claude Code history, then make it searchable\n  find <question> [--context NAME[,NAME...] | --all-contexts]\n                                Search imported history; returns passages, never an answer\n  show <passage-id>             Show the exact stored events behind one `cg find` passage\n  status [--context NAME[,NAME...] | --all-contexts]\n                                Read this machine's Context Graph memory store without changing\n                                it: graph memory, captured history and search readiness (the\n                                model connection is `cg model status`)\n  forget --session <ref> | --context NAME\n                                Delete imported history and everything derived from it\n\nEvery command writes JSON by default; --format text selects the human rendering.\n\nExamples:\n  cd ~/projects/my-app && cg import .\n  cg find \"why did we change the retry policy?\" --format text\n  cg show <passage-id> --format text\n  cg status --format text\n  cg forget --session <ref>\n  cg model auth login --connection claude --consent"
+        "Usage: cg <command>\n\nModels and fabric:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  model status                  Show the model connection and the memory store it serves\n  sync <status|push|pull>       Sync this machine's memory store against a remote hub\n                                (--remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID)\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n  worker [--poll-interval MS] [--budget N]\n                                Run this machine as a fabric understanding worker: dial the\n                                configured hub ticket, advertise capability, execute jobs other\n                                nodes submitted (needs cg/fabric.toml + a connected model)\n\nConversation history (Claude Code sessions, stored in this machine's Context Graph store):\n  import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer]\n                                Capture a project's Claude Code history, then make it searchable\n  find <question> [--context NAME[,NAME...] | --all-contexts]\n                                Search imported history; returns passages, never an answer\n  show <passage-id>             Show the exact stored events behind one `cg find` passage\n  status [--context NAME[,NAME...] | --all-contexts]\n                                Read this machine's Context Graph memory store without changing\n                                it: graph memory, captured history and search readiness (the\n                                model connection is `cg model status`)\n  forget --session <ref> | --context NAME\n                                Delete imported history and everything derived from it\n\nEvery command writes JSON by default; --format text selects the human rendering.\n\nEvery command also takes --write-memory-limit-bytes <BYTES>: the working memory one write may\nhold on this machine. Unset, cg derives it from the machine; [write] memory_limit_bytes in\ncg/fabric.toml sets it for every command, and `cg status` shows the value in force. A low\nderived writer limit blocks writable capture, not help or read-only inspection.\n\nReads use [read] memory_limit_bytes and active_time_ms in cg/fabric.toml; unset, the\nlimits are 1 GiB and 5000 ms of active time per statement.\n\nExamples:\n  cd ~/projects/my-app && cg import .\n  cg find \"why did we change the retry policy?\" --format text\n  cg show <passage-id> --format text\n  cg status --format text\n  cg forget --session <ref>\n  cg model auth login --connection claude --consent"
     );
 }
 
@@ -203,7 +242,7 @@ fn run_fabric_capture(
     context_graph::fabric::capture(store, capture)
 }
 
-fn handle_record(args: &[String]) -> i32 {
+fn handle_record(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
@@ -248,7 +287,7 @@ fn handle_record(args: &[String]) -> i32 {
     if first_load {
         eprintln!("loading bundled text embedder: text-default");
     }
-    let store = match open_memory_store(&root) {
+    let store = match open_memory_store(&root, read_memory_limit_bytes) {
         Ok(store) => store,
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
@@ -444,9 +483,9 @@ const LAST_UNDERSTANDING_RUN_KEY: &str = "last_understanding_run";
 /// - `cg understand [--budget N] [--context C]` — a foreground run the user invokes; prints a receipt.
 /// - `cg understand --worker` — the detached post-capture kick: one worker per data root (lockfile),
 ///   silent, drains every context's backlog until empty / budget / no model, then exits 0.
-fn handle_understand(args: &[String]) -> i32 {
+fn handle_understand(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     if has_flag(args, "--worker") {
-        return understand_worker(args);
+        return understand_worker(args, read_memory_limit_bytes);
     }
     let root = data_root();
     let db_path = memory_db_path(&root);
@@ -464,7 +503,7 @@ fn handle_understand(args: &[String]) -> i32 {
             "cg understand needs a connected model; run cg model connect or cg model auth login",
         );
     }
-    let store = match open_memory_store(&root) {
+    let store = match open_memory_store(&root, read_memory_limit_bytes) {
         Ok(store) => store,
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
@@ -504,7 +543,7 @@ fn handle_understand(args: &[String]) -> i32 {
 /// The detached one-per-data-root worker the capture path kicks. Acquires an exclusive lockfile
 /// (a second concurrent worker exits 0 without draining), then drains every context's backlog until
 /// the queue is empty, the budget ceiling is hit, or no model is connected — all silently.
-fn understand_worker(args: &[String]) -> i32 {
+fn understand_worker(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let root = data_root();
     let Some(_lock) = acquire_worker_lock(&root) else {
         // Another worker already holds the drain lock; exactly one drains at a time.
@@ -514,7 +553,7 @@ fn understand_worker(args: &[String]) -> i32 {
     if memory_capture_connection_name(&root).is_none() {
         return 0;
     }
-    let Ok(store) = open_memory_store(&root) else {
+    let Ok(store) = open_memory_store(&root, read_memory_limit_bytes) else {
         return 0;
     };
     let budget = parse_understand_budget(args).unwrap_or_default();
@@ -565,7 +604,7 @@ fn understand_worker(args: &[String]) -> i32 {
 /// `fabric::run_worker_poll` (and the inner `run_worker_once` it wraps). This function only loads
 /// config + identity, builds the `SyncClient`, enforces the single-worker lock and budget/poll knobs,
 /// and renders per-job receipts.
-fn handle_worker(args: &[String]) -> i32 {
+fn handle_worker(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let root = data_root();
     let fabric_path = root.join("cg").join(FABRIC_CONFIG_FILE);
 
@@ -667,7 +706,7 @@ fn handle_worker(args: &[String]) -> i32 {
     };
     let node_id = identity.node_id();
 
-    let store = match open_memory_store(&root) {
+    let store = match open_memory_store(&root, read_memory_limit_bytes) {
         Ok(store) => store,
         Err(err) => {
             return worker_failure(
@@ -1013,7 +1052,7 @@ fn drain_context_queue(
             &pending_digest.chunk_text,
             config.skills_enabled,
             config.review_mode,
-        );
+        )?;
         let Some(extractor) =
             ConnectedModelExtractor::for_context(root, context_id, config.clone())
                 .map(|extractor| extractor.with_steering(steering))
@@ -1607,7 +1646,7 @@ fn load_capture_config(root: &Path) -> Result<CaptureHarnessConfig, String> {
     }
 }
 
-fn handle_query(args: &[String]) -> i32 {
+fn handle_query(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
@@ -1615,7 +1654,7 @@ fn handle_query(args: &[String]) -> i32 {
     if query.trim().is_empty() {
         return usage_error("query requires text");
     }
-    let store = match open_memory_store(&root) {
+    let store = match open_memory_store(&root, read_memory_limit_bytes) {
         Ok(store) => store,
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
@@ -1746,12 +1785,15 @@ fn db_value_order_key(value: &DbValue) -> u128 {
 
 /// Resolve the store + context for an action verb. Read-only on the store side; never creates a
 /// missing context (an action on a non-existent context is a no-op resolution).
-fn open_action_store(args: &[String]) -> Result<(Store, String, PathBuf, Option<ContextId>), i32> {
+fn open_action_store(
+    args: &[String],
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> Result<(Store, String, PathBuf, Option<ContextId>), i32> {
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
-    let store =
-        open_memory_store(&root).map_err(|err| memory_error(err, &db_path, &context_label))?;
+    let store = open_memory_store(&root, read_memory_limit_bytes)
+        .map_err(|err| memory_error(err, &db_path, &context_label))?;
     let context_id = lookup_cli_context(&store, &context_label)
         .ok()
         .flatten()
@@ -1766,7 +1808,7 @@ fn action_positionals(args: &[String]) -> Vec<String> {
 /// `cg fix @n <value>` — correct a flagged/captured item now (an append-only overlay) and log it as
 /// a teaching event the learning loop can later promote into a skill. The original capture is
 /// untouched; the read view shows the corrected value.
-fn handle_fix(args: &[String]) -> i32 {
+fn handle_fix(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let positionals = action_positionals(args);
     let Some(handle) = positionals.first() else {
         return usage_error("fix requires an item handle, e.g. `cg fix @1 <value>`");
@@ -1775,10 +1817,11 @@ fn handle_fix(args: &[String]) -> i32 {
         return usage_error("fix requires a corrected value, e.g. `cg fix @1 <value>`");
     }
     let new_value = positionals[1..].join(" ");
-    let (store, context_label, db_path, context_id) = match open_action_store(args) {
-        Ok(parts) => parts,
-        Err(code) => return code,
-    };
+    let (store, context_label, db_path, context_id) =
+        match open_action_store(args, read_memory_limit_bytes) {
+            Ok(parts) => parts,
+            Err(code) => return code,
+        };
     let Some(item_id) = resolve_item_handle(&store, context_id, handle) else {
         return usage_error(&format!("no item matches handle `{handle}`"));
     };
@@ -1790,10 +1833,19 @@ fn handle_fix(args: &[String]) -> i32 {
         ConnectedModelExtractor::for_context(&root, ctx, CaptureHarnessConfig::default())
     });
     let correction = match (context_id, model_client.as_ref()) {
-        (Some(ctx), Some(client)) => context_graph::skill_store::apply_correction_with_llm_client(
-            &store, &item_id, &new_value, None, ctx, client,
-        ),
-        _ => context_graph::skill_store::apply_correction(&store, &item_id, &new_value, None),
+        (Some(ctx), Some(client)) => {
+            match context_graph::skill_store::apply_correction_with_llm_client(
+                &store, &item_id, &new_value, None, ctx, client,
+            ) {
+                Ok(value) => value,
+                Err(error) => return read_policy_failure(error),
+            }
+        }
+        _ => match context_graph::skill_store::apply_correction(&store, &item_id, &new_value, None)
+        {
+            Ok(value) => value,
+            Err(error) => return read_policy_failure(error),
+        },
     };
     if !correction.applied {
         return memory_failure(
@@ -1831,15 +1883,16 @@ fn handle_fix(args: &[String]) -> i32 {
 
 /// `cg drop @n` — "this shouldn't have been captured." An append-only overlay exclusion: the item
 /// leaves the read view (`cg query` no longer returns it) while its provenance row is preserved.
-fn handle_drop(args: &[String]) -> i32 {
+fn handle_drop(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let positionals = action_positionals(args);
     let Some(handle) = positionals.first() else {
         return usage_error("drop requires an item handle, e.g. `cg drop @1`");
     };
-    let (store, context_label, db_path, context_id) = match open_action_store(args) {
-        Ok(parts) => parts,
-        Err(code) => return code,
-    };
+    let (store, context_label, db_path, context_id) =
+        match open_action_store(args, read_memory_limit_bytes) {
+            Ok(parts) => parts,
+            Err(code) => return code,
+        };
     let Some(item_id) = resolve_item_handle(&store, context_id, handle) else {
         return usage_error(&format!("no item matches handle `{handle}`"));
     };
@@ -1862,7 +1915,7 @@ fn handle_drop(args: &[String]) -> i32 {
 /// `cg group ok|rename|no [name]` — confirm / rename / reject a grouping proposal. Confirm links the
 /// candidate Intentions under one canonical catalog entry (an additive, reversible link, never a row
 /// merge); rename retitles the entry; reject leaves them ungrouped. Each is a DISTINCT effect.
-fn handle_group(args: &[String]) -> i32 {
+fn handle_group(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let positionals = action_positionals(args);
     let Some(sub) = positionals.first() else {
         return usage_error("group requires a sub-action: `cg group ok|rename|no [name]`");
@@ -1876,10 +1929,11 @@ fn handle_group(args: &[String]) -> i32 {
         .get(1..)
         .map(|rest| rest.join(" "))
         .unwrap_or_default();
-    let (store, context_label, db_path, context_id) = match open_action_store(args) {
-        Ok(parts) => parts,
-        Err(code) => return code,
-    };
+    let (store, context_label, db_path, context_id) =
+        match open_action_store(args, read_memory_limit_bytes) {
+            Ok(parts) => parts,
+            Err(code) => return code,
+        };
     let Some(ctx) = context_id else {
         return usage_error("group requires a context with captured intentions");
     };
@@ -1974,15 +2028,16 @@ fn reverse_live_grouping_links(store: &Store, intentions: &[context_graph::Inten
 
 /// `cg undo @n` — reverse the most recent overlay action on an item (a tombstone, never a delete or
 /// in-place edit); the reversal removes the read-view effect and is logged as a compensation event.
-fn handle_undo(args: &[String]) -> i32 {
+fn handle_undo(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let positionals = action_positionals(args);
     let Some(handle) = positionals.first() else {
         return usage_error("undo requires an item handle, e.g. `cg undo @1`");
     };
-    let (store, context_label, db_path, context_id) = match open_action_store(args) {
-        Ok(parts) => parts,
-        Err(code) => return code,
-    };
+    let (store, context_label, db_path, context_id) =
+        match open_action_store(args, read_memory_limit_bytes) {
+            Ok(parts) => parts,
+            Err(code) => return code,
+        };
     let Some(item_id) = resolve_item_handle(&store, context_id, handle) else {
         return usage_error(&format!("no item matches handle `{handle}`"));
     };
@@ -2031,12 +2086,13 @@ fn skill_apply_strategy_from_flag(
 
 /// `cg skills [off|on|review on|review off]` — list active learned skills, or toggle the master
 /// switch / review-hold gate. Listing names each skill with provenance and fire info.
-fn handle_skills(args: &[String]) -> i32 {
+fn handle_skills(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let positionals = action_positionals(args);
-    let (store, context_label, db_path, context_id) = match open_action_store(args) {
-        Ok(parts) => parts,
-        Err(code) => return code,
-    };
+    let (store, context_label, db_path, context_id) =
+        match open_action_store(args, read_memory_limit_bytes) {
+            Ok(parts) => parts,
+            Err(code) => return code,
+        };
     match positionals.first().map(String::as_str) {
         Some("off") => {
             context_graph::skill_store::set_skills_enabled(&store, false);
@@ -2098,7 +2154,10 @@ fn handle_skills(args: &[String]) -> i32 {
                     }
                 }
             }
-            if !context_graph::skill_store::persist_skill(&store, &skill) {
+            if !match context_graph::skill_store::persist_skill(&store, &skill) {
+                Ok(value) => value,
+                Err(error) => return read_policy_failure(error),
+            } {
                 return usage_error(&format!(
                     "skill `{}` already exists or could not be added",
                     skill.id
@@ -2120,16 +2179,21 @@ fn handle_skills(args: &[String]) -> i32 {
             let Some(skill_id) = positionals.get(1) else {
                 return usage_error("skills export requires a skill id");
             };
-            let Some(skill) = context_graph::skill_store::list_skills_in_store(&store)
-                .into_iter()
-                .find(|skill| &skill.id == skill_id)
-            else {
+            let Some(skill) = match context_graph::skill_store::list_skills_in_store(&store) {
+                Ok(value) => value,
+                Err(error) => return read_policy_failure(error),
+            }
+            .into_iter()
+            .find(|skill| &skill.id == skill_id) else {
                 return usage_error(&format!("no learned skill `{skill_id}`"));
             };
             println!("{}", context_graph::skill_store::export_skill(&skill));
         }
         None => {
-            let skills = context_graph::skill_store::list_skills_in_store(&store);
+            let skills = match context_graph::skill_store::list_skills_in_store(&store) {
+                Ok(value) => value,
+                Err(error) => return read_policy_failure(error),
+            };
             let rendered = render_skill_cards(&skills);
             print_action_result(
                 json!({
@@ -2152,7 +2216,7 @@ fn handle_skills(args: &[String]) -> i32 {
 /// single-edge categories (uncertain items, grouping proposals, drift). A bare `cg review` shows the
 /// summary across categories; every lens (bare or filtered) is read-only — visibility is act-on-based
 /// (`cg drop`/`cg keep` etc. via `act_on_item`), not cursor-based.
-fn handle_review(args: &[String]) -> i32 {
+fn handle_review(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let positionals = action_positionals(args);
     let lens = positionals.first().map(String::as_str);
     let want_skills = has_flag(args, "--skills") || lens == Some("skills");
@@ -2160,12 +2224,16 @@ fn handle_review(args: &[String]) -> i32 {
     let want_uncertain = has_flag(args, "--uncertain") || lens == Some("uncertain");
     let bare = !want_skills && !want_groupings && !want_uncertain;
 
-    let (store, context_label, db_path, context_id) = match open_action_store(args) {
-        Ok(parts) => parts,
-        Err(code) => return code,
-    };
+    let (store, context_label, db_path, context_id) =
+        match open_action_store(args, read_memory_limit_bytes) {
+            Ok(parts) => parts,
+            Err(code) => return code,
+        };
     let cursor = context_graph::review_surface::ReviewCursor::default();
-    let summary = context_graph::review_surface::gather_review_summary(&store, &cursor);
+    let summary = match context_graph::review_surface::gather_review_summary(&store, &cursor) {
+        Ok(value) => value,
+        Err(error) => return read_policy_failure(error),
+    };
 
     let mut messages: Vec<Value> = Vec::new();
     let mut rendered_lines: Vec<String> = Vec::new();
@@ -2188,13 +2256,19 @@ fn handle_review(args: &[String]) -> i32 {
         }
     }
     if bare || want_skills {
-        for alert in drift_alerts_from_record(&store) {
+        for alert in match drift_alerts_from_record(&store) {
+            Ok(value) => value,
+            Err(error) => return read_policy_failure(error),
+        } {
             let msg = context_graph::review_surface::emit_drift_alert(&alert.0, &alert.1);
             rendered_lines.push(format!("drift: {}", msg.content));
             messages.push(review_message_json(&msg));
         }
         if want_skills {
-            for skill in context_graph::skill_store::list_skills_in_store(&store) {
+            for skill in match context_graph::skill_store::list_skills_in_store(&store) {
+                Ok(value) => value,
+                Err(error) => return read_policy_failure(error),
+            } {
                 let msg = context_graph::review_surface::emit_skill_card(&skill.description);
                 rendered_lines.push(format!("skill: {}", msg.content));
                 messages.push(review_message_json(&msg));
@@ -2238,15 +2312,16 @@ fn handle_review(args: &[String]) -> i32 {
 /// (`legal_types_for_flagged_item`). Only a genuinely-flagged closed-vocab item gets its legal type
 /// list enumerated (a correction chosen from a named set); a non-flagged / unknown id renders a clear
 /// "not a flagged closed-vocab item" message with NO legal-type enumeration.
-fn handle_why(args: &[String]) -> i32 {
+fn handle_why(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let positionals = action_positionals(args);
     let Some(handle) = positionals.first() else {
         return usage_error("why requires an item handle, e.g. `cg why @1`");
     };
-    let (store, context_label, db_path, context_id) = match open_action_store(args) {
-        Ok(parts) => parts,
-        Err(code) => return code,
-    };
+    let (store, context_label, db_path, context_id) =
+        match open_action_store(args, read_memory_limit_bytes) {
+            Ok(parts) => parts,
+            Err(code) => return code,
+        };
     let item_id = resolve_item_handle(&store, context_id, handle).unwrap_or_else(|| handle.clone());
     match context_graph::grounding::legal_types_for_flagged_item(&store, &item_id) {
         Some(legal) => {
@@ -2298,12 +2373,12 @@ fn review_message_json(msg: &context_graph::review_surface::ReviewMessage) -> Va
 }
 
 /// Drift alerts to surface in review, deduped by skill id. The verdict comes from persisted
-/// per-firing trace rows; the legacy aggregate counters on skill rows are not treated as evidence.
+/// per-firing trace rows; aggregate counters on skill rows are not treated as evidence.
 /// A drift alert only informs — nothing is auto-disabled.
-fn drift_alerts_from_record(store: &Store) -> Vec<(String, String)> {
+fn drift_alerts_from_record(store: &Store) -> context_graph::Result<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    for alert in context_graph::skill_store::list_drift_alerts(store) {
+    for alert in context_graph::skill_store::list_drift_alerts(store)? {
         if seen.insert(alert.skill_id.clone()) {
             out.push((
                 alert.skill_id.clone(),
@@ -2311,7 +2386,7 @@ fn drift_alerts_from_record(store: &Store) -> Vec<(String, String)> {
             ));
         }
     }
-    out
+    Ok(out)
 }
 
 fn skill_provenance_label(
@@ -2429,7 +2504,7 @@ fn stored_grouping_proposals(store: &Store) -> Vec<String> {
     context_graph::overlay::live_grouping_catalogs(store)
 }
 
-fn handle_sync(args: &[String]) -> i32 {
+fn handle_sync(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
             "Usage: cg sync <status|push|pull> --remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID\n\n--remote-server takes the pasted hub enrollment ticket / endpoint spec for your tenant fabric."
@@ -2454,7 +2529,12 @@ fn handle_sync(args: &[String]) -> i32 {
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
-    let stores = match open_scoped_memory_store_for_sync(&root, &context_label, action == "pull") {
+    let stores = match open_scoped_memory_store_for_sync(
+        &root,
+        &context_label,
+        action == "pull",
+        read_memory_limit_bytes,
+    ) {
         Ok(stores) => stores,
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
@@ -2753,12 +2833,12 @@ fn context_id_for_label(store: &Store, context_label: &str) -> Option<ContextId>
         .map(|context| context.id)
 }
 
-fn handle_impact(_args: &[String]) -> i32 {
+fn handle_impact(_args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let args = _args;
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
-    let store = match open_memory_store(&root) {
+    let store = match open_memory_store(&root, read_memory_limit_bytes) {
         Ok(store) => store,
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
@@ -2818,12 +2898,12 @@ fn handle_impact(_args: &[String]) -> i32 {
     0
 }
 
-fn handle_changed(_args: &[String]) -> i32 {
+fn handle_changed(_args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let args = _args;
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
-    let store = match open_memory_store(&root) {
+    let store = match open_memory_store(&root, read_memory_limit_bytes) {
         Ok(store) => store,
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
@@ -2875,7 +2955,7 @@ fn handle_changed(_args: &[String]) -> i32 {
     0
 }
 
-fn handle_by_intention(args: &[String]) -> i32 {
+fn handle_by_intention(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
@@ -2892,7 +2972,7 @@ fn handle_by_intention(args: &[String]) -> i32 {
         );
         return 0;
     };
-    let store = match open_memory_store(&root) {
+    let store = match open_memory_store(&root, read_memory_limit_bytes) {
         Ok(store) => store,
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
@@ -2958,7 +3038,7 @@ fn handle_by_intention(args: &[String]) -> i32 {
     0
 }
 
-fn handle_by_entity(args: &[String]) -> i32 {
+fn handle_by_entity(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     let root = data_root();
     let db_path = memory_db_path(&root);
     let context_label = memory_context_label(args);
@@ -2975,7 +3055,7 @@ fn handle_by_entity(args: &[String]) -> i32 {
         );
         return 0;
     };
-    let store = match open_memory_store(&root) {
+    let store = match open_memory_store(&root, read_memory_limit_bytes) {
         Ok(store) => store,
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
@@ -3074,6 +3154,7 @@ enum MemoryCliError {
     /// identify. So the condition itself is carried, not a message rendered from it, and the
     /// operator reads its own sentence rather than a Rust value.
     StoreHeldByReaders(context_graph::CgError),
+    ReaderCoordinationUnavailable(context_graph::CgError),
     Io(String),
     UseImportForSessionFiles,
 }
@@ -3088,6 +3169,9 @@ fn map_store_open_err(err: context_graph::CgError) -> MemoryCliError {
         }
         held @ context_graph::CgError::StoreHeldByReaders { .. } => {
             MemoryCliError::StoreHeldByReaders(held)
+        }
+        condition @ context_graph::CgError::ReaderCoordinationUnavailable { .. } => {
+            MemoryCliError::ReaderCoordinationUnavailable(condition)
         }
         other => MemoryCliError::Store(format!("{other:?}")),
     }
@@ -3161,6 +3245,7 @@ fn injected_status_read_failure(_read: &str) -> Result<(), MemoryCliError> {
 fn memory_status_snapshot(
     root: &Path,
     args: &[String],
+    read_memory_limit_bytes: std::num::NonZeroUsize,
 ) -> Result<MemoryStatusSnapshot, MemoryCliError> {
     let db_path = memory_db_path(root);
     let context_label = memory_context_label(args);
@@ -3172,7 +3257,7 @@ fn memory_status_snapshot(
     let mut fabric_jobs: Vec<FabricJobLine> = Vec::new();
     let last_injection = read_last_injection(root);
     let (raw_retention_days, last_understanding_run) = {
-        let store = open_memory_store(root)?;
+        let store = open_memory_store(root, read_memory_limit_bytes)?;
         injected_status_read_failure("retention")?;
         let raw_retention_days = tier0::raw_retention_days(&store).map_err(map_store_open_err)?;
         injected_status_read_failure("understanding_run")?;
@@ -3391,28 +3476,39 @@ struct OpenedSyncStores {
     admin: Store,
 }
 
-fn open_memory_store(root: &Path) -> Result<Store, MemoryCliError> {
-    open_memory_store_for_sync(root, false)
+fn open_memory_store(
+    root: &Path,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> Result<Store, MemoryCliError> {
+    open_memory_store_for_sync(root, false, read_memory_limit_bytes)
 }
 
 fn open_memory_store_for_sync(
     root: &Path,
     allow_schema_version_mismatch_for_sync: bool,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
 ) -> Result<Store, MemoryCliError> {
     let db_path = memory_db_path(root);
-    let expected_schema_version =
-        expected_schema_version_for_sync_open(&db_path, allow_schema_version_mismatch_for_sync);
-    open_memory_store_with_expected_schema(root, expected_schema_version)
+    let expected_schema_version = expected_schema_version_for_sync_open(
+        &db_path,
+        allow_schema_version_mismatch_for_sync,
+        read_memory_limit_bytes,
+    )?;
+    open_memory_store_with_expected_schema(root, expected_schema_version, read_memory_limit_bytes)
 }
 
 fn open_memory_store_with_expected_schema(
     root: &Path,
     expected_schema_version: u32,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
 ) -> Result<Store, MemoryCliError> {
     fs::create_dir_all(root).map_err(|err| MemoryCliError::Io(err.to_string()))?;
     let mut config = StoreConfig {
         db_path: memory_db_path(root),
         expected_schema_version,
+        read_memory_limit_bytes,
+        read_active_time_ms: read_config::active_time_in_force(),
+        write_memory_limit_bytes: crate::write_config::in_force().bytes,
         ..Default::default()
     };
     if env::var_os("CG_USE_TEST_LEXICAL_EMBEDDER").is_some() {
@@ -3435,16 +3531,27 @@ fn open_scoped_memory_store_for_sync(
     root: &Path,
     context_label: &str,
     allow_schema_version_mismatch_for_sync: bool,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
 ) -> Result<OpenedSyncStores, MemoryCliError> {
     let db_path = memory_db_path(root);
-    let expected_schema_version =
-        expected_schema_version_for_sync_open(&db_path, allow_schema_version_mismatch_for_sync);
-    let admin_store = open_memory_store_with_expected_schema(root, expected_schema_version)?;
+    let expected_schema_version = expected_schema_version_for_sync_open(
+        &db_path,
+        allow_schema_version_mismatch_for_sync,
+        read_memory_limit_bytes,
+    )?;
+    let admin_store = open_memory_store_with_expected_schema(
+        root,
+        expected_schema_version,
+        read_memory_limit_bytes,
+    )?;
     let context = ensure_cli_context(&admin_store, context_label)
         .map_err(|err| MemoryCliError::Store(format!("{err:?}")))?;
     let mut config = StoreConfig {
         expected_schema_version,
         db_path,
+        read_memory_limit_bytes,
+        read_active_time_ms: read_config::active_time_in_force(),
+        write_memory_limit_bytes: crate::write_config::in_force().bytes,
         ..Default::default()
     };
     if env::var_os("CG_USE_TEST_LEXICAL_EMBEDDER").is_some() {
@@ -3461,26 +3568,40 @@ fn open_scoped_memory_store_for_sync(
 fn expected_schema_version_for_sync_open(
     db_path: &Path,
     allow_schema_version_mismatch_for_sync: bool,
-) -> u32 {
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> Result<u32, MemoryCliError> {
     if !allow_schema_version_mismatch_for_sync {
-        return CG_SCHEMA_VERSION;
+        return Ok(CG_SCHEMA_VERSION);
     }
-    existing_schema_version(db_path).unwrap_or(CG_SCHEMA_VERSION)
+    Ok(existing_schema_version(db_path, read_memory_limit_bytes)?.unwrap_or(CG_SCHEMA_VERSION))
 }
 
-fn existing_schema_version(db_path: &Path) -> Option<u32> {
+fn existing_schema_version(
+    db_path: &Path,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> Result<Option<u32>, MemoryCliError> {
     if !db_path.exists() {
-        return None;
+        return Ok(None);
     }
-    let db = Database::open(db_path).ok()?;
-    let rows = db.scan("cg_schema_version", db.snapshot()).ok()?;
-    if rows.len() != 1 {
-        return None;
+    let session = ReadSession::open_in_runtime_dir(
+        db_path,
+        context_graph::owner_control::context_graph_read_session_options_with_budgets(
+            read_memory_limit_bytes,
+            read_config::active_time_in_force(),
+        ),
+        context_graph::owner_control::owner_read_runtime_dir(),
+    )
+    .map_err(|err| MemoryCliError::Store(err.to_string()))?;
+    let result = session
+        .execute("SELECT version FROM cg_schema_version", &Default::default())
+        .map_err(|err| MemoryCliError::Store(err.to_string()))?;
+    if result.rows.len() != 1 {
+        return Ok(None);
     }
-    match rows[0].values.get("version") {
+    Ok(match result.rows[0].first() {
         Some(DbValue::Int64(version)) => u32::try_from(*version).ok(),
         _ => None,
-    }
+    })
 }
 
 fn ensure_cli_context(store: &Store, label: &str) -> context_graph::Result<context_graph::Context> {
@@ -4148,11 +4269,11 @@ impl ConversationExtractor for ConnectedModelExtractor {
     }
 }
 
-/// A persisted local selection whose artifact set names a `.gguf` is a pre-removal in-process
-/// understanding model. That runtime was removed, so such a selection is inert everywhere: the
-/// `cg understand`/`cg worker` model gates treat it as not-connected (refusing with `cg model
-/// connect` before any drain), and `cg model status`/`list` render it not-connected rather than
-/// operational. The kept safetensors seam carries no `.gguf`, so it is unaffected.
+/// A local selection whose artifact set names a `.gguf` has no available understanding runtime,
+/// so such a selection is inert everywhere: the `cg understand`/`cg worker` model gates treat it
+/// as not-connected (refusing with `cg model connect` before any drain), and `cg model status`/`list`
+/// render it not-connected rather than operational. A safetensors artifact set carries no `.gguf`,
+/// so it is unaffected.
 fn local_artifacts_name_gguf(artifact_filenames: &[String]) -> bool {
     artifact_filenames
         .iter()
@@ -4175,9 +4296,9 @@ fn memory_capture_connection_name(root: &Path) -> Option<String> {
     {
         return None;
     }
-    // An upgraded data root can carry a pre-removal GGUF understanding selection whose in-process
-    // runtime is gone. Treat it as not-connected so understanding refuses at the gates (naming
-    // `cg model connect`) instead of degrading to a silent no-op inside dispatch.
+    // A GGUF understanding selection has no available runtime. Treat it as not-connected so
+    // understanding refuses at the gates (naming `cg model connect`) instead of degrading to a
+    // silent no-op inside dispatch.
     if let Some(model) = catalog.model_for_connection(&connection_name)
         && local_artifacts_name_gguf(&model.artifact_filenames)
     {
@@ -4523,6 +4644,13 @@ fn memory_error(err: MemoryCliError, db_path: &Path, context_label: &str) -> i32
                 &condition.to_string(),
             )
         }
+        MemoryCliError::ReaderCoordinationUnavailable(condition) => memory_failure(
+            1,
+            "ReaderCoordinationUnavailable",
+            db_path,
+            context_label,
+            &condition.to_string(),
+        ),
         MemoryCliError::Store(message) | MemoryCliError::Io(message) => {
             memory_failure(1, "MemoryError", db_path, context_label, &message)
         }
@@ -4886,7 +5014,7 @@ fn write_last_record_tx(root: &Path, context_id: ContextId, tx: u64) {
     let _ = fs::write(path, tx.to_string());
 }
 
-fn handle_model(args: &[String]) -> i32 {
+fn handle_model(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     match args.first().map(String::as_str) {
         Some("--help") | Some("-h") => {
             println!(
@@ -4895,7 +5023,11 @@ fn handle_model(args: &[String]) -> i32 {
             0
         }
         Some("connect") => handle_model_connect(&args[1..]),
-        Some("status") => handle_status(&args[1..], StatusSurface::ModelByok),
+        Some("status") => handle_status(
+            &args[1..],
+            StatusSurface::ModelByok,
+            read_memory_limit_bytes,
+        ),
         Some("selftest") => handle_selftest(&args[1..], SelftestSurface::ModelByok),
         Some("list") => handle_model_list(&args[1..]),
         Some("show") => handle_model_show(&args[1..]),
@@ -5218,8 +5350,8 @@ fn handle_model_list(args: &[String]) -> i32 {
 
     if format == OutputFormat::Text {
         for model in &models {
-            // A persisted pre-removal GGUF selection (artifact set names a `.gguf`) is inert: the
-            // in-process runtime is gone, so it is never reported as connected.
+            // A GGUF selection (artifact set names a `.gguf`) has no available runtime, so it is
+            // never reported as connected.
             let connected = model
                 .connection_name
                 .as_deref()
@@ -5392,7 +5524,11 @@ fn raw_registration_entry(root: &Path, id: &str) -> Option<cg_catalog::CatalogEn
         .find(|entry| entry.id == id)
 }
 
-fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
+fn handle_status(
+    args: &[String],
+    surface: StatusSurface,
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
             "Usage: cg status [CONNECTION] [--connection NAME] [--format json|text]\n\nReports two things in one command:\n  - whether cg is connected to a model, and\n  - the state of this machine's Context Graph memory store: context totals, the\n    understanding queue, the raw footprint and the fabric posture.\n\n`no model connection is active` is an answer about the model; the store beside it may\nbe perfectly healthy. An answer about the store carries \"bucket\": \"memory\" and the\nstore path it is about.\n\nWhen the store cannot be read, status says so and never prints `goals: 0 decisions: 0\nobservations: 0` — those totals mean the store WAS read and is empty. A store another\nprocess is writing is refused as `store busy / already in use` under condition\nStoreBusy with exit 4, naming the holder and the store. A store direct readers are\nstill holding is refused under condition StoreHeldByReaders. It names each\nverified reader by process id and name, and discloses any holder the store\nobserved and could not identify. Its numeric exit code is deliberately unsettled,\nso branch on the failure and the condition name rather than on a number.\n\nExamples:\n  cg status\n  cg model status byok-openai --format text"
@@ -5401,7 +5537,7 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     }
     let format = output_format(args);
     let root = data_root();
-    let memory_status = match memory_status_snapshot(&root, args) {
+    let memory_status = match memory_status_snapshot(&root, args, read_memory_limit_bytes) {
         Ok(snapshot) => snapshot,
         // The store was not read, so there are no totals to print beside anything else: `cg status`
         // gives the same typed answer here that every other command that opens the store gives.
@@ -5503,9 +5639,9 @@ fn handle_status(args: &[String], surface: StatusSurface) -> i32 {
     let endpoint = model
         .as_ref()
         .and_then(|model| model.hosted_endpoint.as_ref());
-    // A registered local model carries a cache_path and no hosted endpoint. A persisted pre-removal
-    // GGUF selection (its artifact set names a `.gguf`) is inert — the in-process runtime is gone —
-    // so it is never rendered as ready/active; a kept non-GGUF local registration renders neutrally.
+    // A registered local model carries a cache_path and no hosted endpoint. A GGUF selection
+    // (its artifact set names a `.gguf`) has no available runtime, so it is never rendered as
+    // ready/active; a non-GGUF local registration renders neutrally.
     let is_stale_local_gguf = model.as_ref().is_some_and(|model| {
         model.cache_path.is_some() && local_artifacts_name_gguf(&model.artifact_filenames)
     });
@@ -6561,8 +6697,8 @@ fn list_cg_connections() -> i32 {
     0
 }
 
-/// Legacy per-agent hook paths for non-claude-code agents (cursor / gemini-cli), kept so their
-/// disconnect still works. claude-code is handled by the structured settings.json path above.
+/// Per-agent hook paths for cursor and gemini-cli, used by disconnect. claude-code uses the
+/// structured settings.json path above.
 fn legacy_agent_paths(agent: &str) -> Vec<PathBuf> {
     let home = home_dir();
     match agent {
@@ -6597,15 +6733,18 @@ fn legacy_clean_hooks(agent: &str, path: &Path) {
 // The hook never writes memory to the store — it only bumps retrieval-touch counters.
 // ---------------------------------------------------------------------------
 
-fn handle_hook(args: &[String]) -> i32 {
+fn handle_hook(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     match args.first().map(String::as_str) {
-        Some("claude-code") => handle_hook_claude_code(&args[1..]),
+        Some("claude-code") => handle_hook_claude_code(&args[1..], read_memory_limit_bytes),
         // Unknown agent: degrade silently, never block the session.
         _ => 0,
     }
 }
 
-fn handle_hook_claude_code(args: &[String]) -> i32 {
+fn handle_hook_claude_code(
+    args: &[String],
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> i32 {
     let Some(event) = args.first().cloned() else {
         return 0;
     };
@@ -6619,7 +6758,7 @@ fn handle_hook_claude_code(args: &[String]) -> i32 {
         return 0;
     }
     let root = data_root();
-    let Ok(store) = open_memory_store(&root) else {
+    let Ok(store) = open_memory_store(&root, read_memory_limit_bytes) else {
         return 0;
     };
     let context_label = memory_context_label(args);
@@ -7070,14 +7209,17 @@ fn print_json(value: &Value) {
 /// `CLAUDE_CONFIG_DIR` (Claude Code's own configuration directory), where Claude Code keeps the local
 /// conversation history `cg import` reads.
 ///
-/// This binary reads three further variables, and they are development affordances rather than
+/// This binary reads six further variables, and they are development affordances rather than
 /// configuration, named here rather than left for a reader to find: `CG_NO_UNDERSTAND_KICK`
 /// suppresses the background understanding worker (:870), `CG_USE_TEST_LEXICAL_EMBEDDER` swaps in
 /// the lexical mock embedder (:4249, :4281), and `CG_FAIL_STATUS_METRIC_READ` refuses one named
-/// `cg status` read. All three are inert unless set, and the last is compiled out of every build
-/// that is not a test build. The libraries below this binary take environment inputs of their own
-/// — the model cache root and the read-probe pair among them — so this list speaks for `main.rs`
-/// and claims nothing beyond it.
+/// `cg status` read. `CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER` pauses the event-search worker after
+/// catch-up and before it releases the handoff, while
+/// `CG_EVENT_SEARCH_TEST_PRE_CATCH_UP_BARRIER` pauses it before catch-up.
+/// `CG_FORGET_TEST_BEFORE_PURGE_SOCKET` pauses forget after its writable open and before erasure.
+/// These barriers and the status fault injection are compiled out of ordinary builds. The libraries
+/// below this binary take environment inputs of their own — the model cache root and the read-probe
+/// pair among them — so this list speaks for `main.rs` and claims nothing beyond it.
 fn data_root() -> PathBuf {
     env::var_os("CG_DATA_ROOT")
         .map(PathBuf::from)
@@ -7091,9 +7233,41 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn read_policy_failure(error: CgError) -> i32 {
+    failure(1, "ReadRefused", "memory", &error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_coordination_failure_keeps_its_condition_and_display_message() {
+        let condition = context_graph::CgError::ReaderCoordinationUnavailable {
+            operation: "open".to_string(),
+            path: "/data/cg/memory.db".to_string(),
+            reason: "reader inventory unavailable".to_string(),
+        };
+        let display = condition.to_string();
+        let mapped = map_store_open_err(condition);
+        let MemoryCliError::ReaderCoordinationUnavailable(mapped_condition) = mapped else {
+            panic!("reader coordination condition was lost");
+        };
+        assert_eq!(mapped_condition.to_string(), display);
+        assert!(
+            !mapped_condition
+                .to_string()
+                .contains("ReaderCoordinationUnavailable {")
+        );
+        assert_eq!(
+            memory_error(
+                MemoryCliError::ReaderCoordinationUnavailable(mapped_condition),
+                Path::new("/data/cg/memory.db"),
+                "default",
+            ),
+            1,
+        );
+    }
 
     // A locked store must exit `4`/`StoreBusy` so a caller can distinguish "another
     // process owns this store" (retryable) from a generic error. The classification

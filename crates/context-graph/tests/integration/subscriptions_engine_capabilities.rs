@@ -160,7 +160,9 @@ fn engine_per_sink_queue_isolation_one_sink_panic_does_not_block_other_sink_deli
     wait_for_metric(&db, "audit", |delivered, _, _, permanent| {
         delivered == 50 && permanent == 0
     });
-    wait_for_metric(&db, "slack", |_, _, _, permanent| permanent >= 50);
+    wait_for_metric(&db, "slack", |_, queued, retried, permanent| {
+        queued == 50 && retried > 0 && permanent == 0
+    });
 
     assert_eq!(audit_count.load(Ordering::SeqCst), 50);
     let audit_metrics = db.sink_metrics_for_test("audit");
@@ -168,8 +170,8 @@ fn engine_per_sink_queue_isolation_one_sink_panic_does_not_block_other_sink_deli
     assert_eq!(audit_metrics.permanent_failures, 0);
     let panic_metrics = db.sink_metrics_for_test("slack");
     assert!(
-        panic_metrics.permanent_failures >= 50,
-        "panic sink should record one permanent failure per event, got {panic_metrics:?}"
+        panic_metrics.uncertain > 0 && panic_metrics.queued == 50,
+        "panic sink should retain uncertain actions for retry, got {panic_metrics:?}"
     );
 }
 

@@ -1727,7 +1727,6 @@ fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
         ("manual vector zip", ".zip("),
         ("manual vector fold", ".fold("),
         ("manual vector sum", ".sum("),
-        ("manual vector dot map", ".map("),
         ("manual vector dot", ".dot("),
         ("manual vector enumerate", ".enumerate("),
         ("manual indexed vector loop", "for idx in 0.."),

@@ -81,6 +81,12 @@ fn a_command_refused_by_a_reader_held_store_names_the_readers_it_waits_on() {
     let first_reader = first.wait_until_parked();
     let second_reader = second.wait_until_parked();
 
+    // The production command waits up to a minute for readers to finish. This private-feature
+    // binary instead uses the core's existing zero-allowance seam, so this test proves the
+    // exhausted refusal without spending the production allowance.
+    std::fs::write(runtime.path().join("exhaust-store-open-retry"), b"test")
+        .expect("arm the private retry allowance override");
+
     let refused = run_cg_below_runtime_root(&["impact"], data_root.path(), runtime.path());
     let said = refused.everything_said();
 
@@ -180,4 +186,50 @@ fn a_command_refused_by_a_writer_held_store_keeps_its_typed_answer() {
     );
 
     holder.release();
+}
+
+#[test]
+#[cfg(any(
+    context_graph_internal_test_support,
+    feature = "event-search-test-support"
+))]
+fn history_import_names_reader_contention_without_claiming_writer_contention() {
+    let runtime = runtime_root();
+    let data_root = seeded_data_root(runtime.path());
+    let store_path = store_path_in(data_root.path());
+    let source = data_root.path().join("held-store.jsonl");
+    std::fs::write(&source, b"{}\n").expect("one source record");
+    let mut reader =
+        HoldingChild::park_a_reader(&store_path, runtime.path(), "a_parked_direct_reader_child");
+    let observed = reader.wait_until_parked();
+    std::fs::write(runtime.path().join("exhaust-store-open-retry"), b"test")
+        .expect("use the private zero retry allowance");
+    let source_name = source.to_str().expect("scratch path is UTF-8");
+    let refused = run_cg_below_runtime_root(
+        &[
+            "import",
+            source_name,
+            "--context",
+            "reader-contention",
+            "--search",
+            "defer",
+        ],
+        data_root.path(),
+        runtime.path(),
+    );
+    let answer = refused.everything_said();
+    assert_ne!(refused.code, 0, "the refused import must fail: {answer}");
+    assert_ne!(refused.code, 4, "writer contention owns exit 4: {answer}");
+    assert!(answer.contains("StoreHeldByReaders"), "{answer}");
+    assert!(answer.contains("store_held_by_readers"), "{answer}");
+    assert!(
+        answer.contains(&store_path.display().to_string()),
+        "{answer}"
+    );
+    assert!(
+        answer.contains(&format!("process {}", observed.process_id)),
+        "{answer}"
+    );
+    assert!(!answer.contains("store_busy"), "{answer}");
+    reader.release();
 }

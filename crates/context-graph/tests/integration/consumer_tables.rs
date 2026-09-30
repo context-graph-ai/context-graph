@@ -17,7 +17,9 @@ use std::collections::{BTreeSet, HashMap};
 use context_graph::{
     CG_SCHEMA_VERSION, CgError, ConsumerSchema, ConsumerTable, ScopeLabel, Store, StoreConfig,
 };
-use contextdb_core::{EdgeDiscardMode, Error as EngineError, Value};
+use contextdb_core::{
+    EdgeDiscardMode, Error as EngineError, MaintainedCounts, SortDirection, Value,
+};
 use contextdb_engine::{Database, natural_key_columns_for_meta};
 
 const SETTINGS_DDL: &str = "CREATE TABLE vigil_settings (name TEXT PRIMARY KEY, requested TEXT, source TEXT) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP LATEST";
@@ -761,9 +763,10 @@ const CONSUMER_TABLES_AS_SHIPPED: &[(&str, &str)] = &[
 /// A declaration carrying a clause on every surface the verification compares —
 /// retention with a declared unit, sync direction, conflict policy, history,
 /// vector quantization, a scope label, a context-id column, a default, a
-/// table-level unique constraint — so a false refusal on any one of them shows up
-/// here rather than on a consumer's second start.
-const EVERY_CLAUSE_DDL: &str = "CREATE TABLE vigil_every_clause (id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE, weight REAL DEFAULT 1.0, tags JSON, seen TIMESTAMP, embedding VECTOR(4) WITH (quantization = 'SQ8'), holder TEXT CONTEXT_ID, scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('server'), UNIQUE (name, holder)) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP LATEST HISTORY CURRENT ONLY";
+/// table-level unique constraint, a maintained-count declaration — so a false
+/// refusal on any one of them shows up here rather than on a consumer's second
+/// start.
+const EVERY_CLAUSE_DDL: &str = "CREATE TABLE vigil_every_clause (id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE, weight REAL DEFAULT 1.0, tags JSON, seen TIMESTAMP, embedding VECTOR(4) WITH (quantization = 'SQ8'), holder TEXT CONTEXT_ID, scope_label TEXT SCOPE_LABEL_READ ('edge', 'server') WRITE ('server'), UNIQUE (name, holder)) RETAIN 48 HOURS SYNC SAFE SYNC TWO WAY SYNC CONFLICT KEEP LATEST HISTORY CURRENT ONLY MAINTAIN COUNT ALL PREFIXES";
 
 const CUSTODY_POLICY_DDL: &str = "CREATE TABLE vigil_custody (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER vigil_custody_parts EDGE DISCARD AFTER OUTCOME";
 
@@ -864,6 +867,58 @@ fn a_declaration_that_changes_edge_discard_policy_is_refused_on_the_existing_con
     assert!(
         mismatch.contains("edge discard"),
         "the refusal must name the discard policy that differs: {mismatch}"
+    );
+}
+
+#[test]
+fn a_declaration_carrying_a_maintain_count_clause_reopens_with_the_engine_metadata_it_declared() {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let ddl = "CREATE TABLE vigil_index_counts (owner TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (owner, seq)) MAINTAIN COUNT (owner)";
+    let schema = schema_with("vigil_index_counts", ddl);
+    let store = open_with(config(&dir), schema.clone()).expect("create the maintain-count table");
+    let meta = store
+        .sync_database()
+        .table_meta("vigil_index_counts")
+        .expect("the consumer's maintain-count table exists");
+
+    assert_eq!(
+        Some(MaintainedCounts::Lists(vec![vec![(
+            "owner".to_string(),
+            SortDirection::Asc
+        )]])),
+        meta.maintained_counts,
+        "the engine metadata must retain the consumer's declared maintained-count list"
+    );
+    drop(store);
+
+    open_with(config(&dir), schema)
+        .expect("the declaration that created the maintain-count metadata reopens the same table");
+}
+
+#[test]
+fn a_declaration_that_changes_maintain_count_policy_is_refused_on_the_table_that_still_carries_the_old_one()
+ {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let created = "CREATE TABLE vigil_hub_settings (owner TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (owner, seq)) MAINTAIN COUNT (owner)";
+    let changed = "CREATE TABLE vigil_hub_settings (owner TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (owner, seq)) MAINTAIN COUNT NONE";
+    let (_, mismatch) = drift_refusal(&dir, created, changed);
+
+    assert!(
+        mismatch.contains("MAINTAIN COUNT"),
+        "the refusal must name the maintained-count policy that no longer matches: {mismatch}"
+    );
+}
+
+#[test]
+fn a_declaration_that_adds_a_maintain_count_clause_is_refused_on_the_table_that_declared_none() {
+    let dir = tempfile::tempdir().expect("consumer tempdir");
+    let created = "CREATE TABLE vigil_hub_settings (id UUID PRIMARY KEY, owner TEXT NOT NULL)";
+    let changed = "CREATE TABLE vigil_hub_settings (id UUID PRIMARY KEY, owner TEXT NOT NULL) MAINTAIN COUNT ALL PREFIXES";
+    let (_, mismatch) = drift_refusal(&dir, created, changed);
+
+    assert!(
+        mismatch.contains("MAINTAIN COUNT"),
+        "an undeclared table must not silently accept a maintained-count declaration on reopen: {mismatch}"
     );
 }
 

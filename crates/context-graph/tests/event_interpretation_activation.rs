@@ -269,6 +269,7 @@ fn rebuild(
             interpretation_generation_id: Some(interpretation_generation_id),
             embedder: registration,
             profile: EventSearchProfile::default(),
+            embedding_workers: NonZeroUsize::MIN,
             max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_passages_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_bytes_per_batch: NonZeroUsize::new(4_096).expect("nonzero bytes"),

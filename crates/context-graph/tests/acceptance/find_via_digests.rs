@@ -375,9 +375,8 @@ fn raw_digest_vector_query(
             _ => None,
         })
         .collect::<Vec<_>>();
-    // The vectors the maintained (HNSW) route searched for this statement, as the engine's own
-    // query disclosure reports them; zero unless the statement resolved to the indexed route. The
-    // engine no longer exposes whole-index graph statistics once the index is partitioned.
+    // The vectors admitted to the indexed AUTO plan, as the engine's query disclosure reports
+    // them. An AUTO leaf may still use bounded exact work when the maintained graph is unavailable.
     let indexed_vectors = result
         .trace
         .vector_search
@@ -683,10 +682,13 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
     );
     let public_trace = store.last_query_trace().unwrap_or_default();
 
+    // The public read is paged; cursor pages do not carry an engine plan. Compare its answers
+    // and graph links with the direct query, while checking the direct query's disclosed route.
     assert!(
         raw_ids == vec![target_digest.id, near_decoy.id]
             && indexed_vectors >= 1010
-            && raw_trace.contains("HNSWSearch")
+            && raw_trace.contains("resolved_mode: Indexed")
+            && (raw_trace.contains("HNSWSearch") || raw_trace.contains("route: Some(Exact)"))
             && raw_graph_trace.contains("AdjacencyProbe")
             && raw_graph_source_ids == expected_graph_source_ids
             && hits.iter().map(|hit| hit.digest_id).collect::<Vec<_>>() == raw_ids
@@ -708,11 +710,9 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
                 .first()
                 .is_some_and(|hit| hit.graph_walk.target_digest_id == target_digest.id
                     && hit.graph_walk.relationship == "EXTRACTED_FROM"
-                    && hit.graph_walk.source_ids == raw_graph_source_ids
-                    && hit.graph_walk.engine_plan == raw_graph_trace)
-            && public_trace.contains("digests.vector_text")
-            && public_trace.contains(raw_trace.as_str()),
-        "digest retrieval must root at contextdb's digest vector index and then expose the contextdb GRAPH_TABLE EXTRACTED_FROM walk that completed the hit; hits={hits:?}, raw_ids={raw_ids:?}, raw_trace={raw_trace:?}, raw_graph_source_ids={raw_graph_source_ids:?}, raw_graph_trace={raw_graph_trace:?}, indexed_vectors={indexed_vectors}, public_trace={public_trace:?}"
+                    && hit.graph_walk.source_ids == raw_graph_source_ids)
+            && public_trace.contains("digests.vector_text"),
+        "digest retrieval must use ContextDB's disclosed indexed AUTO plan and GRAPH_TABLE EXTRACTED_FROM walk; hits={hits:?}, raw_ids={raw_ids:?}, raw_trace={raw_trace:?}, raw_graph_source_ids={raw_graph_source_ids:?}, raw_graph_trace={raw_graph_trace:?}, indexed_vectors={indexed_vectors}, public_trace={public_trace:?}"
     );
 }
 

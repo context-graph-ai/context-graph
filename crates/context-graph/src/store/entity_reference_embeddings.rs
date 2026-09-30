@@ -93,7 +93,7 @@ impl Store {
                 "SELECT entity_id, label, score FROM {table} WHERE embedding_space_id = $embedding_space_id ORDER BY vector <=> $query LIMIT {fetch_limit}"
             ),
         };
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let result = self.read_query(&sql, &params)?;
         let column = |name: &str| result.columns.iter().position(|c| c == name);
         let (Some(entity_column), Some(label_column), Some(score_column)) =
             (column("entity_id"), column("label"), column("score"))

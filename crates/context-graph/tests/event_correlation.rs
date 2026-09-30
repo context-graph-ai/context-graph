@@ -1084,6 +1084,12 @@ fn reject_content_reads_in_expr(expr: &Expr) -> Result<(), String> {
             }
             Ok(())
         }
+        Expr::Row(elements) => {
+            for element in elements {
+                reject_content_reads_in_expr(element)?;
+            }
+            Ok(())
+        }
         Expr::RowVectorSource { column, key, .. } => {
             reject_content_column(column)?;
             reject_content_reads_in_expr(key)

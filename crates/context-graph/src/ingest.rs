@@ -1462,8 +1462,13 @@ fn record_conversation_internal_with_stored_text(
         &prior_decisions,
         &tagger,
     )?;
-    let skill_application =
-        crate::skill_store::select_and_apply_learned_skills(store, &mut harvest, text, true, false);
+    let skill_application = crate::skill_store::select_and_apply_learned_skills(
+        store,
+        &mut harvest,
+        text,
+        true,
+        false,
+    )?;
     // Run the deterministic grounding check over every value class before consuming the harvest,
     // plus the Stage-3 empty-candidate-set flag for a decision that needed a candidate and found none.
     flagged_items.extend(grounding_check_harvest(&harvest, text, &default_vocab));
@@ -6374,16 +6379,13 @@ fn read_changed_cursor_tx(store: &Store, context_id: ContextId) -> Result<crate:
 
 fn read_changed_cursor_row(store: &Store, context_id: ContextId) -> Result<Option<crate::TxId>> {
     ensure_changed_cursor_table(store)?;
-    let result = store
-        .internal_db()
-        .execute(
-            "SELECT last_seen_tx FROM cg_changed_cursors WHERE context_id = $context_id",
-            &HashMap::from([(
-                "context_id".to_string(),
-                DbValue::Uuid(context_id.as_uuid()),
-            )]),
-        )
-        .map_err(map_engine)?;
+    let result = store.read_query(
+        "SELECT last_seen_tx FROM cg_changed_cursors WHERE context_id = $context_id",
+        &HashMap::from([(
+            "context_id".to_string(),
+            DbValue::Uuid(context_id.as_uuid()),
+        )]),
+    )?;
     Ok(result.rows.first().and_then(|row| match row.first() {
         Some(DbValue::TxId(tx)) => Some(*tx),
         _ => None,
@@ -6441,10 +6443,7 @@ fn runtime_model_context(
         params.insert("default".to_string(), DbValue::Bool(true));
     }
     sql.push_str(" ORDER BY created_at DESC LIMIT 1");
-    let result = store
-        .internal_db()
-        .execute(&sql, &params)
-        .map_err(map_engine)?;
+    let result = store.read_query(&sql, &params)?;
     Ok(result
         .rows
         .first()

@@ -9,7 +9,7 @@ use crate::types::*;
 
 use super::Store;
 use super::convert::map_engine_err;
-use super::encode::decode_outcome;
+use super::encode::{decode_outcome, get_txid};
 
 impl Store {
     pub fn record_outcome(
@@ -27,9 +27,16 @@ impl Store {
         let outcome = {
             let _outcome_guard = self.outcome_mutex.lock().expect("outcome mutex poisoned");
             let tx = self.begin_tx()?;
-            match self.record_outcome_in_tx(tx, context_id, decision_id, success, notes) {
-                Ok(outcome) => {
+            match self.record_outcome_in_tx_with_audit_id(
+                tx,
+                context_id,
+                decision_id,
+                success,
+                notes,
+            ) {
+                Ok((mut outcome, audit_id)) => {
                     self.db.commit(tx).map_err(map_engine_err)?;
+                    outcome.recorded_at = self.outcome_txid_from_audit(audit_id, context_id)?;
                     outcome
                 }
                 Err(e) => {
@@ -70,6 +77,18 @@ impl Store {
         success: bool,
         notes: Option<String>,
     ) -> Result<Outcome> {
+        self.record_outcome_in_tx_with_audit_id(tx, context_id, decision_id, success, notes)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn record_outcome_in_tx_with_audit_id(
+        &self,
+        tx: TxId,
+        context_id: ContextId,
+        decision_id: DecisionId,
+        success: bool,
+        notes: Option<String>,
+    ) -> Result<(Outcome, AuditId)> {
         let previous = self.outcome_for_decision(decision_id)?;
         let id = OutcomeId::new_v7();
         let notes_value = match &notes {
@@ -119,33 +138,46 @@ impl Store {
             notes,
             recorded_at: tx,
         };
-        let new_payload = serde_json::to_value(&outcome)
-            .map_err(|e| CgError::Engine(format!("outcome serialize: {e}")))?;
-
         if let Some(prev) = previous.as_ref() {
-            let prev_payload = serde_json::to_value(prev)
-                .map_err(|e| CgError::Engine(format!("prev outcome serialize: {e}")))?;
-            self.record_audit_in_tx(
+            self.record_outcome_audit_in_tx(
                 tx,
                 AuditOperation::RecordOutcome,
                 Principal::System,
                 None,
                 AuditTarget::Outcome(decision_id),
                 context_id,
-                Some(prev_payload),
+                prev,
             )?;
         }
-        self.record_audit_in_tx(
+        let audit_id = self.record_outcome_audit_in_tx_with_id(
             tx,
             AuditOperation::RecordOutcome,
             Principal::System,
             None,
             AuditTarget::Outcome(decision_id),
             context_id,
-            Some(new_payload),
+            &outcome,
         )?;
 
-        Ok(outcome)
+        Ok((outcome, audit_id))
+    }
+
+    fn outcome_txid_from_audit(&self, audit_id: AuditId, context_id: ContextId) -> Result<TxId> {
+        let params = HashMap::from([
+            ("id".to_string(), Value::Uuid(audit_id.as_uuid())),
+            ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+        ]);
+        let result = self.read_query(
+            "SELECT txid FROM audit_log WHERE id = $id AND context_id = $context_id",
+            &params,
+        )?;
+        if result.rows.len() != 1 {
+            return Err(CgError::Engine(format!(
+                "committed Outcome audit anchor {audit_id} returned {} rows",
+                result.rows.len()
+            )));
+        }
+        get_txid(&result.rows[0], &result.columns, "txid")
     }
 
     /// `HAS_OUTCOME` is a virtual one-to-one relationship backed by the current
@@ -183,13 +215,10 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT id FROM outcomes WHERE decision_id = $decision_id AND id = $outcome_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT id FROM outcomes WHERE decision_id = $decision_id AND id = $outcome_id",
+            &params,
+        )?;
         Ok(!result.rows.is_empty())
     }
 

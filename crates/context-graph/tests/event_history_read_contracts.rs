@@ -35,6 +35,11 @@ const SPACE: &str = "event-history-read-contracts-768";
 const CONNECTOR: &str = "event-history-read-contracts";
 const SESSION: &str = "event-history-read-session";
 const SOURCE: &str = "event-history-read-source";
+const EVENT_CONTEXT_SESSIONS_DDL: &str = "CREATE TABLE event_context_sessions (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, event_count INTEGER NOT NULL, latest_occurred_at TIMESTAMP, PRIMARY KEY (context_id, connector_id, session_ref)) SYNC OFF";
+const EVENT_CONTEXT_COUNTS_DDL: &str = "CREATE TABLE event_context_counts (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), captured_events INTEGER NOT NULL, complete_events INTEGER NOT NULL, opaque_events INTEGER NOT NULL, payload_refused_events INTEGER NOT NULL, source_declared_missing_events INTEGER NOT NULL) SYNC OFF";
+const EVENT_SEARCH_SESSION_PROGRESS_DDL: &str = "CREATE TABLE event_search_session_progress (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, event_count INTEGER NOT NULL, committed_event_count INTEGER NOT NULL DEFAULT 0, eligible_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, searchable_event_count INTEGER NOT NULL DEFAULT 0, no_searchable_text_event_count INTEGER NOT NULL DEFAULT 0, is_required BOOLEAN NOT NULL DEFAULT false, is_published BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (context_id, generation_id, connector_id, session_ref), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF";
+const EVENT_SEARCH_WORK_POLICIES_DDL: &str = "CREATE TABLE event_search_work_policies (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), search_order TEXT NOT NULL, search_sessions INTEGER) SYNC OFF";
+const EVENT_SEARCH_CURSORS_DDL: &str = "CREATE TABLE event_search_cursors (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, committed_sequence INTEGER NOT NULL, open_tail_start_sequence INTEGER, open_tail_members JSON NOT NULL, open_tail_passage_id UUID, watermark_sha256 TEXT NOT NULL, updated_at TXID NOT NULL, PRIMARY KEY (context_id, generation_id, connector_id, source_instance_ref, session_ref), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF";
 
 #[derive(Default)]
 struct QueryRecorder {
@@ -245,6 +250,31 @@ fn append(
     ordinal: u64,
     text: &str,
 ) -> context_graph::ConversationEvent {
+    append_at(
+        store,
+        context_id,
+        connector_id,
+        session_ref,
+        source_instance_ref,
+        source_event_key,
+        ordinal,
+        text,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_at(
+    store: &Store,
+    context_id: ContextId,
+    connector_id: &str,
+    session_ref: &str,
+    source_instance_ref: &str,
+    source_event_key: &str,
+    ordinal: u64,
+    text: &str,
+    occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> context_graph::ConversationEvent {
     store
         .append_event_batch(AppendEventBatch::live(
             context_id,
@@ -254,7 +284,7 @@ fn append(
                 session_ref: session_ref.into(),
                 source_event_key: source_event_key.into(),
                 source_position: json!({"ordinal": ordinal}),
-                occurred_at: None,
+                occurred_at,
                 author: "fixture-user".into(),
                 kind: "message".into(),
                 render_role: EventRenderRole::HumanMessage,
@@ -280,6 +310,7 @@ fn project(store: &Store, context_id: ContextId, embedder: &Arc<DeterministicRol
             context_id,
             embedder: embedder.registration(),
             profile: EventSearchProfile::default(),
+            embedding_workers: NonZeroUsize::MIN,
             max_events_per_batch: NonZeroU32::new(1).unwrap(),
             max_passages_per_batch: NonZeroU32::new(1).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(4_096).unwrap(),
@@ -537,8 +568,8 @@ fn published_table(name: &str) -> ConsumerTable {
 /// a literal snapshot of their persisted DDL: drift must refuse the reader instead of widening it.
 fn event_history_read_declaration() -> ConsumerDeclaration {
     const EVENT_DDL: &str = "CREATE TABLE events (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, adapter_version TEXT NOT NULL, anchor_declaration_version TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, source_event_key TEXT NOT NULL, source_position JSON NOT NULL, seq INTEGER NOT NULL, content_hash TEXT NOT NULL, anchor_count INTEGER NOT NULL, anchor_set_hash TEXT NOT NULL, occurred_at TIMESTAMP, author TEXT NOT NULL, kind TEXT NOT NULL, render_role TEXT NOT NULL, interaction_ref TEXT, text TEXT, payload JSON NOT NULL DEFAULT '{}', anchors JSON NOT NULL DEFAULT '{}', source_remainder JSON NOT NULL DEFAULT '{}', coverage TEXT NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, connector_id, session_ref, source_event_key), UNIQUE (context_id, connector_id, source_instance_ref, seq)) IMMUTABLE SYNC OFF SYNC CONFLICT KEEP FIRST";
-    const GENERATIONS_DDL: &str = "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), interpretation_generation_id UUID, interpretation_snapshot JSON NOT NULL, interpretation_snapshot_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, renderer_id TEXT NOT NULL, renderer_version TEXT NOT NULL, renderer_profile JSON NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), encoding_profile TEXT NOT NULL, state TEXT NOT NULL, eligible_event_count INTEGER NOT NULL DEFAULT 0, rendered_event_count INTEGER NOT NULL DEFAULT 0, embedded_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, passage_count INTEGER NOT NULL DEFAULT 0, started_at TXID NOT NULL, completed_at TXID, sanitized_failure TEXT, UNIQUE (context_id, id), FOREIGN KEY (context_id, interpretation_generation_id) REFERENCES event_interpretation_generations(context_id, id)) SYNC OFF";
-    const PASSAGES_DDL: &str = "CREATE TABLE event_search_passages (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, passage_ordinal INTEGER NOT NULL, first_event_sequence INTEGER NOT NULL, last_event_sequence INTEGER NOT NULL, rendered_text TEXT NOT NULL, content_sha256 TEXT NOT NULL, vector_text VECTOR(768), dimension INTEGER NOT NULL, is_current BOOLEAN NOT NULL, created_at TXID NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, generation_id, id), UNIQUE (context_id, generation_id, connector_id, source_instance_ref, passage_ordinal), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF";
+    const GENERATIONS_DDL: &str = "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), interpretation_generation_id UUID, interpretation_snapshot JSON NOT NULL, interpretation_snapshot_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, source_content_sha256 TEXT NOT NULL DEFAULT '', capture_ordinal INTEGER NOT NULL DEFAULT 0, renderer_id TEXT NOT NULL, renderer_version TEXT NOT NULL, renderer_profile JSON NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), encoding_profile TEXT NOT NULL, state TEXT NOT NULL, required_event_count INTEGER NOT NULL DEFAULT 0, searchable_event_count INTEGER NOT NULL DEFAULT 0, searchable_excluded_event_count INTEGER NOT NULL DEFAULT 0, eligible_event_count INTEGER NOT NULL DEFAULT 0, rendered_event_count INTEGER NOT NULL DEFAULT 0, embedded_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, passage_count INTEGER NOT NULL DEFAULT 0, started_at TXID NOT NULL, completed_at TXID, finalized_event_revision_tx TXID, last_attempt_at TXID, last_attempt_token UUID NOT NULL, sanitized_failure TEXT, UNIQUE (context_id, id), FOREIGN KEY (context_id, interpretation_generation_id) REFERENCES event_interpretation_generations(context_id, id)) SYNC OFF";
+    const PASSAGES_DDL: &str = "CREATE TABLE event_search_passages (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, passage_ordinal INTEGER NOT NULL, first_event_sequence INTEGER NOT NULL, last_event_sequence INTEGER NOT NULL, rendered_text TEXT NOT NULL, content_sha256 TEXT NOT NULL, vector_text VECTOR(768), dimension INTEGER NOT NULL, is_current BOOLEAN NOT NULL, is_searchable BOOLEAN NOT NULL DEFAULT true, created_at TXID NOT NULL, UNIQUE (context_id, id), UNIQUE (context_id, generation_id, id), UNIQUE (context_id, generation_id, connector_id, source_instance_ref, passage_ordinal), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) HISTORY CURRENT ONLY SYNC OFF";
     const SOURCES_DDL: &str = "CREATE TABLE event_search_passage_sources (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), passage_id UUID NOT NULL REFERENCES event_search_passages(id), event_id UUID NOT NULL REFERENCES events(id), connector_id TEXT NOT NULL, session_ref TEXT NOT NULL, source_instance_ref TEXT NOT NULL, source_order INTEGER NOT NULL, event_start_byte INTEGER, event_end_byte INTEGER, passage_start_byte INTEGER NOT NULL, passage_end_byte INTEGER NOT NULL, PRIMARY KEY (context_id, passage_id, source_order), FOREIGN KEY (context_id, generation_id, passage_id) REFERENCES event_search_passages(context_id, generation_id, id), FOREIGN KEY (context_id, event_id) REFERENCES events(context_id, id)) IMMUTABLE SYNC OFF";
     const HEADS_DDL: &str = "CREATE TABLE event_search_heads (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), activated_at TXID NOT NULL, FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF";
     let local = [
@@ -556,6 +587,23 @@ fn event_history_read_declaration() -> ConsumerDeclaration {
                     name: name.into(),
                     ddl: ddl.into(),
                 }))
+                .chain(
+                    [
+                        ("event_context_counts", EVENT_CONTEXT_COUNTS_DDL),
+                        ("event_context_sessions", EVENT_CONTEXT_SESSIONS_DDL),
+                        (
+                            "event_search_session_progress",
+                            EVENT_SEARCH_SESSION_PROGRESS_DDL,
+                        ),
+                        ("event_search_work_policies", EVENT_SEARCH_WORK_POLICIES_DDL),
+                        ("event_search_cursors", EVENT_SEARCH_CURSORS_DDL),
+                    ]
+                    .into_iter()
+                    .map(|(name, ddl)| ConsumerTable {
+                        name: name.into(),
+                        ddl: ddl.into(),
+                    }),
+                )
                 .collect(),
         },
         scope_labels: BTreeSet::new(),
@@ -636,5 +684,170 @@ fn ready_consumer_reader_matches_store_results_and_keeps_retrieval_read_only() {
         directory_image(root.path()),
         before,
         "the read-only query leaves every database and companion byte unchanged"
+    );
+}
+
+#[test]
+fn many_session_status_and_find_use_constant_coverage_queries_and_record_scan_cost() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let database = root.path().join("many-session-read-cost.db");
+    let embedder = DeterministicRoleAwareEmbedder::new("many-session-read-cost-profile");
+    let recorder = Arc::new(QueryRecorder::default());
+    let store = Store::open_with_database_plugin_and_embedder_registrations(
+        config(database, embedder.embedding_space()),
+        recorder.clone(),
+        vec![embedder.registration()],
+    )
+    .expect("open measured store");
+    let selected = context(&store, "many-session-read-cost");
+    for index in 0..128_u64 {
+        append_at(
+            &store,
+            selected,
+            CONNECTOR,
+            &format!("many-session-{index:03}"),
+            &format!("many-source-{index:03}"),
+            &format!("many-event-{index:03}"),
+            1,
+            &format!("many session searchable marker {index:03}"),
+            chrono::DateTime::from_timestamp(1_800_000_000 + index as i64, 0),
+        );
+    }
+    project(&store, selected, &embedder);
+
+    recorder.enable();
+    let status = store
+        .event_history_status(ContextSelector::one(selected))
+        .expect("status remains readable before the archive is projected");
+    let search = &status.contexts[0].search;
+    assert_eq!(search.covered_events, 10);
+    assert_eq!(search.pending_events, 0);
+    assert_eq!(search.outside_scope_events, 118);
+    let status_queries = recorder.queries();
+
+    recorder.enable();
+    let found = store
+        .find_event_history(ContextSelector::one(selected), "many session", filter(5))
+        .expect("find remains readable before the archive is projected");
+    assert!(!found.hits.is_empty());
+    assert_eq!(found.coverage[0].searchable_event_count, 10);
+    assert_eq!(found.coverage[0].outside_scope_event_count, 118);
+    let find_queries = recorder.queries();
+
+    for (name, queries) in [("status", &status_queries), ("find", &find_queries)] {
+        let search_queries = queries
+            .iter()
+            .filter(|sql| {
+                sql.contains("event_search_work_policies")
+                    || sql.contains("event_context_sessions")
+                    || sql.contains("searchable_event_count")
+                    || sql.contains("event_search_session_progress")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            search_queries.len() <= 5,
+            "{name} used {} coverage queries for one Context: {search_queries:#?}",
+            search_queries.len()
+        );
+        assert!(
+            search_queries
+                .iter()
+                .filter(|sql| sql.contains("FROM event_search_session_progress"))
+                .count()
+                <= 1,
+            "{name} must fold selected coverage in one progress query: {search_queries:#?}"
+        );
+        assert!(
+            search_queries
+                .iter()
+                .filter(|sql| sql.contains("FROM event_context_sessions"))
+                .count()
+                <= 2,
+            "{name} may read only the timestamped selected-session window: {search_queries:#?}"
+        );
+        assert!(
+            search_queries.iter().all(|sql| {
+                !sql.contains("COUNT(DISTINCT")
+                    && !sql.contains(
+                        "event_search_passage_sources INNER JOIN event_search_source_events",
+                    )
+            }),
+            "{name} must not reconstruct coverage from passage-source membership: {search_queries:#?}"
+        );
+    }
+
+    let selected_window = store
+        .execute_sql_for_test(
+            "SELECT connector_id, session_ref, event_count FROM event_context_sessions WHERE context_id = $context_id AND latest_occurred_at IS NOT NULL ORDER BY latest_occurred_at DESC, connector_id ASC, session_ref ASC LIMIT 10",
+            &std::collections::HashMap::from([(
+                "context_id".into(),
+                contextdb_core::Value::Uuid(selected.as_uuid()),
+            )]),
+        )
+        .expect("measure the exact selected-session query");
+    assert_eq!(selected_window.rows.len(), 10);
+    assert!(selected_window.trace.rows_examined <= 300);
+    let generation_id = search
+        .active_generation_id
+        .expect("bounded projection publishes a ready head");
+    let mut progress_params = std::collections::HashMap::from([
+        (
+            "context_id".into(),
+            contextdb_core::Value::Uuid(selected.as_uuid()),
+        ),
+        (
+            "generation_id".into(),
+            contextdb_core::Value::Uuid(generation_id.as_uuid()),
+        ),
+    ]);
+    let progress_filter = (0..10)
+        .map(|index| {
+            let session = format!("session_{index}");
+            progress_params.insert(
+                session.clone(),
+                contextdb_core::Value::Text(format!("many-session-{:03}", 127 - index)),
+            );
+            format!("(connector_id = $connector AND session_ref = ${session})")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    progress_params.insert(
+        "connector".into(),
+        contextdb_core::Value::Text(CONNECTOR.into()),
+    );
+    let progress = store
+        .execute_sql_for_test(
+            &format!(
+                "SELECT searchable_event_count, no_searchable_text_event_count FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND ({progress_filter})"
+            ),
+            &progress_params,
+        )
+        .expect("measure the exact selected-progress query");
+    assert_eq!(progress.rows.len(), 10);
+    assert!(progress.trace.rows_examined <= 300);
+    eprintln!(
+        "many-session coverage benchmark: status_total_queries={}, find_total_queries={}, status_coverage_queries={}, find_coverage_queries={}, selected_session_rows_examined={}, selected_progress_rows_examined={}",
+        status_queries.len(),
+        find_queries.len(),
+        status_queries
+            .iter()
+            .filter(|sql| {
+                sql.contains("event_search_work_policies")
+                    || sql.contains("event_context_sessions")
+                    || sql.contains("searchable_event_count")
+                    || sql.contains("event_search_session_progress")
+            })
+            .count(),
+        find_queries
+            .iter()
+            .filter(|sql| {
+                sql.contains("event_search_work_policies")
+                    || sql.contains("event_context_sessions")
+                    || sql.contains("searchable_event_count")
+                    || sql.contains("event_search_session_progress")
+            })
+            .count(),
+        selected_window.trace.rows_examined,
+        progress.trace.rows_examined,
     );
 }

@@ -160,6 +160,7 @@ fn correct_repository_with_model(
         entity.context_id,
         client,
     )
+    .expect("read succeeds")
 }
 
 fn teach_repository_skill_from_model_path(
@@ -249,7 +250,7 @@ fn real_corrections_promote_llm_authored_skill_through_heldout_gate() {
         "production promotion must ask the LLM client to author the skill proposal"
     );
 
-    let skills = list_skills_in_store(&store);
+    let skills = list_skills_in_store(&store).expect("read succeeds");
     assert!(
         learned_llm_repository_retype_skill(&skills).is_some(),
         "the promoted rule must be LLM-authored and come from the correction path, not a seeded row"
@@ -265,7 +266,7 @@ fn production_promotion_runs_heldout_gate_and_rejects_tied_candidate() {
         first.new_skill_created,
         "first promotion should create a skill"
     );
-    let skill_count_after_first = list_skills_in_store(&store).len();
+    let skill_count_after_first = list_skills_in_store(&store).expect("read succeeds").len();
 
     let tie = teach_repository_skill_from_model_path(&store, &client, "tied-candidate", false);
     assert!(
@@ -277,7 +278,7 @@ fn production_promotion_runs_heldout_gate_and_rejects_tied_candidate() {
         "a candidate that only ties the incumbent held-out behavior must not promote"
     );
     assert_eq!(
-        list_skills_in_store(&store).len(),
+        list_skills_in_store(&store).expect("read succeeds").len(),
         skill_count_after_first,
         "held-out tie rejection must not persist a second learned skill"
     );
@@ -289,7 +290,7 @@ fn record_conversation_with_extractor_applies_earned_skill_and_records_firing() 
     let client = SkillProposalClient::default();
     let correction = teach_repository_skill_from_model_path(&store, &client, "library-path", true);
     assert!(correction.new_skill_created, "training must earn a skill");
-    let skills = list_skills_in_store(&store);
+    let skills = list_skills_in_store(&store).expect("read succeeds");
     let skill = learned_llm_repository_retype_skill(&skills).expect("learned LLM retype skill");
 
     record_conversation_with_extractor(
@@ -321,7 +322,7 @@ fn rolling_public_capture_applies_earned_skill_using_source_transcript_not_diges
     let client = SkillProposalClient::default();
     let correction = teach_repository_skill_from_model_path(&store, &client, "rolling-path", true);
     assert!(correction.new_skill_created, "training must earn a skill");
-    let skills = list_skills_in_store(&store);
+    let skills = list_skills_in_store(&store).expect("read succeeds");
     let skill = learned_llm_repository_retype_skill(&skills).expect("learned LLM retype skill");
 
     let first_chunk = repository_transcript();
@@ -366,7 +367,7 @@ fn llm_authored_skill_stays_in_learned_scope_and_drift_alert_does_not_disable() 
     let client = SkillProposalClient::default();
     let correction = teach_repository_skill_from_model_path(&store, &client, "guard-path", true);
     assert!(correction.new_skill_created, "training must earn a skill");
-    let skills = list_skills_in_store(&store);
+    let skills = list_skills_in_store(&store).expect("read succeeds");
     let skill = learned_llm_repository_retype_skill(&skills)
         .expect("learned LLM retype skill")
         .clone();
@@ -424,7 +425,7 @@ fn llm_authored_skill_stays_in_learned_scope_and_drift_alert_does_not_disable() 
         .expect("matching capture must persist a new firing trace");
     record_firing_label(&store, new_trace, false);
 
-    let alerts = list_drift_alerts(&store);
+    let alerts = list_drift_alerts(&store).expect("read succeeds");
     let alert = alerts
         .iter()
         .find(|alert| alert.skill_id == skill.id)
@@ -439,6 +440,7 @@ fn llm_authored_skill_stays_in_learned_scope_and_drift_alert_does_not_disable() 
         "drift is informational; it must not disable the LLM-authored skill"
     );
     let skill_after_alert = list_skills_in_store(&store)
+        .expect("read succeeds")
         .into_iter()
         .find(|stored| stored.id == skill.id)
         .expect("skill row must remain present after drift alert");

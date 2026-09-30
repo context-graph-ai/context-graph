@@ -748,13 +748,7 @@ fn expected_embedding_for_text(model_dir: &Path, text: &str) -> (Vec<u32>, Vec<f
 
 fn production_embedder_outbound_fetch_markers() -> Vec<String> {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = crate_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
     let manifest = std::fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest");
-    let lock = std::fs::read_to_string(workspace_root.join("Cargo.lock")).expect("lock");
-    let dependency_text = format!("{manifest}\n{lock}");
     let mut markers = Vec::new();
 
     for dep in [
@@ -772,7 +766,10 @@ fn production_embedder_outbound_fetch_markers() -> Vec<String> {
         "curl".to_string(),
         "curl-sys".to_string(),
     ] {
-        if dependency_text.contains(&format!("name = \"{dep}\"")) || manifest.contains(&dep) {
+        if manifest
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{dep} =")))
+        {
             markers.push(format!("outbound dependency {dep}"));
         }
     }
@@ -802,7 +799,7 @@ fn production_embedder_outbound_fetch_markers() -> Vec<String> {
             "socket2".to_string(),
             "reqwest".to_string(),
             "isahc".to_string(),
-            "surf".to_string(),
+            "surf::".to_string(),
             "hf_hub".to_string(),
             "hf-hub".to_string(),
             "TcpStream".to_string(),

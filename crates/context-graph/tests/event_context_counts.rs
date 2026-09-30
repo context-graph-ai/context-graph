@@ -240,6 +240,7 @@ fn project(store: &Store, context_id: ContextId) {
             context_id,
             embedder: FixedEmbedder::registration(),
             profile: EventSearchProfile::default(),
+            embedding_workers: NonZeroUsize::MIN,
             max_events_per_batch: NonZeroU32::new(8).unwrap(),
             max_passages_per_batch: NonZeroU32::new(8).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(64 * 1024).unwrap(),
@@ -692,13 +693,13 @@ fn show_reads_its_source_links_once_through_the_passage_first_index() {
         "{:#?}",
         traced.trace
     );
+    assert_eq!(traced.rows.len(), passage.sources.len());
     assert_eq!(
-        traced.trace.index_used.as_deref(),
-        Some("event_search_passage_sources_passage_idx"),
-        "{:#?}",
+        traced.trace.rows_examined as usize,
+        passage.sources.len(),
+        "show reads each returned source link once: {:#?}",
         traced.trace
     );
-    assert_eq!(traced.rows.len(), passage.sources.len());
 }
 
 /// Releases a waiting appender the moment the forget's PURGE is issued — after the forget has read

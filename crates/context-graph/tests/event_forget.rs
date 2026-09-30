@@ -201,6 +201,7 @@ fn project(store: &Store, context_id: ContextId) {
             context_id,
             embedder: FixedEmbedder::registration(),
             profile: EventSearchProfile::default(),
+            embedding_workers: NonZeroUsize::MIN,
             max_events_per_batch: NonZeroU32::new(8).unwrap(),
             max_passages_per_batch: NonZeroU32::new(8).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(64 * 1024).unwrap(),
@@ -341,6 +342,27 @@ fn forgetting_a_session_erases_its_events_and_everything_derived_while_keeping_t
         "the project binding remains"
     );
 
+    let derived_reader = reader(&database);
+    assert_eq!(
+        count(
+            &derived_reader,
+            "SELECT COUNT(*) AS n FROM event_context_sessions WHERE context_id = $context_id AND event_count = 1",
+            context_id
+        ),
+        1,
+        "the capture-time session summary is deleted with the forgotten session and retains the kept session's exact count"
+    );
+    assert_eq!(
+        count(
+            &derived_reader,
+            "SELECT COUNT(*) AS n FROM event_search_session_progress WHERE context_id = $context_id",
+            context_id
+        ),
+        0,
+        "forget purges the generation progress in the same transaction before the retained history is rebuilt"
+    );
+    drop(derived_reader);
+
     project(&store, context_id);
     let after_find = store
         .find_event_history(
@@ -422,6 +444,28 @@ fn forgetting_a_context_erases_all_of_its_history_and_the_next_capture_lands_in_
     append(&store, untouched, "s1", "src1", "u-1", 1);
     project(&store, forgotten);
     project(&store, untouched);
+
+    let selection_reader = reader(&database);
+    assert_eq!(
+        selection_reader
+            .forget_selection_session_count(&ForgetSelection::Context {
+                context_id: forgotten,
+            })
+            .expect("count selected Context sessions"),
+        2,
+        "events, checkpoints, and locators for the same sessions count once"
+    );
+    assert_eq!(
+        selection_reader
+            .forget_selection_session_count(&ForgetSelection::Session {
+                context_id: forgotten,
+                connector_id: CONNECTOR.into(),
+                session_ref: "s1".into(),
+            })
+            .expect("count selected session"),
+        1
+    );
+    drop(selection_reader);
 
     let receipt = store
         .forget_event_history(ForgetSelection::Context {
@@ -676,6 +720,7 @@ fn build_and_activate_interpretation(database: &Path, context_id: ContextId) {
             interpretation_generation_id: Some(interpretation.generation_id),
             embedder: FixedEmbedder::registration(),
             profile: EventSearchProfile::default(),
+            embedding_workers: NonZeroUsize::MIN,
             max_events_per_batch: NonZeroU32::new(8).unwrap(),
             max_passages_per_batch: NonZeroU32::new(8).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(64 * 1024).unwrap(),

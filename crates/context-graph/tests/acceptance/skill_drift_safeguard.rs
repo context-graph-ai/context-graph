@@ -434,7 +434,7 @@ fn skill_whose_record_turns_bad_is_flagged_once_for_any_provenance() {
 
         // list_drift_alerts must surface exactly one alert for sk-target (deduped).
         // Placeholder returns empty → assertion fails.
-        let all_alerts = list_drift_alerts(&store);
+        let all_alerts = list_drift_alerts(&store).expect("read succeeds");
         let target_alerts: Vec<_> = all_alerts
             .iter()
             .filter(|a| a.skill_id == "sk-target")
@@ -610,7 +610,7 @@ fn skill_application_records_a_firing_trace_on_the_capture_path() {
     record_firing_label(&store, &firing.id, false);
     record_firing_label(&store, &firing.id, false);
     record_firing_label(&store, &firing.id, false);
-    let alerts = list_drift_alerts(&store);
+    let alerts = list_drift_alerts(&store).expect("read succeeds");
     assert!(
         alerts.iter().any(|a| a.skill_id == "sk-fires"),
         "after wrong-label corrections on the CAPTURE-produced firing, list_drift_alerts must \

@@ -1,25 +1,49 @@
 ---
 name: cg-find
-description: Search imported conversation history with `cg find` and use the returned passage handles. Use when an agent needs the source discussion behind a past decision or question.
+description: Search imported Claude Code history for stored passages behind a question or decision.
 ---
 <!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
 
-# Search imported history with `cg find`
+# Find conversation passages
+
+## Prerequisites
+
+Install `cg` from the repository README and capture history using [cg-import](../cg-import/SKILL.md).
+Install the search model with `cg model fetch --defaults`, then run the original import with
+`--search wait`; find itself never indexes.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight` -->
+
+## Recipe
+
+1. Run `cg find "your question"` in the bound project, or pass `--context NAME` explicitly.
+2. To search a wider authorized scope, use `--context app,infra` or `--all-contexts`.
+3. Read `hits[].text` as source passages, then cite `context_name` and `passage_id`.
+4. Expand a hit with `cg show <passage-id>` using the same Context selection.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
+
+Find ranks across the selected Context set. It reports omitted unready Contexts rather than treating
+their missing coverage as a complete search. Its shared coverage reads do not multiply with the
+number of selected Contexts.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `a_find_over_ready_contexts_issues_the_same_statements_at_one_eight_and_sixty_four` -->
+
+## Reproducible missing-store example
+
+This POSIX-shell/Python 3 example opens a fresh data root with no store. The command exits 1;
+its JSON says `store_not_found` instead of inventing results. The final command prints that asserted
+state. Use the numbered recipe above for an existing imported store.<!-- enforced by: `cg_status_is_read_only_uses_project_binding_or_explicit_context_set_and_returns_store_not_found_without_creating_either` -->
 
 ```sh
-cg find "why did we choose Iroh instead of NATS?"
-cg find "<question>" --context app,infra      # several named Contexts, ranked together
-cg find "<question>" --all-contexts           # every Context in the store
+cg_read_example=$(mktemp -d)
+CG_DATA_ROOT="$cg_read_example/data" cg find anything --format json > "$cg_read_example/read.json" || test "$?" -eq 1
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$cg_read_example/read.json"
 ```
 
-With no selector it searches the Context linked to the current project. It returns passages of
-the stored conversation, never an answer: read `hits[].text`, and cite `hits[].passage_id` and
-`hits[].context_name`. Pass a `passage_id` to `cg show` for the exact events.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
+Exact final stdout:
 
-- `state: no_matching_history` (exit 0): the selected Contexts hold no imported history.
-- `state: history_search_not_ready` (exit 1): history is captured but not searchable; run
-  `cg import <project-directory> --search wait`, or wait for `cg status` to report `ready`.
-- `omitted_contexts`: selected Contexts that were not searched because their search is not ready.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `find_in_a_context_with_no_imported_history_answers_no_matching_history` -->
-- `state: unknown_context` (exit 2): a named Context does not exist; nothing was searched.
+```text
+store_not_found
+```
 
-`cg find` never starts or waits for indexing and never changes the store.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
+## Failure to handle
+
+`history_search_not_ready` (exit 1) means captured history needs search work; follow its retry or
+inspect status. `no_matching_history` (exit 0) is a successful empty result. An unknown explicit
+Context refuses the selection instead of silently dropping it. Reads use `ConsumerReader` and leave
+the store untouched even while another process writes it.<!-- enforced by: `find_in_a_context_with_no_imported_history_answers_no_matching_history`, `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `the_read_only_commands_answer_an_idle_store_and_a_held_one_without_changing_a_byte` -->

@@ -16,11 +16,18 @@ name = "cg"
 path = "src/main.rs"
 
 [features]
+# Private event-search lifecycle controls. The repository gate enables this explicitly so both
+# integration tests and their `CARGO_BIN_EXE_cg` fixture contain the same controls. Ordinary
+# build, release, and install commands do not enable it.
+event-search-test-support = ["context-graph/test-support"]
 # The `cg status` fault-injection door, off in every shipped build. It is turned on ONLY by this
 # package's dev-dependency on itself below, so `cargo test` compiles it and `cargo build` — debug
 # or release — does not: a build profile is not a test boundary, and a developer's ordinary debug
 # binary must neither read nor contain the variable.
 status-fault-injection = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(context_graph_internal_test_support)'] }
 
 [dependencies]
 cg-catalog = { path = "../cg-catalog" }
@@ -33,7 +40,7 @@ cg-cli-conventions.workspace = true
 context-graph = { path = "../context-graph", features = ["fabric-sync"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "46e99e2eefa20853b109ae17a60627d4d7202f5d", features = ["iroh"] }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9", features = ["iroh"] }
 fs4.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -53,6 +60,6 @@ context-graph-cli = { path = ".", features = ["status-fault-injection"] }
 # compiled behind contextdb-engine's `test-seams` feature. This is a test-only activation — the
 # `cg` binary's own dependency edge on contextdb-engine is unchanged.
 contextdb-engine = { workspace = true, features = ["test-seams"] }
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "46e99e2eefa20853b109ae17a60627d4d7202f5d", features = ["iroh", "test-seams"] }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9", features = ["iroh", "test-seams"] }
 libc = "0.2"
 tempfile.workspace = true

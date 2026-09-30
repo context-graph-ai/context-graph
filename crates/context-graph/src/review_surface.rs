@@ -241,11 +241,12 @@ pub(crate) fn legal_vocab_for_pending_item(store: &Store, item_id: &str) -> Opti
 /// category from capture-produced flagged items still pending, plus grouping proposals and drift
 /// alerts persisted in the store. The per-category counts are the TRUE store totals (the display
 /// lists may be capped); a pending flagged item persists here until acted on.
-pub fn gather_review_summary(store: &Store, _cursor: &ReviewCursor) -> ReviewSummary {
+pub fn gather_review_summary(
+    store: &Store,
+    _cursor: &ReviewCursor,
+) -> crate::Result<ReviewSummary> {
     const DISPLAY_CAP: usize = 20;
-    let db = store.sync_database();
-    let snapshot = db.snapshot();
-    let rows = db.scan(PENDING_ITEMS_TABLE, snapshot).unwrap_or_default();
+    let rows = store.read_table(PENDING_ITEMS_TABLE)?;
     let uncertain: Vec<ReviewItem> = rows
         .into_iter()
         .filter_map(|row| {
@@ -274,7 +275,7 @@ pub fn gather_review_summary(store: &Store, _cursor: &ReviewCursor) -> ReviewSum
         })
         .collect();
 
-    let drift: Vec<ReviewItem> = crate::skill_store::list_drift_alerts(store)
+    let drift: Vec<ReviewItem> = crate::skill_store::list_drift_alerts(store)?
         .into_iter()
         .map(|alert| ReviewItem {
             id: alert.skill_id.clone(),
@@ -284,7 +285,7 @@ pub fn gather_review_summary(store: &Store, _cursor: &ReviewCursor) -> ReviewSum
         })
         .collect();
 
-    ReviewSummary {
+    Ok(ReviewSummary {
         uncertain_count: uncertain.len(),
         grouping_count: 0,
         drift_count: drift.len(),
@@ -292,7 +293,7 @@ pub fn gather_review_summary(store: &Store, _cursor: &ReviewCursor) -> ReviewSum
         uncertain_items: uncertain.into_iter().take(DISPLAY_CAP).collect(),
         grouping_items: Vec::new(),
         drift_items: drift.into_iter().take(DISPLAY_CAP).collect(),
-    }
+    })
 }
 
 // The review cursor's position is never read by any gather/list path below (each takes `_cursor`
@@ -345,34 +346,35 @@ fn ensure_pending_item_registered(store: &Store, item_id: &str) {
 /// Returns true if the given item is still pending (has been registered and not yet
 /// acted on). Registering a new item on first query ensures items persist across
 /// cursor advances and captures until explicitly acted on.
-pub fn is_item_pending(store: &Store, item_id: &str, _cursor: &ReviewCursor) -> bool {
+pub fn is_item_pending(
+    store: &Store,
+    item_id: &str,
+    _cursor: &ReviewCursor,
+) -> crate::Result<bool> {
     // Ensure the item is registered in the pending table.
     ensure_pending_item_registered(store, item_id);
 
-    let db = store.sync_database();
-    let snapshot = db.snapshot();
-    let rows = db.scan(PENDING_ITEMS_TABLE, snapshot).unwrap_or_default();
+    let rows = store.read_table(PENDING_ITEMS_TABLE)?;
     for row in &rows {
         match row.values.get("id") {
             Some(contextdb_core::Value::Text(id)) if id == item_id => {
-                return match row.values.get("acted_on") {
+                return Ok(match row.values.get("acted_on") {
                     Some(contextdb_core::Value::Bool(b)) => !b,
                     Some(contextdb_core::Value::Int64(i)) => *i == 0,
                     _ => true,
-                };
+                });
             }
             _ => {}
         }
     }
-    true
+    Ok(true)
 }
 
 /// List all pending review items (not yet acted on).
-pub fn list_pending_items(store: &Store, _cursor: &ReviewCursor) -> Vec<ReviewItem> {
-    let db = store.sync_database();
-    let snapshot = db.snapshot();
-    let rows = db.scan(PENDING_ITEMS_TABLE, snapshot).unwrap_or_default();
-    rows.into_iter()
+pub fn list_pending_items(store: &Store, _cursor: &ReviewCursor) -> crate::Result<Vec<ReviewItem>> {
+    let rows = store.read_table(PENDING_ITEMS_TABLE)?;
+    Ok(rows
+        .into_iter()
         .filter_map(|row| {
             let acted_on = match row.values.get("acted_on") {
                 Some(contextdb_core::Value::Bool(b)) => *b,
@@ -393,7 +395,7 @@ pub fn list_pending_items(store: &Store, _cursor: &ReviewCursor) -> Vec<ReviewIt
                 category: ReviewCategory::Uncertain,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Mark an item as acted on, removing it from the pending review set.

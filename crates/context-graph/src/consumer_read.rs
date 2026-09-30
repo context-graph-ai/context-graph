@@ -70,7 +70,8 @@ use crate::Result;
 use crate::embedder::{Embedder, EmbedderRegistration};
 use crate::error::CgError;
 use crate::owner_control::{
-    WRITER_TRANSITION_ALLOWANCE, context_graph_read_session_options, owner_read_runtime_dir,
+    WRITER_TRANSITION_ALLOWANCE, context_graph_read_session_options_with_budgets,
+    default_read_active_time_ms, default_read_memory_limit_bytes, owner_read_runtime_dir,
 };
 use crate::schema::{LOCAL_DERIVED_TABLES, LOCAL_RUNTIME_TABLES, TABLES};
 use crate::store::convert::{map_consumer_open_err, map_engine_err};
@@ -301,6 +302,30 @@ impl ConsumerReader {
     /// The surface is file-backed only. `:memory:` has no committed file to read and is refused by
     /// type, before any engine call.
     pub fn open(path: impl AsRef<Path>, declaration: ConsumerDeclaration) -> Result<Self> {
+        Self::open_with_memory_limit(path, declaration, default_read_memory_limit_bytes())
+    }
+
+    /// Open with an immutable memory budget and default active-time allowance on either route.
+    pub fn open_with_memory_limit(
+        path: impl AsRef<Path>,
+        declaration: ConsumerDeclaration,
+        memory_limit: std::num::NonZeroUsize,
+    ) -> Result<Self> {
+        Self::open_with_read_limits(
+            path,
+            declaration,
+            memory_limit,
+            default_read_active_time_ms(),
+        )
+    }
+
+    /// Open with immutable memory and per-statement active-time allowances on either route.
+    pub fn open_with_read_limits(
+        path: impl AsRef<Path>,
+        declaration: ConsumerDeclaration,
+        memory_limit: std::num::NonZeroUsize,
+        active_time_ms: std::num::NonZeroU64,
+    ) -> Result<Self> {
         let path = path.as_ref();
         if path.as_os_str() == IN_MEMORY_PATH {
             return Err(CgError::InMemoryStoreHasNoReadSurface {
@@ -308,7 +333,8 @@ impl ConsumerReader {
             });
         }
         let gate = ReaderGate::build(declaration)?;
-        let mut options = context_graph_read_session_options();
+        let mut options =
+            context_graph_read_session_options_with_budgets(memory_limit, active_time_ms);
         // The engine owns row scope end to end, so the declaration's labels go into the session
         // itself. A declaration naming no label narrows nothing, and says so by carrying none:
         // an empty set would be a reader entitled to no row at all. Contexts and a principal stay
@@ -402,6 +428,15 @@ impl ConsumerReader {
     /// Everything this reader is entitled to see.
     pub fn declaration(&self) -> &ConsumerDeclaration {
         &self.gate.declaration
+    }
+
+    /// Current bytes charged to the engine's selected read route.
+    ///
+    /// An owner-channel route observes the owner's shared accountant, so its
+    /// value can include other work served by that owner.
+    pub fn charged_bytes(&self) -> Result<u64> {
+        self.on_session(ReadSession::charged_bytes)
+            .map_err(map_engine_err)
     }
 
     pub(crate) fn attach_event_search_registrations(
@@ -767,6 +802,14 @@ impl ConsumerCursor {
     }
 }
 
+impl Drop for ConsumerCursor {
+    fn drop(&mut self) {
+        if self.cursor.is_some() {
+            let _ = self.close();
+        }
+    }
+}
+
 fn already_closed() -> CgError {
     CgError::Engine("this cursor is closed and holds nothing more to read".to_string())
 }
@@ -1010,6 +1053,15 @@ fn admit_expr(
             admit_body(gate, subquery, bound, params)
         }
         Expr::IsNull { expr, .. } => admit_expr(gate, expr, bound, params),
+        // A row constructor -- `(context_id, generation_id)` on either side of a comparison -- is
+        // a group of ordinary expressions, and each one reaches tables the same way the group
+        // does. Walking them holds every member to the same declaration as any other position.
+        Expr::Row(members) => {
+            for member in members {
+                admit_expr(gate, member, bound, params)?;
+            }
+            Ok(())
+        }
         Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
     }
 }

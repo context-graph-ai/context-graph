@@ -86,13 +86,10 @@ impl Store {
         ]
         .into_iter()
         .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         Ok(!result.rows.is_empty())
     }
 

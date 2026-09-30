@@ -46,6 +46,12 @@ struct GoldenEntry {
     real_nomic_vector_sha256: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct GoldenFixture {
+    model_artifacts_sha256: String,
+    entries: Vec<GoldenEntry>,
+}
+
 fn sha256_of_vector(vector: &[f32]) -> String {
     let mut hasher = Sha256::new();
     for value in vector {
@@ -91,7 +97,11 @@ fn text_default_space_base_golden_capture() {
         });
     }
 
-    let json = serde_json::to_string_pretty(&entries).expect("serialize goldens");
+    let fixture = GoldenFixture {
+        model_artifacts_sha256: nomic_real_model::model_artifacts_sha256(),
+        entries,
+    };
+    let json = serde_json::to_string_pretty(&fixture).expect("serialize goldens");
 
     // Writes ONLY to the caller-supplied destination — never to the checked-in fixture path,
     // never anywhere under the repository or a build working directory.
@@ -110,5 +120,5 @@ fn text_default_space_base_golden_capture() {
         )
     });
 
-    assert_eq!(entries.len(), FIXED_TEXTS.len());
+    assert_eq!(fixture.entries.len(), FIXED_TEXTS.len());
 }

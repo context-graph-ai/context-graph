@@ -20,6 +20,12 @@
 //! - Each reader in the refusal is one of the processes actually parked on the store — its
 //!   operating-system process id, what that process IS, and which run of it — so an operator sent
 //!   after "process N" finds the process that is really holding their store.
+//! - A free store opens before any reader is parked, so the typed refusal belongs to live reader
+//!   contention rather than the harness or a stale registry entry.
+//! - A shared writer waits while those readers hold the store, without holding the registry mutex:
+//!   its retry observer opens an unrelated store before either reader is released.
+//! - Releasing both readers admits that waiting writer, and a later open of the original path
+//!   reuses its registered database handle.
 //!
 //! ## How the condition is produced, and why it takes two processes
 //!
@@ -30,7 +36,8 @@
 //! reproduced: a second PROCESS caught inside hydration. This file drives that same production
 //! path through contextdb's shipped hydration checkpoint (`test-seams`), which parks the reader
 //! after its breadcrumb is published and its read lock is held, and prints the identity it
-//! published. The writer is a third process, so nothing here mutates this process's environment.
+//! published. The refusing writer is a third process, so it observes the readers exactly as a
+//! separate context-graph client does.
 //!
 //! Every assertion below is about a value or a pathname. Nothing waits on elapsed time: the parent
 //! advances only when a child has printed the marker that says it has arrived.
@@ -42,6 +49,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc::channel;
+use std::time::Duration;
 
 use context_graph::{CgError, Store, StoreConfig};
 use contextdb_engine::ReadSession;
@@ -131,6 +140,10 @@ fn a_context_graph_writer_open_child() {
     if std::env::var(CHILD_ROLE_ENV).ok().as_deref() != Some("context-graph-writer-open") {
         return;
     }
+    // Exercise the typed exhaustion result without holding two reader processes for 60 seconds.
+    context_graph::test_support::set_store_open_retry_allowance_for_test(Some(
+        std::time::Duration::ZERO,
+    ));
     match Store::open(store_config(child_store_path())) {
         Ok(store) => {
             drop(store);
@@ -426,11 +439,16 @@ fn seeded_store(directory: &Path) -> PathBuf {
 #[test]
 fn a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store() {
     let runtime = runtime_root();
-    let store_directory = tempfile::Builder::new()
-        .prefix("cgs")
-        .tempdir_in("/tmp")
-        .expect("a store directory");
-    let store_path = seeded_store(store_directory.path());
+    let root = tempfile::tempdir().expect("store root");
+    let store_path = seeded_store(root.path());
+    let unrelated_directory = root.path().join("unrelated-store");
+    fs::create_dir(&unrelated_directory).expect("an unrelated store directory");
+    let unrelated = seeded_store(&unrelated_directory);
+
+    drop(
+        Store::open(store_config(store_path.clone()))
+            .expect("a free store opens, so the busy condition belongs only to a held store"),
+    );
 
     // Two readers, so the reported count cannot be satisfied by a floor a single refusal would
     // carry: only a real observation of the live readers reaches two.
@@ -483,23 +501,35 @@ fn a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store() 
          published — the process an operator goes and finds, what it is, and which run of it"
     );
 
+    let (waiting, observed) = channel();
+    let (finish, finished) = channel();
+    let writer_path = store_path.clone();
+    let writer = std::thread::spawn(move || {
+        context_graph::test_support::observe_store_open_retries_for_test(move |error| {
+            assert!(matches!(error, CgError::StoreHeldByReaders { .. }));
+            drop(
+                Store::open(store_config(unrelated.clone()))
+                    .expect("registry is released while waiting"),
+            );
+            waiting.send(()).unwrap();
+        });
+        let store = Store::open(store_config(writer_path)).expect("reader release admits writer");
+        finish.send(()).unwrap();
+        store
+    });
+    observed
+        .recv_timeout(Duration::from_secs(10))
+        .expect("real reader refusal reached the shared Store wait");
+    assert!(finished.try_recv().is_err());
     first.release();
     second.release();
-}
-
-#[test]
-fn a_context_graph_open_with_nobody_reading_is_not_refused() {
-    let runtime = runtime_root();
-    let store_directory = tempfile::Builder::new()
-        .prefix("cgs")
-        .tempdir_in("/tmp")
-        .expect("a store directory");
-    let store_path = seeded_store(store_directory.path());
-
-    assert_eq!(
-        open_a_context_graph_writer(&store_path, runtime.path()),
-        WriterOpenOutcome::Acquired,
-        "the busy condition is what a HELD store produces; a free one still opens, so a refusal \
-         here would mean the harness, not the store, is what refused the writer"
-    );
+    finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("writer opens after reader release");
+    let store = writer.join().unwrap();
+    let shared = Store::open(store_config(store_path)).expect("reuse registered writer");
+    assert!(std::sync::Arc::ptr_eq(
+        &store.sync_database(),
+        &shared.sync_database()
+    ));
 }

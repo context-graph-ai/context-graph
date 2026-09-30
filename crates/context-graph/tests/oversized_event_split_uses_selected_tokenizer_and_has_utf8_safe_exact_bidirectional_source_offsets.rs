@@ -1,4 +1,4 @@
-//! C6 (assertion 25, offsets arm) — document preparation's token->byte boundaries are exact,
+//! Document preparation's token-to-byte boundaries are exact,
 //! UTF-8 safe, and bidirectional over multi-byte, emoji, CJK and combining-character content.
 //!
 //! An oversized event is PREPARED, not rejected: preparation returns the complete token

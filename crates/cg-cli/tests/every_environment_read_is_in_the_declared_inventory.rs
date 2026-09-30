@@ -20,7 +20,8 @@
 //! `CONTEXTDB_OWNER_READ_RUNTIME_DIR` (which directory the owner channel lives in, read one layer
 //! down in `context_graph::owner_control` under the substrate's own name — cg invents no name of
 //! its own for it and does not re-read it). `HOME` is read only to find `CG_DATA_ROOT`'s default.
-//! Three development switches sit beside them, one of which is not in a shipped binary at all.
+//! Six development switches sit beside them; the two event-search barriers, forget barrier and status fault
+//! injection are not in a shipped binary at all.
 //!
 //! ## What this test does not claim
 //!
@@ -34,10 +35,22 @@ use std::path::{Path, PathBuf};
 
 /// The complete set of environment variables the `cg` sources may read, and what each one is for.
 /// A name reaching the source without reaching this list is the failure this file exists to cause.
-const DECLARED_INVENTORY: [(&str, &str); 6] = [
+const DECLARED_INVENTORY: [(&str, &str); 9] = [
     (
         "CG_DATA_ROOT",
         "location: where this machine's cg data lives",
+    ),
+    (
+        "CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER",
+        "development switch: test-only barrier after event-search catch-up and before handoff",
+    ),
+    (
+        "CG_EVENT_SEARCH_TEST_PRE_CATCH_UP_BARRIER",
+        "development switch: test-only barrier before event-search catch-up",
+    ),
+    (
+        "CG_FORGET_TEST_BEFORE_PURGE_SOCKET",
+        "development switch: test-only barrier after forget opens and before erasure",
     ),
     (
         "CLAUDE_CONFIG_DIR",
@@ -221,7 +234,10 @@ fn the_binary_reads_exactly_the_environment_it_declares() {
         read.keys().cloned().collect::<Vec<_>>(),
         vec![
             "CG_DATA_ROOT".to_string(),
+            "CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER".to_string(),
+            "CG_EVENT_SEARCH_TEST_PRE_CATCH_UP_BARRIER".to_string(),
             FAULT_ENV.to_string(),
+            "CG_FORGET_TEST_BEFORE_PURGE_SOCKET".to_string(),
             "CG_NO_UNDERSTAND_KICK".to_string(),
             "CG_USE_TEST_LEXICAL_EMBEDDER".to_string(),
             "CLAUDE_CONFIG_DIR".to_string(),

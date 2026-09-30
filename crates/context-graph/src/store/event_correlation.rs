@@ -13,7 +13,6 @@ use serde_json::Value as JsonValue;
 
 use crate::Result;
 use crate::error::CgError;
-use crate::owner_control::context_graph_read_limits;
 use crate::types::{
     CorrelationResolution, EventAdapterDeclaration, EventCorrelationResolver,
     EventCorrelationScope, EventDraft, EventRenderRole, PriorRequestAnchorQuery,
@@ -208,7 +207,7 @@ impl EventCorrelationResolver for StoreEventCorrelationResolver<'_> {
             }
         }
 
-        let mut limits = context_graph_read_limits();
+        let mut limits = self.store.read_limits();
         limits.cursor_page_rows = 1;
         #[cfg(context_graph_internal_test_support)]
         let session = match self.test_observers.as_ref() {

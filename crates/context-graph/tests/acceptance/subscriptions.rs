@@ -444,6 +444,7 @@ fn subscribe_new_decision_fires_post_commit_carries_served_intention_ids_and_des
     wait_for_len(&payloads, 1);
     let payload = payloads.lock().expect("collector")[0].clone();
     assert_eq!(payload.decision.id, created.id);
+    assert!(payload.action_id > 0);
     assert_eq!(payload.served_intention_ids, vec![intent_id]);
     assert_eq!(
         payload.served_intention_descriptions.get(&intent_id),
@@ -471,6 +472,7 @@ fn subscribe_invalidation_detected_fires_carries_intention_anchor_and_render_str
     wait_for_len(&payloads, 1);
     let payload = payloads.lock().expect("collector")[0].clone();
     assert_eq!(payload.invalidation.affected_decision_id, dec);
+    assert!(payload.action_id > 0);
     assert_eq!(
         payload.decision_description,
         "auth module lives at src/auth.py"
@@ -755,6 +757,7 @@ fn subscribe_conflict_detected_fires_on_outcome_divergence_carries_older_newer_i
     wait_for_len(&payloads, 1);
     let payload = payloads.lock().expect("collector")[0].clone();
     assert_eq!(payload.older_decision_id, older);
+    assert!(payload.action_id > 0);
     assert_eq!(payload.newer_decision_id, newer.id);
     assert_eq!(payload.threatened_intention_ids, vec![intent]);
     assert!(payload.intention_in_tension);
@@ -798,6 +801,7 @@ fn subscribe_precedent_match_fires_for_cites_walked_successful_precedent_carries
     wait_for_len(&payloads, 1);
     let payload = payloads.lock().expect("collector")[0].clone();
     assert_eq!(payload.new_decision_id, new.id);
+    assert!(payload.action_id > 0);
     assert_eq!(payload.precedent_decision_id, prior);
     assert_eq!(payload.served_intention_ids, vec![intent]);
     assert_eq!(
@@ -1601,14 +1605,30 @@ fn subscription_does_not_fire_when_observation_transaction_rolls_back() {
     drop(dir);
 }
 
-// Use case: a failing sink records failure after the upstream commit is already durable.
+// Use case: a receiver uses the stable action identity when its first acknowledgement is lost.
 #[test]
-fn subscription_callback_returning_sink_error_permanent_does_not_rollback_transaction() {
+fn lost_subscription_acknowledgement_retries_one_identity_and_one_receiver_effect() {
     let (_dir, _path, store, ctx, ent, _intent, _dec, _payloads) = collect_invalidation();
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let visible_effects = Arc::new(Mutex::new(BTreeSet::new()));
+    let attempts_for_handler = Arc::clone(&attempts);
+    let effects_for_handler = Arc::clone(&visible_effects);
     let failing_sub = store
         .with_system_principal()
-        .subscribe_invalidation_detected(SubscriptionFilter::default(), |_payload| {
-            Err(SubscriptionError::HandlerFailed("sink failed".to_string()))
+        .subscribe_invalidation_detected(SubscriptionFilter::default(), move |payload| {
+            effects_for_handler
+                .lock()
+                .expect("receiver")
+                .insert(payload.action_id);
+            let mut attempts = attempts_for_handler.lock().expect("attempts");
+            attempts.push(payload.action_id);
+            if attempts.len() == 1 {
+                Err(SubscriptionError::HandlerFailed(
+                    "acknowledgement lost".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
         })
         .expect("subscribe failing sink");
     let result = observe(
@@ -1627,11 +1647,49 @@ fn subscription_callback_returning_sink_error_permanent_does_not_rollback_transa
         result.observation_id
     );
     let metrics = wait_for_metrics(&store, &failing_sub, |metrics| {
-        metrics.permanent_failures == 1
+        metrics.uncertain >= 1 && metrics.delivered == 1
     });
-    assert_eq!(metrics.permanent_failures, 1);
+    assert_eq!(metrics.uncertain, 1);
+    assert_eq!(metrics.permanent_failures, 0);
+    let attempts = attempts.lock().expect("attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
+    assert_eq!(visible_effects.lock().expect("receiver").len(), 1);
+}
+
+#[test]
+fn external_handler_without_dedup_reports_uncertain_delivery() {
+    let (_dir, _path, store, ctx, ent, _intent, _dec, _payloads) = collect_invalidation();
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&attempts);
+    let subscription = store
+        .with_system_principal()
+        .subscribe_invalidation_detected(SubscriptionFilter::default(), move |payload| {
+            seen.lock().expect("attempts").push(payload.action_id);
+            Err(SubscriptionError::HandlerFailed(
+                "external acknowledgement was lost".to_string(),
+            ))
+        })
+        .expect("subscribe external handler");
+    observe(
+        &store,
+        ctx,
+        ent,
+        delta(&[("path", json!("src/uncertain.py"))]),
+    );
+    wait_for_len(&attempts, 1);
+    let metrics = wait_for_metrics(&store, &subscription, |metrics| metrics.uncertain > 0);
+    assert!(metrics.uncertain > 0);
     assert_eq!(metrics.delivered, 0);
-    assert_eq!(metrics.retried, 0);
+    assert_eq!(metrics.permanent_failures, 0);
+    assert!(metrics.queued > 0);
+    assert!(
+        attempts
+            .lock()
+            .expect("attempts")
+            .first()
+            .is_some_and(|id| *id > 0)
+    );
 }
 
 // Use case: basis_fields suppress unrelated Entity changes and forward relevant ones.

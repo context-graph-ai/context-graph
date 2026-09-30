@@ -12,10 +12,12 @@
 //! Resolves the exact directory production locates the installed `nomic-embed-text-v1.5` weights
 //! under by calling `cg_catalog::default_cache_root()` — the one function that owns the
 //! `CG_MODEL_CACHE_ROOT` env var / platform-default resolution — rather than re-deriving that same
-//! rule a second time here. Deliberately never the legacy `~/.cache/cg/embedders` tree a stale
-//! acceptance helper might still point at.
+//! rule a second time here. Tests use the same cache root as the production loader.
 
 use std::path::PathBuf;
+use std::{fs::File, io::Read};
+
+use sha2::{Digest, Sha256};
 
 use context_graph::embedder::nomic::NomicTextEmbedder;
 use context_graph::{Embedder, EmbedderConfig, ModelSource};
@@ -32,6 +34,73 @@ pub fn canonical_cache_root() -> PathBuf {
 /// The canonical, already-installed model directory: `<canonical_cache_root>/nomic-embed-text-v1.5`.
 pub fn canonical_model_dir() -> PathBuf {
     canonical_cache_root().join(NOMIC_MODEL_ID)
+}
+
+/// Bind a real-model golden to the same declared artifact set and digest shape as the
+/// event-history benchmark. Catalog bookkeeping is excluded from the model identity.
+pub fn model_artifacts_sha256() -> String {
+    fn declared_files(prefix: &str, table: &toml::Table, files: &mut Vec<String>) {
+        for (name, value) in table {
+            let name = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            if value.is_str() {
+                files.push(name);
+            } else if let Some(child) = value.as_table() {
+                declared_files(&name, child, files);
+            }
+        }
+    }
+
+    let dir = canonical_model_dir();
+    let catalog = dir.join("catalog.toml");
+    let mut names = if catalog.is_file() {
+        let contents = std::fs::read_to_string(&catalog).expect("read model catalog manifest");
+        let manifest: toml::Value =
+            toml::from_str(&contents).expect("parse model catalog manifest");
+        let table = manifest
+            .get("per_file_sha256")
+            .and_then(toml::Value::as_table)
+            .expect("model catalog manifest declares per_file_sha256");
+        let mut files = Vec::new();
+        declared_files("", table, &mut files);
+        files
+    } else {
+        [
+            "REVISION",
+            "config.json",
+            "model.safetensors",
+            "tokenizer.json",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    };
+    names.sort();
+    names.dedup();
+    assert!(
+        !names.is_empty(),
+        "model catalog manifest declares no artifacts"
+    );
+    let mut binding = Sha256::new();
+    for name in names {
+        let mut file = File::open(dir.join(&name))
+            .unwrap_or_else(|err| panic!("model catalog artifact {name} is missing: {err}"));
+        let mut artifact = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).expect("read model artifact");
+            if count == 0 {
+                break;
+            }
+            artifact.update(&buffer[..count]);
+        }
+        binding.update(name.as_bytes());
+        binding.update(format!("{:x}", artifact.finalize()).as_bytes());
+    }
+    format!("{:x}", binding.finalize())
 }
 
 /// A local-source, offline, download-denying config over an arbitrary model directory, pinned to

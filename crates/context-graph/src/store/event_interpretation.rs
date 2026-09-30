@@ -328,7 +328,7 @@ pub(crate) fn list_coverage_gaps(
         } else {
             ""
         };
-        let mut limits = crate::owner_control::context_graph_read_limits();
+        let mut limits = store.read_limits();
         limits.cursor_page_rows = GAP_SCAN_PAGE_ROWS.min(per_context_limit as u64);
         let session = store
             .internal_db()
@@ -435,7 +435,7 @@ fn materialize_coverage_gaps(
     selector: &ContextSelector,
     connector_id: &str,
 ) -> Result<()> {
-    let mut limits = crate::owner_control::context_graph_read_limits();
+    let mut limits = store.read_limits();
     limits.cursor_page_rows = GAP_SCAN_PAGE_ROWS;
     for context_id in selector.context_ids() {
         let session = store
@@ -623,7 +623,7 @@ fn gap_events(
         ("context_id".into(), Value::Uuid(context_id.as_uuid())),
         ("gap_id".into(), Value::Uuid(gap_id.as_uuid())),
     ]);
-    let mut limits = crate::owner_control::context_graph_read_limits();
+    let mut limits = store.read_limits();
     limits.cursor_page_rows = GAP_SCAN_PAGE_ROWS;
     let session = store
         .internal_db()
@@ -717,16 +717,13 @@ fn active_generation(
     context_id: ContextId,
     connector_id: &str,
 ) -> Result<Option<InterpretationGenerationId>> {
-    let result = store
-        .internal_db()
-        .execute(
+    let result = store.read_query(
             "SELECT generation_id FROM event_interpretation_heads WHERE context_id = $context_id AND connector_id = $connector_id",
             &HashMap::from([
                 ("context_id".into(), Value::Uuid(context_id.as_uuid())),
                 ("connector_id".into(), Value::Text(connector_id.to_owned())),
             ]),
-        )
-        .map_err(map_engine_err)?;
+        )?;
     result
         .rows
         .first()
@@ -745,9 +742,7 @@ fn event_has_complete_active_value(
     let Some(generation_id) = generation_id else {
         return Ok(false);
     };
-    let result = store
-        .internal_db()
-        .execute(
+    let result = store.read_query(
             "SELECT coverage FROM event_interpretation_values WHERE context_id = $context_id AND generation_id = $generation_id AND event_id = $event_id",
             &HashMap::from([
                 ("context_id".into(), Value::Uuid(context_id.as_uuid())),
@@ -757,8 +752,7 @@ fn event_has_complete_active_value(
                 ),
                 ("event_id".into(), Value::Uuid(event_id.as_uuid())),
             ]),
-        )
-        .map_err(map_engine_err)?;
+        )?;
     Ok(result
         .rows
         .first()
@@ -792,7 +786,7 @@ fn context_status(
 }
 
 fn count_uncovered_gaps(store: &Store, context_id: ContextId, connector_id: &str) -> Result<u64> {
-    let mut limits = crate::owner_control::context_graph_read_limits();
+    let mut limits = store.read_limits();
     limits.cursor_page_rows = GAP_SCAN_PAGE_ROWS;
     let session = store
         .internal_db()
@@ -884,13 +878,10 @@ fn generation_status_row(
     ]);
     let generation_id = generation_id.expect("the no-head branch returned above");
     params.insert("generation_id".into(), Value::Uuid(generation_id.as_uuid()));
-    let result = store
-        .internal_db()
-        .execute(
+    let result = store.read_query(
             "SELECT target_interpretation_version, event_count, ordered_source_set_sha256, interpreted_event_count, state, sanitized_failure FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND id = $generation_id",
             &params,
-        )
-        .map_err(map_engine_err)?;
+        )?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -904,7 +895,7 @@ fn latest_generation_status_row(
     context_id: ContextId,
     connector_id: &str,
 ) -> Result<Option<GenerationStatusRow>> {
-    let mut limits = crate::owner_control::context_graph_read_limits();
+    let mut limits = store.read_limits();
     limits.cursor_page_rows = GAP_SCAN_PAGE_ROWS;
     let session = store
         .internal_db()

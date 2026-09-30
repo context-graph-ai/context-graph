@@ -15,7 +15,7 @@ file that does it named beside it.
 | `cg-cli` | `crates/cg-cli/` | The `cg` binary: argument parsing, help text, output rendering, and the mapping from a typed library condition to an exit code. |
 | `cg-cli-conventions` | `crates/cg-cli-conventions/` | The command-rendering conventions the CLI surfaces share: severities, findings, the doctor/selftest check registry and the report shapes. |
 | `cg-catalog` | `crates/cg-catalog/` | Model catalog state: registered models, model connections, provider specs, and the artifact cache lifecycle. |
-| `cg-node-fs` | `crates/cg-node-fs/` | The node deployment's filesystem roots: reading a per-node config file, and holding the per-data-root worker lock. |
+| `cg-node-fs` | `crates/cg-node-fs/` | The node deployment's filesystem roots: reading node configuration and machine-memory limits, holding worker locks, and atomically replacing bounded worker requests. |
 | `cg-bench` | `crates/cg-bench/` | The correctness bench: the gold answer-key format and the frozen scoring method. Not a shipped product surface. |
 | `candle-embeddinggemma` | `crates/candle-embeddinggemma/` | Loading and running the EmbeddingGemma text embedder. |
 | `cg-vision-embedder` | `crates/cg-vision-embedder/` | Loading and running the bundled SigLIP-family joint image+text embedder. |
@@ -38,12 +38,11 @@ Routing, in the words a change usually arrives in:
   imported history is encoded with Nomic's document/query task instruction — is declared in
   `crates/context-graph/src/embedding_space.rs` (`event_history_embedding_space`) and answered for
   by the thin wrapper `EventHistoryTextEmbedder` over the same loaded model, in
-  `crates/context-graph/src/embedder/nomic.rs`. It carries **no table binding yet**: the physical
-  passage target `event_search_passages.vector_text` lands in the same change as that table, and
-  until then the space is registrable but bound to nothing, which is what keeps it from contending
-  with the text-default space for `evidence.vector_text` or `digests.vector_text`. A change to
-  which prefix is added, to the space's identifier, or to that deferred binding is a change to
-  those two files.
+  `crates/context-graph/src/embedder/nomic.rs`. It binds only
+  `event_search_passages.vector_text`, leaving `evidence.vector_text` and `digests.vector_text`
+  to the text-default space. Guard: `canonical_event_history_declaration_has_only_the_passage_binding`
+  in `crates/context-graph/src/store/embedding.rs`. Change the prefix, identifier or binding in
+  those owning modules.
 - The **bundled default** text embedder — `nomic-embed-text-v1.5`, the one a `cg` install gets
   without asking — is not a sibling crate: it lives inside `context-graph` itself, at
   `crates/context-graph/src/embedder/nomic.rs`, behind the default feature `nomic-embedder`
@@ -72,6 +71,29 @@ today, and they are the whole list:
 Adding a fourth is a placement decision, not a detail: say which module and under which feature
 here, or move the code. Note that a grep for `std::fs` does not find all of these —
 `crates/context-graph/src/embedder/nomic.rs` imports it as `fs as file_system`.
+
+## Where a change lives
+
+| Change | Owner and entry point |
+|---|---|
+| Event capture, checkpoints, identity, tenant placement | `crates/context-graph/src/store/event_import.rs` and `crates/context-graph/src/store/event.rs` |
+| Passage projection, leases, retry ownership, session work policy | `crates/context-graph/src/store/event_search_projection.rs` and `crates/context-graph/src/event_search.rs` |
+| Shared typed read SQL and decoding | `crates/context-graph/src/store/graph_rows.rs`; consumers use `crates/context-graph/src/consumer_read.rs` |
+| CLI read budget and writer admission | `crates/cg-cli/src/read_config.rs` and `crates/cg-cli/src/write_config.rs`; library defaults in `crates/context-graph/src/owner_control.rs` and `crates/context-graph/src/write_budget.rs` |
+| Detached worker handoff and command rendering | `crates/cg-cli/src/history/worker.rs` and `crates/cg-cli/src/history/read.rs` |
+| Node memory probe, locks and bounded request IO | `crates/cg-node-fs/src/lib.rs` |
+| Explicit fetch adopts verified artifact-only cache | `crates/cg-catalog/src/lib.rs` |
+
+## Skills
+
+| Task | Recipe |
+|---|---|
+| Capture Claude Code history and schedule search | `skills/cg-import/SKILL.md` |
+| Find stored conversation passages | `skills/cg-find/SKILL.md` |
+| Expand a passage to its stored source | `skills/cg-show/SKILL.md` |
+| Inspect capture/search and configure read budgets | `skills/cg-status/SKILL.md` |
+| Delete imported history | `skills/cg-forget/SKILL.md` |
+| Fetch the default search model, including an artifact-only cache | `skills/cg-model-fetch/SKILL.md` |
 
 ## Invariants
 
@@ -119,8 +141,9 @@ asking its own store a question is not a client of itself, and routing it back t
 channel would spend an owner admission slot on the owner's own work.
 
 - Every total is an aggregate, or a page of rows opened as a cursor and read to completion, under
-  the ceilings `owner_control::context_graph_read_limits()` declares once for the whole crate. Only
-  one page is ever held.
+  the ceilings `owner_control::context_graph_read_limits_with_budgets()` declares once for the
+  whole crate, using the held Store's immutable memory and active-time allowances. Only one page
+  is ever held.
 - Every cursor is closed on every exit path, including the error paths;
   `StatusReads::open_cursors()` is the counter that makes that checkable.
 - Never raise the ceilings to make a scan fit. Page instead.
@@ -218,6 +241,12 @@ wall-clock arm through `CG_GATE_JUNIT`, then runs `scripts/check-gate-wall-clock
 modes, `scripts/validate-doc-coverage.py --base` (`GATE_BASE`, default `origin/dev`), and
 `scripts/check-doc-validator-negative-control.sh`, which requires that validator to still fail on
 a repository carrying a dead reference and an unbound claim.
+
+The event-search lifecycle tests run only with
+`--features context-graph-cli/event-search-test-support` in both the integration tests and their
+`CARGO_BIN_EXE_cg` fixture. Their exact test command is
+`cargo nextest run --workspace --no-fail-fast -P default --features context-graph-cli/event-search-test-support`.
+A run without the feature skips those tests.
 `cargo test --workspace` carries four mechanically-enforced arms alongside the ordinary
 behavior proofs:
 
@@ -239,9 +268,8 @@ behavior proofs:
 - **Agent-facing docs pointer check** —
   `crates/context-graph/tests/agents_md_names_only_paths_that_exist.rs` requires every path this
   file names to exist, and every path each crate's own `AGENTS.md` names, and requires the crate
-  table above to name every crate in `crates/` and no directory that is not one. It requires a
-  crate-level `AGENTS.md` from `cg-catalog` and `cg-cli` only; the other five crates carry none
-  yet, and adding one is how a crate joins that list.
+  table above to name every crate in `crates/` and no directory that is not one. The current guides cover `context-graph`,
+  `cg-cli`, `cg-catalog`, `cg-node-fs` and `cg-connector-claude-code`.
 - **Gate wall-clock ratchet** — `[gate_wall_seconds]` in
   `crates/context-graph/tests/fixtures/test_estate_baseline.toml` freezes the wall seconds each
   test binary took, and `[gate_wall_seconds_policy]` declares how far a fresh measurement may

@@ -370,13 +370,10 @@ impl Store {
             [("entity_id".to_string(), Value::Uuid(entity_id.as_uuid()))]
                 .into_iter()
                 .collect();
-        let result = self
-            .db
-            .execute(
-                "SELECT state_delta FROM observations WHERE entity_id = $entity_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT state_delta FROM observations WHERE entity_id = $entity_id",
+            &params,
+        )?;
         let mut count = 0usize;
         for row in &result.rows {
             let is_non_invalidating = match row.first() {

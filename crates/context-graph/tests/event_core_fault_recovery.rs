@@ -769,8 +769,7 @@ async fn ordinary_authenticated_installer_failure_cleans_to_bootstrap_and_retrie
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn interrupted_authenticated_installer_is_refused_to_read_then_recovered_before_retrying_the_saved_binding()
- {
+async fn interrupted_authenticated_installer_preserves_readable_old_schema_until_retry() {
     let root = TempDir::new().expect("tempdir");
     let path = root.path().join("interrupted-install.db");
     let hub = authenticated_hub().await;
@@ -805,32 +804,24 @@ async fn interrupted_authenticated_installer_is_refused_to_read_then_recovered_b
         .expect("the callback records the interrupted installer table");
     drop(store);
 
+    let committed_tables = persisted_table_names(&path);
+    assert_eq!(
+        committed_tables, bootstrap_tables,
+        "read-only metadata sees the old complete schema after the interrupted transaction"
+    );
     assert!(
-        persisted_table_names(&path).contains(&interrupted_table),
-        "the callback-named table is present in the committed read-only image after the interrupted handles drop"
+        !committed_tables.contains(&interrupted_table),
+        "a callback before commit cannot publish its table"
     );
 
-    assert!(
-        matches!(
-            ConsumerReader::open(&path, ConsumerDeclaration::default()),
-            Err(CgError::StoreNeedsWritableRecovery { .. })
-        ),
-        "a consumer is told that the interrupted partial install needs writable recovery"
-    );
-    let recovered = Store::open(tenant_config(path.clone())).expect("open performs recovery first");
-    assert_bootstrap_or_unready(&recovered.sync_database(), &bootstrap_tables, &binding_rows);
-    assert!(
-        matches!(
-            ConsumerReader::open(&path, ConsumerDeclaration::default()),
-            Err(CgError::StoreNeedsWritableRecovery { .. })
-        ),
-        "the recovered but unbound bootstrap still tells the consumer it needs writable recovery"
-    );
-    recovered
+    let reopened = Store::open(tenant_config(path.clone()))
+        .expect("the consistent old schema opens without schema recovery");
+    assert_bootstrap_or_unready(&reopened.sync_database(), &bootstrap_tables, &binding_rows);
+    reopened
         .bind_authenticated_tenant_policy(binding)
-        .expect("saved binding installs the complete schema after recovery");
-    assert_complete_authenticated_install(&recovered);
-    drop(recovered);
+        .expect("saved binding installs the complete schema in one transaction on retry");
+    assert_complete_authenticated_install(&reopened);
+    drop(reopened);
     ConsumerReader::open(&path, ConsumerDeclaration::default())
         .expect("the consumer reader opens the completed authenticated schema");
     hub.stop().await;

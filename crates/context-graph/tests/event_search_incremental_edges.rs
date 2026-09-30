@@ -185,6 +185,7 @@ fn run(
         contexts: context_graph::ContextSelector::one(context_id),
         embedder: embedder.registration(),
         profile: profile(),
+        embedding_workers: NonZeroUsize::MIN,
         max_events_per_batch: NonZeroU32::new(8).expect("nonzero event batch"),
         max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),

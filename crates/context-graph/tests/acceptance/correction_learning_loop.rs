@@ -103,7 +103,8 @@ fn correct_entity_type(
         overlay.item_id, item_id,
         "the correction overlay must target the captured entity"
     );
-    let correction = apply_correction(store, &item_id, corrected_type, skill_id);
+    let correction =
+        apply_correction(store, &item_id, corrected_type, skill_id).expect("read succeeds");
     assert!(
         correction.applied,
         "the correction entrypoint must accept the real captured entity id"
@@ -125,7 +126,7 @@ fn teach_repository_skill_from_real_corrections(store: &Store) -> Vec<LearnedSki
         );
         correct_entity_type(store, &entity, "Repository", None);
     }
-    list_skills_in_store(store)
+    list_skills_in_store(store).expect("read succeeds")
 }
 
 fn learned_repository_retype_skill(skills: &[LearnedSkill]) -> Option<&LearnedSkill> {
@@ -279,7 +280,8 @@ fn correct_chained_retype_after_reopen_with_rules_rewritten(
         fixture.target_digest_id,
         &format!("{} {}", fixture.starting_type, fixture.entity_name),
         None,
-    );
+    )
+    .expect("read succeeds");
     assert!(
         correction.applied,
         "the reopened store must accept the digest correction using only persisted trace metadata"
@@ -308,7 +310,7 @@ fn repeated_real_corrections_promote_persisted_skill_then_run_capture_auto_appli
     let (_dir, store) = fresh_store();
 
     let skills = teach_repository_skill_from_real_corrections(&store);
-    let teaching_events = list_teaching_events_in_store(&store);
+    let teaching_events = list_teaching_events_in_store(&store).expect("read succeeds");
     assert!(
         teaching_events.len() >= 3,
         "the setup must have logged at least three real correction teaching events; got {}",
@@ -388,7 +390,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        )
+        .expect("read succeeds"),
         "the no-op fixture must persist the co-fired retype skill"
     );
     let (noop_report, noop_harness) = run_capture(
@@ -448,7 +451,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        )
+        .expect("read succeeds"),
         "the co-fired retype skill must be older than the learned File -> Repository skill so \
          first-matching-skill shortcuts fail"
     );
@@ -467,7 +471,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        )
+        .expect("read succeeds"),
         "the effectful co-fired retype skill must be older than the learned File -> Repository skill \
          so first-effectful-skill shortcuts fail"
     );
@@ -527,7 +532,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        )
+        .expect("read succeeds"),
         "the fixture must add an unrelated co-firing skill so correction attribution cannot label \
          every skill that fired on the corrected digest"
     );
@@ -789,7 +795,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
          digest; effectful_retype_traces_before={effectful_retype_traces_before:?}"
     );
     assert!(
-        list_drift_alerts(&store).is_empty(),
+        list_drift_alerts(&store).expect("read succeeds").is_empty(),
         "unlabeled firing traces alone must not raise drift before the correction labels a specific \
          firing wrong"
     );
@@ -813,7 +819,8 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         overlay.item_id, target_digest_id,
         "the correction overlay must target the captured unit the user addressed"
     );
-    let correction = apply_correction(&store, &target_digest_id, "File context-graph", None);
+    let correction = apply_correction(&store, &target_digest_id, "File context-graph", None)
+        .expect("read succeeds");
     assert!(
         correction.applied,
         "the correction entrypoint must accept the captured-unit digest id used by cg fix @n"
@@ -823,7 +830,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
         "the correction entrypoint must log a teaching event for the captured-unit correction"
     );
 
-    let alerts = list_drift_alerts(&store);
+    let alerts = list_drift_alerts(&store).expect("read succeeds");
     let traces_after = firing_traces_for_skill(&store, &learned_skill_id);
     let unrelated_traces_after = firing_traces_for_skill(&store, &unrelated_skill_id);
     let cofired_retype_traces_after = firing_traces_for_skill(&store, &cofired_retype_skill_id);
@@ -938,7 +945,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
          traces_after_relabel={traces_after_relabel:?}"
     );
     assert!(
-        list_drift_alerts(&store).is_empty(),
+        list_drift_alerts(&store).expect("read succeeds").is_empty(),
         "drift must be derived from the persisted firing trace labels: when the same target firing \
          is no longer wrong, the alert must disappear"
     );
@@ -1034,7 +1041,7 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        ).expect("read succeeds"),
         "the first chain skill must persist"
     );
     assert!(
@@ -1054,7 +1061,8 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        )
+        .expect("read succeeds"),
         "the second chain skill must persist"
     );
     assert!(
@@ -1074,7 +1082,8 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        )
+        .expect("read succeeds"),
         "the selected-but-unapplied branch skill must persist"
     );
     assert!(
@@ -1098,7 +1107,7 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 fire_right: 0,
                 fire_wrong: 0,
             }
-        ),
+        ).expect("read succeeds"),
         "the unrelated effectful skill must persist"
     );
 
@@ -1606,6 +1615,7 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
          traces={other_after:?}"
     );
     let alert_ids = list_drift_alerts(&reopened_store)
+        .expect("read succeeds")
         .into_iter()
         .map(|alert| alert.skill_id)
         .collect::<std::collections::BTreeSet<_>>();

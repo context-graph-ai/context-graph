@@ -18,20 +18,107 @@ use crate::{
 
 use super::convert::map_engine_err;
 
+type EventSearchRowVisitor<'a> = dyn FnMut(&[String], &[Value]) -> Result<()> + 'a;
+
 pub(crate) trait EventSearchRows {
     fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult>;
+    fn stream_rows(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        visit: &mut EventSearchRowVisitor<'_>,
+    ) -> Result<()>;
     fn event_search_embedder(&self, embedding_space_id: &str) -> Option<Arc<dyn Embedder>>;
     /// Whether this door may read `event_context_counts`. A read-only consumer that declared only
     /// the events table recounts from the events it declared.
     fn reads_event_context_counts(&self) -> bool;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Statement recording (test-only)
+// ---------------------------------------------------------------------------------------------
+
+// Every statement the event-history reads issue goes through `EventSearchRows`, so recording here
+// records the whole shape of a `find`, a `status` or a projection pass: how many statements it
+// costs and what each one is. A proof that a read does not fan out per Context, or never falls back
+// to a recount, is a statement about this list and nothing else -- never about elapsed time.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+thread_local! {
+    static RECORDED_STATEMENTS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Start recording event-history statements on this thread, discarding anything already recorded.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn record_event_history_statements_for_test() {
+    RECORDED_STATEMENTS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+}
+
+/// Take what has been recorded on this thread and stop recording.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_recorded_event_history_statements_for_test() -> Vec<String> {
+    RECORDED_STATEMENTS.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn record_statement(sql: &str) {
+    RECORDED_STATEMENTS.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut()
+            && let Some(recorded) = slot.as_mut()
+        {
+            recorded.push(sql.to_string());
+        }
+    });
+}
+
+/// Compiled out of every build that does not activate the test seam, so a shipped read pays
+/// nothing for it.
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+#[inline(always)]
+fn record_statement(_sql: &str) {}
+
 impl EventSearchRows for Store {
     fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        record_statement(sql);
         self.require_application_ready()?;
         self.internal_db()
             .execute(sql, params)
             .map_err(map_engine_err)
+    }
+
+    fn stream_rows(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        visit: &mut EventSearchRowVisitor<'_>,
+    ) -> Result<()> {
+        record_statement(sql);
+        self.require_application_ready()?;
+        let session = self
+            .internal_db()
+            .read_session(self.read_limits())
+            .map_err(map_engine_err)?;
+        let mut cursor = session.open_cursor(sql, params).map_err(map_engine_err)?;
+        let read = (|| -> Result<()> {
+            let first = cursor.first_page();
+            let mut has_more = first.has_more;
+            for row in &first.rows {
+                visit(&first.columns, row)?;
+            }
+            while has_more {
+                let page = cursor.fetch(None).map_err(map_engine_err)?;
+                has_more = page.has_more;
+                for row in &page.rows {
+                    visit(&page.columns, row)?;
+                }
+            }
+            Ok(())
+        })();
+        let closed = cursor.close().map_err(map_engine_err);
+        read?;
+        closed
     }
 
     fn event_search_embedder(&self, embedding_space_id: &str) -> Option<Arc<dyn Embedder>> {
@@ -45,6 +132,7 @@ impl EventSearchRows for Store {
 
 impl EventSearchRows for ConsumerReader {
     fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        record_statement(sql);
         let mut cursor = self.open_cursor(sql, params)?;
         let paged = (|| -> Result<(Vec<String>, Vec<Vec<Value>>)> {
             let first = cursor.first_page()?;
@@ -69,6 +157,34 @@ impl EventSearchRows for ConsumerReader {
             rows,
             ..QueryResult::empty()
         })
+    }
+
+    fn stream_rows(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+        visit: &mut EventSearchRowVisitor<'_>,
+    ) -> Result<()> {
+        record_statement(sql);
+        let mut cursor = self.open_cursor(sql, params)?;
+        let read = (|| -> Result<()> {
+            let first = cursor.first_page()?;
+            let mut has_more = first.has_more;
+            for row in &first.rows {
+                visit(&first.columns, row)?;
+            }
+            while has_more {
+                let page = cursor.fetch(None)?;
+                has_more = page.has_more;
+                for row in &page.rows {
+                    visit(&page.columns, row)?;
+                }
+            }
+            Ok(())
+        })();
+        let closed = cursor.close();
+        read?;
+        closed
     }
 
     fn event_search_embedder(&self, embedding_space_id: &str) -> Option<Arc<dyn Embedder>> {
@@ -216,11 +332,19 @@ pub(crate) fn captured_event_counts<R: EventSearchRows + ?Sized>(
     rows: &R,
     context_ids: &[ContextId],
 ) -> Result<HashMap<ContextId, CapturedEventCounts>> {
-    let mut counts = if rows.reads_event_context_counts() {
-        stored_event_context_counts(rows, context_ids)?
-    } else {
-        HashMap::new()
-    };
+    // A reader that did not declare the count table used to fall through to the recount below
+    // without saying so: the same answer, five `COUNT(*)` statements per Context, and nothing in
+    // the output to tell anyone it had happened. It is refused by the table's own name instead,
+    // the way every other undeclared read in this crate is, so a consumer fixes its declaration.
+    if !rows.reads_event_context_counts() {
+        return Err(CgError::UndeclaredTableRefused {
+            table: EVENT_CONTEXT_COUNTS_TABLE.to_string(),
+        });
+    }
+    let mut counts = stored_event_context_counts(rows, context_ids)?;
+    // A Context with no row has captured nothing, or had its row taken away by a `forget` that did
+    // not finish rewriting it. The second is why this recounts rather than answering zero: a
+    // Context whose events are still there must not read as empty.
     for context_id in context_ids {
         if !counts.contains_key(context_id) {
             counts.insert(*context_id, count_captured_events(rows, *context_id)?);
@@ -262,7 +386,6 @@ pub(crate) fn registration_map(
 struct ReadyHead {
     context_id: ContextId,
     generation_id: EventSearchGenerationId,
-    event_count: u64,
     source_sha256: String,
     embedding_space_id: String,
     encoding_profile: String,
@@ -357,26 +480,25 @@ pub(crate) fn find_event_history(
     let mut params = HashMap::from([
         ("query".to_string(), Value::Vector(output.vector)),
         ("is_current".to_string(), Value::Bool(true)),
+        ("is_searchable".to_string(), Value::Bool(true)),
     ]);
-    let context_filter = bind_contexts(
-        &mut params,
-        "search_context",
-        classified.ready_heads.iter().map(|head| head.context_id),
-    );
-    let generation_filter = bind_generations(
-        &mut params,
-        "search_generation",
-        classified.ready_heads.iter().map(|head| head.generation_id),
-    );
     // One statement selects every ready (Context, active generation) partition of the vector
-    // column. Generation ids are globally unique and each belongs to one Context, so the cross
-    // product of the two lists names exactly the active pairs; a pair that does not exist is an
-    // empty partition, never a wider search. ContextDB merges the selected partitions before the
-    // single top-k, and `is_current` stays a residual filter inside them.
+    // column, named as the pairs themselves: the standard row-value list, so the engine plans one
+    // index run per active pair rather than one per combination of the two id lists. ContextDB
+    // merges the selected partitions before the single top-k, and `is_current` stays a filter
+    // inside them.
+    let pair_filter = bind_context_generation_pairs(
+        &mut params,
+        "search",
+        classified
+            .ready_heads
+            .iter()
+            .map(|head| (head.context_id, head.generation_id)),
+    );
     let mut predicates = vec![
-        context_filter,
-        generation_filter,
+        pair_filter,
         "is_current = $is_current".to_string(),
+        "is_searchable = $is_searchable".to_string(),
     ];
     if let Some(connector_id) = &filter.connector_id {
         params.insert("connector_filter".into(), Value::Text(connector_id.clone()));
@@ -500,9 +622,12 @@ pub(crate) fn get_event_search_passage(
             "SELECT id, context_id, generation_id, connector_id, session_ref, \
              source_instance_ref, passage_ordinal, first_event_sequence, last_event_sequence, \
              rendered_text, content_sha256, dimension, is_current, created_at \
-             FROM event_search_passages WHERE id = $passage_id AND {context_filter} LIMIT 1"
+             FROM event_search_passages WHERE id = $passage_id AND is_searchable = $is_searchable AND {context_filter} LIMIT 1"
         ),
-        &params,
+        &{
+            params.insert("is_searchable".into(), Value::Bool(true));
+            params
+        },
     )?;
     let Some(row) = passage.rows.first() else {
         return Ok(None);
@@ -643,7 +768,8 @@ fn classify_contexts(
             &generation_params,
         )?;
         for row in &generations.rows {
-            if get_text(row, &generations.columns, "state")? != "ready" {
+            let state = get_text(row, &generations.columns, "state")?;
+            if state != "ready" && state != "building" {
                 continue;
             }
             let context_id = ContextId::from(get_uuid(row, &generations.columns, "context_id")?);
@@ -659,7 +785,6 @@ fn classify_contexts(
                 ReadyHead {
                     context_id,
                     generation_id,
-                    event_count: get_u64(row, &generations.columns, "event_count")?,
                     source_sha256: get_text(
                         row,
                         &generations.columns,
@@ -672,31 +797,68 @@ fn classify_contexts(
         }
     }
 
+    // Coverage bookkeeping for the WHOLE selected set, in a statement count that does not grow
+    // with the Context count: one policy read, two session reads, and -- when anything is ready --
+    // one generation read and one session-progress read. A read per Context here would put four
+    // statements at one Context and 256 at sixty-four on the critical find path.
+    let policies =
+        super::event_search_projection::persisted_work_policies(rows, &selected_context_ids)?;
+    let session_work = super::event_search_projection::selected_captured_session_work_for(
+        rows,
+        &selected_context_ids,
+        &policies,
+    )?;
+    let captured_totals = selected_context_ids
+        .iter()
+        .map(|context_id| {
+            (
+                *context_id,
+                captured
+                    .get(context_id)
+                    .map(|counts| counts.captured)
+                    .unwrap_or(0),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let ready_pairs = selected_context_ids
+        .iter()
+        .filter_map(|context_id| {
+            ready_by_context
+                .get(context_id)
+                .map(|head| (*context_id, head.generation_id))
+        })
+        .collect::<Vec<_>>();
+    let mut policy_coverages = super::event_search_projection::policy_coverage_for(
+        rows,
+        &ready_pairs,
+        &session_work,
+        &captured_totals,
+    )?;
+
     let mut coverage = Vec::with_capacity(selected_context_ids.len());
     let mut ready_heads = Vec::new();
     for context_id in &selected_context_ids {
-        let captured_event_count = captured
+        let captured_event_count = captured_totals.get(context_id).copied().unwrap_or(0);
+        let selected_events = session_work
             .get(context_id)
-            .map(|counts| counts.captured)
+            .map(super::event_search_projection::SessionWorkSet::selected_events)
             .unwrap_or(0);
         if let Some(head) = ready_by_context.remove(context_id) {
-            let pending_event_count = captured_event_count
-                .checked_sub(head.event_count)
-                .ok_or_else(|| {
-                    CgError::Engine(format!(
-                        "ready event-search generation {} covers more events than Context {} retains",
-                        head.generation_id, head.context_id
-                    ))
-                })?;
+            let policy_coverage = policy_coverages.remove(context_id).ok_or_else(|| {
+                CgError::Engine("event-search coverage generation returned no row".into())
+            })?;
             coverage.push(EventSearchContextCoverage {
                 context_id: *context_id,
                 state: EventSearchContextState::Ready,
                 generation_id: Some(head.generation_id),
                 captured_event_count,
-                searchable_event_count: head.event_count,
-                pending_event_count,
+                searchable_event_count: policy_coverage.covered_events,
+                pending_event_count: policy_coverage.pending_events,
+                outside_scope_event_count: policy_coverage.outside_scope_events,
+                outside_scope_indexed_event_count: policy_coverage.outside_scope_indexed_events,
+                no_searchable_text_event_count: policy_coverage.no_searchable_text_events,
                 source_watermark: Some(EventWatermark {
-                    event_count: head.event_count,
+                    event_count: policy_coverage.covered_events,
                     ordered_source_set_sha256: head.source_sha256.clone(),
                 }),
             });
@@ -712,7 +874,10 @@ fn classify_contexts(
                 generation_id: None,
                 captured_event_count,
                 searchable_event_count: 0,
-                pending_event_count: captured_event_count,
+                pending_event_count: selected_events,
+                outside_scope_event_count: captured_event_count.saturating_sub(selected_events),
+                outside_scope_indexed_event_count: 0,
+                no_searchable_text_event_count: 0,
                 source_watermark: None,
             });
         }
@@ -909,7 +1074,7 @@ fn source_time_range(
     (first, last)
 }
 
-fn bind_contexts(
+pub(crate) fn bind_contexts(
     params: &mut HashMap<String, Value>,
     prefix: &str,
     values: impl IntoIterator<Item = ContextId>,
@@ -922,7 +1087,7 @@ fn bind_contexts(
     )
 }
 
-fn bind_generations(
+pub(crate) fn bind_generations(
     params: &mut HashMap<String, Value>,
     prefix: &str,
     values: impl IntoIterator<Item = EventSearchGenerationId>,
@@ -933,6 +1098,37 @@ fn bind_generations(
         prefix,
         values.into_iter().map(|id| id.as_uuid()),
     )
+}
+
+/// The (Context, generation) pairs a statement selects, as one row-value list:
+/// `(context_id, generation_id) IN (($c0, $g0), ($c1, $g1), ...)`. One pair is written as two
+/// equalities.
+pub(crate) fn bind_context_generation_pairs(
+    params: &mut HashMap<String, Value>,
+    prefix: &str,
+    pairs: impl IntoIterator<Item = (ContextId, EventSearchGenerationId)>,
+) -> String {
+    let pairs = pairs
+        .into_iter()
+        .map(|(context, generation)| (context.as_uuid(), generation.as_uuid()))
+        .collect::<BTreeSet<_>>();
+    debug_assert!(!pairs.is_empty());
+    let mut rows = Vec::with_capacity(pairs.len());
+    for (index, (context, generation)) in pairs.into_iter().enumerate() {
+        let context_name = format!("{prefix}_context_{index}");
+        let generation_name = format!("{prefix}_generation_{index}");
+        params.insert(context_name.clone(), Value::Uuid(context));
+        params.insert(generation_name.clone(), Value::Uuid(generation));
+        rows.push((context_name, generation_name));
+    }
+    if let [(context, generation)] = rows.as_slice() {
+        return format!("context_id = ${context} AND generation_id = ${generation}");
+    }
+    let listed = rows
+        .iter()
+        .map(|(context, generation)| format!("(${context}, ${generation})"))
+        .collect::<Vec<_>>();
+    format!("(context_id, generation_id) IN ({})", listed.join(", "))
 }
 
 fn bind_events(
@@ -948,7 +1144,7 @@ fn bind_events(
     )
 }
 
-fn bind_uuid_values(
+pub(crate) fn bind_uuid_values(
     params: &mut HashMap<String, Value>,
     column: &str,
     prefix: &str,

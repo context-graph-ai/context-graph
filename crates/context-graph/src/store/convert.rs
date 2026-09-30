@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use contextdb_core::Error as EngineError;
-use contextdb_core::read_contract::{ReadFailureDetail, ReadFailureKind, ReaderBreadcrumb};
+use contextdb_core::read_contract::{
+    ReadFailureDetail, ReadFailureKind, ReadFailureLimit, ReaderBreadcrumb,
+};
 
 use crate::Result;
 use crate::error::EngineError as CgEngineError;
@@ -95,12 +97,27 @@ pub(crate) fn map_consumer_open_err(store_path: &Path, err: EngineError) -> CgEr
         }
         // Somebody is holding the store. Nothing is wrong with it, and the caller is told who by
         // the one conversion that already knows how to say so.
+        EngineError::ReaderCoordinationUnavailable { .. } => {
+            return map_engine_err(err);
+        }
         EngineError::DatabaseLocked { .. } => {}
         EngineError::ReadFailure(failure)
             if matches!(
                 failure.detail(),
                 ReadFailureDetail::HeldByWriter(_) | ReadFailureDetail::HeldByReaders(_)
             ) => {}
+        EngineError::MemoryBudgetExceeded {
+            budget_limit_bytes, ..
+        } => {
+            return CgError::Engine(format!(
+                "the read went past the memory it is allowed: {budget_limit_bytes} bytes"
+            ));
+        }
+        EngineError::ReadFailure(failure)
+            if matches!(failure.detail(), ReadFailureDetail::OwnerLimitExceeded(_)) =>
+        {
+            return map_engine_err(err);
+        }
         // Everything else refused this open with the store sitting right there: a permission, a
         // mount, a metadata failure, damage. The store is named and what the substrate found
         // travels with it, because the next step depends entirely on which of those it is.
@@ -214,6 +231,41 @@ pub(crate) fn map_engine_err(err: EngineError) -> CgError {
                 path: PathBuf::from(&detail.store_path),
             }
         }
+        EngineError::ReaderCoordinationUnavailable {
+            operation,
+            path,
+            reason,
+        } => CgError::ReaderCoordinationUnavailable {
+            operation,
+            path,
+            reason,
+        },
+        EngineError::ReadFailure(failure)
+            if matches!(
+                failure.detail(),
+                ReadFailureDetail::OwnerLimitExceeded(detail)
+                    if detail.limit == ReadFailureLimit::ActiveMs
+            ) =>
+        {
+            let ReadFailureDetail::OwnerLimitExceeded(detail) = failure.detail() else {
+                unreachable!("the guard admits only the active-time limit detail")
+            };
+            CgError::ReadActiveTimeExceeded {
+                limit_ms: detail.value,
+            }
+        }
+        EngineError::ReadFailure(failure) => CgError::Engine(failure.to_string()),
+        // The working memory cg is allowed on this machine ran out. Nothing is damaged and the
+        // statement wrote nothing, so this is a budget the operator can raise -- not an engine
+        // fault, and not prose for them to parse.
+        EngineError::MemoryBudgetExceeded {
+            requested_bytes,
+            budget_limit_bytes,
+            ..
+        } => CgError::WriteDidNotFitTheMemoryLimit {
+            requested_bytes,
+            limit_bytes: budget_limit_bytes,
+        },
         EngineError::BfsDepthExceeded(d) => CgError::Engine(format!("bfs depth exceeded: {d}")),
         // A schema the engine will not accept — a consumer-declared table among
         // them. The engine already says what is wrong and what to declare instead,
@@ -487,6 +539,32 @@ mod tests {
         ReadFailureDetail, ReadFailureKind,
     };
 
+    #[test]
+    fn active_time_refusals_keep_their_typed_condition() {
+        use contextdb_core::read_contract::OwnerLimitExceededDetail;
+        let refusal = |limit| {
+            EngineError::ReadFailure(ReadFailure::owner_limit_exceeded(
+                OwnerLimitExceededDetail {
+                    limit,
+                    value: 5_000,
+                    required: None,
+                    statement: None,
+                },
+            ))
+        };
+        assert_eq!(
+            map_engine_err(refusal(ReadFailureLimit::ActiveMs)),
+            CgError::ReadActiveTimeExceeded { limit_ms: 5_000 },
+        );
+        assert!(
+            matches!(
+                map_engine_err(refusal(ReadFailureLimit::Work)),
+                CgError::Engine(_)
+            ),
+            "another read limit must remain a terminal unrelated failure"
+        );
+    }
+
     /// The store path a refusal is about, as the substrate renders it: a string, always present.
     const HELD_STORE_PATH: &str = "/data/cg/memory.db";
 
@@ -665,6 +743,24 @@ mod tests {
                 holder_pid: Some(4242),
                 path,
             }
+        );
+    }
+
+    #[test]
+    fn reader_coordination_refusal_keeps_its_operation_path_and_reason() {
+        let refusal = EngineError::ReaderCoordinationUnavailable {
+            operation: "authoritative purge".into(),
+            path: "/data/cg/runtime".into(),
+            reason: "reader registry cannot be authenticated".into(),
+        };
+        let mapped = map_consumer_open_err(Path::new("/data/cg/store.db"), refusal);
+        assert!(matches!(
+            mapped,
+            CgError::ReaderCoordinationUnavailable { .. }
+        ));
+        assert_eq!(
+            mapped.to_string(),
+            "authoritative purge cannot safely coordinate readers through /data/cg/runtime: reader registry cannot be authenticated"
         );
     }
 }

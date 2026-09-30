@@ -48,15 +48,21 @@ pub(super) fn register_conflict_detection_triggers(db: &Database) -> Result<()> 
         .iter()
         .any(|name| name == CONFLICT_DETECTION_ON_DECISIONS)
     {
-        db.register_trigger_callback(CONFLICT_DETECTION_ON_DECISIONS, run_conflict_detection)
-            .map_err(map_engine_err)?;
+        db.register_transactional_trigger_callback(
+            CONFLICT_DETECTION_ON_DECISIONS,
+            run_conflict_detection,
+        )
+        .map_err(map_engine_err)?;
     }
     if !registered
         .iter()
         .any(|name| name == CONFLICT_DETECTION_ON_OUTCOMES)
     {
-        db.register_trigger_callback(CONFLICT_DETECTION_ON_OUTCOMES, run_conflict_detection)
-            .map_err(map_engine_err)?;
+        db.register_transactional_trigger_callback(
+            CONFLICT_DETECTION_ON_OUTCOMES,
+            run_conflict_detection,
+        )
+        .map_err(map_engine_err)?;
     }
     Ok(())
 }

@@ -4054,7 +4054,7 @@ impl ModelConnectionCatalog {
                 Ok(()) => err.clone(),
                 Err(rollback_err) => {
                     format!(
-                        "{err}; rollback after legacy stored-secret cleanup failure failed: {rollback_err}"
+                        "{err}; rollback after previous stored-secret cleanup failure failed: {rollback_err}"
                     )
                 }
             };

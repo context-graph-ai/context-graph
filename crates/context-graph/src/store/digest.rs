@@ -181,13 +181,10 @@ impl Store {
         let params: HashMap<String, Value> = [("id".to_string(), Value::Uuid(id.as_uuid()))]
             .into_iter()
             .collect();
-        let result = self
-            .db
-            .execute(
+        let result = self.read_query(
                 "SELECT id, source, session_ref, summary, vector_text, dimension, context_id, properties, created_at FROM digests WHERE id = $id",
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         if result.rows.is_empty() {
             return Ok(None);
         }
@@ -198,13 +195,10 @@ impl Store {
         &self,
         context_id: ContextId,
     ) -> Result<Vec<uuid::Uuid>> {
-        let result = self
-            .db
-            .execute(
-                "SELECT id FROM digests WHERE context_id = $context_id",
-                &HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            "SELECT id FROM digests WHERE context_id = $context_id",
+            &HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
+        )?;
         let mut source_ids = Vec::new();
         for row in &result.rows {
             let digest_id = DigestId::from(get_uuid(row, &result.columns, "id")?);
@@ -270,7 +264,7 @@ impl Store {
         sql.push_str(&format!(
             " ORDER BY vector_text <=> $query LIMIT {candidate_limit}"
         ));
-        let result = self.db.execute(&sql, &params).map_err(map_engine_err)?;
+        let result = self.read_query(&sql, &params)?;
         let vector_trace = format!("{:?}", result.trace);
         let mut candidates = Vec::new();
         for row in result.rows {
@@ -500,18 +494,15 @@ impl Store {
             ("digest_id".to_string(), Value::Uuid(digest_id.as_uuid())),
             ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
         ]);
-        let result = self
-            .db
-            .execute(
-                "SELECT source_id FROM GRAPH_TABLE(
+        let result = self.read_query(
+            "SELECT source_id FROM GRAPH_TABLE(
                     edges MATCH (d)<-[:EXTRACTED_FROM]-(s)
                     WHERE d.id = $digest_id
                     COLUMNS (s.id AS source_id)
                 )
                 WHERE source_id IN (SELECT source_id FROM edges WHERE context_id = $context_id)",
-                &params,
-            )
-            .map_err(map_engine_err)?;
+            &params,
+        )?;
         let graph_trace = format!("{:?}", result.trace);
         let mut graph_ids = result
             .rows
@@ -536,13 +527,10 @@ impl Store {
 
         let mut params = HashMap::new();
         let id_list = uuid_param_list("source", source_ids.iter().copied(), &mut params);
-        let intentions = self
-            .db
-            .execute(
-                &format!("SELECT id, description FROM intentions WHERE id IN ({id_list})"),
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let intentions = self.read_query(
+            &format!("SELECT id, description FROM intentions WHERE id IN ({id_list})"),
+            &params,
+        )?;
         for row in &intentions.rows {
             let raw_id = value_uuid(row, &intentions.columns, "id")?;
             let overlay = crate::overlay::overlay_read_decision_for_item(self, &raw_id.to_string());
@@ -564,13 +552,10 @@ impl Store {
 
         let mut params = HashMap::new();
         let id_list = uuid_param_list("source", source_ids.iter().copied(), &mut params);
-        let decisions = self
-            .db
-            .execute(
-                &format!("SELECT id, description, status FROM decisions WHERE id IN ({id_list})"),
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let decisions = self.read_query(
+            &format!("SELECT id, description, status FROM decisions WHERE id IN ({id_list})"),
+            &params,
+        )?;
         for row in &decisions.rows {
             let raw_id = value_uuid(row, &decisions.columns, "id")?;
             let overlay = crate::overlay::overlay_read_decision_for_item(self, &raw_id.to_string());
@@ -597,15 +582,12 @@ impl Store {
 
         let mut params = HashMap::new();
         let id_list = uuid_param_list("source", source_ids.iter().copied(), &mut params);
-        let observations = self
-            .db
-            .execute(
+        let observations = self.read_query(
                 &format!(
                     "SELECT id, observation_type, state_delta, entity_id FROM observations WHERE id IN ({id_list})"
                 ),
                 &params,
-            )
-            .map_err(map_engine_err)?;
+            )?;
         let mut observation_rows = Vec::new();
         let mut entity_ids = source_ids.clone();
         for row in &observations.rows {
@@ -663,13 +645,10 @@ impl Store {
         }
         let mut params = HashMap::new();
         let id_list = uuid_param_list("entity", ids.iter().copied(), &mut params);
-        let result = self
-            .db
-            .execute(
-                &format!("SELECT id, name FROM entities WHERE id IN ({id_list})"),
-                &params,
-            )
-            .map_err(map_engine_err)?;
+        let result = self.read_query(
+            &format!("SELECT id, name FROM entities WHERE id IN ({id_list})"),
+            &params,
+        )?;
         let mut out = HashMap::new();
         for row in &result.rows {
             out.insert(

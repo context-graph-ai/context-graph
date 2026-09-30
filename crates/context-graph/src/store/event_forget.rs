@@ -17,9 +17,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use contextdb_core::Value;
+use contextdb_core::read_contract::CursorPage;
 use serde::{Deserialize, Serialize};
 
-use crate::{CgError, ConnectorId, ContextId, EventPlacementState, Result, Store};
+use crate::consumer_read::ConsumerCursor;
+use crate::{CgError, ConnectorId, ConsumerReader, ContextId, EventPlacementState, Result, Store};
 
 use super::convert::map_engine_err;
 use super::event::rewrite_event_context_counts;
@@ -44,6 +46,127 @@ impl ForgetSelection {
             ForgetSelection::Session { context_id, .. }
             | ForgetSelection::Context { context_id } => *context_id,
         }
+    }
+}
+
+impl ConsumerReader {
+    /// Count the distinct sessions the forget planner selects, including sources with no events.
+    /// Merge three ordered, bounded cursor streams so the count needs no set of all sessions.
+    pub fn forget_selection_session_count(&self, selection: &ForgetSelection) -> Result<u64> {
+        let mut params = HashMap::from([(
+            "context_id".to_string(),
+            Value::Uuid(selection.context_id().as_uuid()),
+        )]);
+        let predicate = match selection {
+            ForgetSelection::Session {
+                connector_id,
+                session_ref,
+                ..
+            } => {
+                params.insert(
+                    "connector_id".to_string(),
+                    Value::Text(connector_id.clone()),
+                );
+                params.insert("session_ref".to_string(), Value::Text(session_ref.clone()));
+                "context_id = $context_id AND connector_id = $connector_id AND session_ref = $session_ref"
+            }
+            ForgetSelection::Context { .. } => "context_id = $context_id",
+        };
+        let mut streams = Vec::with_capacity(3);
+        let read = (|| {
+            for table in [
+                "events",
+                "event_source_checkpoints",
+                "event_source_locators",
+            ] {
+                let cursor = self.open_cursor(
+                    &format!(
+                        "SELECT DISTINCT connector_id, session_ref FROM {table} WHERE {predicate} ORDER BY connector_id ASC, session_ref ASC"
+                    ),
+                    &params,
+                )?;
+                streams.push(ForgetSessionStream::new(table, cursor));
+            }
+            let mut heads = streams
+                .iter_mut()
+                .map(ForgetSessionStream::next_key)
+                .collect::<Result<Vec<_>>>()?;
+            let mut count = 0_u64;
+            while let Some(key) = heads.iter().filter_map(Option::as_ref).min().cloned() {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| CgError::Engine("forget session count overflowed".into()))?;
+                for (stream, head) in streams.iter_mut().zip(&mut heads) {
+                    while head.as_ref() == Some(&key) {
+                        *head = stream.next_key()?;
+                    }
+                }
+            }
+            Ok(count)
+        })();
+        let mut close_error = None;
+        for stream in &mut streams {
+            if let Err(error) = stream.close()
+                && close_error.is_none()
+            {
+                close_error = Some(error);
+            }
+        }
+        let count = read?;
+        if let Some(error) = close_error {
+            return Err(error);
+        }
+        Ok(count)
+    }
+}
+
+/// One table's sorted distinct keys, retaining at most one cursor page.
+struct ForgetSessionStream {
+    table: &'static str,
+    cursor: ConsumerCursor,
+    page: Option<CursorPage>,
+    offset: usize,
+}
+
+impl ForgetSessionStream {
+    fn new(table: &'static str, cursor: ConsumerCursor) -> Self {
+        Self {
+            table,
+            cursor,
+            page: None,
+            offset: 0,
+        }
+    }
+
+    fn next_key(&mut self) -> Result<Option<(String, String)>> {
+        if self.page.is_none() {
+            self.page = Some(self.cursor.first_page()?.clone());
+        }
+        loop {
+            let page = self.page.as_ref().expect("initialized above");
+            if let Some(row) = page.rows.get(self.offset) {
+                self.offset += 1;
+                return match (row.first(), row.get(1)) {
+                    (Some(Value::Text(connector)), Some(Value::Text(session))) => {
+                        Ok(Some((connector.clone(), session.clone())))
+                    }
+                    other => Err(CgError::Engine(format!(
+                        "forget session read from {} returned {other:?}",
+                        self.table
+                    ))),
+                };
+            }
+            if !page.has_more {
+                return Ok(None);
+            }
+            self.page = Some(self.cursor.fetch(std::num::NonZeroUsize::new(128))?);
+            self.offset = 0;
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.page = None;
+        self.cursor.close()
     }
 }
 
@@ -87,8 +210,10 @@ pub struct RetiredInterpretation {
 const CONTEXT_DERIVED_TABLES: &[&str] = &[
     "event_context_counts",
     "event_search_heads",
+    "event_search_work_policies",
     "event_search_leases",
     "event_search_cursors",
+    "event_search_session_progress",
     "event_search_embedding_handles",
     "event_search_passage_sources",
     "event_search_passages",
@@ -451,6 +576,11 @@ fn session_plan(
     plan.select_in("adapter_coverage_gaps", "gap", "id", orphaned_gaps);
     let session_predicate =
         "context_id = $context_id AND connector_id = $connector_id AND session_ref = $session_ref";
+    // The captured-session summary is erased with its immutable events. Other sessions survive the
+    // same authoritative purge, so reads never need a post-forget archive recount.
+    plan.select("event_context_sessions", session_predicate);
+    plan.select("event_search_request_selections", session_predicate);
+    plan.select("event_search_refusal_frontiers", session_predicate);
     let mut source_values = Vec::with_capacity(sources.len());
     for (index, source) in sources.into_iter().enumerate() {
         let name = format!("ordering_source_{index}");
@@ -512,8 +642,11 @@ fn context_plan(store: &Store, context_id: ContextId) -> Result<Option<(PurgePla
     let mut plan = PurgePlan::new(context_id);
     for table in CONTEXT_DERIVED_TABLES.iter().chain(
         [
+            "event_search_request_selections",
+            "event_search_refusal_frontiers",
             "adapter_coverage_gap_events",
             "adapter_coverage_gaps",
+            "event_context_sessions",
             "event_context_revisions",
             "event_source_ordering",
             "event_source_checkpoints",

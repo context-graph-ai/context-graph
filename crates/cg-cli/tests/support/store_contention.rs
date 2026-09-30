@@ -305,6 +305,10 @@ pub fn run_cg_below_runtime_root(
         .env("CG_USE_TEST_LEXICAL_EMBEDDER", "1")
         .env("HOME", data_root)
         .env("XDG_RUNTIME_DIR", runtime_directory)
+        .env(
+            "CG_EVENT_SEARCH_TEST_PRE_CATCH_UP_BARRIER",
+            runtime_directory,
+        )
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
         .env_remove("ANTHROPIC_API_KEY")

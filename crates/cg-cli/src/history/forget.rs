@@ -4,12 +4,15 @@ use context_graph::{CgError, ContextSelector, ForgetSelection, Store};
 use serde_json::{Value, json};
 
 use super::{
-    OutputFormat, SelectionError, Terminal, context_names, db_path, grouped, library_refusal,
-    parse, print_json, refuse, resolve_selection, search_artifact_available, selection_refusal,
-    store_config, store_not_found, usage,
+    OutputFormat, SelectionError, Terminal, configured_passage_profile, context_names, db_path,
+    grouped, library_refusal, parse, print_json, refuse, resolve_selection,
+    search_artifact_available, selection_refusal, store_config, store_not_found, usage,
 };
 
-pub(crate) fn handle_forget(args: &[String]) -> i32 {
+pub(crate) fn handle_forget(
+    args: &[String],
+    read_memory_limit_bytes: std::num::NonZeroUsize,
+) -> i32 {
     let format = super::super::output_format(args);
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{FORGET_HELP}");
@@ -52,7 +55,7 @@ pub(crate) fn handle_forget(args: &[String]) -> i32 {
         }
     }
     let root = super::super::data_root();
-    let reader = match super::open_reader(&root) {
+    let reader = match super::open_reader(&root, read_memory_limit_bytes) {
         Ok(reader) => reader,
         Err(CgError::StoreMissing { .. }) => return store_not_found(format, &db_path(&root), true),
         Err(error) => return library_refusal(format, &error),
@@ -78,9 +81,7 @@ pub(crate) fn handle_forget(args: &[String]) -> i32 {
         Ok(mut set) => set.contexts.remove(0),
         Err(error) => return library_refusal(format, &error),
     };
-    drop(reader);
-
-    let (selector, sessions, events, retry) = match &session {
+    let (selector, events, retry) = match &session {
         Some(session_ref) => {
             let streams = status
                 .source_streams
@@ -102,14 +103,12 @@ pub(crate) fn handle_forget(args: &[String]) -> i32 {
                     connector_id,
                     session_ref: session_ref.clone(),
                 },
-                u64::from(!streams.is_empty()),
                 events,
                 retry,
             )
         }
         None => (
             ForgetSelection::Context { context_id },
-            status.sessions,
             status.captured_events,
             format!("cg forget --context {context_name} --yes"),
         ),
@@ -126,7 +125,33 @@ pub(crate) fn handle_forget(args: &[String]) -> i32 {
         }),
     };
 
-    if events > 0 && !parsed.has("--yes") {
+    // Status counts sessions with captured events only. The planner also selects checkpoint and
+    // locator sessions whose sources had no decodable records, so confirmation uses that count.
+    let sessions = match reader.forget_selection_session_count(&selector) {
+        Ok(count) => count,
+        Err(error) => return library_refusal(format, &error),
+    };
+    drop(reader);
+
+    if sessions == 0 {
+        if format == OutputFormat::Text {
+            println!("nothing to forget in \"{context_name}\"");
+        } else {
+            print_json(&json!({
+                "ok": true,
+                "state": "nothing_to_forget",
+                "selection": selection_json,
+                "counts": {"sessions": 0, "events": 0, "anchors": 0, "passages": 0, "vectors": 0},
+                "tables": [],
+                "remaining_events": status.captured_events,
+                "search": {"status": "nothing_to_index", "pending_events": 0},
+                "retry": Value::Null,
+            }));
+        }
+        return 0;
+    }
+
+    if !parsed.has("--yes") {
         let prompt =
             format!("Forget {sessions} sessions ({events} events) from \"{context_name}\"? [y/N] ");
         let confirmed = match Terminal::open() {
@@ -168,10 +193,15 @@ pub(crate) fn handle_forget(args: &[String]) -> i32 {
         }
     }
 
-    let store = match Store::open(store_config(&root, None)) {
+    let store = match Store::open(store_config(&root, None, read_memory_limit_bytes)) {
         Ok(store) => store,
+        Err(error @ CgError::WriteDidNotFitTheMemoryLimit { .. }) => {
+            return erasure_memory_refusal(format, &selection_json, &error);
+        }
         Err(error) => return library_refusal(format, &error),
     };
+    #[cfg(all(feature = "event-search-test-support", unix))]
+    pause_before_forget_for_test();
     let receipt = match store.forget_event_history(selector) {
         Ok(receipt) => receipt,
         Err(CgError::EventHistoryForgetRequiresEdgeDiscard { .. }) => {
@@ -183,9 +213,13 @@ pub(crate) fn handle_forget(args: &[String]) -> i32 {
                 &format!("error: {message}"),
             );
         }
+        Err(error @ CgError::WriteDidNotFitTheMemoryLimit { .. }) => {
+            return erasure_memory_refusal(format, &selection_json, &error);
+        }
         Err(
             error @ (CgError::StoreLocked { .. }
             | CgError::StoreHeldByReaders { .. }
+            | CgError::ReaderCoordinationUnavailable { .. }
             | CgError::NotFound { .. }),
         ) => return library_refusal(format, &error),
         Err(error) => {
@@ -217,17 +251,26 @@ pub(crate) fn handle_forget(args: &[String]) -> i32 {
             "next": "cg model fetch --defaults",
         })
     } else {
-        match super::worker::kick(&root) {
-            Ok(worker) => json!({
-                "status": "rebuild_scheduled",
-                "pending_events": remaining,
-                "worker": worker,
-            }),
+        match configured_passage_profile(&root) {
             Err(reason) => json!({
                 "status": "rebuild_not_started",
                 "pending_events": remaining,
                 "reason": reason,
             }),
+            Ok(profile) => {
+                match super::worker::kick(&root, &profile, context_id, read_memory_limit_bytes) {
+                    Ok(worker) => json!({
+                        "status": "rebuild_scheduled",
+                        "pending_events": remaining,
+                        "worker": worker,
+                    }),
+                    Err(reason) => json!({
+                        "status": "rebuild_not_started",
+                        "pending_events": remaining,
+                        "reason": reason,
+                    }),
+                }
+            }
         }
     };
     if format == OutputFormat::Text {
@@ -281,6 +324,47 @@ pub(crate) fn handle_forget(args: &[String]) -> i32 {
     0
 }
 
+fn erasure_memory_refusal(format: OutputFormat, selection: &Value, error: &CgError) -> i32 {
+    let CgError::WriteDidNotFitTheMemoryLimit {
+        requested_bytes,
+        limit_bytes,
+    } = error
+    else {
+        unreachable!("erasure memory refusal requires a typed memory condition")
+    };
+    let message = format!(
+        "erasure needed {} of working memory but cg is allowed {} on this machine; no history was erased. {}",
+        context_graph::write_budget::human_bytes(*requested_bytes as u64),
+        context_graph::write_budget::human_bytes(*limit_bytes as u64),
+        context_graph::write_budget::how_to_raise_the_writer_budget()
+    );
+    refuse(
+        format,
+        1,
+        json!({"ok": false, "state": "purge_refused", "condition": "WriteDidNotFitTheMemoryLimit", "selection": selection, "message": message}),
+        &format!("error (WriteDidNotFitTheMemoryLimit): {message}"),
+    )
+}
+
+#[cfg(all(feature = "event-search-test-support", unix))]
+fn pause_before_forget_for_test() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let Some(socket) = std::env::var_os("CG_FORGET_TEST_BEFORE_PURGE_SOCKET") else {
+        return;
+    };
+    let mut stream = UnixStream::connect(socket).expect("connect forget test barrier");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .expect("bound forget test barrier");
+    stream.write_all(b"r").expect("report writable open");
+    let mut release = [0_u8; 1];
+    stream
+        .read_exact(&mut release)
+        .expect("wait for purge release");
+}
+
 const FORGET_HELP: &str =
     "Usage: cg forget --session <ref> [--context NAME] [--yes] [--format json|text]
        cg forget --context NAME [--yes] [--format json|text]
@@ -293,10 +377,16 @@ Deletes imported conversation history from this machine's Context Graph store. -
 one imported session of the Context linked to the current project (or the Context named with
 --context); --context alone deletes every imported session in that Context. The events, their
 exact anchors, file checkpoints and every search passage and vector derived from them go in one
-authoritative erasure, or nothing changes. The Context and its project link remain, so the next
-import lands in the same place. Forgetting one session also clears that Context's search index;
-forget then schedules the re-indexing of the remaining history in the background (or reports that
-the local model must first be installed with `cg model fetch --defaults`).
+authoritative erasure, or nothing changes. Erasure uses the writer limit shown by `cg status`;
+it has no capture proof floor. If erasure exceeds that limit, `purge_refused` reports
+`WriteDidNotFitTheMemoryLimit` and leaves history unchanged. Set --write-memory-limit-bytes <BYTES>
+for one attempt, or [write] memory_limit_bytes in cg/fabric.toml for every command.
+A selection with no events,
+checkpoints or source locators returns nothing_to_forget after read-only inspection, without
+opening the store for writing. The Context and its project link remain, so the next import lands
+in the same place. Forgetting one session also clears that Context's search index; forget then
+schedules the re-indexing of remaining history in the background (or reports that the local model
+must first be installed with `cg model fetch --defaults`).
 
 On a terminal it asks `Forget <N> sessions (<M> events) from \"<context>\"? [y/N]` and Enter means
 no. Without a terminal it requires --yes.";

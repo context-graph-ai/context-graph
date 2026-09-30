@@ -444,12 +444,7 @@ pub fn semantic_search(
         .get(&EvidenceKind::Text)
         .cloned()
         .ok_or(CgError::TextEmbedderDisabled)?;
-    let space =
-        store
-            .embedding_space_for_id(&space_id)
-            .map_err(|_| CgError::UnknownEmbeddingSpace {
-                id: space_id.clone(),
-            })?;
+    let space = store.embedding_space_for_id(&space_id)?;
     let embedder = store
         .embedders
         .get(&space_id)
@@ -2172,15 +2167,28 @@ mod event_search_space_isolation_tests {
     /// there is none, so a store without one can never reach the cross-space refusal the arms
     /// below drive. It is the same offline, download-denying configuration over the canonical
     /// installed model the rest of this module uses — never `default_nomic()`, which could fetch.
-    fn store_with_both_spaces() -> Store {
+    fn store_with_both_spaces() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().expect("store dir");
-        Store::open(StoreConfig {
+        let store = Store::open(StoreConfig {
             db_path: dir.path().join("cg.db"),
             extra_embedding_spaces: vec![event_history_embedding_space()],
             default_text_embedder: Some(local_offline_nomic_config()),
             ..Default::default()
         })
-        .expect("open store with both spaces registered")
+        .expect("open store with both spaces registered");
+        (dir, store)
+    }
+
+    #[test]
+    fn semantic_search_preserves_a_space_lookup_engine_error() {
+        let (_dir, mut store) = store_with_both_spaces();
+        store.read_memory_limit_bytes = std::num::NonZeroUsize::new(1).unwrap();
+
+        let result = semantic_search(&store, "query", VectorSearchFilters::default());
+        assert!(
+            matches!(&result, Err(CgError::Engine(_))),
+            "a failed space lookup must retain its engine error, got {result:?}"
+        );
     }
 
     /// The canonical production declaration ([`event_history_embedding_space`]) binds only to the
@@ -2245,7 +2253,7 @@ mod event_search_space_isolation_tests {
         // (`compare_embedding_targets_across_spaces`) as well as through `vector_search` against
         // a store that has both spaces registered — both must refuse by exact id and dimension,
         // never by coincidence of a shared table.
-        let store = store_with_both_spaces();
+        let (_dir, store) = store_with_both_spaces();
         let result = vector_search(
             &store,
             &query_output.vector,

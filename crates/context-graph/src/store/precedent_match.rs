@@ -33,8 +33,11 @@ pub(super) fn register_precedent_match_trigger(db: &Database) -> Result<()> {
         .iter()
         .any(|name| name == PRECEDENT_MATCH_ON_DECISIONS)
     {
-        db.register_trigger_callback(PRECEDENT_MATCH_ON_DECISIONS, run_precedent_match)
-            .map_err(map_engine_err)?;
+        db.register_transactional_trigger_callback(
+            PRECEDENT_MATCH_ON_DECISIONS,
+            run_precedent_match,
+        )
+        .map_err(map_engine_err)?;
     }
     Ok(())
 }

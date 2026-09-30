@@ -1,17 +1,15 @@
 use std::collections::HashMap;
 
-use contextdb_core::Value;
-use serde_json::Value as JsonValue;
-use uuid::Uuid;
-
 use crate::Result;
 use crate::TxId;
 use crate::error::CgError;
 use crate::types::*;
+use contextdb_core::Value;
+use serde_json::Value as JsonValue;
 
 use super::Store;
 use super::convert::{audit_operation_from_str, audit_operation_str, map_engine_err};
-use super::encode::{get_json, get_optional_text, get_text, get_txid, get_uuid};
+use super::encode::{get_json, get_optional_text, get_optional_txid, get_text, get_txid, get_uuid};
 use super::graph_rows::GraphRows;
 
 impl Store {
@@ -31,6 +29,89 @@ impl Store {
         context_id: ContextId,
         payload: Option<JsonValue>,
     ) -> Result<()> {
+        self.record_audit_in_tx_with_id(
+            tx, operation, principal, reason, target, context_id, payload,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_audit_in_tx_with_id(
+        &self,
+        tx: TxId,
+        operation: AuditOperation,
+        principal: Principal,
+        reason: Option<String>,
+        target: AuditTarget,
+        context_id: ContextId,
+        payload: Option<JsonValue>,
+    ) -> Result<AuditId> {
+        self.record_audit_in_tx_with_outcome_recorded_at(
+            tx, operation, principal, reason, target, context_id, payload, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_outcome_audit_in_tx(
+        &self,
+        tx: TxId,
+        operation: AuditOperation,
+        principal: Principal,
+        reason: Option<String>,
+        target: AuditTarget,
+        context_id: ContextId,
+        outcome: &Outcome,
+    ) -> Result<()> {
+        self.record_outcome_audit_in_tx_with_id(
+            tx, operation, principal, reason, target, context_id, outcome,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_outcome_audit_in_tx_with_id(
+        &self,
+        tx: TxId,
+        operation: AuditOperation,
+        principal: Principal,
+        reason: Option<String>,
+        target: AuditTarget,
+        context_id: ContextId,
+        outcome: &Outcome,
+    ) -> Result<AuditId> {
+        let mut payload = serde_json::to_value(outcome)
+            .map_err(|e| CgError::Engine(format!("outcome serialize: {e}")))?;
+        let JsonValue::Object(snapshot) = &mut payload else {
+            return Err(CgError::Engine(
+                "outcome snapshot must be a JSON object".to_string(),
+            ));
+        };
+        snapshot.remove("recorded_at");
+        self.record_audit_in_tx_with_outcome_recorded_at(
+            tx,
+            operation,
+            principal,
+            reason,
+            target,
+            context_id,
+            Some(payload),
+            Some(outcome.recorded_at),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_audit_in_tx_with_outcome_recorded_at(
+        &self,
+        tx: TxId,
+        operation: AuditOperation,
+        principal: Principal,
+        reason: Option<String>,
+        target: AuditTarget,
+        context_id: ContextId,
+        payload: Option<JsonValue>,
+        outcome_recorded_at: Option<TxId>,
+    ) -> Result<AuditId> {
+        let id = AuditId::new_v7();
         let (target_kind, target_id) = match &target {
             AuditTarget::Context(c) => ("context", c.as_uuid()),
             AuditTarget::Decision(d) => ("decision", d.as_uuid()),
@@ -48,8 +129,12 @@ impl Store {
             Some(p) => Value::Json(p.clone()),
             None => Value::Null,
         };
+        let outcome_recorded_at_value = match outcome_recorded_at {
+            Some(recorded_at) => Value::TxId(recorded_at),
+            None => Value::Null,
+        };
         let params: HashMap<String, Value> = [
-            ("id".to_string(), Value::Uuid(Uuid::now_v7())),
+            ("id".to_string(), Value::Uuid(id.as_uuid())),
             ("txid".to_string(), Value::TxId(tx)),
             (
                 "operation".to_string(),
@@ -63,6 +148,7 @@ impl Store {
             ),
             ("target_id".to_string(), Value::Uuid(target_id)),
             ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+            ("outcome_recorded_at".to_string(), outcome_recorded_at_value),
             ("payload".to_string(), payload_value),
         ]
         .into_iter()
@@ -70,11 +156,11 @@ impl Store {
         self.db
             .execute_in_tx(
                 tx,
-                "INSERT INTO audit_log (id, txid, operation, actor, reason, target_kind, target_id, context_id, payload) VALUES ($id, $txid, $operation, $actor, $reason, $target_kind, $target_id, $context_id, $payload)",
+                "INSERT INTO audit_log (id, txid, operation, actor, reason, target_kind, target_id, context_id, outcome_recorded_at, payload) VALUES ($id, $txid, $operation, $actor, $reason, $target_kind, $target_id, $context_id, $outcome_recorded_at, $payload)",
                 &params,
             )
             .map_err(map_engine_err)?;
-        Ok(())
+        Ok(id)
     }
 }
 
@@ -100,7 +186,7 @@ pub(crate) fn audit_query(rows: &dyn GraphRows, filter: AuditFilter) -> Result<V
         params.insert("until_txid".to_string(), Value::TxId(until));
     }
     let mut sql = String::from(
-        "SELECT id, txid, operation, actor, reason, target_kind, target_id, context_id, payload FROM audit_log",
+        "SELECT id, txid, operation, actor, reason, target_kind, target_id, context_id, outcome_recorded_at, payload FROM audit_log",
     );
     if !clauses.is_empty() {
         sql.push_str(" WHERE ");
@@ -167,6 +253,7 @@ fn decode_audit_entry(columns: &[String], row: &[Value]) -> Result<AuditEntry> {
     let target_kind = get_text(row, columns, "target_kind")?;
     let target_id = get_uuid(row, columns, "target_id")?;
     let context_id = ContextId::from(get_uuid(row, columns, "context_id")?);
+    let outcome_recorded_at = get_optional_txid(row, columns, "outcome_recorded_at")?;
     let payload = get_json(row, columns, "payload")?;
     let target = match target_kind.as_str() {
         "context" => AuditTarget::Context(ContextId::from(target_id)),
@@ -182,10 +269,9 @@ fn decode_audit_entry(columns: &[String], row: &[Value]) -> Result<AuditEntry> {
             )));
         }
     };
-    let outcome = match &payload {
-        JsonValue::Null => None,
-        other => serde_json::from_value::<Outcome>(other.clone()).ok(),
-    };
+    let outcome = outcome_recorded_at
+        .map(|recorded_at| decode_outcome_snapshot(&payload, recorded_at))
+        .transpose()?;
     let payload = decode_audit_payload(&payload)?;
     Ok(AuditEntry {
         id,
@@ -198,6 +284,18 @@ fn decode_audit_entry(columns: &[String], row: &[Value]) -> Result<AuditEntry> {
         outcome,
         payload,
     })
+}
+
+fn decode_outcome_snapshot(payload: &JsonValue, recorded_at: TxId) -> Result<Outcome> {
+    let mut snapshot = payload.clone();
+    let JsonValue::Object(fields) = &mut snapshot else {
+        return Err(CgError::Engine(
+            "Outcome audit snapshot must be a JSON object".to_string(),
+        ));
+    };
+    fields.insert("recorded_at".to_string(), JsonValue::from(recorded_at.0));
+    serde_json::from_value(snapshot)
+        .map_err(|e| CgError::Engine(format!("invalid Outcome audit snapshot: {e}")))
 }
 
 pub fn decode_audit_payload(value: &JsonValue) -> Result<Option<AuditPayload>> {

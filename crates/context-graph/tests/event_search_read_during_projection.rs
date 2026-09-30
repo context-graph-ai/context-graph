@@ -1,4 +1,4 @@
-//! Reads are never refused as busy while a projection worker holds the Store (assertion 67a).
+//! Reads stay available while a projection worker holds the Store.
 //!
 //! The worker here is a plain writable Store, exactly as the detached projection worker and an
 //! import open it: no administrative handler. The owner channel lives in an explicit runtime
@@ -8,6 +8,7 @@
 #![cfg(context_graph_internal_test_support)]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -26,6 +27,7 @@ use context_graph::{
     EventSearchBuildRequest, EventSearchFilter, EventSearchProfile, EvidenceKind, EvidenceProducer,
     Result, Store, StoreConfig, event_history_reader_declaration,
 };
+use contextdb_core::Value;
 use serde_json::json;
 
 const CONNECTOR: &str = "read-during-projection";
@@ -203,6 +205,7 @@ fn catch_up(store: &Store, context_id: ContextId) {
             context_id,
             embedder: FixtureEmbedder::registration(),
             profile: EventSearchProfile::default(),
+            embedding_workers: NonZeroUsize::MIN,
             max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_passages_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_bytes_per_batch: NonZeroUsize::new(4_096).expect("nonzero bytes"),
@@ -307,6 +310,199 @@ fn a_reader_opened_before_the_worker_takes_the_store_keeps_answering() {
     drop(worker);
 
     read_both(&reader, context_id).expect("the earlier reader answers after the worker lets go");
+}
+
+#[test]
+fn active_reader_snapshot_remains_consistent_across_currency_maintenance() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("reader-across-currency-maintenance.db");
+    let (worker, context_id) = ready_store_with_pending_event(&path);
+    let reader = open_reader(&path);
+    let params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+    let sql = "SELECT id, is_searchable FROM event_search_passages WHERE context_id = $context_id ORDER BY passage_ordinal";
+    let mut cursor = reader
+        .open_cursor(sql, &params)
+        .expect("open reader statement before passage update");
+    let first = cursor.first_page().expect("first snapshot page").clone();
+    assert_eq!(first.rows.len(), 1, "one initial projected passage");
+    assert_eq!(first.rows[0][1], Value::Bool(true));
+    let passage_id = first.rows[0][0].clone();
+
+    // A ConsumerReader alone does not pin one snapshot across separate statements. Keep the
+    // statement cursor open and pin its pre-update engine snapshot for a second explicit read.
+    let db = worker.sync_database();
+    let snapshot = db.snapshot();
+    let pin = db.pin_snapshot(snapshot);
+    db.execute_at_snapshot(sql, &params, snapshot)
+        .expect("read old snapshot before update");
+    db.execute(
+        "UPDATE event_search_passages SET is_searchable = false WHERE id = $id",
+        &HashMap::from([("id".into(), passage_id.clone())]),
+    )
+    .expect("supersede a passage version while the reader is open");
+    let held = db
+        .run_maintenance_cycle()
+        .expect("maintain while the old reader snapshot is pinned");
+    eprintln!("reader-held currency maintenance: {:?}", held.currency);
+    assert!(
+        held.currency.versions_deferred_for_readers > 0,
+        "the old snapshot's passage version is protected: {held:?}"
+    );
+    assert_eq!(cursor.first_page().expect("held reader page"), &first);
+    let old = db
+        .execute_at_snapshot(sql, &params, snapshot)
+        .expect("old snapshot remains readable after maintenance");
+    assert_eq!(old.rows[0][1], Value::Bool(true));
+    let current = reader.execute(sql, &params).expect("read current passage");
+    assert_eq!(current.rows[0][1], Value::Bool(false));
+
+    cursor.close().expect("close held cursor");
+    drop(pin);
+    let released = db
+        .run_maintenance_cycle()
+        .expect("reclaim after the old reader snapshot releases");
+    eprintln!(
+        "reader-released currency maintenance: {:?}",
+        released.currency
+    );
+    assert!(released.currency.pruned_versions > 0, "{released:?}");
+    assert!(
+        released
+            .currency
+            .compacted_tables
+            .iter()
+            .any(|table| table == "event_search_passages"),
+        "the protected passage version was reclaimed: {released:?}"
+    );
+    let current = reader.execute(sql, &params).expect("read after reclaim");
+    assert_eq!(current.rows[0][1], Value::Bool(false));
+}
+
+#[test]
+fn consumer_cursor_fetches_unread_passage_versions_across_currency_maintenance() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("cursor-across-currency-maintenance.db");
+    let worker = open_worker(&path);
+    let context_id = worker
+        .create_context(CreateContext {
+            name: "paged passage reader".into(),
+            labels: Vec::new(),
+            properties: Default::default(),
+        })
+        .expect("create Context")
+        .id;
+    let drafts = (0..220)
+        .map(|ordinal| {
+            draft(
+                &format!("passage-{ordinal}"),
+                ordinal + 1,
+                &format!("passage {ordinal}: {}", "x".repeat(230)),
+            )
+        })
+        .collect();
+    worker
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            "paged-stream",
+            drafts,
+        ))
+        .expect("append enough events for several cursor pages");
+    catch_up(&worker, context_id);
+
+    let db = worker.sync_database();
+    // Projection may leave older versions of unrelated rows. Clear them before opening the
+    // cursor so the deferred count below belongs to the passage this proof supersedes.
+    db.run_maintenance_cycle()
+        .expect("clear projection versions before the cursor opens");
+    let reader = open_reader(&path);
+    let params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+    let sql = "SELECT id, is_searchable FROM event_search_passages WHERE context_id = $context_id ORDER BY passage_ordinal";
+    let before = reader
+        .execute(sql, &params)
+        .expect("read passage identities before update");
+    assert!(
+        before.rows.len() > 200,
+        "need several cursor pages: {before:?}"
+    );
+    let target = before.rows[150][0].clone();
+
+    let mut cursor = reader
+        .open_cursor(sql, &params)
+        .expect("open consumer cursor before passage update");
+    let first = cursor.first_page().expect("first cursor page").clone();
+    assert!(first.has_more, "unread passage pages must remain");
+    assert!(
+        first.rows.len() <= 100,
+        "the changed row must still be unread"
+    );
+    assert!(first.rows.iter().all(|row| row[0] != target));
+
+    db.execute(
+        "UPDATE event_search_passages SET is_searchable = false WHERE id = $id",
+        &HashMap::from([("id".into(), target.clone())]),
+    )
+    .expect("supersede a passage the cursor has not fetched");
+    worker
+        .maintain_event_search_vectors_for_test()
+        .expect("run passage vector maintenance with cursor open");
+    let held = db
+        .run_maintenance_cycle()
+        .expect("maintain while only the consumer cursor holds the old read");
+    assert!(
+        held.currency.versions_deferred_for_readers > 0,
+        "the cursor must defer reclaim of its unread passage version: {held:?}"
+    );
+
+    let mut pages = 1;
+    let mut seen = first.rows;
+    let mut has_more = first.has_more;
+    while has_more {
+        let page = cursor
+            .fetch(None)
+            .expect("continue the same cursor without retry");
+        pages += 1;
+        has_more = page.has_more;
+        seen.extend(page.rows);
+    }
+    assert!(pages >= 3, "the cursor must fetch several pages");
+    assert_eq!(seen.len(), before.rows.len());
+    assert_eq!(
+        seen, before.rows,
+        "the cursor must return its pre-update snapshot"
+    );
+    assert_eq!(
+        seen.iter()
+            .find(|row| row[0] == target)
+            .expect("unread target")[1],
+        Value::Bool(true),
+    );
+
+    cursor.close().expect("release the consumer cursor");
+    let released = db
+        .run_maintenance_cycle()
+        .expect("reclaim after the consumer cursor closes");
+    assert!(released.currency.pruned_versions > 0, "{released:?}");
+    assert!(released.currency.reclaimed_bytes > 0, "{released:?}");
+    assert!(
+        released
+            .currency
+            .compacted_tables
+            .iter()
+            .any(|table| table == "event_search_passages"),
+        "the passage version must be reclaimed: {released:?}"
+    );
+    let current = reader
+        .execute(sql, &params)
+        .expect("fresh read after reclaim");
+    assert_eq!(
+        current
+            .rows
+            .iter()
+            .find(|row| row[0] == target)
+            .expect("current target")[1],
+        Value::Bool(false),
+    );
 }
 
 const REOPEN_CHILD_ENV: &str = "CG_READ_DURING_PROJECTION_REOPEN_CHILD";

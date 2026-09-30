@@ -106,18 +106,21 @@ fn skill(id: &str, effect: SkillEffectEnvelope, strategy: SkillApplyStrategy) ->
 #[test]
 fn recategorize_decision_effect_applies_post_harvest() {
     let (_dir, store) = fresh_store();
-    assert!(persist_skill(
-        &store,
-        &skill(
-            "recat-1",
-            SkillEffectEnvelope::RecategorizeDecision {
-                decision_matcher: "redis".to_string(),
-                from_category: "infrastructure".to_string(),
-                to_category: "technology_choice".to_string(),
-            },
-            SkillApplyStrategy::PostHarvestRetype,
-        ),
-    ));
+    assert!(
+        persist_skill(
+            &store,
+            &skill(
+                "recat-1",
+                SkillEffectEnvelope::RecategorizeDecision {
+                    decision_matcher: "redis".to_string(),
+                    from_category: "infrastructure".to_string(),
+                    to_category: "technology_choice".to_string(),
+                },
+                SkillApplyStrategy::PostHarvestRetype,
+            ),
+        )
+        .expect("read succeeds")
+    );
     let report = capture(&store, "recat");
     let decision = store
         .get_decision(decision_id_from_stable(&report, "D1").expect("D1"))
@@ -132,17 +135,20 @@ fn recategorize_decision_effect_applies_post_harvest() {
 #[test]
 fn add_tag_effect_applies_post_harvest() {
     let (_dir, store) = fresh_store();
-    assert!(persist_skill(
-        &store,
-        &skill(
-            "tag-1",
-            SkillEffectEnvelope::AddTag {
-                item_matcher: "redis".to_string(),
-                tag: "reviewed".to_string(),
-            },
-            SkillApplyStrategy::PostHarvestRetype,
-        ),
-    ));
+    assert!(
+        persist_skill(
+            &store,
+            &skill(
+                "tag-1",
+                SkillEffectEnvelope::AddTag {
+                    item_matcher: "redis".to_string(),
+                    tag: "reviewed".to_string(),
+                },
+                SkillApplyStrategy::PostHarvestRetype,
+            ),
+        )
+        .expect("read succeeds")
+    );
     let report = capture(&store, "tag");
     let decision = store
         .get_decision(decision_id_from_stable(&report, "D1").expect("D1"))
@@ -158,16 +164,19 @@ fn add_tag_effect_applies_post_harvest() {
 #[test]
 fn drop_item_effect_removes_the_matched_decision() {
     let (_dir, store) = fresh_store();
-    assert!(persist_skill(
-        &store,
-        &skill(
-            "drop-1",
-            SkillEffectEnvelope::DropItem {
-                item_matcher: "redis".to_string(),
-            },
-            SkillApplyStrategy::PostHarvestRetype,
-        ),
-    ));
+    assert!(
+        persist_skill(
+            &store,
+            &skill(
+                "drop-1",
+                SkillEffectEnvelope::DropItem {
+                    item_matcher: "redis".to_string(),
+                },
+                SkillApplyStrategy::PostHarvestRetype,
+            ),
+        )
+        .expect("read succeeds")
+    );
     capture(&store, "drop");
     let counts = memory_counts(&store, context_id(&store, "drop")).expect("counts");
     assert_eq!(
@@ -181,16 +190,19 @@ fn unknown_apply_strategy_is_withheld_and_capture_is_unchanged() {
     let (_dir, store) = fresh_store();
     // A known DROP effect carried under an apply strategy this build does not implement must be
     // withheld verbatim — never coerced into running — so the decision is NOT dropped.
-    assert!(persist_skill(
-        &store,
-        &skill(
-            "withheld-1",
-            SkillEffectEnvelope::DropItem {
-                item_matcher: "redis".to_string(),
-            },
-            SkillApplyStrategy::Unknown("generation-time-v2".to_string()),
-        ),
-    ));
+    assert!(
+        persist_skill(
+            &store,
+            &skill(
+                "withheld-1",
+                SkillEffectEnvelope::DropItem {
+                    item_matcher: "redis".to_string(),
+                },
+                SkillApplyStrategy::Unknown("generation-time-v2".to_string()),
+            ),
+        )
+        .expect("read succeeds")
+    );
     capture(&store, "withheld");
     let counts = memory_counts(&store, context_id(&store, "withheld")).expect("counts");
     assert_eq!(

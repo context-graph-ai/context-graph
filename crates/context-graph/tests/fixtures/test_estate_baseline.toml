@@ -41,11 +41,9 @@
 "crates/cg-cli/tests/event_history.rs" = 1
 "crates/cg-cli/tests/cli_acceptance.rs" = 2
 "crates/cg-cli/tests/cli_model_byok.rs" = 1
-# Bounded polls of a separate process's observable state with a deadline (manager ruling):
-#   :212/:224/:231 Instant::now, Instant::now, sleep — wait for the child `cg` to print its terminal prompt (60 s)
-#   :268/:281/:287 Instant::now, Instant::now, sleep — poll `cg status` until the background worker reports search ready (600 s)
-#   :295/:300/:306 Instant::now, Instant::now, sleep — poll until the detached worker process releases its data-root lock (120 s)
-"crates/cg-cli/tests/event_support/mod.rs" = 9
+# Shared bounded state observation used by prompt, readiness, and lock waits:
+#   :47/:57 Instant::now, sleep — one operation owns its observation budget and capped pause
+"crates/cg-cli/tests/event_support/mod.rs" = 2
 "crates/cg-cli/tests/first_light_cli.rs" = 2
 "crates/cg-cli/tests/support/mod.rs" = 5
 "crates/context-graph/src/capture_sync_status.rs" = 4
@@ -58,7 +56,7 @@
 #   :527 Instant::now — start of one session call, to tell an owner hand-over from a slow answer
 #   :531 Instant::now — deadline check before replacing the session
 "crates/context-graph/src/consumer_read.rs" = 6
-"crates/context-graph/src/embedder/nomic.rs" = 1
+"crates/context-graph/src/embedder/nomic.rs" = 2
 "crates/context-graph/src/ingest.rs" = 6
 # owner_control.rs, the bounded reader-release wait every cg writer uses (same manager exception):
 #   :374 Instant::now — remaining time left before the deadline, checked before waiting at all
@@ -66,12 +64,11 @@
 "crates/context-graph/src/store/embedding.rs" = 2
 "crates/context-graph/src/store/evidence.rs" = 1
 "crates/context-graph/src/store/observation.rs" = 2
-# event_search_projection.rs, the bounded reader-release wait a projection build takes before it can
-# run (same manager exception):
-#   :51 Instant::now — start of the reader-release allowance
-#   :56 Instant::now — remaining time left before the deadline, checked before waiting
-#   :67 thread::sleep — backoff between reopen attempts, capped at the remaining allowance
-"crates/context-graph/src/store/event_search_projection.rs" = 3
+# The existing projection contention loop moved to the shared Store admission helper.
+# Its two clock/sleep sites plus the shared projection measurement site preserve the prior
+# aggregate ceiling of three. Duplicate embed timing now uses the existing measurement helper.
+"crates/context-graph/src/store/open_retry.rs" = 2
+"crates/context-graph/src/store/event_search_projection.rs" = 1
 "crates/context-graph/src/tier0.rs" = 2
 "crates/context-graph/tests/a_closed_cursor_answers_its_first_page_by_type_not_by_panic.rs" = 2
 "crates/context-graph/tests/a_graph_read_past_the_read_ceiling_answers_what_the_writable_store_answers.rs" = 2
@@ -149,19 +146,115 @@
 # crate outside the ratchet, and the audit reports it rather than exempting it.
 "candle-embeddinggemma" = 7
 "cg-bench" = 10
-"cg-catalog" = 109
+"cg-catalog" = 110
 "cg-cli-conventions" = 0
 "cg-connector-claude-code" = 23
-"cg-node-fs" = 0
+# 2 -> 3: `update_guard_reads_and_replaces_one_bounded_record` covers the policy-update lock's
+# read/replace operation alongside the existing missing/oversize policy-record cases.
+"cg-node-fs" = 3
 "cg-vision-embedder" = 5
-"context-graph" = 1214
+# 1244 -> 1251: three cap-transition/file-refresh tests and three internal-support concurrency
+# correctness tests land here; the exact scanner also absorbs the preceding one-test shortfall.
+# Reconciled against f392db9: source scanner was 1251, not the stale 1253 entry.
+# Retired in 518951b: five cases covering a missing cursor index, a missing
+# zero-progress cursor, and a missing attempt column on ready/partial/failed stores.
+# Crash recovery remains. This change adds five projection cases (including
+# the writer child), one reader-admission case, one pure admission test, and activates the
+# existing helper-pool concurrency case: 1251 + 8 = 1259. The 23 existing projection tests
+# and typed Outcome test already counted in this scanner; dev activation now makes them run.
+# One pure capability-ceiling admission test joins the default tier: 1259 + 1 = 1260.
+# The free-store and registry-freedom cases now share the real-reader fixture and assertions above:
+# 1262 - 2 = 1260.
+# Newest-first scope adds bounded completion, order reversal, first-session availability, and
+# mid-build published-coverage proofs: 1260 + 4 = 1264.
+# Final publication correction adds replacement-union activation, nonzero no-text, reopened-tail
+# count coherence, and measured many-session read-cost proofs: 1264 + 4 = 1268.
+# The config runner deletes its owned lease across reopen before a later claim: 1268 + 1 = 1269.
+# The startup schema becoming one commit adds the two-node half of that promise -- a second node
+# receives the whole startup schema in the order it was authored -- in its own test binary:
+# 1269 + 1 = 1270.
+# Statement-cost coverage adds four: a find over ready Contexts and a find over Contexts whose
+# projection is owed each cost the same statements at 1, 8 and 64 Contexts, and the captured-event
+# totals every read reports come from the maintained count row rather than a recount, with a reader
+# that did not declare that table refused by its name: 1270 + 4 = 1274.
+# Writer-transition continuity adds four: a cursor opened before a writer handed the store
+# over, a statement asked across the same handover, and the two writer children those proofs
+# re-invoke: 1274 + 4 = 1278.
+# Declaring which index-prefix totals the event tables keep adds four proofs that each count a read
+# issues is answered from a declared total and that the two tables written beside an event keep
+# none, plus three that a store whose event tables predate the declaration is named as no longer
+# matching: 1278 + 7 = 1285.
+# The writer's memory budget adds fourteen: what this machine allows a write to hold under a
+# container ceiling, under installed memory alone, capped, with neither published, at and either
+# side of the share a capture needs, never above the share the kernel enforces, which knob a
+# declared budget names, that a named budget is never second-guessed, that a refusal offers both
+# knobs and no environment variable, and a live probe of this machine's own reading:
+# 1285 + 14 = 1299.
+# Declaring the same total on the tables a status read counts adds five: one that every total
+# status reports for a Context is read rather than counted, two that a store whose counted tables
+# predate the declaration is named as no longer matching and that the shipped declarations reopen
+# the tables they create, and two that one captured event maintains none of those totals and keeps
+# exactly the two the event reads ask for, that the coverage-gap total is declared even on a
+# Context that has none, and that a total asked for alongside another aggregate is never served
+# from a declared one -- which is why the raw-chunk footprint's table declares none:
+# 1299 + 7 = 1306.
+# The shared-source, two-session projection proof adds one default-tier test: 1308 + 1 = 1309.
+# Subscription receipt recovery and an uncertain external delivery add two default-tier proofs.
+# Reader coordination mapping and cursor drop release add two default-tier proofs.
+# Three named passage-history proofs extend the counted test estate.
+# The consumer cursor continuation proof adds one default-tier test.
+# Typed active-time mapping and committed-prefix projection recovery add two proofs.
+"context-graph" = 1320
 # 190 -> 184: the status tests for answers read-only status no longer gives were removed with that
 # change, and the retired chunked-import, estimate and raw-chunk forget routes took their tests.
 # 184 -> 187: coverage for the reader-wait allowance and the foreground import's unusable-lock
 # report was added with that change.
 # 187 -> 189: proofs that the default data root is ~/.cg and that find over a Context with no
 # imported history answers no_matching_history.
-"context-graph-cli" = 189
+# 189 -> 190: import recovers a store that needs a writable open, and status names that command.
+# 190 -> 192: an invalid passage override is refused before writing, and an override is recorded and reported.
+# 192 -> 196: event-history coverage includes the bounded state waits and reader-held worker journeys.
+# 196 -> 203: embedding-worker policy adds resolver/default/precedence validation, CLI prewrite
+# refusals and the requesting-import handoff proof.
+# 203 -> 211: production request-builder delivery, detached/resumed delivery, override reset, and
+# defer/caught-up policy lifetime are covered by executable import journeys; the exact scanner also
+# absorbs the one-test shortfall in the preceding embedding-worker baseline. The lifecycle controls
+# `queued_forget_uses_configured_cap_and_finishes_after_foreground_releases`,
+# `sigint_foreground_hands_the_queued_request_to_one_background_worker`, and
+# `sigint_during_prepared_embedding_hands_off_the_queued_request_once` are explicitly
+# `event-search-test-support`-gated, so they are not default-tier tests. The stale 214 entry is
+# reconciled to the scanner's actual 211 rather than treating feature activation as a default-test
+# addition.
+# One default-tier CLI proof makes invalid placement previews match real import refusals without
+# changing a new or existing data root or touching model assets: 211 + 1 = 212.
+# Search-policy precedence, prewrite refusal, worker-policy delivery, and read-only bounded-status
+# coverage add four CLI proofs: 212 + 4 = 216. Retry coverage adds an interrupted all-session
+# resume proof and a missing-model scope-preservation proof: 216 + 2 = 218. Shell-token-safe
+# retry and persisted-policy read-retry coverage add two more CLI proofs: 218 + 2 = 220.
+# The read-only commands are proved against a store a live writer is holding -- one proof for
+# status/find/show answering an idle and a held store alike, one for status under a still-owed
+# projection, and the writer-holder child the binary re-invokes: 220 + 3 = 223.
+# The writer memory budget adds nine: five invocation-local proofs that the switch comes off the
+# argument list in both spellings, that a switch with no usable number is refused before any store
+# is opened, that the switch beats the config file which beats the machine, that a config file
+# whose budget is not a byte count is named with its path, and that a budget an operator named runs
+# whatever its size; plus four journeys through the binary -- status naming the budget and its
+# origin under all three answers, the text rendering carrying the same two facts, an import refused
+# in words that name both knobs, and an invalid config file refused as a configuration error:
+# A later batch crossing the configured writer limit, and a retry that resumes its committed
+# prefix without duplicate capture, adds one CLI journey: 223 + 10 = 233.
+# Small-machine admission routing and read-only CLI inspection add two tests.
+# The reader-contention journey uses the private zero-retry allowance and is feature-gated.
+# The forget coordination journey adds one test. The source scanner counts its feature-gated
+# `#[test]` declaration, so it moves this frozen count too. The obsolete forget capture-floor
+# unit test is removed; erasure now relies on the typed memory refusal from the actual write.
+# Durable request selection adds fourteen lifecycle and production-path proofs.
+# Failure-safe asynchronous fixture ownership adds one unwind cleanup proof.
+# A newest-one refusal retry completes its original frontier without embedding other history.
+# A retired refusal survives Context forget and is acknowledged after foreground re-import.
+# One saved-frontier broad-refusal proof covers retired and unretired evidence.
+# Read-time configuration and eleven selected-request recovery paths add twelve proofs.
+"context-graph-cli" = 276
 
 [gate_wall_seconds_policy]
 # A test binary's ceiling is `recorded seconds * tolerance_factor + slack_seconds`. Both terms are
@@ -227,11 +320,20 @@ slack_seconds = 0.235
 "cg-catalog::production_guards" = 0.022
 "cg-connector-claude-code::history_prefix" = 0.040
 "cg-connector-claude-code::source_fidelity" = 27.387
+"cg-node-fs::event_search_worker_policy" = 0.033
 "cg-vision-embedder::siglip" = 0.082
 "context-graph" = 36.976
+"context-graph::audit_outcome_typed_snapshot" = 1.755
+"context-graph::event_search_embedding_parallelism" = 19.067
+"context-graph::event_search_projection_correctness" = 139.337
+"context-graph::read_memory_policy" = 15.073
 "context-graph-cli::a_busy_store_is_told_to_the_operator" = 1.322
+"context-graph-cli::a_read_only_command_answers_a_store_a_writer_is_holding" = 99.860
 "context-graph-cli::a_failed_status_read_is_never_rendered_as_an_answer" = 3.365
 "context-graph-cli::a_reader_the_store_could_not_name_is_still_a_holder" = 0.076
+"context-graph-cli::event_search_worker_controls" = 539.604
+"context-graph-cli::import_embedding_workers" = 99.530
+"context-graph-cli::read_memory_policy" = 1.545
 "context-graph-cli::a_refusal_answers_in_the_format_the_caller_asked_for" = 0.514
 "context-graph-cli::bin/cg" = 0.013
 "context-graph-cli::cg_model_fetch_finds_a_registration_that_cg_model_show_reads_when_data_and_cache_roots_differ" = 0.086
@@ -327,6 +429,10 @@ slack_seconds = 0.235
 "context-graph::regression_guards" = 40.242
 "context-graph::role_prepared_values_share_one_event_history_profile_across_the_raw_embedder_and_its_wrapper" = 28.507
 "context-graph::startup_schema_is_one_commit" = 2.003
+"context-graph::a_second_node_receives_the_whole_startup_schema" = 12.448
+"context-graph::a_find_costs_the_same_statements_at_any_context_count" = 293.870
+"context-graph::a_read_that_can_see_the_counts_table_never_recounts_events" = 13.779
+"context-graph::a_paged_read_across_a_writer_transition_answers_the_snapshot_it_opened" = 48.558
 "context-graph::status_totals_are_bounded_on_a_large_store" = 600.208
 "context-graph::test_estate_audit" = 0.241
 "context-graph::unit" = 3.843

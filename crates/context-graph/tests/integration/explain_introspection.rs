@@ -229,16 +229,26 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
             && hit.context_id == Some(allowed_context.id)
             && hit.index_ref == "evidence.vector_text"
             && hit.planner_trace == format!("{:?}", raw_vector_query.trace)
-            && hit.planner_trace.contains("IndexScan -> HNSWSearch")
-            && hit.planner_trace.contains("__unique_context_id_id")
+            && hit.planner_trace.contains("IndexScan -> VectorSearch")
+            && raw_vector_query.trace.index_used.is_some()
+            && raw_vector_query
+                .trace
+                .predicates_pushed
+                .iter()
+                .any(|p| p == "context_id")
+            && raw_vector_query
+                .trace
+                .vector_search
+                .as_ref()
+                .is_some_and(|route| {
+                    route.aggregate_allowed_vectors == Some(5)
+                        && route.effective_auto_index_at == 1000
+                        && route.fallback.as_deref() == Some("aggregate_below_auto_index_at")
+                })
             && hit.candidate_count_before_filter >= 1000
             && hit.candidate_count_after_filter == 5)
             && raw_ids.len() == 5
             && raw_ids == hit_ids
-            && hnsw_stats.is_some_and(|stats| stats.point_count >= 1013 && stats.dimension == 768)
-            && expected_row_id.is_some_and(|expected_row_id| raw_hnsw_rows
-                .iter()
-                .any(|(row_id, _)| *row_id == expected_row_id))
             && raw_ids
                 == vec![
                     expected,
@@ -247,8 +257,8 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
                     expected_fourth,
                     expected_fifth
                 ]
-            && raw_vector_query.trace.physical_plan == "IndexScan -> HNSWSearch",
-        "vector search must return the same ordered top-k ids as the raw contextdb HNSW query, carry that QueryResult.trace rather than a copied EXPLAIN string, and prove the searched VectorIndexRef has an HNSW graph; first={first:?}, hits={hits:?}, hit_ids={hit_ids:?}, raw_ids={raw_ids:?}, expected_row_id={expected_row_id:?}, raw_hnsw_rows={raw_hnsw_rows:?}, hnsw_stats={hnsw_stats:?}, raw_explain={raw_explain:?}, raw_trace={:?}",
+            && raw_vector_query.trace.physical_plan == "IndexScan -> VectorSearch",
+        "vector search must preserve indexed context prefiltering and the exact route for five admitted vectors; first={first:?}, hits={hits:?}, hit_ids={hit_ids:?}, raw_ids={raw_ids:?}, expected_row_id={expected_row_id:?}, raw_hnsw_rows={raw_hnsw_rows:?}, hnsw_stats={hnsw_stats:?}, raw_explain={raw_explain:?}, raw_trace={:?}",
         raw_vector_query.trace
     );
 }

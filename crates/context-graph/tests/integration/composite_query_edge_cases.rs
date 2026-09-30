@@ -563,6 +563,13 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
     seed_text_distractors(&store, 1008);
     let db_path = store.db_path().to_path_buf();
     drop(store);
+    // Graph construction belongs to maintenance; the first query reads its saved result.
+    let maintenance_db = Database::open(&db_path).expect("open for graph maintenance");
+    let maintenance = maintenance_db
+        .run_maintenance_cycle()
+        .expect("build the seeded graph");
+    assert!(maintenance.vector.built_indexes > 0, "{maintenance:?}");
+    drop(maintenance_db);
     let reopened = Store::open_with_database_plugin(
         StoreConfig {
             db_path: db_path.clone(),
@@ -631,9 +638,7 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
                     && hit.planner_trace.as_str() == raw_trace.as_str()
                     && hit.planner_trace.contains("HNSWSearch"))
             && raw_targets == targets
-            && hnsw_stats
-                .as_ref()
-                .is_some_and(|stats| stats.point_count >= 1013 && stats.dimension == 768)
+            && raw_trace.contains("maintained_graph_ready")
             && public_sql.len() == 1
             && public_sql[0].contains("ORDER BY vector_text <=>")
             && public_sql[0].contains("LIMIT"),

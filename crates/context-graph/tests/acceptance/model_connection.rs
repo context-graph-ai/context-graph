@@ -886,7 +886,7 @@ fn status_read_shows_active_connection_consent_state_and_which_model_a_context_r
     );
 }
 
-// Use case: an upgrade from the old hosted shape should leave an auditably migrated connection, not a silent rewrite or a dropped credential.
+// Use case: recording a credential reference leaves an auditable connection without reading the secret.
 #[test]
 fn migration_from_welded_auth_env_var_is_explicit_observable_and_reads_no_secret() {
     if model_connection_child_mode("migration") {

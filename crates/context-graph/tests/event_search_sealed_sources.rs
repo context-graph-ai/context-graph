@@ -254,6 +254,7 @@ fn late_append_stays_out_of_the_already_embedded_passage_then_catches_up_before_
         contexts: context_graph::ContextSelector::one(context_id),
         embedder: embedder.registration(),
         profile: EventSearchProfile::default(),
+        embedding_workers: NonZeroUsize::MIN,
         max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch size"),
         max_passages_per_batch: NonZeroU32::new(8).expect("nonzero batch size"),
         max_bytes_per_batch: NonZeroUsize::new(4_096).expect("nonzero byte size"),
