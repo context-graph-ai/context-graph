@@ -82,7 +82,9 @@ pub mod test_support {
     pub use crate::store::database_is_live_for_test as store_database_is_live_for_test;
     #[cfg(feature = "test-support")]
     pub use crate::store::event_search_projection::{
-        observe_embedding_waves_for_test, take_claim_loads_for_test,
+        assert_claim_batch_examines_only_pending_tail_for_test,
+        assert_selected_frontier_count_is_bounded_for_test, observe_embedding_waves_for_test,
+        take_claim_loads_for_test,
     };
     #[cfg(feature = "test-support")]
     pub use crate::store::open_retry::{

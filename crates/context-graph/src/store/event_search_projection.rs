@@ -463,6 +463,12 @@ pub fn take_claim_loads_for_test() -> Vec<(usize, usize, usize)> {
     CLAIM_LOADS.with(|loads| std::mem::take(&mut *loads.borrow_mut()))
 }
 
+const FIRST_PENDING_SOURCE_STATEMENT: &str = "SELECT ordinal FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $committed ORDER BY source_sequence ASC LIMIT 1";
+const HAS_LATER_SESSION_STATEMENT: &str = "SELECT source_sequence FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $after ORDER BY source_sequence ASC LIMIT 1";
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+const SELECTED_STREAM_COUNT_STATEMENT: &str = "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source";
+const SELECTED_FRONTIER_COUNT_STATEMENT: &str = "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source AND source_sequence <= $frontier";
+const SOURCE_POSITION_SESSION_STATEMENT: &str = "SELECT session_ref FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND source_sequence = $start";
 const SOURCE_MEMBER_COLUMNS: &str = "membership_id, ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, effective_interpretation_generation_id, captured_source_sha256, effective_source_sha256";
 
 #[derive(Clone, Copy)]
@@ -2554,14 +2560,20 @@ fn selected_session_work_for_run(
             let next = selected.rank.len();
             selected.rank.entry(key.clone()).or_insert(next);
             let rows = store.query_rows(
-                "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source AND source_sequence <= $frontier",
+                SELECTED_FRONTIER_COUNT_STATEMENT,
                 &HashMap::from([
                     ("context_id".into(), Value::Uuid(context_id.as_uuid())),
                     ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
                     ("connector".into(), Value::Text(stream.connector_id.clone())),
                     ("session".into(), Value::Text(stream.session_ref.clone())),
-                    ("source".into(), Value::Text(stream.source_instance_ref.clone())),
-                    ("frontier".into(), integer(stream.frontier, "selected frontier")?),
+                    (
+                        "source".into(),
+                        Value::Text(stream.source_instance_ref.clone()),
+                    ),
+                    (
+                        "frontier".into(),
+                        integer(stream.frontier, "selected frontier")?,
+                    ),
                 ]),
             )?;
             *selected.events.entry(key.clone()).or_default() +=
@@ -4461,6 +4473,12 @@ fn claim_batch(
     claim_pending_batch(store, generation, bounds, event_limit, pending, None)
 }
 
+fn claim_source_statement(event_limit: usize) -> String {
+    format!(
+        "SELECT {SOURCE_MEMBER_COLUMNS} FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND ordinal >= $start_ordinal ORDER BY ordinal ASC LIMIT {event_limit}"
+    )
+}
+
 fn claim_pending_batch(
     store: &Store,
     generation: &Generation,
@@ -4495,10 +4513,7 @@ fn claim_pending_batch(
     let result = query_rows(
         store,
         bounds,
-        &format!(
-            "SELECT {SOURCE_MEMBER_COLUMNS} FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND ordinal >= $start_ordinal ORDER BY ordinal ASC LIMIT {}",
-            event_limit.clamp(1, bounds.events.max(1))
-        ),
+        &claim_source_statement(event_limit.clamp(1, bounds.events.max(1))),
         &HashMap::from([
             (
                 "context_id".into(),
@@ -4972,7 +4987,7 @@ fn first_pending_stream(
             let first = query_rows(
                 store,
                 bounds,
-                "SELECT ordinal FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $committed ORDER BY source_sequence ASC LIMIT 1",
+                FIRST_PENDING_SOURCE_STATEMENT,
                 &HashMap::from([
                     (
                         "context_id".into(),
@@ -5042,7 +5057,7 @@ fn reopenable_tail_start(
     let result = query_rows(
         store,
         bounds,
-        "SELECT session_ref FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND source_sequence = $start",
+        SOURCE_POSITION_SESSION_STATEMENT,
         &HashMap::from([
             (
                 "context_id".into(),
@@ -5213,7 +5228,7 @@ fn has_later_session_event(
     let result = query_rows(
         store,
         bounds,
-        "SELECT source_sequence FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $after ORDER BY ordinal ASC LIMIT 1",
+        HAS_LATER_SESSION_STATEMENT,
         &HashMap::from([
             (
                 "context_id".into(),
@@ -9014,5 +9029,272 @@ mod bounded_preparation_tests {
             Rendered::OverPassageBound { fitting_events: 2 }
         ));
         assert_eq!(preparation_work(&work_receiver).embeds, 0);
+    }
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_claim_batch_examines_only_pending_tail_for_test(
+    fixture: impl FnMut() -> contextdb_engine::Database,
+) {
+    assert_session_read_work_for_test(fixture, false);
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn assert_selected_frontier_count_is_bounded_for_test(
+    fixture: impl FnMut() -> contextdb_engine::Database,
+) {
+    // Engine gap: a declared MAINTAIN COUNT is currently DeclaredNotServed on
+    // the live read path. Keep this oracle strict until that upstream route lands.
+    assert_session_read_work_for_test(fixture, true);
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn assert_session_read_work_for_test(
+    mut fixture: impl FnMut() -> contextdb_engine::Database,
+    count_only: bool,
+) {
+    fn examined(
+        db: contextdb_engine::Database,
+        completed: i64,
+        neighbours: i64,
+        count_only: bool,
+    ) -> (u64, bool) {
+        // Preserve the projection columns and primary key; omit unrelated parent FKs
+        // and natural-key uniqueness checks from setup. Exercise shipped access routes
+        // and statements; public import/resume has its own identity/order proofs.
+        db.execute("CREATE TABLE event_search_source_events (membership_id UUID NOT NULL, context_id UUID NOT NULL, generation_id UUID NOT NULL, ordinal INTEGER NOT NULL, event_id UUID NOT NULL, connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, source_sequence INTEGER NOT NULL, effective_interpretation_generation_id UUID, captured_source_sha256 TEXT NOT NULL, effective_source_sha256 TEXT NOT NULL, PRIMARY KEY (context_id, generation_id, ordinal)) IMMUTABLE SYNC OFF", &HashMap::new()).expect("create projection table");
+        for index in crate::schema::LOCAL_DERIVED_INDEXES
+            .iter()
+            .filter(|index| index.table == "event_search_source_events")
+        {
+            db.execute(index.ddl, &HashMap::new())
+                .expect("install shipped projection index");
+        }
+        if count_only {
+            db.execute("ALTER TABLE event_search_source_events SET MAINTAIN COUNT (context_id, generation_id, connector_id, source_instance_ref, session_ref)", &HashMap::new()).expect("declare exact stream count for upstream route proof");
+        }
+        let context = uuid::Uuid::new_v4();
+        let generation = uuid::Uuid::new_v4();
+        let mut rows = Vec::new();
+        for (source, session, count, sequence_start) in [
+            ("selected-source", "selected-session", completed, 0),
+            (
+                "selected-source",
+                "a-neighbour-session",
+                neighbours,
+                completed,
+            ),
+            (
+                "selected-source",
+                "z-neighbour-session",
+                neighbours,
+                completed + neighbours,
+            ),
+            ("a-neighbour-source", "selected-session", neighbours, 0),
+            ("z-neighbour-source", "selected-session", neighbours, 0),
+            (
+                "selected-source",
+                "selected-session",
+                5,
+                completed + 2 * neighbours,
+            ),
+        ] {
+            for offset in 1..=count {
+                rows.push(HashMap::from([
+                    ("membership_id".into(), Value::Uuid(uuid::Uuid::new_v4())),
+                    ("context_id".into(), Value::Uuid(context)),
+                    ("generation_id".into(), Value::Uuid(generation)),
+                    ("ordinal".into(), Value::Int64(rows.len() as i64 + 1)),
+                    ("event_id".into(), Value::Uuid(uuid::Uuid::new_v4())),
+                    ("connector_id".into(), Value::Text("claim-fixture".into())),
+                    ("source_instance_ref".into(), Value::Text(source.into())),
+                    ("session_ref".into(), Value::Text(session.into())),
+                    (
+                        "source_sequence".into(),
+                        Value::Int64(sequence_start + offset),
+                    ),
+                    ("effective_interpretation_generation_id".into(), Value::Null),
+                    (
+                        "captured_source_sha256".into(),
+                        Value::Text("fixture".into()),
+                    ),
+                    (
+                        "effective_source_sha256".into(),
+                        Value::Text("fixture".into()),
+                    ),
+                ]));
+            }
+        }
+        for batch in rows.chunks(64) {
+            let tx = db.begin().expect("begin fixture batch");
+            for row in batch {
+                db.insert_row(tx, "event_search_source_events", row.clone())
+                    .expect("insert projection membership");
+            }
+            db.commit(tx).expect("commit fixture batch");
+        }
+        let mut params = HashMap::from([
+            ("context_id".into(), Value::Uuid(context)),
+            ("generation_id".into(), Value::Uuid(generation)),
+            ("connector_id".into(), Value::Text("claim-fixture".into())),
+            ("source".into(), Value::Text("selected-source".into())),
+            ("session".into(), Value::Text("selected-session".into())),
+            ("committed".into(), Value::Int64(completed)),
+        ]);
+        let session = db
+            .read_session(ReadLimits {
+                result_rows: 3,
+                ..ReadLimits::default()
+            })
+            .expect("bounded live projection session");
+        if count_only {
+            params.insert("connector".into(), Value::Text("claim-fixture".into()));
+            params.insert(
+                "frontier".into(),
+                Value::Int64(completed + 2 * neighbours + 3),
+            );
+            let count = session
+                .execute(SELECTED_FRONTIER_COUNT_STATEMENT, &params)
+                .unwrap();
+            assert_eq!(count.rows, vec![vec![Value::Int64(completed + 3)]]);
+            let total = session
+                .execute(SELECTED_STREAM_COUNT_STATEMENT, &params)
+                .unwrap();
+            assert_eq!(total.rows, vec![vec![Value::Int64(completed + 5)]]);
+            eprintln!(
+                "selected_frontier_count: completed={completed}, neighbours={neighbours}, examined={}, total_examined={}, maintained={:?}, index={:?}",
+                count.trace.rows_examined,
+                total.trace.rows_examined,
+                total.trace.maintained_count,
+                count.trace.index_used
+            );
+            return (
+                count.trace.rows_examined,
+                matches!(
+                    total.trace.maintained_count.as_deref(),
+                    Some(
+                        contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. }
+                    )
+                ),
+            );
+        }
+        let discovery = session
+            .execute(FIRST_PENDING_SOURCE_STATEMENT, &params)
+            .expect("discover the selected pending tail");
+        eprintln!(
+            "pending_discovery: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
+            discovery.trace.rows_examined, discovery.trace.index_used, discovery.trace.sort_elided
+        );
+        assert_eq!(
+            discovery.trace.index_used.as_deref(),
+            Some("idx_event_search_source_events_session_sequence"),
+            "{:#?}",
+            discovery.trace
+        );
+        assert!(discovery.trace.sort_elided, "{:#?}", discovery.trace);
+        assert_eq!(discovery.trace.rows_examined, 1, "{:#?}", discovery.trace);
+        assert_eq!(
+            discovery.rows,
+            vec![vec![Value::Int64(completed + 4 * neighbours + 1)]]
+        );
+        params.insert("start".into(), Value::Int64(completed + 2 * neighbours + 1));
+        let source_position = session
+            .execute(SOURCE_POSITION_SESSION_STATEMENT, &params)
+            .unwrap();
+        assert_eq!(
+            source_position.rows,
+            vec![vec![Value::Text("selected-session".into())]]
+        );
+        assert_eq!(
+            source_position.trace.index_used.as_deref(),
+            Some("idx_event_search_source_events_cursor_range")
+        );
+        assert_eq!(
+            source_position.trace.rows_examined, 2,
+            "source-position equality probe stays constant"
+        );
+        eprintln!(
+            "source_position: completed={completed}, neighbours={neighbours}, examined={}, index={:?}",
+            source_position.trace.rows_examined, source_position.trace.index_used
+        );
+        params.insert("after".into(), Value::Int64(completed));
+        let later = session
+            .execute(HAS_LATER_SESSION_STATEMENT, &params)
+            .unwrap();
+        eprintln!(
+            "has_later: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
+            later.trace.rows_examined, later.trace.index_used, later.trace.sort_elided
+        );
+        assert_eq!(later.trace.rows_examined, 1);
+        assert_eq!(
+            later.trace.index_used.as_deref(),
+            Some("idx_event_search_source_events_session_sequence")
+        );
+        assert!(later.trace.sort_elided);
+        assert_eq!(
+            later.rows,
+            vec![vec![Value::Int64(completed + 2 * neighbours + 1)]]
+        );
+        params.insert("start_ordinal".into(), discovery.rows[0][0].clone());
+        let sql = claim_source_statement(3);
+        let claim = session
+            .execute(&sql, &params)
+            .expect("claim three pending entries");
+        assert_eq!(claim.rows.len(), 3);
+        for (offset, row) in claim.rows.iter().enumerate() {
+            assert_eq!(
+                row[1],
+                Value::Int64(completed + 4 * neighbours + 1 + offset as i64)
+            );
+            assert_eq!(row[3], Value::Text("claim-fixture".into()));
+            assert_eq!(row[4], Value::Text("selected-source".into()));
+            assert_eq!(row[5], Value::Text("selected-session".into()));
+            assert_eq!(
+                row[6],
+                Value::Int64(completed + 2 * neighbours + 1 + offset as i64)
+            );
+        }
+        eprintln!(
+            "claim_batch_examines_only_pending_tail: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
+            claim.trace.rows_examined, claim.trace.index_used, claim.trace.sort_elided
+        );
+        assert_eq!(
+            claim.trace.index_used.as_deref(),
+            Some("idx_event_search_source_events_session_claim"),
+            "{:#?}",
+            claim.trace
+        );
+        assert!(claim.trace.sort_elided, "{:#?}", claim.trace);
+        let explanation = contextdb_engine::cli_render::render_explain(&db, &sql, &params)
+            .expect("explain the shipped claim statement");
+        assert!(
+            explanation.contains("idx_event_search_source_events_session_claim"),
+            "{explanation}"
+        );
+        assert!(explanation.contains("sort_elided: true"), "{explanation}");
+        eprintln!("claim EXPLAIN at completed={completed}:\n{explanation}");
+        assert!(
+            claim.trace.rows_examined >= 3,
+            "account for returned entries"
+        );
+        (claim.trace.rows_examined, true)
+    }
+    let receipts: Vec<_> = [(10, 16), (10, 1_016), (2_010, 16), (2_010, 1_016)]
+        .into_iter()
+        .map(|(completed, neighbours)| examined(fixture(), completed, neighbours, count_only))
+        .collect();
+    if count_only {
+        assert!(
+            receipts.iter().all(|(_, served)| *served),
+            "upstream LIVE maintained-count gap: DeclaredNotServed; receipts={receipts:?}"
+        );
+    }
+    for receipt in &receipts[1..] {
+        assert_eq!(
+            receipt.0, receipts[0].0,
+            "completed history and neighbouring streams must not increase examined work: {receipts:?}"
+        );
     }
 }

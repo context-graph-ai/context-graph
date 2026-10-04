@@ -550,6 +550,16 @@ pub(crate) const LOCAL_DERIVED_INDEXES: &[IndexSpec] = &[
         ddl: "CREATE INDEX idx_event_search_source_events_cursor_range ON event_search_source_events (context_id, generation_id, connector_id, source_instance_ref, source_sequence, ordinal)",
     },
     IndexSpec {
+        table: "event_search_source_events",
+        name: "idx_event_search_source_events_session_claim",
+        ddl: "CREATE INDEX idx_event_search_source_events_session_claim ON event_search_source_events (context_id, generation_id, connector_id, source_instance_ref, session_ref, ordinal)",
+    },
+    IndexSpec {
+        table: "event_search_source_events",
+        name: "idx_event_search_source_events_session_sequence",
+        ddl: "CREATE INDEX idx_event_search_source_events_session_sequence ON event_search_source_events (context_id, generation_id, connector_id, source_instance_ref, session_ref, source_sequence)",
+    },
+    IndexSpec {
         table: "event_search_passages",
         name: "event_search_passages_active_idx",
         ddl: "CREATE INDEX event_search_passages_active_idx ON event_search_passages (context_id, generation_id, is_current, is_searchable)",

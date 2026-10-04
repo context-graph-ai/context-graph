@@ -5327,3 +5327,28 @@ fn reopened_published_tail_updates_session_and_generation_coverage_atomically() 
     let status = consumer_search(&config, context_id);
     assert_eq!((status.covered_events, status.pending_events), (2, 0));
 }
+
+#[test]
+fn claim_batch_examines_only_pending_tail() {
+    let mut roots = Vec::new();
+    context_graph::test_support::assert_claim_batch_examines_only_pending_tail_for_test(|| {
+        let root = tempfile::tempdir().expect("tempdir");
+        let db = contextdb_engine::Database::open(root.path().join("claim-tail.db"))
+            .expect("open fixture store");
+        roots.push(root);
+        db
+    });
+}
+
+#[test]
+fn selected_frontier_count_does_not_examine_completed_history() {
+    // The live MAINTAIN COUNT route is an upstream engine gap. This strict
+    // regression deliberately remains red while it discloses DeclaredNotServed.
+    let mut roots = Vec::new();
+    context_graph::test_support::assert_selected_frontier_count_is_bounded_for_test(|| {
+        let root = tempfile::tempdir().unwrap();
+        let db = contextdb_engine::Database::open(root.path().join("count-tail.db")).unwrap();
+        roots.push(root);
+        db
+    });
+}
