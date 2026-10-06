@@ -3858,7 +3858,12 @@ fn a_stale_attempt_failure_cannot_overwrite_a_newer_owned_refusal() {
     let inspect = config.clone();
     let saved = Arc::new(Mutex::new(None));
     let newer_marker = saved.clone();
+    // The rendezvous runs at the first forward call only; the invocation count is asserted below.
+    let fired = AtomicBool::new(false);
     *stale.embed_observer.lock().unwrap() = Some(Arc::new(move || {
+        if fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let before = attempt_rows(&inspect, context_id);
         let next = ControlledEmbedder::new();
         let request = run_request(&inspect, context_id, &next, profile(), 1, LEASE_MS);

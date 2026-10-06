@@ -1179,13 +1179,15 @@ fn concurrent_takeovers_between_threads_admit_exactly_one() {
     let committed = crash_child_at("exit-after-claim", EXIT_AFTER_CLAIM, &config, context_id);
     let (pending_first, _) = pending_markers(&committed);
 
-    // The winner holds inside its preparation until the loser is seen waiting on it, so the loser
-    // meets a live holder whichever thread wins.
+    // The winner holds inside its first preparation of the taken-over batch until the loser is
+    // seen waiting on it, so the loser meets a live holder whichever thread wins. Rendering one
+    // batch prepares its text several times, so the gate closes exactly once.
     let (open_gate, gate) = channel::<()>();
     let gate = Mutex::new(gate);
+    let gated = AtomicBool::new(false);
     let embedder = FixtureEmbedder::new();
     embedder.on_prepare(move |text| {
-        if text.contains(pending_first) {
+        if text.contains(pending_first) && !gated.swap(true, Ordering::SeqCst) {
             gate.lock()
                 .expect("gate")
                 .recv_timeout(RENDEZVOUS)
