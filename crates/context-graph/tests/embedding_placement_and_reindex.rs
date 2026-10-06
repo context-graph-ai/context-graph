@@ -43,6 +43,10 @@ use contextdb_core::Value;
 const ITEMS: usize = 40;
 const TEXT_DIMENSION: usize = 16;
 const FACE_DIMENSION: usize = 8;
+/// A space of a non-base dimension binds its own column; registration adds it to the space's
+/// placement table (the base `vector_text` is 768-d and `vector_vision` 512-d).
+const TEXT_COLUMN: &str = "vector_text_16";
+const FACE_COLUMN: &str = "vector_vision_8";
 const CHILD_PATH: &str = "CG_EMBEDDING_REINDEX_CHILD_PATH";
 /// The embedder's call on which the reindexing child dies: the first call of the second batch.
 const DIE_ON_CALL: usize = 33;
@@ -110,7 +114,7 @@ fn text_space(revision: &str) -> EmbeddingSpace {
         bindings: vec![EmbeddingSpaceBinding {
             embedding_space_id: id,
             table_name: "evidence".into(),
-            vector_column: "vector_text".into(),
+            vector_column: TEXT_COLUMN.into(),
         }],
         placement: VectorPlacement::NodeLocal,
         media_reachable_on_every_node: false,
@@ -319,17 +323,31 @@ fn rows(store: &Store, sql: &str, params: Vec<(&str, Value)>) -> Vec<Vec<Value>>
 }
 
 /// Every evidence vector row of one space in one physical table, as target -> (created_at, vector).
+/// The column a space's vectors live in: the lexical mock is 768-d and uses the base column.
+fn column_of(space_id: &str) -> &'static str {
+    if space_id.starts_with("placement_face") {
+        FACE_COLUMN
+    } else if space_id.starts_with("placement_") {
+        TEXT_COLUMN
+    } else {
+        "vector_text"
+    }
+}
+
 fn vectors_in(store: &Store, table: &str, space_id: &str) -> BTreeMap<uuid::Uuid, (Value, Value)> {
+    let column = column_of(space_id);
     rows(
         store,
         &format!(
-            "SELECT target_id, created_at, vector_text FROM {table} WHERE embedding_space_id = $space"
+            "SELECT target_id, created_at, {column} FROM {table} WHERE embedding_space_id = $space"
         ),
         vec![("space", Value::Text(space_id.to_string()))],
     )
     .into_iter()
     .map(|row| match (&row[0], &row[1], &row[2]) {
-        (Value::Uuid(target), created_at, vector) => (*target, (created_at.clone(), vector.clone())),
+        (Value::Uuid(target), created_at, vector) => {
+            (*target, (created_at.clone(), vector.clone()))
+        }
         other => panic!("evidence embedding row {other:?}"),
     })
     .collect()
@@ -741,7 +759,7 @@ fn caller_space(revision: &str) -> EmbeddingSpace {
         bindings: vec![EmbeddingSpaceBinding {
             embedding_space_id: id,
             table_name: "evidence".into(),
-            vector_column: "vector_text".into(),
+            vector_column: TEXT_COLUMN.into(),
         }],
         placement: VectorPlacement::TravelsWithItem,
         media_reachable_on_every_node: false,
@@ -961,7 +979,7 @@ fn face_space(revision: &str) -> EmbeddingSpace {
         bindings: vec![EmbeddingSpaceBinding {
             embedding_space_id: id,
             table_name: "evidence".into(),
-            vector_column: "vector_vision".into(),
+            vector_column: FACE_COLUMN.into(),
         }],
         placement: VectorPlacement::TravelsWithItem,
         media_reachable_on_every_node: false,
@@ -1303,7 +1321,7 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
             "SELECT reason FROM embedding_pending WHERE target_id = $id",
             vec![("id", Value::Uuid(evidence.as_uuid()))],
         ),
-        vec![vec![Value::Text("received".into())]],
+        vec![vec![Value::Text("pending".into())]],
         "the receiving node marks the item for its own rebuild instead of receiving a vector"
     );
     assert_eq!(
@@ -1533,7 +1551,9 @@ async fn concurrent_writes_to_an_item_in_old_and_new_spaces_converge_on_the_new_
 fn all_travelling(store: &Store) -> Vec<Vec<Value>> {
     rows(
         store,
-        "SELECT embedding_space_id, target_id, is_head, vector_text FROM evidence_embeddings_travelling ORDER BY embedding_space_id, target_id",
+        &format!(
+            "SELECT embedding_space_id, target_id, is_head, {TEXT_COLUMN} FROM evidence_embeddings_travelling ORDER BY embedding_space_id, target_id"
+        ),
         Vec::new(),
     )
 }
