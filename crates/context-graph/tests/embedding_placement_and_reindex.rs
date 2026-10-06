@@ -114,6 +114,7 @@ fn text_space(revision: &str) -> EmbeddingSpace {
         }],
         placement: VectorPlacement::NodeLocal,
         media_reachable_on_every_node: false,
+        producer: text_identity(revision),
     }
 }
 
@@ -158,12 +159,16 @@ impl Embedder for TextModel {
     }
 
     fn producer(&self) -> ModelIdentity {
-        ModelIdentity {
-            model: "placement-text".into(),
-            weights_revision: self.revision.clone(),
-            preparation: "plain".into(),
-            dimension: TEXT_DIMENSION as u32,
-        }
+        text_identity(&self.revision)
+    }
+}
+
+fn text_identity(revision: &str) -> ModelIdentity {
+    ModelIdentity {
+        model: "placement-text".into(),
+        weights_revision: revision.into(),
+        preparation: "plain".into(),
+        dimension: TEXT_DIMENSION as u32,
     }
 }
 
@@ -740,6 +745,7 @@ fn caller_space(revision: &str) -> EmbeddingSpace {
         }],
         placement: VectorPlacement::TravelsWithItem,
         media_reachable_on_every_node: false,
+        producer: caller_identity(revision),
     }
 }
 
@@ -839,6 +845,103 @@ fn a_travelling_switch_preserves_and_reports_what_this_node_cannot_regenerate() 
     );
 }
 
+#[test]
+fn a_foreign_vector_supplied_into_a_node_local_space_is_recomputed_never_stored() {
+    // A caller vector from another model never lands in a reproducible space; the item is rebuilt instead.
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("foreign-supply.db");
+    let store = Store::open(StoreConfig {
+        db_path: path,
+        default_text_embedder: None,
+        extra_embedding_spaces: vec![text_space("rev-a")],
+        ..StoreConfig::default()
+    })
+    .expect("open with the space declared and no model on this node");
+    let space = text_space("rev-a").embedding_space_id;
+    let context_id = create_context(&store);
+    let entity_id = create_entity(&store, context_id, "notebook");
+    let evidence_id = EvidenceId::new_v7();
+    let recorded = store
+        .record_observation(RecordObservation {
+            id: ObservationId::new_v7(),
+            entity_id,
+            context_id,
+            observation_type: "note".into(),
+            source: "placement-fixture".into(),
+            observed_at: chrono::DateTime::from_timestamp(1_790_000_000, 0).expect("fixed time"),
+            evidence: vec![EvidenceRef {
+                id: evidence_id,
+                kind: EvidenceKind::Text,
+                source_ref: format!("note://{evidence_id}"),
+                retention_status: RetentionStatus::RetainedExternal,
+                producer: capture_producer(),
+                text_projection: Some("supplied by another model".into()),
+                ..EvidenceRef::default()
+            }],
+            observed_properties: BTreeMap::new(),
+            state_delta: BTreeMap::new(),
+            properties: BTreeMap::new(),
+            embeddings: vec![context_graph::PrecomputedEmbedding {
+                id: context_graph::EmbeddingId::new_v7(),
+                embedding_space_id: space.clone(),
+                vector: text_vector("foreign"),
+                target: EmbeddingTarget::Evidence(evidence_id),
+                produced_by: EvidenceProducer::from(&caller_identity("foreign")),
+            }],
+        })
+        .expect("a foreign supply is not an error");
+    assert!(
+        matches!(
+            recorded.supplied_vectors.as_slice(),
+            [context_graph::SuppliedVectorOutcome {
+                outcome: context_graph::SuppliedVector::Recomputed {
+                    reason: context_graph::RecomputeReason::ForeignProducer,
+                },
+                ..
+            }]
+        ),
+        "the write reports that the foreign vector will be recomputed: {:?}",
+        recorded.supplied_vectors
+    );
+    assert!(
+        recorded.embedding_ids.is_empty(),
+        "no vector row was written"
+    );
+    assert!(
+        node_local(&store, &space).is_empty(),
+        "the foreign vector is never stored"
+    );
+    assert_eq!(
+        rows(
+            &store,
+            "SELECT reason FROM embedding_pending WHERE target_id = $target",
+            vec![("target", Value::Uuid(evidence_id.as_uuid()))],
+        ),
+        vec![vec![Value::Text("no_embedder".into())]],
+        "the item is marked for recompute"
+    );
+    assert_eq!(
+        status_of(&store, &space).unembedded,
+        1,
+        "and counted until then"
+    );
+
+    let stored = store
+        .supply_embedding(
+            EmbeddingTarget::Evidence(evidence_id),
+            &space,
+            text_identity("rev-a"),
+            text_vector("supplied by another model"),
+        )
+        .expect("a supply from the space's own model");
+    assert!(
+        matches!(stored, context_graph::SuppliedVector::Stored { .. }),
+        "{stored:?}"
+    );
+    assert_eq!(node_local(&store, &space).len(), 1);
+    assert_eq!(status_of(&store, &space).unembedded, 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Enrollments: identity, multi-shot, replacement and preservation across models.
 // ---------------------------------------------------------------------------------------------
@@ -862,16 +965,22 @@ fn face_space(revision: &str) -> EmbeddingSpace {
         }],
         placement: VectorPlacement::TravelsWithItem,
         media_reachable_on_every_node: false,
+        producer: face_identity(revision),
     }
 }
 
-fn face_producer(revision: &str) -> EvidenceProducer {
-    EvidenceProducer {
-        system: "placement-face".into(),
-        model_name: "placement-face".into(),
-        model_version: revision.into(),
-        pipeline_version: "1".into(),
+fn face_identity(revision: &str) -> ModelIdentity {
+    ModelIdentity {
+        model: "placement-face".into(),
+        weights_revision: revision.into(),
+        preparation: "face".into(),
+        dimension: FACE_DIMENSION as u32,
     }
+}
+
+/// An enrollment's producer is the face space's own model.
+fn face_producer(revision: &str) -> EvidenceProducer {
+    EvidenceProducer::from(&face_identity(revision))
 }
 
 fn axis(index: usize) -> Vec<f32> {
