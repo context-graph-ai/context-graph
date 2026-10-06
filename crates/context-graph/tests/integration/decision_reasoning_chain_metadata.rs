@@ -103,7 +103,7 @@ fn text_space(version: &str) -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_text".to_string(),
         }],
-        placement: VectorPlacement::NodeLocal,
+        placement: Some(VectorPlacement::NodeLocal),
         media_reachable_on_every_node: false,
         producer: identity(version),
     }

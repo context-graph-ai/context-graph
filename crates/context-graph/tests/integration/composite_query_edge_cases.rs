@@ -91,7 +91,7 @@ fn image_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
-        placement: context_graph::VectorPlacement::TravelsWithItem,
+        placement: Some(context_graph::VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: context_graph::ModelIdentity {
             model: "clip-local".to_string(),

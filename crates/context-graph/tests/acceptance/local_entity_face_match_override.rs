@@ -40,7 +40,7 @@ fn store(name: &str) -> Store {
                     vector_column: "vector_vision".to_string(),
                 }],
                 // Live and reference face vectors are caller-filled and travel; one face model.
-                placement: VectorPlacement::TravelsWithItem,
+                placement: Some(VectorPlacement::TravelsWithItem),
                 media_reachable_on_every_node: false,
                 producer: face_identity(FACE_MODEL_REVISION),
             },
@@ -54,7 +54,7 @@ fn store(name: &str) -> Store {
                 supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
                 default_for_evidence_kind: None,
                 bindings: Vec::new(),
-                placement: VectorPlacement::TravelsWithItem,
+                placement: Some(VectorPlacement::TravelsWithItem),
                 media_reachable_on_every_node: false,
                 producer: face_identity("face-v2"),
             },

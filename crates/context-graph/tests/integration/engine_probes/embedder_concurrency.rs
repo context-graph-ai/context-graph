@@ -374,7 +374,7 @@ fn vision_space() -> EmbeddingSpaceDecl {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: probe_identity(512),
     }
@@ -391,7 +391,7 @@ fn face_reference_space() -> EmbeddingSpaceDecl {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: ModelIdentity {
             model: "face-reference".to_string(),

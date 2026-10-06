@@ -31,7 +31,7 @@ fn store() -> Store {
                 table_name: "digests".to_string(),
                 vector_column: "vector_text".to_string(),
             }],
-            placement: VectorPlacement::NodeLocal,
+            placement: Some(VectorPlacement::NodeLocal),
             media_reachable_on_every_node: false,
             producer: ModelIdentity {
                 model: "embeddinggemma-500m".to_string(),

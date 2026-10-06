@@ -33,7 +33,7 @@ fn store(name: &str) -> Store {
             default_for_evidence_kind: None,
             bindings: Vec::new(),
             // Enrollments are caller-filled and travel; the space holds one model.
-            placement: context_graph::VectorPlacement::TravelsWithItem,
+            placement: Some(context_graph::VectorPlacement::TravelsWithItem),
             media_reachable_on_every_node: false,
             producer: vision_identity(),
         }],
@@ -444,7 +444,7 @@ fn embedder_input_supports_in_memory_image_bytes() {
                 supported_evidence_kinds: vec![context_graph::EvidenceKind::ImageFrame],
                 default_for_evidence_kind: None,
                 bindings: Vec::new(),
-                placement: context_graph::VectorPlacement::TravelsWithItem,
+                placement: Some(context_graph::VectorPlacement::TravelsWithItem),
                 media_reachable_on_every_node: false,
                 producer: vision_identity(),
             }

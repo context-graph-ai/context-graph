@@ -35,7 +35,7 @@ fn fixture(name: &str) -> Fixture {
             default_for_evidence_kind: None,
             bindings: Vec::new(),
             // Enrollments are caller-filled and travel; the space holds one face model.
-            placement: VectorPlacement::TravelsWithItem,
+            placement: Some(VectorPlacement::TravelsWithItem),
             media_reachable_on_every_node: false,
             producer: face_identity(),
         }],

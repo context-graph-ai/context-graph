@@ -96,7 +96,7 @@ fn image_space() -> EmbeddingSpace {
             vector_column: "vector_vision".to_string(),
         }],
         // Caller-filled image vectors travel; the model is the vision producer's own fields.
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: ModelIdentity {
             model: "clip-local".to_string(),
@@ -122,7 +122,7 @@ fn new_text_space() -> EmbeddingSpace {
             table_name: "digests".to_string(),
             vector_column: "vector_text".to_string(),
         }],
-        placement: VectorPlacement::NodeLocal,
+        placement: Some(VectorPlacement::NodeLocal),
         media_reachable_on_every_node: false,
         producer: ModelIdentity {
             model: "clip-local".to_string(),
@@ -177,7 +177,7 @@ fn axis_text_space() -> EmbeddingSpace {
                 vector_column: "vector_text".to_string(),
             },
         ],
-        placement: VectorPlacement::NodeLocal,
+        placement: Some(VectorPlacement::NodeLocal),
         media_reachable_on_every_node: false,
         producer: axis_text_identity(),
     }

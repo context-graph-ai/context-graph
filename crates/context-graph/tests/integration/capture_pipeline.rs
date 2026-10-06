@@ -50,7 +50,7 @@ fn digest_foreign_space() -> EmbeddingSpaceDecl {
             table_name: "digests".to_string(),
             vector_column: "vector_text".to_string(),
         }],
-        placement: context_graph::VectorPlacement::NodeLocal,
+        placement: Some(context_graph::VectorPlacement::NodeLocal),
         media_reachable_on_every_node: false,
         producer: context_graph::ModelIdentity {
             model: "foreign-text".to_string(),

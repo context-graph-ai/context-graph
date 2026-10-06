@@ -194,7 +194,7 @@ fn text_space() -> EmbeddingSpace {
                 vector_column: "vector_text".to_string(),
             },
         ],
-        placement: VectorPlacement::NodeLocal,
+        placement: Some(VectorPlacement::NodeLocal),
         media_reachable_on_every_node: false,
         producer: new_identity(),
     }
@@ -215,7 +215,7 @@ fn image_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: image_identity(),
     }

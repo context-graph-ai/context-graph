@@ -323,7 +323,7 @@ fn face_space() -> EmbeddingSpaceDecl {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: ModelIdentity {
             model: "face-reid".to_string(),

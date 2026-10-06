@@ -448,7 +448,7 @@ fn node_local_space(
             table_name: "evidence".to_string(),
             vector_column: vector_column.to_string(),
         }],
-        placement: VectorPlacement::NodeLocal,
+        placement: Some(VectorPlacement::NodeLocal),
         media_reachable_on_every_node,
         producer: identity,
     }
@@ -488,7 +488,7 @@ fn unbound_space() -> EmbeddingSpace {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: identity_for_space(UNBOUND_SPACE),
     }

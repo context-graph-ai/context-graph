@@ -555,7 +555,7 @@ fn vision_config() -> StoreConfig {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_vision".to_string(),
             }],
-            placement: VectorPlacement::TravelsWithItem,
+            placement: Some(VectorPlacement::TravelsWithItem),
             media_reachable_on_every_node: false,
             producer: vision_identity(),
         }],

@@ -57,7 +57,7 @@ fn scenario() -> Scenario {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_vision".to_string(),
             }],
-            placement: VectorPlacement::TravelsWithItem,
+            placement: Some(VectorPlacement::TravelsWithItem),
             media_reachable_on_every_node: false,
             producer: ModelIdentity {
                 model: "face-local".to_string(),

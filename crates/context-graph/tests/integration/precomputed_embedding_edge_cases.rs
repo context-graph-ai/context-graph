@@ -75,7 +75,7 @@ fn face_space_decl() -> EmbeddingSpaceDecl {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: face_identity(),
     }
@@ -809,7 +809,7 @@ fn producer_metadata_model_name_persists_full_string_up_to_documented_max() {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_text".to_string(),
             }],
-            placement: VectorPlacement::NodeLocal,
+            placement: Some(VectorPlacement::NodeLocal),
             media_reachable_on_every_node: false,
             producer: long_identity.clone(),
         }],
