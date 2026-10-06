@@ -18,9 +18,9 @@ use contextdb_core::{TxId, Value, VectorIndexRef};
 use contextdb_engine::Database;
 
 /// The space reindex fills: the new text model's own space.
-const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
+const TEXT_SPACE: &str = "reindex_test_embeddinggemma_300m_new_768";
 /// The space the evidence was embedded in before the text role switched models.
-const OLD_TEXT_SPACE: &str = "reindex_old_text_768";
+const OLD_TEXT_SPACE: &str = "reindex_test_embeddinggemma_300m_old_768";
 const IMAGE_SPACE: &str = "vigil_face_reid_v1";
 
 struct Fixture {
@@ -41,10 +41,36 @@ struct Fixture {
 
 impl Fixture {
     /// Switch the text role to the new model; the old space turns stale and reindex fills the new one.
-    fn switch_to_new_model(&self) -> SwitchResult {
-        self.store
+    fn switch_to_new_model(mut self) -> (Self, SwitchResult) {
+        let switched = self
+            .store
             .switch_embedding_space(EmbeddingRole::EvidenceText, text_space(), OldSpace::Reindex)
-            .expect("switch the text role to the new model")
+            .expect("switch the text role to the new model");
+        // The switch records both generations before a reopen registers their models together.
+        // Their declared defaults stay immutable; no registration order chooses the active one.
+        drop(self.store);
+        self.store = Store::open_with_embedder_registrations(
+            StoreConfig {
+                db_path: self.db_path.clone(),
+                extra_embedding_spaces: vec![image_space()],
+                ..Default::default()
+            },
+            vec![
+                EmbedderRegistration {
+                    space: OldTextEmbedder.embedding_space(),
+                    embedder: Arc::new(OldTextEmbedder),
+                },
+                EmbedderRegistration {
+                    space: text_space(),
+                    embedder: Arc::new(RecordingReindexEmbedder {
+                        calls: Arc::clone(&self.reindex_calls),
+                        embed_calls: Arc::clone(&self.embed_calls),
+                    }),
+                },
+            ],
+        )
+        .expect("reopen with both models after the text role's recorded switch");
+        (self, switched)
     }
 }
 
@@ -179,8 +205,8 @@ fn text_space() -> EmbeddingSpace {
         metric: DistanceMetric::Cosine,
         model_family: "text".to_string(),
         model_name: "embeddinggemma-300m".to_string(),
-        model_version: "default".to_string(),
-        supported_evidence_kinds: vec![EvidenceKind::Text, EvidenceKind::StructuredSignal],
+        model_version: "new".to_string(),
+        supported_evidence_kinds: vec![EvidenceKind::Text],
         default_for_evidence_kind: Some(EvidenceKind::Text),
         bindings: vec![
             EmbeddingSpaceBinding {
@@ -284,20 +310,10 @@ fn fixture(name: &str) -> Fixture {
             extra_embedding_spaces: vec![image_space()],
             ..Default::default()
         },
-        vec![
-            // Registered first, so the old model's space is the text role's active space.
-            EmbedderRegistration {
-                space: OldTextEmbedder.embedding_space(),
-                embedder: Arc::new(OldTextEmbedder),
-            },
-            EmbedderRegistration {
-                space: text_space(),
-                embedder: Arc::new(RecordingReindexEmbedder {
-                    calls: Arc::clone(&reindex_calls),
-                    embed_calls: Arc::clone(&embed_calls),
-                }),
-            },
-        ],
+        vec![EmbedderRegistration {
+            space: OldTextEmbedder.embedding_space(),
+            embedder: Arc::new(OldTextEmbedder),
+        }],
     )
     .expect("open");
     let context = store
@@ -545,8 +561,19 @@ fn vector_index_matches_sources(
             .iter()
             .zip(source_texts)
             .all(|(evidence_id, text)| {
-                score_for(db, *evidence_id, expected_reindexed_vector(text))
-                    .is_some_and(|score| score > 0.99)
+                let expected = expected_reindexed_vector(text);
+                let stored = db
+                    .execute(
+                        "SELECT vector_text FROM evidence_embeddings WHERE target_id = $id AND embedding_space_id = $space",
+                        &params(vec![
+                            ("id", Value::Uuid(evidence_id.as_uuid())),
+                            ("space", Value::Text(TEXT_SPACE.to_string())),
+                        ]),
+                    )
+                    .expect("read the new model's exact stored vector");
+                stored.rows == vec![vec![Value::Vector(expected.clone())]]
+                    && score_for(db, *evidence_id, expected)
+                        .is_some_and(|score| score > 0.99)
             })
 }
 
@@ -581,7 +608,14 @@ fn produced_rows(db: &Database, space: &str, identity: &ModelIdentity) -> i64 {
 
 fn calls_include_all(calls: &Arc<Mutex<Vec<String>>>, expected_texts: &[String]) -> bool {
     let calls = calls.lock().expect("reindex calls");
-    expected_texts.iter().all(|text| calls.contains(text))
+    calls.len() == expected_texts.len()
+        && expected_texts.iter().all(|text| {
+            calls.iter().filter(|call| *call == text).count()
+                == expected_texts
+                    .iter()
+                    .filter(|expected| *expected == text)
+                    .count()
+        })
 }
 
 fn writer_texts_embedded_only_by_writer_threads(
@@ -624,7 +658,7 @@ fn observation_created_txids(db: &Database, evidence_ids: &[EvidenceId]) -> Vec<
 #[test]
 fn reindex_updates_vectors_and_preserves_searchability() {
     let fixture = fixture("reindex-searchability");
-    fixture.switch_to_new_model();
+    let (fixture, _) = fixture.switch_to_new_model();
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
@@ -660,7 +694,7 @@ fn reindex_updates_vectors_and_preserves_searchability() {
 #[test]
 fn reindex_changes_stored_vectors() {
     let fixture = fixture("reindex-changes-vector");
-    fixture.switch_to_new_model();
+    let (fixture, _) = fixture.switch_to_new_model();
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
@@ -714,7 +748,7 @@ fn reindex_changes_stored_vectors() {
 #[test]
 fn reindex_scoped_by_embedding_space() {
     let fixture = fixture("reindex-scope");
-    fixture.switch_to_new_model();
+    let (fixture, _) = fixture.switch_to_new_model();
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
@@ -752,7 +786,7 @@ fn reindex_scoped_by_embedding_space() {
 #[test]
 fn reindex_does_not_trigger_impact_analysis_invalidation_cascade() {
     let fixture = fixture("reindex-no-invalidation");
-    fixture.switch_to_new_model();
+    let (fixture, _) = fixture.switch_to_new_model();
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
@@ -788,7 +822,9 @@ fn reindex_preserves_pre_reindex_producer_lineage_via_original_write_txid() {
             })
             .collect::<Vec<_>>()
     };
-    let switched = fixture.switch_to_new_model();
+    let created_txids_before =
+        observation_created_txids(&fixture.store.sync_database(), &evidence_ids);
+    let (fixture, switched) = fixture.switch_to_new_model();
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
@@ -810,18 +846,19 @@ fn reindex_preserves_pre_reindex_producer_lineage_via_original_write_txid() {
     assert!(
         result.is_ok()
             && written_after == written_before
+            && created_txids == created_txids_before
             && created_txids.iter().all(Option::is_some)
             && new_producer_rows == evidence_ids.len() as i64
             && switched.from_space == OLD_TEXT_SPACE
             && switched.to_space == TEXT_SPACE,
-        "reindex must leave each item's original capture lineage and write transaction untouched, record which model produced each new vector, and report the model switch it serves, result={result:?}, switched={switched:?}, written_before={written_before:?}, written_after={written_after:?}, created_txids={created_txids:?}, new_producer_rows={new_producer_rows}"
+        "reindex must leave each item's original capture lineage and write transaction untouched, record which model produced each new vector, and report the model switch it serves, result={result:?}, switched={switched:?}, written_before={written_before:?}, written_after={written_after:?}, created_txids_before={created_txids_before:?}, created_txids={created_txids:?}, new_producer_rows={new_producer_rows}"
     );
 }
 
 #[test]
 fn reindex_resumable_after_interruption_picks_up_at_last_committed_cursor() {
     let fixture = fixture("reindex-resume");
-    fixture.switch_to_new_model();
+    let (fixture, _) = fixture.switch_to_new_model();
     let interrupted = fixture.store.reindex_space(
         TEXT_SPACE,
         ReindexOptions {
@@ -829,11 +866,24 @@ fn reindex_resumable_after_interruption_picks_up_at_last_committed_cursor() {
         },
     );
     let calls_before_resume = fixture.reindex_calls.lock().expect("calls").len();
+    let vector_snapshot_sql = "SELECT id, target_id, created_at, vector_text, produced_by FROM evidence_embeddings WHERE embedding_space_id = $space";
+    let vector_snapshot_params = params(vec![("space", Value::Text(TEXT_SPACE.to_string()))]);
+    let committed_before_resume = fixture
+        .store
+        .sync_database()
+        .execute(vector_snapshot_sql, &vector_snapshot_params)
+        .expect("snapshot the committed vector before resume")
+        .rows;
     let resumed = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
     let calls_after_resume = fixture.reindex_calls.lock().expect("calls").len();
     let total = fixture.evidence_ids.len() as u64;
+    let db = fixture.store.sync_database();
+    let committed_after_resume = db
+        .execute(vector_snapshot_sql, &vector_snapshot_params)
+        .expect("snapshot the completed vectors after resume")
+        .rows;
 
     assert!(
         matches!(
@@ -845,8 +895,13 @@ fn reindex_resumable_after_interruption_picks_up_at_last_committed_cursor() {
         ) && resumed
             .as_ref()
             .is_ok_and(|report| report.embedded == total - 1 && report.remaining == 0)
-            && calls_after_resume - calls_before_resume == (total - 1) as usize,
-        "interrupted reindex must keep its committed batch and resume from it, embedding only what remained, interrupted={interrupted:?}, resumed={resumed:?}, calls_before_resume={calls_before_resume}, calls_after_resume={calls_after_resume}"
+            && calls_after_resume - calls_before_resume == (total - 1) as usize
+            && committed_before_resume.len() == 1
+            && committed_before_resume
+                .iter()
+                .all(|row| committed_after_resume.contains(row))
+            && vector_index_matches_sources(&db, &fixture.evidence_ids, &fixture.source_texts),
+        "interrupted reindex must keep its committed batch and resume from it, embedding only what remained, interrupted={interrupted:?}, resumed={resumed:?}, calls_before_resume={calls_before_resume}, calls_after_resume={calls_after_resume}, committed_before_resume={committed_before_resume:?}, committed_after_resume={committed_after_resume:?}"
     );
 }
 
@@ -883,7 +938,7 @@ fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_determin
             "reindex concurrent padding seed failed: {seeded:?}"
         );
     }
-    fixture.switch_to_new_model();
+    let (fixture, _) = fixture.switch_to_new_model();
     let writer_count = 24;
     let writer_nonce = uuid::Uuid::now_v7();
     let new_evidence_ids = (0..writer_count)

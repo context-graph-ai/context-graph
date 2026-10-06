@@ -175,7 +175,7 @@ impl Embedder for ControlledEmbedder {
         context_graph::ModelIdentity {
             model: "correctness-fixture".into(),
             weights_revision: "1".into(),
-            preparation: "test".to_string(),
+            preparation: "1".into(),
             dimension: 768,
         }
     }

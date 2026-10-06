@@ -309,6 +309,8 @@ struct Fixture {
     _dir: tempfile::TempDir,
     db_path: PathBuf,
     store: Store,
+    text_embedder: Arc<dyn Embedder>,
+    image_embedder: Arc<dyn Embedder>,
 }
 
 struct ActiveBasisDecision {
@@ -325,26 +327,18 @@ fn fixture(name: &str) -> Fixture {
     )
 }
 
-/// Which model holds each role in the declared config: the old ones while items are seeded,
-/// the new ones once the roles were switched forward (every reopen after the switch).
+/// The seeding open loads only the old default models. After the production switch has
+/// recorded their successors, another open can load both generations under that role history.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Roles {
     Seeding,
     Switched,
 }
 
-fn store_config(db_path: PathBuf, roles: Roles) -> StoreConfig {
-    let seeding = roles == Roles::Seeding;
+fn store_config(db_path: PathBuf) -> StoreConfig {
     StoreConfig {
         db_path,
-        extra_embedding_spaces: vec![
-            with_default(old_text_space(), seeding.then_some(EvidenceKind::Text)),
-            with_default(
-                old_image_space(),
-                seeding.then_some(EvidenceKind::ImageFrame),
-            ),
-            unbound_space(),
-        ],
+        extra_embedding_spaces: vec![unbound_space()],
         ..Default::default()
     }
 }
@@ -354,22 +348,75 @@ fn registrations(
     image_embedder: Arc<dyn Embedder>,
     roles: Roles,
 ) -> Vec<EmbedderRegistration> {
-    let switched = roles == Roles::Switched;
-    vec![
+    let mut registrations = vec![
         EmbedderRegistration {
-            space: with_default(text_space(), switched.then_some(EvidenceKind::Text)),
-            embedder: text_embedder,
+            space: old_text_space(),
+            embedder: Arc::new(SourceSeedingConcurrencyEmbedder {
+                space: old_text_space(),
+            }),
         },
         EmbedderRegistration {
-            space: with_default(image_space(), switched.then_some(EvidenceKind::ImageFrame)),
-            embedder: image_embedder,
+            space: old_image_space(),
+            embedder: Arc::new(SourceSeedingConcurrencyEmbedder {
+                space: old_image_space(),
+            }),
         },
-    ]
+    ];
+    if roles == Roles::Switched {
+        registrations.extend([
+            EmbedderRegistration {
+                space: text_space(),
+                embedder: text_embedder,
+            },
+            EmbedderRegistration {
+                space: image_space(),
+                embedder: image_embedder,
+            },
+        ]);
+    }
+    registrations
 }
 
-fn with_default(mut space: EmbeddingSpace, default: Option<EvidenceKind>) -> EmbeddingSpace {
-    space.default_for_evidence_kind = default;
-    space
+/// Each old model answers only for its immutable seeding declaration; it never poses as its
+/// successor or changes identity when the fixture opens again.
+#[derive(Clone)]
+struct SourceSeedingConcurrencyEmbedder {
+    space: EmbeddingSpace,
+}
+
+impl Embedder for SourceSeedingConcurrencyEmbedder {
+    fn embed(&self, input: EmbeddingInput) -> CgResult<EmbeddingOutput> {
+        let kind = match input {
+            EmbeddingInput::Text(_) => EvidenceKind::Text,
+            EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(_) => {
+                EvidenceKind::ImageFrame
+            }
+            EmbeddingInput::AudioSegment { .. } => EvidenceKind::AudioSegment,
+            EmbeddingInput::VideoSegment { .. } => EvidenceKind::VideoSegment,
+            EmbeddingInput::StructuredSignal(_) => EvidenceKind::StructuredSignal,
+        };
+        if !self.space.supported_evidence_kinds.contains(&kind) {
+            return Err(CgError::UnsupportedEvidenceKind { kind });
+        }
+        Ok(EmbeddingOutput {
+            embedding_space_id: self.space.embedding_space_id.clone(),
+            dimension: self.space.dimension,
+            producer: EvidenceProducer::from(&self.space.producer),
+            vector: axis(self.space.dimension, 0),
+        })
+    }
+
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        self.space.supported_evidence_kinds.clone()
+    }
+
+    fn embedding_space(&self) -> EmbeddingSpace {
+        self.space.clone()
+    }
+
+    fn producer(&self) -> ModelIdentity {
+        self.space.producer.clone()
+    }
 }
 
 fn fixture_with_embedders(
@@ -380,19 +427,26 @@ fn fixture_with_embedders(
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(format!("{name}.db"));
     let store = Store::open_with_embedder_registrations(
-        store_config(db_path.clone(), Roles::Seeding),
-        registrations(text_embedder, image_embedder, Roles::Seeding),
+        store_config(db_path.clone()),
+        registrations(
+            Arc::clone(&text_embedder),
+            Arc::clone(&image_embedder),
+            Roles::Seeding,
+        ),
     )
     .expect("store opens");
     Fixture {
         _dir: dir,
         db_path,
         store,
+        text_embedder,
+        image_embedder,
     }
 }
 
 /// Move the text and image roles forward to the new models; the old rows are rebuilt by reindex.
-fn switch_forward(store: &Store) -> SwitchResult {
+fn switch_forward(fixture: &mut Fixture) -> SwitchResult {
+    let store = &fixture.store;
     let text = store
         .switch_embedding_space(EmbeddingRole::EvidenceText, text_space(), OldSpace::Reindex)
         .expect("switch the text role to the new model");
@@ -403,6 +457,21 @@ fn switch_forward(store: &Store) -> SwitchResult {
             OldSpace::Reindex,
         )
         .expect("switch the image role to the new model");
+    assert!(
+        store.drain_reindex_events().is_empty(),
+        "switches must not emit reindex progress before either generation is rebuilt"
+    );
+    // Successors are first declared by the switches above. Both generations keep their default
+    // declarations; the persisted role history, rather than registration order, settles them.
+    fixture.store = Store::open_with_embedder_registrations(
+        store_config(fixture.db_path.clone()),
+        registrations(
+            Arc::clone(&fixture.text_embedder),
+            Arc::clone(&fixture.image_embedder),
+            Roles::Switched,
+        ),
+    )
+    .expect("switched generations reopen under their recorded role history");
     text
 }
 
@@ -442,7 +511,7 @@ fn node_local_space(
         model_name: identity.model.clone(),
         model_version: identity.weights_revision.clone(),
         supported_evidence_kinds: vec![kind],
-        default_for_evidence_kind: None,
+        default_for_evidence_kind: Some(kind),
         bindings: vec![EmbeddingSpaceBinding {
             embedding_space_id: id.to_string(),
             table_name: "evidence".to_string(),
@@ -1006,7 +1075,7 @@ fn open_reindex_store_with_embedder(
     embedder: Arc<dyn Embedder>,
 ) -> context_graph::Result<Store> {
     Store::open_with_embedder_registrations(
-        store_config(db_path, Roles::Switched),
+        store_config(db_path),
         registrations(
             embedder,
             Arc::new(RecordingVisionConcurrencyEmbedder),
@@ -1070,9 +1139,9 @@ fn completions(events: &[ReindexEvent]) -> Vec<(String, u64, u64)> {
 
 #[test]
 fn reindex_concurrent_invocations_on_same_space_serialize_or_reject_typed() {
-    let fixture = fixture("reindex-same-space");
+    let mut fixture = fixture("reindex-same-space");
     let seeded = seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 3);
-    switch_forward(&fixture.store);
+    switch_forward(&mut fixture);
     let db_path = fixture.db_path.clone();
     drop(fixture.store);
     let control = Arc::new(BlockingReindexControl::default());
@@ -1127,7 +1196,7 @@ fn reindex_concurrent_invocations_on_same_space_serialize_or_reject_typed() {
 #[test]
 fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
     let row_count = 20;
-    let serial_fixture = fixture("reindex-distinct-serial");
+    let mut serial_fixture = fixture("reindex-distinct-serial");
     let serial_text_seeded = seed_rows(
         &serial_fixture.store,
         OLD_TEXT_SPACE,
@@ -1142,7 +1211,7 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
         512,
         row_count,
     );
-    switch_forward(&serial_fixture.store);
+    switch_forward(&mut serial_fixture);
     let serial_text_start = Instant::now();
     let serial_text = serial_fixture
         .store
@@ -1163,7 +1232,7 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
 
     let text_control = Arc::new(BlockingReindexControl::default());
     let image_control = Arc::new(BlockingReindexControl::default());
-    let fixture = fixture_with_embedders(
+    let mut fixture = fixture_with_embedders(
         "reindex-distinct-parallel",
         Arc::new(BlockingSecondRowConcurrencyEmbedder {
             control: Arc::clone(&text_control),
@@ -1186,7 +1255,7 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
         512,
         row_count,
     );
-    switch_forward(&fixture.store);
+    switch_forward(&mut fixture);
     let db_path = fixture.db_path.clone();
     let parallel_start = Instant::now();
     let shared = Arc::new(fixture.store.clone());
@@ -1239,7 +1308,7 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
 
 #[test]
 fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
-    let fixture = fixture("reindex-empty");
+    let mut fixture = fixture("reindex-empty");
     let context = fixture
         .store
         .create_context(CreateContext {
@@ -1284,7 +1353,7 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
             ..Default::default()
         })
         .expect("positive control decision");
-    switch_forward(&fixture.store);
+    switch_forward(&mut fixture);
     let before_events = fixture.store.drain_reindex_events();
     let result = fixture
         .store
@@ -1349,9 +1418,9 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
 
 #[test]
 fn reindex_on_single_row_space_processes_exactly_one_row() {
-    let fixture = fixture("reindex-one-row");
+    let mut fixture = fixture("reindex-one-row");
     seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 1);
-    switch_forward(&fixture.store);
+    switch_forward(&mut fixture);
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
@@ -1449,7 +1518,7 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
 
     let pause_salt = new_reindex_vector_salt(0x7061_7573_652d_6e65);
     let pause_calls = Arc::new(Mutex::new(Vec::new()));
-    let fixture = fixture_with_embedders(
+    let mut fixture = fixture_with_embedders(
         "reindex-cursor",
         Arc::new(PhaseRecordingConcurrencyEmbedder {
             vector_salt: pause_salt,
@@ -1464,7 +1533,7 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
         768,
         reindex_cursor_seed_count(),
     );
-    switch_forward(&fixture.store);
+    switch_forward(&mut fixture);
     let result = fixture.store.reindex_space(
         TEXT_SPACE,
         ReindexOptions {
@@ -1588,9 +1657,9 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
 #[test]
 fn reindex_emits_observable_pause_signal_when_underlying_io_unavailable_and_resume_signal_when_restored()
  {
-    let fixture = fixture("reindex-pause-resume");
+    let mut fixture = fixture("reindex-pause-resume");
     let seeded = seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 3);
-    switch_forward(&fixture.store);
+    switch_forward(&mut fixture);
     let result = fixture.store.reindex_space(
         TEXT_SPACE,
         ReindexOptions {
@@ -1646,7 +1715,7 @@ fn reindex_emits_observable_pause_signal_when_underlying_io_unavailable_and_resu
 
 #[test]
 fn reindex_zero_invalidation_cascades_under_fleet_load_n_decisions_n_entities() {
-    let fixture = fixture("reindex-fleet");
+    let mut fixture = fixture("reindex-fleet");
     let decisions = seed_active_basis_decisions(&fixture.store, 50);
     seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 50);
     seed_rows(
@@ -1656,7 +1725,7 @@ fn reindex_zero_invalidation_cascades_under_fleet_load_n_decisions_n_entities() 
         512,
         50,
     );
-    switch_forward(&fixture.store);
+    switch_forward(&mut fixture);
     let db_path = fixture.db_path.clone();
     let (first, second) = run_two_reindexes(fixture.store, TEXT_SPACE, IMAGE_SPACE);
     let text_rows = rows_in_space(&db_path, TEXT_SPACE);
@@ -1746,9 +1815,9 @@ fn reindex_on_registered_space_with_no_bindings_returns_typed_no_op_or_error() {
 
 #[test]
 fn reindex_emits_typed_completion_event_distinct_from_invalidation_callbacks() {
-    let fixture = fixture("reindex-completion");
+    let mut fixture = fixture("reindex-completion");
     let seeded = seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 2);
-    let switched = switch_forward(&fixture.store);
+    let switched = switch_forward(&mut fixture);
     let before_events = fixture.store.drain_reindex_events();
     let result = fixture
         .store

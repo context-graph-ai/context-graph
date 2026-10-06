@@ -96,6 +96,7 @@ impl FabricNode {
 
 /// Authenticated ticketed hubs plus two real persisted-identity edges.
 pub struct FabricFixture {
+    _shutdown_on_drop: ShutdownOnDrop,
     _hubs: Vec<FabricNode>,
     pub edge1: FabricNode,
     pub edge2: FabricNode,
@@ -106,9 +107,53 @@ pub struct FabricFixture {
     _server_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-impl Drop for FabricFixture {
+struct ShutdownOnDrop(Arc<AtomicBool>);
+
+impl Drop for ShutdownOnDrop {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Two stores after their real clients are dropped and every hub serving task has exited.
+pub struct OfflineFabricFixture {
+    pub edge1: FabricNode,
+    pub edge2: FabricNode,
+    pub stopped_hubs: usize,
+}
+
+impl FabricFixture {
+    pub async fn into_offline(self) -> OfflineFabricFixture {
+        let Self {
+            _hubs,
+            edge1,
+            edge2,
+            edge1_client,
+            edge2_client,
+            edge2_dial_spec: _,
+            shutdown,
+            _server_tasks,
+            _shutdown_on_drop,
+        } = self;
+        drop(edge1_client);
+        drop(edge2_client);
+        shutdown.store(true, Ordering::SeqCst);
+        let expected = _hubs.len();
+        let mut stopped_hubs = 0;
+        for task in _server_tasks {
+            // run_until returns only after the serving endpoint has closed and applies drain.
+            task.await
+                .expect("hub serving task exits after transport shutdown");
+            stopped_hubs += 1;
+        }
+        assert_eq!(stopped_hubs, expected, "every actual hub task was joined");
+        drop(_hubs);
+        drop(_shutdown_on_drop);
+        OfflineFabricFixture {
+            edge1,
+            edge2,
+            stopped_hubs,
+        }
     }
 }
 
@@ -231,6 +276,7 @@ pub async fn fabric_fixture_with_node_openers(
         edge1_client,
         edge2_client,
         edge2_dial_spec,
+        _shutdown_on_drop: ShutdownOnDrop(Arc::clone(&shutdown)),
         shutdown,
         _server_tasks: server_tasks,
     }

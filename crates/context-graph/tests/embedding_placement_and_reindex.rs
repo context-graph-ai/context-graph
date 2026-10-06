@@ -25,7 +25,7 @@ mod fake_extractor;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use context_graph::embedder::{EmbedderConfig, ModelSource};
@@ -48,6 +48,8 @@ const FACE_DIMENSION: usize = 8;
 const TEXT_COLUMN: &str = "vector_text_16";
 const FACE_COLUMN: &str = "vector_vision_8";
 const CHILD_PATH: &str = "CG_EMBEDDING_REINDEX_CHILD_PATH";
+const CHILD_CLOCK: &str = "CG_EMBEDDING_REINDEX_CHILD_CLOCK";
+const RECOVERY_CLOCK: u64 = 1_800_000_000_000;
 /// The embedder's call on which the reindexing child dies: the first call of the second batch.
 const DIE_ON_CALL: usize = 33;
 const EXIT_MID_REINDEX: i32 = 72;
@@ -326,11 +328,28 @@ fn plain_config(path: &Path) -> StoreConfig {
 }
 
 fn open_with(path: &Path, models: &[&Arc<TextModel>]) -> Store {
-    Store::open_with_embedder_registrations(
+    let store = Store::open_with_embedder_registrations(
         plain_config(path),
         models.iter().map(|model| model.registration()).collect(),
     )
-    .expect("open with the text models")
+    .expect("open with the text models");
+    if models.len() > 1 {
+        for model in models {
+            assert_eq!(
+                rows(
+                    &store,
+                    "SELECT default_for_evidence_kind FROM embedding_spaces WHERE embedding_space_id = $space",
+                    vec![(
+                        "space",
+                        Value::Text(model.embedding_space().embedding_space_id)
+                    )]
+                ),
+                vec![vec![Value::Text("text".into())]],
+                "persisted model generations keep their immutable declared default after succession"
+            );
+        }
+    }
+    store
 }
 
 /// A store whose configured default text embedder is the deterministic test model at `revision`.
@@ -528,6 +547,20 @@ fn vectors_in(
     found
 }
 
+/// Assert the expected item exists before inspecting its vector: a missing production row is an
+/// assertion failure at this proof's own boundary, never an unrelated map-index panic.
+fn vector_row(
+    snapshot: &BTreeMap<uuid::Uuid, (Value, Value, Value)>,
+    target: uuid::Uuid,
+) -> &(Value, Value, Value) {
+    assert!(
+        snapshot.contains_key(&target),
+        "expected stored vector for item {target}; found {:?}",
+        snapshot.keys().collect::<Vec<_>>()
+    );
+    snapshot.get(&target).expect("presence asserted above")
+}
+
 fn node_local(store: &Store, space_id: &str) -> BTreeMap<uuid::Uuid, (Value, Value, Value)> {
     vectors_in(store, "evidence_embeddings", space_id)
 }
@@ -546,9 +579,14 @@ fn embedding_reindex_child() {
         return;
     };
     let path = PathBuf::from(path);
+    let clock = std::env::var(CHILD_CLOCK)
+        .expect("parent supplies the fixed crash clock")
+        .parse::<u64>()
+        .expect("fixed crash clock milliseconds");
+    let _clock = contextdb_core::Wallclock::test_clock_guard(move || clock);
     let old = TextModel::new("rev-a");
     let new = TextModel::dying_on("rev-b", DIE_ON_CALL);
-    let store = open_with(&path, &[&old, &new]);
+    let store = open_with(&path, &[&old]);
     store
         .switch_embedding_space(
             EmbeddingRole::EvidenceText,
@@ -556,16 +594,18 @@ fn embedding_reindex_child() {
             OldSpace::Reindex,
         )
         .expect("switch the text role to the new model");
-    let _ = store.reindex_space(
+    let _ = store.reindex_space_with_embedder(
         &text_space("rev-b").embedding_space_id,
         ReindexOptions::default(),
+        new,
     );
     panic!("the reindex must reach the embedder's dying call");
 }
 
 #[test]
 fn a_crash_mid_reindex_resumes_on_reopen_repeating_no_committed_item() {
-    // A reindex killed between batches resumes at once on reopen and redoes only uncommitted items.
+    // Neither the parent nor the real child advances time to make the dead holder recoverable.
+    let _clock = contextdb_core::Wallclock::test_clock_guard(|| RECOVERY_CLOCK);
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("crash-reindex.db");
     let old = TextModel::new("rev-a");
@@ -582,6 +622,7 @@ fn a_crash_mid_reindex_resumes_on_reopen_repeating_no_committed_item() {
     let output = Command::new(std::env::current_exe().expect("test binary"))
         .args(["--exact", "embedding_reindex_child", "--nocapture"])
         .env(CHILD_PATH, &path)
+        .env(CHILD_CLOCK, RECOVERY_CLOCK.to_string())
         .output()
         .expect("run the reindexing child");
     assert_eq!(
@@ -608,9 +649,27 @@ fn a_crash_mid_reindex_resumes_on_reopen_repeating_no_committed_item() {
         "the killed reindex is reported interrupted, not running"
     );
 
+    let waits = Arc::new(AtomicUsize::new(0));
+    let observed_waits = Arc::clone(&waits);
+    context_graph::test_support::observe_background_claim_waits_for_test(move |work, _| {
+        if work == context_graph::BackgroundWork::Reindex {
+            observed_waits.fetch_add(1, Ordering::SeqCst);
+        }
+    });
     let report = store
         .reindex_space(&new_space, ReindexOptions::default())
         .expect("the immediate rerun resumes the killed reindex");
+    context_graph::test_support::observe_background_claim_waits_for_test(|_, _| {});
+    assert_eq!(
+        waits.load(Ordering::SeqCst),
+        0,
+        "dead-holder recovery never waits on a live claim"
+    );
+    assert_eq!(
+        contextdb_core::Wallclock::now(),
+        contextdb_core::Wallclock::from_raw_wire(RECOVERY_CLOCK),
+        "resume completes while the clock remains at the child claim time; no lease expires"
+    );
     assert_eq!(
         new.calls(),
         ITEMS - committed.len(),
@@ -660,7 +719,7 @@ fn a_skipped_item_keeps_its_old_vector_and_is_counted_until_it_is_rebuilt() {
     }
     let old = TextModel::new("rev-a");
     let new = TextModel::new("rev-b");
-    let store = open_with(&path, &[&old, &new]);
+    let store = open_with(&path, &[&old]);
     let (_, evidence) = seed_items(&store);
     let refused = evidence[7].as_uuid();
     let old_space = text_space("rev-a").embedding_space_id;
@@ -671,7 +730,7 @@ fn a_skipped_item_keeps_its_old_vector_and_is_counted_until_it_is_rebuilt() {
         "the item has a node-local vector under the old model before the switch: {:?}",
         before_switch.keys().collect::<Vec<_>>()
     );
-    let old_vector = before_switch[&refused].clone();
+    let old_vector = vector_row(&before_switch, refused).clone();
 
     store
         .switch_embedding_space(
@@ -680,6 +739,8 @@ fn a_skipped_item_keeps_its_old_vector_and_is_counted_until_it_is_rebuilt() {
             OldSpace::Reindex,
         )
         .expect("switch to the new model");
+    drop(store);
+    let store = open_with(&path, &[&old, &new]);
     new.refuse(Some(&note(7)));
     let report = store
         .reindex_space(&new_space, ReindexOptions::default())
@@ -884,7 +945,7 @@ fn a_retained_space_stays_searchable_and_counted_until_it_is_released() {
     let path = root.path().join("retained.db");
     let old = TextModel::new("rev-a");
     let new = TextModel::new("rev-b");
-    let store = open_with(&path, &[&old, &new]);
+    let store = open_with(&path, &[&old]);
     let (_, evidence) = seed_items(&store);
     let old_space = text_space("rev-a").embedding_space_id;
     let new_space = text_space("rev-b").embedding_space_id;
@@ -897,6 +958,8 @@ fn a_retained_space_stays_searchable_and_counted_until_it_is_released() {
             OldSpace::Retain,
         )
         .expect("switch keeping the old space");
+    drop(store);
+    let store = open_with(&path, &[&old, &new]);
     assert_eq!(switched.role, Some(EmbeddingRole::EvidenceText));
     assert_eq!(
         (switched.from_space.as_str(), switched.to_space.as_str()),
@@ -944,8 +1007,8 @@ fn a_retained_space_stays_searchable_and_counted_until_it_is_released() {
         "the new model actually generated distinct values"
     );
     assert_ne!(
-        node_local(&store, &new_space)[&evidence[0].as_uuid()].1,
-        before[&evidence[0].as_uuid()].1,
+        vector_row(&node_local(&store, &new_space), evidence[0].as_uuid()).1,
+        vector_row(&before, evidence[0].as_uuid()).1,
     );
 
     let released = store
@@ -1243,7 +1306,7 @@ async fn a_travelling_switch_preserves_and_reports_what_this_node_cannot_regener
     let mut expected = axis(2);
     expected[3] = 0.25;
     assert_eq!(
-        media_before[&media_id.as_uuid()].1,
+        vector_row(&media_before, media_id.as_uuid()).1,
         Value::Vector(expected.clone())
     );
     assert!(!media_path.exists());
@@ -1428,6 +1491,24 @@ fn a_foreign_vector_supplied_into_a_node_local_space_is_refused_and_a_compatible
     // All four write doors validate one identity component at a time and atomically refuse it.
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("supplied-vectors.db");
+    let ambiguous_path = root.path().join("unrelated-defaults.db");
+    let ambiguous = Store::open_with_embedder_registrations(
+        plain_config(&ambiguous_path),
+        vec![
+            TextModel::new("unrelated-a").registration(),
+            TextModel::new("unrelated-b").registration(),
+        ],
+    )
+    .expect_err("two unrelated defaults are refused on a fresh root");
+    assert!(
+        matches!(ambiguous, CgError::AmbiguousEmbeddingSpace),
+        "{ambiguous:?}"
+    );
+    assert!(
+        !ambiguous_path.exists(),
+        "ambiguity is refused before opening or writing the database"
+    );
+
     let declared = text_space("rev-a");
     let space = declared.embedding_space_id.clone();
     let mut local_caller = caller_space("local-only");
@@ -1470,10 +1551,12 @@ fn a_foreign_vector_supplied_into_a_node_local_space_is_refused_and_a_compatible
             outcome: context_graph::SuppliedVector::Stored { embedding_id }, ..
         }] if *embedding_id == recorded.embedding_ids[0]));
     assert_eq!(
-        node_local(&store, &space)[&compatible.as_uuid()].1,
+        vector_row(&node_local(&store, &space), compatible.as_uuid()).1,
         Value::Vector(supplied_vector)
     );
-    let compatible_id = node_local(&store, &space)[&compatible.as_uuid()].2.clone();
+    let compatible_id = vector_row(&node_local(&store, &space), compatible.as_uuid())
+        .2
+        .clone();
     assert_eq!(
         compatible_id,
         Value::Uuid(recorded.embedding_ids[0].as_uuid())
@@ -1556,7 +1639,7 @@ fn a_foreign_vector_supplied_into_a_node_local_space_is_refused_and_a_compatible
         matches!(direct, context_graph::SuppliedVector::Stored { embedding_id } if embedding_id == recorded.embedding_ids[0])
     );
     assert_eq!(
-        node_local(&store, &space)[&compatible.as_uuid()].1,
+        vector_row(&node_local(&store, &space), compatible.as_uuid()).1,
         Value::Vector(direct_vector)
     );
 
@@ -1736,11 +1819,11 @@ fn a_foreign_vector_supplied_into_a_node_local_space_is_refused_and_a_compatible
         .reindex_space(&space, ReindexOptions::default())
         .expect("same-space repair computes local values");
     assert_eq!(
-        node_local(&store, &space)[&compatible.as_uuid()].1,
+        vector_row(&node_local(&store, &space), compatible.as_uuid()).1,
         Value::Vector(text_vector("rev-a:a supplied note"))
     );
     assert_eq!(
-        node_local(&store, &space)[&compatible.as_uuid()].2,
+        vector_row(&node_local(&store, &space), compatible.as_uuid()).2,
         compatible_id,
         "same-node rebuild preserves the actual item/model identity despite changing values"
     );
@@ -1761,6 +1844,12 @@ fn a_foreign_vector_supplied_into_a_node_local_space_is_refused_and_a_compatible
         node_local(&store, &local_caller.embedding_space_id),
         held_before,
         "repairing the reproducible space never rewrites caller-only local values"
+    );
+    let held_after_repair = status_of(&store, &local_caller.embedding_space_id);
+    assert_eq!(
+        (held_after_repair.role, held_after_repair.state),
+        (None, SpaceState::HeldOnlyHere),
+        "an extra caller-only space stays unassigned after reopen and another space's repair"
     );
 }
 
@@ -1835,6 +1924,16 @@ fn enrollments() -> Enrollments {
     store
         .switch_travelling_space(&v1, v2.clone())
         .expect("register the successor face model");
+    assert_eq!(
+        status_of(&store, &v1).role,
+        None,
+        "the old extra face space was never assigned a default role"
+    );
+    assert_eq!(
+        status_of(&store, &v2.embedding_space_id).role,
+        None,
+        "activating the successor of an extra space does not invent a default role"
+    );
     Enrollments {
         _root: root,
         store,
@@ -2063,6 +2162,10 @@ fn count_where(store: &Store, table: &str, column: &str, id: uuid::Uuid) -> usiz
 #[tokio::test]
 async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     // Real interrupted source work, then independent offline rebuilds on each node.
+    let clock = Arc::new(AtomicU64::new(RECOVERY_CLOCK));
+    let clock_reads = Arc::clone(&clock);
+    let _clock =
+        contextdb_core::Wallclock::test_clock_guard(move || clock_reads.load(Ordering::SeqCst));
     let old = TextModel::new("rev-a");
     let source_new = TextModel::new("rev-b");
     let receiver_new = TextModel::new("rev-b");
@@ -2083,11 +2186,7 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
                     event_placement: Some(context_graph::EventPlacementPolicy::TenantHub),
                     ..plain_config(&path)
                 },
-                vec![
-                    old.registration(),
-                    source_new.registration(),
-                    source_event_model.registration(),
-                ],
+                vec![old.registration(), source_event_model.registration()],
             )
         },
         |label| {
@@ -2124,12 +2223,21 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
             supplied_local.clone(),
         )
         .expect("store compatible local supply as given");
+    let supplied_source_rows = node_local(
+        &fixture.edge1.store,
+        &text_space("rev-a").embedding_space_id,
+    );
     assert_eq!(
-        node_local(
-            &fixture.edge1.store,
-            &text_space("rev-a").embedding_space_id
-        )[&item.as_uuid()]
-            .1,
+        supplied_source_rows.len(),
+        ITEMS,
+        "compatible supply keeps exactly one vector per seeded item"
+    );
+    assert!(
+        supplied_source_rows.contains_key(&item.as_uuid()),
+        "compatible supply stores this source item in its declared local space"
+    );
+    assert_eq!(
+        vector_row(&supplied_source_rows, item.as_uuid()).1,
         Value::Vector(supplied_local)
     );
     fixture
@@ -2238,11 +2346,12 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     let paused = fixture
         .edge1
         .store
-        .reindex_space(
+        .reindex_space_with_embedder(
             &text_space("rev-b").embedding_space_id,
             ReindexOptions {
                 interrupt_after: Some(1),
             },
+            source_new.clone(),
         )
         .expect_err("source interrupts with committed work");
     assert!(
@@ -2278,7 +2387,8 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     assert_eq!(source_old_remaining.len(), ITEMS - 1);
     for (target, predecessor) in &source_old_remaining {
         assert_eq!(
-            predecessor, &source_old_evidence_before[target],
+            predecessor,
+            vector_row(&source_old_evidence_before, *target),
             "each remaining predecessor retains its exact vector, creation transaction and id"
         );
     }
@@ -2435,7 +2545,11 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
         Vec::<Vec<Value>>::new()
     );
     assert_eq!(
-        travelling(second, &space.embedding_space_id)[&item.as_uuid()].1,
+        vector_row(
+            &travelling(second, &space.embedding_space_id),
+            item.as_uuid()
+        )
+        .1,
         Value::Vector(text_vector("first"))
     );
     assert_eq!(
@@ -2470,6 +2584,137 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
         );
     }
     assert_eq!(receiver_event_model.calls.load(Ordering::SeqCst), 0);
+    // A long quiet interval is represented by the canonical clock, never by sleeping. There is
+    // no automatic reindex scheduler/drive exposed today: this snapshot is not credited as that
+    // missing automatic-takeover proof. Explicit work below remains an explicit user drive.
+    clock.store(RECOVERY_CLOCK + 365 * 24 * 60 * 60 * 1000, Ordering::SeqCst);
+    assert_eq!(
+        status_of(second, &text_space("rev-b").embedding_space_id).work,
+        BackgroundWorkState::Idle
+    );
+    assert_eq!(pending_snapshot(second), receiver_pending_after);
+    assert_eq!(receiver_new.calls(), 0);
+
+    fixture
+        .edge1
+        .store
+        .supply_embedding(
+            EmbeddingTarget::Evidence(item),
+            &space.embedding_space_id,
+            caller_identity("v1"),
+            text_vector("corrected"),
+        )
+        .expect("correct travelling vector");
+    fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
+    for store in [&fixture.edge1.store, second] {
+        assert_eq!(travelling(store, &space.embedding_space_id).len(), 1);
+        assert_eq!(
+            vector_row(
+                &travelling(store, &space.embedding_space_id),
+                item.as_uuid()
+            )
+            .1,
+            Value::Vector(text_vector("corrected"))
+        );
+        assert_eq!(
+            rows(
+                store,
+                "SELECT id FROM evidence_embeddings_travelling WHERE target_id = $id",
+                vec![("id", Value::Uuid(item.as_uuid()))]
+            ),
+            id_before,
+            "replacement preserves the actual deterministic id"
+        );
+    }
+
+    // Allowed enrollment receipt is a generic authenticated transport journey; per-site privacy
+    // is a separate unavailable surface (CG-078).
+    let enrollment_space = face_space("transport-v1");
+    fixture
+        .edge1
+        .store
+        .register_embedding_space(enrollment_space.clone())
+        .expect("declare travelling enrollment space");
+    let enrolled_entity = create_entity(
+        &fixture.edge1.store,
+        context_id,
+        "transport enrollment subject",
+    );
+    let enrollment_id = fixture
+        .edge1
+        .store
+        .enroll_entity_reference(
+            enrolled_entity,
+            &enrollment_space.embedding_space_id,
+            Some("front".into()),
+            axis(1),
+            face_producer("transport-v1"),
+        )
+        .expect("populate source enrollment");
+    let transported_enrollment = |store: &Store| {
+        rows(
+            store,
+            &format!(
+                "SELECT id, entity_id, label, embedding_space_id, vector FROM entity_reference_embeddings_{FACE_DIMENSION} WHERE entity_id = $entity ORDER BY id"
+            ),
+            vec![("entity", Value::Uuid(enrolled_entity.as_uuid()))],
+        )
+    };
+    let expected_enrollment = |vector| {
+        vec![vec![
+            Value::Uuid(enrollment_id.as_uuid()),
+            Value::Uuid(enrolled_entity.as_uuid()),
+            Value::Text("front".into()),
+            Value::Text(enrollment_space.embedding_space_id.clone()),
+            Value::Vector(vector),
+        ]]
+    };
+    assert_eq!(
+        transported_enrollment(&fixture.edge1.store),
+        expected_enrollment(axis(1))
+    );
+    fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
+    assert_eq!(
+        count_where(second, "entities", "id", enrolled_entity.as_uuid()),
+        1,
+        "the authorized enrollment subject itself is received"
+    );
+    assert_eq!(
+        transported_enrollment(second),
+        expected_enrollment(axis(1)),
+        "authenticated receipt keeps exact subject, shot, model, values and identity"
+    );
+    let corrected_enrollment = fixture
+        .edge1
+        .store
+        .enroll_entity_reference(
+            enrolled_entity,
+            &enrollment_space.embedding_space_id,
+            Some("front".into()),
+            axis(4),
+            face_producer("transport-v1"),
+        )
+        .expect("re-supply same enrollment with corrected values");
+    assert_eq!(
+        corrected_enrollment, enrollment_id,
+        "re-supply replaces the deterministic enrollment identity"
+    );
+    fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
+    for store in [&fixture.edge1.store, second] {
+        assert_eq!(
+            transported_enrollment(store),
+            expected_enrollment(axis(4)),
+            "one corrected enrollment converges through production sync"
+        );
+    }
+
+    let receiver_pending_before_own_capture = pending_snapshot(second);
+    let fixture = fixture.into_offline().await;
+    assert_eq!(
+        fixture.stopped_hubs, 1,
+        "the populated tenant hub is observed stopped before local work"
+    );
+    let second = &fixture.edge2.store;
     let receiver_capture = second
         .append_event_batch(authorized_event_batch)
         .expect("receiver separately captures its own caller-authorized fixture history");
@@ -2483,7 +2728,7 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     );
     assert_eq!(
         pending_snapshot(second),
-        receiver_pending_after,
+        receiver_pending_before_own_capture,
         "own event capture does not replace receiver evidence/digest work markers"
     );
     let receiver_event_build = build_events(second, &receiver_event_model);
@@ -2579,7 +2824,7 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     }
     assert_eq!(source_event_model.calls.load(Ordering::SeqCst), 1);
     assert_eq!(receiver_event_model.calls.load(Ordering::SeqCst), 1);
-    // Neither drive calls transport: the receiving node rebuilds its own content offline.
+    // Every client and hub has been dropped after its serving task exited; both drives are offline.
     let local_before = node_local(
         &fixture.edge1.store,
         &text_space("rev-b").embedding_space_id,
@@ -2587,9 +2832,10 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     let resumed = fixture
         .edge1
         .store
-        .reindex_space(
+        .reindex_space_with_embedder(
             &text_space("rev-b").embedding_space_id,
             ReindexOptions::default(),
+            source_new.clone(),
         )
         .expect("source immediately finishes its own interrupted work");
     assert_eq!(
@@ -2613,7 +2859,7 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
         assert_eq!(vectors.len(), ITEMS);
         for (index, item) in evidence.iter().enumerate() {
             assert_eq!(
-                vectors[&item.as_uuid()].1,
+                vector_row(&vectors, item.as_uuid()).1,
                 Value::Vector(text_vector(&format!("rev-b:{}", note(index))))
             );
         }
@@ -2640,8 +2886,8 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     assert_eq!(receiver_vectors.len(), ITEMS);
     for item in &evidence {
         assert_eq!(
-            source_vectors[&item.as_uuid()].2,
-            receiver_vectors[&item.as_uuid()].2,
+            vector_row(&source_vectors, item.as_uuid()).2,
+            vector_row(&receiver_vectors, item.as_uuid()).2,
             "independent nodes generate the same actual identity for this item/model"
         );
     }
@@ -2664,10 +2910,13 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     );
     for (target, row) in local_before {
         assert_eq!(
-            node_local(
-                &fixture.edge1.store,
-                &text_space("rev-b").embedding_space_id
-            )[&target],
+            *vector_row(
+                &node_local(
+                    &fixture.edge1.store,
+                    &text_space("rev-b").embedding_space_id
+                ),
+                target
+            ),
             row,
             "source retains each committed row's exact values and creation transaction"
         );
@@ -2687,42 +2936,37 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
         assert_eq!(hits.hits.len(), 1);
         assert_eq!(hits.hits[0].target, EmbeddingTarget::Evidence(item));
     }
-    fixture
-        .edge1
-        .store
-        .supply_embedding(
-            EmbeddingTarget::Evidence(item),
-            &space.embedding_space_id,
-            caller_identity("v1"),
-            text_vector("corrected"),
-        )
-        .expect("correct travelling vector");
-    fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
-    for store in [&fixture.edge1.store, second] {
-        assert_eq!(travelling(store, &space.embedding_space_id).len(), 1);
-        assert_eq!(
-            travelling(store, &space.embedding_space_id)[&item.as_uuid()].1,
-            Value::Vector(text_vector("corrected"))
-        );
-        assert_eq!(
-            rows(
-                store,
-                "SELECT id FROM evidence_embeddings_travelling WHERE target_id = $id",
-                vec![("id", Value::Uuid(item.as_uuid()))]
-            ),
-            id_before,
-            "replacement preserves the actual deterministic id"
-        );
-    }
-
     // Real authorized sync and wipe/restore all contact the populated alpha hub.
     // Denied-recipient privacy has no typed production authorization surface today (CG-078).
     {
         let recipient = "tenant-alpha";
-        let privacy = fabric_common::fabric_fixture_with_tenants(
+        let restore_model = TextModel::new("rev-a");
+        let reproducible_space = restore_model.embedding_space();
+        let privacy = fabric_common::fabric_fixture_with_node_openers(
             "placement_restore",
             "tenant-alpha",
             recipient,
+            |label| {
+                fabric_common::FabricNode::with_models(
+                    label,
+                    |path| StoreConfig {
+                        event_placement: Some(context_graph::EventPlacementPolicy::TenantHub),
+                        ..plain_config(&path)
+                    },
+                    vec![restore_model.registration()],
+                )
+            },
+            |label| {
+                fabric_common::FabricNode::with_models(
+                    label,
+                    |path| StoreConfig {
+                        event_placement: Some(context_graph::EventPlacementPolicy::TenantHub),
+                        extra_embedding_spaces: vec![reproducible_space.clone(), space.clone()],
+                        ..plain_config(&path)
+                    },
+                    vec![],
+                )
+            },
         )
         .await;
         privacy
@@ -2737,7 +2981,24 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
         );
         let authorized_source_row = travelling(&privacy.edge1.store, &space.embedding_space_id);
         assert_eq!(authorized_source_row.len(), 1);
+        let source_local = node_local(&privacy.edge1.store, &reproducible_space.embedding_space_id);
+        assert_eq!(
+            source_local.len(),
+            1,
+            "the source populated this exact space"
+        );
+        assert_eq!(
+            vector_row(&source_local, target.as_uuid()).1,
+            Value::Vector(text_vector("rev-a:a shared note"))
+        );
         fabric_common::push_then_pull(&privacy.edge1_client, &privacy.edge2_client).await;
+        assert_eq!(
+            status_of(&privacy.edge2.store, &reproducible_space.embedding_space_id).state,
+            SpaceState::Unavailable
+        );
+        assert!(
+            node_local(&privacy.edge2.store, &reproducible_space.embedding_space_id).is_empty()
+        );
         assert_eq!(
             travelling(&privacy.edge2.store, &space.embedding_space_id),
             authorized_source_row
@@ -2758,7 +3019,8 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
         let restore_root = tempfile::tempdir().expect("restore root");
         let restore_path = restore_root.path().join("wiped-receiver.db");
         let config = || StoreConfig {
-            extra_embedding_spaces: vec![text_space("rev-a"), space.clone()],
+            event_placement: Some(context_graph::EventPlacementPolicy::TenantHub),
+            extra_embedding_spaces: vec![reproducible_space.clone(), space.clone()],
             ..plain_config(&restore_path)
         };
         let receiver = Store::open(config()).expect("receiver without a reproducible model");
@@ -2788,10 +3050,10 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
             1
         );
         assert_eq!(
-            status_of(&receiver, &text_space("rev-a").embedding_space_id).state,
+            status_of(&receiver, &reproducible_space.embedding_space_id).state,
             SpaceState::Unavailable
         );
-        assert!(node_local(&receiver, &text_space("rev-a").embedding_space_id).is_empty());
+        assert!(node_local(&receiver, &reproducible_space.embedding_space_id).is_empty());
         #[cfg(context_graph_internal_test_support)]
         {
             let hits = context_graph::test_support::embedding::vector_search(
@@ -2829,6 +3091,11 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
         .expect("reopen retained authenticated recipient identity");
         fabric_common::push_then_pull(&privacy.edge1_client, &client).await;
         assert_eq!(
+            status_of(&receiver, &reproducible_space.embedding_space_id).state,
+            SpaceState::Unavailable
+        );
+        assert!(node_local(&receiver, &reproducible_space.embedding_space_id).is_empty());
+        assert_eq!(
             travelling(&receiver, &space.embedding_space_id),
             authorized_source_row,
             "authorized sync/restore preserves exact id, values and creation transaction"
@@ -2848,7 +3115,11 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
         );
         {
             assert_eq!(
-                travelling(&receiver, &space.embedding_space_id)[&target.as_uuid()].1,
+                vector_row(
+                    &travelling(&receiver, &space.embedding_space_id),
+                    target.as_uuid()
+                )
+                .1,
                 Value::Vector(text_vector("private item"))
             );
         }
@@ -2956,11 +3227,11 @@ async fn concurrent_writes_to_an_item_in_old_and_new_spaces_converge_on_the_new_
             Value::Bool(true)
         );
         assert_eq!(
-            travelling(store, &old.embedding_space_id)[&item.as_uuid()].1,
+            vector_row(&travelling(store, &old.embedding_space_id), item.as_uuid()).1,
             Value::Vector(text_vector("old model again"))
         );
         assert_eq!(
-            travelling(store, &new.embedding_space_id)[&item.as_uuid()].1,
+            vector_row(&travelling(store, &new.embedding_space_id), item.as_uuid()).1,
             Value::Vector(text_vector("new model"))
         );
         assert_eq!(
