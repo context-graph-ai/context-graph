@@ -351,34 +351,38 @@ fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
     }
 }
 
+/// The first column of the first row, or `None` when the query returns no row. A failed query
+/// or a value of another type fails the test instead of reading as an absent row.
+fn single_value(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Option<Value> {
+    let result = db
+        .execute(sql, params)
+        .unwrap_or_else(|error| panic!("readback query failed: {sql}: {error:?}"));
+    result.rows.first().map(|row| {
+        row.first()
+            .cloned()
+            .unwrap_or_else(|| panic!("readback row has no column: {sql}"))
+    })
+}
+
 fn single_i64(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Option<i64> {
-    db.execute(sql, params)
-        .ok()
-        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
-        .and_then(|value| match value {
-            Value::Int64(value) => Some(value),
-            _ => None,
-        })
+    single_value(db, sql, params).map(|value| match value {
+        Value::Int64(value) => value,
+        other => panic!("expected an integer from {sql}, got {other:?}"),
+    })
 }
 
 fn single_txid(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Option<TxId> {
-    db.execute(sql, params)
-        .ok()
-        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
-        .and_then(|value| match value {
-            Value::TxId(value) => Some(value),
-            _ => None,
-        })
+    single_value(db, sql, params).map(|value| match value {
+        Value::TxId(value) => value,
+        other => panic!("expected a transaction id from {sql}, got {other:?}"),
+    })
 }
 
 fn single_uuid(db: &Database, sql: &str, params: &HashMap<String, Value>) -> Option<uuid::Uuid> {
-    db.execute(sql, params)
-        .ok()
-        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
-        .and_then(|value| match value {
-            Value::Uuid(value) => Some(value),
-            _ => None,
-        })
+    single_value(db, sql, params).map(|value| match value {
+        Value::Uuid(value) => value,
+        other => panic!("expected a UUID from {sql}, got {other:?}"),
+    })
 }
 
 fn stored_evidence_vision_vector(db: &Database, evidence_id: EvidenceId) -> Option<Vec<f32>> {
