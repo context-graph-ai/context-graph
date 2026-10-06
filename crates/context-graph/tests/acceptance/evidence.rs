@@ -4781,15 +4781,37 @@ fn store_open_freshly_initialized_schema_introspection_shows_no_observations_dat
 #[test]
 fn store_open_extra_embedding_spaces_validates_binding_against_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // A binding to an existing column of another dimension is refused: the 512-d vision space
+    // cannot bind the 768-d `vector_text`.
     let mut config = vision_config();
     config.db_path = dir.path().join("cg.db");
-    config.extra_embedding_spaces[0].bindings[0].vector_column = "missing_vector".to_string();
+    config.extra_embedding_spaces[0].bindings[0].vector_column = "vector_text".to_string();
     let result = Store::open(config);
-    assert!(matches!(
-        result,
-        Err(CgError::MissingVectorColumnForSpace { table, column })
-            if table == "evidence" && column == "missing_vector"
-    ));
+    assert!(
+        matches!(
+            &result,
+            Err(CgError::EmbeddingSpaceConfigMismatch { field, .. }) if *field == "dimension"
+        ),
+        "{:?}",
+        result.as_ref().err()
+    );
+
+    // A space that names its own new column gets it, in its placement's table, at open.
+    let fresh = tempfile::tempdir().expect("tempdir");
+    let mut config = vision_config();
+    config.db_path = fresh.path().join("cg.db");
+    config.extra_embedding_spaces[0].bindings[0].vector_column = "vector_vision_custom".to_string();
+    let store = Store::open(config).expect("a space's own column is created at open");
+    let db = reopen_database_for_store(store);
+    assert!(
+        db.table_meta(VISION_VECTOR_TABLE)
+            .expect("travelling table meta")
+            .columns
+            .iter()
+            .any(|column| column.name == "vector_vision_custom"
+                && column.column_type == ColumnType::Vector(512)),
+        "the declared column exists with the space's dimension in its placement table"
+    );
 }
 
 #[test]
@@ -4798,13 +4820,16 @@ fn store_open_invalid_extra_embedding_space_does_not_poison_fresh_db_path() {
     let db_path = dir.path().join("cg.db");
     let mut invalid = vision_config();
     invalid.db_path = db_path.clone();
-    invalid.extra_embedding_spaces[0].bindings[0].vector_column = "missing_vector".to_string();
+    invalid.extra_embedding_spaces[0].bindings[0].vector_column = "vector_text".to_string();
     let result = Store::open(invalid);
-    assert!(matches!(
-        result,
-        Err(CgError::MissingVectorColumnForSpace { table, column })
-            if table == "evidence" && column == "missing_vector"
-    ));
+    assert!(
+        matches!(
+            &result,
+            Err(CgError::EmbeddingSpaceConfigMismatch { field, .. }) if *field == "dimension"
+        ),
+        "{:?}",
+        result.as_ref().err()
+    );
 
     let recovered = Store::open(StoreConfig {
         db_path,
