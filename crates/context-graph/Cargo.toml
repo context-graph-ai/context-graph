@@ -70,6 +70,8 @@ contextdb-vector = { workspace = true, features = ["test-seams"] }
 criterion.workspace = true
 iroh = { version = "1.0.2", default-features = false, features = ["tls-ring"] }
 iroh-tickets = "1.0.0"
+# Stops, continues, kills and reaps real child processes in the background-claim recovery proofs.
+libc = "0.2"
 safetensors.workspace = true
 sha2.workspace = true
 serde_yaml_ng.workspace = true

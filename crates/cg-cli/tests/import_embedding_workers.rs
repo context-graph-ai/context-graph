@@ -7215,8 +7215,9 @@ mod request_write_ceilings {
         );
         assert_ready(&queued, &queued_project, "queued-shared-budget");
 
-        // A killed writer leaves a live durable lease. The replacement must keep the request
-        // until that lease is released, then resume under its persisted ceiling.
+        // A killed writer leaves its claim behind with nobody holding it. The replacement takes
+        // that claim over in its first pass, with no expiry to wait out, and resumes under the
+        // request's persisted ceiling.
         let orphan = Machine::with_nomic();
         let orphan_project = orphan.project("orphan-budget");
         write_session(
@@ -7237,9 +7238,8 @@ mod request_write_ceilings {
         await_marker(&orphan_pause, "entered");
         terminate_observed_background_worker(&orphan_pause);
         orphan.wait_for_search_worker_exit();
-        let lease_wait = batch_observer(&orphan, "orphan-lease-wait");
-        std::fs::write(lease_wait.join("numbered-passes"), b"1")
-            .expect("observe the lease-only pass");
+        let takeover = batch_observer(&orphan, "orphan-takeover");
+        std::fs::write(takeover.join("numbered-passes"), b"1").expect("observe the takeover pass");
         let resumed = orphan.spawn_with_env(
             &orphan_project,
             &[
@@ -7249,28 +7249,18 @@ mod request_write_ceilings {
                 &HIGH.to_string(),
             ],
             REQUEST_OBSERVER_ENV,
-            &lease_wait,
+            &takeover,
         );
-        await_marker(&lease_wait, "entered.1");
+        await_marker(&takeover, "entered.1");
         assert_eq!(
             worker_policy(&orphan.data_root)["pending_background_request"]["write_requests"][0]["completed"],
             false
         );
-        {
-            let db = contextdb_engine::Database::open(orphan.db_path())
-                .expect("open the closed lease fixture");
-            let changed = db
-                .execute(
-                    "UPDATE event_search_leases SET expires_at = $expired",
-                    &std::collections::HashMap::from([(
-                        "expired".into(),
-                        contextdb_core::Value::Timestamp(0),
-                    )]),
-                )
-                .expect("expire the orphan claim deterministically");
-            assert_eq!(changed.rows_affected, 1);
-        }
-        std::fs::write(lease_wait.join("release"), b"resume expired claim")
+        assert!(
+            budgets(&takeover).iter().all(|(_, limit)| *limit == LOW),
+            "the first pass already serves the orphaned batch under its persisted ceiling"
+        );
+        std::fs::write(takeover.join("release"), b"finish the taken-over claim")
             .expect("release replacement");
         let output = resumed.wait_with_output().expect("replacement completes");
         assert_eq!(
@@ -7279,8 +7269,8 @@ mod request_write_ceilings {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!budgets(&lease_wait).is_empty());
-        assert!(budgets(&lease_wait).iter().all(|(_, limit)| *limit == LOW));
+        assert!(!budgets(&takeover).is_empty());
+        assert!(budgets(&takeover).iter().all(|(_, limit)| *limit == LOW));
         assert_ready(&orphan, &orphan_project, "orphan-budget");
 
         for (completed_limit, next_limit, startup_limit) in [(HIGH, LOW, HIGH), (LOW, HIGH, LOW)] {
@@ -7307,7 +7297,7 @@ mod request_write_ceilings {
             );
             assert_eq!(first.code, 0, "{}", first.describe());
             await_marker(&observer, "entered.2");
-            // The first projection finished before the pause, so restart has no orphan lease.
+            // The first projection finished before the pause, so restart has no orphaned claim.
             assert_ready(&machine, &project, "shared-budget");
             let additional = write_session(
                 &machine.history_root(),

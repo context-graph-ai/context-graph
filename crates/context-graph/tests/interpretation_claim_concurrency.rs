@@ -1,8 +1,9 @@
 //! RED regressions for concurrent public interpretation runners.
 //!
 //! The mappers are the only barriers.  Each captures the durable claim made by a real runner;
-//! the control expires only that row through the existing test SQL seam.  No test invents a
-//! generation, member, event ID, or lease token.
+//! the control releases only the first runner's kernel holder lock through the claim test seam,
+//! so a second runner may take the claim over while the first is still alive.  No test invents a
+//! generation, member, event ID, or claim token.
 
 #![cfg(context_graph_internal_test_support)]
 
@@ -161,8 +162,8 @@ fn capture(path: PathBuf) -> (Store, context_graph::ContextId) {
 #[derive(Clone, Debug, PartialEq)]
 struct ClaimSnapshot {
     generation_id: uuid::Uuid,
-    lease_token: String,
-    lease_epoch: i64,
+    owner_token: uuid::Uuid,
+    owner_epoch: i64,
     build_ordinal: i64,
     claim_end_ordinal: i64,
     membership: Vec<Vec<Value>>,
@@ -171,7 +172,7 @@ struct ClaimSnapshot {
 fn live_claim(store: &Store, context_id: context_graph::ContextId) -> ClaimSnapshot {
     let generation = rows(
         store,
-        "SELECT id, lease_token, lease_epoch, build_ordinal, claim_end_ordinal FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND state = $state AND lease_token IS NOT NULL AND claim_end_ordinal IS NOT NULL",
+        "SELECT id, build_ordinal, claim_end_ordinal FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND state = $state AND claim_end_ordinal IS NOT NULL",
         HashMap::from([
             ("context_id".into(), Value::Uuid(context_id.as_uuid())),
             ("connector_id".into(), Value::Text(CONNECTOR.into())),
@@ -184,19 +185,11 @@ fn live_claim(store: &Store, context_id: context_graph::ContextId) -> ClaimSnaps
         Value::Uuid(id) => id,
         ref value => panic!("real generation ID: {value:?}"),
     };
-    let lease_token = match &row[1] {
-        Value::Text(token) => token.clone(),
-        value => panic!("real lease token: {value:?}"),
-    };
-    let lease_epoch = match row[2] {
-        Value::Int64(epoch) => epoch,
-        ref value => panic!("real lease epoch: {value:?}"),
-    };
-    let build_ordinal = match row[3] {
+    let build_ordinal = match row[1] {
         Value::Int64(ordinal) => ordinal,
         ref value => panic!("real build ordinal: {value:?}"),
     };
-    let claim_end_ordinal = match row[4] {
+    let claim_end_ordinal = match row[2] {
         Value::Int64(ordinal) => ordinal,
         ref value => panic!("real claim end ordinal: {value:?}"),
     };
@@ -211,10 +204,32 @@ fn live_claim(store: &Store, context_id: context_graph::ContextId) -> ClaimSnaps
         ]),
     );
     assert_eq!(membership.len(), 1, "real live claim owns one source row");
+    let claim = rows(
+        store,
+        "SELECT owner_token, owner_epoch FROM background_claims WHERE work = $work AND context_id = $context_id AND unit_id = $unit_id",
+        HashMap::from([
+            ("work".into(), Value::Text("interpretation".into())),
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("unit_id".into(), Value::Uuid(generation_id)),
+        ]),
+    );
+    assert_eq!(
+        claim.len(),
+        1,
+        "one real background claim owns the generation"
+    );
+    let owner_token = match claim[0][0] {
+        Value::Uuid(token) => token,
+        ref value => panic!("real claim token: {value:?}"),
+    };
+    let owner_epoch = match claim[0][1] {
+        Value::Int64(epoch) => epoch,
+        ref value => panic!("real claim epoch: {value:?}"),
+    };
     ClaimSnapshot {
         generation_id,
-        lease_token,
-        lease_epoch,
+        owner_token,
+        owner_epoch,
         build_ordinal,
         claim_end_ordinal,
         membership,
@@ -228,6 +243,7 @@ struct RelevantRows {
     values: Vec<Vec<Value>>,
     anchors: Vec<Vec<Value>>,
     heads: Vec<Vec<Value>>,
+    claims: Vec<Vec<Value>>,
 }
 
 fn relevant_rows(
@@ -242,7 +258,7 @@ fn relevant_rows(
     RelevantRows {
         generation: rows(
             store,
-            "SELECT id, context_id, connector_id, accepted_source_declarations, target_interpretation_version, target_adapter_version, target_anchor_declaration_version, mapping_contract_id, mapping_contract_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, build_ordinal, claim_end_ordinal, claim_membership_sha256, lease_epoch, lease_token, lease_expires_at, state, eligible_event_count, interpreted_event_count, failed_event_count, effective_content_sha256, sanitized_failure, started_at, completed_at, activated_at, activation_receipt FROM event_interpretation_generations WHERE context_id = $context_id AND id = $generation_id ORDER BY id",
+            "SELECT id, context_id, connector_id, accepted_source_declarations, target_interpretation_version, target_adapter_version, target_anchor_declaration_version, mapping_contract_id, mapping_contract_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, build_ordinal, claim_end_ordinal, claim_membership_sha256, state, eligible_event_count, interpreted_event_count, failed_event_count, effective_content_sha256, sanitized_failure, started_at, completed_at, activated_at, activation_receipt FROM event_interpretation_generations WHERE context_id = $context_id AND id = $generation_id ORDER BY id",
             common.clone(),
         ),
         membership: rows(
@@ -265,6 +281,11 @@ fn relevant_rows(
             "SELECT context_id, connector_id, generation_id, activated_at FROM event_interpretation_heads WHERE context_id = $context_id ORDER BY connector_id, generation_id",
             HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         ),
+        claims: rows(
+            store,
+            "SELECT work, unit_id, owner_token, owner_epoch FROM background_claims WHERE context_id = $context_id ORDER BY work, unit_id",
+            HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+        ),
     }
 }
 
@@ -285,25 +306,23 @@ impl ReleasedConnectorInterpretation for FirstRunnerMapper {
     fn interpret_event(&self, _: &ConversationEvent) -> Result<EffectiveEventFields> {
         let control = Store::open(config(self.path.clone())).expect("open mapper control Store");
         let claim = live_claim(&control, self.context_id);
-        rows(
-            &control,
-            "UPDATE event_interpretation_generations SET lease_expires_at = $expired WHERE context_id = $context_id AND id = $generation_id",
-            HashMap::from([
-                ("expired".into(), Value::Timestamp(0)),
-                ("context_id".into(), Value::Uuid(self.context_id.as_uuid())),
-                ("generation_id".into(), Value::Uuid(claim.generation_id)),
-            ]),
+        drop(control);
+        // A stays alive but loses its kernel holder lock, so B may take the claim over.
+        assert_eq!(
+            context_graph::test_support::lose_held_claim_presence_for_test(&self.path),
+            1,
+            "A holds exactly one claim on this store"
         );
         self.paused
             .send(claim)
-            .expect("test receives the expired real A claim");
+            .expect("test receives the real A claim whose lock was lost");
         self.resume
             .lock()
             .expect("A resume lock")
             .recv_timeout(CHANNEL_TIMEOUT)
-            .expect("test releases A after B has reclaimed");
+            .expect("test releases A after B has taken over");
         Err(CgError::Engine(
-            "late A mapper error after B reclaim".into(),
+            "late A mapper error after B takeover".into(),
         ))
     }
 }
@@ -329,11 +348,11 @@ impl ReleasedConnectorInterpretation for SecondRunnerMapper {
         let claim = live_claim(&control, self.context_id);
         assert_eq!(
             claim.generation_id, self.first.generation_id,
-            "B reclaims A's real generation"
+            "B takes over A's real generation"
         );
         assert_eq!(
             claim.membership, self.first.membership,
-            "B reclaims A's real membership rows"
+            "B takes over A's real membership rows"
         );
         assert_eq!(
             claim.build_ordinal, self.first.build_ordinal,
@@ -344,16 +363,16 @@ impl ReleasedConnectorInterpretation for SecondRunnerMapper {
             "B keeps A's durable claim bound"
         );
         assert_ne!(
-            claim.lease_token, self.first.lease_token,
-            "B owns a renewed real lease token"
+            claim.owner_token, self.first.owner_token,
+            "B owns a new real claim token"
         );
         assert!(
-            claim.lease_epoch > self.first.lease_epoch,
-            "B owns a later lease epoch"
+            claim.owner_epoch > self.first.owner_epoch,
+            "B owns a later claim epoch"
         );
         self.paused
             .send(claim)
-            .expect("test receives B's reclaimed real lease");
+            .expect("test receives B's taken-over real claim");
         self.resume
             .lock()
             .expect("B resume lock")
@@ -383,7 +402,7 @@ fn late_a_error_preserves_b_claim(b_completes_before_a_error: bool) {
     });
     let first_claim = a_paused_rx
         .recv_timeout(CHANNEL_TIMEOUT)
-        .expect("A paused after expiring its real lease with test SQL");
+        .expect("A paused after losing its holder lock");
 
     let (b_paused_tx, b_paused_rx) = channel();
     let (b_resume_tx, b_resume_rx) = channel();
@@ -400,7 +419,7 @@ fn late_a_error_preserves_b_claim(b_completes_before_a_error: bool) {
     }));
     let b_claim = b_paused_rx
         .recv_timeout(CHANNEL_TIMEOUT)
-        .expect("B reclaimed and paused on the renewed real lease");
+        .expect("B took over and paused on its new real claim");
 
     if b_completes_before_a_error {
         b_resume_tx.send(()).expect("release B to complete");
@@ -408,7 +427,7 @@ fn late_a_error_preserves_b_claim(b_completes_before_a_error: bool) {
             .expect("B thread is still held by its mapper")
             .join()
             .expect("B runner thread joins")
-            .expect("B completes its reclaimed claim before A returns an error");
+            .expect("B completes its taken-over claim before A returns an error");
     }
 
     let before_a_error = {
@@ -419,7 +438,7 @@ fn late_a_error_preserves_b_claim(b_completes_before_a_error: bool) {
     a_resume_tx.send(()).expect("release A's late mapper error");
     let a_error = a.join().expect("A runner thread joins");
     assert!(
-        matches!(a_error, Err(CgError::Engine(message)) if message == "late A mapper error after B reclaim")
+        matches!(a_error, Err(CgError::Engine(message)) if message == "late A mapper error after B takeover")
     );
     let after_a_error = {
         let inspect =
@@ -441,15 +460,15 @@ fn late_a_error_preserves_b_claim(b_completes_before_a_error: bool) {
 
     assert_eq!(
         after_a_error, before_a_error,
-        "A's late error leaves every relevant row of B's reclaimed lease or completed generation intact"
+        "A's late error leaves every relevant row of B's taken-over claim or completed generation intact"
     );
     if let Some(result) = b_result_after_a_error {
-        result.expect("B completes its reclaimed claim after A returns an error");
+        result.expect("B completes its taken-over claim after A returns an error");
     }
 }
 
 #[test]
-fn late_mapper_error_cannot_clear_a_reclaimed_live_lease_or_its_progress() {
+fn late_mapper_error_cannot_clear_a_taken_over_live_claim_or_its_progress() {
     late_a_error_preserves_b_claim(false);
 }
 

@@ -20,7 +20,7 @@ use context_graph::{
     InterpretationGenerationState, InterpretationLeaseRefusalReason,
     ReleasedConnectorInterpretation, ReleasedInterpretationDeclaration, Result, Store, StoreConfig,
 };
-use contextdb_core::{Value, Wallclock};
+use contextdb_core::Value;
 use serde_json::json;
 
 const CONNECTOR: &str = "interpretation-recovery-fixture";
@@ -248,59 +248,51 @@ fn captured_store(path: PathBuf) -> (Store, context_graph::ContextId, Conversati
 #[derive(Clone, Debug, PartialEq)]
 struct LiveGenerationSnapshot {
     id: uuid::Uuid,
-    lease_token: String,
-    lease_epoch: i64,
-    lease_expires_at: i64,
+    owner_token: uuid::Uuid,
+    owner_epoch: i64,
     build_ordinal: i64,
     sealed_membership: Vec<Vec<Value>>,
 }
 
-fn now_millis() -> i64 {
-    // The same seamed clock the store stamps leases with.
-    i64::try_from(Wallclock::now().0).expect("current timestamp fits engine TIMESTAMP")
-}
-
+/// The building generation and the shared background claim that currently owns it.
 fn selected_live_generation(
     store: &Store,
     context_id: context_graph::ContextId,
 ) -> LiveGenerationSnapshot {
     let generation = one_row(
         store,
-        "SELECT id, lease_token, lease_epoch, lease_expires_at, build_ordinal, state FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND lease_token IS NOT NULL AND lease_expires_at > $now ORDER BY started_at DESC LIMIT 1",
+        "SELECT id, build_ordinal, state FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND state = $state ORDER BY started_at DESC LIMIT 1",
         HashMap::from([
             ("context_id".into(), Value::Uuid(context_id.as_uuid())),
             ("connector_id".into(), Value::Text(CONNECTOR.into())),
-            ("now".into(), Value::Timestamp(now_millis())),
+            ("state".into(), Value::Text("building".into())),
         ]),
     );
     let id = match generation[0] {
         Value::Uuid(id) => id,
         ref other => panic!("live generation id: {other:?}"),
     };
-    let lease_token = match &generation[1] {
-        Value::Text(token) => token.clone(),
-        other => panic!("live generation token: {other:?}"),
-    };
-    let lease_epoch = match generation[2] {
-        Value::Int64(epoch) => epoch,
-        ref other => panic!("live generation epoch: {other:?}"),
-    };
-    let lease_expires_at = match generation[3] {
-        Value::Timestamp(expires_at) => expires_at,
-        ref other => panic!("live generation expiry: {other:?}"),
-    };
-    assert!(
-        lease_expires_at > now_millis(),
-        "selected lease is unexpired"
-    );
-    let build_ordinal = match generation[4] {
+    let build_ordinal = match generation[1] {
         Value::Int64(ordinal) => ordinal,
         ref other => panic!("live generation build ordinal: {other:?}"),
     };
-    assert!(
-        matches!(&generation[5], Value::Text(state) if state == "building"),
-        "selected live generation remains in building state"
+    let claim = one_row(
+        store,
+        "SELECT owner_token, owner_epoch FROM background_claims WHERE work = $work AND context_id = $context_id AND unit_id = $unit_id",
+        HashMap::from([
+            ("work".into(), Value::Text("interpretation".into())),
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("unit_id".into(), Value::Uuid(id)),
+        ]),
     );
+    let owner_token = match claim[0] {
+        Value::Uuid(token) => token,
+        ref other => panic!("live claim token: {other:?}"),
+    };
+    let owner_epoch = match claim[1] {
+        Value::Int64(epoch) => epoch,
+        ref other => panic!("live claim epoch: {other:?}"),
+    };
     let sealed_membership = rows(
         store,
         "SELECT event_id, source_row_sha256 FROM event_interpretation_source_events WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY ordinal",
@@ -315,9 +307,8 @@ fn selected_live_generation(
     );
     LiveGenerationSnapshot {
         id,
-        lease_token,
-        lease_epoch,
-        lease_expires_at,
+        owner_token,
+        owner_epoch,
         build_ordinal,
         sealed_membership,
     }
@@ -480,26 +471,25 @@ fn stale_claim_changed_during_mapper_is_refused_without_values_or_head() {
         *callback_claim
             .lock()
             .expect("capture selected real generation") = Some(generation.clone());
+        // Ownership moves while the mapper runs: another owner now holds the claim.
         rows(
             &control,
-            "UPDATE event_interpretation_generations SET lease_token = $lease_token, lease_epoch = $lease_epoch WHERE context_id = $context_id AND id = $id",
+            "UPDATE background_claims SET owner_token = $owner_token, owner_epoch = $owner_epoch WHERE work = $work AND context_id = $context_id AND unit_id = $unit_id",
             HashMap::from([
+                ("owner_token".into(), Value::Uuid(uuid::Uuid::new_v4())),
                 (
-                    "lease_token".into(),
-                    Value::Text("replacement-real-lease-token".into()),
+                    "owner_epoch".into(),
+                    Value::Int64(generation.owner_epoch + 1),
                 ),
-                (
-                    "lease_epoch".into(),
-                    Value::Int64(generation.lease_epoch + 1),
-                ),
+                ("work".into(), Value::Text("interpretation".into())),
                 ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                ("id".into(), Value::Uuid(generation.id)),
+                ("unit_id".into(), Value::Uuid(generation.id)),
             ]),
         );
     }));
     let error =
         ConnectorInterpretationRunner::build(request(path.clone(), context_id, mapper.clone()))
-            .expect_err("late mapper result is refused against the actual replaced lease");
+            .expect_err("late mapper result is refused against the actual replaced claim");
     assert!(matches!(
         error,
         CgError::InterpretationLeaseRefused {
@@ -530,141 +520,73 @@ fn stale_claim_changed_during_mapper_is_refused_without_values_or_head() {
 }
 
 #[test]
-fn expired_claim_reclaims_once_and_commits_one_value_set() {
+fn a_claim_that_lost_its_lock_still_commits_once_when_nobody_took_it_over() {
+    // Exclusion never depends on the lock: a builder whose lock is lost but whose claim nobody took
+    // over commits its one value set and leaves no claim behind.
     let root = tempfile::tempdir().expect("tempdir");
-    let path = root.path().join("expired.db");
+    let path = root.path().join("lost-lock.db");
     let (store, context_id, _) = captured_store(path.clone());
     drop(store);
-    let first_control_path = path.clone();
-    let first_claim = Arc::new(Mutex::new(None));
-    let first_callback_claim = Arc::clone(&first_claim);
-    let second_control_path = path.clone();
-    let second_callback_claim = Arc::clone(&first_claim);
-    let reclaimed_claim = Arc::new(Mutex::new(None));
-    let reclaimed_callback_claim = Arc::clone(&reclaimed_claim);
-    let mapper = Arc::new(RecoveryMapper::with_controls(vec![
-        Box::new(move || {
-            let control = open_control_store(&first_control_path);
-            let generation = selected_live_generation(&control, context_id);
-            *first_callback_claim
-                .lock()
-                .expect("capture first real generation") = Some(generation.clone());
-            rows(
-                &control,
-                "UPDATE event_interpretation_generations SET lease_expires_at = $expired WHERE context_id = $context_id AND id = $id",
-                HashMap::from([
-                    ("expired".into(), Value::Timestamp(0)),
-                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                    ("id".into(), Value::Uuid(generation.id)),
-                ]),
-            );
-        }),
-        Box::new(move || {
-            let control = open_control_store(&second_control_path);
-            let renewed = selected_live_generation(&control, context_id);
-            let first = second_callback_claim
-                .lock()
-                .expect("read first real generation")
-                .clone()
-                .expect("first control captured a real live generation");
-            assert_eq!(
-                renewed.id, first.id,
-                "reclaim renews the selected real generation"
-            );
-            assert_eq!(
-                renewed.sealed_membership, first.sealed_membership,
-                "reclaim retains the same sealed source membership"
-            );
-            assert_eq!(
-                renewed.build_ordinal, first.build_ordinal,
-                "expired first attempt did not advance the selected generation build cursor"
-            );
-            assert_ne!(
-                renewed.lease_token, first.lease_token,
-                "reclaim renews the live lease token"
-            );
-            assert!(
-                renewed.lease_epoch > first.lease_epoch,
-                "reclaim advances the live lease epoch"
-            );
-            assert!(
-                renewed.lease_expires_at > now_millis(),
-                "reclaim gives the renewed lease a future expiry"
-            );
-            assert_refused_claim_did_not_advance(&control, context_id, &first);
-            *reclaimed_callback_claim
-                .lock()
-                .expect("capture reclaimed real generation") = Some(renewed);
-        }),
-    ]));
+    let control_path = path.clone();
+    let selected_claim = Arc::new(Mutex::new(None));
+    let callback_claim = Arc::clone(&selected_claim);
+    let mapper = Arc::new(RecoveryMapper::new(move || {
+        let control = open_control_store(&control_path);
+        let generation = selected_live_generation(&control, context_id);
+        assert_eq!(
+            generation.owner_epoch, 1,
+            "a fresh build claims at the first epoch"
+        );
+        drop(control);
+        assert_eq!(
+            context_graph::test_support::lose_held_claim_presence_for_test(&control_path),
+            1,
+            "the builder loses the kernel lock of its one claim"
+        );
+        *callback_claim
+            .lock()
+            .expect("capture selected real generation") = Some(generation);
+    }));
     let receipt =
         ConnectorInterpretationRunner::build(request(path.clone(), context_id, mapper.clone()))
-            .expect("expired first claim is reclaimed and the second attempt commits");
+            .expect("an unchanged claim commits even after its lock was lost");
     assert_eq!(
         mapper.calls.load(Ordering::SeqCst),
-        2,
-        "only the reclaimed attempt remaps"
-    );
-    assert_eq!(
-        mapper.control_calls.load(Ordering::SeqCst),
-        2,
-        "both expiry controls ran across the rejected and reclaimed mapper attempts"
+        1,
+        "the event is mapped once"
     );
     assert_eq!(receipt.interpreted_event_count, 1);
-    let inspected = Store::open(config(path)).expect("inspect reclaimed build");
-    let reclaimed = reclaimed_claim
+    let selected = selected_claim
         .lock()
-        .expect("read reclaimed real generation")
+        .expect("read selected real generation")
         .clone()
-        .expect("second control captured the reclaimed live generation");
-    assert_eq!(
-        receipt.generation_id.as_uuid(),
-        reclaimed.id,
-        "successful retry returns the generation reclaimed during its callback"
-    );
-    assert_eq!(
-        one_row(
-            &inspected,
-            "SELECT build_ordinal FROM event_interpretation_generations WHERE context_id = $context_id AND id = $generation_id",
-            HashMap::from([
-                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                ("generation_id".into(), Value::Uuid(reclaimed.id)),
-            ]),
-        ),
-        vec![Value::Int64(
-            reclaimed.build_ordinal
-                + i64::try_from(reclaimed.sealed_membership.len())
-                    .expect("sealed membership count fits build ordinal"),
-        )],
-        "successful reclaimed claim advances its persisted cursor through its actual sealed membership"
-    );
+        .expect("control captured the live generation");
+    assert_eq!(receipt.generation_id.as_uuid(), selected.id);
+    let inspected = Store::open(config(path)).expect("inspect committed build");
     assert_eq!(
         rows(
             &inspected,
             "SELECT event_id FROM event_interpretation_values WHERE context_id = $context_id AND generation_id = $generation_id",
             HashMap::from([
                 ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                ("generation_id".into(), Value::Uuid(receipt.generation_id.as_uuid())),
+                ("generation_id".into(), Value::Uuid(selected.id)),
             ]),
         )
         .len(),
         1,
-        "reclaimed lease commits one value set"
-    );
-    let generation = one_row(
-        &inspected,
-        "SELECT lease_token FROM event_interpretation_generations WHERE context_id = $context_id AND id = $generation_id",
-        HashMap::from([
-            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-            (
-                "generation_id".into(),
-                Value::Uuid(receipt.generation_id.as_uuid()),
-            ),
-        ]),
+        "the build commits exactly one value set"
     );
     assert!(
-        matches!(generation[0], Value::Null),
-        "committed claim consumes its live lease token"
+        rows(
+            &inspected,
+            "SELECT owner_token FROM background_claims WHERE work = $work AND context_id = $context_id",
+            HashMap::from([
+                ("work".into(), Value::Text("interpretation".into())),
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ]),
+        )
+        .is_empty(),
+        "the committed claim is consumed"
     );
 }
 

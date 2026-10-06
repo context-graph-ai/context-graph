@@ -225,48 +225,34 @@ fn spawn_worker_before_first_assessment(
         .expect("spawn default event-search worker")
 }
 
-/// Install one live lease for an existing generation after every CLI process has released the
-/// store. The worker under test sees a durable lease exactly as it would after an interrupted
-/// process, while the fixture's short lifetime keeps the journey bounded.
+/// Leave one orphaned claim on an existing generation after every CLI process has released the
+/// store: a claim row whose owner holds no kernel holder lock, exactly what a killed worker leaves.
 #[cfg(any(
     context_graph_internal_test_support,
     feature = "event-search-test-support"
 ))]
-fn seed_unexpired_event_search_lease(
-    machine: &Machine,
-    context_id: &str,
-    generation_id: &str,
-    lifetime: Duration,
-) {
+fn seed_orphaned_event_search_claim(machine: &Machine, context_id: &str, generation_id: &str) {
     use std::collections::HashMap;
 
-    use contextdb_core::{Value as DbValue, Wallclock};
+    use contextdb_core::Value as DbValue;
     use contextdb_engine::Database;
 
     let context_id = uuid::Uuid::parse_str(context_id).expect("Context id from import receipt");
     let generation_id =
         uuid::Uuid::parse_str(generation_id).expect("generation id from ready status receipt");
-    let expires_at = i64::try_from(Wallclock::now().0.saturating_add(
-        u64::try_from(lifetime.as_millis()).expect("fixture lease duration fits u64"),
-    ))
-    .expect("fixture lease expiry fits timestamp");
     let db = Database::open(machine.db_path()).expect("open durable fixture store");
     db.execute(
-        "INSERT INTO event_search_leases (context_id, generation_id, owner_token, lease_epoch, claimed_connector_id, claimed_source_instance_ref, claimed_start_sequence, claimed_end_sequence, cursor_sha256, expires_at) VALUES ($context_id, $generation_id, $owner_token, $lease_epoch, $connector_id, $source, $start, $end, $cursor_sha256, $expires_at)",
+        "INSERT INTO background_claims (work, context_id, unit_id, owner_token, owner_epoch) VALUES ($work, $context_id, $unit_id, $owner_token, $owner_epoch)",
         &HashMap::from([
+            ("work".into(), DbValue::Text("event_search".into())),
             ("context_id".into(), DbValue::Uuid(context_id)),
-            ("generation_id".into(), DbValue::Uuid(generation_id)),
-            ("owner_token".into(), DbValue::Text("interrupted-worker".into())),
-            ("lease_epoch".into(), DbValue::Int64(1)),
-            ("connector_id".into(), DbValue::Null),
-            ("source".into(), DbValue::Null),
-            ("start".into(), DbValue::Null),
-            ("end".into(), DbValue::Null),
-            ("cursor_sha256".into(), DbValue::Text("fixture-orphan-lease".into())),
-            ("expires_at".into(), DbValue::Timestamp(expires_at)),
+            ("unit_id".into(), DbValue::Uuid(generation_id)),
+            ("owner_token".into(), DbValue::Uuid(uuid::Uuid::new_v4())),
+            ("owner_epoch".into(), DbValue::Int64(1)),
         ]),
     )
-    .expect("persist unexpired orphan lease");
+    .expect("persist the orphaned claim a killed worker leaves");
+    db.close().expect("close the fixture store");
 }
 
 fn hits(value: &Value) -> Vec<Value> {
@@ -2686,17 +2672,17 @@ fn a_default_import_with_a_changed_profile_reuses_the_live_workers_next_pass() {
     );
 }
 
-// A killed worker leaves its lease durable. The next default worker must keep serving another
-// Context, then recheck the leased one until it can resume the captured work without another
-// import.
+// A killed worker leaves its claim row behind with nobody holding it. The next default worker
+// takes that claim over at once in the same pass that serves every other pending Context: no
+// expiry to outwait, no recheck, no other import.
 #[test]
 #[cfg(any(
     context_graph_internal_test_support,
     feature = "event-search-test-support"
 ))]
-fn a_default_worker_waits_for_an_orphaned_lease_and_does_not_starve_other_contexts() {
+fn a_default_worker_takes_over_an_orphaned_claim_at_once_alongside_other_contexts() {
     let machine = Machine::with_nomic();
-    let orphaned_project = machine.project("orphaned-lease");
+    let orphaned_project = machine.project("orphaned-claim");
     let eligible_project = machine.project("eligible-while-orphaned");
     write_session(
         &machine.history_root(),
@@ -2710,7 +2696,7 @@ fn a_default_worker_waits_for_an_orphaned_lease_and_does_not_starve_other_contex
             "import",
             ".",
             "--context",
-            "orphaned-lease",
+            "orphaned-claim",
             "--search",
             "wait",
         ],
@@ -2737,7 +2723,7 @@ fn a_default_worker_waits_for_an_orphaned_lease_and_does_not_starve_other_contex
             "import",
             ".",
             "--context",
-            "orphaned-lease",
+            "orphaned-claim",
             "--search",
             "defer",
         ],
@@ -2784,25 +2770,19 @@ fn a_default_worker_waits_for_an_orphaned_lease_and_does_not_starve_other_contex
     let mut worker =
         spawn_worker_before_first_assessment(&machine, &orphaned_project, barrier.path());
     wait_for_worker_marker(&barrier.path().join("pre-catch-up-entered"));
-    seed_unexpired_event_search_lease(
-        &machine,
-        &orphaned_context_id,
-        &generation_id,
-        Duration::from_secs(5),
-    );
+    seed_orphaned_event_search_claim(&machine, &orphaned_context_id, &generation_id);
     fs::write(barrier.path().join("pre-catch-up-release"), b"continue\n")
-        .expect("release worker into durable lease");
+        .expect("release worker into the orphaned claim");
 
-    // The handoff barrier runs after this service pass. It holds the worker before its next
-    // assessment, making service order observable without requiring the eligible model build to
-    // beat the orphan lease's five-second TTL.
+    // The handoff barrier runs after this service pass and holds the worker before its next
+    // assessment, so what the first pass served is observable.
     wait_for_handoff_barrier(barrier.path());
     let eligible_ready = machine.run(&eligible_project, &["status"]);
     assert_eq!(eligible_ready.code, 0, "{}", eligible_ready.describe());
     assert_eq!(
         eligible_ready.json().pointer("/history/search/status"),
         Some(&Value::from("ready")),
-        "the eligible Context was not served in the worker's first pass"
+        "the eligible Context was served in the worker's first pass"
     );
     let orphaned_before_next_assessment = machine.run(&orphaned_project, &["status"]);
     assert_eq!(
@@ -2811,12 +2791,19 @@ fn a_default_worker_waits_for_an_orphaned_lease_and_does_not_starve_other_contex
         "{}",
         orphaned_before_next_assessment.describe()
     );
-    assert_ne!(
-        orphaned_before_next_assessment
-            .json()
-            .pointer("/history/search/status"),
+    let orphaned_status = orphaned_before_next_assessment.json();
+    assert_eq!(
+        orphaned_status.pointer("/history/search/status"),
         Some(&Value::from("ready")),
-        "the leased Context was served before the eligible Context"
+        "the orphaned claim was taken over and served in the same first pass"
+    );
+    assert_eq!(
+        u64_at(&orphaned_status, "/history/search/pending_events"),
+        0
+    );
+    assert_eq!(
+        u64_at(&orphaned_status, "/history/search/covered_events"),
+        4
     );
     fs::write(
         barrier.path().join("release"),
@@ -2824,13 +2811,7 @@ fn a_default_worker_waits_for_an_orphaned_lease_and_does_not_starve_other_contex
     )
     .expect("release worker after observing ordered service");
 
-    let resumed = machine.wait_for_search_ready(&orphaned_project, "orphaned-lease");
-    assert_eq!(u64_at(&resumed, "/history/search/pending_events"), 0);
-    assert_eq!(u64_at(&resumed, "/history/search/covered_events"), 4);
-    machine.wait_for_search_worker_exit();
-    let status = worker
-        .wait()
-        .expect("join default worker after lease expiry");
+    let status = worker.wait().expect("join default worker after its passes");
     assert!(status.success(), "default worker exited {status}");
 }
 

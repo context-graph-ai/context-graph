@@ -205,7 +205,15 @@
 # The consumer cursor continuation proof adds one default-tier test.
 # Typed active-time mapping and committed-prefix projection recovery add two proofs.
 # The session claim and strict upstream count work proofs join the default tier: 1320 + 2 = 1322.
-"context-graph" = 1326
+# Prompt crash recovery of background work adds twenty-four tests and retires three. Added:
+# immediate takeover after a kill, mid-embed and pre-commit crash cuts, a live, stopped and
+# copied-store holder, obsolete-worker fences after takeover, after forget and in process,
+# concurrent takeovers between threads and between processes, a lock-less filesystem, interrupted
+# status, a panicked worker, interpretation takeover, waiting and status, the understanding drain,
+# the two ownership audits, the long-batch live-claim proof, and three child-process entry points.
+# Retired: the lease-renewal, lease-TTL and expired-reclaim proofs, which no longer describe the
+# product: 1326 + 24 - 3 = 1347.
+"context-graph" = 1347
 # 190 -> 184: the status tests for answers read-only status no longer gives were removed with that
 # change, and the retired chunked-import, estimate and raw-chunk forget routes took their tests.
 # 184 -> 187: coverage for the reader-wait allowance and the foreground import's unusable-lock
@@ -255,7 +263,9 @@
 # A retired refusal survives Context forget and is acknowledged after foreground re-import.
 # One saved-frontier broad-refusal proof covers retired and unretired evidence.
 # Read-time configuration and eleven selected-request recovery paths add twelve proofs.
-"context-graph-cli" = 276
+# A killed background worker resumes on the next import and on the next read command, status
+# reports it interrupted, and a caught-up read starts no worker: 276 + 4 = 280.
+"context-graph-cli" = 280
 
 [gate_wall_seconds_policy]
 # A test binary's ceiling is `recorded seconds * tolerance_factor + slack_seconds`. Both terms are

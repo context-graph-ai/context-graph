@@ -50,7 +50,7 @@ use context_graph::{
     EventSearchWorkPolicy, EventSearchWorkSpec, EvidenceKind, EvidenceProducer, Result, Store,
     StoreConfig, event_history_reader_declaration,
 };
-use contextdb_core::{Value, Wallclock};
+use contextdb_core::Value;
 use serde_json::json;
 
 const CONNECTOR: &str = "event-search-correctness";
@@ -903,8 +903,9 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
     run(&config, resume_context, &embedder, 8, LEASE_MS)
         .expect("a normal later run completes after the resumption takeover");
 
-    // Completion owns a live lease. The hook releases only that lease, then uses the ordinary
-    // refusal path to create the competing attempt after completion has committed.
+    // Completion owns a live claim. The hook deletes only that claim row and drops its holder
+    // lock, then uses the ordinary refusal path to create the competing attempt after completion
+    // has committed.
     let store = open(&config);
     let completion_context = create_context_named(&store, "completion post-commit takeover");
     store
@@ -928,13 +929,14 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
     after_next_event_search_completion_commit_before_readback_for_test(move |store| {
         store
             .execute_sql_for_test(
-                "DELETE FROM event_search_leases WHERE context_id = $context_id",
+                "DELETE FROM background_claims WHERE work = 'event_search' AND context_id = $context_id",
                 &HashMap::from([(
                     "context_id".into(),
                     Value::Uuid(completion_context.as_uuid()),
                 )]),
             )
-            .expect("release the completed caller's lease for the competing normal attempt");
+            .expect("release the completed caller's claim for the competing normal attempt");
+        context_graph::test_support::lose_held_claim_presence_for_test(&completion_config.db_path);
         EventSearchProjectionRunner::record_refusal(
             run_request(
                 &completion_config,
@@ -1404,8 +1406,6 @@ fn directory_image(path: &Path) -> Vec<(String, Vec<u8>)> {
 #[test]
 fn requested_projection_assessment_uses_full_identity_on_store_and_actual_consumer_reader_without_artifacts()
  {
-    let now = Wallclock::now().0;
-    let _clock = Wallclock::test_clock_guard(move || now);
     let root = tempfile::tempdir().expect("tempdir");
     let config = config(root.path().join("requested-work.db"));
     let store = open(&config);
@@ -1682,8 +1682,6 @@ fn requested_projection_assessment_keeps_a_finishing_unactivated_replacement_pen
 /// A failed call is still an invocation: it crossed the embedder boundary and must remain counted.
 #[test]
 fn observed_run_counts_each_embedding_invocation_including_the_failed_call() {
-    let now = Wallclock::now().0;
-    let _clock = Wallclock::test_clock_guard(move || now);
     let root = tempfile::tempdir().expect("tempdir");
     let config = config(root.path().join("observed-invocations.db"));
     let store = open(&config);
@@ -1774,13 +1772,10 @@ fn observed_run_counts_each_embedding_invocation_including_the_failed_call() {
 }
 
 #[test]
-fn observed_invocations_distinguish_grouped_opaque_split_and_expired_claim_retry() {
-    for case in ["grouped", "opaque", "split", "expired"] {
+fn observed_invocations_distinguish_grouped_opaque_and_split_calls() {
+    for case in ["grouped", "opaque", "split"] {
         let root = tempfile::tempdir().unwrap();
         let config = config(root.path().join(format!("{case}.db")));
-        let clock = Arc::new(AtomicU64::new(Wallclock::now().0));
-        let test_clock = clock.clone();
-        let _clock = Wallclock::test_clock_guard(move || test_clock.load(Ordering::SeqCst));
         let store = open(&config);
         let context_id = create_context(&store);
         let events = match case {
@@ -1794,13 +1789,12 @@ fn observed_invocations_distinguish_grouped_opaque_split_and_expired_claim_retry
                 payload: json!({"retained": "opaque provider payload"}),
                 ..draft("opaque", 1, EventRenderRole::Opaque, "")
             }],
-            "split" => vec![draft(
+            _ => vec![draft(
                 "split",
                 1,
                 EventRenderRole::ToolResult,
                 &"α".repeat(400),
             )],
-            _ => vec![draft("expired", 1, EventRenderRole::HumanMessage, "α")],
         };
         store
             .append_event_batch(AppendEventBatch::live(
@@ -1815,12 +1809,7 @@ fn observed_invocations_distinguish_grouped_opaque_split_and_expired_claim_retry
         let actual_calls = Arc::new(AtomicU64::new(0));
         let calls = actual_calls.clone();
         *embedder.embed_observer.lock().unwrap() = Some(Arc::new(move || {
-            let call = calls.fetch_add(1, Ordering::SeqCst);
-            if case == "expired" && call == 0 {
-                // The first forward finishes after its lease expires. Its vector is discarded;
-                // the unchanged cursor is reclaimed and inference must actually run again.
-                clock.fetch_add(LEASE_MS + 1, Ordering::SeqCst);
-            }
+            calls.fetch_add(1, Ordering::SeqCst);
         }));
         let outcome = EventSearchProjectionRunner::catch_up_observed(run_request(
             &config,
@@ -1852,7 +1841,7 @@ fn observed_invocations_distinguish_grouped_opaque_split_and_expired_claim_retry
                 assert!(passages.is_empty());
                 assert_eq!(outcome.embedding_invocations, 0);
             }
-            "split" => {
+            _ => {
                 assert_eq!(receipt.embedded_event_count, 1);
                 assert!(passages.len() > 1, "oversized fixture actually splits");
                 assert_eq!(
@@ -1861,24 +1850,11 @@ fn observed_invocations_distinguish_grouped_opaque_split_and_expired_claim_retry
                     "the existing singleton forward bound counts each split call"
                 );
             }
-            _ => {
-                assert_eq!(
-                    receipt.retry_count, 1,
-                    "one expired commit forces one retry"
-                );
-                assert_eq!(outcome.embedding_invocations, 2);
-                assert_eq!(embedder.embedded().len(), 2);
-                assert_eq!(embedder.embedded()[0], embedder.embedded()[1]);
-                assert_eq!(
-                    passages.len(),
-                    1,
-                    "the discarded vector never becomes duplicate coverage"
-                );
-                eprintln!(
-                    "expiry reproduction: 2 identical successful forward calls, 1 stale-claim retry, 1 committed passage"
-                );
-            }
         }
+        assert_eq!(
+            receipt.retry_count, 0,
+            "{case}: a live worker's claim never lapses, so nothing is retried"
+        );
         drop(store);
         let noop = EventSearchProjectionRunner::catch_up_observed(run_request(
             &config,
@@ -2372,11 +2348,11 @@ fn a_worker_killed_after_a_committed_batch_resumes_without_duplicates_or_re_embe
         matches!(&killed, CgError::Engine(message) if message.contains("fixture worker killed")),
         "the simulated kill surfaces unchanged: {killed:?}"
     );
-    // A claim whose lease expires before its commit is re-rendered, so the first stream's batch may
-    // be embedded more than once before it commits; the second stream's batch never completes.
+    // A live claim never lapses, so the first stream's batch is embedded exactly once before it
+    // commits; the second stream's batch never completes.
     let first_run = embedder.embedded();
     assert!(
-        !first_run.is_empty()
+        first_run.len() == 1
             && first_run
                 .iter()
                 .all(|text| text.contains('α') && text.contains('β') && !text.contains('γ')),
@@ -2393,14 +2369,10 @@ fn a_worker_killed_after_a_committed_batch_resumes_without_duplicates_or_re_embe
     let committed_id = committed[0].0;
     drop(inspect);
 
-    // The killed worker's lease is left behind exactly as a dead process would leave it. The rerun
-    // reads the seamed clock past that lease's expiry instead of waiting it out.
-    let past_expiry = Wallclock::now().0 + LEASE_MS * 2;
-    let resumed = {
-        let _clock = Wallclock::test_clock_guard(move || past_expiry);
-        run(&config, context_id, &embedder, 8, LEASE_MS)
-    }
-    .expect("the rerun resumes after the lease expires");
+    // The failed run released its claim, so the immediate rerun claims the interrupted range at
+    // once: there is no lease to outwait and no clock to move.
+    let resumed = run(&config, context_id, &embedder, 8, LEASE_MS)
+        .expect("the immediate rerun resumes the interrupted range");
     let resumed_inputs = embedder.embedded()[first_run.len()..].to_vec();
     assert!(
         !resumed_inputs.is_empty()
@@ -2580,12 +2552,8 @@ fn reader_refusal_after_a_committed_first_build_batch_keeps_it_resumable() {
         .expect("restore the resumable first-build fixture");
     drop(store);
 
-    let past_expiry = Wallclock::now().0 + LEASE_MS * 2;
-    let resumed = {
-        let _clock = Wallclock::test_clock_guard(move || past_expiry);
-        run(&config, context_id, &embedder, 8, LEASE_MS)
-    }
-    .expect("a later run resumes the recorded reader refusal");
+    let resumed = run(&config, context_id, &embedder, 8, LEASE_MS)
+        .expect("the immediate rerun resumes the recorded reader refusal");
     let resumed_inputs = embedder.embedded()[before_refusal.len()..].to_vec();
     assert!(
         resumed_inputs
@@ -2808,9 +2776,9 @@ fn an_append_during_rebuild_finalization_is_caught_up_before_the_head_switches()
 }
 
 #[test]
-fn a_completed_config_runner_deletes_its_owned_lease_across_reopen_and_later_claims() {
+fn a_completed_config_runner_leaves_no_claim_across_reopen_and_later_claims() {
     let root = tempfile::tempdir().expect("tempdir");
-    let config = config(root.path().join("completed-config-runner-lease.db"));
+    let config = config(root.path().join("completed-config-runner-claim.db"));
     let embedder = ControlledEmbedder::new();
     let store =
         Store::open_with_embedder_registrations(config.clone(), vec![embedder.registration()])
@@ -2820,12 +2788,12 @@ fn a_completed_config_runner_deletes_its_owned_lease_across_reopen_and_later_cla
         .append_event_batch(AppendEventBatch::live(
             context_id,
             declaration(),
-            "completed-config-runner-lease-stream",
+            "completed-config-runner-claim-stream",
             vec![draft(
-                "completed-config-runner-lease",
+                "completed-config-runner-claim",
                 1,
                 EventRenderRole::HumanMessage,
-                "a completed config runner releases its projection lease",
+                "a completed config runner releases its projection claim",
             )],
         ))
         .expect("append rebuild fixture event");
@@ -2839,29 +2807,29 @@ fn a_completed_config_runner_deletes_its_owned_lease_across_reopen_and_later_cla
         8,
         OBSERVED_LEASE_MS,
     ))
-    .expect("config runner completes its owned batch and exact lease deletion");
+    .expect("config runner completes its owned batch and exact claim deletion");
 
     let current = open(&config);
     assert_eq!(
-        lease_rows(&current, context_id),
+        claim_rows(&current, context_id),
         0,
-        "the completed config runner left a lease on its current Store handle"
+        "the completed config runner left a claim on its current Store handle"
     );
     drop(current);
 
     let reopened = open(&config);
     assert_eq!(
-        lease_rows(&reopened, context_id),
+        claim_rows(&reopened, context_id),
         0,
-        "a reopened Store re-read a lease after the completed config runner removed it"
+        "a reopened Store re-read a claim after the completed config runner removed it"
     );
     reopened
         .append_event_batch(AppendEventBatch::live(
             context_id,
             declaration(),
-            "completed-config-runner-lease-second-stream",
+            "completed-config-runner-claim-second-stream",
             vec![draft(
-                "completed-config-runner-lease-second",
+                "completed-config-runner-claim-second",
                 2,
                 EventRenderRole::AgentMessage,
                 "a later config runner can claim and read back new work",
@@ -2880,14 +2848,14 @@ fn a_completed_config_runner_deletes_its_owned_lease_across_reopen_and_later_cla
     .expect("later config runner claims and reads back work after reopen");
 }
 
-/// Every projection lease row the Context holds, whatever its expiry.
-fn lease_rows(store: &Store, context_id: ContextId) -> usize {
+/// Every event-search claim row the Context holds, whoever owns it.
+fn claim_rows(store: &Store, context_id: ContextId) -> usize {
     store
         .execute_sql_for_test(
-            "SELECT owner_token FROM event_search_leases WHERE context_id = $context_id",
+            "SELECT owner_token FROM background_claims WHERE work = 'event_search' AND context_id = $context_id",
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
-        .expect("inspect projection leases")
+        .expect("inspect projection claims")
         .rows
         .len()
 }
@@ -2911,12 +2879,11 @@ fn a_run_that_gives_up_after_claiming_releases_its_claim_so_the_next_run_claims_
         .expect("append one stream");
     drop(store);
 
-    // A ten-minute lease: if the run that gives up left its claim behind, nothing could claim this
-    // Context again for ten minutes, and the rerun below would be refused rather than slow.
-    let long_lease_ms = 600_000;
+    // If the run that gives up left its claim behind, the rerun below would have to take over
+    // an orphan instead of finding the work released.
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control lock") = Some('α');
-    let abandoned = run(&config, context_id, &embedder, 8, long_lease_ms)
+    let abandoned = run(&config, context_id, &embedder, 8, OBSERVED_LEASE_MS)
         .expect_err("the run gives up while embedding the batch it claimed");
     assert!(
         matches!(&abandoned, CgError::Engine(message) if message.contains("fixture worker killed")),
@@ -2925,14 +2892,14 @@ fn a_run_that_gives_up_after_claiming_releases_its_claim_so_the_next_run_claims_
 
     let inspect = open(&config);
     assert_eq!(
-        lease_rows(&inspect, context_id),
+        claim_rows(&inspect, context_id),
         0,
         "a run that gives up after claiming releases the claim it was holding"
     );
     drop(inspect);
 
     // No clock guard anywhere: the next run claims the released work at once.
-    let resumed = run(&config, context_id, &embedder, 8, long_lease_ms)
+    let resumed = run(&config, context_id, &embedder, 8, OBSERVED_LEASE_MS)
         .expect("the next run claims the released work immediately");
     assert_eq!(resumed.source_watermark.event_count, 2);
     assert_eq!(resumed.embedded_event_count, 2);
@@ -3023,23 +2990,6 @@ fn waiting_for_readers_never_outlasts_the_allowance() {
     });
 }
 
-/// Every lease row of the Context as (owner token, expires_at).
-fn lease_expiries(store: &Store, context_id: ContextId) -> Vec<(String, i64)> {
-    store
-        .execute_sql_for_test(
-            "SELECT owner_token, expires_at FROM event_search_leases WHERE context_id = $context_id",
-            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        )
-        .expect("inspect lease rows")
-        .rows
-        .iter()
-        .map(|row| match (&row[0], &row[1]) {
-            (Value::Text(owner), Value::Timestamp(expires_at)) => (owner.clone(), *expires_at),
-            other => panic!("unexpected lease row {other:?}"),
-        })
-        .collect()
-}
-
 fn append_many(store: &Store, context_id: ContextId, count: u64) {
     store
         .append_event_batch(AppendEventBatch::live(
@@ -3061,50 +3011,43 @@ fn append_many(store: &Store, context_id: ContextId, count: u64) {
 }
 
 #[test]
-fn a_live_worker_whose_batch_outlasts_the_lease_keeps_it_and_refuses_a_second_worker() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
+fn a_live_worker_keeps_one_claim_through_a_long_batch_and_a_held_store_door_is_refused() {
+    // However long a live worker computes, its one claim stays its own and nobody takes it over.
     let root = tempfile::tempdir().expect("tempdir");
-    let config = config(root.path().join("renew.db"));
+    let config = config(root.path().join("long-batch.db"));
     let store = open(&config);
     let context_id = create_context(&store);
     append_many(&store, context_id, 12);
     drop(store);
 
-    // Injected time: every document preparation costs a tenth of the lease, so the one claimed
-    // batch of twelve events runs for several whole leases.
-    let clock = Arc::new(AtomicU64::new(Wallclock::now().0));
-    let _clock = {
-        let clock = clock.clone();
-        Wallclock::test_clock_guard(move || clock.load(Ordering::SeqCst))
-    };
     let embedder = ControlledEmbedder::new();
-    let observations = Arc::new(Mutex::new(Vec::<(u64, Vec<(String, i64)>)>::new()));
-    let second_claim = Arc::new(Mutex::new(None::<Result<EventSearchBuildReceipt>>));
-    let tried_second = Arc::new(AtomicBool::new(false));
-    let start = clock.load(Ordering::SeqCst);
+    let observations = Arc::new(Mutex::new(Vec::<Vec<(uuid::Uuid, i64)>>::new()));
+    let door_refusals = Arc::new(Mutex::new(Vec::<CgError>::new()));
     {
-        let clock = clock.clone();
         let observations = observations.clone();
-        let second_claim = second_claim.clone();
-        let tried_second = tried_second.clone();
+        let door_refusals = door_refusals.clone();
         let config = config.clone();
+        let door_embedder = ControlledEmbedder::new();
         *embedder.observer.lock().expect("observer lock") = Some(Arc::new(move || {
-            let now = clock.fetch_add(LEASE_MS / 10, Ordering::SeqCst) + LEASE_MS / 10;
-            // Opening a Store is costly, so the lease is inspected every half lease of time.
-            if !(now - start).is_multiple_of(LEASE_MS / 2) {
-                return;
-            }
             let reader = open(&config);
             observations
                 .lock()
                 .expect("observations")
-                .push((now, lease_expiries(&reader, context_id)));
-            drop(reader);
-            if now > start + LEASE_MS * 2 && !tried_second.swap(true, Ordering::SeqCst) {
-                let second = ControlledEmbedder::new();
-                *second_claim.lock().expect("second claim") =
-                    Some(run(&config, context_id, &second, 16, LEASE_MS));
+                .push(claim_owners(&reader, context_id));
+            if door_refusals.lock().expect("door refusals").is_empty() {
+                let refused = reader
+                    .catch_up_event_search(EventSearchBuildRequest {
+                        context_id,
+                        embedder: door_embedder.registration(),
+                        profile: profile(),
+                        embedding_workers: NonZeroUsize::MIN,
+                        max_events_per_batch: NonZeroU32::new(16).expect("nonzero batch"),
+                        max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
+                        max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
+                        lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
+                    })
+                    .expect_err("a held-Store door never takes over a live worker");
+                door_refusals.lock().expect("door refusals").push(refused);
             }
         }));
     }
@@ -3112,99 +3055,49 @@ fn a_live_worker_whose_batch_outlasts_the_lease_keeps_it_and_refuses_a_second_wo
     let receipt = run(&config, context_id, &embedder, 16, LEASE_MS)
         .expect("the live worker commits its long batch");
     assert_eq!(receipt.embedded_event_count, 12);
+    assert_eq!(receipt.retry_count, 0, "a live worker's claim never lapses");
     let observations = observations.lock().expect("observations").clone();
-    assert!(
-        observations
-            .last()
-            .is_some_and(|(now, _)| *now > start + LEASE_MS * 3),
-        "the batch ran for several leases of injected time"
-    );
+    assert!(observations.len() >= 12, "every preparation was observed");
     let owners = observations
         .iter()
-        .flat_map(|(_, leases)| leases.iter().map(|(owner, _)| owner.clone()))
+        .flatten()
+        .copied()
         .collect::<BTreeSet<_>>();
     assert_eq!(
         owners.len(),
         1,
-        "one worker held the claim throughout: {owners:?}"
+        "one worker held one first-epoch claim throughout: {owners:?}"
     );
-    for (now, leases) in &observations {
-        assert!(
-            leases
-                .iter()
-                .all(|(_, expires_at)| *expires_at > i64::try_from(*now).expect("time fits")),
-            "the live worker's lease stays unexpired at {now}: {leases:?}"
-        );
-    }
-    let second = second_claim
-        .lock()
-        .expect("second claim")
-        .take()
-        .expect("a second worker tried to claim mid-batch");
+    assert_eq!(owners.iter().next().map(|(_, epoch)| *epoch), Some(1));
+    let refusals = door_refusals.lock().expect("door refusals");
     assert!(
-        matches!(&second, Err(CgError::Engine(message)) if message.contains("owns the unexpired claim")),
-        "the second worker is refused while the first is alive: {:?}",
-        second.as_ref().map(|receipt| receipt.embedded_event_count)
+        matches!(
+            refusals.as_slice(),
+            [CgError::BackgroundWorkHeldByLiveWorker {
+                work: context_graph::BackgroundWork::EventSearch,
+                ..
+            }]
+        ),
+        "the held-Store door is refused while the worker is alive: {refusals:?}"
     );
+    assert_eq!(claim_rows(&open(&config), context_id), 0);
 }
 
-#[test]
-fn a_worker_that_stops_renewing_loses_its_lease_after_one_ttl() {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    let root = tempfile::tempdir().expect("tempdir");
-    let config = config(root.path().join("dead-worker.db"));
-    let store = open(&config);
-    let context_id = create_context(&store);
-    append_many(&store, context_id, 4);
-    drop(store);
-
-    let clock = Arc::new(AtomicU64::new(Wallclock::now().0));
-    let _clock = {
-        let clock = clock.clone();
-        Wallclock::test_clock_guard(move || clock.load(Ordering::SeqCst))
-    };
-    // A worker dies mid-embedding without unwinding through its release path.
-    let dying = ControlledEmbedder::new();
-    *dying.observer.lock().expect("observer lock") =
-        Some(Arc::new(|| panic!("fixture worker process killed")));
-    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run(&config, context_id, &dying, 16, LEASE_MS)
-    }));
-    assert!(died.is_err(), "the fixture worker died mid-batch");
-    let died_at = clock.load(Ordering::SeqCst);
-
-    let inspect = open(&config);
-    let left = lease_expiries(&inspect, context_id);
-    drop(inspect);
-    assert_eq!(left.len(), 1, "the dead worker's lease is left behind");
-    let expires_at = u64::try_from(left[0].1).expect("expiry fits");
-    assert!(
-        expires_at <= died_at + LEASE_MS,
-        "a worker that stops renewing holds its lease for at most one TTL"
-    );
-
-    let refused = run(
-        &config,
-        context_id,
-        &ControlledEmbedder::new(),
-        16,
-        LEASE_MS,
-    );
-    assert!(
-        matches!(&refused, Err(CgError::Engine(message)) if message.contains("owns the unexpired claim")),
-        "within the TTL the dead worker's lease still refuses a claim"
-    );
-    clock.store(expires_at + 1, Ordering::SeqCst);
-    let resumed = run(
-        &config,
-        context_id,
-        &ControlledEmbedder::new(),
-        16,
-        LEASE_MS,
-    )
-    .expect("after the TTL a new worker claims the Context");
-    assert_eq!(resumed.embedded_event_count, 4);
+/// Every event-search claim of the Context as (owner token, owner epoch).
+fn claim_owners(store: &Store, context_id: ContextId) -> Vec<(uuid::Uuid, i64)> {
+    store
+        .execute_sql_for_test(
+            "SELECT owner_token, owner_epoch FROM background_claims WHERE work = 'event_search' AND context_id = $context_id",
+            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+        )
+        .expect("inspect claim owners")
+        .rows
+        .iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Uuid(owner), Value::Int64(epoch)) => (*owner, *epoch),
+            other => panic!("unexpected claim row {other:?}"),
+        })
+        .collect()
 }
 
 #[test]
@@ -3385,9 +3278,9 @@ fn one_concurrent_failure_waits_for_its_held_sibling_commits_nothing_and_retries
 
     let after_failure = open(&config);
     assert_eq!(
-        lease_rows(&after_failure, context_id),
+        claim_rows(&after_failure, context_id),
         0,
-        "a failed concurrent run left a live lease behind"
+        "a failed concurrent run left a claim behind"
     );
     assert_eq!(
         all_passage_count(&after_failure, context_id),
@@ -3465,9 +3358,8 @@ fn a_finished_build_with_only_a_worker_cap_change_makes_zero_embedding_calls() {
 }
 
 #[test]
-fn slow_forward_calls_within_one_claim_never_let_the_live_workers_lease_lapse() {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
+fn slow_forward_calls_within_one_claim_keep_the_live_workers_claim() {
+    // Many bounded forward calls inside one claim never let another caller take that claim.
     let root = tempfile::tempdir().expect("tempdir");
     let config = config(root.path().join("slow-embed.db"));
     let store = open(&config);
@@ -3489,58 +3381,45 @@ fn slow_forward_calls_within_one_claim_never_let_the_live_workers_lease_lapse() 
         .expect("append one oversized event");
     drop(store);
 
-    // Injected time: preparation is free, and every forward call costs three fifths of the
-    // lease, so the claim's calls together outlast the lease even though no single call does.
-    let clock = Arc::new(AtomicU64::new(Wallclock::now().0));
-    let _clock = {
-        let clock = clock.clone();
-        Wallclock::test_clock_guard(move || clock.load(Ordering::SeqCst))
-    };
-    let start = clock.load(Ordering::SeqCst);
     let embedder = ControlledEmbedder::new();
-    let observations = Arc::new(Mutex::new(Vec::<(u64, Vec<(String, i64)>)>::new()));
-    let second_claim = Arc::new(Mutex::new(None::<Result<EventSearchBuildReceipt>>));
-    let tried_second = Arc::new(AtomicBool::new(false));
-    let forward_calls = Arc::new(AtomicUsize::new(0));
+    let observations = Arc::new(Mutex::new(Vec::<Vec<(uuid::Uuid, i64)>>::new()));
+    let door_refusal = Arc::new(Mutex::new(None::<CgError>));
     let request = |embedder: &Arc<ControlledEmbedder>| EventSearchRunRequest {
         store: config.clone(),
         contexts: ContextSelector::one(context_id),
         embedder: embedder.registration(),
         profile: profile(),
-        embedding_workers: NonZeroUsize::new(2).expect("concurrent lease proof"),
+        embedding_workers: NonZeroUsize::new(2).expect("concurrent forward calls"),
         max_events_per_batch: NonZeroU32::new(16).expect("nonzero batch"),
         max_passages_per_batch: NonZeroU32::new(64).expect("nonzero passage batch"),
         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
         lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
     };
     {
-        let clock = clock.clone();
         let observations = observations.clone();
-        let second_claim = second_claim.clone();
-        let tried_second = tried_second.clone();
-        let forward_calls = forward_calls.clone();
+        let door_refusal = door_refusal.clone();
         let config = config.clone();
-        let second_request = request(&ControlledEmbedder::new());
+        let door_embedder = ControlledEmbedder::new();
         *embedder.embed_observer.lock().expect("observer lock") = Some(Arc::new(move || {
-            let callback_clock = clock.clone();
-            let _clock = Wallclock::test_clock_guard(move || callback_clock.load(Ordering::SeqCst));
-            // The lease is inspected as the call begins, then the call spends its time.
-            let now = clock.load(Ordering::SeqCst);
             let reader = open(&config);
             observations
                 .lock()
                 .expect("observations")
-                .push((now, lease_expiries(&reader, context_id)));
-            drop(reader);
-            if now > start + LEASE_MS && !tried_second.swap(true, Ordering::SeqCst) {
-                *second_claim.lock().expect("second claim") = Some(
-                    EventSearchProjectionRunner::catch_up(second_request.clone()),
-                );
-            }
-            // Two workers in one wave spend the same logical interval. Advancing once per wave
-            // models elapsed time without adding concurrent call durations together.
-            if forward_calls.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
-                clock.fetch_add(LEASE_MS * 3 / 5, Ordering::SeqCst);
+                .push(claim_owners(&reader, context_id));
+            let mut refusal = door_refusal.lock().expect("door refusal");
+            if refusal.is_none() {
+                *refusal = reader
+                    .catch_up_event_search(EventSearchBuildRequest {
+                        context_id,
+                        embedder: door_embedder.registration(),
+                        profile: profile(),
+                        embedding_workers: NonZeroUsize::MIN,
+                        max_events_per_batch: NonZeroU32::new(16).expect("nonzero batch"),
+                        max_passages_per_batch: NonZeroU32::new(64).expect("nonzero passage batch"),
+                        max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
+                        lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
+                    })
+                    .err();
             }
         }));
     }
@@ -3548,29 +3427,37 @@ fn slow_forward_calls_within_one_claim_never_let_the_live_workers_lease_lapse() 
     let receipt = EventSearchProjectionRunner::catch_up(request(&embedder))
         .expect("the live worker commits the oversized event");
     assert_eq!(receipt.embedded_event_count, 1);
+    assert_eq!(
+        receipt.retry_count, 0,
+        "the live worker's claim never lapses"
+    );
     let observations = observations.lock().expect("observations").clone();
     assert!(
         observations.len() >= 3,
         "the claim's passages went through several bounded forward calls: {}",
         observations.len()
     );
-    for (now, leases) in &observations {
-        assert!(
-            leases
-                .iter()
-                .all(|(_, expires_at)| *expires_at > i64::try_from(*now).expect("time fits")),
-            "the live worker's lease is unexpired as each forward call begins at {now}: {leases:?}"
-        );
-    }
-    let second = second_claim
-        .lock()
-        .expect("second claim")
-        .take()
-        .expect("a second worker tried to claim mid-claim");
+    let first = observations[0].clone();
+    assert_eq!(
+        first.len(),
+        1,
+        "one claim is held while embedding: {first:?}"
+    );
+    assert_eq!(first[0].1, 1, "the claim stays at its first epoch");
     assert!(
-        matches!(&second, Err(CgError::Engine(message)) if message.contains("owns the unexpired claim")),
-        "the second worker is refused while the first is embedding: {:?}",
-        second.as_ref().map(|receipt| receipt.embedded_event_count)
+        observations.iter().all(|owners| *owners == first),
+        "the same claim is held as every forward call begins: {observations:?}"
+    );
+    let refusal = door_refusal.lock().expect("door refusal").take();
+    assert!(
+        matches!(
+            refusal,
+            Some(CgError::BackgroundWorkHeldByLiveWorker {
+                work: context_graph::BackgroundWork::EventSearch,
+                ..
+            })
+        ),
+        "a held-Store door is refused while the worker is embedding: {refusal:?}"
     );
 }
 
@@ -3813,8 +3700,6 @@ fn consumer_search(
 
 #[test]
 fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_creation() {
-    let now = Wallclock::now().0;
-    let _clock = Wallclock::test_clock_guard(move || now);
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path().join("attempt-chronology.db"));
     let store = open(&config);
@@ -3957,9 +3842,6 @@ fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_cr
 fn a_stale_attempt_failure_cannot_overwrite_a_newer_owned_refusal() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path().join("stale-attempt.db"));
-    let clock = Arc::new(AtomicU64::new(Wallclock::now().0));
-    let test_clock = clock.clone();
-    let _clock = Wallclock::test_clock_guard(move || test_clock.load(Ordering::SeqCst));
     let store = open(&config);
     let context_id = create_context(&store);
     store
@@ -3977,19 +3859,9 @@ fn a_stale_attempt_failure_cannot_overwrite_a_newer_owned_refusal() {
     let saved = Arc::new(Mutex::new(None));
     let newer_marker = saved.clone();
     *stale.embed_observer.lock().unwrap() = Some(Arc::new(move || {
-        let callback_clock = clock.clone();
-        let _clock = Wallclock::test_clock_guard(move || callback_clock.load(Ordering::SeqCst));
         let before = attempt_rows(&inspect, context_id);
         let next = ControlledEmbedder::new();
         let request = run_request(&inspect, context_id, &next, profile(), 1, LEASE_MS);
-        let refused = EventSearchProjectionRunner::record_refusal(
-            request.clone(),
-            "nonowner must not publish",
-        )
-        .expect_err("a live lease refuses another attempt");
-        assert!(
-            matches!(refused, CgError::Engine(message) if message.contains("owns the unexpired claim"))
-        );
         let mut invalid = request.clone();
         invalid.profile.target_passage_tokens = NonZeroU32::new(300).unwrap();
         let invalid = EventSearchProjectionRunner::catch_up_observed(invalid);
@@ -4002,11 +3874,36 @@ fn a_stale_attempt_failure_cannot_overwrite_a_newer_owned_refusal() {
         assert_eq!(
             attempt_rows(&inspect, context_id),
             before,
-            "invalid and nonowner refusals change no attempt metadata"
+            "an invalid request changes no attempt metadata"
         );
-        clock.fetch_add(LEASE_MS + 1, Ordering::SeqCst);
-        EventSearchProjectionRunner::record_refusal(request, "newer owned refusal")
-            .expect("expired ownership allows a newer real attempt");
+        // A second caller meets the live worker and waits for it rather than publishing.
+        let (waiting, waits) = channel();
+        let recorder = std::thread::spawn(move || {
+            context_graph::test_support::observe_background_claim_waits_for_test(move |work, _| {
+                let _ = waiting.send(work);
+            });
+            EventSearchProjectionRunner::record_refusal(request, "newer owned refusal")
+        });
+        assert_eq!(
+            waits
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the second caller waits on the live worker"),
+            context_graph::BackgroundWork::EventSearch
+        );
+        assert_eq!(
+            attempt_rows(&inspect, context_id),
+            before,
+            "a caller waiting on a live worker changes no attempt metadata"
+        );
+        // The worker loses its lock while it is still computing: ownership moves to the waiter.
+        assert_eq!(
+            context_graph::test_support::lose_held_claim_presence_for_test(&inspect.db_path),
+            1
+        );
+        recorder
+            .join()
+            .expect("the waiting caller joins")
+            .expect("ownership that moved allows a newer real attempt");
         let after = attempt_rows(&inspect, context_id);
         assert_eq!(&after[0][..2], &before[0][..2]);
         let (Value::TxId(old), Value::TxId(new)) = (&before[0][2], &after[0][2]) else {
@@ -4047,10 +3944,6 @@ fn a_stale_attempt_failure_cannot_overwrite_a_newer_owned_refusal() {
 
 #[test]
 fn building_progress_is_visible_without_replacing_the_ready_head() {
-    // Status progress is independent of lease expiry. The invocation proof above explicitly
-    // exercises expired-claim retries; keep this fixture's claims live even under suite load.
-    let now = Wallclock::now().0;
-    let _clock = Wallclock::test_clock_guard(move || now);
     let root = tempfile::tempdir().expect("tempdir");
     let config = config(root.path().join("building-progress-status.db"));
     let store = open(&config);
@@ -4437,13 +4330,10 @@ impl Drop for HeldWriter {
 }
 
 #[test]
-fn projection_retries_real_writer_at_claim_renewal_and_commit_without_reembedding() {
-    for phase in ["claim", "renewal", "commit"] {
+fn projection_retries_real_writer_at_claim_and_commit_without_reembedding() {
+    for phase in ["claim", "commit"] {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path().join("writer-contention.db"));
-        let clock = Arc::new(AtomicU64::new(Wallclock::now().0));
-        let clock_read = clock.clone();
-        let _clock = Wallclock::test_clock_guard(move || clock_read.load(Ordering::SeqCst));
         let store = open(&cfg);
         let context = create_context(&store);
         store
@@ -4462,7 +4352,6 @@ fn projection_retries_real_writer_at_claim_renewal_and_commit_without_reembeddin
         let retries = Arc::new(AtomicUsize::new(0));
         let retry_count = retries.clone();
         let release_writer = held.clone();
-        let (release_embed, embed_released) = channel();
         context_graph::test_support::observe_store_open_retries_for_test(move |refusal| {
             assert!(
                 matches!(refusal, CgError::StoreLocked { .. }),
@@ -4475,21 +4364,13 @@ fn projection_retries_real_writer_at_claim_renewal_and_commit_without_reembeddin
                 .take()
                 .expect("writer still held at exact reopen")
                 .release();
-            if phase == "renewal" {
-                release_embed.send(()).unwrap();
-            }
         });
         let embedder = ControlledEmbedder::new();
         if phase != "claim" {
             let path = cfg.db_path.clone();
             let held = held.clone();
-            let embed_released = Mutex::new(embed_released);
             *embedder.embed_observer.lock().unwrap() = Some(Arc::new(move || {
                 *held.lock().unwrap() = Some(HeldWriter::start(&path));
-                if phase == "renewal" {
-                    clock.fetch_add(LEASE_MS / 2, Ordering::SeqCst);
-                    embed_released.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).expect("lease renewal met and released the writer while inference remained held");
-                }
             }));
         }
         let outcome = EventSearchProjectionRunner::catch_up_observed(run_request(

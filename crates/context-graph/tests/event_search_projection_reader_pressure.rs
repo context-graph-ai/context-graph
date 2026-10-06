@@ -351,13 +351,13 @@ fn create_context(store: &Store) -> ContextId {
         .id
 }
 
-fn lease_rows(store: &Store, context_id: ContextId) -> usize {
+fn claim_rows(store: &Store, context_id: ContextId) -> usize {
     store
         .execute_sql_for_test(
-            "SELECT owner_token FROM event_search_leases WHERE context_id = $context_id",
+            "SELECT owner_token FROM background_claims WHERE work = 'event_search' AND context_id = $context_id",
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
-        .expect("inspect projection leases")
+        .expect("inspect projection claims")
         .rows
         .len()
 }
@@ -370,8 +370,6 @@ fn a_run_reopening_the_store_under_continuous_readers_commits_every_batch() {
 }
 
 fn a_run_reopening_the_store_under_continuous_readers_body() {
-    // Long enough that nothing here is about lease expiry: this test is about readers.
-    let unexpiring_lease_ms = 600_000;
     for scenario in 0..6 {
         let root = tempfile::tempdir().expect("tempdir");
         let config = config(root.path().join(format!("readers-{scenario}.db")));
@@ -458,7 +456,7 @@ fn a_run_reopening_the_store_under_continuous_readers_body() {
             }
             let embedder = ControlledEmbedder::new();
             build_active.store(true, Ordering::Release);
-            let receipt = run(&config, context_id, &embedder, 1, unexpiring_lease_ms);
+            let receipt = run(&config, context_id, &embedder, 1, 600_000);
             build_active.store(false, Ordering::Release);
             stop.store(true, Ordering::Relaxed);
             receipt
@@ -496,7 +494,7 @@ fn a_run_reopening_the_store_under_continuous_readers_body() {
 
         let after = open(&config);
         assert_eq!(
-            lease_rows(&after, context_id),
+            claim_rows(&after, context_id),
             0,
             "scenario {scenario} left no claim behind"
         );

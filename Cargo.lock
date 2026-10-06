@@ -871,6 +871,7 @@ dependencies = [
  "fs4",
  "iroh",
  "iroh-tickets",
+ "libc",
  "pollster",
  "rayon",
  "safetensors 0.7.0",

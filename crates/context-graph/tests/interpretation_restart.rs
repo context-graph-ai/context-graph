@@ -269,7 +269,7 @@ fn rows(store: &Store, sql: &str, params: HashMap<String, Value>) -> Vec<Vec<Val
 struct ClaimSnapshot {
     id: InterpretationGenerationId,
     build_ordinal: i64,
-    lease_epoch: i64,
+    owner_epoch: i64,
     sealed_membership: Vec<Vec<Value>>,
 }
 
@@ -277,7 +277,7 @@ fn actual_claim(path: &Path, context_id: context_graph::ContextId) -> ClaimSnaps
     let store = Store::open(config(path.to_path_buf())).expect("open mapper inspection Store");
     let generation = rows(
         &store,
-        "SELECT id, build_ordinal, lease_token, lease_epoch, lease_expires_at, state FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id ORDER BY started_at DESC LIMIT 1",
+        "SELECT id, build_ordinal, state FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id ORDER BY started_at DESC LIMIT 1",
         HashMap::from([
             ("context_id".into(), Value::Uuid(context_id.as_uuid())),
             ("connector_id".into(), Value::Text(CONNECTOR.into())),
@@ -297,19 +297,29 @@ fn actual_claim(path: &Path, context_id: context_graph::ContextId) -> ClaimSnaps
         Value::Int64(value) => value,
         ref other => panic!("runner build ordinal: {other:?}"),
     };
-    assert!(
-        matches!(row[2], Value::Text(_)),
-        "mapper sees the real lease token"
+    assert!(matches!(&row[2], Value::Text(state) if state == "building"));
+    let claim = rows(
+        &store,
+        "SELECT owner_token, owner_epoch FROM background_claims WHERE work = $work AND context_id = $context_id AND unit_id = $unit_id",
+        HashMap::from([
+            ("work".into(), Value::Text("interpretation".into())),
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("unit_id".into(), Value::Uuid(id.as_uuid())),
+        ]),
     );
-    let lease_epoch = match row[3] {
+    assert_eq!(
+        claim.len(),
+        1,
+        "mapper runs under one real background claim"
+    );
+    assert!(
+        matches!(claim[0][0], Value::Uuid(_)),
+        "mapper sees the real claim owner"
+    );
+    let owner_epoch = match claim[0][1] {
         Value::Int64(value) => value,
-        ref other => panic!("runner lease epoch: {other:?}"),
+        ref other => panic!("runner claim epoch: {other:?}"),
     };
-    assert!(
-        matches!(row[4], Value::Timestamp(_)),
-        "mapper sees the real lease expiry"
-    );
-    assert!(matches!(&row[5], Value::Text(state) if state == "building"));
     let sealed_membership = rows(
         &store,
         "SELECT ordinal, event_id, source_row_sha256 FROM event_interpretation_source_events WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY ordinal",
@@ -325,7 +335,7 @@ fn actual_claim(path: &Path, context_id: context_graph::ContextId) -> ClaimSnaps
     ClaimSnapshot {
         id,
         build_ordinal,
-        lease_epoch,
+        owner_epoch,
         sealed_membership,
     }
 }

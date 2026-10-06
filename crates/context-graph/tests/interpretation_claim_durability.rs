@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,13 +18,12 @@ use context_graph::{
     EventDraft, EventRenderRole, InstalledInterpretationContract, InterpretationBuildRequest,
     ReleasedConnectorInterpretation, ReleasedInterpretationDeclaration, Result, Store, StoreConfig,
 };
-use contextdb_core::{Value, Wallclock};
+use contextdb_core::Value;
 use contextdb_engine::plugin::{DatabasePlugin, QueryOutcome};
 use serde_json::json;
 
 const CONNECTOR: &str = "interpretation-claim-durability-red";
 const TARGET: &str = "claim-durability-v1";
-const T0: u64 = 1_700_000_000_000;
 const PRELUDE_EVENTS: u64 = 96;
 const UNCLAIMED_TAIL_EVENTS: u64 = 10_000;
 const APPEND_BATCH_EVENTS: u64 = 128;
@@ -141,62 +140,6 @@ impl DatabasePlugin for QueryRecorder {
     }
 }
 
-/// Advances only after a mapper has returned a real result.  The retained Store that owns this
-/// plugin is intentional: plain runner reopens share its database plugin; it is not evidence
-/// that mapping retains or releases a Store handle.
-struct ExpiryOnReopenedValidationQuery {
-    clock: Arc<AtomicU64>,
-    expiry: AtomicU64,
-    armed: AtomicBool,
-    advanced: AtomicBool,
-    fired_sql: Mutex<Option<String>>,
-}
-
-impl ExpiryOnReopenedValidationQuery {
-    fn new(clock: Arc<AtomicU64>) -> Self {
-        Self {
-            clock,
-            expiry: AtomicU64::new(0),
-            armed: AtomicBool::new(false),
-            advanced: AtomicBool::new(false),
-            fired_sql: Mutex::new(None),
-        }
-    }
-
-    fn arm_after_mapping(&self, expiry: u64) {
-        self.expiry.store(expiry, Ordering::SeqCst);
-        assert!(
-            !self.armed.swap(true, Ordering::SeqCst),
-            "the expiry callback is armed once, after the first mapped result"
-        );
-    }
-
-    fn fired_sql(&self) -> String {
-        self.fired_sql
-            .lock()
-            .expect("expiry callback SQL lock")
-            .clone()
-            .expect("the reopened commit validation queried through the plugin")
-    }
-}
-
-impl DatabasePlugin for ExpiryOnReopenedValidationQuery {
-    fn on_query(&self, sql: &str) -> contextdb_core::Result<()> {
-        if self.armed.swap(false, Ordering::SeqCst) {
-            self.clock.store(
-                self.expiry
-                    .load(Ordering::SeqCst)
-                    .checked_add(1)
-                    .expect("lease expiry has a successor"),
-                Ordering::SeqCst,
-            );
-            *self.fired_sql.lock().expect("expiry callback SQL lock") = Some(sql.into());
-            self.advanced.store(true, Ordering::SeqCst);
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 struct ClaimSnapshot {
     generation_id: uuid::Uuid,
@@ -204,9 +147,6 @@ struct ClaimSnapshot {
     end: i64,
     digest: String,
     membership: Vec<(uuid::Uuid, String)>,
-    lease_epoch: i64,
-    lease_token: String,
-    lease_expires_at: u64,
 }
 
 fn assert_same_pending_claim(actual: &ClaimSnapshot, expected: &ClaimSnapshot, message: &str) {
@@ -236,7 +176,7 @@ fn rows(store: &Store, sql: &str, params: HashMap<String, Value>) -> Vec<Vec<Val
 fn claim_snapshot(store: &Store, context_id: context_graph::ContextId) -> ClaimSnapshot {
     let generation = rows(
         store,
-        "SELECT id, build_ordinal, claim_end_ordinal, claim_membership_sha256, lease_epoch, lease_token, lease_expires_at FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND claim_end_ordinal IS NOT NULL",
+        "SELECT id, build_ordinal, claim_end_ordinal, claim_membership_sha256 FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND claim_end_ordinal IS NOT NULL",
         HashMap::from([
             ("context_id".into(), Value::Uuid(context_id.as_uuid())),
             ("connector_id".into(), Value::Text(CONNECTOR.into())),
@@ -262,18 +202,6 @@ fn claim_snapshot(store: &Store, context_id: context_graph::ContextId) -> ClaimS
     let digest = match &generation[0][3] {
         Value::Text(value) => value.clone(),
         other => panic!("claim membership digest: {other:?}"),
-    };
-    let lease_epoch = match generation[0][4] {
-        Value::Int64(value) => value,
-        ref other => panic!("claim lease epoch: {other:?}"),
-    };
-    let lease_token = match &generation[0][5] {
-        Value::Text(value) => value.clone(),
-        other => panic!("claim lease token: {other:?}"),
-    };
-    let lease_expires_at = match generation[0][6] {
-        Value::Timestamp(value) => u64::try_from(value).expect("positive lease expiry"),
-        ref other => panic!("claim lease expiry: {other:?}"),
     };
     assert!(
         start < end,
@@ -305,9 +233,6 @@ fn claim_snapshot(store: &Store, context_id: context_graph::ContextId) -> ClaimS
         end,
         digest,
         membership,
-        lease_epoch,
-        lease_token,
-        lease_expires_at,
     }
 }
 
@@ -565,73 +490,6 @@ impl ReleasedConnectorInterpretation for ResumePendingClaim {
     }
 }
 
-struct ReclaimAfterReopenedExpiry {
-    store: Store,
-    context_id: context_graph::ContextId,
-    pending: ClaimSnapshot,
-    expiry: Arc<ExpiryOnReopenedValidationQuery>,
-    calls: Mutex<Vec<uuid::Uuid>>,
-    attempts: Mutex<Vec<(i64, String)>>,
-    checked_reclaim: AtomicBool,
-}
-
-impl ReleasedConnectorInterpretation for ReclaimAfterReopenedExpiry {
-    fn declaration(&self) -> &ReleasedInterpretationDeclaration {
-        static DECLARATION: std::sync::OnceLock<ReleasedInterpretationDeclaration> =
-            std::sync::OnceLock::new();
-        DECLARATION.get_or_init(release)
-    }
-
-    fn interpret_event(&self, event: &ConversationEvent) -> Result<EffectiveEventFields> {
-        let snapshot = claim_snapshot(&self.store, self.context_id);
-        if snapshot.start >= self.pending.end {
-            return Err(CgError::Engine(
-                "stop after committing the reclaimed pending claim".into(),
-            ));
-        }
-        assert_same_pending_claim(
-            &snapshot,
-            &self.pending,
-            "the expired result reclaims the same persisted pending claim",
-        );
-        let mut attempts = self.attempts.lock().expect("mapping attempts lock");
-        let lease = (snapshot.lease_epoch, snapshot.lease_token.clone());
-        if attempts.last() != Some(&lease) {
-            if let Some((previous_epoch, previous_token)) = attempts.last() {
-                assert!(
-                    snapshot.lease_epoch > *previous_epoch
-                        && snapshot.lease_token != *previous_token,
-                    "the subsequent mapping attempt has a renewed lease epoch and token"
-                );
-                assert!(
-                    self.expiry.advanced.load(Ordering::SeqCst)
-                        && !self.checked_reclaim.swap(true, Ordering::SeqCst),
-                    "only the subsequent mapping attempt checks the expired first attempt"
-                );
-                assert_claim_uncommitted(&self.store, self.context_id, &self.pending);
-            }
-            attempts.push(lease);
-        }
-        let first_attempt = attempts.len() == 1;
-        drop(attempts);
-        self.calls
-            .lock()
-            .expect("mapper calls lock")
-            .push(event.id.as_uuid());
-        if first_attempt
-            && snapshot
-                .membership
-                .last()
-                .is_some_and(|(id, _)| *id == event.id.as_uuid())
-        {
-            // Every first-attempt member has inspected its persisted claim before this callback
-            // can advance the clock; a later member cannot masquerade as a reclaimed attempt.
-            self.expiry.arm_after_mapping(snapshot.lease_expires_at);
-        }
-        Ok(effective())
-    }
-}
-
 fn pending_claim_fixture(
     unclaimed_tail_events: u64,
 ) -> (
@@ -786,84 +644,4 @@ fn commit_uses_only_full_primary_key_membership_reads_for_the_resumed_pending_cl
             "commit rejects every membership range, ordered read, and unordered scan: {query}"
         );
     }
-}
-
-#[test]
-fn reopened_validation_expiry_discards_the_first_result_then_reclaims_the_same_claim_once() {
-    let clock = Arc::new(AtomicU64::new(T0));
-    let clock_for_guard = Arc::clone(&clock);
-    let _guard = Wallclock::test_clock_guard(move || clock_for_guard.load(Ordering::SeqCst));
-    let root = tempfile::tempdir().expect("tempdir");
-    let path = root.path().join("reopened-expiry.db");
-    let expiry = Arc::new(ExpiryOnReopenedValidationQuery::new(Arc::clone(&clock)));
-    // This retained Store owns the test-only plugin for runner reopens; it is not a release proof.
-    let retained_store = Store::open_with_database_plugin(config(path.clone()), expiry.clone())
-        .expect("open plugin fixture Store");
-    let context_id = capture(&retained_store, 0);
-    let interrupted = Arc::new(InterruptPendingClaim {
-        store: Store::open(config(path.clone())).expect("open mapper inspection Store"),
-        context_id,
-        pending: Mutex::new(None),
-    });
-    ConnectorInterpretationRunner::build(request(path.clone(), context_id, interrupted.clone()))
-        .expect_err("leave the actual durable claim pending before restart");
-    let pending = interrupted
-        .pending
-        .lock()
-        .expect("pending claim lock")
-        .clone()
-        .expect("pending claim");
-    assert_eq!(
-        clock.load(Ordering::SeqCst),
-        T0,
-        "the restart begins before the plugin advances the guarded wallclock"
-    );
-
-    let resumed = Arc::new(ReclaimAfterReopenedExpiry {
-        store: Store::open(config(path.clone())).expect("open restart mapper inspection Store"),
-        context_id,
-        pending: pending.clone(),
-        expiry: expiry.clone(),
-        calls: Mutex::new(Vec::new()),
-        attempts: Mutex::new(Vec::new()),
-        checked_reclaim: AtomicBool::new(false),
-    });
-    let resumed_error =
-        ConnectorInterpretationRunner::build(request(path, context_id, resumed.clone()))
-            .expect_err("stop once the reclaimed pending claim has committed");
-    assert!(
-        matches!(resumed_error, CgError::Engine(message) if message == "stop after committing the reclaimed pending claim")
-    );
-    assert!(
-        expiry.advanced.load(Ordering::SeqCst) && resumed.checked_reclaim.load(Ordering::SeqCst),
-        "the first mapped result expired at reopened validation and the next attempt reclaimed it"
-    );
-    assert!(
-        expiry
-            .fired_sql()
-            .contains("FROM event_interpretation_generations"),
-        "the plugin advanced the clock on the reopened commit validation query"
-    );
-    let expected_once = pending
-        .membership
-        .iter()
-        .map(|(id, _)| *id)
-        .collect::<Vec<_>>();
-    let calls = resumed.calls.lock().expect("mapper calls lock").clone();
-    assert_eq!(calls, [expected_once.clone(), expected_once].concat());
-    assert_eq!(
-        resumed
-            .attempts
-            .lock()
-            .expect("mapping attempts lock")
-            .len(),
-        2,
-        "two renewed lease attempts each map the same pending membership once"
-    );
-    assert_eq!(
-        generation_build_ordinal(&retained_store, context_id, pending.generation_id),
-        pending.end,
-        "only the reclaimed result advances the cursor"
-    );
-    assert_claim_values_once(&retained_store, context_id, &pending);
 }

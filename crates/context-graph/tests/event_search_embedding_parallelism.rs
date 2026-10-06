@@ -458,16 +458,16 @@ fn start_held_store_projection(embedding_workers: NonZeroUsize) -> HeldStoreProj
     }
 }
 
-fn held_store_has_live_lease(run: &HeldStoreProjection) -> bool {
+fn held_store_claim_is_running(run: &HeldStoreProjection) -> bool {
     let work = run
         .probe
         .event_search_work(
             context_graph::ContextSelector::one(run.context_id),
             &run.spec,
         )
-        .expect("inspect the held Store's projection lease");
+        .expect("inspect the held Store's projection claim");
     assert_eq!(work.len(), 1, "the held-Store fixture has one Context");
-    work[0].live_projection_lease
+    work[0].work == context_graph::BackgroundWorkState::Running
 }
 
 fn finish_projection(
@@ -624,7 +624,7 @@ fn embedding_worker_cap_two_enters_two_calls_but_never_a_third_before_release() 
 }
 
 #[test]
-fn held_store_cap_two_overlaps_two_calls_while_its_claim_lease_stays_live() {
+fn held_store_cap_two_overlaps_two_calls_while_its_claim_stays_running() {
     let run = start_held_store_projection(NonZeroUsize::new(2).unwrap());
     let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
     let second = run.entered.recv_timeout(Duration::from_secs(10)).ok();
@@ -649,7 +649,7 @@ fn held_store_cap_two_overlaps_two_calls_while_its_claim_lease_stays_live() {
         "held Store cap 2 admitted a third embedding call before either gated call returned"
     );
     assert!(
-        held_store_has_live_lease(&run),
+        held_store_claim_is_running(&run),
         "the held Store lost its projection claim while two gated embedding calls were active"
     );
 
@@ -665,7 +665,7 @@ fn held_store_cap_two_overlaps_two_calls_while_its_claim_lease_stays_live() {
 }
 
 #[test]
-fn held_store_cap_one_serializes_calls_while_its_claim_lease_stays_live() {
+fn held_store_cap_one_serializes_calls_while_its_claim_stays_running() {
     let run = start_held_store_projection(NonZeroUsize::MIN);
     let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
     assert_eq!(
@@ -685,7 +685,7 @@ fn held_store_cap_one_serializes_calls_while_its_claim_lease_stays_live() {
         "held Store cap 1 admitted a second embedding call before the first returned"
     );
     assert!(
-        held_store_has_live_lease(&run),
+        held_store_claim_is_running(&run),
         "the held Store lost its projection claim while its gated embedding call was active"
     );
 
