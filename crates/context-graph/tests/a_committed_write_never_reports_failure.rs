@@ -490,7 +490,7 @@ fn an_observation_that_committed_never_reports_failure() {
             evidence: vec![EvidenceRef {
                 id: EvidenceId::new_v7(),
                 kind: EvidenceKind::Text,
-                source_ref: "sensor://front-door".into(),
+                source_ref: format!("cas://sha256:{:064x}", 0x0d00_u128),
                 retention_status: RetentionStatus::RetainedExternal,
                 ..EvidenceRef::default()
             }],
