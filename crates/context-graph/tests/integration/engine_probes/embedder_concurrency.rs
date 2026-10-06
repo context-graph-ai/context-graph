@@ -403,7 +403,7 @@ fn face_reference_space() -> EmbeddingSpaceDecl {
 }
 
 /// The caller-filled vision space's one model: `producer("record")`'s own fields.
-fn probe_identity(dimension: usize) -> ModelIdentity {
+fn probe_identity(dimension: u32) -> ModelIdentity {
     ModelIdentity {
         model: "probe-model".to_string(),
         weights_revision: "record".to_string(),
@@ -1018,10 +1018,15 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
     let text_db = Arc::clone(&db);
     let text_store = vector_store.clone();
     thread::spawn(move || {
+        let reader = text_db
+            .declared_reader_memory()
+            .expect("admit the maintenance fixture reader");
+        let mut executing_owner = contextdb_engine::vector_read_memory::admission(reader);
         let result = text_store
             .run_hnsw_maintenance_for_index_for_test(
                 &text_index(),
                 Arc::new(MemoryAccountant::no_limit()),
+                &mut executing_owner,
             )
             .map_err(|error| format!("{error:?}"))
             .and_then(|_| {
@@ -1037,6 +1042,10 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
     let vision_store = vector_store.clone();
     let vision_row_for_thread = vision_row_id;
     thread::spawn(move || {
+        let reader = vision_db
+            .declared_reader_memory()
+            .expect("admit the maintenance fixture reader");
+        let mut executing_owner = contextdb_engine::vector_read_memory::admission(reader);
         let result = vision_row_for_thread
             .ok_or_else(|| "missing vision vector row".to_string())
             .and_then(|row_id| {
@@ -1048,6 +1057,7 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
                     .run_hnsw_maintenance_for_index_for_test(
                         &vision_index(),
                         Arc::new(MemoryAccountant::no_limit()),
+                        &mut executing_owner,
                     )
                     .map_err(|error| format!("{error:?}"))?;
                 first_hit_id(&vision_db, vision_index(), vector(4))

@@ -431,7 +431,7 @@ fn node_local_space(
     let identity = identity_for_space(id);
     EmbeddingSpace {
         embedding_space_id: id.to_string(),
-        dimension: identity.dimension,
+        dimension: identity.dimension as usize,
         metric: DistanceMetric::Cosine,
         model_family: if kind == EvidenceKind::Text {
             "text"

@@ -1,9 +1,9 @@
 //! Embedding placement per space, and reindex as shared background work.
 //!
 //! The contract: every embedding space declares where its vectors live. A reproducible space is
-//! node-local — each node builds its own copy and nothing about it syncs. A space only callers
-//! fill, or whose input is media, travels with its item and converges across nodes because a
-//! repeat replaces. A space is one model identity, so a new model or weights revision is a new
+//! node-local — each node builds its own copy. Callers and media spaces declare their placement
+//! too: caller-only values may be held only here, while travelling values follow their item
+//! authorization and converge across nodes because a repeat replaces. A space is one model identity, so a new model or weights revision is a new
 //! space; switching moves forward only. Rebuildable history is re-embedded locally, history that
 //! cannot be regenerated is preserved in its old space and reported, and no item ever loses its
 //! only vector. Reindex is background work on the shared crash-recovery mechanism.
@@ -111,11 +111,18 @@ fn text_space(revision: &str) -> EmbeddingSpace {
         model_version: revision.into(),
         supported_evidence_kinds: vec![EvidenceKind::Text],
         default_for_evidence_kind: Some(EvidenceKind::Text),
-        bindings: vec![EmbeddingSpaceBinding {
-            embedding_space_id: id,
-            table_name: "evidence".into(),
-            vector_column: TEXT_COLUMN.into(),
-        }],
+        bindings: vec![
+            EmbeddingSpaceBinding {
+                embedding_space_id: id.clone(),
+                table_name: "evidence".into(),
+                vector_column: TEXT_COLUMN.into(),
+            },
+            EmbeddingSpaceBinding {
+                embedding_space_id: id,
+                table_name: "digests".into(),
+                vector_column: TEXT_COLUMN.into(),
+            },
+        ],
         placement: Some(VectorPlacement::NodeLocal),
         media_reachable_on_every_node: false,
         producer: text_identity(revision),
@@ -150,7 +157,7 @@ impl Embedder for TextModel {
             embedding_space_id: text_space(&self.revision).embedding_space_id,
             dimension: TEXT_DIMENSION,
             producer: EvidenceProducer::from(&self.producer()),
-            vector: text_vector(&text),
+            vector: text_vector(&format!("{}:{text}", self.revision)),
         })
     }
 
@@ -164,6 +171,140 @@ impl Embedder for TextModel {
 
     fn producer(&self) -> ModelIdentity {
         text_identity(&self.revision)
+    }
+}
+
+/// A media model boundary that really reads the supplied file; a deleted file cannot be embedded.
+struct MediaModel {
+    revision: &'static str,
+    calls: AtomicUsize,
+}
+impl Embedder for MediaModel {
+    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let EmbeddingInput::ImageFrame { uri } = input else {
+            return Err(CgError::UnsupportedEvidenceKind {
+                kind: input.evidence_kind(),
+            });
+        };
+        let bytes = std::fs::read(uri.strip_prefix("file://").unwrap_or(&uri))
+            .map_err(|error| CgError::Engine(format!("media source unavailable: {error}")))?;
+        let mut vector = axis(usize::from(bytes[0]) % FACE_DIMENSION);
+        vector[(usize::from(bytes[0]) + 1) % FACE_DIMENSION] = 0.25;
+        Ok(EmbeddingOutput {
+            embedding_space_id: self.embedding_space().embedding_space_id,
+            dimension: FACE_DIMENSION,
+            producer: EvidenceProducer::from(&self.producer()),
+            vector,
+        })
+    }
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        vec![EvidenceKind::ImageFrame]
+    }
+    fn embedding_space(&self) -> EmbeddingSpace {
+        let mut space = face_space(self.revision);
+        space.default_for_evidence_kind = Some(EvidenceKind::ImageFrame);
+        space
+    }
+    fn producer(&self) -> ModelIdentity {
+        face_identity(self.revision)
+    }
+}
+
+/// A sealed, content-faithful event model; it runs on token bytes instead of inventing passage rows.
+struct EventModel {
+    calls: AtomicUsize,
+}
+impl EventModel {
+    fn registration(self: &Arc<Self>) -> EmbedderRegistration {
+        EmbedderRegistration {
+            space: self.embedding_space(),
+            embedder: self.clone(),
+        }
+    }
+    fn output(&self, tokens: &[u32]) -> EmbeddingOutput {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let text: String = tokens
+            .iter()
+            .map(|token| char::from_u32(*token).expect("byte token"))
+            .collect();
+        let mut vector = vec![0.0; 768];
+        vector[..TEXT_DIMENSION].copy_from_slice(&text_vector(&text));
+        EmbeddingOutput {
+            embedding_space_id: self.embedding_space().embedding_space_id,
+            dimension: 768,
+            producer: EvidenceProducer::from(&self.producer()),
+            vector,
+        }
+    }
+}
+impl Embedder for EventModel {
+    fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
+        let EmbeddingInput::Text(text) = input else {
+            return Err(CgError::UnsupportedEvidenceKind {
+                kind: input.evidence_kind(),
+            });
+        };
+        Ok(self.output(&text.bytes().map(u32::from).collect::<Vec<_>>()))
+    }
+    fn producer(&self) -> ModelIdentity {
+        ModelIdentity {
+            model: "placement-event".into(),
+            weights_revision: "v1".into(),
+            preparation: "byte-event".into(),
+            dimension: 768,
+        }
+    }
+    fn supported_inputs(&self) -> Vec<EvidenceKind> {
+        vec![EvidenceKind::Text]
+    }
+    fn embedding_space(&self) -> EmbeddingSpace {
+        let mut space = context_graph::embedding_space::event_history_embedding_space();
+        space.embedding_space_id = "placement-event-768".into();
+        space.model_name = "placement-event".into();
+        space.model_version = "v1".into();
+        space.producer = self.producer();
+        space.bindings[0].embedding_space_id = space.embedding_space_id.clone();
+        space
+    }
+    fn encoding_profile_id(&self) -> String {
+        "placement-byte-event-v1".into()
+    }
+    fn event_search_capability(&self) -> Option<context_graph::embedder::EventSearchCapability> {
+        context_graph::embedder::EventSearchCapability::new(8192)
+    }
+    fn prepare_document_hook(
+        &self,
+        text: &str,
+        seal: &context_graph::embedder::EventSearchSeal,
+    ) -> context_graph::Result<context_graph::embedder::PreparedEventSearchDocument> {
+        seal.document_builder()
+            .token_count(text.len())
+            .byte_boundaries((0..text.len()).map(|index| (index, index + 1)).collect())
+            .payload(text.bytes().map(u32::from).collect())
+            .seal()
+    }
+    fn prepare_query_hook(
+        &self,
+        text: &str,
+        seal: &context_graph::embedder::EventSearchSeal,
+    ) -> context_graph::Result<context_graph::embedder::PreparedEventSearchQuery> {
+        seal.query_builder()
+            .token_count(text.len())
+            .payload(text.bytes().map(u32::from).collect())
+            .seal()
+    }
+    fn embed_prepared_document_hook(
+        &self,
+        input: &context_graph::embedder::EventSearchInference,
+    ) -> context_graph::Result<EmbeddingOutput> {
+        Ok(self.output(input.token_ids()))
+    }
+    fn embed_prepared_query_hook(
+        &self,
+        input: &context_graph::embedder::EventSearchInference,
+    ) -> context_graph::Result<EmbeddingOutput> {
+        Ok(self.output(input.token_ids()))
     }
 }
 
@@ -322,7 +463,8 @@ fn rows(store: &Store, sql: &str, params: Vec<(&str, Value)>) -> Vec<Vec<Value>>
         .rows
 }
 
-/// Every evidence vector row of one space in one physical table, as target -> (created_at, vector).
+/// Snapshot each vector as target -> (created_at, vector, actual deterministic id).
+/// Keeping the id makes every crash, skip, retention and restore snapshot compare identity too.
 /// The column a space's vectors live in: the lexical mock is 768-d and uses the base column.
 fn column_of(space_id: &str) -> &'static str {
     if space_id.starts_with("placement_face") {
@@ -334,30 +476,63 @@ fn column_of(space_id: &str) -> &'static str {
     }
 }
 
-fn vectors_in(store: &Store, table: &str, space_id: &str) -> BTreeMap<uuid::Uuid, (Value, Value)> {
+fn vectors_in(
+    store: &Store,
+    table: &str,
+    space_id: &str,
+) -> BTreeMap<uuid::Uuid, (Value, Value, Value)> {
     let column = column_of(space_id);
-    rows(
+    let raw = rows(
         store,
         &format!(
-            "SELECT target_id, created_at, {column} FROM {table} WHERE embedding_space_id = $space"
+            "SELECT id, target_id, created_at, {column} FROM {table} WHERE embedding_space_id = $space ORDER BY target_id"
         ),
         vec![("space", Value::Text(space_id.to_string()))],
-    )
-    .into_iter()
-    .map(|row| match (&row[0], &row[1], &row[2]) {
-        (Value::Uuid(target), created_at, vector) => {
-            (*target, (created_at.clone(), vector.clone()))
-        }
-        other => panic!("evidence embedding row {other:?}"),
-    })
-    .collect()
+    );
+    let distinct_targets = raw
+        .iter()
+        .map(|row| match row[1] {
+            Value::Uuid(target) => target,
+            _ => panic!("embedding target must be a UUID: {row:?}"),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        raw.len(),
+        distinct_targets.len(),
+        "raw SQL contains exactly one row per item before collecting a snapshot"
+    );
+    let mut found = BTreeMap::new();
+    let mut identities = std::collections::BTreeSet::new();
+    for row in &raw {
+        let (Value::Uuid(id), Value::Uuid(target)) = (&row[0], &row[1]) else {
+            panic!("evidence embedding row {row:?}");
+        };
+        assert_eq!(
+            id.get_version_num(),
+            8,
+            "embedding identity uses UUIDv8 format; snapshots and independent nodes check stability"
+        );
+        assert!(identities.insert(*id), "one physical row per embedding id");
+        assert!(
+            found
+                .insert(*target, (row[2].clone(), row[3].clone(), row[0].clone()))
+                .is_none(),
+            "one physical embedding row per item and model, never collapsed by collection"
+        );
+    }
+    assert_eq!(
+        raw.len(),
+        found.len(),
+        "raw SQL cardinality equals item cardinality"
+    );
+    found
 }
 
-fn node_local(store: &Store, space_id: &str) -> BTreeMap<uuid::Uuid, (Value, Value)> {
+fn node_local(store: &Store, space_id: &str) -> BTreeMap<uuid::Uuid, (Value, Value, Value)> {
     vectors_in(store, "evidence_embeddings", space_id)
 }
 
-fn travelling(store: &Store, space_id: &str) -> BTreeMap<uuid::Uuid, (Value, Value)> {
+fn travelling(store: &Store, space_id: &str) -> BTreeMap<uuid::Uuid, (Value, Value, Value)> {
     vectors_in(store, "evidence_embeddings_travelling", space_id)
 }
 
@@ -477,6 +652,12 @@ fn a_skipped_item_keeps_its_old_vector_and_is_counted_until_it_is_rebuilt() {
     // An item the new model refuses keeps its only vector, is counted, and is retried on request.
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("skipped.db");
+    for builtin in [
+        context_graph::embedding_space::default_text_embedding_space(),
+        context_graph::embedding_space::event_history_embedding_space(),
+    ] {
+        assert_eq!(builtin.placement, Some(VectorPlacement::NodeLocal));
+    }
     let old = TextModel::new("rev-a");
     let new = TextModel::new("rev-b");
     let store = open_with(&path, &[&old, &new]);
@@ -737,6 +918,35 @@ fn a_retained_space_stays_searchable_and_counted_until_it_is_released() {
         "a retained space is never stale: its rows survive the rebuild"
     );
     assert_eq!(node_local(&store, &new_space).len(), ITEMS);
+    #[cfg(context_graph_internal_test_support)]
+    {
+        let retained = context_graph::test_support::embedding::vector_search(
+            &store,
+            &text_vector(&format!("rev-a:{}", note(0))),
+            &old_space,
+            context_graph::test_support::embedding::VectorSearchFilters {
+                top_k: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("search the retained space's actual local index");
+        assert_eq!(retained.hits.len(), 1);
+        assert_eq!(
+            retained.hits[0].target,
+            EmbeddingTarget::Evidence(evidence[0])
+        );
+        assert_eq!(retained.hits[0].embedding_space_id, old_space);
+        assert_eq!(retained.coverage.preserved_elsewhere, 0);
+    }
+    assert_eq!(
+        new.calls(),
+        ITEMS,
+        "the new model actually generated distinct values"
+    );
+    assert_ne!(
+        node_local(&store, &new_space)[&evidence[0].as_uuid()].1,
+        before[&evidence[0].as_uuid()].1,
+    );
 
     let released = store
         .release_retained_space(EmbeddingRole::EvidenceText, &old_space)
@@ -782,8 +992,8 @@ fn caller_identity(revision: &str) -> ModelIdentity {
     }
 }
 
-#[test]
-fn a_travelling_switch_preserves_and_reports_what_this_node_cannot_regenerate() {
+#[tokio::test]
+async fn a_travelling_switch_preserves_and_reports_what_this_node_cannot_regenerate() {
     // A caller-filled space switched to a new model keeps every old vector and reports them.
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("travelling-switch.db");
@@ -834,6 +1044,34 @@ fn a_travelling_switch_preserves_and_reports_what_this_node_cannot_regenerate() 
         "the switch records its succession"
     );
     assert_eq!(status.preserved_elsewhere as usize, ITEMS);
+    #[cfg(context_graph_internal_test_support)]
+    {
+        let uncovered = context_graph::test_support::embedding::vector_search(
+            &store,
+            &text_vector("query"),
+            &v2.embedding_space_id,
+            Default::default(),
+        )
+        .expect("ordinary evidence search reports preserved-only items");
+        assert!(uncovered.hits.is_empty());
+        assert_eq!(uncovered.coverage.preserved_elsewhere as usize, ITEMS);
+        assert_eq!(uncovered.coverage.unembedded, 0);
+        let old_hits = context_graph::test_support::embedding::vector_search(
+            &store,
+            &text_vector("caller 0"),
+            &v1,
+            context_graph::test_support::embedding::VectorSearchFilters {
+                top_k: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("preserved evidence remains searchable");
+        assert_eq!(old_hits.hits.len(), 1);
+        assert_eq!(
+            old_hits.hits[0].target,
+            EmbeddingTarget::Evidence(evidence[0])
+        );
+    }
 
     store
         .supply_embedding(
@@ -848,6 +1086,27 @@ fn a_travelling_switch_preserves_and_reports_what_this_node_cannot_regenerate() 
         ITEMS - 1,
         "a re-supplied item is no longer served only from the old space"
     );
+    #[cfg(context_graph_internal_test_support)]
+    {
+        let new_hits = context_graph::test_support::embedding::vector_search(
+            &store,
+            &text_vector("caller zero, new model"),
+            &v2.embedding_space_id,
+            Default::default(),
+        )
+        .expect("ordinary evidence search after supplying one successor");
+        assert_eq!(new_hits.hits.len(), 1);
+        assert_eq!(
+            new_hits.hits[0].target,
+            EmbeddingTarget::Evidence(evidence[0])
+        );
+        assert_eq!(new_hits.coverage.preserved_elsewhere as usize, ITEMS - 1);
+    }
+    let preserved = travelling(&store, &v1);
+    store
+        .reindex_space(&v2.embedding_space_id, ReindexOptions::default())
+        .expect("driving a travelling space keeps irregenerable values");
+    assert_eq!(travelling(&store, &v1), preserved);
     let refused = store
         .supply_embedding(
             EmbeddingTarget::Evidence(evidence[1]),
@@ -867,6 +1126,259 @@ fn a_travelling_switch_preserves_and_reports_what_this_node_cannot_regenerate() 
         matches!(&cycle, CgError::EmbeddingSuccessionCycle { from, to } if *from == v2.embedding_space_id && *to == v1),
         "{cycle:?}"
     );
+    // cg-derived media values: the old model read real bytes, then the source really disappeared.
+    let media_path = root.path().join("source-image.bin");
+    std::fs::write(&media_path, [2_u8, 7, 9]).expect("retained source bytes for the first model");
+    let media_old = Arc::new(MediaModel {
+        revision: "media-old",
+        calls: AtomicUsize::new(0),
+    });
+    let media_new = Arc::new(MediaModel {
+        revision: "media-new",
+        calls: AtomicUsize::new(0),
+    });
+    let media_id = EvidenceId::new_v7();
+    let mut media_switch = None;
+    let mut media_before_switch = None;
+    let media_fixture = fabric_common::fabric_fixture_with_node_openers(
+        "placement_missing_media",
+        "tenant-alpha",
+        "tenant-alpha",
+        |label| {
+            let first_generation = fabric_common::FabricNode::with_models(
+                label,
+                |path| StoreConfig {
+                    file_uri_allowed: true,
+                    ..plain_config(&path)
+                },
+                vec![EmbedderRegistration {
+                    space: media_old.embedding_space(),
+                    embedder: media_old.clone(),
+                }],
+            );
+            let media_context = create_context(&first_generation.store);
+            let media_entity = create_entity(&first_generation.store, media_context, "camera");
+            let mut observation = supplied_note(
+                media_context,
+                media_entity,
+                media_id,
+                &v1,
+                Vec::new(),
+                &caller_identity("v1"),
+            );
+            observation.embeddings.clear();
+            observation.evidence[0].kind = EvidenceKind::ImageFrame;
+            observation.evidence[0].text_projection = None;
+            observation.evidence[0].source_ref = format!("file://{}", media_path.display());
+            observation.evidence[0].retention_status = RetentionStatus::RetainedExternal;
+            first_generation
+                .store
+                .record_observation(observation)
+                .expect("cg derives the first vector from actual media bytes");
+            media_before_switch = Some(travelling(
+                &first_generation.store,
+                &media_old.embedding_space().embedding_space_id,
+            ));
+            std::fs::remove_file(&media_path).expect("media is no longer retained");
+            media_switch = Some(
+                first_generation
+                    .store
+                    .switch_travelling_space(
+                        &media_old.embedding_space().embedding_space_id,
+                        media_new.embedding_space(),
+                    )
+                    .expect("declare the real successor while source is unavailable"),
+            );
+            // Both declarations claim ImageFrame only after the production switch has made
+            // them generations of the same space. Reopening resolves the successor default.
+            first_generation.reopen_with_models(
+                |path| StoreConfig {
+                    file_uri_allowed: true,
+                    ..plain_config(&path)
+                },
+                vec![
+                    EmbedderRegistration {
+                        space: media_old.embedding_space(),
+                        embedder: media_old.clone(),
+                    },
+                    EmbedderRegistration {
+                        space: media_new.embedding_space(),
+                        embedder: media_new.clone(),
+                    },
+                ],
+            )
+        },
+        |label| {
+            // This receiver starts with one generation. The successor declaration and its
+            // relationship arrive together through the real production sync path.
+            fabric_common::FabricNode::with_models(
+                label,
+                |path| StoreConfig {
+                    extra_embedding_spaces: vec![media_old.embedding_space()],
+                    file_uri_allowed: true,
+                    ..plain_config(&path)
+                },
+                Vec::new(),
+            )
+        },
+    )
+    .await;
+    let media_store = &media_fixture.edge1.store;
+    let media_switch = media_switch.expect("source durably declared the actual succession");
+    assert_eq!(media_switch.preserved_elsewhere, 1);
+    assert_eq!(
+        active(&media_store, EmbeddingRole::EvidenceImageFrame),
+        media_new.embedding_space().embedding_space_id
+    );
+    assert_eq!(media_old.calls.load(Ordering::SeqCst), 1);
+    let media_before = travelling(
+        &media_store,
+        &media_old.embedding_space().embedding_space_id,
+    );
+    assert_eq!(media_before.len(), 1);
+    assert_eq!(
+        media_before,
+        media_before_switch.expect("pre-switch media vector identity")
+    );
+    let mut expected = axis(2);
+    expected[3] = 0.25;
+    assert_eq!(
+        media_before[&media_id.as_uuid()].1,
+        Value::Vector(expected.clone())
+    );
+    assert!(!media_path.exists());
+    fabric_common::push_then_pull(&media_fixture.edge1_client, &media_fixture.edge2_client).await;
+    assert_eq!(
+        travelling(
+            &media_fixture.edge2.store,
+            &media_old.embedding_space().embedding_space_id
+        ),
+        media_before,
+        "cg-derived media vector, identity and provenance travel after its actual source is gone"
+    );
+    assert_eq!(
+        count_where(
+            &media_fixture.edge2.store,
+            "evidence",
+            "id",
+            media_id.as_uuid()
+        ),
+        1
+    );
+
+    for store in [&media_store, &media_fixture.edge2.store] {
+        assert_eq!(
+            rows(
+                store,
+                "SELECT embedding_space_id, default_for_evidence_kind FROM embedding_spaces WHERE embedding_space_id = $old OR embedding_space_id = $new ORDER BY embedding_space_id",
+                vec![
+                    (
+                        "old",
+                        Value::Text(media_old.embedding_space().embedding_space_id)
+                    ),
+                    (
+                        "new",
+                        Value::Text(media_new.embedding_space().embedding_space_id)
+                    ),
+                ],
+            ),
+            vec![
+                vec![
+                    Value::Text(media_new.embedding_space().embedding_space_id),
+                    Value::Text("image_frame".into())
+                ],
+                vec![
+                    Value::Text(media_old.embedding_space().embedding_space_id),
+                    Value::Text("image_frame".into())
+                ],
+            ],
+            "both generations retain their declared default after real succession sync"
+        );
+    }
+    let source_succession = rows(
+        &media_store,
+        "SELECT from_space, to_space, declared_at FROM embedding_space_successions WHERE from_space = $old",
+        vec![(
+            "old",
+            Value::Text(media_old.embedding_space().embedding_space_id),
+        )],
+    );
+    assert_eq!(source_succession.len(), 1);
+    assert_eq!(
+        source_succession[0][1],
+        Value::Text(media_new.embedding_space().embedding_space_id)
+    );
+    assert_eq!(
+        rows(
+            &media_fixture.edge2.store,
+            "SELECT from_space, to_space, declared_at FROM embedding_space_successions WHERE from_space = $old",
+            vec![(
+                "old",
+                Value::Text(media_old.embedding_space().embedding_space_id)
+            )],
+        ),
+        source_succession,
+        "the receiver acquired the exact source-declared succession through sync"
+    );
+    let media_report = media_store
+        .reindex_space(
+            &media_new.embedding_space().embedding_space_id,
+            ReindexOptions::default(),
+        )
+        .expect("unavailable media is a counted skip, never aborts preservation");
+    assert_eq!(
+        (
+            media_report.embedded,
+            media_report.skipped,
+            media_report.remaining
+        ),
+        (0, 1, 0)
+    );
+    assert_eq!(
+        media_new.calls.load(Ordering::SeqCst),
+        1,
+        "successor really encountered the unavailable file"
+    );
+    assert_eq!(
+        travelling(
+            &media_store,
+            &media_old.embedding_space().embedding_space_id
+        ),
+        media_before
+    );
+    let media_status = status_of(
+        &media_store,
+        &media_new.embedding_space().embedding_space_id,
+    );
+    assert_eq!(
+        (
+            media_status.state,
+            media_status.preserved_elsewhere,
+            media_status.skipped
+        ),
+        (SpaceState::Travelling, 1, 1)
+    );
+    #[cfg(context_graph_internal_test_support)]
+    {
+        let found = context_graph::test_support::embedding::vector_search(
+            &media_store,
+            &expected,
+            &media_new.embedding_space().embedding_space_id,
+            Default::default(),
+        )
+        .expect("missing-media successor search coverage");
+        assert!(found.hits.is_empty());
+        assert_eq!(found.coverage.preserved_elsewhere, 1);
+        let old = context_graph::test_support::embedding::vector_search(
+            &media_store,
+            &expected,
+            &media_old.embedding_space().embedding_space_id,
+            Default::default(),
+        )
+        .expect("preserved media remains comparable");
+        assert_eq!(old.hits.len(), 1);
+        assert_eq!(old.hits[0].target, EmbeddingTarget::Evidence(media_id));
+    }
 }
 
 /// One text note whose vector the caller supplies under `producer`.
@@ -913,57 +1425,33 @@ fn supplied_note(
 #[test]
 fn a_foreign_vector_supplied_into_a_node_local_space_is_refused_and_a_compatible_one_is_stored_as_given()
  {
-    // A supplied vector is never silently discarded or recomputed: another model's vector is a
-    // typed refusal that writes nothing, and the space's own model's vector is kept exactly.
+    // All four write doors validate one identity component at a time and atomically refuse it.
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("supplied-vectors.db");
+    let declared = text_space("rev-a");
+    let space = declared.embedding_space_id.clone();
+    let mut local_caller = caller_space("local-only");
+    local_caller.placement = Some(VectorPlacement::NodeLocal);
     let store = Store::open(StoreConfig {
-        db_path: path,
-        default_text_embedder: None,
-        extra_embedding_spaces: vec![text_space("rev-a")],
-        ..StoreConfig::default()
+        extra_embedding_spaces: vec![declared, local_caller.clone(), face_space("v1")],
+        ..plain_config(&path)
     })
-    .expect("open with the space declared and no model on this node");
-    let space = text_space("rev-a").embedding_space_id;
+    .expect("declare reproducible and caller-only local spaces without loaded models");
     let context_id = create_context(&store);
     let entity_id = create_entity(&store, context_id, "notebook");
-    let count = |table: &str, evidence_id: EvidenceId| {
-        let column = if table == "evidence" {
-            "id"
-        } else {
-            "target_id"
-        };
-        rows(
-            &store,
-            &format!("SELECT {column} FROM {table} WHERE {column} = $id"),
-            vec![("id", Value::Uuid(evidence_id.as_uuid()))],
-        )
-        .len()
-    };
-
-    // Another model's vector, through the observation write: refused whole, nothing written.
-    let foreign = EvidenceId::new_v7();
-    let refused = store.record_observation(supplied_note(
-        context_id,
-        entity_id,
-        foreign,
-        &space,
-        text_vector("foreign"),
-        &caller_identity("foreign"),
-    ));
-    assert!(
-        matches!(
-            &refused,
-            Err(CgError::EmbeddingProducerMismatch { space: refused_space, .. }) if *refused_space == space
-        ),
-        "a foreign producer is refused with the typed error: {refused:?}"
+    let unavailable = status_of(&store, &space);
+    assert_eq!(unavailable.role, Some(EmbeddingRole::EvidenceText));
+    assert_eq!(unavailable.placement, VectorPlacement::NodeLocal);
+    assert_eq!(unavailable.state, SpaceState::Unavailable);
+    let held = status_of(&store, &local_caller.embedding_space_id);
+    assert_eq!(
+        (held.role, held.placement, held.state),
+        (None, VectorPlacement::NodeLocal, SpaceState::HeldOnlyHere)
     );
-    assert_eq!(count("evidence", foreign), 0, "no evidence row");
-    assert_eq!(count("evidence_embeddings", foreign), 0, "no vector row");
-    assert!(node_local(&store, &space).is_empty(), "nothing is stored");
-
-    // The space's own model's vector is accepted; then another model's vector for the same
-    // item, through the direct supply door, is refused and changes nothing.
+    assert_eq!(
+        status_of(&store, &face_space("v1").embedding_space_id).state,
+        SpaceState::Travelling
+    );
     let compatible = EvidenceId::new_v7();
     let supplied_vector = text_vector("kept exactly as supplied");
     let recorded = store
@@ -975,46 +1463,305 @@ fn a_foreign_vector_supplied_into_a_node_local_space_is_refused_and_a_compatible
             supplied_vector.clone(),
             &text_identity("rev-a"),
         ))
-        .expect("a supply from the space's own model is accepted");
-    let refused_supply = store.supply_embedding(
-        EmbeddingTarget::Evidence(compatible),
-        &space,
-        caller_identity("foreign"),
-        text_vector("foreign again"),
+        .expect("compatible observation supply is stored exactly");
+    assert_eq!(recorded.embedding_ids.len(), 1);
+    assert!(matches!(recorded.supplied_vectors.as_slice(),
+        [context_graph::SuppliedVectorOutcome {
+            outcome: context_graph::SuppliedVector::Stored { embedding_id }, ..
+        }] if *embedding_id == recorded.embedding_ids[0]));
+    assert_eq!(
+        node_local(&store, &space)[&compatible.as_uuid()].1,
+        Value::Vector(supplied_vector)
     );
-    assert!(
-        matches!(
-            &refused_supply,
-            Err(CgError::EmbeddingProducerMismatch { .. })
+    let compatible_id = node_local(&store, &space)[&compatible.as_uuid()].2.clone();
+    assert_eq!(
+        compatible_id,
+        Value::Uuid(recorded.embedding_ids[0].as_uuid())
+    );
+    let digest = context_graph::DigestId::new_v7();
+    let digest_vector = text_vector("supplied digest");
+    let digest_input =
+        |id, producer: &ModelIdentity, vector: Vec<f32>| context_graph::CreateDigest {
+            id,
+            context_id,
+            source: "fixture".into(),
+            summary: "digest summary".into(),
+            kind: EvidenceKind::Text,
+            embedding: context_graph::PrecomputedEmbedding {
+                id: context_graph::EmbeddingId::new_v7(),
+                embedding_space_id: space.clone(),
+                target: EmbeddingTarget::Digest(id),
+                vector,
+                produced_by: EvidenceProducer::from(producer),
+            },
+            ..Default::default()
+        };
+    let created = store
+        .create_digest(digest_input(
+            digest,
+            &text_identity("rev-a"),
+            digest_vector.clone(),
+        ))
+        .expect("compatible digest supply is stored exactly");
+    assert!(matches!(
+        created.supplied_vector,
+        Some(context_graph::SuppliedVector::Stored { .. })
+    ));
+    assert_eq!(
+        rows(
+            &store,
+            &format!("SELECT {TEXT_COLUMN} FROM digest_embeddings WHERE target_id = $id"),
+            vec![("id", Value::Uuid(digest.as_uuid()))]
         ),
-        "{refused_supply:?}"
+        vec![vec![Value::Vector(digest_vector)]]
+    );
+    let face = face_space("v1").embedding_space_id;
+    let enrolled = store
+        .enroll_entity_reference(
+            entity_id,
+            &face,
+            Some("compatible".into()),
+            axis(0),
+            face_producer("v1"),
+        )
+        .expect("compatible enrollment is stored exactly");
+    assert_eq!(
+        enrollment_rows(&store, entity_id),
+        vec![(
+            Value::Text("compatible".into()),
+            face.clone(),
+            Value::Vector(axis(0))
+        )]
+    );
+    assert_eq!(
+        rows(
+            &store,
+            &format!(
+                "SELECT id FROM entity_reference_embeddings_{FACE_DIMENSION} WHERE entity_id = $id"
+            ),
+            vec![("id", Value::Uuid(entity_id.as_uuid()))]
+        ),
+        vec![vec![Value::Uuid(enrolled.as_uuid())]]
+    );
+    let direct_vector = text_vector("compatible direct replacement");
+    let direct = store
+        .supply_embedding(
+            EmbeddingTarget::Evidence(compatible),
+            &space,
+            text_identity("rev-a"),
+            direct_vector.clone(),
+        )
+        .expect("compatible direct supply replaces exactly");
+    assert!(
+        matches!(direct, context_graph::SuppliedVector::Stored { embedding_id } if embedding_id == recorded.embedding_ids[0])
+    );
+    assert_eq!(
+        node_local(&store, &space)[&compatible.as_uuid()].1,
+        Value::Vector(direct_vector)
     );
 
-    // The space's own model's vector is stored as given, under the space's placement.
-    assert_eq!(
-        recorded.embedding_ids.len(),
-        1,
-        "one row written: {recorded:?}"
+    let related_tables = [
+        "observations",
+        "evidence",
+        "entity_snapshots",
+        "entity_snapshot_observations",
+        "audit_log",
+        "entity_current_snapshots",
+        "entity_snapshot_links",
+        "digests",
+        "evidence_embeddings",
+        "evidence_embeddings_travelling",
+        "digest_embeddings",
+        "embedding_pending",
+        "embedding_skips",
+    ];
+    for component in ["model", "revision", "preparation", "dimension"] {
+        let mut incompatible = text_identity("rev-a");
+        match component {
+            "model" => incompatible.model = "other-family-model".into(),
+            "revision" => incompatible.weights_revision = "rev-foreign".into(),
+            "preparation" => incompatible.preparation = "different-preprocessing".into(),
+            "dimension" => incompatible.dimension += 1,
+            _ => unreachable!(),
+        }
+        let vector = vec![0.25; incompatible.dimension as usize];
+        let before: Vec<_> = related_tables
+            .iter()
+            .map(|table| rows(&store, &format!("SELECT * FROM {table}"), Vec::new()))
+            .collect();
+        let foreign = EvidenceId::new_v7();
+        let mut observation = supplied_note(
+            context_id,
+            entity_id,
+            foreign,
+            &space,
+            vector.clone(),
+            &incompatible,
+        );
+        observation.state_delta.insert(
+            "marker".into(),
+            Some(serde_json::Value::String(component.into())),
+        );
+        let observation_id = observation.id;
+        let error = store
+            .record_observation(observation)
+            .expect_err("incompatible observation supply refused");
+        if component == "dimension" {
+            assert!(
+                matches!(error, CgError::EmbeddingDimensionMismatch { expected, found, .. }
+                if expected == TEXT_DIMENSION as u32 && found == TEXT_DIMENSION as u32 + 1),
+                "{error:?}"
+            );
+        } else {
+            assert!(
+                matches!(error, CgError::EmbeddingProducerMismatch { ref space, ref expected, ref supplied } if space == &text_space("rev-a").embedding_space_id && expected == &text_identity("rev-a") && supplied == &incompatible),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            count_where(&store, "observations", "id", observation_id.as_uuid()),
+            0
+        );
+        assert_eq!(count_where(&store, "evidence", "id", foreign.as_uuid()), 0);
+        let direct_error = store
+            .supply_embedding(
+                EmbeddingTarget::Evidence(compatible),
+                &space,
+                incompatible.clone(),
+                vector.clone(),
+            )
+            .expect_err("incompatible direct supply refused");
+        let digest_error = store
+            .create_digest(digest_input(
+                context_graph::DigestId::new_v7(),
+                &incompatible,
+                vector,
+            ))
+            .expect_err("incompatible digest supply refused");
+        for error in [direct_error, digest_error] {
+            if component == "dimension" {
+                assert!(
+                    matches!(error, CgError::EmbeddingDimensionMismatch { expected, found, .. }
+                    if expected == TEXT_DIMENSION as u32 && found == TEXT_DIMENSION as u32 + 1),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, CgError::EmbeddingProducerMismatch { ref space, ref expected, ref supplied } if space == &text_space("rev-a").embedding_space_id && expected == &text_identity("rev-a") && supplied == &incompatible),
+                    "{error:?}"
+                );
+            }
+        }
+        let mut identity = face_identity("v1");
+        match component {
+            "model" => identity.model = "other-family-model".into(),
+            "revision" => identity.weights_revision = "v-foreign".into(),
+            "preparation" => identity.preparation = "different-preprocessing".into(),
+            "dimension" => identity.dimension += 1,
+            _ => unreachable!(),
+        }
+        let enrollment_error = store
+            .enroll_entity_reference(
+                entity_id,
+                &face,
+                Some(component.into()),
+                vec![0.25; identity.dimension as usize],
+                EvidenceProducer::from(&identity),
+            )
+            .expect_err("incompatible enrollment supply refused");
+        if component == "dimension" {
+            assert!(
+                matches!(enrollment_error, CgError::EmbeddingDimensionMismatch { expected, found, .. }
+                if expected == FACE_DIMENSION as u32 && found == FACE_DIMENSION as u32 + 1),
+                "{enrollment_error:?}"
+            );
+        } else {
+            assert!(
+                matches!(enrollment_error, CgError::EmbeddingProducerMismatch { ref space, ref expected, ref supplied } if space == &face && expected == &face_identity("v1") && supplied == &identity),
+                "{enrollment_error:?}"
+            );
+        }
+        assert_eq!(
+            enrollment_rows(&store, entity_id),
+            vec![(
+                Value::Text("compatible".into()),
+                face.clone(),
+                Value::Vector(axis(0))
+            )]
+        );
+        for (table, before) in related_tables.iter().zip(before) {
+            assert_eq!(
+                rows(&store, &format!("SELECT * FROM {table}"), Vec::new()),
+                before,
+                "{component} refusal changes no related write in {table}"
+            );
+        }
+    }
+    // Producer system is provenance only: changing it does not change identity compatibility.
+    let mut provenance = supplied_note(
+        context_id,
+        entity_id,
+        EvidenceId::new_v7(),
+        &space,
+        text_vector("different system"),
+        &text_identity("rev-a"),
     );
-    assert!(
-        matches!(
-            recorded.supplied_vectors.as_slice(),
-            [context_graph::SuppliedVectorOutcome {
-                outcome: context_graph::SuppliedVector::Stored { embedding_id },
-                ..
-            }] if *embedding_id == recorded.embedding_ids[0]
+    provenance.embeddings[0].produced_by.system = "another-system".into();
+    store
+        .record_observation(provenance)
+        .expect("system provenance does not cause model mismatch");
+    let held_item = EvidenceId::new_v7();
+    store
+        .record_observation(supplied_note(
+            context_id,
+            entity_id,
+            held_item,
+            &local_caller.embedding_space_id,
+            text_vector("held on this receiving node"),
+            &caller_identity("local-only"),
+        ))
+        .expect("a caller-only space may explicitly be local");
+    let held = status_of(&store, &local_caller.embedding_space_id);
+    assert_eq!(
+        (held.state, held.role, held.embedded, held.unembedded),
+        (SpaceState::HeldOnlyHere, None, 1, 0)
+    );
+    assert!(travelling(&store, &local_caller.embedding_space_id).is_empty());
+    let held_before = node_local(&store, &local_caller.embedding_space_id);
+    drop(store);
+    let model = TextModel::new("rev-a");
+    let store = open_with(&path, &[&model]);
+    assert_eq!(status_of(&store, &space).state, SpaceState::Active);
+    store
+        .reindex_space(&space, ReindexOptions::default())
+        .expect("same-space repair computes local values");
+    assert_eq!(
+        node_local(&store, &space)[&compatible.as_uuid()].1,
+        Value::Vector(text_vector("rev-a:a supplied note"))
+    );
+    assert_eq!(
+        node_local(&store, &space)[&compatible.as_uuid()].2,
+        compatible_id,
+        "same-node rebuild preserves the actual item/model identity despite changing values"
+    );
+    assert_eq!(
+        rows(
+            &store,
+            &format!("SELECT {TEXT_COLUMN} FROM digest_embeddings WHERE target_id = $id"),
+            vec![("id", Value::Uuid(digest.as_uuid()))]
         ),
-        "the write reports the supplied vector as stored: {:?}",
-        recorded.supplied_vectors
+        vec![vec![Value::Vector(text_vector("rev-a:digest summary"))]]
     );
-    let stored = node_local(&store, &space);
-    assert_eq!(stored.len(), 1, "only the compatible vector is stored");
     assert_eq!(
-        stored[&compatible.as_uuid()].1,
-        Value::Vector(supplied_vector),
-        "the supplied values are kept as given, never replaced by a recompute"
+        model.calls(),
+        4,
+        "three evidence projections and one digest summary were rebuilt locally"
     );
-    assert_eq!(status_of(&store, &space).unembedded, 0);
+    assert_eq!(
+        node_local(&store, &local_caller.embedding_space_id),
+        held_before,
+        "repairing the reproducible space never rewrites caller-only local values"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1283,12 +2030,6 @@ fn an_enrollment_match_after_a_model_switch_reports_subjects_enrolled_only_in_th
 // item's sync direction.
 // ---------------------------------------------------------------------------------------------
 
-fn sql(store: &Store, statement: &str) {
-    store
-        .execute_sql_for_test(statement, &HashMap::new())
-        .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
-}
-
 /// One evidence item on `store` with a caller vector in the travelling space and a node-local
 /// vector in the store's active text space.
 fn record_with_caller_vector(
@@ -1321,96 +2062,796 @@ fn count_where(store: &Store, table: &str, column: &str, id: uuid::Uuid) -> usiz
 
 #[tokio::test]
 async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
-    // Node-local vectors, markers and claims stay on their node; a caller vector travels and converges.
-    let fixture = fabric_common::fabric_fixture("placement_second_node").await;
+    // Real interrupted source work, then independent offline rebuilds on each node.
+    let old = TextModel::new("rev-a");
+    let source_new = TextModel::new("rev-b");
+    let receiver_new = TextModel::new("rev-b");
+    let source_event_model = Arc::new(EventModel {
+        calls: AtomicUsize::new(0),
+    });
+    let receiver_event_model = Arc::new(EventModel {
+        calls: AtomicUsize::new(0),
+    });
+    let fixture = fabric_common::fabric_fixture_with_node_openers(
+        "placement_second_node",
+        "tenant-alpha",
+        "tenant-alpha",
+        |label| {
+            fabric_common::FabricNode::with_models(
+                label,
+                |path| StoreConfig {
+                    event_placement: Some(context_graph::EventPlacementPolicy::TenantHub),
+                    ..plain_config(&path)
+                },
+                vec![
+                    old.registration(),
+                    source_new.registration(),
+                    source_event_model.registration(),
+                ],
+            )
+        },
+        |label| {
+            fabric_common::FabricNode::with_models(
+                label,
+                |path| StoreConfig {
+                    event_placement: Some(context_graph::EventPlacementPolicy::TenantHub),
+                    ..plain_config(&path)
+                },
+                vec![
+                    receiver_new.registration(),
+                    receiver_event_model.registration(),
+                ],
+            )
+        },
+    )
+    .await;
     let space = caller_space("v1");
     for edge in [&fixture.edge1, &fixture.edge2] {
         edge.store
             .register_embedding_space(space.clone())
-            .expect("declare the caller space on both nodes");
+            .expect("declare travelling placement");
     }
-    let (_, evidence) = record_with_caller_vector(
-        &fixture.edge1.store,
-        &space.embedding_space_id,
-        text_vector("first"),
-    );
-    let edge1_text = active(&fixture.edge1.store, EmbeddingRole::EvidenceText);
-    assert_eq!(
-        count_where(
-            &fixture.edge1.store,
-            "evidence_embeddings",
-            "target_id",
-            evidence.as_uuid()
-        ),
-        1,
-        "the writing node embedded the item node-locally"
-    );
-
-    fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
-    let second = &fixture.edge2.store;
-    assert_eq!(
-        count_where(second, "evidence", "id", evidence.as_uuid()),
-        1,
-        "the item arrived"
-    );
-    assert_eq!(
-        count_where(
-            second,
-            "evidence_embeddings",
-            "target_id",
-            evidence.as_uuid()
-        ),
-        0,
-        "no node-local vector is ever received"
-    );
-    assert!(
-        rows(
-            second,
-            "SELECT owner_token FROM background_claims",
-            Vec::new()
-        )
-        .is_empty(),
-        "no claim is ever received"
-    );
-    assert_eq!(
-        rows(
-            second,
-            "SELECT reason FROM embedding_pending WHERE target_id = $id",
-            vec![("id", Value::Uuid(evidence.as_uuid()))],
-        ),
-        vec![vec![Value::Text("pending".into())]],
-        "the receiving node marks the item for its own rebuild instead of receiving a vector"
-    );
-    assert_eq!(
-        travelling(second, &space.embedding_space_id)
-            .get(&evidence.as_uuid())
-            .map(|(_, vector)| vector.clone()),
-        Some(Value::Vector(text_vector("first"))),
-        "the caller vector travelled with its item"
-    );
-    let _ = edge1_text;
-
+    let (context_id, evidence) = seed_items(&fixture.edge1.store);
+    let item = evidence[0];
+    let supplied_local = text_vector("source caller-supplied local values");
     fixture
         .edge1
         .store
         .supply_embedding(
-            EmbeddingTarget::Evidence(evidence),
+            EmbeddingTarget::Evidence(item),
+            &text_space("rev-a").embedding_space_id,
+            text_identity("rev-a"),
+            supplied_local.clone(),
+        )
+        .expect("store compatible local supply as given");
+    assert_eq!(
+        node_local(
+            &fixture.edge1.store,
+            &text_space("rev-a").embedding_space_id
+        )[&item.as_uuid()]
+            .1,
+        Value::Vector(supplied_local)
+    );
+    fixture
+        .edge1
+        .store
+        .supply_embedding(
+            EmbeddingTarget::Evidence(item),
+            &space.embedding_space_id,
+            caller_identity("v1"),
+            text_vector("first"),
+        )
+        .expect("supply travelling values");
+    let id_before = rows(
+        &fixture.edge1.store,
+        "SELECT id FROM evidence_embeddings_travelling WHERE target_id = $id",
+        vec![("id", Value::Uuid(item.as_uuid()))],
+    );
+    assert_eq!(id_before.len(), 1);
+    let digest_id = context_graph::DigestId::new_v7();
+    fixture
+        .edge1
+        .store
+        .create_digest(context_graph::CreateDigest {
+            id: digest_id,
+            context_id,
+            source: "fixture".into(),
+            summary: "shared digest summary".into(),
+            kind: EvidenceKind::Text,
+            embedding: context_graph::PrecomputedEmbedding {
+                id: context_graph::EmbeddingId::new_v7(),
+                target: EmbeddingTarget::Digest(digest_id),
+                embedding_space_id: text_space("rev-a").embedding_space_id,
+                produced_by: EvidenceProducer::from(&text_identity("rev-a")),
+                vector: text_vector("caller digest"),
+            },
+            ..Default::default()
+        })
+        .expect("source supplied digest");
+    let source_old_evidence_before = node_local(
+        &fixture.edge1.store,
+        &text_space("rev-a").embedding_space_id,
+    );
+    assert_eq!(source_old_evidence_before.len(), ITEMS);
+    let source_old_digest_before = rows(
+        &fixture.edge1.store,
+        &format!(
+            "SELECT id, target_id, created_at, {TEXT_COLUMN} FROM digest_embeddings WHERE embedding_space_id = $space ORDER BY target_id"
+        ),
+        vec![("space", Value::Text(text_space("rev-a").embedding_space_id))],
+    );
+    assert_eq!(source_old_digest_before.len(), 1);
+    assert_eq!(
+        source_old_digest_before[0][1],
+        Value::Uuid(digest_id.as_uuid())
+    );
+    // Establish the receiver's own insert/head-recheck markers before source reindex work exists.
+    // This baseline comes from this receiver's production apply path, so marker reasons and ids
+    // are observed rather than guessed or copied from the production deterministic-id algorithm.
+    fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
+    let pending_snapshot = |store: &Store| {
+        rows(
+            store,
+            "SELECT id, target_table, target_id, role, reason, created_at FROM embedding_pending WHERE context_id = $context ORDER BY id",
+            vec![("context", Value::Uuid(context_id.as_uuid()))],
+        )
+    };
+    let receiver_pending_before = pending_snapshot(&fixture.edge2.store);
+    assert!(
+        !receiver_pending_before.is_empty(),
+        "received content creates this receiver's own local work"
+    );
+    for marker in &receiver_pending_before {
+        assert!(
+            matches!(&marker[0], Value::Uuid(_)),
+            "marker has an actual id"
+        );
+        assert!(
+            matches!(&marker[1], Value::Text(table)
+            if table == "evidence" || table == "digests" || table == "evidence_embeddings_travelling"),
+            "receiver's own marker concerns an authorized received item: {marker:?}"
+        );
+        assert!(
+            matches!(&marker[2], Value::Uuid(id)
+            if evidence.iter().any(|item| item.as_uuid() == *id) || digest_id.as_uuid() == *id),
+            "receiver's marker identifies exact received evidence/digest: {marker:?}"
+        );
+    }
+    fixture
+        .edge1
+        .store
+        .switch_embedding_space(
+            EmbeddingRole::EvidenceText,
+            text_space("rev-b"),
+            OldSpace::Reindex,
+        )
+        .expect("source switches evidence locally");
+    fixture
+        .edge1
+        .store
+        .switch_embedding_space(
+            EmbeddingRole::Digest,
+            text_space("rev-b"),
+            OldSpace::Reindex,
+        )
+        .expect("source switches digest locally");
+    let paused = fixture
+        .edge1
+        .store
+        .reindex_space(
+            &text_space("rev-b").embedding_space_id,
+            ReindexOptions {
+                interrupt_after: Some(1),
+            },
+        )
+        .expect_err("source interrupts with committed work");
+    assert!(
+        matches!(paused, CgError::ReindexPaused { ref embedding_space_id, .. }
+        if embedding_space_id == &text_space("rev-b").embedding_space_id),
+        "{paused:?}"
+    );
+    let claims = rows(
+        &fixture.edge1.store,
+        "SELECT owner_token FROM background_claims WHERE work = 'reindex'",
+        Vec::new(),
+    );
+    assert_eq!(claims.len(), 1, "a real source claim exists before sync");
+    let source_pending_before_sync = pending_snapshot(&fixture.edge1.store);
+    let source_status = status_of(
+        &fixture.edge1.store,
+        &text_space("rev-b").embedding_space_id,
+    );
+    assert_eq!(source_status.work, BackgroundWorkState::Interrupted);
+    assert_eq!(
+        source_status.unembedded, ITEMS as u64,
+        "one of 41 projections committed; stale predecessor rows durably identify the remaining 40"
+    );
+    let source_committed = node_local(
+        &fixture.edge1.store,
+        &text_space("rev-b").embedding_space_id,
+    );
+    assert_eq!(source_committed.len(), 1);
+    let source_old_remaining = node_local(
+        &fixture.edge1.store,
+        &text_space("rev-a").embedding_space_id,
+    );
+    assert_eq!(source_old_remaining.len(), ITEMS - 1);
+    for (target, predecessor) in &source_old_remaining {
+        assert_eq!(
+            predecessor, &source_old_evidence_before[target],
+            "each remaining predecessor retains its exact vector, creation transaction and id"
+        );
+    }
+    assert_eq!(
+        source_old_evidence_before
+            .keys()
+            .filter(|target| !source_old_remaining.contains_key(target))
+            .copied()
+            .collect::<Vec<_>>(),
+        source_committed.keys().copied().collect::<Vec<_>>(),
+        "only the committed evidence projection lost its predecessor"
+    );
+    assert_eq!(
+        rows(
+            &fixture.edge1.store,
+            &format!(
+                "SELECT id, target_id, created_at, {TEXT_COLUMN} FROM digest_embeddings WHERE embedding_space_id = $space ORDER BY target_id"
+            ),
+            vec![("space", Value::Text(text_space("rev-a").embedding_space_id))],
+        ),
+        source_old_digest_before,
+        "the one remaining digest retains its exact predecessor identity and values"
+    );
+    // Both callers own this fixture history. Capture it separately through the public append
+    // API: TenantHub events push to the hub and are never pulled onto another edge.
+    let authorized_event_batch = context_graph::AppendEventBatch::live(
+        context_id,
+        context_graph::EventAdapterDeclaration {
+            connector_id: "placement-event".into(),
+            adapter_version: "v1".into(),
+            anchor_declaration_version: "v1".into(),
+            anchor_schema: serde_json::json!({"type":"object"}),
+            source_position_order: vec!["/ordinal".into()],
+        },
+        "source-node",
+        vec![context_graph::EventDraft {
+            session_ref: "placement-session".into(),
+            source_event_key: "event-1".into(),
+            source_position: serde_json::json!({"ordinal":1}),
+            occurred_at: None,
+            author: "operator".into(),
+            kind: "message".into(),
+            render_role: context_graph::EventRenderRole::HumanMessage,
+            interaction_ref: None,
+            text: Some("event vectors rebuild from authorized history".into()),
+            payload: serde_json::json!({}),
+            anchors: serde_json::json!({"fixture":"caller-authorized"}),
+            source_remainder: serde_json::json!({}),
+            coverage: context_graph::EventCoverage::Complete,
+        }],
+    );
+    let source_capture = fixture
+        .edge1
+        .store
+        .append_event_batch(authorized_event_batch.clone())
+        .expect("append caller-authorized source history");
+    assert_eq!(
+        (source_capture.inserted, source_capture.already_present),
+        (1, 0)
+    );
+    assert_eq!(source_capture.events.len(), 1);
+    let build_events = |store: &Store, model: &Arc<EventModel>| {
+        store
+            .catch_up_event_search(context_graph::EventSearchBuildRequest {
+                context_id,
+                embedder: model.registration(),
+                profile: Default::default(),
+                embedding_workers: std::num::NonZeroUsize::MIN,
+                max_events_per_batch: std::num::NonZeroU32::new(8).unwrap(),
+                max_passages_per_batch: std::num::NonZeroU32::new(8).unwrap(),
+                max_bytes_per_batch: std::num::NonZeroUsize::new(4096).unwrap(),
+            })
+            .expect("build this node's own event passages")
+    };
+    let source_event_build = build_events(&fixture.edge1.store, &source_event_model);
+    assert_eq!(
+        (
+            source_event_build.embedded_event_count,
+            source_event_build.passage_count,
+            source_event_build.state
+        ),
+        (1, 1, context_graph::EventSearchGenerationState::Ready)
+    );
+    assert_eq!(source_event_model.calls.load(Ordering::SeqCst), 1);
+    for table in [
+        "events",
+        "event_anchors",
+        "event_search_passages",
+        "event_search_embedding_handles",
+        "event_search_cursors",
+        "event_search_session_progress",
+    ] {
+        assert_eq!(
+            rows(
+                &fixture.edge1.store,
+                &format!("SELECT * FROM {table}"),
+                Vec::new()
+            )
+            .len(),
+            1,
+            "source has real durable event work in {table} before sync"
+        );
+    }
+    fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
+    let second = &fixture.edge2.store;
+    let receiver_status = status_of(second, &text_space("rev-b").embedding_space_id);
+    assert_eq!(
+        (receiver_status.work, receiver_status.unembedded),
+        (BackgroundWorkState::Idle, ITEMS as u64 + 1),
+        "receiver has its own 41 projections and no source interrupted claim or committed result"
+    );
+    let receiver_pending_after = pending_snapshot(second);
+    assert_eq!(
+        receiver_pending_after, receiver_pending_before,
+        "syncing interrupted source work adds no progress: receiver keeps only its own marker ids, kinds, reasons and creation transactions"
+    );
+    for source_marker in &source_pending_before_sync {
+        for receiver_marker in receiver_pending_after
+            .iter()
+            .filter(|row| row[0] == source_marker[0])
+        {
+            assert!(
+                receiver_pending_before.contains(receiver_marker),
+                "a coinciding deterministic marker id is this receiver's own pre-existing work"
+            );
+            assert_ne!(
+                receiver_marker[5], source_marker[5],
+                "coinciding item ids do not transfer the source marker's creation transaction"
+            );
+        }
+        assert!(
+            !receiver_pending_after.contains(source_marker),
+            "the exact source-local marker (id, kind, target, role, reason, source transaction) must be absent on receiver: {source_marker:?}"
+        );
+    }
+    assert_eq!(
+        rows(
+            second,
+            "SELECT owner_token FROM background_claims WHERE work = 'reindex'",
+            Vec::new()
+        ),
+        Vec::<Vec<Value>>::new()
+    );
+    assert_eq!(count_where(second, "evidence", "id", item.as_uuid()), 1);
+    assert_eq!(count_where(second, "digests", "id", digest_id.as_uuid()), 1);
+    assert!(node_local(second, &text_space("rev-a").embedding_space_id).is_empty());
+    assert!(node_local(second, &text_space("rev-b").embedding_space_id).is_empty());
+    assert_eq!(
+        rows(
+            second,
+            "SELECT target_id FROM digest_embeddings",
+            Vec::new()
+        ),
+        Vec::<Vec<Value>>::new()
+    );
+    assert_eq!(
+        travelling(second, &space.embedding_space_id)[&item.as_uuid()].1,
+        Value::Vector(text_vector("first"))
+    );
+    assert_eq!(
+        rows(
+            second,
+            "SELECT id FROM evidence_embeddings_travelling WHERE target_id = $id",
+            vec![("id", Value::Uuid(item.as_uuid()))]
+        ),
+        id_before
+    );
+    assert_eq!(
+        rows(
+            second,
+            "SELECT id FROM events WHERE context_id = $context",
+            vec![("context", Value::Uuid(context_id.as_uuid()))]
+        ),
+        Vec::<Vec<Value>>::new(),
+        "TenantHub PushOnly source events never pull onto another edge"
+    );
+    for table in [
+        "event_anchors",
+        "event_search_source_events",
+        "event_search_passages",
+        "event_search_embedding_handles",
+        "event_search_cursors",
+        "event_search_session_progress",
+    ] {
+        assert_eq!(
+            rows(second, &format!("SELECT * FROM {table}"), Vec::new()),
+            Vec::<Vec<Value>>::new(),
+            "event vectors, handles and source progress remain local: {table}"
+        );
+    }
+    assert_eq!(receiver_event_model.calls.load(Ordering::SeqCst), 0);
+    let receiver_capture = second
+        .append_event_batch(authorized_event_batch)
+        .expect("receiver separately captures its own caller-authorized fixture history");
+    assert_eq!(
+        (receiver_capture.inserted, receiver_capture.already_present),
+        (1, 0)
+    );
+    assert_eq!(
+        receiver_capture.events, source_capture.events,
+        "public capture assigns the same logical event identity and content independently"
+    );
+    assert_eq!(
+        pending_snapshot(second),
+        receiver_pending_after,
+        "own event capture does not replace receiver evidence/digest work markers"
+    );
+    let receiver_event_build = build_events(second, &receiver_event_model);
+    assert_eq!(
+        (
+            receiver_event_build.embedded_event_count,
+            receiver_event_build.passage_count,
+            receiver_event_build.state
+        ),
+        (1, 1, context_graph::EventSearchGenerationState::Ready)
+    );
+    assert_eq!(
+        receiver_event_model.calls.load(Ordering::SeqCst),
+        1,
+        "receiver embeds its separately captured event once"
+    );
+    let rendered = "User [author=\"operator\"]: event vectors rebuild from authorized history";
+    let mut expected_event_vector = vec![0.0; 768];
+    expected_event_vector[..TEXT_DIMENSION].copy_from_slice(&text_vector(rendered));
+    for (store, build) in [
+        (&fixture.edge1.store, &source_event_build),
+        (second, &receiver_event_build),
+    ] {
+        let event = rows(
+            store,
+            "SELECT id, rendered_text, vector_text, dimension FROM event_search_passages WHERE context_id = $context",
+            vec![("context", Value::Uuid(context_id.as_uuid()))],
+        );
+        assert_eq!(event.len(), 1);
+        assert_eq!(
+            &event[0][1..],
+            &[
+                Value::Text(rendered.into()),
+                Value::Vector(expected_event_vector.clone()),
+                Value::Int64(768),
+            ]
+        );
+        assert_eq!(
+            rows(
+                store,
+                "SELECT passage_id, embedding_space_id FROM event_search_embedding_handles WHERE context_id = $context",
+                vec![("context", Value::Uuid(context_id.as_uuid()))]
+            ),
+            vec![vec![
+                event[0][0].clone(),
+                Value::Text("placement-event-768".into())
+            ]]
+        );
+        assert_eq!(
+            rows(
+                store,
+                "SELECT connector_id, source_instance_ref, session_ref, committed_sequence FROM event_search_cursors WHERE context_id = $context",
+                vec![("context", Value::Uuid(context_id.as_uuid()))]
+            ),
+            vec![vec![
+                Value::Text("placement-event".into()),
+                Value::Text("source-node".into()),
+                Value::Text("placement-session".into()),
+                Value::Int64(1)
+            ]]
+        );
+        assert_eq!(
+            rows(
+                store,
+                "SELECT event_count, committed_event_count, eligible_event_count, excluded_event_count, searchable_event_count, no_searchable_text_event_count, is_published FROM event_search_session_progress WHERE context_id = $context",
+                vec![("context", Value::Uuid(context_id.as_uuid()))]
+            ),
+            vec![vec![
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(0),
+                Value::Int64(1),
+                Value::Int64(0),
+                Value::Bool(true)
+            ]]
+        );
+        assert_eq!(
+            rows(
+                store,
+                "SELECT id, rendered_text FROM event_search_passages WHERE context_id = $context AND generation_id = $generation AND is_current = $current AND is_searchable = $searchable ORDER BY vector_text <=> $query LIMIT 1",
+                vec![
+                    ("context", Value::Uuid(context_id.as_uuid())),
+                    ("generation", Value::Uuid(build.generation_id.as_uuid())),
+                    ("current", Value::Bool(true)),
+                    ("searchable", Value::Bool(true)),
+                    ("query", Value::Vector(expected_event_vector.clone()))
+                ]
+            ),
+            vec![vec![event[0][0].clone(), Value::Text(rendered.into())]],
+            "each node searches its independently built event vector index"
+        );
+    }
+    assert_eq!(source_event_model.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(receiver_event_model.calls.load(Ordering::SeqCst), 1);
+    // Neither drive calls transport: the receiving node rebuilds its own content offline.
+    let local_before = node_local(
+        &fixture.edge1.store,
+        &text_space("rev-b").embedding_space_id,
+    );
+    let resumed = fixture
+        .edge1
+        .store
+        .reindex_space(
+            &text_space("rev-b").embedding_space_id,
+            ReindexOptions::default(),
+        )
+        .expect("source immediately finishes its own interrupted work");
+    assert_eq!(
+        (resumed.embedded, resumed.skipped, resumed.remaining),
+        (ITEMS as u64, 0, 0)
+    );
+    let rebuilt = second
+        .reindex_space(
+            &text_space("rev-b").embedding_space_id,
+            ReindexOptions::default(),
+        )
+        .expect("receiver builds its own copy");
+    assert_eq!(
+        (rebuilt.embedded, rebuilt.skipped, rebuilt.remaining),
+        (ITEMS as u64 + 1, 0, 0)
+    );
+    assert_eq!(source_new.calls(), ITEMS + 1);
+    assert_eq!(receiver_new.calls(), ITEMS + 1);
+    for store in [&fixture.edge1.store, second] {
+        let vectors = node_local(store, &text_space("rev-b").embedding_space_id);
+        assert_eq!(vectors.len(), ITEMS);
+        for (index, item) in evidence.iter().enumerate() {
+            assert_eq!(
+                vectors[&item.as_uuid()].1,
+                Value::Vector(text_vector(&format!("rev-b:{}", note(index))))
+            );
+        }
+        assert_eq!(
+            rows(
+                store,
+                &format!("SELECT {TEXT_COLUMN} FROM digest_embeddings WHERE target_id = $id"),
+                vec![("id", Value::Uuid(digest_id.as_uuid()))]
+            ),
+            vec![vec![Value::Vector(text_vector(
+                "rev-b:shared digest summary"
+            ))]]
+        );
+        let final_status = status_of(store, &text_space("rev-b").embedding_space_id);
+        assert_eq!(final_status.work, BackgroundWorkState::Idle);
+        assert_eq!(final_status.unembedded, 0);
+    }
+    let source_vectors = node_local(
+        &fixture.edge1.store,
+        &text_space("rev-b").embedding_space_id,
+    );
+    let receiver_vectors = node_local(second, &text_space("rev-b").embedding_space_id);
+    assert_eq!(source_vectors.len(), ITEMS);
+    assert_eq!(receiver_vectors.len(), ITEMS);
+    for item in &evidence {
+        assert_eq!(
+            source_vectors[&item.as_uuid()].2,
+            receiver_vectors[&item.as_uuid()].2,
+            "independent nodes generate the same actual identity for this item/model"
+        );
+    }
+    let digest_identity = |store: &Store| {
+        rows(
+            store,
+            "SELECT id FROM digest_embeddings WHERE target_id = $id AND embedding_space_id = $space",
+            vec![
+                ("id", Value::Uuid(digest_id.as_uuid())),
+                ("space", Value::Text(text_space("rev-b").embedding_space_id)),
+            ],
+        )
+    };
+    let source_digest_id = digest_identity(&fixture.edge1.store);
+    assert_eq!(source_digest_id.len(), 1);
+    assert_eq!(
+        digest_identity(second),
+        source_digest_id,
+        "independent digest rebuilds preserve the same actual item/model identity"
+    );
+    for (target, row) in local_before {
+        assert_eq!(
+            node_local(
+                &fixture.edge1.store,
+                &text_space("rev-b").embedding_space_id
+            )[&target],
+            row,
+            "source retains each committed row's exact values and creation transaction"
+        );
+    }
+    #[cfg(context_graph_internal_test_support)]
+    for store in [&fixture.edge1.store, second] {
+        let hits = context_graph::test_support::embedding::vector_search(
+            store,
+            &text_vector(&format!("rev-b:{}", note(0))),
+            &text_space("rev-b").embedding_space_id,
+            context_graph::test_support::embedding::VectorSearchFilters {
+                top_k: Some(1),
+                ..Default::default()
+            },
+        )
+        .expect("each node built its own actual vector index");
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].target, EmbeddingTarget::Evidence(item));
+    }
+    fixture
+        .edge1
+        .store
+        .supply_embedding(
+            EmbeddingTarget::Evidence(item),
             &space.embedding_space_id,
             caller_identity("v1"),
             text_vector("corrected"),
         )
-        .expect("re-supply a corrected vector");
+        .expect("correct travelling vector");
     fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
-    for store in [&fixture.edge1.store, &fixture.edge2.store] {
-        let vectors = travelling(store, &space.embedding_space_id);
-        assert_eq!(vectors.len(), 1, "a repeat replaces, never duplicates");
+    for store in [&fixture.edge1.store, second] {
+        assert_eq!(travelling(store, &space.embedding_space_id).len(), 1);
         assert_eq!(
-            vectors
-                .get(&evidence.as_uuid())
-                .map(|(_, vector)| vector.clone()),
-            Some(Value::Vector(text_vector("corrected"))),
-            "both nodes converge on the correction"
+            travelling(store, &space.embedding_space_id)[&item.as_uuid()].1,
+            Value::Vector(text_vector("corrected"))
         );
+        assert_eq!(
+            rows(
+                store,
+                "SELECT id FROM evidence_embeddings_travelling WHERE target_id = $id",
+                vec![("id", Value::Uuid(item.as_uuid()))]
+            ),
+            id_before,
+            "replacement preserves the actual deterministic id"
+        );
+    }
+
+    // Real authorized sync and wipe/restore all contact the populated alpha hub.
+    // Denied-recipient privacy has no typed production authorization surface today (CG-078).
+    {
+        let recipient = "tenant-alpha";
+        let privacy = fabric_common::fabric_fixture_with_tenants(
+            "placement_restore",
+            "tenant-alpha",
+            recipient,
+        )
+        .await;
+        privacy
+            .edge1
+            .store
+            .register_embedding_space(space.clone())
+            .expect("source travelling declaration");
+        let (_, target) = record_with_caller_vector(
+            &privacy.edge1.store,
+            &space.embedding_space_id,
+            text_vector("private item"),
+        );
+        let authorized_source_row = travelling(&privacy.edge1.store, &space.embedding_space_id);
+        assert_eq!(authorized_source_row.len(), 1);
+        fabric_common::push_then_pull(&privacy.edge1_client, &privacy.edge2_client).await;
+        assert_eq!(
+            travelling(&privacy.edge2.store, &space.embedding_space_id),
+            authorized_source_row
+        );
+        assert_eq!(
+            count_where(&privacy.edge2.store, "evidence", "id", target.as_uuid()),
+            1
+        );
+        assert_eq!(
+            count_where(
+                &privacy.edge2.store,
+                "evidence_embeddings_travelling",
+                "target_id",
+                target.as_uuid()
+            ),
+            1
+        );
+        let restore_root = tempfile::tempdir().expect("restore root");
+        let restore_path = restore_root.path().join("wiped-receiver.db");
+        let config = || StoreConfig {
+            extra_embedding_spaces: vec![text_space("rev-a"), space.clone()],
+            ..plain_config(&restore_path)
+        };
+        let receiver = Store::open(config()).expect("receiver without a reproducible model");
+        let client = contextdb_server::SyncClient::new(
+            receiver.sync_database(),
+            &privacy.edge2_dial_spec,
+            contextdb_core::TenantId::from(recipient),
+        )
+        .expect("authenticated recipient restore client");
+        fabric_common::push_then_pull(&privacy.edge1_client, &client).await;
+        assert_eq!(
+            travelling(&receiver, &space.embedding_space_id),
+            authorized_source_row,
+            "authorized sync/restore preserves exact id, values and creation transaction"
+        );
+        assert_eq!(
+            count_where(&receiver, "evidence", "id", target.as_uuid()),
+            1
+        );
+        assert_eq!(
+            count_where(
+                &receiver,
+                "evidence_embeddings_travelling",
+                "target_id",
+                target.as_uuid()
+            ),
+            1
+        );
+        assert_eq!(
+            status_of(&receiver, &text_space("rev-a").embedding_space_id).state,
+            SpaceState::Unavailable
+        );
+        assert!(node_local(&receiver, &text_space("rev-a").embedding_space_id).is_empty());
+        #[cfg(context_graph_internal_test_support)]
+        {
+            let hits = context_graph::test_support::embedding::vector_search(
+                &receiver,
+                &text_vector("private item"),
+                &space.embedding_space_id,
+                Default::default(),
+            )
+            .expect("received numbers can be compared without the model");
+            assert_eq!(hits.hits.len(), 1);
+            assert_eq!(hits.hits[0].target, EmbeddingTarget::Evidence(target));
+        }
+        drop(client);
+        drop(receiver);
+        let receiver =
+            Store::initialize_fresh(config()).expect("wipe this recipient's entire database");
+        assert_eq!(
+            count_where(&receiver, "evidence", "id", target.as_uuid()),
+            0
+        );
+        assert_eq!(
+            count_where(
+                &receiver,
+                "evidence_embeddings_travelling",
+                "target_id",
+                target.as_uuid()
+            ),
+            0
+        );
+        let client = contextdb_server::SyncClient::new(
+            receiver.sync_database(),
+            &privacy.edge2_dial_spec,
+            contextdb_core::TenantId::from(recipient),
+        )
+        .expect("reopen retained authenticated recipient identity");
+        fabric_common::push_then_pull(&privacy.edge1_client, &client).await;
+        assert_eq!(
+            travelling(&receiver, &space.embedding_space_id),
+            authorized_source_row,
+            "authorized sync/restore preserves exact id, values and creation transaction"
+        );
+        assert_eq!(
+            count_where(&receiver, "evidence", "id", target.as_uuid()),
+            1
+        );
+        assert_eq!(
+            count_where(
+                &receiver,
+                "evidence_embeddings_travelling",
+                "target_id",
+                target.as_uuid()
+            ),
+            1
+        );
+        {
+            assert_eq!(
+                travelling(&receiver, &space.embedding_space_id)[&target.as_uuid()].1,
+                Value::Vector(text_vector("private item"))
+            );
+        }
     }
 }
 
@@ -1510,9 +2951,17 @@ async fn concurrent_writes_to_an_item_in_old_and_new_spaces_converge_on_the_new_
             Value::Bool(false),
             "the old-space row is not the item's head once a successor row exists"
         );
-        assert!(
-            travelling(store, &new.embedding_space_id).contains_key(&item.as_uuid()),
-            "the successor row is present on every node"
+        assert_eq!(
+            is_head(store, &new.embedding_space_id, item),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            travelling(store, &old.embedding_space_id)[&item.as_uuid()].1,
+            Value::Vector(text_vector("old model again"))
+        );
+        assert_eq!(
+            travelling(store, &new.embedding_space_id)[&item.as_uuid()].1,
+            Value::Vector(text_vector("new model"))
         );
         assert_eq!(
             status_of(store, &new.embedding_space_id).preserved_elsewhere,

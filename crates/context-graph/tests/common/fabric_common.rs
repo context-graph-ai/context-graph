@@ -15,8 +15,9 @@ use std::time::Duration;
 use context_graph::fabric::CaptureFault;
 use context_graph::ingest::{ConversationExtractor, ExtractionRequest, StructuredHarvest};
 use context_graph::tier0::Tier0CaptureRequest;
-use context_graph::{Store, StoreConfig};
+use context_graph::{EventPlacementPolicy, EventPlacementState, Store, StoreConfig};
 use contextdb_core::TenantId;
+use contextdb_engine::ApplicationTablePolicyExpectation;
 use contextdb_server::transport::iroh::IrohServer;
 use contextdb_server::{SyncClient, SyncServer};
 use tempfile::TempDir;
@@ -46,6 +47,44 @@ impl FabricNode {
         }
     }
 
+    /// Open an ordinary node with an explicit registration set, including the empty/no-model set.
+    pub fn with_models(
+        label: &str,
+        config: impl FnOnce(PathBuf) -> StoreConfig,
+        models: Vec<context_graph::EmbedderRegistration>,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!("{label}.db"));
+        let store = Store::open_with_embedder_registrations(config(db_path.clone()), models)
+            .expect("open node with explicit models");
+        Self {
+            _dir: dir,
+            db_path,
+            store,
+        }
+    }
+
+    /// Reopen this same root after a production switch has durably declared its succession.
+    pub fn reopen_with_models(
+        self,
+        config: impl FnOnce(PathBuf) -> StoreConfig,
+        models: Vec<context_graph::EmbedderRegistration>,
+    ) -> Self {
+        let Self {
+            _dir,
+            db_path,
+            store,
+        } = self;
+        drop(store);
+        let store = Store::open_with_embedder_registrations(config(db_path.clone()), models)
+            .expect("reopen node against its real persisted succession");
+        Self {
+            _dir,
+            db_path,
+            store,
+        }
+    }
+
     /// The node's data root directory (parent of the memory db) — where `cg/fabric.toml` lives.
     pub fn data_root(&self) -> PathBuf {
         self.db_path
@@ -62,6 +101,7 @@ pub struct FabricFixture {
     pub edge2: FabricNode,
     pub edge1_client: SyncClient,
     pub edge2_client: SyncClient,
+    pub edge2_dial_spec: String,
     shutdown: Arc<AtomicBool>,
     _server_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -84,10 +124,41 @@ pub async fn fabric_fixture_with_tenants(
     edge1_tenant: &str,
     edge2_tenant: &str,
 ) -> FabricFixture {
+    fabric_fixture_with_node_openers(
+        test_name,
+        edge1_tenant,
+        edge2_tenant,
+        FabricNode::open,
+        FabricNode::open,
+    )
+    .await
+}
+
+/// The same real transport with node-specific production model registrations.
+pub async fn fabric_fixture_with_node_openers(
+    test_name: &str,
+    edge1_tenant: &str,
+    edge2_tenant: &str,
+    open_first: impl FnOnce(&str) -> FabricNode,
+    open_second: impl FnOnce(&str) -> FabricNode,
+) -> FabricFixture {
+    let edge1 = open_first(&format!("{test_name}_edge1"));
+    let edge2 = open_second(&format!("{test_name}_edge2"));
+    let edge1_needs_binding = edge1
+        .store
+        .event_placement_state()
+        .expect("first edge placement")
+        == EventPlacementState::TenantHubUnbound;
+    let edge2_needs_binding = edge2
+        .store
+        .event_placement_state()
+        .expect("second edge placement")
+        == EventPlacementState::TenantHubUnbound;
     let shutdown = Arc::new(AtomicBool::new(false));
     let (first_hub, first_ticket, first_task) = start_ticketed_hub(
         &format!("{test_name}_hub_{edge1_tenant}"),
         edge1_tenant,
+        edge1_needs_binding || (edge1_tenant == edge2_tenant && edge2_needs_binding),
         Arc::clone(&shutdown),
     )
     .await;
@@ -99,6 +170,7 @@ pub async fn fabric_fixture_with_tenants(
         let (second_hub, second_ticket, second_task) = start_ticketed_hub(
             &format!("{test_name}_hub_{edge2_tenant}"),
             edge2_tenant,
+            edge2_needs_binding,
             Arc::clone(&shutdown),
         )
         .await;
@@ -107,8 +179,6 @@ pub async fn fabric_fixture_with_tenants(
         second_ticket
     };
 
-    let edge1 = FabricNode::open(&format!("{test_name}_edge1"));
-    let edge2 = FabricNode::open(&format!("{test_name}_edge2"));
     let edge1_dial_spec = contextdb_server::peer_dial_spec(
         &first_ticket,
         &edge1.db_path.with_extension("fabric-identity.key"),
@@ -119,6 +189,7 @@ pub async fn fabric_fixture_with_tenants(
         TenantId::from(edge1_tenant),
     )
     .expect("admit engine read memory");
+
     let edge2_dial_spec = contextdb_server::peer_dial_spec(
         &edge2_ticket,
         &edge2.db_path.with_extension("fabric-identity.key"),
@@ -130,12 +201,36 @@ pub async fn fabric_fixture_with_tenants(
     )
     .expect("admit engine read memory");
 
+    for (edge, client, needs_binding) in [
+        (&edge1, &edge1_client, edge1_needs_binding),
+        (&edge2, &edge2_client, edge2_needs_binding),
+    ] {
+        if needs_binding {
+            let expectation = ApplicationTablePolicyExpectation::new()
+                .expect_table("events", EVENT_POLICY)
+                .expect("event policy grammar")
+                .expect_table("event_anchors", ANCHOR_POLICY)
+                .expect("anchor policy grammar");
+            let binding = tokio::time::timeout(
+                Duration::from_secs(30),
+                client.bind_application_table_policy(expectation),
+            )
+            .await
+            .expect("authenticated tenant event binding stays bounded")
+            .expect("real authenticated tenant event policy binding");
+            edge.store
+                .bind_authenticated_tenant_policy(binding)
+                .expect("install authenticated event schema before using the edge");
+        }
+    }
+
     FabricFixture {
         _hubs: hubs,
         edge1,
         edge2,
         edge1_client,
         edge2_client,
+        edge2_dial_spec,
         shutdown,
         _server_tasks: server_tasks,
     }
@@ -144,9 +239,25 @@ pub async fn fabric_fixture_with_tenants(
 async fn start_ticketed_hub(
     label: &str,
     tenant: &str,
+    tenant_events: bool,
     shutdown: Arc<AtomicBool>,
 ) -> (FabricNode, String, tokio::task::JoinHandle<()>) {
-    let hub = FabricNode::open(label);
+    // An event-tenant hub starts without local-only event tables. Its authority declarations
+    // authenticate the edges' binding; the real sync path installs their matching schema.
+    let hub = if tenant_events {
+        FabricNode::with_models(
+            label,
+            |db_path| StoreConfig {
+                db_path,
+                default_text_embedder: None,
+                event_placement: Some(EventPlacementPolicy::TenantHub),
+                ..Default::default()
+            },
+            vec![],
+        )
+    } else {
+        FabricNode::open(label)
+    };
     let endpoint = tokio::time::timeout(
         Duration::from_secs(30),
         IrohServer::bind(&format!(
@@ -162,9 +273,24 @@ async fn start_ticketed_hub(
         SyncServer::new(hub.store.sync_database(), &endpoint, TenantId::from(tenant))
             .expect("admit engine read memory"),
     );
+    if tenant_events {
+        for (table, policy) in [("events", EVENT_POLICY), ("event_anchors", ANCHOR_POLICY)] {
+            hub.store
+                .sync_database()
+                .execute(
+                    &format!("DECLARE TENANT TABLE POLICY {table} {policy}"),
+                    &std::collections::HashMap::new(),
+                )
+                .expect("hub declares event policy before real edge enrollment");
+        }
+    }
     let task = tokio::spawn(async move { server.run_until(shutdown).await });
     (hub, ticket, task)
 }
+
+const EVENT_POLICY: &str =
+    "SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER event_anchors";
+const ANCHOR_POLICY: &str = "SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE";
 
 /// Drive one edge's push, then the other's pull, to converge the ledger.
 pub async fn push_then_pull(pusher: &SyncClient, puller: &SyncClient) {

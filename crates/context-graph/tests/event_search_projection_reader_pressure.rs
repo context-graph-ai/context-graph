@@ -165,6 +165,18 @@ impl Embedder for ControlledEmbedder {
                 table_name: "event_search_passages".into(),
                 vector_column: "vector_text".into(),
             }],
+            placement: Some(context_graph::VectorPlacement::NodeLocal),
+            media_reachable_on_every_node: false,
+            producer: self.producer(),
+        }
+    }
+
+    fn producer(&self) -> context_graph::ModelIdentity {
+        context_graph::ModelIdentity {
+            model: "correctness-fixture".into(),
+            weights_revision: "1".into(),
+            preparation: "test".to_string(),
+            dimension: 768,
         }
     }
 
@@ -454,7 +466,7 @@ fn a_run_reopening_the_store_under_continuous_readers_body() {
             }
             let embedder = ControlledEmbedder::new();
             build_active.store(true, Ordering::Release);
-            let receipt = run(&config, context_id, &embedder, 1, 600_000);
+            let receipt = run(&config, context_id, &embedder, 1);
             build_active.store(false, Ordering::Release);
             stop.store(true, Ordering::Relaxed);
             receipt
