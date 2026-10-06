@@ -26,7 +26,11 @@ use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
 
 const NOMIC_TEXT_DEFAULT_ID: &str = "text_default_nomic_v1_5_768";
 const NOMIC_MODEL_ID: &str = "nomic-embed-text-v1.5";
-const EMBEDDINGGEMMA_TEXT_DEFAULT_ID: &str = "text_default_embeddinggemma_300m_768";
+/// EmbeddingGemma's space id derives from its identity, like every cg embedder's
+/// (`text_embeddinggemma_300m_768_<revision>`), so it is read from the embedder.
+fn embeddinggemma_space_id() -> String {
+    embeddinggemma_embedder().producer().space_id()
+}
 const FACE_REID_SPACE: &str = "vigil_face_reid_v1";
 
 fn temp_store_config(name: &str) -> (tempfile::TempDir, StoreConfig) {
@@ -491,7 +495,7 @@ fn freshly_initialized_store_with_default_storeconfig_seeds_text_default_nomic_v
     assert!(
         spaces
             .iter()
-            .all(|space| space.embedding_space_id != EMBEDDINGGEMMA_TEXT_DEFAULT_ID),
+            .all(|space| space.embedding_space_id != embeddinggemma_space_id()),
         "the previous bundled text space must not be seeded by default"
     );
 }
@@ -579,7 +583,14 @@ fn candle_embeddinggemma_workspace_sibling_crate_implements_existing_embedder_tr
     let embedder: Box<dyn Embedder> = Box::new(embeddinggemma_embedder());
     let space = embedder.embedding_space();
 
-    assert_eq!(EMBEDDINGGEMMA_TEXT_DEFAULT_ID, space.embedding_space_id);
+    assert_eq!(embedder.producer().space_id(), space.embedding_space_id);
+    assert!(
+        space
+            .embedding_space_id
+            .starts_with("text_embeddinggemma_300m_768_"),
+        "the sibling's space is identity-derived: {}",
+        space.embedding_space_id
+    );
     assert_eq!(768, space.dimension);
     assert_eq!(vec![EvidenceKind::Text], embedder.supported_inputs());
 }
@@ -615,7 +626,7 @@ fn candle_embeddinggemma_consumer_registers_via_storeconfig_extra_embedding_spac
     assert!(
         spaces
             .iter()
-            .any(|space| space.embedding_space_id == EMBEDDINGGEMMA_TEXT_DEFAULT_ID)
+            .any(|space| space.embedding_space_id == embeddinggemma_space_id())
     );
     let context_id = ContextId::new_v7();
     let observation_id = ObservationId::new_v7();
@@ -636,7 +647,7 @@ fn candle_embeddinggemma_consumer_registers_via_storeconfig_extra_embedding_spac
             evidence,
             vec![PrecomputedEmbedding {
                 id: EmbeddingId::new_v7(),
-                embedding_space_id: EMBEDDINGGEMMA_TEXT_DEFAULT_ID.to_string(),
+                embedding_space_id: embeddinggemma_space_id(),
                 vector: sibling_vector.clone(),
                 target: EmbeddingTarget::Evidence(evidence_id),
                 produced_by: sibling_supply,
@@ -844,10 +855,7 @@ fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_defaul
         "embeddinggemma reindex keeps prior text searchable",
     );
 
-    assert_eq!(
-        EMBEDDINGGEMMA_TEXT_DEFAULT_ID,
-        sibling_space.embedding_space_id
-    );
+    assert_eq!(embeddinggemma_space_id(), sibling_space.embedding_space_id);
     assert!(
         spaces
             .iter()
@@ -856,7 +864,7 @@ fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_defaul
     assert!(
         spaces
             .iter()
-            .any(|space| space.embedding_space_id == EMBEDDINGGEMMA_TEXT_DEFAULT_ID)
+            .any(|space| space.embedding_space_id == embeddinggemma_space_id())
     );
     let nomic_supply = EvidenceProducer {
         system: "acceptance".to_string(),
@@ -890,12 +898,12 @@ fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_defaul
         )
         .expect("switch the text role forward to the EmbeddingGemma sibling space");
     store
-        .reindex_space(EMBEDDINGGEMMA_TEXT_DEFAULT_ID, ReindexOptions::default())
+        .reindex_space(&sibling_space.embedding_space_id, ReindexOptions::default())
         .expect("reindex registered EmbeddingGemma sibling space");
     let events = store.drain_reindex_events();
     assert!(
         switched.from_space == NOMIC_TEXT_DEFAULT_ID
-            && switched.to_space == EMBEDDINGGEMMA_TEXT_DEFAULT_ID,
+            && switched.to_space == sibling_space.embedding_space_id,
         "the switch must move the text role from Nomic to the sibling space, switched={switched:?}"
     );
     assert!(
@@ -905,7 +913,7 @@ fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_defaul
                 embedding_space_id,
                 embedded: 1,
                 skipped: 0,
-            } if embedding_space_id == EMBEDDINGGEMMA_TEXT_DEFAULT_ID
+            } if *embedding_space_id == sibling_space.embedding_space_id
         )),
         "expected reindex completion for the sibling space, events={events:?}"
     );
