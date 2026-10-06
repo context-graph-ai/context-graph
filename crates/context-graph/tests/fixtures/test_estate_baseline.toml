@@ -264,9 +264,7 @@
 # Read-time configuration and eleven selected-request recovery paths add twelve proofs.
 # A killed background worker resumes on the next import and on the next read command, status
 # reports it interrupted, and a caught-up read starts no worker: 276 + 4 = 280.
-# A detached worker keeps none of the descriptors its import inherited, so an inherited pipe
-# reaches end-of-file while the worker still runs: 280 + 1 = 281.
-"context-graph-cli" = 281
+"context-graph-cli" = 280
 
 [gate_wall_seconds_policy]
 # A test binary's ceiling is `recorded seconds * tolerance_factor + slack_seconds`. Both terms are
