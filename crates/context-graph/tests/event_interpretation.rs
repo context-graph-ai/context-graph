@@ -3,7 +3,7 @@
 //! Fixture values are authored directly in JSON.  The mapper, preservation validator, and every
 //! expected assertion below deliberately avoid production mapping and hash helpers.
 
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use context_graph::{
@@ -386,7 +386,6 @@ fn build_refuses_unpublished_unauthorized_and_declaration_mismatched_releases_by
             contract,
             max_events_per_batch: NonZeroU32::new(2).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(4096).unwrap(),
-            lease_duration_ms: NonZeroU64::new(1000).unwrap(),
         };
     assert!(matches!(
         ConnectorInterpretationRunner::build(request(
@@ -580,7 +579,6 @@ fn positive_activation_retry_is_idempotent() {
         contract: contract.clone(),
         max_events_per_batch: NonZeroU32::new(1).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(4096).unwrap(),
-        lease_duration_ms: NonZeroU64::new(1000).unwrap(),
     })
     .expect("build derives from retained events");
     let search_store =
@@ -596,7 +594,6 @@ fn positive_activation_retry_is_idempotent() {
             max_events_per_batch: NonZeroU32::new(1).unwrap(),
             max_passages_per_batch: NonZeroU32::new(1).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(4096).unwrap(),
-            lease_duration_ms: NonZeroU64::new(1000).unwrap(),
         })
         .expect("explicit staged search rebuild produces the activation generation");
     assert_eq!(

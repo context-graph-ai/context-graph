@@ -13,6 +13,7 @@ runtime, a second embedding trait or a second transport to the running owner.
 |---|---|
 | Capture and deterministic identity | `src/store/event_import.rs`, `src/store/event.rs`; `EventImportAdapter` supplies drafts |
 | Passage rendering, durable request selections, work policy, embedding cap and batch writer admission | `src/event_search.rs`, `src/store/event_search_projection.rs` |
+| Background-work claims: claim, takeover, publish fence, release, live-holder wait, status | `src/background_work.rs`, `src/store/background_claim.rs`; holder presence is contextdb's |
 | Find/status/forget | `src/store/event_search_read.rs`, `src/store/event_history_status.rs`, `src/store/event_forget.rs` |
 | One SQL/decoder across read and write | `src/store/graph_rows.rs` (`GraphRows`); `src/consumer_read/graph.rs` |
 | Read session admission, memory and active time | `src/consumer_read.rs`, `src/owner_control.rs`, `src/status_reads.rs` |
@@ -52,8 +53,25 @@ open carrying both capabilities is `Store::open_with_control_handler_and_embedde
   `src/store/embedding.rs::canonical_event_history_declaration_has_only_the_passage_binding`.
 - Session work scope is independent of vector identity; narrowing keeps indexed history:
   `tests/event_search_projection_correctness.rs::recent_session_scope_builds_the_ten_most_recent_newest_first_and_widens_without_reembedding`.
-- Shared status distinguishes capture, coverage and live lease:
-  `tests/event_history_status.rs::status_separates_capture_from_search_coverage_per_selected_context`.
+- Shared status distinguishes capture, coverage and a running or interrupted claim:
+  `tests/event_history_status.rs::status_separates_capture_from_search_coverage_per_selected_context`,
+  `tests/background_claim_recovery.rs::status_reports_interrupted_not_running_after_a_crash`.
+- Search projection, connector interpretation and the understanding drain claim through the one
+  module in `src/store/background_claim.rs`, which alone takes contextdb's holder lock and writes
+  `background_claims` rows; no job keeps a lease, expiry, renewal or poll of its own. A search or
+  interpretation run holds its generation's claim from its first batch until the generation's
+  completion commit deletes it (or the run stops and releases it); a drain holds one digest. A
+  dead holder's claim is taken over at once, a live holder is waited on (standalone) or reported
+  (held Store), a run that loses the takeover race reads again and waits on the winner, and
+  publication is fenced on the exact claim. Guards:
+  `tests/background_claim_ownership_audit.rs::only_the_background_claim_module_holds_presence_or_writes_claim_rows`,
+  `tests/background_claim_ownership_audit.rs::every_background_job_claims_through_the_shared_module_and_keeps_no_lease_of_its_own`,
+  `tests/background_claim_recovery.rs::a_worker_killed_after_its_claim_is_taken_over_at_once`,
+  `tests/background_claim_recovery.rs::a_live_worker_computing_with_its_store_closed_is_never_taken_over`,
+  `tests/background_claim_recovery.rs::an_obsolete_worker_never_publishes_after_takeover`,
+  `tests/background_claim_recovery.rs::concurrent_takeovers_between_threads_admit_exactly_one`,
+  `tests/interpretation_crash_recovery.rs::an_interpretation_build_killed_after_its_claim_is_taken_over_at_once`,
+  `tests/understanding_drain_crash_recovery.rs::a_digest_whose_drain_was_killed_is_offered_and_claimed_again_at_once`.
 - Coverage reads batch Contexts and use maintained counts, never per-Context recounts:
   `tests/a_find_costs_the_same_statements_at_any_context_count.rs::a_find_over_ready_contexts_issues_the_same_statements_at_one_eight_and_sixty_four`;
   `tests/a_read_that_can_see_the_counts_table_never_recounts_events.rs::status_find_and_the_work_assessment_answer_without_counting_a_single_event`.
@@ -66,10 +84,10 @@ open carrying both capabilities is `Store::open_with_control_handler_and_embedde
   passages for continuation, without duplicate passage identities. Guard:
   `tests/event_search_projection_correctness.rs::a_typed_active_time_refusal_retains_committed_passages_and_resumes`.
 - Projection retry retains claim and rendered work; failure is recorded only for its owner:
-  `tests/event_search_projection_correctness.rs::projection_retries_real_writer_at_claim_renewal_and_commit_without_reembedding`
+  `tests/event_search_projection_correctness.rs::projection_retries_real_writer_at_claim_and_commit_without_reembedding`
   and `post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes` in that file.
-- The worker cap bounds calls and retains the held Store's lease:
-  `tests/event_search_embedding_parallelism.rs::held_store_cap_two_overlaps_two_calls_while_its_claim_lease_stays_live`.
+- The worker cap bounds calls and keeps the held Store's claim running:
+  `tests/event_search_embedding_parallelism.rs::held_store_cap_two_overlaps_two_calls_while_its_claim_stays_running`.
 - Request selections persist session identities and per-source capture frontiers in
   `src/store/event_search_projection.rs`; the bounded node worker queue carries their identities.
   Replacement selections also freeze previously published stream frontiers and the saved
@@ -97,7 +115,7 @@ open carrying both capabilities is `Store::open_with_control_handler_and_embedde
   `selected_session_ceiling_survives_restart_before_the_first_claim` and
   `work_completed_by_another_request_is_acknowledged_without_reprojection`.
 - Standalone projection batches resolve their writer ceiling before admission, release old
-  writable state when it changes, and retain that ceiling through renewal, commit and failure
+  writable state when it changes, and retain that ceiling through commit and failure
   recording. CLI guards in `crates/cg-cli/tests/import_embedding_workers.rs`:
   `overlapping_imports_keep_each_contexts_write_ceiling` and
   `the_next_batch_refuses_an_insufficient_persisted_ceiling_and_keeps_its_request`.

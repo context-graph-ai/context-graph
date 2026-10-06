@@ -2,9 +2,10 @@
 //!
 //! Both run the library's `EventSearchProjectionRunner`; the only thing this module owns is the
 //! process boundary: the advisory `event-search-worker.lock` file (held through `cg-node-fs`, and
-//! taken by no other worker kind), a silent detached process for background mode, and polling for
-//! the same lock in wait mode so there is never a second builder. The Store-enforced projection
-//! lease stays the correctness boundary if two callers race.
+//! taken by no other worker kind), a silent detached process for background mode, and a blocking
+//! wait for the same lock in wait mode so there is never a second builder. The lock only schedules
+//! builders; who may publish a batch is decided by the library's shared background-work claim,
+//! which also restarts a crashed builder's work at once.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,17 +20,16 @@ use std::time::{Duration, Instant};
 
 use cg_node_fs::{
     WorkerLock, WorkerLockRefusal, acquire_event_search_worker_policy_update, acquire_worker_lock,
-    read_event_search_worker_policy,
+    acquire_worker_lock_blocking, read_event_search_worker_policy,
 };
 use context_graph::owner_control::{
-    READER_RELEASE_ALLOWANCE, ReaderRelease, WRITER_TRANSITION_ALLOWANCE,
-    wait_for_reader_release_within,
+    READER_RELEASE_ALLOWANCE, ReaderRelease, wait_for_reader_release_within,
 };
 use context_graph::{
-    CgError, ContextId, ContextSelector, EmbedderRegistration, EventSearchBatchWriteLimit,
-    EventSearchFailureDisposition, EventSearchProfile, EventSearchProjectionRunner,
-    EventSearchRunOutcome, EventSearchRunRequest, EventSearchSelectedWork,
-    EventSearchWorkAssessment, EventSearchWorkPolicy,
+    BackgroundWorkState, CgError, ContextId, ContextSelector, EmbedderRegistration,
+    EventSearchBatchWriteLimit, EventSearchFailureDisposition, EventSearchProfile,
+    EventSearchProjectionRunner, EventSearchRunOutcome, EventSearchRunRequest,
+    EventSearchSelectedWork, EventSearchWorkAssessment, EventSearchWorkPolicy,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -1445,7 +1445,6 @@ fn run_request(
         max_events_per_batch: NonZeroU32::new(256).expect("non-zero"),
         max_passages_per_batch: NonZeroU32::new(32).expect("non-zero"),
         max_bytes_per_batch: NonZeroUsize::new(4 * 1024 * 1024).expect("non-zero"),
-        lease_duration_ms: NonZeroU64::new(120_000).expect("non-zero"),
     };
     #[cfg(any(
         context_graph_internal_test_support,
@@ -2242,10 +2241,62 @@ fn kick_after_admission(
     }
 }
 
+/// A process `cg` starts and does not wait for owns none of its spawner's descriptors. A pipe the
+/// caller still reads, a terminal, or a lock some ancestor holds would otherwise stay open for as
+/// long as that process runs, so the reader never sees end-of-file and the lock never frees.
+pub(crate) fn detach_from_spawner_descriptors(command: &mut Command) {
+    let descriptor_ceiling = descriptor_ceiling();
+    // SAFETY: the hook runs in the forked child before exec and makes only async-signal-safe
+    // system calls, on descriptors the child is about to give up anyway.
+    unsafe {
+        command.pre_exec(move || {
+            close_inherited_descriptors_on_exec(descriptor_ceiling);
+            Ok(())
+        });
+    }
+}
+
+/// One past the highest descriptor this process can have open, read before forking because the
+/// forked child may only make async-signal-safe calls.
+fn descriptor_ceiling() -> libc::c_int {
+    // SAFETY: sysconf reads a process limit and has no other effect.
+    let ceiling = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    libc::c_int::try_from(ceiling)
+        .ok()
+        .filter(|ceiling| *ceiling > 3)
+        .unwrap_or(1024)
+        .min(1 << 20)
+}
+
+/// Mark every descriptor above stderr close-on-exec in the forked child, so exec drops them all.
+fn close_inherited_descriptors_on_exec(ceiling: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        // `CLOSE_RANGE_CLOEXEC` (Linux 5.11): one call marks the whole range.
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: close_range only changes descriptor flags in this child.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, CLOSE_RANGE_CLOEXEC) }
+            == 0
+        {
+            return;
+        }
+    }
+    for descriptor in 3..ceiling {
+        // SAFETY: setting close-on-exec on a descriptor that is not open fails harmlessly.
+        unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
+/// Set once this process has started a detached worker. The worker takes the data root's worker
+/// lock only after it starts, so until then the lock reads free; the resume hook that runs after
+/// the command must not start a second worker in that window.
+static STARTED_WORKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn spawn_worker(envelope: WorkerEnvelope) -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot locate the cg executable: {error}"))?;
-    let child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg(WORKER_COMMAND)
         .arg(serde_json::to_string(&envelope).expect("worker envelope serializes"))
         .arg(context_graph::write_budget::WRITE_MEMORY_LIMIT_SWITCH)
@@ -2253,9 +2304,12 @@ fn spawn_worker(envelope: WorkerEnvelope) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .process_group(0)
+        .process_group(0);
+    detach_from_spawner_descriptors(&mut command);
+    let child = command
         .spawn()
         .map_err(|error| format!("could not start the background search worker: {error}"))?;
+    STARTED_WORKER.store(true, std::sync::atomic::Ordering::SeqCst);
     #[cfg(any(
         context_graph_internal_test_support,
         feature = "event-search-test-support"
@@ -2269,21 +2323,72 @@ fn spawn_worker(envelope: WorkerEnvelope) -> Result<(), String> {
     Ok(())
 }
 
-fn acquire_worker_lock_within(root: &Path, allowance: Duration) -> Option<WorkerLock> {
-    let started = Instant::now();
-    loop {
-        match acquire_worker_lock(&root.join(EVENT_SEARCH_WORKER_LOCK)) {
-            Ok(held) => return Some(held),
-            Err(WorkerLockRefusal::HeldByAnotherWorker)
-                if !allowance.saturating_sub(started.elapsed()).is_zero() =>
-            {
-                std::thread::sleep(
-                    Duration::from_millis(20).min(allowance.saturating_sub(started.elapsed())),
-                );
-            }
-            Err(_) => return None,
-        }
+/// Start the detached search worker when queued background work is unfinished and no worker holds
+/// the data root's worker lock — the state a crash, a kill or a machine restart leaves behind — so
+/// that pending work resumes on whatever `cg` command runs next instead of waiting for another
+/// import. A request whose remaining selections have all spent their allowance is left alone, and a
+/// deferred or caught-up store has no queued request, so neither starts anything. Silent: it never
+/// prints and never changes the calling command's answer or exit code.
+pub(crate) fn resume_pending_background_work(root: &Path) {
+    // The command already started a worker for this work; it may not hold the lock yet.
+    if STARTED_WORKER.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
+    let Some(request) = pending_background_request(root) else {
+        return;
+    };
+    let resumable = request.write_requests.iter().any(|entry| {
+        !entry.completed
+            && (entry.read_timeout_no_progress < WORKER_RETRIES || entry.refusal_superseded)
+    });
+    if !resumable {
+        return;
+    }
+    let Ok(profile) = configured_passage_profile(root) else {
+        return;
+    };
+    let _ = kick_after_admission(
+        root,
+        &profile,
+        request.embedding_workers,
+        request.work_policy,
+        request.ignored_publication,
+    );
+}
+
+/// Under the test handoff barrier, pause the detached worker inside its first embedding call made
+/// after a batch has committed — claim held, Store closed — so a proof can kill it exactly there.
+#[cfg(any(
+    context_graph_internal_test_support,
+    feature = "event-search-test-support"
+))]
+fn arm_mid_embed_pause_for_test() {
+    let Some(directory) = std::env::var_os("CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    if !directory
+        .join("pause-mid-embed-after-committed-batch")
+        .is_file()
+    {
+        return;
+    }
+    let committed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = std::rc::Rc::clone(&committed);
+    context_graph::test_support::after_next_event_search_batch_commit_for_test(move |_| {
+        observed.set(true);
+    });
+    let paused = std::cell::Cell::new(false);
+    context_graph::test_support::observe_embedding_waves_for_test(move |_| {
+        if committed.get() && !paused.get() {
+            paused.set(true);
+            let _ = std::fs::write(directory.join("mid-embed-entered"), b"mid-embed");
+            // A test that ended without releasing (its barrier directory is gone) frees the worker.
+            wait_for_test_release(|| {
+                directory.join("release-mid-embed").exists() || !directory.exists()
+            });
+        }
+    });
 }
 
 /// After a foreground holder releases the long worker lock, start the ordinary detached worker if
@@ -2682,7 +2787,9 @@ fn catch_up(
             );
             continue;
         }
-        if work.live_projection_lease {
+        // A live builder outside this worker owns this Context right now; serve the others first.
+        // An interrupted claim is served: the run takes it over at once.
+        if work.work == BackgroundWorkState::Running {
             continue;
         }
         if suppression.failed.contains(&context_id) {
@@ -3121,7 +3228,11 @@ pub(crate) fn handle_event_search_worker(
     };
     let mut unknown_reads = 0;
     let mut worker_failed = false;
-    let mut lease_recheck_backoff = Duration::from_millis(20);
+    #[cfg(any(
+        context_graph_internal_test_support,
+        feature = "event-search-test-support"
+    ))]
+    arm_mid_embed_pause_for_test();
     loop {
         #[cfg(any(
             context_graph_internal_test_support,
@@ -3140,7 +3251,10 @@ pub(crate) fn handle_event_search_worker(
             }
         }
         let held = if retry_worker_lock {
-            let Some(held) = acquire_worker_lock_within(&root, WRITER_TRANSITION_ALLOWANCE) else {
+            // The interrupted foreground turn that spawned this child releases the lock as it
+            // exits; wait for that in the kernel rather than on a clock.
+            let Ok(held) = acquire_worker_lock_blocking(&root.join(EVENT_SEARCH_WORKER_LOCK))
+            else {
                 return 1;
             };
             held
@@ -3157,7 +3271,6 @@ pub(crate) fn handle_event_search_worker(
         {
             profile = next;
             suppression.clear();
-            lease_recheck_backoff = Duration::from_millis(20);
         }
         #[cfg(any(
             context_graph_internal_test_support,
@@ -3298,7 +3411,7 @@ pub(crate) fn handle_event_search_worker(
         }
 
         // A queued turn ends when its accepted selections are acknowledged. A standalone
-        // turn still rechecks refused reads and live leases below.
+        // turn still rechecks refused reads and live holders below.
         match pending_background_request_checked(&root) {
             Ok(None)
                 if serviced_request
@@ -3327,7 +3440,6 @@ pub(crate) fn handle_event_search_worker(
         {
             profile = next;
             suppression.clear();
-            lease_recheck_backoff = Duration::from_millis(20);
             continue;
         }
         let assessment_request = match pending_background_request_checked(&root) {
@@ -3371,15 +3483,25 @@ pub(crate) fn handle_event_search_worker(
                     }
                     return i32::from(worker_failed);
                 }
-                if unfailed.iter().all(|work| work.live_projection_lease) {
-                    // The live holder may be completing normally or may be an interrupted worker
-                    // whose durable lease has not expired yet. Dropping our OS lock before this
-                    // pause lets the owner finish; the next pass serves expired work without an
-                    // additional import.
-                    pause_before_recheck(&mut lease_recheck_backoff, UNOBSERVABLE_BACKOFF_CEILING);
+                if unfailed
+                    .iter()
+                    .all(|work| work.work == BackgroundWorkState::Running)
+                {
+                    // Every remaining Context is being built by a live holder outside this
+                    // worker. Our worker lock is already released; wait in the kernel until that
+                    // holder publishes, releases or dies, then look again. A dead holder's claim is
+                    // taken over at once by the next pass.
+                    let config = store_config(&root, None, read_memory_limit_bytes);
+                    if EventSearchProjectionRunner::wait_for_live_holder(
+                        &config,
+                        unfailed[0].context_id,
+                    )
+                    .is_err()
+                    {
+                        return 1;
+                    }
                     continue;
                 }
-                lease_recheck_backoff = Duration::from_millis(20);
             }
             Err(error) => {
                 worker_failed |= record_aggregate_read_timeout(
@@ -3763,19 +3885,10 @@ pub(crate) fn run_in_foreground(
     let result = (|| {
         publish_foreground_embedding_worker_policy(root, embedding_workers, work_policy)?;
         let embedder = search_registration().map_err(|error| error.to_string())?;
-        let held = loop {
-            match acquire_worker_lock(&root.join(EVENT_SEARCH_WORKER_LOCK)) {
-                Ok(held) => break held,
-                Err(WorkerLockRefusal::HeldByAnotherWorker) => {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                Err(refusal) => {
-                    return Err(format!(
-                        "the search worker turn could not be taken: {refusal}"
-                    ));
-                }
-            }
-        };
+        // Wait in the kernel for the worker turn; it frees the moment its holder releases it or
+        // exits.
+        let held = acquire_worker_lock_blocking(&root.join(EVENT_SEARCH_WORKER_LOCK))
+            .map_err(|refusal| format!("the search worker turn could not be taken: {refusal}"))?;
         interrupt.hold(held);
         // Freeze the refused identities before service. A successful retry may complete their
         // original frontiers, but cannot acknowledge a refusal accepted later in this turn.

@@ -388,12 +388,7 @@ pub fn evidence_search(
                 kind: evidence.kind,
             })?,
     };
-    let space =
-        store
-            .embedding_space_for_id(&space_id)
-            .map_err(|_| CgError::UnknownEmbeddingSpace {
-                id: space_id.clone(),
-            })?;
+    let space = store.embedding_space_for_id(&space_id)?;
     let binding = vector_binding_for_target(&space, "evidence")?;
 
     if evidence_has_persisted_vector(store, evidence.id, &space_id, &binding.vector_column)? {

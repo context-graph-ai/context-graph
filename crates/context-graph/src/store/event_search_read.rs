@@ -32,6 +32,8 @@ pub(crate) trait EventSearchRows {
     /// Whether this door may read `event_context_counts`. A read-only consumer that declared only
     /// the events table recounts from the events it declared.
     fn reads_event_context_counts(&self) -> bool;
+    /// The store file this door reads, which locates the holder-presence companion beside it.
+    fn store_path(&self) -> &std::path::Path;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -248,6 +250,10 @@ impl EventSearchRows for Store {
     fn reads_event_context_counts(&self) -> bool {
         true
     }
+
+    fn store_path(&self) -> &std::path::Path {
+        self.db_path()
+    }
 }
 
 impl EventSearchRows for ConsumerReader {
@@ -325,6 +331,10 @@ impl EventSearchRows for ConsumerReader {
             .tables
             .iter()
             .any(|table| table.name == EVENT_CONTEXT_COUNTS_TABLE)
+    }
+
+    fn store_path(&self) -> &std::path::Path {
+        self.path()
     }
 }
 

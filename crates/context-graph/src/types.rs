@@ -587,6 +587,10 @@ pub struct IntentionSnapshot {
     pub tags: Vec<String>,
     pub valid_from: TxId,
     pub valid_to: Option<TxId>,
+    /// Whether `valid_from` is the commit's final transaction id. A write that creates this
+    /// snapshot reads it back after its commit; while `Unavailable`, `valid_from` holds the
+    /// transaction's provisional id.
+    pub valid_from_readback: Readback,
 }
 
 /// One immutable predecessor → successor edge in an intention's history DAG.
@@ -616,6 +620,10 @@ pub struct Decision {
     pub based_on_snapshots: Vec<EntitySnapshotId>,
     pub outcome: Option<Outcome>,
     pub precedent_ids: Vec<DecisionId>,
+    /// Whether `precedent_ids` could be read back after the decision committed. The precedent
+    /// edges are written while the decision commits, so a write that creates a decision can only
+    /// read them afterwards.
+    pub precedent_readback: Readback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -686,6 +694,20 @@ pub struct RecordObservationResult {
     pub embedding_ids: Vec<EmbeddingId>,
     pub snapshot_id: Option<EntitySnapshotId>,
     pub invalidations: Vec<Invalidation>,
+    /// Whether `invalidations` lists every invalidation the observation's commit recorded.
+    pub invalidation_readback: Readback,
+}
+
+/// Whether a committed write's result could be read back after its commit. A write that committed
+/// never reports failure: when the read that completes its result is refused, the write still
+/// returns its result, marked `Unavailable`, and what it committed can be read later.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Readback {
+    /// The result is complete.
+    #[default]
+    Complete,
+    /// The write committed, but reading its result back failed.
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -695,6 +717,10 @@ pub struct Outcome {
     pub success: bool,
     pub notes: Option<String>,
     pub recorded_at: TxId,
+    /// Whether `recorded_at` is the commit's final transaction id. The id is assigned at commit, so
+    /// recording an outcome reads it back afterwards; while `Unavailable`, `recorded_at` holds the
+    /// transaction's provisional id.
+    pub recorded_at_readback: Readback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

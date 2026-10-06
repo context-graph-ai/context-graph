@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use contextdb_core::{Value, Wallclock};
+use contextdb_core::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::consumer_read::ConsumerDeclaration;
@@ -54,7 +54,7 @@ const EVENT_HISTORY_READ_TABLES: &[&str] = &[
     "event_search_refusal_frontiers",
     "event_search_cursors",
     "event_search_pending_streams",
-    "event_search_leases",
+    "background_claims",
     "cg_local_settings",
     "work_inputs",
 ];
@@ -120,8 +120,12 @@ pub struct EventSourceStreamStatus {
 pub enum EventHistorySearchState {
     /// Captured events are not covered and no projection is running.
     Pending,
-    /// A live, unexpired projection lease exists.
+    /// A live worker holds a projection claim.
     Running,
+    /// A projection claim's worker has exited — a crash, a kill or a machine restart — so the
+    /// projection is not running. The next projection run takes the claim over at once and repeats
+    /// only the uncommitted batch.
+    Interrupted,
     /// Captured events are not covered and the local embedding artifact is not installed.
     Blocked,
     /// The last projection attempt recorded a failure and no projection is running.
@@ -164,7 +168,9 @@ pub struct EventHistorySearchStatus {
     /// Captured events not yet sealed by the building generation.
     #[serde(default)]
     pub building_pending_events: u64,
-    pub live_projection_lease: bool,
+    /// Whether a live worker holds a projection claim now, a claim's worker has exited, or no
+    /// claim exists.
+    pub work: crate::BackgroundWorkState,
     pub last_failure: Option<String>,
 }
 
@@ -331,7 +337,6 @@ pub(crate) fn event_history_status(
         });
     }
     let names = context_names(source, &selected)?;
-    let now = i64::try_from(Wallclock::now().0).unwrap_or(i64::MAX);
     let mut contexts = Vec::with_capacity(selected.len());
     for context_id in &selected {
         contexts.push(context_status(
@@ -339,7 +344,6 @@ pub(crate) fn event_history_status(
             placement,
             *context_id,
             names[context_id].clone(),
-            now,
         )?);
     }
     Ok(EventHistoryStatusSet {
@@ -404,7 +408,6 @@ fn context_status(
     placement: EventPlacementState,
     context_id: ContextId,
     context_name: String,
-    now_ms: i64,
 ) -> Result<EventHistoryContextStatus> {
     let params = context_params(context_id);
     let memory = EventHistoryMemoryCounts {
@@ -487,7 +490,7 @@ fn context_status(
         _ => source.tenant_delivery(context_id)?,
     };
 
-    let search = search_status(source, context_id, captured_events, now_ms)?;
+    let search = search_status(source, context_id, captured_events)?;
     Ok(EventHistoryContextStatus {
         context_id,
         context_name,
@@ -553,7 +556,6 @@ fn search_status(
     source: &dyn EventHistoryStatusSource,
     context_id: ContextId,
     captured_events: u64,
-    now_ms: i64,
 ) -> Result<EventHistorySearchStatus> {
     let params = context_params(context_id);
     let work_policy = super::event_search_projection::persisted_work_policy(source, context_id)?;
@@ -632,8 +634,7 @@ fn search_status(
             },
         );
     }
-    let live_projection_lease =
-        super::event_search_projection::live_projection_lease(source, context_id, now_ms)?;
+    let work = super::event_search_projection::projection_work_state(source, context_id)?;
     let activated_at = head
         .rows
         .first()
@@ -720,8 +721,10 @@ fn search_status(
 
     let state = if pending_events == 0 {
         EventHistorySearchState::Ready
-    } else if live_projection_lease {
+    } else if work == crate::BackgroundWorkState::Running {
         EventHistorySearchState::Running
+    } else if work == crate::BackgroundWorkState::Interrupted {
+        EventHistorySearchState::Interrupted
     } else if last_failure.is_some() {
         EventHistorySearchState::Failed
     } else {
@@ -744,7 +747,7 @@ fn search_status(
         building_profile,
         building_covered_events,
         building_pending_events,
-        live_projection_lease,
+        work,
         last_failure,
     })
 }

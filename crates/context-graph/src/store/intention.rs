@@ -367,7 +367,7 @@ impl Store {
 
         let mut out = Vec::with_capacity(patches.len());
         for (id, _) in &patches {
-            out.push(self.get_intention(*id)?.ok_or_else(|| CgError::NotFound {
+            out.push(self.post_commit_readback(|| self.get_intention(*id))?.ok_or_else(|| CgError::NotFound {
                 id: Some(id.as_uuid().to_string()),
                 missing: Some("intention"),
             })?);
@@ -556,7 +556,7 @@ impl Store {
                 }
             };
         self.db.commit(tx).map_err(map_engine_err)?;
-        self.history(id)?
+        self.post_commit_readback(|| self.history(id))?
             .into_iter()
             .find(|snapshot| snapshot.id == successor.id)
             .ok_or_else(|| {
@@ -682,6 +682,7 @@ impl Store {
             tags,
             valid_from: tx,
             valid_to: None,
+            valid_from_readback: Readback::Complete,
         })
     }
 
@@ -1398,6 +1399,7 @@ fn decode_intention_snapshot(columns: &[String], row: &[Value]) -> Result<Intent
         tags,
         valid_from,
         valid_to,
+        valid_from_readback: Readback::Complete,
     })
 }
 

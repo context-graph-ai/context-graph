@@ -244,7 +244,8 @@ impl Store {
 
         self.db.commit(tx).map_err(map_engine_err)?;
 
-        let precedent_ids = self.precedents_for_decision(id, input.context_id)?;
+        let precedent_ids =
+            self.post_commit_readback(|| self.precedents_for_decision(id, input.context_id))?;
         Ok(Decision {
             id,
             decision_type: input.decision_type,
@@ -261,6 +262,7 @@ impl Store {
             based_on_snapshots: basis_snapshot_ids,
             outcome: None,
             precedent_ids,
+            precedent_readback: Readback::Complete,
         })
     }
 
@@ -1051,7 +1053,7 @@ impl Store {
         }
         self.db.commit(tx).map_err(map_engine_err)?;
 
-        self.get_decision(id)?.ok_or(CgError::NotFound {
+        self.post_commit_readback(|| self.get_decision(id))?.ok_or(CgError::NotFound {
             id: Some(id.as_uuid().to_string()),
             missing: Some("decision"),
         })
@@ -1388,7 +1390,8 @@ impl Store {
         }
         self.db.commit(tx).map_err(map_engine_err)?;
 
-        let precedent_ids = self.precedents_for_decision(new_id, new.context_id)?;
+        let precedent_ids =
+            self.post_commit_readback(|| self.precedents_for_decision(new_id, new.context_id))?;
         Ok(Decision {
             id: new_id,
             decision_type: new.decision_type,
@@ -1405,6 +1408,7 @@ impl Store {
             based_on_snapshots: basis_snapshot_ids,
             outcome: None,
             precedent_ids,
+            precedent_readback: Readback::Complete,
         })
     }
 
@@ -1550,7 +1554,7 @@ impl Store {
         }
         self.db.commit(tx).map_err(map_engine_err)?;
 
-        self.get_decision(id)?.ok_or(CgError::NotFound {
+        self.post_commit_readback(|| self.get_decision(id))?.ok_or(CgError::NotFound {
             id: Some(id.as_uuid().to_string()),
             missing: Some("decision"),
         })
@@ -1948,6 +1952,7 @@ fn decode_intention_snapshot_at_read(
         tags: tags_from_json(&get_json(row, columns, "tags")?),
         valid_from: get_txid(row, columns, "valid_from")?,
         valid_to: get_optional_txid(row, columns, "valid_to")?,
+        valid_from_readback: Readback::Complete,
     })
 }
 
@@ -2295,6 +2300,7 @@ fn decode_decision_raw(columns: &[String], row: &[Value]) -> Result<Decision> {
         based_on_snapshots: Vec::new(),
         outcome: None,
         precedent_ids: Vec::new(),
+        precedent_readback: Readback::Complete,
     })
 }
 

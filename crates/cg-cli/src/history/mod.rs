@@ -35,7 +35,10 @@ pub(crate) use import::handle_import;
 pub(crate) use read::{handle_find, handle_show, handle_status};
 #[cfg(feature = "event-search-test-support")]
 pub(crate) use worker::apply_store_open_retry_allowance_for_test;
-pub(crate) use worker::{WORKER_COMMAND, handle_event_search_worker};
+pub(crate) use worker::{
+    WORKER_COMMAND, detach_from_spawner_descriptors, handle_event_search_worker,
+    resume_pending_background_work,
+};
 
 /// Render a pasteable POSIX-shell import retry from separate argv tokens. The target can be an
 /// operator's actual source path or the documented receipt placeholder; either way it is never

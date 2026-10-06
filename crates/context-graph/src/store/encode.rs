@@ -180,5 +180,6 @@ pub(super) fn decode_outcome(columns: &[String], row: &[Value]) -> Result<Outcom
         success: get_bool(row, columns, "success")?,
         notes: get_optional_text(row, columns, "notes")?,
         recorded_at: get_txid(row, columns, "recorded_at")?,
+        recorded_at_readback: Readback::Complete,
     })
 }

@@ -5,7 +5,7 @@
 //! projection surfaces, never from a status helper.
 
 use std::collections::BTreeMap;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -207,7 +207,6 @@ fn project(store: &Store, context_id: ContextId) {
             max_events_per_batch: NonZeroU32::new(8).unwrap(),
             max_passages_per_batch: NonZeroU32::new(8).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(64 * 1024).unwrap(),
-            lease_duration_ms: NonZeroU64::new(5_000).unwrap(),
         })
         .expect("projection completes");
 }
@@ -619,7 +618,6 @@ fn the_published_read_declaration_serves_the_exact_anchor_event_read() {
             contract: contract.clone(),
             max_events_per_batch: NonZeroU32::new(8).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(4_096).unwrap(),
-            lease_duration_ms: NonZeroU64::new(10_000).unwrap(),
         },
     )
     .expect("build the renaming interpretation");
@@ -634,7 +632,6 @@ fn the_published_read_declaration_serves_the_exact_anchor_event_read() {
             max_events_per_batch: NonZeroU32::new(8).unwrap(),
             max_passages_per_batch: NonZeroU32::new(8).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(4_096).unwrap(),
-            lease_duration_ms: NonZeroU64::new(10_000).unwrap(),
         })
         .expect("build the staged replacement search");
     drop(store);

@@ -140,6 +140,9 @@ pub struct CaptureReport {
     pub derived_items: Vec<DerivedMemoryItem>,
     pub provenance_edges: Vec<ExtractionProvenance>,
     pub invalidations: Vec<MemoryInvalidationNotice>,
+    /// Whether `invalidations` could be read back after the capture committed; it is empty while
+    /// `Unavailable`.
+    pub invalidation_readback: crate::Readback,
     pub stable_ids: BTreeMap<String, String>,
     pub wrote_digest: bool,
     pub impact_signal: Option<CaptureImpactSignal>,
@@ -172,6 +175,7 @@ impl CaptureReport {
             derived_items: Vec::new(),
             provenance_edges: Vec::new(),
             invalidations: Vec::new(),
+            invalidation_readback: crate::Readback::Complete,
             stable_ids: BTreeMap::new(),
             wrote_digest: false,
             impact_signal: None,
@@ -2075,6 +2079,7 @@ fn capture_raw(
         derived_items: Vec::new(),
         provenance_edges: Vec::new(),
         invalidations: Vec::new(),
+        invalidation_readback: crate::Readback::Complete,
         stable_ids: BTreeMap::new(),
         wrote_digest: true,
         impact_signal: Some(CaptureImpactSignal::VerbatimOnlyNoGraph),
@@ -3232,6 +3237,15 @@ pub(crate) fn capture_structured_harvest(
     }
 
     let total_harvest = tx.total_counts(context_id)?;
+    // A drain understanding a digest it holds publishes the graph only while it still holds the
+    // digest: if another drain took it over, this transaction is refused at commit.
+    if let Some(digest_id) = reuse_digest
+        && let Err(err) = crate::understanding::fence_held_digest_in_tx(store, tx.tx, digest_id)
+    {
+        tx.rollback();
+        return Err(err);
+    }
+    let completed_digest = completion.as_ref().map(|marker| marker.digest_id);
     // The apply-path completion marker joins THIS transaction, so the write-once completion commits
     // atomically with the structured graph it guards — a crash between the two is impossible. The
     // fault seam fires after every graph row is staged but before the marker + commit, so a test can
@@ -3253,14 +3267,15 @@ pub(crate) fn capture_structured_harvest(
         )?;
     }
     tx.commit()?;
+    if let Some(digest_id) = completed_digest {
+        crate::understanding::digest_result_committed(store, digest_id);
+    }
 
     let mut committed_invalidation_rows = Vec::new();
     for decision_id in invalidated_decision_ids {
-        committed_invalidation_rows.extend(store.list_invalidations(
-            context_id,
-            Some(decision_id),
-            None,
-        )?);
+        committed_invalidation_rows.extend(store.post_commit_readback(|| {
+            store.list_invalidations(context_id, Some(decision_id), None)
+        })?);
     }
     committed_invalidation_rows.sort_by_key(|row| row.id);
     committed_invalidation_rows.dedup_by_key(|row| row.id);
@@ -3562,6 +3577,7 @@ impl<'a> CaptureTxn<'a> {
             based_on_snapshots,
             outcome: None,
             precedent_ids,
+            precedent_readback: crate::Readback::Complete,
         })
     }
 
@@ -5521,6 +5537,7 @@ fn report_with_counts(
         derived_items,
         provenance_edges,
         invalidations,
+        invalidation_readback: crate::Readback::Complete,
         stable_ids,
         wrote_digest: true,
         impact_signal: Some(CaptureImpactSignal::DerivedGraph),

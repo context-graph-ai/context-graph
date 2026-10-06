@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
@@ -56,10 +56,6 @@ use serde_json::json;
 const CONNECTOR: &str = "event-search-correctness";
 const SESSION: &str = "event-search-correctness-session";
 const SPACE: &str = "event-search-correctness-768";
-/// Short enough that the resume test can outwait a dead worker's lease.
-const LEASE_MS: u64 = 1_000;
-/// Long enough that a reader opening a Store between claims never expires the live claim.
-const OBSERVED_LEASE_MS: u64 = 60_000;
 
 #[test]
 fn slow_projection_work_does_not_keep_a_source_read_statement_open() {
@@ -100,7 +96,7 @@ fn slow_projection_work_does_not_keep_a_source_read_statement_open() {
     *embedder.embed_observer.lock().expect("observer lock") = Some(wait.clone());
     after_next_event_search_membership_read_page_for_test(move || wait());
     set_event_search_projection_read_deadline_ms_for_test(Some(500));
-    let result = run(&config, context_id, &embedder, 2, OBSERVED_LEASE_MS);
+    let result = run(&config, context_id, &embedder, 2);
     set_event_search_projection_read_deadline_ms_for_test(None);
     let receipt = result.expect("bounded source pages survive slow work and slow embeddings");
     assert_eq!(receipt.embedded_event_count, 6);
@@ -143,7 +139,7 @@ fn a_typed_active_time_refusal_retains_committed_passages_and_resumes() {
         .expect("select captured source frontiers");
     drop(reader);
     let embedder = ControlledEmbedder::new();
-    let request = run_request(&config, context_id, &embedder, profile(), 2, LEASE_MS);
+    let request = run_request(&config, context_id, &embedder, profile(), 2);
     let mut source_batches = 0;
     let stopped =
         EventSearchProjectionRunner::catch_up_observed_with_selected_work_and_batch_limits(
@@ -492,7 +488,6 @@ fn run(
     context_id: ContextId,
     embedder: &Arc<ControlledEmbedder>,
     max_events_per_batch: u32,
-    lease_ms: u64,
 ) -> Result<EventSearchBuildReceipt> {
     run_with_profile(
         config,
@@ -500,7 +495,6 @@ fn run(
         embedder,
         profile(),
         max_events_per_batch,
-        lease_ms,
     )
 }
 
@@ -510,7 +504,6 @@ fn run_with_profile(
     embedder: &Arc<ControlledEmbedder>,
     profile: EventSearchProfile,
     max_events_per_batch: u32,
-    lease_ms: u64,
 ) -> Result<EventSearchBuildReceipt> {
     EventSearchProjectionRunner::catch_up(run_request(
         config,
@@ -518,7 +511,6 @@ fn run_with_profile(
         embedder,
         profile,
         max_events_per_batch,
-        lease_ms,
     ))
 }
 
@@ -528,7 +520,6 @@ fn run_request(
     embedder: &Arc<ControlledEmbedder>,
     profile: EventSearchProfile,
     max_events_per_batch: u32,
-    lease_ms: u64,
 ) -> EventSearchRunRequest {
     run_request_with_workers(
         config,
@@ -536,7 +527,6 @@ fn run_request(
         embedder,
         profile,
         max_events_per_batch,
-        lease_ms,
         NonZeroUsize::MIN,
     )
 }
@@ -547,7 +537,6 @@ fn run_request_with_workers(
     embedder: &Arc<ControlledEmbedder>,
     profile: EventSearchProfile,
     max_events_per_batch: u32,
-    lease_ms: u64,
     embedding_workers: NonZeroUsize,
 ) -> EventSearchRunRequest {
     EventSearchRunRequest {
@@ -559,7 +548,6 @@ fn run_request_with_workers(
         max_events_per_batch: NonZeroU32::new(max_events_per_batch).expect("nonzero batch"),
         max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-        lease_duration_ms: NonZeroU64::new(lease_ms).expect("nonzero lease"),
     }
 }
 
@@ -650,7 +638,7 @@ fn projection_attempts_and_completion_keep_their_committed_identity_when_commits
             .borrow_mut()
             .push(commit_later_begun_audit_transaction(store, context_id));
     });
-    let receipt = run(&config, context_id, &embedder, 8, LEASE_MS)
+    let receipt = run(&config, context_id, &embedder, 8)
         .expect("a new attempt still claims and completes after the later transaction commits");
     let row = attempt_rows(&config, context_id).remove(0);
     let (Value::TxId(started), Value::TxId(attempt)) = (&row[1], &row[2]) else {
@@ -699,7 +687,6 @@ fn projection_attempts_and_completion_keep_their_committed_identity_when_commits
         &embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     assert!(
         matches!(&failed.result, Err(CgError::Engine(reason)) if reason.contains("fixture worker killed")),
@@ -737,7 +724,6 @@ fn projection_attempts_and_completion_keep_their_committed_identity_when_commits
         &embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     assert_eq!(
         resumed.failure_disposition,
@@ -797,7 +783,6 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
                 &capture_embedder,
                 profile(),
                 8,
-                LEASE_MS,
             ),
             "capture competitor owns the committed marker",
         )
@@ -811,7 +796,6 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
         &embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     assert!(
         matches!(&capture.result, Err(CgError::Engine(reason)) if reason.contains("superseded before committed timestamp readback")),
@@ -832,7 +816,7 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
         [Value::Uuid(_), Value::TxId(_), Value::TxId(_), Value::Uuid(_), Value::Null, Value::Text(reason)]
             if reason == "capture competitor owns the committed marker"
     ));
-    run(&config, capture_context, &embedder, 8, LEASE_MS)
+    run(&config, capture_context, &embedder, 8)
         .expect("a normal later run completes after the capture takeover");
 
     // Existing-generation resumption takes the other attempt path and receives the same refusal.
@@ -852,7 +836,7 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
         ))
         .expect("append resumption takeover fixture");
     drop(store);
-    run(&config, resume_context, &embedder, 8, LEASE_MS)
+    run(&config, resume_context, &embedder, 8)
         .expect("make the generation available for resumption");
     let resume_owner = Rc::new(RefCell::new(None));
     let resume_owner_hook = Rc::clone(&resume_owner);
@@ -866,7 +850,6 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
                 &resume_embedder,
                 profile(),
                 8,
-                LEASE_MS,
             ),
             "resumption competitor owns the committed marker",
         )
@@ -879,7 +862,6 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
         &embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     assert!(
         matches!(&resumed.result, Err(CgError::Engine(reason)) if reason.contains("superseded before committed timestamp readback")),
@@ -900,7 +882,7 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
         [Value::Uuid(_), Value::TxId(_), Value::TxId(_), Value::Uuid(_), Value::TxId(_), Value::Text(reason)]
             if reason == "resumption competitor owns the committed marker"
     ));
-    run(&config, resume_context, &embedder, 8, LEASE_MS)
+    run(&config, resume_context, &embedder, 8)
         .expect("a normal later run completes after the resumption takeover");
 
     // Completion owns a live claim. The hook deletes only that claim row and drops its holder
@@ -944,7 +926,6 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
                 &completion_embedder,
                 profile(),
                 8,
-                LEASE_MS,
             ),
             "completion competitor owns the committed marker",
         )
@@ -958,7 +939,6 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
         &embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     assert!(
         matches!(&completion.result, Err(CgError::Engine(reason)) if reason.contains("superseded before completion timestamp readback")),
@@ -993,7 +973,7 @@ fn post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes() {
         competitor_attempt > completed,
         "beginning the competing attempt preserves the already committed completion timestamp"
     );
-    let later = run(&config, completion_context, &embedder, 8, LEASE_MS)
+    let later = run(&config, completion_context, &embedder, 8)
         .expect("a normal later run completes after the completion-readback takeover");
     assert_eq!(later.completed_at, Some(*completed));
 }
@@ -1154,8 +1134,7 @@ fn old_conversations_remain_searchable_after_superseded_passage_reclaim() {
     append_timestamped_sessions(&store, context_id, 3);
     drop(store);
     let embedder = ControlledEmbedder::new();
-    run(&config, context_id, &embedder, 1, OBSERVED_LEASE_MS)
-        .expect("publish the earlier conversations");
+    run(&config, context_id, &embedder, 1).expect("publish the earlier conversations");
     let store =
         Store::open_with_embedder_registrations(config.clone(), vec![embedder.registration()])
             .expect("open searchable store");
@@ -1177,7 +1156,7 @@ fn old_conversations_remain_searchable_after_superseded_passage_reclaim() {
     assert!(before.iter().all(|hits| hits.len() == 1));
     append_timestamped_session(&store, context_id, 3);
     drop(store);
-    run(&config, context_id, &embedder, 1, OBSERVED_LEASE_MS)
+    run(&config, context_id, &embedder, 1)
         .expect("publish another conversation in the same Context");
     let store = Store::open_with_embedder_registrations(config, vec![embedder.registration()])
         .expect("reopen searchable store");
@@ -1234,7 +1213,7 @@ fn passage_handles_and_sources_resolve_after_superseded_passage_reclaim() {
         .expect("append first event");
     drop(store);
     let embedder = ControlledEmbedder::new();
-    run(&config, context_id, &embedder, 1, OBSERVED_LEASE_MS).expect("publish open tail");
+    run(&config, context_id, &embedder, 1).expect("publish open tail");
     let store =
         Store::open_with_embedder_registrations(config.clone(), vec![embedder.registration()])
             .expect("open searchable store");
@@ -1266,7 +1245,7 @@ fn passage_handles_and_sources_resolve_after_superseded_passage_reclaim() {
         ))
         .expect("append replacement event");
     drop(store);
-    run(&config, context_id, &embedder, 1, OBSERVED_LEASE_MS).expect("retire the old open tail");
+    run(&config, context_id, &embedder, 1).expect("retire the old open tail");
     let store = Store::open_with_embedder_registrations(config, vec![embedder.registration()])
         .expect("reopen searchable store");
     let retired = store
@@ -1444,7 +1423,7 @@ fn requested_projection_assessment_uses_full_identity_on_store_and_actual_consum
     drop(store);
 
     let embedder = ControlledEmbedder::new();
-    run(&config, context_id, &embedder, 8, LEASE_MS).expect("build the matching head");
+    run(&config, context_id, &embedder, 8).expect("build the matching head");
     let store = open(&config);
     let matching = one_work(&store, context_id, work_spec(profile()));
     assert_eq!(matching.captured_events, 2);
@@ -1502,10 +1481,7 @@ fn requested_projection_assessment_uses_full_identity_on_store_and_actual_consum
     assert_eq!(from_consumer.covered_events, matching.covered_events);
     assert_eq!(from_consumer.pending_events, matching.pending_events);
     assert_eq!(from_consumer.work_required, matching.work_required);
-    assert_eq!(
-        from_consumer.live_projection_lease,
-        matching.live_projection_lease
-    );
+    assert_eq!(from_consumer.work, matching.work);
     assert_eq!(
         one_work(&reader, empty_context, work_spec(profile())),
         empty
@@ -1561,7 +1537,7 @@ fn requested_projection_assessment_uses_full_identity_on_store_and_actual_consum
             before,
             "stale {column} assessment is read-only"
         );
-        let rebuilt = run(&config, context_id, &embedder, 8, LEASE_MS).unwrap();
+        let rebuilt = run(&config, context_id, &embedder, 8).unwrap();
         assert_ne!(
             rebuilt.generation_id, old_head,
             "runner replaces the identity rejected by assessment"
@@ -1609,7 +1585,7 @@ fn requested_projection_assessment_uses_full_identity_on_store_and_actual_consum
     );
     drop(reader);
     assert_eq!(directory_image(root.path()), before);
-    let rebuilt = run(&config, context_id, &embedder, 8, LEASE_MS).unwrap();
+    let rebuilt = run(&config, context_id, &embedder, 8).unwrap();
     assert_ne!(rebuilt.generation_id, old_head);
     assert_eq!(rebuilt.source_watermark.event_count, 3);
     assert!(!one_work(&open(&config), context_id, work_spec(profile())).work_required);
@@ -1640,7 +1616,7 @@ fn requested_projection_assessment_keeps_a_finishing_unactivated_replacement_pen
             )],
         ))
         .expect("capture fixture event");
-    run(&config, context_id, &embedder, 8, LEASE_MS).expect("build existing ready head");
+    run(&config, context_id, &embedder, 8).expect("build existing ready head");
 
     let replacement_profile = EventSearchProfile {
         ordinary_overlap_events: NonZeroU32::new(2).expect("nonzero replacement overlap"),
@@ -1673,7 +1649,6 @@ fn requested_projection_assessment_keeps_a_finishing_unactivated_replacement_pen
             max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
             max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-            lease_duration_ms: NonZeroU64::new(OBSERVED_LEASE_MS).expect("nonzero lease"),
         })
         .expect("the replacement activates after the rendezvous");
 }
@@ -1717,7 +1692,6 @@ fn observed_run_counts_each_embedding_invocation_including_the_failed_call() {
         max_events_per_batch: NonZeroU32::new(1).expect("nonzero event batch"),
         max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-        lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
     });
     assert!(
         matches!(&observed.result, Err(CgError::Engine(message)) if message.contains("fixture worker killed")),
@@ -1748,7 +1722,6 @@ fn observed_run_counts_each_embedding_invocation_including_the_failed_call() {
         &embedder,
         profile(),
         1,
-        LEASE_MS,
     ));
     assert_eq!(
         resumed.failure_disposition,
@@ -1817,7 +1790,6 @@ fn observed_invocations_distinguish_grouped_opaque_and_split_calls() {
             &embedder,
             profile(),
             8,
-            LEASE_MS,
         ));
         let receipt = outcome
             .result
@@ -1862,7 +1834,6 @@ fn observed_invocations_distinguish_grouped_opaque_and_split_calls() {
             &embedder,
             profile(),
             8,
-            LEASE_MS,
         ));
         noop.result.expect("unchanged projection is complete");
         assert_eq!(
@@ -1899,7 +1870,7 @@ fn invalid_passage_profiles_are_refused_before_generation_writes() {
         hard_passage_tokens: NonZeroU32::new(256).expect("nonzero hard limit"),
         ..profile()
     };
-    run_with_profile(&config, valid_context_id, &embedder, valid, 8, LEASE_MS)
+    run_with_profile(&config, valid_context_id, &embedder, valid, 8)
         .expect("a hard passage limit at the declared prepared-token capability runs");
     let embedded_after_valid_control = embedder.embedded().len();
     assert!(
@@ -1938,7 +1909,7 @@ fn invalid_passage_profiles_are_refused_before_generation_writes() {
         hard_passage_tokens: NonZeroU32::new(10_000).expect("nonzero hard limit"),
         ..profile()
     };
-    let refusal = run_with_profile(&config, context_id, &embedder, invalid, 8, LEASE_MS)
+    let refusal = run_with_profile(&config, context_id, &embedder, invalid, 8)
         .expect_err("a hard passage limit above the declared prepared-token capability is refused");
     assert!(
         matches!(
@@ -1981,9 +1952,8 @@ fn invalid_passage_profiles_are_refused_before_generation_writes() {
         oversized_event_overlap_tokens: NonZeroU32::new(4).expect("nonzero overlap"),
         ..profile()
     };
-    let overlap_refusal =
-        run_with_profile(&config, context_id, &embedder, overlap_invalid, 8, LEASE_MS)
-            .expect_err("a hard limit equal to the oversized-event overlap is refused");
+    let overlap_refusal = run_with_profile(&config, context_id, &embedder, overlap_invalid, 8)
+        .expect_err("a hard limit equal to the oversized-event overlap is refused");
     assert!(
         matches!(
             overlap_refusal,
@@ -2025,7 +1995,7 @@ fn invalid_profile_preserves_an_in_progress_build() {
 
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control lock") = Some('β');
-    run(&config, context_id, &embedder, 1, LEASE_MS)
+    run(&config, context_id, &embedder, 1)
         .expect_err("the second batch fails after the first one commits");
 
     let store = open(&config);
@@ -2089,7 +2059,6 @@ fn invalid_profile_preserves_an_in_progress_build() {
         &embedder,
         invalid.clone(),
         1,
-        LEASE_MS,
     ));
     assert_eq!(
         invalid_outcome.failure_disposition,
@@ -2120,7 +2089,6 @@ fn invalid_profile_preserves_an_in_progress_build() {
             max_events_per_batch: NonZeroU32::new(1).expect("nonzero batch"),
             max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
             max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-            lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
         })
         .expect_err("held build refuses a profile above its embedder ceiling");
     assert!(matches!(
@@ -2140,7 +2108,6 @@ fn invalid_profile_preserves_an_in_progress_build() {
             max_events_per_batch: NonZeroU32::new(1).expect("nonzero batch"),
             max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
             max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-            lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
         })
         .expect_err("held rebuild refuses a profile above its embedder ceiling");
     assert!(matches!(
@@ -2152,7 +2119,7 @@ fn invalid_profile_preserves_an_in_progress_build() {
     ));
     drop(store);
     let recorded = EventSearchProjectionRunner::record_refusal(
-        run_request(&config, context_id, &embedder, invalid, 1, LEASE_MS),
+        run_request(&config, context_id, &embedder, invalid, 1),
         "this must not be recorded",
     )
     .expect_err("explicit refusal validates before it creates or changes a generation");
@@ -2242,7 +2209,7 @@ fn pending_discovery_uses_stream_progress_instead_of_completed_events() {
 
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control lock") = Some('!');
-    run(&config, context_id, &embedder, 1, LEASE_MS)
+    run(&config, context_id, &embedder, 1)
         .expect_err("the first worker leaves a durable partially completed generation");
 
     clear_event_search_discovery_observations_for_test();
@@ -2270,7 +2237,7 @@ fn pending_discovery_uses_stream_progress_instead_of_completed_events() {
             ))
             .expect("append a stream after the resumed runner's first claim");
     }));
-    run(&config, context_id, &embedder, 1, LEASE_MS)
+    run(&config, context_id, &embedder, 1)
         .expect("the public runner resumes the generation and catches up the new stream");
     assert!(
         appended_after_first_claim.load(Ordering::SeqCst),
@@ -2342,7 +2309,7 @@ fn a_worker_killed_after_a_committed_batch_resumes_without_duplicates_or_re_embe
 
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control lock") = Some('γ');
-    let killed = run(&config, context_id, &embedder, 8, LEASE_MS)
+    let killed = run(&config, context_id, &embedder, 8)
         .expect_err("the worker dies while embedding the second stream's batch");
     assert!(
         matches!(&killed, CgError::Engine(message) if message.contains("fixture worker killed")),
@@ -2371,7 +2338,7 @@ fn a_worker_killed_after_a_committed_batch_resumes_without_duplicates_or_re_embe
 
     // The failed run released its claim, so the immediate rerun claims the interrupted range at
     // once: there is no lease to outwait and no clock to move.
-    let resumed = run(&config, context_id, &embedder, 8, LEASE_MS)
+    let resumed = run(&config, context_id, &embedder, 8)
         .expect("the immediate rerun resumes the interrupted range");
     let resumed_inputs = embedder.embedded()[first_run.len()..].to_vec();
     assert!(
@@ -2419,7 +2386,7 @@ fn a_worker_killed_after_a_committed_batch_resumes_without_duplicates_or_re_embe
     drop(after);
 
     let before_unchanged = embedder.embedded().len();
-    run(&config, context_id, &embedder, 8, LEASE_MS).expect("an unchanged rerun completes");
+    run(&config, context_id, &embedder, 8).expect("an unchanged rerun completes");
     assert_eq!(
         embedder.embedded().len(),
         before_unchanged,
@@ -2460,7 +2427,7 @@ fn reader_refusal_after_a_committed_first_build_batch_keeps_it_resumable() {
 
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control lock") = Some('γ');
-    run(&config, context_id, &embedder, 8, LEASE_MS)
+    run(&config, context_id, &embedder, 8)
         .expect_err("the first source commits before the second source stops the worker");
     let before_refusal = embedder.embedded();
     assert!(
@@ -2480,7 +2447,6 @@ fn reader_refusal_after_a_committed_first_build_batch_keeps_it_resumable() {
             max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
             max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-            lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
         },
         "readers held the store past the worker allowance",
     )
@@ -2552,7 +2518,7 @@ fn reader_refusal_after_a_committed_first_build_batch_keeps_it_resumable() {
         .expect("restore the resumable first-build fixture");
     drop(store);
 
-    let resumed = run(&config, context_id, &embedder, 8, LEASE_MS)
+    let resumed = run(&config, context_id, &embedder, 8)
         .expect("the immediate rerun resumes the recorded reader refusal");
     let resumed_inputs = embedder.embedded()[before_refusal.len()..].to_vec();
     assert!(
@@ -2597,7 +2563,7 @@ fn readers_between_incremental_tail_claims_see_the_complete_old_or_new_tail_neve
     drop(store);
 
     let embedder = ControlledEmbedder::new();
-    run(&config, context_id, &embedder, 8, LEASE_MS).expect("initial projection");
+    run(&config, context_id, &embedder, 8).expect("initial projection");
     let before = open(&config);
     let initial = current_passages(&before, context_id);
     assert_eq!(
@@ -2643,7 +2609,7 @@ fn readers_between_incremental_tail_claims_see_the_complete_old_or_new_tail_neve
             .push(searchable_current_passages(&reader, context_id));
     }));
     // One new event per claim, so the tail replacement spans several committed claims.
-    run(&config, context_id, &embedder, 1, OBSERVED_LEASE_MS).expect("incremental catch-up");
+    run(&config, context_id, &embedder, 1).expect("incremental catch-up");
     *embedder.observer.lock().expect("observer lock") = None;
     let after = open(&config);
     let mut observations = observations.lock().expect("observation log").clone();
@@ -2718,7 +2684,7 @@ fn an_append_during_rebuild_finalization_is_caught_up_before_the_head_switches()
             vec![draft("before", 1, EventRenderRole::HumanMessage, "α")],
         ))
         .expect("append the event present when the rebuild begins");
-    run(&config, context_id, &embedder, 8, LEASE_MS).expect("an existing ready head");
+    run(&config, context_id, &embedder, 8).expect("an existing ready head");
 
     // The only way a second event exists is this append, made inside the rebuild's final
     // head-switch transaction after its revision guard and live count check.
@@ -2742,7 +2708,6 @@ fn an_append_during_rebuild_finalization_is_caught_up_before_the_head_switches()
             max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
             max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-            lease_duration_ms: NonZeroU64::new(OBSERVED_LEASE_MS).expect("nonzero lease"),
         })
         .expect("the rebuild completes");
 
@@ -2805,7 +2770,6 @@ fn a_completed_config_runner_leaves_no_claim_across_reopen_and_later_claims() {
         &embedder,
         profile(),
         8,
-        OBSERVED_LEASE_MS,
     ))
     .expect("config runner completes its owned batch and exact claim deletion");
 
@@ -2843,7 +2807,6 @@ fn a_completed_config_runner_leaves_no_claim_across_reopen_and_later_claims() {
         &embedder,
         profile(),
         8,
-        OBSERVED_LEASE_MS,
     ))
     .expect("later config runner claims and reads back work after reopen");
 }
@@ -2883,7 +2846,7 @@ fn a_run_that_gives_up_after_claiming_releases_its_claim_so_the_next_run_claims_
     // an orphan instead of finding the work released.
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control lock") = Some('α');
-    let abandoned = run(&config, context_id, &embedder, 8, OBSERVED_LEASE_MS)
+    let abandoned = run(&config, context_id, &embedder, 8)
         .expect_err("the run gives up while embedding the batch it claimed");
     assert!(
         matches!(&abandoned, CgError::Engine(message) if message.contains("fixture worker killed")),
@@ -2899,7 +2862,7 @@ fn a_run_that_gives_up_after_claiming_releases_its_claim_so_the_next_run_claims_
     drop(inspect);
 
     // No clock guard anywhere: the next run claims the released work at once.
-    let resumed = run(&config, context_id, &embedder, 8, OBSERVED_LEASE_MS)
+    let resumed = run(&config, context_id, &embedder, 8)
         .expect("the next run claims the released work immediately");
     assert_eq!(resumed.source_watermark.event_count, 2);
     assert_eq!(resumed.embedded_event_count, 2);
@@ -3044,7 +3007,6 @@ fn a_live_worker_keeps_one_claim_through_a_long_batch_and_a_held_store_door_is_r
                         max_events_per_batch: NonZeroU32::new(16).expect("nonzero batch"),
                         max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
                         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-                        lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
                     })
                     .expect_err("a held-Store door never takes over a live worker");
                 door_refusals.lock().expect("door refusals").push(refused);
@@ -3052,8 +3014,8 @@ fn a_live_worker_keeps_one_claim_through_a_long_batch_and_a_held_store_door_is_r
         }));
     }
 
-    let receipt = run(&config, context_id, &embedder, 16, LEASE_MS)
-        .expect("the live worker commits its long batch");
+    let receipt =
+        run(&config, context_id, &embedder, 16).expect("the live worker commits its long batch");
     assert_eq!(receipt.embedded_event_count, 12);
     assert_eq!(receipt.retry_count, 0, "a live worker's claim never lapses");
     let observations = observations.lock().expect("observations").clone();
@@ -3128,7 +3090,6 @@ fn serial_and_concurrent_runs_commit_identical_passages_vectors_order_and_covera
             &embedder,
             profile(),
             2,
-            OBSERVED_LEASE_MS,
             embedding_workers,
         ))
         .expect("build complete fixture projection");
@@ -3234,7 +3195,6 @@ fn one_concurrent_failure_waits_for_its_held_sibling_commits_nothing_and_retries
         &embedder,
         failure_profile.clone(),
         2,
-        OBSERVED_LEASE_MS,
         NonZeroUsize::new(2).unwrap(),
     );
     let (finished_tx, finished_rx) = channel();
@@ -3301,7 +3261,6 @@ fn one_concurrent_failure_waits_for_its_held_sibling_commits_nothing_and_retries
         &embedder,
         failure_profile,
         2,
-        OBSERVED_LEASE_MS,
         NonZeroUsize::new(2).unwrap(),
     ));
     assert!(
@@ -3333,7 +3292,6 @@ fn a_finished_build_with_only_a_worker_cap_change_makes_zero_embedding_calls() {
         &serial,
         profile(),
         4,
-        OBSERVED_LEASE_MS,
         NonZeroUsize::MIN,
     ))
     .expect("finish serial build");
@@ -3345,7 +3303,6 @@ fn a_finished_build_with_only_a_worker_cap_change_makes_zero_embedding_calls() {
         &cap_changed,
         profile(),
         4,
-        OBSERVED_LEASE_MS,
         NonZeroUsize::new(2).unwrap(),
     ));
     assert!(
@@ -3393,7 +3350,6 @@ fn slow_forward_calls_within_one_claim_keep_the_live_workers_claim() {
         max_events_per_batch: NonZeroU32::new(16).expect("nonzero batch"),
         max_passages_per_batch: NonZeroU32::new(64).expect("nonzero passage batch"),
         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-        lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
     };
     {
         let observations = observations.clone();
@@ -3417,7 +3373,6 @@ fn slow_forward_calls_within_one_claim_keep_the_live_workers_claim() {
                         max_events_per_batch: NonZeroU32::new(16).expect("nonzero batch"),
                         max_passages_per_batch: NonZeroU32::new(64).expect("nonzero passage batch"),
                         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-                        lease_duration_ms: NonZeroU64::new(LEASE_MS).expect("nonzero lease"),
                     })
                     .err();
             }
@@ -3488,7 +3443,6 @@ fn a_projection_run_that_fails_records_why_and_a_later_successful_run_clears_it(
         &embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     assert!(
         matches!(&failed_run.result, Err(CgError::Engine(message)) if message.contains("fixture worker killed")),
@@ -3525,7 +3479,7 @@ fn a_projection_run_that_fails_records_why_and_a_later_successful_run_clears_it(
     ));
     let _ = take_event_search_membership_captures_for_test();
     let contention = EventSearchProjectionRunner::record_refusal(
-        run_request(&config, context_id, &embedder, profile(), 8, LEASE_MS),
+        run_request(&config, context_id, &embedder, profile(), 8),
         "writer contention must not erase the existing reason",
     )
     .expect_err("a real writer denies the refusal write");
@@ -3543,7 +3497,7 @@ fn a_projection_run_that_fails_records_why_and_a_later_successful_run_clears_it(
         "a denied contention stamp leaves the prior specific failure untouched"
     );
 
-    run(&config, context_id, &embedder, 8, LEASE_MS).expect("the rerun completes");
+    run(&config, context_id, &embedder, 8).expect("the rerun completes");
     let recovered = search(&config);
     assert_eq!(recovered.pending_events, 0);
     assert_eq!(
@@ -3575,7 +3529,6 @@ fn a_projection_run_that_fails_records_why_and_a_later_successful_run_clears_it(
         &embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     assert!(
         matches!(&preparation.result, Err(CgError::Engine(message)) if message == "specific membership preparation failure"),
@@ -3604,7 +3557,6 @@ fn a_projection_run_that_fails_records_why_and_a_later_successful_run_clears_it(
         &embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     assert_eq!(
         preparation_recovered.failure_disposition,
@@ -3650,7 +3602,6 @@ fn a_projection_run_that_fails_records_why_and_a_later_successful_run_clears_it(
         &denied_embedder,
         profile(),
         8,
-        LEASE_MS,
     ));
     context_graph::test_support::set_store_open_retry_allowance_for_test(None);
     assert!(
@@ -3674,7 +3625,7 @@ fn a_projection_run_that_fails_records_why_and_a_later_successful_run_clears_it(
         context_graph::EventHistorySearchState::Pending
     );
     assert_eq!(pending.last_failure, None);
-    run(&config, denied_context, &denied_embedder, 8, LEASE_MS)
+    run(&config, denied_context, &denied_embedder, 8)
         .expect("a later run can finish an unrecorded failure");
 }
 
@@ -3717,8 +3668,7 @@ fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_cr
     drop(store);
     let old = ControlledEmbedder::new();
     *old.fail_once_on.lock().unwrap() = Some('β');
-    run(&config, context_id, &old, 1, LEASE_MS)
-        .expect_err("older partial fails after committing a source");
+    run(&config, context_id, &old, 1).expect_err("older partial fails after committing a source");
     let original = attempt_rows(&config, context_id);
     assert_eq!(original.len(), 1);
     let newer = ControlledEmbedder::new();
@@ -3738,7 +3688,7 @@ fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_cr
         ordinary_overlap_events: NonZeroU32::new(2).unwrap(),
         ..profile()
     };
-    run_with_profile(&config, context_id, &newer, changed.clone(), 1, LEASE_MS)
+    run_with_profile(&config, context_id, &newer, changed.clone(), 1)
         .expect_err("newer profile fails before committing");
     assert!(observed_new.load(Ordering::SeqCst));
     let two_failed = attempt_rows(&config, context_id);
@@ -3786,8 +3736,8 @@ fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_cr
         assert_eq!(search.building_pending_events, 2);
         saw.store(true, Ordering::SeqCst);
     }));
-    let receipt = run(&config, context_id, &old, 1, LEASE_MS)
-        .expect("the older generation resumes and activates");
+    let receipt =
+        run(&config, context_id, &old, 1).expect("the older generation resumes and activates");
     *old.observer.lock().unwrap() = None;
     assert!(observed_resume.load(Ordering::SeqCst));
     assert_eq!(Value::Uuid(receipt.generation_id.as_uuid()), original[0][0]);
@@ -3810,7 +3760,7 @@ fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_cr
     assert_eq!(consumer_search(&config, context_id).last_failure, None);
 
     EventSearchProjectionRunner::record_refusal(
-        run_request(&config, context_id, &old, profile(), 1, LEASE_MS),
+        run_request(&config, context_id, &old, profile(), 1),
         "active head maintenance refused",
     )
     .unwrap();
@@ -3834,7 +3784,7 @@ fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_cr
         ready.building_generation_id, ready.active_generation_id,
         "failure never invents an active replacement"
     );
-    run(&config, context_id, &old, 1, LEASE_MS).unwrap();
+    run(&config, context_id, &old, 1).unwrap();
     assert_eq!(consumer_search(&config, context_id).last_failure, None);
 }
 
@@ -3866,7 +3816,7 @@ fn a_stale_attempt_failure_cannot_overwrite_a_newer_owned_refusal() {
         }
         let before = attempt_rows(&inspect, context_id);
         let next = ControlledEmbedder::new();
-        let request = run_request(&inspect, context_id, &next, profile(), 1, LEASE_MS);
+        let request = run_request(&inspect, context_id, &next, profile(), 1);
         let mut invalid = request.clone();
         invalid.profile.target_passage_tokens = NonZeroU32::new(300).unwrap();
         let invalid = EventSearchProjectionRunner::catch_up_observed(invalid);
@@ -3924,7 +3874,6 @@ fn a_stale_attempt_failure_cannot_overwrite_a_newer_owned_refusal() {
         &stale,
         profile(),
         1,
-        LEASE_MS,
     ));
     assert!(
         matches!(late.result, Err(CgError::Engine(message)) if message.contains("fixture worker killed")),
@@ -3979,7 +3928,7 @@ fn building_progress_is_visible_without_replacing_the_ready_head() {
 
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control lock") = Some('β');
-    let first_generation_failed = run(&config, first_generation_context, &embedder, 1, LEASE_MS)
+    let first_generation_failed = run(&config, first_generation_context, &embedder, 1)
         .expect_err("the first generation fails after its first batch commits");
     assert!(
         matches!(&first_generation_failed, CgError::Engine(message) if message.contains("fixture worker killed")),
@@ -4002,7 +3951,7 @@ fn building_progress_is_visible_without_replacing_the_ready_head() {
         .expect("append the first generation's event");
     drop(store);
 
-    run(&config, context_id, &embedder, 1, LEASE_MS).expect("the first generation is ready");
+    run(&config, context_id, &embedder, 1).expect("the first generation is ready");
     let ready = open(&config)
         .event_history_status(ContextSelector::one(context_id))
         .expect("status after the first generation")
@@ -4037,15 +3986,8 @@ fn building_progress_is_visible_without_replacing_the_ready_head() {
     };
     *embedder.fail_once_on.lock().expect("failure control lock") = Some('β');
     let embedding_trace_before_rebuild = embedder.embedded().len();
-    let failed = run_with_profile(
-        &config,
-        context_id,
-        &embedder,
-        changed_profile.clone(),
-        1,
-        LEASE_MS,
-    )
-    .expect_err("the changed-profile rebuild fails after two committed batches");
+    let failed = run_with_profile(&config, context_id, &embedder, changed_profile.clone(), 1)
+        .expect_err("the changed-profile rebuild fails after two committed batches");
     assert!(
         matches!(&failed, CgError::Engine(message) if message.contains("fixture worker killed")),
         "the deterministic rebuild failure remains visible: {failed:?}"
@@ -4183,14 +4125,7 @@ fn open_tail_loads_only_text_members_across_a_long_metadata_suffix() {
         .unwrap();
     drop(store);
     take_claim_loads_for_test();
-    run(
-        &cfg,
-        context,
-        &ControlledEmbedder::new(),
-        8,
-        OBSERVED_LEASE_MS,
-    )
-    .unwrap();
+    run(&cfg, context, &ControlledEmbedder::new(), 8).unwrap();
     let loads = take_claim_loads_for_test();
     assert!(loads.len() >= 32, "long suffix must cross many claims");
     for (fresh, tail, actual_loaded_rows) in &loads {
@@ -4238,14 +4173,7 @@ fn missing_or_mismatched_open_tail_member_ids_are_refused_before_embedding() {
             ))
             .unwrap();
         drop(store);
-        run(
-            &cfg,
-            context,
-            &ControlledEmbedder::new(),
-            8,
-            OBSERVED_LEASE_MS,
-        )
-        .unwrap();
+        run(&cfg, context, &ControlledEmbedder::new(), 8).unwrap();
         let store = open(&cfg);
         let metadata = store.execute_sql_for_test("SELECT membership_id FROM event_search_source_events WHERE context_id = $context_id AND source_sequence = 2", &HashMap::from([("context_id".into(), Value::Uuid(context.as_uuid()))])).unwrap();
         let Value::Uuid(metadata_id) = metadata.rows[0][0] else {
@@ -4267,7 +4195,7 @@ fn missing_or_mismatched_open_tail_member_ids_are_refused_before_embedding() {
             .unwrap();
         drop(store);
         let embedder = ControlledEmbedder::new();
-        let result = run(&cfg, context, &embedder, 8, OBSERVED_LEASE_MS);
+        let result = run(&cfg, context, &embedder, 8);
         assert!(
             result.is_err(),
             "corrupt continuation must not become a different passage"
@@ -4384,7 +4312,6 @@ fn projection_retries_real_writer_at_claim_and_commit_without_reembedding() {
             &embedder,
             profile(),
             8,
-            LEASE_MS,
         ));
         assert!(outcome.result.is_ok(), "{phase}: {:?}", outcome.result);
         assert_eq!(
@@ -4430,7 +4357,6 @@ fn shared_store_returns_real_writer_busy_immediately_and_projection_exhaustion_s
         &ControlledEmbedder::new(),
         profile(),
         8,
-        LEASE_MS,
     ));
     context_graph::test_support::set_store_open_retry_allowance_for_test(None);
     context_graph::test_support::observe_store_open_retries_for_test(|_| {});
@@ -4676,14 +4602,7 @@ fn scoped_run(
     policy: EventSearchWorkPolicy,
 ) -> EventSearchBuildReceipt {
     EventSearchProjectionRunner::catch_up_observed_with_policy(
-        run_request(
-            config,
-            context_id,
-            embedder,
-            profile(),
-            1,
-            OBSERVED_LEASE_MS,
-        ),
+        run_request(config, context_id, embedder, profile(), 1),
         policy,
     )
     .result
@@ -4978,14 +4897,7 @@ fn status_and_find_report_published_coverage_while_the_selected_scope_is_mid_bui
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control") = Some('0');
     let outcome = EventSearchProjectionRunner::catch_up_observed_with_policy(
-        run_request(
-            &config,
-            context_id,
-            &embedder,
-            profile(),
-            1,
-            OBSERVED_LEASE_MS,
-        ),
+        run_request(&config, context_id, &embedder, profile(), 1),
         EventSearchWorkPolicy::default(),
     );
     assert!(
@@ -5044,14 +4956,7 @@ fn changed_profile_replacement_keeps_the_old_head_until_the_required_union_is_re
     let calls_before_replacement = embedder.embedded().len();
     *embedder.fail_once_on.lock().expect("failure control") = Some('1');
     let failed = EventSearchProjectionRunner::catch_up_observed_with_policy(
-        run_request(
-            &config,
-            context_id,
-            &embedder,
-            changed_profile.clone(),
-            1,
-            OBSERVED_LEASE_MS,
-        ),
+        run_request(&config, context_id, &embedder, changed_profile.clone(), 1),
         recent_one,
     )
     .result
@@ -5079,14 +4984,7 @@ fn changed_profile_replacement_keeps_the_old_head_until_the_required_union_is_re
     assert_eq!(readable.hits.len(), 3);
 
     let completed = EventSearchProjectionRunner::catch_up_observed_with_policy(
-        run_request(
-            &config,
-            context_id,
-            &embedder,
-            changed_profile,
-            1,
-            OBSERVED_LEASE_MS,
-        ),
+        run_request(&config, context_id, &embedder, changed_profile, 1),
         recent_one,
     )
     .result
@@ -5456,14 +5354,7 @@ fn select_work_examines_no_completed_events() {
         drop(store);
         let embedder = ControlledEmbedder::new();
         EventSearchProjectionRunner::catch_up_observed_with_policy(
-            run_request(
-                &cfg,
-                context_id,
-                &embedder,
-                profile(),
-                128,
-                OBSERVED_LEASE_MS,
-            ),
+            run_request(&cfg, context_id, &embedder, profile(), 128),
             EventSearchWorkPolicy {
                 order: EventSearchOrder::Newest,
                 sessions: EventSearchSessionScope::All,
@@ -5520,12 +5411,8 @@ fn select_work_examines_no_completed_events() {
         );
         let stream_cost = bounded_read_rows(&cost, "FROM events");
         let selection_cost = bounded_read_rows(&cost, "");
-        eprintln!(
-            "stream selection: completed_events_per_stream={completed} examined_entries={} charged_bytes={}",
-            stream_cost.0, stream_cost.1
-        );
         drop(store);
-        let request = run_request(&cfg, context_id, &embedder, profile(), 8, OBSERVED_LEASE_MS);
+        let request = run_request(&cfg, context_id, &embedder, profile(), 8);
         let resumed =
             EventSearchProjectionRunner::catch_up_observed_with_selected_work_and_batch_limits(
                 request,
@@ -5552,16 +5439,6 @@ fn select_work_examines_no_completed_events() {
             .event_history_status(ContextSelector::one(context_id))
             .unwrap();
         let status_reads = take_event_history_read_cost_for_test();
-        for read in status_reads
-            .reads
-            .iter()
-            .filter(|read| read.sql.contains("FROM events"))
-        {
-            eprintln!(
-                "status cursor: sql={} examined_entries={:?} charged_bytes={}",
-                read.sql, read.rows_examined, read.charged_bytes
-            );
-        }
         let status_cost = bounded_read_rows(&status_reads, "FROM events");
         assert_eq!(
             status.contexts[0].search.pending_events, 0,
@@ -5582,14 +5459,6 @@ fn select_work_examines_no_completed_events() {
                 .map(|stream| stream.event_count)
                 .sum::<u64>(),
             completed * completed_sessions as u64 + 1
-        );
-        eprintln!(
-            "status engine stream counts: completed_events_per_stream={completed} examined_entries={} charged_bytes={}",
-            status_cost.0, status_cost.1
-        );
-        eprintln!(
-            "all-session selection: completed_sessions={completed_sessions} completed_events_per_stream={completed} examined_entries={} charged_bytes={}",
-            selection_cost.0, selection_cost.1
         );
         if completed_sessions == 2 {
             event_growth.push((stream_cost, status_cost));
@@ -5634,7 +5503,7 @@ fn pending_marker_and_cursor_publish_together_across_process_crashes() {
         }
         let embedder = ControlledEmbedder::new();
         let _ = EventSearchProjectionRunner::catch_up_observed_with_policy(
-            run_request(&cfg, context_id, &embedder, profile(), 8, OBSERVED_LEASE_MS),
+            run_request(&cfg, context_id, &embedder, profile(), 8),
             EventSearchWorkPolicy {
                 order: EventSearchOrder::Newest,
                 sessions: EventSearchSessionScope::All,
@@ -5663,7 +5532,7 @@ fn pending_marker_and_cursor_publish_together_across_process_crashes() {
         drop(store);
         let embedder = ControlledEmbedder::new();
         EventSearchProjectionRunner::catch_up_observed_with_policy(
-            run_request(&cfg, context_id, &embedder, profile(), 8, OBSERVED_LEASE_MS),
+            run_request(&cfg, context_id, &embedder, profile(), 8),
             EventSearchWorkPolicy {
                 order: EventSearchOrder::Newest,
                 sessions: EventSearchSessionScope::All,
@@ -5728,7 +5597,7 @@ fn pending_marker_and_cursor_publish_together_across_process_crashes() {
         assert_eq!(selected.streams.len(), usize::from(expected_pending));
         drop(recovered);
         EventSearchProjectionRunner::catch_up_observed_with_policy(
-            run_request(&cfg, context_id, &embedder, profile(), 8, OBSERVED_LEASE_MS),
+            run_request(&cfg, context_id, &embedder, profile(), 8),
             EventSearchWorkPolicy {
                 order: EventSearchOrder::Newest,
                 sessions: EventSearchSessionScope::All,
@@ -5793,14 +5662,7 @@ fn recent_coverage_reads_only_selected_progress_keys() {
                 .unwrap();
         }
         drop(store);
-        let request = run_request(
-            &cfg,
-            context_id,
-            &embedder,
-            profile(),
-            128,
-            OBSERVED_LEASE_MS,
-        );
+        let request = run_request(&cfg, context_id, &embedder, profile(), 128);
         EventSearchProjectionRunner::catch_up_observed_with_policy(
             request,
             EventSearchWorkPolicy {

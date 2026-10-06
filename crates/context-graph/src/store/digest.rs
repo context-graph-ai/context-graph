@@ -34,11 +34,7 @@ impl Store {
                 actual: format!("{:?}", input.embedding.target),
             });
         }
-        let space = self
-            .embedding_space_for_id(&input.embedding.embedding_space_id)
-            .map_err(|_| CgError::UnknownEmbeddingSpace {
-                id: input.embedding.embedding_space_id.clone(),
-            })?;
+        let space = self.embedding_space_for_id(&input.embedding.embedding_space_id)?;
         if input.embedding.vector.len() != space.dimension {
             return Err(CgError::EmbeddingDimensionMismatch {
                 space_id: input.embedding.embedding_space_id.clone(),

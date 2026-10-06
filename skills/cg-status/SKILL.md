@@ -40,6 +40,8 @@ Common search outcomes and actions (not an exhaustive state reference):
 | --- | --- |
 | `ready` | Selected search coverage is caught up; use `cg find`. |
 | `pending` | Search work remains; use `history.search.next` to retry with the persisted session scope and order. |
+| `running` | A live background worker is building search now; wait and ask again. |
+| `interrupted` | A worker stopped before finishing (crash, kill or restart). Any `cg` command that opens the data root restarts queued background work at once; `history.search.work` reads `interrupted` until it does.<!-- enforced by: `cg_status_reports_interrupted_not_running_after_a_crash`, `a_killed_background_worker_resumes_on_the_next_read_command` --> |
 | `blocked` | The local Nomic artifact is missing; run `cg model fetch --defaults`, then the original import with `--search wait`. |
 
 <!-- enforced by: `status_separates_capture_from_search_coverage_per_selected_context`, `receipt_placeholder_substitution_and_read_retries_preserve_persisted_scope`, `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight`, `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->

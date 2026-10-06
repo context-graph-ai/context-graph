@@ -41,7 +41,7 @@ pub(crate) const LOCAL_DERIVED_TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "event_interpretation_generations",
-        ddl: "CREATE TABLE event_interpretation_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, accepted_source_declarations JSON NOT NULL, target_interpretation_version TEXT NOT NULL, target_adapter_version TEXT NOT NULL, target_anchor_declaration_version TEXT NOT NULL, mapping_contract_id TEXT NOT NULL, mapping_contract_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, source_content_sha256 TEXT NOT NULL, capture_ordinal INTEGER NOT NULL DEFAULT 0, build_ordinal INTEGER NOT NULL DEFAULT 0, claim_end_ordinal INTEGER, claim_membership_sha256 TEXT, lease_epoch INTEGER NOT NULL DEFAULT 0, lease_token TEXT, lease_expires_at TIMESTAMP, state TEXT NOT NULL, eligible_event_count INTEGER NOT NULL DEFAULT 0, interpreted_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, effective_content_sha256 TEXT, sanitized_failure TEXT, started_at TXID NOT NULL, completed_at TXID, activated_at TXID, activation_receipt JSON, UNIQUE (context_id, id), UNIQUE (context_id, connector_id, id), UNIQUE (context_id, connector_id, target_interpretation_version, event_count, ordered_source_set_sha256)) SYNC OFF",
+        ddl: "CREATE TABLE event_interpretation_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, accepted_source_declarations JSON NOT NULL, target_interpretation_version TEXT NOT NULL, target_adapter_version TEXT NOT NULL, target_anchor_declaration_version TEXT NOT NULL, mapping_contract_id TEXT NOT NULL, mapping_contract_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, source_content_sha256 TEXT NOT NULL, capture_ordinal INTEGER NOT NULL DEFAULT 0, build_ordinal INTEGER NOT NULL DEFAULT 0, claim_end_ordinal INTEGER, claim_membership_sha256 TEXT, state TEXT NOT NULL, eligible_event_count INTEGER NOT NULL DEFAULT 0, interpreted_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, effective_content_sha256 TEXT, sanitized_failure TEXT, started_at TXID NOT NULL, completed_at TXID, activated_at TXID, activation_receipt JSON, UNIQUE (context_id, id), UNIQUE (context_id, connector_id, id), UNIQUE (context_id, connector_id, target_interpretation_version, event_count, ordered_source_set_sha256)) SYNC OFF",
     },
     TableSpec {
         name: "event_interpretation_source_events",
@@ -146,8 +146,11 @@ pub(crate) const LOCAL_DERIVED_TABLES: &[TableSpec] = &[
         ddl: "CREATE TABLE event_search_cursors (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, committed_sequence INTEGER NOT NULL, open_tail_start_sequence INTEGER, open_tail_members JSON NOT NULL, open_tail_passage_id UUID, watermark_sha256 TEXT NOT NULL, updated_at TXID NOT NULL, PRIMARY KEY (context_id, generation_id, connector_id, source_instance_ref, session_ref), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF",
     },
     TableSpec {
-        name: "event_search_leases",
-        ddl: "CREATE TABLE event_search_leases (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), owner_token TEXT NOT NULL, lease_epoch INTEGER NOT NULL, claimed_connector_id TEXT, claimed_source_instance_ref TEXT, claimed_start_sequence INTEGER, claimed_end_sequence INTEGER, cursor_sha256 TEXT NOT NULL, expires_at TIMESTAMP NOT NULL, PRIMARY KEY (context_id, generation_id), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF",
+        // Who owns each unit of background work right now (search generation, interpretation
+        // generation, understood digest). A claim's holder proves it is alive with a kernel lock
+        // on its owner token; the row itself never expires.
+        name: "background_claims",
+        ddl: "CREATE TABLE background_claims (work TEXT NOT NULL, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), unit_id UUID NOT NULL UNIQUE, owner_token UUID NOT NULL, owner_epoch INTEGER NOT NULL, PRIMARY KEY (work, context_id, unit_id)) HISTORY CURRENT ONLY SYNC OFF",
     },
 ];
 

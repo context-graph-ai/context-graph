@@ -36,7 +36,8 @@ impl Store {
             ) {
                 Ok((mut outcome, audit_id)) => {
                     self.db.commit(tx).map_err(map_engine_err)?;
-                    outcome.recorded_at = self.outcome_txid_from_audit(audit_id, context_id)?;
+                    outcome.recorded_at = self
+                        .post_commit_readback(|| self.outcome_txid_from_audit(audit_id, context_id))?;
                     outcome
                 }
                 Err(e) => {
@@ -137,6 +138,7 @@ impl Store {
             success,
             notes,
             recorded_at: tx,
+            recorded_at_readback: Readback::Complete,
         };
         if let Some(prev) = previous.as_ref() {
             self.record_outcome_audit_in_tx(

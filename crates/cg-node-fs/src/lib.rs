@@ -156,6 +156,22 @@ pub fn acquire_worker_lock(lock_path: &Path) -> Result<WorkerLock, WorkerLockRef
     }
 }
 
+/// Take the per-data-root worker lock at `lock_path`, waiting in the kernel while another worker
+/// holds it. The wait ends the moment that holder releases the lock or exits, for any reason; it
+/// never polls and never gives up. Only an unusable lockfile is refused.
+pub fn acquire_worker_lock_blocking(lock_path: &Path) -> Result<WorkerLock, WorkerLockRefusal> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(WorkerLockRefusal::Unusable)?;
+    use fs4::fs_std::FileExt;
+    file.lock_exclusive().map_err(WorkerLockRefusal::Unusable)?;
+    Ok(WorkerLock { _file: file })
+}
+
 /// Load a config file's text, mapping a missing file to `Ok(None)` (an absent config is not an
 /// error — the node runs with defaults). Any other IO error surfaces as `Err`.
 pub fn load_text_if_present(path: &Path) -> std::io::Result<Option<String>> {

@@ -8,6 +8,7 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctest;
 
+pub mod background_work;
 pub mod capture_sync_status;
 pub mod consumer_read;
 pub mod embedder;
@@ -36,6 +37,7 @@ pub mod types;
 pub mod understanding;
 pub mod write_budget;
 
+pub use background_work::{BackgroundWork, BackgroundWorkState};
 pub use capture_sync_status::*;
 pub use consumer_read::graph::ConsumerGraphView;
 pub use consumer_read::{ConsumerDeclaration, ConsumerReader};
@@ -93,6 +95,18 @@ pub mod test_support {
 
     /// Pauses inside the next event-search head-switch transaction on the calling thread.
     pub use crate::store::pause_next_event_search_finalization_for_test;
+
+    /// Crash cuts, waits, lost locks and lock-less filesystems for the one background-work claim
+    /// mechanism every kind of background work shares.
+    pub use crate::store::background_claim::{
+        before_next_background_claim_commit_for_test, fail_next_background_claim_presence_for_test,
+        lose_held_claim_presence_for_test, observe_background_claim_waits_for_test,
+    };
+
+    /// Refuses the next read a write makes after its commit, so a committed write can be shown
+    /// never to report that refusal as its failure.
+    #[cfg(context_graph_internal_test_support)]
+    pub use crate::store::background_claim::refuse_next_post_commit_readback_for_test;
 
     pub use crate::store::event_search_projection::{
         after_next_event_search_batch_commit_for_test,

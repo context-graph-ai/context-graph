@@ -2150,7 +2150,7 @@ mod fixture {
 #[cfg(context_graph_internal_test_support)]
 mod sessions {
     use std::collections::{HashMap, HashSet};
-    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroUsize};
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
@@ -2298,7 +2298,6 @@ mod sessions {
                     max_events_per_batch: NonZeroU32::new(256).expect("non-zero"),
                     max_passages_per_batch: NonZeroU32::new(32).expect("non-zero"),
                     max_bytes_per_batch: NonZeroUsize::new(4 * 1024 * 1024).expect("non-zero"),
-                    lease_duration_ms: NonZeroU64::new(120_000).expect("non-zero"),
                 },
                 EventSearchWorkPolicy {
                     order: EventSearchOrder::Oldest,

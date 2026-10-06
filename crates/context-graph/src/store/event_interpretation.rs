@@ -782,7 +782,54 @@ fn context_status(
         uncovered_gap_count,
         state,
         sanitized_failure: failure,
+        work: interpretation_work_state(store, context_id, connector_id)?,
     })
+}
+
+/// Whether a builder of this connector's interpretation is running, interrupted or idle: the
+/// strongest state among the claims on the connector's generations. Reads only.
+fn interpretation_work_state(
+    store: &Store,
+    context_id: ContextId,
+    connector_id: &str,
+) -> Result<crate::BackgroundWorkState> {
+    let mut state = crate::BackgroundWorkState::Idle;
+    for (generation_id, _) in super::background_claim::context_claims(
+        store,
+        crate::BackgroundWork::Interpretation,
+        context_id,
+    )? {
+        let owner = store
+            .internal_db()
+            .execute(
+                "SELECT connector_id FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
+                &HashMap::from([
+                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                    ("id".into(), Value::Uuid(generation_id)),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        let belongs = owner.rows.first().is_some_and(|row| {
+            get_text(row, &owner.columns, "connector_id").as_deref() == Ok(connector_id)
+        });
+        if !belongs {
+            continue;
+        }
+        match super::background_claim::ClaimKey::new(
+            crate::BackgroundWork::Interpretation,
+            context_id,
+            generation_id,
+        )
+        .state(store)?
+        {
+            crate::BackgroundWorkState::Running => return Ok(crate::BackgroundWorkState::Running),
+            crate::BackgroundWorkState::Interrupted => {
+                state = crate::BackgroundWorkState::Interrupted;
+            }
+            crate::BackgroundWorkState::Idle => {}
+        }
+    }
+    Ok(state)
 }
 
 fn count_uncovered_gaps(store: &Store, context_id: ContextId, connector_id: &str) -> Result<u64> {
@@ -1151,7 +1198,7 @@ fn activate_in_tx(
     let generation = db
         .execute_in_tx(
             tx,
-            "SELECT context_id, connector_id, accepted_source_declarations, target_interpretation_version, target_adapter_version, target_anchor_declaration_version, mapping_contract_id, mapping_contract_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, build_ordinal, claim_end_ordinal, lease_token, state, eligible_event_count, interpreted_event_count, failed_event_count, effective_content_sha256, sanitized_failure, completed_at, activated_at, activation_receipt FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
+            "SELECT context_id, connector_id, accepted_source_declarations, target_interpretation_version, target_adapter_version, target_anchor_declaration_version, mapping_contract_id, mapping_contract_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, build_ordinal, claim_end_ordinal, state, eligible_event_count, interpreted_event_count, failed_event_count, effective_content_sha256, sanitized_failure, completed_at, activated_at, activation_receipt FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
             &HashMap::from([
                 ("context_id".into(), context_param.clone()),
                 ("id".into(), generation_param.clone()),
@@ -1239,7 +1286,6 @@ fn activate_in_tx(
     let ready = get_text(row, columns, "state")? == "ready"
         && get_optional_txid(row, columns, "completed_at")?.is_some()
         && get_optional_text(row, columns, "sanitized_failure")?.is_none()
-        && get_optional_text(row, columns, "lease_token")?.is_none()
         && matches!(
             row.get(column_index(columns, "claim_end_ordinal")?),
             Some(Value::Null) | None

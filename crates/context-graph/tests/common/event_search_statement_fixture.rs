@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use context_graph::embedder::{
@@ -242,7 +242,6 @@ pub fn fixture(contexts: usize, project: bool) -> Fixture {
                 max_events_per_batch: NonZeroU32::new(64).unwrap(),
                 max_passages_per_batch: NonZeroU32::new(64).unwrap(),
                 max_bytes_per_batch: NonZeroUsize::new(1 << 20).unwrap(),
-                lease_duration_ms: NonZeroU64::new(30_000).unwrap(),
             })
             .expect("the projection commits and reports ready");
         }

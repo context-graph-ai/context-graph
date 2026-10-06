@@ -292,7 +292,18 @@ impl Store {
                 }
             }
 
-            let invalidations = self.invalidations_for_observation(input.context_id, id)?;
+            // The observation and the invalidations its commit recorded are durable now. Reading
+            // them back can still be refused, and that never reports a committed write as failed.
+            let (invalidations, invalidation_readback) =
+                match self.post_commit_readback(|| self.invalidations_for_observation(input.context_id, id)) {
+                    Ok(invalidations) => (invalidations, Readback::Complete),
+                    Err(err) => (
+                        Vec::new(),
+                        Readback::Unavailable {
+                            reason: err.to_string(),
+                        },
+                    ),
+                };
             std::thread::yield_now();
             return Ok(RecordObservationResult {
                 observation_id: id,
@@ -304,6 +315,7 @@ impl Store {
                     .collect(),
                 snapshot_id,
                 invalidations,
+                invalidation_readback,
             });
         }
 
@@ -553,11 +565,7 @@ impl Store {
     ) -> Result<EmbeddingRoute> {
         match embedding.target {
             EmbeddingTarget::Evidence(target_id) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_id(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -585,11 +593,7 @@ impl Store {
                 })
             }
             EmbeddingTarget::EntityReference(_, _) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_id(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -612,11 +616,7 @@ impl Store {
                 })
             }
             EmbeddingTarget::Digest(_) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_id(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -1336,11 +1336,7 @@ impl Store {
         embedding_space_id: &str,
         query_vector: &[f32],
     ) -> Result<Option<f32>> {
-        let space = self
-            .embedding_space_for_id(embedding_space_id)
-            .map_err(|_| CgError::UnknownEmbeddingSpace {
-                id: embedding_space_id.to_string(),
-            })?;
+        let space = self.embedding_space_for_id(embedding_space_id)?;
         if query_vector.len() != space.dimension {
             return Err(CgError::EmbeddingDimensionMismatch {
                 space_id: embedding_space_id.to_string(),

@@ -2,28 +2,30 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
-use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use contextdb_core::{Error as EngineError, Value, Wallclock};
+use contextdb_core::{Error as EngineError, Value};
 use contextdb_engine::{ReadLimits, ReadSession};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CgError, ContextSelector, ConversationEvent, EVENT_SEARCH_RENDERER_ID,
-    EVENT_SEARCH_RENDERER_VERSION, EmbeddingId, EmbeddingTarget, EventCoverage, EventRenderRole,
-    EventSearchBatchWriteLimit, EventSearchBuildReceipt, EventSearchBuildRequest,
-    EventSearchBuildTimings, EventSearchEmbedder, EventSearchFailureDisposition,
-    EventSearchGenerationId, EventSearchGenerationState, EventSearchOrder, EventSearchPassageId,
-    EventSearchPendingBatch, EventSearchProfile, EventSearchRebuildRequest, EventSearchRunOutcome,
-    EventSearchRunRequest, EventSearchSelectedStream, EventSearchSelectedWork,
-    EventSearchSessionScope, EventSearchWorkAssessment, EventSearchWorkPolicy, EventSearchWorkSpec,
-    EventWatermark, InterpretationActivationRefusalReason, InterpretationGenerationId,
-    PassageEventSource, Result, Store, TxId,
+    BackgroundWork, BackgroundWorkState, CgError, ContextSelector, ConversationEvent,
+    EVENT_SEARCH_RENDERER_ID, EVENT_SEARCH_RENDERER_VERSION, EmbeddingId, EmbeddingTarget,
+    EventCoverage, EventRenderRole, EventSearchBatchWriteLimit, EventSearchBuildReceipt,
+    EventSearchBuildRequest, EventSearchBuildTimings, EventSearchEmbedder,
+    EventSearchFailureDisposition, EventSearchGenerationId, EventSearchGenerationState,
+    EventSearchOrder, EventSearchPassageId, EventSearchPendingBatch, EventSearchProfile,
+    EventSearchRebuildRequest, EventSearchRunOutcome, EventSearchRunRequest,
+    EventSearchSelectedStream, EventSearchSelectedWork, EventSearchSessionScope,
+    EventSearchWorkAssessment, EventSearchWorkPolicy, EventSearchWorkSpec, EventWatermark,
+    InterpretationActivationRefusalReason, InterpretationGenerationId, PassageEventSource, Result,
+    Store, TxId,
 };
 
+use super::background_claim::{ClaimKey, HeldClaim, Taken, Unheld};
 use super::convert::map_engine_err;
 use super::encode::{column_index, get_bool, get_json, get_optional_text, get_text, get_uuid};
 use super::event_interpretation::{
@@ -85,6 +87,24 @@ pub(crate) fn record_refusal_standalone(
     request: EventSearchRunRequest,
     reason: &str,
 ) -> Result<()> {
+    // A live holder owns the generation's attempt; recording over it would displace a worker that
+    // is still running. Wait for it in the kernel, with this run's Store dropped, then record. A
+    // race lost to another runner reads again the same way.
+    let mut lost_races = 0;
+    loop {
+        match record_refusal_once(&request, reason) {
+            Err(refusal @ CgError::BackgroundWorkHeldByLiveWorker { .. }) => {
+                super::background_claim::wait_for_refusal(&request.store.db_path, &refusal)?;
+            }
+            Err(error) if is_lost_race(&error) && lost_races < MAX_STALE_RETRIES => {
+                lost_races += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+fn record_refusal_once(request: &EventSearchRunRequest, reason: &str) -> Result<()> {
     validate_profile_for_registration(&request.profile, &request.embedder)?;
     let context_ids = request.contexts.context_ids();
     if context_ids.len() != 1 {
@@ -105,8 +125,8 @@ pub(crate) fn record_refusal_standalone(
     )?;
     let snapshot = snapshot_json(&bindings);
     let spec = EventSearchWorkSpec {
-        profile: request.profile,
-        embedding_space_id: request.embedder.space.embedding_space_id,
+        profile: request.profile.clone(),
+        embedding_space_id: request.embedder.space.embedding_space_id.clone(),
         encoding_profile_id: request.embedder.embedder.encoding_profile_id(),
     };
     let generation = select_generation(
@@ -124,146 +144,44 @@ pub(crate) fn record_refusal_standalone(
     record_refusal_attempt(&store, context_id, generation.id, reason)
 }
 
-/// What a run needs to let go of the claim it took, by its own token.
-struct HeldClaim {
-    context_id: crate::ContextId,
-    generation_id: EventSearchGenerationId,
-    owner_token: String,
-    lease_epoch: i64,
+/// The shared claim key for one search generation. A run takes it with its first batch and holds
+/// it, across the Store reopenings between batches, until the generation is finished or the run
+/// stops: status reads running for the whole run, and a runner that meets it waits for the whole
+/// run instead of slipping in between two batches.
+fn generation_claim(generation: &Generation) -> ClaimKey {
+    generation_claim_key(generation.context_id, generation.id)
 }
 
-impl HeldClaim {
-    fn of(claim: &Claim) -> Self {
-        Self {
-            context_id: claim.generation.context_id,
-            generation_id: claim.generation.id,
-            owner_token: claim.owner_token.clone(),
-            lease_epoch: claim.lease_epoch,
-        }
-    }
+fn generation_claim_key(context_id: crate::ContextId, id: EventSearchGenerationId) -> ClaimKey {
+    ClaimKey::new(BackgroundWork::EventSearch, context_id, id.as_uuid())
 }
 
-/// Let go of a claim this run took but will not commit.
+/// Let go of the claim a run still holds when it stops without finishing its generation, on a
+/// Store opened for it.
 ///
-/// A run that returns without committing must not leave its claim standing: the lease is the
-/// Store-enforced single-writer guard, so an orphan refuses the next attempt — the retry the caller
-/// is about to make — for the rest of the lease, and the Context sits uncovered with nothing
-/// running. Only the row this run owns is removed, matched on its own token and epoch, so a claim
-/// that has already been taken over is left alone. A late result carrying this token is still
-/// refused afterwards, because the commit path requires its own lease row to still be there.
-///
-/// Best effort by nature: a process that is killed outright releases nothing, and its lease expiry
-/// remains the backstop.
-fn release_claim(
+/// Releasing lets status read idle at once. If the release cannot be written, the claim stays
+/// behind as interrupted: this process drops its presence with the claim, so the next runner
+/// takes it over immediately and nothing waits on a timer. A late result carrying this token is
+/// still refused afterwards, because every publication fences on the exact claim row.
+fn release_run_claim(
     config: &crate::StoreConfig,
     embedder: &crate::EmbedderRegistration,
-    held: &HeldClaim,
+    run_claim: &mut Option<HeldClaim>,
 ) {
+    let Some(held) = run_claim.take() else {
+        return;
+    };
     let Ok(store) = open_for_run(config, embedder) else {
         return;
     };
-    release_claim_in(&store, held);
+    let _ = held.release(&store);
 }
 
-/// [`release_claim`] on a Store the caller already holds.
-fn release_claim_in(store: &Store, held: &HeldClaim) {
-    let _ = try_release_claim_in(store, held);
-}
-
-/// Persist release of this run's exact token and epoch before a stale-claim retry.
-///
-/// A zero-row delete is success: it means the lease was already removed or replaced, and the
-/// ownership predicates ensure a newer owner's row is never deleted. An engine refusal is not a
-/// retryable stale claim; the caller must surface it instead of hiding failed cleanup behind the
-/// next claim attempt.
-fn try_release_claim_in(store: &Store, held: &HeldClaim) -> Result<()> {
-    store
-        .internal_db()
-        .execute(
-        "DELETE FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id AND owner_token = $owner_token AND lease_epoch = $lease_epoch",
-        &HashMap::from([
-            (
-                "context_id".to_string(),
-                Value::Uuid(held.context_id.as_uuid()),
-            ),
-            (
-                "generation_id".to_string(),
-                Value::Uuid(held.generation_id.as_uuid()),
-            ),
-            (
-                "owner_token".to_string(),
-                Value::Text(held.owner_token.clone()),
-            ),
-            ("lease_epoch".to_string(), Value::Int64(held.lease_epoch)),
-        ]),
-    )
-        .map(|_| ())
-        .map_err(map_engine_err)
-}
-
-/// The claim's current expiry and renewal, carried through preparation and every embed call.
-struct LeaseRenewal<'a> {
-    expires_at: i64,
-    renew: &'a mut dyn FnMut(i64) -> Result<i64>,
-}
-
-impl LeaseRenewal<'_> {
-    /// Renew if due, between preparation candidates as well as between embed calls.
-    fn keep(&mut self) -> Result<()> {
-        self.expires_at = (self.renew)(self.expires_at)?;
-        Ok(())
+/// [`release_run_claim`] on a Store the caller already holds.
+fn release_run_claim_in(store: &Store, run_claim: &mut Option<HeldClaim>) {
+    if let Some(held) = run_claim.take() {
+        let _ = held.release(store);
     }
-}
-
-/// Whether more than a third of the lease has elapsed, so a live run renews its claim now.
-fn renewal_due(expires_at: i64, bounds: Bounds) -> Result<bool> {
-    let lease = i64::try_from(bounds.lease_ms)
-        .map_err(|_| CgError::Engine("event-search lease exceeds TIMESTAMP".into()))?;
-    Ok(expires_at.saturating_sub(now_millis()?) < lease.saturating_sub(lease / 3))
-}
-
-/// Extend this run's own claim by one lease from now, matched on its token, epoch and the expiry
-/// it last wrote. A claim that is gone or was taken over is refused as stale, never re-taken.
-fn renew_claim(store: &Store, held: &HeldClaim, expires_at: i64, bounds: Bounds) -> Result<i64> {
-    let now = now_millis()?;
-    if expires_at <= now {
-        return Err(stale_claim("event-search claim expired while embedding"));
-    }
-    let renewed = now
-        .checked_add(
-            i64::try_from(bounds.lease_ms)
-                .map_err(|_| CgError::Engine("event-search lease exceeds TIMESTAMP".into()))?,
-        )
-        .ok_or_else(|| CgError::Engine("event-search lease expiry exhausted TIMESTAMP".into()))?;
-    let updated = store
-        .internal_db()
-        .execute(
-            "UPDATE event_search_leases SET expires_at = $renewed WHERE context_id = $context_id AND generation_id = $generation_id AND owner_token = $owner_token AND lease_epoch = $lease_epoch AND expires_at = $expires_at",
-            &HashMap::from([
-                ("renewed".to_string(), Value::Timestamp(renewed)),
-                (
-                    "context_id".to_string(),
-                    Value::Uuid(held.context_id.as_uuid()),
-                ),
-                (
-                    "generation_id".to_string(),
-                    Value::Uuid(held.generation_id.as_uuid()),
-                ),
-                (
-                    "owner_token".to_string(),
-                    Value::Text(held.owner_token.clone()),
-                ),
-                ("lease_epoch".to_string(), Value::Int64(held.lease_epoch)),
-                ("expires_at".to_string(), Value::Timestamp(expires_at)),
-            ]),
-        )
-        .map_err(map_engine_err)?;
-    if updated.rows_affected != 1 {
-        return Err(stale_claim(
-            "event-search claim was taken over while embedding",
-        ));
-    }
-    Ok(renewed)
 }
 
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
@@ -290,6 +208,63 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static AFTER_COMPLETION_COMMIT_BEFORE_READBACK: std::cell::RefCell<Option<StoreHook>> =
         const { std::cell::RefCell::new(None) };
+    // The shared background-work claim's two test hooks live beside this projection's own, so
+    // every kind of background work reaches them through one per-thread slot.
+    static BEFORE_BACKGROUND_CLAIM_COMMIT: std::cell::RefCell<Option<StoreHook>> =
+        const { std::cell::RefCell::new(None) };
+    static BACKGROUND_CLAIM_WAIT_OBSERVER: std::cell::RefCell<Option<BackgroundClaimWaitObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+type BackgroundClaimWaitObserver = Box<dyn FnMut(BackgroundWork, crate::ContextId)>;
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) fn set_before_background_claim_commit_hook(hook: StoreHook) {
+    BEFORE_BACKGROUND_CLAIM_COMMIT.with(|slot| *slot.borrow_mut() = Some(hook));
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) fn take_before_background_claim_commit_hook() -> Option<StoreHook> {
+    BEFORE_BACKGROUND_CLAIM_COMMIT.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) fn set_background_claim_wait_observer(observer: BackgroundClaimWaitObserver) {
+    BACKGROUND_CLAIM_WAIT_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observer));
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) fn observe_background_claim_wait(work: BackgroundWork, context_id: crate::ContextId) {
+    BACKGROUND_CLAIM_WAIT_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().as_mut() {
+            observer(work, context_id);
+        }
+    });
+}
+
+#[cfg(context_graph_internal_test_support)]
+thread_local! {
+    // One armed refusal for the next read a write makes after its commit, on one store.
+    static NEXT_POST_COMMIT_READBACK_REFUSAL: std::cell::RefCell<Option<(std::path::PathBuf, CgError)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(context_graph_internal_test_support)]
+pub(crate) fn arm_post_commit_readback_refusal(store_path: std::path::PathBuf, error: CgError) {
+    NEXT_POST_COMMIT_READBACK_REFUSAL.with(|slot| *slot.borrow_mut() = Some((store_path, error)));
+}
+
+#[cfg(context_graph_internal_test_support)]
+pub(crate) fn take_post_commit_readback_refusal(store_path: &std::path::Path) -> Option<CgError> {
+    NEXT_POST_COMMIT_READBACK_REFUSAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(armed, _)| armed == store_path) {
+            slot.take().map(|(_, error)| error)
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
@@ -492,7 +467,6 @@ struct Bounds {
     events: usize,
     passages: usize,
     bytes: usize,
-    lease_ms: u64,
 }
 
 #[derive(Clone)]
@@ -575,13 +549,9 @@ enum GenerationMode {
 struct Claim {
     publication_event_count: Option<u64>,
     generation: Generation,
-    owner_token: String,
-    lease_epoch: i64,
-    expires_at: i64,
     connector_id: String,
     source_instance_ref: String,
     session_ref: String,
-    start_sequence: u64,
     end_sequence: u64,
     cursor_sha256: String,
     passage_ordinal: u64,
@@ -675,6 +645,7 @@ impl SessionWorkSet {
 }
 
 enum ClaimResult {
+    /// A batch this run now owns under its claim of the generation.
     Work(Box<Claim>),
     Complete,
     ScopeComplete,
@@ -922,8 +893,9 @@ fn record_run_failure(
     }
 }
 
-/// Claim an attempt before resuming metadata work. A live claim is somebody else's; an expired
-/// claim and the old attempt marker are guarded in the same transaction that clears its failure.
+/// Claim an attempt before resuming metadata work. A claim with a live holder is somebody else's
+/// and is never displaced; a claim whose holder has exited, and the old attempt marker, are
+/// guarded in the same transaction that clears its failure.
 fn begin_generation_attempt(
     store: &Store,
     context_id: crate::ContextId,
@@ -978,35 +950,15 @@ fn write_generation_attempt(
             )
             .map_err(map_engine_err)?
         {
-            return Err(stale_claim(
-                "event-search attempt changed before resumption",
-            ));
+            return Err(lost_race("its attempt changed before it was recorded"));
         }
-        let lease = store.internal_db().execute_in_tx(tx,
-            "SELECT owner_token, lease_epoch, expires_at FROM event_search_leases WHERE context_id = $context_id AND generation_id = $id", &params).map_err(map_engine_err)?;
-        if let Some(row) = lease.rows.first() {
-            if get_timestamp(row, &lease.columns, "expires_at")? > now_millis()? {
-                return Err(stale_claim(
-                    "another event-search worker owns the unexpired claim",
+        match generation_claim_key(context_id, id).guard_unheld_in_tx(store, tx)? {
+            Unheld::Free => {}
+            Unheld::Live(live) => return Err(live.refusal()),
+            Unheld::Moved => {
+                return Err(lost_race(
+                    "the generation's claim moved while its attempt was recorded",
                 ));
-            }
-            let conditions = exact_conditions(
-                row,
-                &lease.columns,
-                &["owner_token", "lease_epoch", "expires_at"],
-            )?;
-            if !store
-                .internal_db()
-                .guard_row_conditions_in_tx(
-                    tx,
-                    "event_search_leases",
-                    "generation_id",
-                    &Value::Uuid(id.as_uuid()),
-                    &conditions,
-                )
-                .map_err(map_engine_err)?
-            {
-                return Err(stale_claim("event-search claim changed before resumption"));
             }
         }
         let mut params = params;
@@ -1037,8 +989,9 @@ fn write_generation_attempt(
         .internal_db()
         .commit(tx)
         .map_err(|error| match error {
+            // Another runner recorded its attempt or took the generation's claim first.
             EngineError::ConditionalUpdateConflict { .. } => {
-                stale_claim("event-search attempt changed before resumption committed")
+                lost_race("its attempt changed before it committed")
             }
             other => map_engine_err(other),
         })?;
@@ -1132,7 +1085,44 @@ type SelectedBatchLimitResolver<'a> =
 type BatchWriteMemoryLimitResolver<'a> =
     dyn FnMut(&dyn Fn(EventSearchWorkPolicy) -> Result<bool>) -> Result<NonZeroUsize> + 'a;
 
+/// Run passes until one finishes. A pass that meets a live holder of this generation returns with
+/// its Store already dropped; the run then waits in the kernel for that holder to release or exit,
+/// with no timer and no polling, and starts a fresh pass that sees whatever the holder published.
+/// A pass that loses the race for the generation to another runner also starts afresh, and that
+/// fresh pass finds the winner live and waits on it, or finds its work done. Waiting never spends
+/// the stale-claim retry allowance.
 fn catch_up_standalone_run(
+    request: &mut EventSearchRunRequest,
+    work_policy: EventSearchWorkPolicy,
+    resolve_embedding_workers: &mut dyn FnMut() -> NonZeroUsize,
+    resolve_write_memory_limit: &mut BatchWriteMemoryLimitResolver<'_>,
+    selected_work: Option<&EventSearchSelectedWork>,
+    mut resolve_selected_limit: Option<&mut SelectedBatchLimitResolver<'_>>,
+    observations: &mut RunObservations,
+) -> Result<EventSearchBuildReceipt> {
+    let mut lost_races = 0;
+    loop {
+        match catch_up_standalone_pass(
+            request,
+            work_policy,
+            resolve_embedding_workers,
+            resolve_write_memory_limit,
+            selected_work,
+            resolve_selected_limit.as_deref_mut(),
+            observations,
+        ) {
+            Err(refusal @ CgError::BackgroundWorkHeldByLiveWorker { .. }) => {
+                super::background_claim::wait_for_refusal(&request.store.db_path, &refusal)?;
+            }
+            Err(error) if is_lost_race(&error) && lost_races < MAX_STALE_RETRIES => {
+                lost_races += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+fn catch_up_standalone_pass(
     request: &mut EventSearchRunRequest,
     work_policy: EventSearchWorkPolicy,
     resolve_embedding_workers: &mut dyn FnMut() -> NonZeroUsize,
@@ -1148,11 +1138,11 @@ fn catch_up_standalone_run(
         ));
     }
     let context_id = context_ids[0];
+    super::background_claim::require_presence(&request.store.db_path)?;
     let bounds = bounds(
         request.max_events_per_batch.get(),
         request.max_passages_per_batch.get(),
         request.max_bytes_per_batch.get(),
-        request.lease_duration_ms.get(),
     );
     // Every writable open costs memory in the engine today, so each open does as much as it can
     // before it is dropped: the open that prepares the generation takes the first claim, and the
@@ -1184,204 +1174,198 @@ fn catch_up_standalone_run(
         selected_work,
     )?;
     let mut open = Some(store);
-
-    let mut retries = 0_u64;
-    let mut event_limit = bounds.events;
-    loop {
-        let mut store = match open.take() {
-            Some(store) => store,
-            None => open_for_run(&request.store, &request.embedder)?,
-        };
-        let mut pending = measured(&mut observations.event_read, || {
-            first_pending_stream(&store, &generation, &session_work, bounds)
-        })?;
-        let limit = if let Some(resolve) = resolve_selected_limit.as_mut() {
-            let applies = |request_id| match &pending {
-                Some(pending) => selected_frontier(&store, context_id, request_id, pending),
-                None => Ok(None),
+    // The run takes its generation's claim with its first batch and keeps it until the generation
+    // is finished; every way out before that lets the claim go, so status reads idle at once.
+    let mut run_claim: Option<HeldClaim> = None;
+    let result = (|| -> Result<EventSearchBuildReceipt> {
+        let mut retries = 0_u64;
+        let mut event_limit = bounds.events;
+        loop {
+            let mut store = match open.take() {
+                Some(store) => store,
+                None => open_for_run(&request.store, &request.embedder)?,
             };
-            let admitted = resolve(pending.as_ref().map(|pending| EventSearchPendingBatch {
-                connector_id: &pending.connector_id,
-                session_ref: &pending.session_ref,
-                source_instance_ref: &pending.source_instance_ref,
-                committed_sequence: pending.committed_sequence,
-                selected_frontier: &applies,
-            }))?;
-            if let Some(pending) = &mut pending {
-                pending.through_sequence =
-                    match (pending.through_sequence, admitted.through_sequence) {
-                        (Some(selected), Some(admitted)) => Some(selected.min(admitted)),
-                        (selected, admitted) => selected.or(admitted),
-                    };
-            }
-            admitted.memory_limit_bytes
-        } else if let Some(pending) = &pending {
-            resolve_write_memory_limit(&|policy| {
-                let primary = selected_captured_session_work(&store, context_id, work_policy)?;
-                let inherited = primary
-                    .rank(&pending.connector_id, &pending.session_ref)
-                    .is_none();
-                Ok(inherited
-                    || selected_captured_session_work(&store, context_id, policy)?
-                        .rank(&pending.connector_id, &pending.session_ref)
-                        .is_some())
-            })?
-        } else {
-            resolve_write_memory_limit(&|_| Ok(true))?
-        };
-        if limit != request.store.write_memory_limit_bytes {
-            drop(store);
-            request.store.write_memory_limit_bytes = limit;
-            store = open_for_run(&request.store, &request.embedder)?;
-        }
-        #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
-        if let Some(pending) = &pending {
-            BATCH_ADMISSION_HOOK.with(|slot| {
-                if let Some(hook) = slot.borrow().as_ref() {
-                    hook(
-                        &pending.session_ref,
-                        &pending.source_instance_ref,
-                        pending.committed_sequence,
-                        pending.through_sequence,
-                        store
-                            .internal_db()
-                            .memory_limit()
-                            .expect("projection writer has a finite budget"),
-                    );
+            let mut pending = measured(&mut observations.event_read, || {
+                first_pending_stream(&store, &generation, &session_work, bounds)
+            })?;
+            let limit = if let Some(resolve) = resolve_selected_limit.as_mut() {
+                let applies = |request_id| match &pending {
+                    Some(pending) => selected_frontier(&store, context_id, request_id, pending),
+                    None => Ok(None),
+                };
+                let admitted = resolve(pending.as_ref().map(|pending| EventSearchPendingBatch {
+                    connector_id: &pending.connector_id,
+                    session_ref: &pending.session_ref,
+                    source_instance_ref: &pending.source_instance_ref,
+                    committed_sequence: pending.committed_sequence,
+                    selected_frontier: &applies,
+                }))?;
+                if let Some(pending) = &mut pending {
+                    pending.through_sequence =
+                        match (pending.through_sequence, admitted.through_sequence) {
+                            (Some(selected), Some(admitted)) => Some(selected.min(admitted)),
+                            (selected, admitted) => selected.or(admitted),
+                        };
                 }
-            });
-        }
-        let claim_result = measured(&mut observations.event_read, || {
-            claim_pending_batch(
-                &store,
-                &generation,
-                bounds,
-                event_limit,
-                pending,
-                selected_work.and_then(|work| work.request_id),
-            )
-        })?;
-        let ClaimResult::Work(claim) = claim_result else {
-            let outcome = finish_or_continue(
-                &store,
-                &generation,
+                admitted.memory_limit_bytes
+            } else if let Some(pending) = &pending {
+                resolve_write_memory_limit(&|policy| {
+                    let primary = selected_captured_session_work(&store, context_id, work_policy)?;
+                    let inherited = primary
+                        .rank(&pending.connector_id, &pending.session_ref)
+                        .is_none();
+                    Ok(inherited
+                        || selected_captured_session_work(&store, context_id, policy)?
+                            .rank(&pending.connector_id, &pending.session_ref)
+                            .is_some())
+                })?
+            } else {
+                resolve_write_memory_limit(&|_| Ok(true))?
+            };
+            if limit != request.store.write_memory_limit_bytes {
+                drop(store);
+                request.store.write_memory_limit_bytes = limit;
+                store = open_for_run(&request.store, &request.embedder)?;
+            }
+            #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+            if let Some(pending) = &pending {
+                BATCH_ADMISSION_HOOK.with(|slot| {
+                    if let Some(hook) = slot.borrow().as_ref() {
+                        hook(
+                            &pending.session_ref,
+                            &pending.source_instance_ref,
+                            pending.committed_sequence,
+                            pending.through_sequence,
+                            store
+                                .internal_db()
+                                .memory_limit()
+                                .expect("projection writer has a finite budget"),
+                        );
+                    }
+                });
+            }
+            let claim_result = measured(&mut observations.event_read, || {
+                claim_pending_batch(
+                    &store,
+                    &generation,
+                    bounds,
+                    event_limit,
+                    pending,
+                    selected_work.and_then(|work| work.request_id),
+                    &mut run_claim,
+                )
+            })?;
+            let ClaimResult::Work(claim) = claim_result else {
+                let outcome = finish_or_continue(
+                    &store,
+                    &generation,
+                    &request.embedder,
+                    &request.profile,
+                    bounds,
+                    InterpretationSelection::Ordinary,
+                    retries,
+                    observations,
+                    run_claim.as_ref(),
+                );
+                let outcome = match outcome {
+                    Ok(FinishResult::Rebuild) => measured(&mut observations.event_read, || {
+                        ensure_generation(
+                            &store,
+                            context_id,
+                            &request.embedder,
+                            &request.profile,
+                            bounds,
+                            true,
+                            InterpretationSelection::Ordinary,
+                            &mut observations.attempt,
+                        )
+                    })
+                    .map(|generation| FinishResult::Continue(Box::new(generation))),
+                    Ok(FinishResult::Ready(receipt)) => {
+                        // Completion deleted this run's claim; its presence goes with it.
+                        run_claim = None;
+                        maintain_passage_vectors(&store).map(|()| FinishResult::Ready(receipt))
+                    }
+                    other => other,
+                };
+                match outcome? {
+                    FinishResult::Continue(next) => {
+                        if next.id != generation.id {
+                            // A rebuild moves the run to a new generation; the old claim goes first.
+                            release_run_claim_in(&store, &mut run_claim);
+                        }
+                        generation = *next;
+                        session_work = selected_session_work_for_run(
+                            &store,
+                            context_id,
+                            generation.id,
+                            work_policy,
+                            selected_work,
+                        )?;
+                        open = Some(store);
+                        continue;
+                    }
+                    FinishResult::Ready(receipt) => return Ok(*receipt),
+                    FinishResult::Rebuild => unreachable!("rebuild handled while Store was open"),
+                }
+            };
+            drop(store);
+            let embedding_workers = resolve_embedding_workers();
+
+            // No Store exists in this scope: renderer/tokenizer/embedder execution is deliberately
+            // between the claim close and the validated commit reopen, and the claim's holder lock
+            // keeps the generation owned however long that takes.
+            let rendered = render_and_embed(
+                *claim,
                 &request.embedder,
                 &request.profile,
                 bounds,
-                InterpretationSelection::Ordinary,
-                retries,
+                embedding_workers,
                 observations,
             );
-            let outcome = match outcome {
-                Ok(FinishResult::Rebuild) => measured(&mut observations.event_read, || {
-                    ensure_generation(
-                        &store,
-                        context_id,
-                        &request.embedder,
-                        &request.profile,
-                        bounds,
-                        true,
-                        InterpretationSelection::Ordinary,
-                        &mut observations.attempt,
-                    )
-                })
-                .map(|generation| FinishResult::Continue(Box::new(generation))),
-                Ok(FinishResult::Ready(receipt)) => {
-                    maintain_passage_vectors(&store).map(|()| FinishResult::Ready(receipt))
+            let built = match rendered {
+                Ok(Rendered::Batch(built)) => *built,
+                Ok(Rendered::OverPassageBound { fitting_events }) => {
+                    // Nothing was embedded: keep the claim and take the events that fit.
+                    event_limit = fitting_events;
+                    continue;
                 }
-                other => other,
+                Err(error) if retries < MAX_STALE_RETRIES as u64 && is_retryable_stale(&error) => {
+                    retries += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
-            match outcome? {
-                FinishResult::Continue(next) => {
-                    generation = *next;
-                    session_work = selected_session_work_for_run(
-                        &store,
-                        context_id,
-                        generation.id,
-                        work_policy,
-                        selected_work,
-                    )?;
+            let rendered_passages = built.passages.len();
+            let store = open_for_run(&request.store, &request.embedder)?;
+            let held = run_claim
+                .as_ref()
+                .expect("a claimed batch is owned under the run's claim");
+            if let Err(error) = commit_batch(
+                &store,
+                &request.embedder,
+                &request.profile,
+                bounds,
+                built,
+                held,
+                observations,
+            ) {
+                // A conditional commit conflict can leave this run's claim intact: the batch is
+                // claimed again under that same claim. A claim that moved stops the run.
+                if retries < MAX_STALE_RETRIES as u64 && is_retryable_stale(&error) {
+                    retries += 1;
                     open = Some(store);
                     continue;
                 }
-                FinishResult::Ready(receipt) => return Ok(*receipt),
-                FinishResult::Rebuild => unreachable!("rebuild handled while Store was open"),
-            }
-        };
-        drop(store);
-        let embedding_workers = resolve_embedding_workers();
-
-        // From here the run holds a claim, so every way out of it releases that claim first.
-        let held = HeldClaim::of(&claim);
-        // No Store exists in this scope: renderer/tokenizer/embedder execution is deliberately
-        // between the claim close and the validated commit reopen.
-        let mut renew = |expires_at| {
-            if !renewal_due(expires_at, bounds)? {
-                return Ok(expires_at);
-            }
-            let store = open_for_run(&request.store, &request.embedder)?;
-            renew_claim(&store, &held, expires_at, bounds)
-        };
-        let rendered = render_and_embed(
-            *claim,
-            &request.embedder,
-            &request.profile,
-            bounds,
-            embedding_workers,
-            &mut renew,
-            observations,
-        );
-        let built = match rendered {
-            Ok(Rendered::Batch(built)) => *built,
-            Ok(Rendered::OverPassageBound { fitting_events }) => {
-                // Nothing was embedded: let the claim go and take the events that fit.
-                let store = open_for_run(&request.store, &request.embedder)?;
-                release_claim_in(&store, &held);
-                event_limit = fitting_events;
-                open = Some(store);
-                continue;
-            }
-            Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
-                // The claim was taken over while this run embedded; nothing is left to release.
-                retries += 1;
-                continue;
-            }
-            Err(error) => {
-                release_claim(&request.store, &request.embedder, &held);
+                release_run_claim_in(&store, &mut run_claim);
                 return Err(error);
             }
-        };
-        let rendered_passages = built.passages.len();
-        let store = match open_for_run(&request.store, &request.embedder) {
-            Ok(store) => store,
-            Err(error) => {
-                release_claim(&request.store, &request.embedder, &held);
-                return Err(error);
-            }
-        };
-        if let Err(error) = commit_batch(
-            &store,
-            &request.embedder,
-            &request.profile,
-            bounds,
-            built,
-            observations,
-        ) {
-            // A conditional commit conflict can make this claim stale while its lease row is
-            // still present. Release only this run's token and epoch before taking a fresh claim;
-            // a real takeover remains untouched because the exact delete no longer matches.
-            if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) {
-                try_release_claim_in(&store, &held)?;
-                retries += 1;
-                open = Some(store);
-                continue;
-            }
-            release_claim_in(&store, &held);
-            return Err(error);
+            event_limit = next_event_limit(event_limit, rendered_passages, bounds);
+            open = Some(store);
         }
-        event_limit = next_event_limit(event_limit, rendered_passages, bounds);
-        open = Some(store);
-    }
+    })();
+    release_run_claim(&request.store, &request.embedder, &mut run_claim);
+    result
 }
 
 /// The event limit for the claim after one that committed `rendered_passages` passages from
@@ -1413,7 +1397,6 @@ pub(crate) fn catch_up_store_with_policy(
         request.max_events_per_batch.get(),
         request.max_passages_per_batch.get(),
         request.max_bytes_per_batch.get(),
-        request.lease_duration_ms.get(),
     );
     run_with_store(
         store,
@@ -1445,7 +1428,6 @@ pub(crate) fn rebuild_store_with_policy(
         request.max_events_per_batch.get(),
         request.max_passages_per_batch.get(),
         request.max_bytes_per_batch.get(),
-        request.lease_duration_ms.get(),
     );
     let selection = request
         .interpretation_generation_id
@@ -1481,8 +1463,12 @@ fn run_with_store(
     selection: InterpretationSelection,
 ) -> Result<EventSearchBuildReceipt> {
     let mut observations = RunObservations::default();
+    // As in the standalone run, the claim is taken with the first batch and kept until the
+    // generation is finished; every way out before that lets it go.
+    let mut run_claim: Option<HeldClaim> = None;
     let result = (|| {
         validate_profile_for_registration(&profile, &embedder)?;
+        super::background_claim::require_presence(store.db_path())?;
         let mut generation = measured(&mut observations.event_read, || {
             ensure_generation(
                 store,
@@ -1502,7 +1488,14 @@ fn run_with_store(
         let mut event_limit = bounds.events;
         loop {
             let claim_result = measured(&mut observations.event_read, || {
-                claim_batch(store, &generation, &session_work, bounds, event_limit)
+                claim_batch(
+                    store,
+                    &generation,
+                    &session_work,
+                    bounds,
+                    event_limit,
+                    &mut run_claim,
+                )
             })?;
             let ClaimResult::Work(claim) = claim_result else {
                 match finish_or_continue(
@@ -1514,6 +1507,7 @@ fn run_with_store(
                     selection,
                     retries,
                     &mut observations,
+                    run_claim.as_ref(),
                 )? {
                     FinishResult::Continue(next) => {
                         generation = *next;
@@ -1522,6 +1516,8 @@ fn run_with_store(
                         continue;
                     }
                     FinishResult::Rebuild => {
+                        // A rebuild moves the run to a new generation; the old claim goes first.
+                        release_run_claim_in(store, &mut run_claim);
                         generation = measured(&mut observations.event_read, || {
                             ensure_generation(
                                 store,
@@ -1539,59 +1535,60 @@ fn run_with_store(
                         continue;
                     }
                     FinishResult::Ready(receipt) => {
+                        // Completion deleted this run's claim; its presence goes with it.
+                        run_claim = None;
                         maintain_passage_vectors(store)?;
                         return Ok(*receipt);
                     }
                 }
             };
             // The caller necessarily retains `store`; this wrapper makes no Store-release claim.
-            let held = HeldClaim::of(&claim);
-            let mut renew = |expires_at| {
-                if !renewal_due(expires_at, bounds)? {
-                    return Ok(expires_at);
-                }
-                renew_claim(store, &held, expires_at, bounds)
-            };
             let built = match render_and_embed(
                 *claim,
                 &embedder,
                 &profile,
                 bounds,
                 embedding_workers,
-                &mut renew,
                 &mut observations,
             ) {
                 Ok(Rendered::Batch(built)) => *built,
                 Ok(Rendered::OverPassageBound { fitting_events }) => {
-                    release_claim_in(store, &held);
+                    // Nothing was embedded: keep the claim and take the events that fit.
                     event_limit = fitting_events;
                     continue;
                 }
-                Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
+                Err(error) if retries < MAX_STALE_RETRIES as u64 && is_retryable_stale(&error) => {
                     retries += 1;
                     continue;
                 }
-                Err(error) => {
-                    release_claim_in(store, &held);
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
             let rendered_passages = built.passages.len();
-            match commit_batch(store, &embedder, &profile, bounds, built, &mut observations) {
+            let held = run_claim
+                .as_ref()
+                .expect("a claimed batch is owned under the run's claim");
+            match commit_batch(
+                store,
+                &embedder,
+                &profile,
+                bounds,
+                built,
+                held,
+                &mut observations,
+            ) {
                 Ok(()) => event_limit = next_event_limit(event_limit, rendered_passages, bounds),
-                Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
-                    try_release_claim_in(store, &held)?;
+                Err(error) if retries < MAX_STALE_RETRIES as u64 && is_retryable_stale(&error) => {
                     retries += 1;
                 }
-                Err(error) => {
-                    release_claim_in(store, &held);
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
     })();
+    release_run_claim_in(store, &mut run_claim);
+    // A live holder is not a failure: it is running and will publish.
     if let (Err(error), Some(attempt)) = (&result, observations.attempt)
         && !is_stale_claim(error)
+        && !matches!(error, CgError::BackgroundWorkHeldByLiveWorker { .. })
     {
         let _ = record_run_failure(store, attempt, &sanitized_failure(error));
     }
@@ -1642,7 +1639,7 @@ impl Store {
     }
 }
 
-fn bounds(events: u32, passages: u32, bytes: usize, lease_ms: u64) -> Bounds {
+fn bounds(events: u32, passages: u32, bytes: usize) -> Bounds {
     let ceiling = crate::owner_control::context_graph_read_limits();
     Bounds {
         events: usize::try_from(events)
@@ -1650,7 +1647,6 @@ fn bounds(events: u32, passages: u32, bytes: usize, lease_ms: u64) -> Bounds {
             .min(usize::try_from(ceiling.cursor_page_rows).unwrap_or(usize::MAX)),
         passages: usize::try_from(passages).unwrap_or(usize::MAX),
         bytes: bytes.min(usize::try_from(ceiling.cursor_page_bytes).unwrap_or(usize::MAX)),
-        lease_ms,
     }
 }
 
@@ -1719,14 +1715,13 @@ pub(crate) fn persist_selected_work_with_retained_requests(
     desired_spec.profile.validate()?;
     let desired_profile = serde_json::to_value(&desired_spec.profile).map_err(json_error)?;
     let mut running_requests = BTreeSet::new();
-    // The lease and header association identify the exact saved run, including streams it
+    // The claim and header association identify the exact saved run, including streams it
     // has not claimed yet. Both are committed in the same batch-claim transaction.
-    store.stream_rows(
-        "SELECT generation_id, owner_token FROM event_search_leases WHERE context_id = $context_id",
-        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        &mut |columns, row| {
-            let generation_id = get_uuid(row, columns, "generation_id")?;
-            let owner_token = get_text(row, columns, "owner_token")?;
+    for (generation_id, owner_token) in
+        super::background_claim::context_claims(store, BackgroundWork::EventSearch, context_id)?
+    {
+        let owner_token = owner_token.to_string();
+        (|| -> Result<()> {
             let generation = store.query_rows(
                 "SELECT renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile FROM event_search_generations WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("id".into(), Value::Uuid(generation_id))]),
@@ -1734,11 +1729,16 @@ pub(crate) fn persist_selected_work_with_retained_requests(
             let Some(generation_row) = generation.rows.first() else {
                 return Err(stale_claim("queued retention generation disappeared"));
             };
-            if get_text(generation_row, &generation.columns, "renderer_id")? == EVENT_SEARCH_RENDERER_ID
-                && get_text(generation_row, &generation.columns, "renderer_version")? == EVENT_SEARCH_RENDERER_VERSION
-                && get_json(generation_row, &generation.columns, "renderer_profile")? == desired_profile
-                && get_text(generation_row, &generation.columns, "embedding_space_id")? == desired_spec.embedding_space_id
-                && get_text(generation_row, &generation.columns, "encoding_profile")? == desired_spec.encoding_profile_id
+            if get_text(generation_row, &generation.columns, "renderer_id")?
+                == EVENT_SEARCH_RENDERER_ID
+                && get_text(generation_row, &generation.columns, "renderer_version")?
+                    == EVENT_SEARCH_RENDERER_VERSION
+                && get_json(generation_row, &generation.columns, "renderer_profile")?
+                    == desired_profile
+                && get_text(generation_row, &generation.columns, "embedding_space_id")?
+                    == desired_spec.embedding_space_id
+                && get_text(generation_row, &generation.columns, "encoding_profile")?
+                    == desired_spec.encoding_profile_id
             {
                 return Ok(());
             }
@@ -1757,8 +1757,8 @@ pub(crate) fn persist_selected_work_with_retained_requests(
                 }
             }
             Ok(())
-        },
-    )?;
+        })()?;
+    }
     let mut merged = selected.clone();
     for request_id in running_requests {
         for stream in load_selected_work(store, context_id, request_id)?.streams {
@@ -2466,7 +2466,7 @@ pub(crate) fn event_search_work(
                 outside_scope_indexed_events,
                 no_searchable_text_events,
                 work_required: captured_events > 0 && (!active || pending_events > 0),
-                live_projection_lease: live_projection_lease(source, context_id, now_millis()?)?,
+                work: projection_work_state(source, context_id)?,
             })
         })
         .collect()
@@ -3329,21 +3329,13 @@ pub(crate) fn persist_work_policy(
     store.internal_db().commit(tx).map_err(map_engine_err)
 }
 
-pub(crate) fn live_projection_lease(
+/// Whether this Context's search projection is running (a live worker holds a claim), interrupted
+/// (a claim's worker has exited) or idle. Reads only; asking for a holder changes no byte.
+pub(crate) fn projection_work_state(
     source: &dyn EventSearchRows,
     context_id: crate::ContextId,
-    now_ms: i64,
-) -> Result<bool> {
-    let leases = source.query_rows(
-        "SELECT expires_at FROM event_search_leases WHERE context_id = $context_id",
-        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-    )?;
-    for row in &leases.rows {
-        if get_timestamp(row, &leases.columns, "expires_at")? > now_ms {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+) -> Result<BackgroundWorkState> {
+    super::background_claim::context_state(source, BackgroundWork::EventSearch, context_id)
 }
 
 pub(crate) fn committed_generation_coverage(
@@ -4933,9 +4925,18 @@ fn claim_batch(
     sessions: &SessionWorkSet,
     bounds: Bounds,
     event_limit: usize,
+    run_claim: &mut Option<HeldClaim>,
 ) -> Result<ClaimResult> {
     let pending = first_pending_stream(store, generation, sessions, bounds)?;
-    claim_pending_batch(store, generation, bounds, event_limit, pending, None)
+    claim_pending_batch(
+        store,
+        generation,
+        bounds,
+        event_limit,
+        pending,
+        None,
+        run_claim,
+    )
 }
 
 fn claim_source_statement(event_limit: usize) -> String {
@@ -4951,6 +4952,7 @@ fn claim_pending_batch(
     event_limit: usize,
     pending: Option<PendingStream>,
     selected_request_id: Option<uuid::Uuid>,
+    run_claim: &mut Option<HeldClaim>,
 ) -> Result<ClaimResult> {
     #[cfg(feature = "test-support")]
     LOADED_EVENT_ROWS.with(|rows| rows.set(0));
@@ -5033,7 +5035,6 @@ fn claim_pending_batch(
             "event-search claim found no bounded source event".into(),
         ));
     }
-    let start_sequence = events.first().expect("non-empty claim").event.seq;
     let end_sequence = events.last().expect("non-empty claim").event.seq;
     let reopen_tail_start = reopenable_tail_start(
         store,
@@ -5089,70 +5090,57 @@ fn claim_pending_batch(
     });
     let cursor_sha256 = claim_hash(open_tail_events.iter().chain(events.iter()));
     let passage_ordinal = generation_passage_count(store, generation.id, bounds)?;
-    let owner_token = uuid::Uuid::now_v7().to_string();
-    let now = now_millis()?;
-    let expires_at = now
-        .checked_add(
-            i64::try_from(bounds.lease_ms)
-                .map_err(|_| CgError::Engine("event-search lease exceeds TIMESTAMP".into()))?,
-        )
-        .ok_or_else(|| CgError::Engine("event-search lease expiry exhausted TIMESTAMP".into()))?;
+    // The run's first batch takes the generation's claim; every later batch is fenced on that same
+    // claim. A first claim that loses to another runner is a lost race, which a standalone run
+    // answers by reading again; a later batch whose claim or attempt moved belongs to another
+    // owner now, and the run stops without publishing.
+    let first = run_claim.is_none();
     let tx = store.begin_tx()?;
+    if let Err(error) = guard_attempt_in_tx(store, tx, generation) {
+        let _ = store.internal_db().rollback(tx);
+        return Err(if first {
+            as_lost_race(error)
+        } else {
+            as_lost_claim(error)
+        });
+    }
     if let Err(error) = guard_generation_for_claim_in_tx(store, tx, generation) {
         let _ = store.internal_db().rollback(tx);
-        return Err(error);
+        return Err(if first { as_lost_race(error) } else { error });
     }
-    let existing = store.internal_db().execute_in_tx(
-        tx,
-        "SELECT owner_token, lease_epoch, expires_at FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id",
-        &HashMap::from([
-            ("context_id".into(), Value::Uuid(generation.context_id.as_uuid())),
-            ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
-        ]),
-    ).map_err(map_engine_err)?;
-    let lease_epoch = if let Some(row) = existing.rows.first() {
-        let persisted_expiry = get_timestamp(row, &existing.columns, "expires_at")?;
-        if persisted_expiry > now {
-            let _ = store.internal_db().rollback(tx);
-            return Err(stale_claim(
-                "another event-search worker owns the unexpired claim",
-            ));
-        }
-        let epoch = get_i64(row, &existing.columns, "lease_epoch")?
-            .checked_add(1)
-            .ok_or_else(|| CgError::Engine("event-search lease epoch exhausted INTEGER".into()))?;
-        store.internal_db().execute_in_tx(
-            tx,
-            "DELETE FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id",
-            &HashMap::from([
-                ("context_id".into(), Value::Uuid(generation.context_id.as_uuid())),
-                ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
-            ]),
-        ).map_err(map_engine_err)?;
-        epoch
-    } else {
-        1
+    let taken = match run_claim.as_ref() {
+        Some(held) => match held.fence_in_tx(store, tx) {
+            Ok(true) => None,
+            Ok(false) => {
+                let _ = store.internal_db().rollback(tx);
+                return Err(lost_claim("its claim moved between two batches"));
+            }
+            Err(error) => {
+                let _ = store.internal_db().rollback(tx);
+                return Err(error);
+            }
+        },
+        None => match generation_claim(generation).take_in_tx(store, tx) {
+            Ok(Taken::Held(held)) => Some(held),
+            Ok(Taken::Live(live)) => {
+                let _ = store.internal_db().rollback(tx);
+                return Err(live.refusal());
+            }
+            Ok(Taken::Moved) => {
+                let _ = store.internal_db().rollback(tx);
+                return Err(lost_race("the generation's claim moved while it was read"));
+            }
+            Err(error) => {
+                let _ = store.internal_db().rollback(tx);
+                return Err(error);
+            }
+        },
     };
-    let insert = store.internal_db().execute_in_tx(
-        tx,
-        "INSERT INTO event_search_leases (context_id, generation_id, owner_token, lease_epoch, claimed_connector_id, claimed_source_instance_ref, claimed_start_sequence, claimed_end_sequence, cursor_sha256, expires_at) VALUES ($context_id, $generation_id, $owner_token, $lease_epoch, $connector_id, $source, $start, $end, $cursor_sha256, $expires_at)",
-        &HashMap::from([
-            ("context_id".into(), Value::Uuid(generation.context_id.as_uuid())),
-            ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
-            ("owner_token".into(), Value::Text(owner_token.clone())),
-            ("lease_epoch".into(), Value::Int64(lease_epoch)),
-            ("connector_id".into(), Value::Text(connector.clone())),
-            ("source".into(), Value::Text(source.clone())),
-            ("start".into(), integer(start_sequence, "claim start")?),
-            ("end".into(), integer(end_sequence, "claim end")?),
-            ("cursor_sha256".into(), Value::Text(cursor_sha256.clone())),
-            ("expires_at".into(), Value::Timestamp(expires_at)),
-        ]),
-    );
-    if let Err(error) = insert {
-        let _ = store.internal_db().rollback(tx);
-        return Err(map_engine_err(error));
-    }
+    let token = taken
+        .as_ref()
+        .or(run_claim.as_ref())
+        .map(HeldClaim::token)
+        .expect("this run holds the generation's claim");
     if let Some(request_id) = selected_request_id {
         let associated = store.internal_db().execute_in_tx(
             tx,
@@ -5161,7 +5149,7 @@ fn claim_pending_batch(
                 ("context_id".into(), Value::Uuid(generation.context_id.as_uuid())),
                 ("request_id".into(), Value::Uuid(request_id)),
                 ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
-                ("owner_token".into(), Value::Text(owner_token.clone())),
+                ("owner_token".into(), Value::Text(token.to_string())),
             ]),
         ).map_err(map_engine_err);
         match associated {
@@ -5178,17 +5166,30 @@ fn claim_pending_batch(
             }
         }
     }
-    store.internal_db().commit(tx).map_err(map_engine_err)?;
+    store
+        .internal_db()
+        .commit(tx)
+        .map_err(|error| match error {
+            // Another runner claimed or took over this generation first.
+            EngineError::ConditionalUpdateConflict { .. } | EngineError::UniqueViolation { .. }
+                if first =>
+            {
+                lost_race("another event-search runner claimed this generation first")
+            }
+            EngineError::ConditionalUpdateConflict { .. } | EngineError::UniqueViolation { .. } => {
+                stale_claim("event-search generation changed while its batch was claimed")
+            }
+            other => map_engine_err(other),
+        })?;
+    if let Some(held) = taken {
+        *run_claim = Some(held);
+    }
     Ok(ClaimResult::Work(Box::new(Claim {
         publication_event_count,
         generation: generation.clone(),
-        owner_token,
-        lease_epoch,
-        expires_at,
         connector_id: connector,
         source_instance_ref: source,
         session_ref: session,
-        start_sequence,
         end_sequence,
         cursor_sha256,
         passage_ordinal,
@@ -5237,7 +5238,6 @@ fn guard_generation_for_claim_in_tx(
     tx: TxId,
     generation: &Generation,
 ) -> Result<()> {
-    guard_attempt_in_tx(store, tx, generation)?;
     let result = store
         .internal_db()
         .execute_in_tx(
@@ -5757,7 +5757,6 @@ fn render_and_embed(
     profile: &EventSearchProfile,
     bounds: Bounds,
     embedding_workers: NonZeroUsize,
-    renew: &mut dyn FnMut(i64) -> Result<i64>,
     observations: &mut RunObservations,
 ) -> Result<Rendered> {
     let embed_before = observations.embed;
@@ -5769,7 +5768,6 @@ fn render_and_embed(
             profile,
             bounds,
             embedding_workers,
-            renew,
             observations,
         )
     });
@@ -5779,12 +5777,11 @@ fn render_and_embed(
 }
 
 fn render_and_embed_inner(
-    mut claim: Claim,
+    claim: Claim,
     registration: &crate::EmbedderRegistration,
     profile: &EventSearchProfile,
     bounds: Bounds,
     embedding_workers: NonZeroUsize,
-    renew: &mut dyn FnMut(i64) -> Result<i64>,
     observations: &mut RunObservations,
 ) -> Result<Rendered> {
     validate_profile_for_registration(profile, registration)?;
@@ -5815,12 +5812,6 @@ fn render_and_embed_inner(
         ));
     }
     let mut excluded = 0_u64;
-    // Preparation and embedding can each outlast the lease. The same owned renewal reaches
-    // oversized candidate selection; the renewed expiry is what the commit guard checks.
-    let mut lease = LeaseRenewal {
-        expires_at: claim.expires_at,
-        renew,
-    };
     // How many leading events rendered within the passage bound: a claim of just those never
     // exceeds it, because their trailing group stays open for the next claim.
     let mut fitting_events = 0_usize;
@@ -5828,7 +5819,6 @@ fn render_and_embed_inner(
         if passages.len() <= bounds.passages {
             fitting_events = index;
         }
-        lease.keep()?;
         let Some(unit) = render_unit(event) else {
             excluded += 1;
             continue;
@@ -5857,7 +5847,6 @@ fn render_and_embed_inner(
                 profile,
                 hard,
                 (claim.events.len() > 1).then(|| bounds.passages - passages.len()),
-                &mut lease,
             )?;
             match slices {
                 OversizedPassages::Complete(slices) => passages.extend(slices),
@@ -5901,7 +5890,6 @@ fn render_and_embed_inner(
         .map(|unit| unit.event.membership_id)
         .collect::<Vec<_>>();
     let final_ordinary_start = ordinary.first().map(|unit| unit.event.event.seq);
-    lease.keep()?;
     if claim.session_ended {
         emit_ordinary(
             &claim,
@@ -5922,15 +5910,7 @@ fn render_and_embed_inner(
     if passages.len() > bounds.passages && claim.events.len() > 1 {
         return Ok(over_passage_bound(&claim, fitting_events));
     }
-    let passages = embed_passages(
-        passages,
-        &mut lease,
-        registration,
-        embedding_workers,
-        bounds,
-        observations,
-    )?;
-    claim.expires_at = lease.expires_at;
+    let passages = embed_passages(passages, registration, embedding_workers, observations)?;
     Ok(Rendered::Batch(Box::new(BuiltBatch {
         claim,
         passages,
@@ -6071,11 +6051,9 @@ fn build_oversized_passages(
     profile: &EventSearchProfile,
     hard: usize,
     remaining_allowance: Option<usize>,
-    lease: &mut LeaseRenewal<'_>,
 ) -> Result<OversizedPassages> {
     let overlap =
         usize::try_from(profile.oversized_event_overlap_tokens.get()).unwrap_or(usize::MAX);
-    lease.keep()?;
     let prepared_body = registration.embedder.prepare_document(&unit.body)?;
     let body_spans = prepared_body
         .byte_boundaries()
@@ -6110,7 +6088,6 @@ fn build_oversized_passages(
     let mut start = 0_usize;
     let mut passages = Vec::new();
     while start < unit.body.len() {
-        lease.keep()?;
         let first_span = spans.first_at_or_after(start);
         // Only the ORIGINAL span count is monotone. The first span above hard + loss
         // supplies an exclusive endpoint ceiling; duplicate spans each consume one count.
@@ -6121,7 +6098,6 @@ fn build_oversized_passages(
         let retained_start = candidate_ends[..retained_end].partition_point(|end| *end <= start);
         let mut selected = None;
         for &end in candidate_ends[retained_start..retained_end].iter().rev() {
-            lease.keep()?;
             let text = format!("{}{}", unit.prefix, &unit.body[start..end]);
             let prepared = registration.embedder.prepare_document(&text)?;
             if prepared.token_count() <= hard {
@@ -6379,20 +6355,18 @@ struct PendingPassage {
 }
 
 /// The most passages one forward call embeds. Bounds the padded batch the model holds at once
-/// (activations grow with batch size and with the square of the longest passage), and so how long
-/// any single call can run between lease renewals.
+/// (activations grow with batch size and with the square of the longest passage).
 const PASSAGES_PER_FORWARD_CALL: usize = 1;
 
 /// Embed a claim's rendered passages in bounded waves of scoped forward calls, one prepared
 /// passage per call. Work is admitted in prepared-length order while results return to their
-/// rendered-order slots. The coordinator renews the claim while each wave is running and joins the
-/// whole wave before it either admits more work or returns an error.
+/// rendered-order slots. The coordinator joins the whole wave before it either admits more work or
+/// returns an error. The claim needs no attention meanwhile: its holder lock lasts as long as this
+/// process does.
 fn embed_passages(
     pending: Vec<PendingPassage>,
-    lease: &mut LeaseRenewal<'_>,
     registration: &crate::EmbedderRegistration,
     embedding_workers: NonZeroUsize,
-    bounds: Bounds,
     observations: &mut RunObservations,
 ) -> Result<Vec<BuiltPassage>> {
     let mut order = (0..pending.len()).collect::<Vec<_>>();
@@ -6402,10 +6376,8 @@ fn embed_passages(
         embed_passages_in_waves(
             &pending,
             &order,
-            lease,
             registration,
             embedding_workers,
-            bounds,
             &mut observations.embedding_invocations,
             helper_pools.as_deref(),
         )
@@ -6453,26 +6425,20 @@ fn concurrent_embedding_helper_pools(
     Ok(Some(pools))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn embed_passages_in_waves(
     pending: &[PendingPassage],
     order: &[usize],
-    lease: &mut LeaseRenewal<'_>,
     registration: &crate::EmbedderRegistration,
     embedding_workers: NonZeroUsize,
-    bounds: Bounds,
     entered_calls: &mut u64,
     helper_pools: Option<&[rayon::ThreadPool]>,
 ) -> Result<Vec<Option<crate::EmbeddingOutput>>> {
     let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<_>>();
     for wave in order.chunks(embedding_workers.get()) {
-        lease.keep()?;
         run_embedding_wave(
             pending,
             wave,
-            lease,
             registration,
-            bounds,
             entered_calls,
             helper_pools,
             &mut outputs,
@@ -6481,19 +6447,15 @@ fn embed_passages_in_waves(
     Ok(outputs)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_embedding_wave(
     pending: &[PendingPassage],
     wave: &[usize],
-    lease: &mut LeaseRenewal<'_>,
     registration: &crate::EmbedderRegistration,
-    bounds: Bounds,
     entered_calls: &mut u64,
     helper_pools: Option<&[rayon::ThreadPool]>,
     outputs: &mut [Option<crate::EmbeddingOutput>],
 ) -> Result<()> {
     let mut first_worker_error = None;
-    let mut first_lease_error = None;
     let mut panic = None;
     std::thread::scope(|scope| {
         let (completed, completions) = sync_channel(wave.len());
@@ -6520,7 +6482,7 @@ fn run_embedding_wave(
             match spawn {
                 Ok(handle) => {
                     // A successful spawn unconditionally enters its call. All handles are joined,
-                    // including on error, panic and stale lease, before this count is observed.
+                    // including on error and panic, before this count is observed.
                     *entered_calls += 1;
                     handles.push(handle);
                 }
@@ -6542,46 +6504,36 @@ fn run_embedding_wave(
 
         let mut received = 0_usize;
         while received < handles.len() {
-            match completions.recv_timeout(lease_poll_interval(bounds)) {
-                Ok((index, result)) => {
-                    received += 1;
-                    match result {
-                        Ok(mut result) if result.len() == PASSAGES_PER_FORWARD_CALL => {
-                            if first_worker_error.is_none() {
-                                let output = result.pop().expect("one checked passage vector");
-                                match validate_passage_embedding_output(&output, registration) {
-                                    Ok(()) if first_lease_error.is_none() => {
-                                        outputs[index] = Some(output);
-                                    }
-                                    Ok(()) => {}
-                                    Err(error) => {
-                                        first_worker_error = Some(error);
-                                    }
-                                }
+            // Block until the next call finishes; every spawned call sends exactly once.
+            let Ok((index, result)) = completions.recv() else {
+                break;
+            };
+            received += 1;
+            match result {
+                Ok(mut result) if result.len() == PASSAGES_PER_FORWARD_CALL => {
+                    if first_worker_error.is_none() {
+                        let output = result.pop().expect("one checked passage vector");
+                        match validate_passage_embedding_output(&output, registration) {
+                            Ok(()) => {
+                                outputs[index] = Some(output);
+                            }
+                            Err(error) => {
+                                first_worker_error = Some(error);
                             }
                         }
-                        Ok(_) => {
-                            first_worker_error.get_or_insert_with(|| {
-                                CgError::Engine(
-                                    "event-search embedder returned the wrong number of passage vectors"
-                                        .into(),
-                                )
-                            });
-                        }
-                        Err(error) => {
-                            first_worker_error.get_or_insert(error);
-                        }
-                    }
-                    if let Err(error) = lease.keep() {
-                        first_lease_error.get_or_insert(error);
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    if let Err(error) = lease.keep() {
-                        first_lease_error.get_or_insert(error);
-                    }
+                Ok(_) => {
+                    first_worker_error.get_or_insert_with(|| {
+                        CgError::Engine(
+                            "event-search embedder returned the wrong number of passage vectors"
+                                .into(),
+                        )
+                    });
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(error) => {
+                    first_worker_error.get_or_insert(error);
+                }
             }
         }
         for handle in handles {
@@ -6595,11 +6547,7 @@ fn run_embedding_wave(
     if let Some(payload) = panic {
         std::panic::resume_unwind(payload);
     }
-    first_worker_error.or(first_lease_error).map_or(Ok(()), Err)
-}
-
-fn lease_poll_interval(bounds: Bounds) -> Duration {
-    Duration::from_millis((bounds.lease_ms / 6).max(1))
+    first_worker_error.map_or(Ok(()), Err)
 }
 
 fn validate_passage_embedding(
@@ -6640,6 +6588,7 @@ fn commit_batch(
     profile: &EventSearchProfile,
     bounds: Bounds,
     built: BuiltBatch,
+    held: &HeldClaim,
     observations: &mut RunObservations,
 ) -> Result<()> {
     let tx = store.begin_tx()?;
@@ -6650,6 +6599,7 @@ fn commit_batch(
         bounds,
         tx,
         &built,
+        held,
         observations,
     );
     if let Err(error) = outcome {
@@ -6675,6 +6625,7 @@ fn commit_batch(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_batch_in_tx(
     store: &Store,
     registration: &crate::EmbedderRegistration,
@@ -6682,66 +6633,20 @@ fn commit_batch_in_tx(
     bounds: Bounds,
     tx: TxId,
     built: &BuiltBatch,
+    held: &HeldClaim,
     observations: &mut RunObservations,
 ) -> Result<()> {
     let claim = &built.claim;
-    guard_attempt_in_tx(store, tx, &claim.generation)?;
-    if now_millis()? >= claim.expires_at {
-        return Err(stale_claim("event-search claim expired before commit"));
+    // Publication is fenced on this run's exact claim. A claim taken over, released or forgotten
+    // since it was taken refuses the whole batch and stops the run; no clock decides anything
+    // here. While the claim is live nobody can record a newer attempt, so a superseded attempt
+    // means the generation moved to another owner too.
+    if !held.fence_in_tx(store, tx)? {
+        return Err(lost_claim(
+            "its claim was taken over, released or forgotten",
+        ));
     }
-    let lease = store.internal_db().execute_in_tx(
-        tx,
-        "SELECT generation_id, context_id, owner_token, lease_epoch, claimed_connector_id, claimed_source_instance_ref, claimed_start_sequence, claimed_end_sequence, cursor_sha256, expires_at FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id",
-        &HashMap::from([
-            ("context_id".into(), Value::Uuid(claim.generation.context_id.as_uuid())),
-            ("generation_id".into(), Value::Uuid(claim.generation.id.as_uuid())),
-        ]),
-    ).map_err(map_engine_err)?;
-    let row = lease
-        .rows
-        .first()
-        .ok_or_else(|| stale_claim("event-search claim no longer exists"))?;
-    if lease.rows.len() != 1
-        || get_text(row, &lease.columns, "owner_token")? != claim.owner_token
-        || get_i64(row, &lease.columns, "lease_epoch")? != claim.lease_epoch
-        || get_text(row, &lease.columns, "claimed_connector_id")? != claim.connector_id
-        || get_text(row, &lease.columns, "claimed_source_instance_ref")?
-            != claim.source_instance_ref
-        || get_u64(row, &lease.columns, "claimed_start_sequence")? != claim.start_sequence
-        || get_u64(row, &lease.columns, "claimed_end_sequence")? != claim.end_sequence
-        || get_text(row, &lease.columns, "cursor_sha256")? != claim.cursor_sha256
-        || get_timestamp(row, &lease.columns, "expires_at")? != claim.expires_at
-    {
-        return Err(stale_claim("event-search claim ownership or range changed"));
-    }
-    let guard_values = exact_conditions(
-        row,
-        &lease.columns,
-        &[
-            "context_id",
-            "owner_token",
-            "lease_epoch",
-            "claimed_connector_id",
-            "claimed_source_instance_ref",
-            "claimed_start_sequence",
-            "claimed_end_sequence",
-            "cursor_sha256",
-            "expires_at",
-        ],
-    )?;
-    let guarded = store
-        .internal_db()
-        .guard_row_conditions_in_tx(
-            tx,
-            "event_search_leases",
-            "generation_id",
-            &Value::Uuid(claim.generation.id.as_uuid()),
-            &guard_values,
-        )
-        .map_err(map_engine_err)?;
-    if !guarded {
-        return Err(stale_claim("event-search claim changed during commit"));
-    }
+    guard_attempt_in_tx(store, tx, &claim.generation).map_err(as_lost_claim)?;
 
     let generation = store.internal_db().execute_in_tx(
         tx,
@@ -7114,21 +7019,6 @@ fn commit_batch_in_tx(
             ("id".into(), Value::Uuid(claim.generation.id.as_uuid())),
         ]),
     ).map_err(map_engine_err)?;
-    let deleted = store.internal_db().execute_in_tx(
-        tx,
-        "DELETE FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id AND owner_token = $owner_token AND lease_epoch = $lease_epoch",
-        &HashMap::from([
-            ("context_id".into(), Value::Uuid(claim.generation.context_id.as_uuid())),
-            ("generation_id".into(), Value::Uuid(claim.generation.id.as_uuid())),
-            ("owner_token".into(), Value::Text(claim.owner_token.clone())),
-            ("lease_epoch".into(), Value::Int64(claim.lease_epoch)),
-        ]),
-    ).map_err(map_engine_err)?;
-    if deleted.rows_affected != 1 {
-        return Err(stale_claim(
-            "event-search owned claim disappeared before its committed lease deletion",
-        ));
-    }
     Ok(())
 }
 
@@ -7499,6 +7389,7 @@ fn upsert_cursor_in_tx(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn finish_or_continue(
     store: &Store,
     generation: &Generation,
@@ -7508,6 +7399,7 @@ fn finish_or_continue(
     selection: InterpretationSelection,
     retry_count: u64,
     observations: &mut RunObservations,
+    run_claim: Option<&HeldClaim>,
 ) -> Result<FinishResult> {
     let mut connectors = event_connectors(store, generation.context_id)?;
     let explicit_connector = match selection {
@@ -7551,6 +7443,7 @@ fn finish_or_continue(
         bounds,
         retry_count,
         observations,
+        run_claim,
     )? {
         Some(receipt) => Ok(FinishResult::Ready(Box::new(receipt))),
         None => Ok(FinishResult::Continue(Box::new(next))),
@@ -7566,6 +7459,7 @@ fn finish_stable(
     bounds: Bounds,
     retry_count: u64,
     observations: &mut RunObservations,
+    run_claim: Option<&HeldClaim>,
 ) -> Result<Option<EventSearchBuildReceipt>> {
     let tx = store.begin_tx()?;
     if let Err(error) = guard_attempt_in_tx(store, tx, generation) {
@@ -7758,6 +7652,22 @@ fn finish_stable(
     let rendered = get_u64(row, &result.columns, "rendered_event_count")?;
     let embedded = get_u64(row, &result.columns, "embedded_event_count")?;
     let failed = get_u64(row, &result.columns, "failed_event_count")?;
+    // The generation's completion and the end of this run's claim on it commit together.
+    if let Some(held) = run_claim {
+        match held.finish_in_tx(store, tx) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = store.internal_db().rollback(tx);
+                return Err(lost_claim(
+                    "its claim moved before the generation completed",
+                ));
+            }
+            Err(error) => {
+                let _ = store.internal_db().rollback(tx);
+                return Err(error);
+            }
+        }
+    }
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     if let Some(hook) = BEFORE_COMPLETION_COMMIT.with(|slot| slot.borrow_mut().take()) {
         hook(store);
@@ -8614,15 +8524,6 @@ fn get_optional_interpretation_id(
     }
 }
 
-fn get_timestamp(row: &[Value], columns: &[String], name: &str) -> Result<i64> {
-    match row.get(column_index(columns, name)?) {
-        Some(Value::Timestamp(value)) => Ok(*value),
-        other => Err(CgError::Engine(format!(
-            "column {name}: expected timestamp, got {other:?}"
-        ))),
-    }
-}
-
 fn get_optional_timestamp(
     row: &[Value],
     columns: &[String],
@@ -8671,11 +8572,6 @@ fn optional_integer(value: Option<u64>, name: &str) -> Result<Value> {
         .map(|value| value.unwrap_or(Value::Null))
 }
 
-fn now_millis() -> Result<i64> {
-    i64::try_from(Wallclock::now().0)
-        .map_err(|_| CgError::Engine("system timestamp exceeds engine TIMESTAMP".into()))
-}
-
 fn claim_hash<'a>(events: impl IntoIterator<Item = &'a ClaimedEvent>) -> String {
     let mut digest = Sha256::new();
     digest.update(b"context-graph/event-search-claim/v1");
@@ -8689,11 +8585,56 @@ fn claim_hash<'a>(events: impl IntoIterator<Item = &'a ClaimedEvent>) -> String 
     finish_hash(digest)
 }
 
+const STALE_CLAIM: &str = "event-search claim refused: ";
+/// This run's claim was taken over, released or forgotten: the run publishes nothing more and does
+/// not retry, because another owner, or a forget, now decides the generation.
+const LOST_CLAIM: &str = "event-search claim refused: this run no longer owns its generation";
+/// Another runner reached the generation first: a standalone run reads again and waits on it.
+const LOST_RACE: &str = "event-search claim refused: another run reached this generation first";
+
 fn stale_claim(reason: &str) -> CgError {
-    CgError::Engine(format!("event-search claim refused: {reason}"))
+    CgError::Engine(format!("{STALE_CLAIM}{reason}"))
 }
 fn is_stale_claim(error: &CgError) -> bool {
-    matches!(error, CgError::Engine(message) if message.starts_with("event-search claim refused:"))
+    matches!(error, CgError::Engine(message) if message.starts_with(STALE_CLAIM))
+}
+fn lost_claim(reason: &str) -> CgError {
+    CgError::Engine(format!("{LOST_CLAIM} ({reason})"))
+}
+fn lost_race(reason: &str) -> CgError {
+    CgError::Engine(format!("{LOST_RACE} ({reason})"))
+}
+fn is_lost_claim(error: &CgError) -> bool {
+    matches!(error, CgError::Engine(message) if message.starts_with(LOST_CLAIM))
+}
+fn is_lost_race(error: &CgError) -> bool {
+    matches!(error, CgError::Engine(message) if message.starts_with(LOST_RACE))
+}
+/// A stale refusal this run may answer by claiming the batch again under the claim it still holds.
+fn is_retryable_stale(error: &CgError) -> bool {
+    is_stale_claim(error) && !is_lost_claim(error) && !is_lost_race(error)
+}
+fn stale_reason(error: &CgError) -> Option<&str> {
+    match error {
+        CgError::Engine(message) => message.strip_prefix(STALE_CLAIM),
+        _ => None,
+    }
+}
+/// A stale refusal met while a run still had to win the generation: a lost race. Anything else
+/// passes through unchanged.
+fn as_lost_race(error: CgError) -> CgError {
+    match stale_reason(&error) {
+        Some(reason) if !is_lost_claim(&error) && !is_lost_race(&error) => lost_race(reason),
+        _ => error,
+    }
+}
+/// A stale refusal met while a run held the generation: its ownership moved. Anything else passes
+/// through unchanged.
+fn as_lost_claim(error: CgError) -> CgError {
+    match stale_reason(&error) {
+        Some(reason) if !is_lost_claim(&error) && !is_lost_race(&error) => lost_claim(reason),
+        _ => error,
+    }
 }
 fn json_error(error: serde_json::Error) -> CgError {
     CgError::Engine(format!("event-search JSON encoding failed: {error}"))
@@ -8963,13 +8904,9 @@ mod bounded_preparation_tests {
                 pending_dual_head_activation: false,
                 mode: GenerationMode::Building,
             },
-            owner_token: "proof".into(),
-            lease_epoch: 1,
-            expires_at: 10,
             connector_id: "proof".into(),
             source_instance_ref: "proof".into(),
             session_ref: "proof".into(),
-            start_sequence: 1,
             end_sequence: bodies.len() as u64,
             cursor_sha256: String::new(),
             passage_ordinal: 0,
@@ -9053,11 +8990,6 @@ mod bounded_preparation_tests {
         registration: &crate::EmbedderRegistration,
         profile: &EventSearchProfile,
     ) -> Vec<PendingPassage> {
-        let mut renew = |expiry| Ok(expiry);
-        let mut lease = LeaseRenewal {
-            expires_at: 10,
-            renew: &mut renew,
-        };
         match build_oversized_passages(
             claim,
             0,
@@ -9066,7 +8998,6 @@ mod bounded_preparation_tests {
             profile,
             profile.hard_passage_tokens.get() as usize,
             None,
-            &mut lease,
         )
         .unwrap()
         {
@@ -9238,25 +9169,19 @@ mod bounded_preparation_tests {
 
     #[test]
     #[cfg(context_graph_internal_test_support)]
-    fn bounded_preparation_single_event_completes_and_renews_inside_candidate_loop() {
+    fn bounded_preparation_single_event_completes_inside_candidate_loop() {
         let body = "α".repeat(512);
         let (inner, work_receiver) = scalar_preparer(false, false, None);
         let registration = registration(Arc::new(BoundedScalarPreparer {
             inner: inner.clone(),
             loss: 0,
         }));
-        let mut keeps = 0;
-        let mut renew = |expiry| {
-            keeps += 1;
-            Ok(expiry + 1)
-        };
         let result = render_and_embed_inner(
             fixture_claim(&[&body]),
             &registration,
             &small_profile(),
-            bounds(8, 1, 8192, 1000),
+            bounds(8, 1, 8192),
             NonZeroUsize::MIN,
-            &mut renew,
             &mut RunObservations::default(),
         )
         .unwrap();
@@ -9264,36 +9189,8 @@ mod bounded_preparation_tests {
             panic!("single oversized event is unlimited");
         };
         assert!(batch.passages.len() > 1);
-        assert_eq!(batch.claim.expires_at, 10 + keeps);
         let work = preparation_work(&work_receiver);
-        assert!(
-            keeps as usize >= work.calls,
-            "renewal checks must reach candidate preparation: {keeps} for {work:?}"
-        );
         assert_eq!(work.embeds, batch.passages.len());
-
-        // An ownership refusal during preparation stops before any inference; it never invents
-        // a replacement lease or swallows the caller's stale-claim result.
-        let (inner, work_receiver) = scalar_preparer(false, false, None);
-        let mut keeps = 0;
-        let result = render_and_embed_inner(
-            fixture_claim(&[&body]),
-            &registration_for_bound(inner.clone()),
-            &small_profile(),
-            bounds(8, 1, 8192, 1000),
-            NonZeroUsize::MIN,
-            &mut |expiry| {
-                keeps += 1;
-                if keeps == 5 {
-                    Err(stale_claim("proof takeover"))
-                } else {
-                    Ok(expiry + 1)
-                }
-            },
-            &mut RunObservations::default(),
-        );
-        assert!(result.is_err_and(|error| is_stale_claim(&error)));
-        assert_eq!(preparation_work(&work_receiver).embeds, 0);
     }
 
     fn registration_for_bound(inner: Arc<ScalarPreparer>) -> crate::EmbedderRegistration {
@@ -9504,9 +9401,8 @@ mod bounded_preparation_tests {
             fixture_claim(&[&body, "DO_NOT_PREPARE"]),
             &registration(embedder.clone()),
             &small_profile(),
-            bounds(8, 1, 8192, 1000),
+            bounds(8, 1, 8192),
             NonZeroUsize::MIN,
-            &mut |expiry| Ok(expiry + 1),
             &mut RunObservations::default(),
         )
         .unwrap();
@@ -9534,9 +9430,8 @@ mod bounded_preparation_tests {
             ]),
             &registration(embedder.clone()),
             &small_profile(),
-            bounds(8, 1, 8192, 1000),
+            bounds(8, 1, 8192),
             NonZeroUsize::MIN,
-            &mut |expiry| Ok(expiry),
             &mut RunObservations::default(),
         )
         .unwrap();

@@ -18,7 +18,8 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 use contextdb_core::{Value as DbValue, VectorIndexRef};
 use contextdb_engine::work_ledger::{
-    self, InputRef, JobSpec, add_job_input_in_tx, job_state, job_state_counts, submit_job_in_tx,
+    self, InputRef, JobSpec, JobState, add_job_input_in_tx, job_state, job_state_counts,
+    submit_job_in_tx,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -97,6 +98,9 @@ pub struct Tier0CaptureReport {
     pub raw_bytes: usize,
     /// Pending understanding jobs in the capture context after this capture (ledger job state).
     pub pending_after: usize,
+    /// Whether `pending_after` could be read back after the capture committed; it is zero while
+    /// `Unavailable`.
+    pub pending_after_readback: crate::Readback,
     /// Always zero — tier-0 never calls a model.
     pub model_calls: usize,
     /// The session handle these digests were grouped under.
@@ -105,11 +109,16 @@ pub struct Tier0CaptureReport {
     pub digest_ids: Vec<DigestId>,
 }
 
-/// Understanding-job counts for one context, by state (computed over the work ledger).
+/// Understanding-job counts for one context, by state (computed over the work ledger and the
+/// shared background-work claims).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueCounts {
     pub pending: usize,
+    /// Digests a live drain is understanding right now, here or on another machine.
     pub in_flight: usize,
+    /// Digests a local drain was understanding when it died (killed, crashed, machine restarted).
+    /// The next drain claims them at once.
+    pub interrupted: usize,
     pub structured: usize,
     pub failed: usize,
     pub skipped: usize,
@@ -227,7 +236,9 @@ pub(crate) fn capture_tier0_inner(
             return Err(err);
         }
     }
-    report.pending_after = queue_counts(store, context.id)?.pending;
+    report.pending_after = store
+        .post_commit_readback(|| queue_counts(store, context.id))?
+        .pending;
     Ok(report)
 }
 
@@ -582,6 +593,44 @@ pub fn queue_counts_observed(
             Ok(())
         },
     )?;
+    // The ledger leases a local attempt until it records a result or failure, so a digest whose
+    // local drain died still reads as leased there. Its shared claim tells the truth: a claim whose
+    // drain is gone is interrupted, not in flight.
+    let mut claims = Vec::new();
+    reads.for_each_page(
+        "SELECT unit_id, owner_token FROM background_claims WHERE work = $work AND context_id = $context_id",
+        &HashMap::from([
+            (
+                "work".to_string(),
+                DbValue::Text(crate::BackgroundWork::Understanding.as_str().to_string()),
+            ),
+            (
+                "context_id".to_string(),
+                DbValue::Uuid(context_id.as_uuid()),
+            ),
+        ]),
+        |rows| {
+            for row in rows {
+                if let (Some(DbValue::Uuid(unit)), Some(DbValue::Uuid(token))) =
+                    (row.first(), row.get(1))
+                {
+                    claims.push((DigestId::from(*unit), *token));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    for (digest_id, token) in claims {
+        if crate::store::background_claim::holder_present(store.db_path(), token)? {
+            continue;
+        }
+        let state = job_state(db, &understanding_job_id(digest_id), ledger_clock_ms())
+            .map_err(map_engine)?;
+        if matches!(&state, JobState::Leased { node_id, .. } if node_id == LOCAL_NODE_ID) {
+            counts.in_flight = counts.in_flight.saturating_sub(1);
+            counts.interrupted += 1;
+        }
+    }
     Ok(counts)
 }
 

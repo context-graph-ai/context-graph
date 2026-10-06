@@ -5,7 +5,7 @@
 #![cfg(context_graph_internal_test_support)]
 
 use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -244,7 +244,6 @@ fn project(store: &Store, context_id: ContextId) {
             max_events_per_batch: NonZeroU32::new(8).unwrap(),
             max_passages_per_batch: NonZeroU32::new(8).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(64 * 1024).unwrap(),
-            lease_duration_ms: NonZeroU64::new(5_000).unwrap(),
         })
         .expect("projection completes");
 }

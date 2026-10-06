@@ -12,7 +12,7 @@ event identity, SQL, or embedding. This crate consumes no ContextDB read route o
 | Change | Entry point / caller |
 |---|---|
 | Config-file IO | `load_text_if_present`; CLI parses the returned text |
-| Worker exclusivity | `acquire_worker_lock`; `context_graph::fabric` and CLI worker consume it |
+| Worker exclusivity | `acquire_worker_lock` (refuses while held); `acquire_worker_lock_blocking` (waits in the kernel until the holder releases or exits); `context_graph::fabric` and CLI worker consume them |
 | Latest request replacement | `read_event_search_worker_policy`, `write_event_search_worker_policy` |
 | Published request size ceiling | `EVENT_SEARCH_WORKER_POLICY_MAX_BYTES`; callers reserve space before publication |
 | Serialized request update | `acquire_event_search_worker_policy_update` |

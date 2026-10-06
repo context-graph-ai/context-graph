@@ -169,6 +169,51 @@ fn run(args: Vec<String>) -> i32 {
         print_json(&json!({"ok": false, "state": "config_error", "message": message}));
         return 1;
     }
+    let code = dispatch(&args, read_memory_limit_bytes);
+    if opens_data_root(&args) {
+        // Background work a crash, a kill or a machine restart interrupted resumes on whatever
+        // command runs next, not only on the next import.
+        history::resume_pending_background_work(&data_root());
+    }
+    code
+}
+
+/// Whether this invocation opens the data root's memory store, after which interrupted background
+/// work is resumed. Help, version, model-provider diagnostics, agent hook wiring, unknown commands
+/// and the hidden worker itself do not.
+fn opens_data_root(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|command| STORE_COMMANDS.contains(&command.as_str()))
+}
+
+/// The top-level commands that open the data root's memory store.
+const STORE_COMMANDS: &[&str] = &[
+    "model",
+    "record",
+    "import",
+    "find",
+    "show",
+    "forget",
+    "understand",
+    "worker",
+    "query",
+    "sync",
+    "impact",
+    "changed",
+    "by-intention",
+    "by-entity",
+    "status",
+    "hook",
+    "fix",
+    "drop",
+    "group",
+    "undo",
+    "skills",
+    "review",
+    "why",
+];
+
+fn dispatch(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize) -> i32 {
     match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") => {
             print_help();
@@ -455,12 +500,14 @@ fn maybe_kick_understanding_worker(args: &[String]) {
     let Ok(exe) = env::current_exe() else {
         return;
     };
-    let _ = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .args(["understand", "--worker"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    history::detach_from_spawner_descriptors(&mut command);
+    let _ = command.spawn();
 }
 
 /// Current wall-clock time in unix epoch milliseconds, for the retention window comparison.
@@ -1075,7 +1122,8 @@ fn drain_context_queue(
                     }
                 })
         else {
-            // Model connection vanished mid-drain; leave the claim to time out on a later run.
+            // Model connection vanished mid-drain. The claim ends with this process, and the next
+            // drain takes the digest over at once.
             counts.claim_skipped += 1;
             continue;
         };
@@ -3432,6 +3480,7 @@ fn add_memory_status_fields(value: &mut Value, snapshot: &MemoryStatusSnapshot) 
             json!({
                 "pending": snapshot.queue.pending,
                 "in_flight": snapshot.queue.in_flight,
+                "interrupted": snapshot.queue.interrupted,
                 "structured": snapshot.queue.structured,
                 "failed": snapshot.queue.failed,
                 "skipped": snapshot.queue.skipped,

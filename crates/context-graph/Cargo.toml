@@ -13,8 +13,9 @@ path = "src/lib.rs"
 
 [features]
 default = ["nomic-embedder"]
-# Private controls: activated by this crate's dev dependency, never by release defaults.
-test-support = []
+# Private controls: activated by this crate's dev dependency, never by release defaults. The
+# background-work claim seams reach contextdb's holder-presence seams, so they come along.
+test-support = ["contextdb-engine/test-seams"]
 nomic-embedder = [
     "dep:candle-core",
     "dep:candle-nn",

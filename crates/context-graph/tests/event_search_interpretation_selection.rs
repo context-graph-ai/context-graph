@@ -3,7 +3,7 @@
 #![cfg(context_graph_internal_test_support)]
 
 use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use context_graph::embedder::{
@@ -257,7 +257,6 @@ fn search_build_request(
         max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch size"),
         max_passages_per_batch: NonZeroU32::new(8).expect("nonzero batch size"),
         max_bytes_per_batch: NonZeroUsize::new(4_096).expect("nonzero byte size"),
-        lease_duration_ms: NonZeroU64::new(1_000).expect("nonzero lease duration"),
     }
 }
 
@@ -275,7 +274,6 @@ fn staged_rebuild_request(
         max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch size"),
         max_passages_per_batch: NonZeroU32::new(8).expect("nonzero batch size"),
         max_bytes_per_batch: NonZeroUsize::new(4_096).expect("nonzero byte size"),
-        lease_duration_ms: NonZeroU64::new(1_000).expect("nonzero lease duration"),
     }
 }
 
@@ -329,7 +327,6 @@ fn ready_unactivated_interpretation_changes_only_the_explicit_staged_search_gene
         contract,
         max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch size"),
         max_bytes_per_batch: NonZeroUsize::new(4_096).expect("nonzero byte size"),
-        lease_duration_ms: NonZeroU64::new(1_000).expect("nonzero lease duration"),
     })
     .expect("released runner builds a ready interpretation from retained capture");
     assert_eq!(

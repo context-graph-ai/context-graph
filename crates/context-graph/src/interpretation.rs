@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -251,6 +251,9 @@ pub struct InterpretationContextStatus {
     pub uncovered_gap_count: u64,
     pub state: Option<InterpretationGenerationState>,
     pub sanitized_failure: Option<String>,
+    /// Whether a live builder holds a claim on one of this connector's generations, a builder that
+    /// held one has exited (crash, kill, restart), or nothing holds a claim.
+    pub work: crate::BackgroundWorkState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,7 +272,6 @@ pub struct InterpretationBuildRequest {
     pub contract: Arc<dyn InstalledInterpretationContract>,
     pub max_events_per_batch: NonZeroU32,
     pub max_bytes_per_batch: NonZeroUsize,
-    pub lease_duration_ms: NonZeroU64,
 }
 
 impl fmt::Debug for InterpretationBuildRequest {
@@ -286,7 +288,6 @@ impl fmt::Debug for InterpretationBuildRequest {
             .field("contract_declaration", self.contract.declaration())
             .field("max_events_per_batch", &self.max_events_per_batch)
             .field("max_bytes_per_batch", &self.max_bytes_per_batch)
-            .field("lease_duration_ms", &self.lease_duration_ms)
             .finish()
     }
 }

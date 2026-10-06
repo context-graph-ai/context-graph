@@ -42,6 +42,8 @@ contextdb-core.workspace = true
 contextdb-engine.workspace = true
 contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9", features = ["iroh"] }
 fs4.workspace = true
+# Marks inherited descriptors close-on-exec when the detached search worker is spawned.
+libc = "0.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true

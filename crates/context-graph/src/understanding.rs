@@ -10,6 +10,13 @@
 //! success (the ledger job's computed state reads `structured`), or a recorded failure that re-queues
 //! below the attempt cap and turns the job terminally `failed` at the cap.
 //!
+//! A local drain owns each digest it claims through the shared background-work claim
+//! ([`crate::background_work`]): the ledger records the attempt, and the shared claim is what keeps
+//! two local drains apart and proves the claiming drain is alive. The claim lasts until the drain
+//! records the digest's result or failure, or its process exits. A drain that dies mid-digest —
+//! killed, crashed, the machine restarted — leaves the digest interrupted, and the next drain, from
+//! any process, offers and claims it at once instead of waiting on a lease.
+//!
 //! The private `cg_understanding_queue` table is retired: the ledger's computed job state
 //! (`work_jobs`/`work_claims`/`work_failures`/`work_cancellations`, plus the retained write-once
 //! `cg_understanding_completions` marker) subsumes the queue's pending/in_flight/attempts/status role,
@@ -25,10 +32,83 @@ use contextdb_engine::work_ledger::{
     ClaimInsert, JobState, insert_claim, job_state, next_attempt, record_failure,
 };
 
+use crate::store::background_claim::{
+    ClaimKey, Taken, abandon_kept, fence_kept_in_tx, finish_kept_in_tx, kept_token, release_kept,
+};
 use crate::tier0::{
     LOCAL_NODE_ID, context_digests, job_exists, ledger_clock_ms, map_engine, understanding_job_id,
 };
-use crate::{ContextId, DigestId, Result, Store};
+use crate::{BackgroundWork, BackgroundWorkState, CgError, ContextId, DigestId, Result, Store};
+
+fn digest_claim(context_id: ContextId, digest_id: DigestId) -> ClaimKey {
+    ClaimKey::new(
+        BackgroundWork::Understanding,
+        context_id,
+        digest_id.as_uuid(),
+    )
+}
+
+/// The Context a captured digest belongs to, or `None` when it no longer exists.
+fn digest_context(store: &Store, digest_id: DigestId) -> Result<Option<ContextId>> {
+    let result = store.read_query(
+        "SELECT context_id FROM digests WHERE id = $id",
+        &HashMap::from([("id".to_string(), DbValue::Uuid(digest_id.as_uuid()))]),
+    )?;
+    Ok(result.rows.first().and_then(|row| match row.first() {
+        Some(DbValue::Uuid(context_id)) => Some(ContextId::from(*context_id)),
+        _ => None,
+    }))
+}
+
+/// Whether a digest's ledger state lets a local drain claim it: pending, or leased by this machine
+/// under a shared claim whose drain is no longer alive (interrupted, or released without a result).
+fn locally_claimable(
+    store: &Store,
+    context_id: ContextId,
+    digest_id: DigestId,
+    state: &JobState,
+) -> Result<bool> {
+    Ok(match state {
+        JobState::Pending => true,
+        JobState::Leased { node_id, .. } if node_id == LOCAL_NODE_ID => {
+            digest_claim(context_id, digest_id).state(store)? != BackgroundWorkState::Running
+        }
+        _ => false,
+    })
+}
+
+/// Fence a graph write into `digest_id` on this process's claim of it, when it holds one, so a
+/// drain that has lost the digest to another can never publish its understanding. A write by a
+/// process that holds no claim (a synced-in result being applied) is not fenced here.
+pub(crate) fn fence_held_digest_in_tx(
+    store: &Store,
+    tx: crate::TxId,
+    digest_id: DigestId,
+) -> Result<()> {
+    if kept_token(store.db_path(), digest_id.as_uuid()).is_none() {
+        return Ok(());
+    }
+    let Some(context_id) = digest_context(store, digest_id)? else {
+        return Err(lost_digest(digest_id));
+    };
+    match fence_kept_in_tx(&digest_claim(context_id, digest_id), store, tx)? {
+        Some(false) => Err(lost_digest(digest_id)),
+        None | Some(true) => Ok(()),
+    }
+}
+
+/// Give up this process's claim of a digest after the transaction that recorded its result
+/// committed. The claim row was deleted by that transaction; this drops the kernel lock.
+pub(crate) fn digest_result_committed(store: &Store, digest_id: DigestId) {
+    release_kept(store.db_path(), digest_id.as_uuid());
+}
+
+fn lost_digest(digest_id: DigestId) -> CgError {
+    CgError::Engine(format!(
+        "understanding of digest {} belongs to another drain now, so this drain's result was not recorded",
+        digest_id.as_uuid()
+    ))
+}
 
 /// The default cap on model attempts per digest. After this many failures a digest stays `failed`
 /// and is never drained again, so a persistently-unparseable chunk cannot wedge the queue.
@@ -57,8 +137,9 @@ pub struct QueueFailure {
 /// List the pending digests for one context in drain PRIORITY order: highest `touch_count` first,
 /// then oldest captured first within equal touch. Each row carries the stored raw chunk text. A
 /// digest that already has a completion row (a synced-in completion from another machine, or a local
-/// success) is skipped even if the ledger job would otherwise read pending. `limit` caps how many are
-/// returned (the full backlog when `None`).
+/// success) is skipped even if the ledger job would otherwise read pending. A digest a local drain
+/// was understanding when it died is offered again at once; one a live drain holds is not. `limit`
+/// caps how many are returned (the full backlog when `None`).
 pub fn list_pending_digests(
     store: &Store,
     context_id: ContextId,
@@ -76,7 +157,8 @@ pub fn list_pending_digests(
         if completion_exists(store, &digest_text)? {
             continue;
         }
-        if job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)? != JobState::Pending {
+        let state = job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)?;
+        if !locally_claimable(store, context_id, digest_id, &state)? {
             continue;
         }
         let Some(chunk_text) = chunk_text_for_digest(store, &digest_text)? else {
@@ -107,36 +189,78 @@ pub fn list_pending_digests(
     Ok(out)
 }
 
-/// Claim a pending digest for understanding via a ledger claim (`pending → leased`). Returns `true`
-/// when this call won the claim, `false` when the digest was not pending (already claimed by another
-/// worker, already structured, failed, or purged) — the ledger's claim primary key makes the claim
-/// safe against a concurrent second worker.
+/// Claim a digest for understanding. Returns `true` when this call won it, `false` when it is not
+/// claimable here: already understood, failed, cancelled or purged, leased by another machine, or
+/// held by a live local drain.
+///
+/// The shared background-work claim is taken first: it keeps two local drains apart and proves this
+/// one is alive for as long as it holds the digest. The ledger then records the attempt
+/// (`pending → leased`), which is what other machines see. A digest a dead local drain left leased
+/// is claimed again at once under the next attempt number; no lease has to run out.
 pub fn claim_digest(store: &Store, digest_id: DigestId) -> Result<bool> {
     let db = store.internal_db();
     let job_id = understanding_job_id(digest_id);
     if !job_exists(store, &job_id)? {
         return Ok(false);
     }
-    // Only a pending job is claimable — a leased (already in-flight), done, failed, or cancelled job
-    // is refused, so a second concurrent worker never re-claims work in flight.
-    if job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)? != JobState::Pending {
+    let Some(context_id) = digest_context(store, digest_id)? else {
+        return Ok(false);
+    };
+    let state = job_state(db, &job_id, ledger_clock_ms()).map_err(map_engine)?;
+    if !matches!(state, JobState::Pending)
+        && !matches!(&state, JobState::Leased { node_id, .. } if node_id == LOCAL_NODE_ID)
+    {
         return Ok(false);
     }
-    let attempt = next_attempt(db, &job_id).map_err(map_engine)?;
-    // The local claim takes an unexpiring lease: the single-node claim is sticky until the worker
-    // records success or failure (the fabric worker slice injects a real lease clock for expiry).
-    match insert_claim(
-        db,
-        &job_id,
-        attempt,
-        LOCAL_NODE_ID,
-        i64::MAX,
-        ledger_clock_ms(),
-    )
-    .map_err(map_engine)?
-    {
-        ClaimInsert::Inserted => Ok(true),
-        ClaimInsert::AlreadyHeld { .. } => Ok(false),
+    let tx = store.begin_tx()?;
+    let claim = match digest_claim(context_id, digest_id).take_in_tx(store, tx) {
+        Ok(Taken::Held(claim)) => claim,
+        // A live drain holds it, or another drain claimed it while this one was reading.
+        Ok(Taken::Live(_) | Taken::Moved) => {
+            let _ = db.rollback(tx);
+            return Ok(false);
+        }
+        Err(error) => {
+            let _ = db.rollback(tx);
+            return Err(error);
+        }
+    };
+    match db.commit(tx) {
+        Ok(()) => {}
+        // Another local drain claimed the digest first.
+        Err(
+            contextdb_core::Error::ConditionalUpdateConflict { .. }
+            | contextdb_core::Error::UniqueViolation { .. },
+        ) => return Ok(false),
+        Err(error) => return Err(map_engine(error)),
+    }
+    let ledger = next_attempt(db, &job_id).and_then(|attempt| {
+        insert_claim(
+            db,
+            &job_id,
+            attempt,
+            LOCAL_NODE_ID,
+            i64::MAX,
+            ledger_clock_ms(),
+        )
+    });
+    match ledger {
+        Ok(ClaimInsert::Inserted) => {
+            // The claim outlives this call: the drain records the digest's result or failure in a
+            // later one.
+            claim.keep()?;
+            Ok(true)
+        }
+        Ok(ClaimInsert::AlreadyHeld { .. }) => {
+            claim.release(store)?;
+            Ok(false)
+        }
+        // The background claim committed but the ledger refused the attempt: give the claim back
+        // so the digest reads as pending, not as interrupted by a drain that never ran.
+        Err(error) => {
+            let _ = claim.release(store);
+            Err(map_engine(error))
+        }
     }
 }
 
@@ -155,7 +279,16 @@ pub fn mark_structured(
     let tx = db.begin().map_err(map_engine)?;
     let outcome = mark_structured_in_tx(store, tx, context_id, digest_id, model, receipt_json);
     match outcome {
-        Ok(()) => db.commit(tx).map_err(map_engine),
+        Ok(()) => match db.commit(tx) {
+            Ok(()) => {
+                digest_result_committed(store, digest_id);
+                Ok(())
+            }
+            Err(contextdb_core::Error::ConditionalUpdateConflict { .. }) => {
+                Err(lost_digest(digest_id))
+            }
+            Err(error) => Err(map_engine(error)),
+        },
         Err(err) => {
             let _ = db.rollback(tx);
             Err(err)
@@ -177,6 +310,11 @@ pub(crate) fn mark_structured_in_tx(
     receipt_json: Option<&str>,
 ) -> Result<()> {
     let db = store.internal_db();
+    // A drain that holds this digest ends its claim in the same transaction as the result, and is
+    // refused if another drain has taken the digest over.
+    if finish_kept_in_tx(&digest_claim(context_id, digest_id), store, tx)? == Some(false) {
+        return Err(lost_digest(digest_id));
+    }
     let digest_text = digest_id.to_string();
     let receipt = match receipt_json {
         Some(json) => DbValue::Text(json.to_string()),
@@ -218,9 +356,11 @@ pub fn mark_failed(
 ) -> Result<QueueFailure> {
     let db = store.internal_db();
     let job_id = understanding_job_id(digest_id);
-    // Record the failure against the attempt this worker holds (the highest claim attempt). The
-    // failure row releases the lease: below the cap the job's computed state falls back to `pending`
-    // for a retry; at the cap (`failures >= max_attempts`) it turns terminally `failed`.
+    // Record the failure against the highest claim attempt, which is the attempt this drain took: a
+    // local lease never runs out, so no other machine claims over it. The failure row ends that
+    // attempt's ledger lease: below the cap the job falls back to `pending` for a retry; at the cap
+    // (`failures >= max_attempts`) it turns terminally `failed`. Only then is the shared claim
+    // released, so no other drain claims it in between.
     let attempt = highest_claim_attempt(store, &job_id)?;
     record_failure(
         db,
@@ -231,6 +371,10 @@ pub fn mark_failed(
         ledger_clock_ms(),
     )
     .map_err(map_engine)?;
+    match digest_context(store, digest_id)? {
+        Some(context_id) => abandon_kept(&digest_claim(context_id, digest_id), store)?,
+        None => release_kept(store.db_path(), digest_id.as_uuid()),
+    }
     let new_attempts = failure_count(store, &job_id)?;
     let terminal = new_attempts >= max_attempts.max(1);
     Ok(QueueFailure {

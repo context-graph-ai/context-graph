@@ -1098,7 +1098,6 @@ fn cli_status_reports_bounded_session_scope_from_the_persisted_worker_policy() {
             max_events_per_batch: std::num::NonZeroU32::new(256).expect("positive batch"),
             max_passages_per_batch: std::num::NonZeroU32::new(64).expect("positive batch"),
             max_bytes_per_batch: std::num::NonZeroUsize::new(1 << 20).expect("positive byte bound"),
-            lease_duration_ms: std::num::NonZeroU64::new(60_000).expect("positive lease"),
         },
         context_graph::EventSearchWorkPolicy::default(),
     )

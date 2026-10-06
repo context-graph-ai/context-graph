@@ -41,6 +41,7 @@ fn state_name(state: EventHistorySearchState) -> &'static str {
     match state {
         EventHistorySearchState::Pending => "pending",
         EventHistorySearchState::Running => "running",
+        EventHistorySearchState::Interrupted => "interrupted",
         EventHistorySearchState::Blocked => "blocked",
         EventHistorySearchState::Failed => "failed",
         EventHistorySearchState::Ready => "ready",
@@ -405,7 +406,7 @@ fn context_status_json(
                     "version": context.search.renderer_version,
                     "profile": context.search.profile,
                 },
-                "live_projection_lease": context.search.live_projection_lease,
+                "work": context.search.work,
                 "last_failure": context.search.last_failure,
                 "next": search_next(context),
             },
@@ -475,6 +476,11 @@ fn render_status_text(
                 grouped(search.covered_events),
                 grouped(search.pending_events)
             ),
+            EventHistorySearchState::Interrupted => format!(
+                "interrupted — the background build stopped before finishing; it resumes from {} events covered, {} pending",
+                grouped(search.covered_events),
+                grouped(search.pending_events)
+            ),
             EventHistorySearchState::Blocked => format!(
                 "blocked — local Nomic artifact is not present; {} events pending",
                 grouped(search.pending_events)
@@ -485,7 +491,7 @@ fn render_status_text(
                 search.last_failure.as_deref().unwrap_or("unknown")
             ),
             EventHistorySearchState::Pending => format!(
-                "pending — no projection holds a live lease; {} events covered / {} pending",
+                "pending — no projection is running; {} events covered / {} pending",
                 grouped(search.covered_events),
                 grouped(search.pending_events)
             ),
@@ -1044,8 +1050,9 @@ With no selector it uses the Context linked to the current project (or a parent 
 --context names one or more Contexts, --all-contexts selects every Context in the store. Each
 selected Context is reported separately.
 
-Search is exactly one of: ready (caught up), running (a projection holds a live lease), pending
-(no worker is running), blocked (the local Nomic model is not installed) or failed.
+Search is exactly one of: ready (caught up), running (a live worker is building it), interrupted
+(a worker stopped before finishing — a crash, a kill or a restart — and the next cg command resumes
+it), pending (no worker is running), blocked (the local Nomic model is not installed) or failed.
 A background write that exceeds its request's persisted ceiling is failed with the needed and
 allowed memory, even if the store could not record that failure. Retry import with an affordable
 --write-memory-limit-bytes value.

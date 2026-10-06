@@ -6,7 +6,7 @@
 #![cfg(context_graph_internal_test_support)]
 
 use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -409,7 +409,6 @@ fn request(
         contract: Arc::new(FixtureContract),
         max_events_per_batch: NonZeroU32::new(97).expect("nonzero event bound"),
         max_bytes_per_batch: NonZeroUsize::new(16_384).expect("nonzero byte bound"),
-        lease_duration_ms: NonZeroU64::new(1_000).expect("nonzero lease duration"),
     }
 }
 

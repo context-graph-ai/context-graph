@@ -1,4 +1,5 @@
 pub(crate) mod audit;
+pub(crate) mod background_claim;
 mod conflict_detection;
 mod consumer_tables;
 pub(crate) mod context;
@@ -608,6 +609,18 @@ impl Store {
             self.read_memory_limit_bytes,
             self.read_active_time_ms,
         )
+    }
+
+    /// Run a read that completes a write's result after the write has committed. Every such read
+    /// goes through here, so the rule that a committed write never reports failure can be shown.
+    pub(crate) fn post_commit_readback<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
+        #[cfg(context_graph_internal_test_support)]
+        if let Some(error) =
+            event_search_projection::take_post_commit_readback_refusal(self.db_path())
+        {
+            return Err(error);
+        }
+        read()
     }
 
     pub fn db_path(&self) -> &Path {

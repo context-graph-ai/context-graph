@@ -157,6 +157,42 @@ pub struct Machine {
     pub model_cache: PathBuf,
 }
 
+/// No detached search worker outlives its test, whether the test passed or stopped at a failed
+/// assertion: the worker group an observer under this machine recorded is stopped with it.
+impl Drop for Machine {
+    fn drop(&mut self) {
+        stop_recorded_workers(&self.root);
+    }
+}
+
+/// Stop every detached search worker whose process group an observer directory directly under
+/// `root` recorded. A group no longer led by a cg search worker (a reused pid) is left alone.
+fn stop_recorded_workers(root: &Path) {
+    const WORKER_COMMAND: &[u8] = b"__event-search-worker";
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(recorded) = fs::read_to_string(entry.path().join("embedding-worker-process-group"))
+        else {
+            continue;
+        };
+        let Ok(group) = recorded.trim().parse::<i32>() else {
+            continue;
+        };
+        let leads_a_worker = fs::read(format!("/proc/{group}/cmdline")).is_ok_and(|cmdline| {
+            cmdline
+                .windows(WORKER_COMMAND.len())
+                .any(|window| window == WORKER_COMMAND)
+        });
+        if leads_a_worker {
+            // SAFETY: the group was recorded by a command this test ran, for the worker it started,
+            // and its leader is still that worker.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+    }
+}
+
 impl Machine {
     /// A machine whose model cache is empty, so any model preflight finds nothing installed.
     pub fn without_model() -> Self {
