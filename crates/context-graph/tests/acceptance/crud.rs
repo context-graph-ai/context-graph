@@ -178,12 +178,15 @@ fn digest_embedding_fixture(seed: &str) -> Vec<f32> {
 /// A digest whose supplied vector carries the built-in text space's own model, so it is stored.
 fn create_digest_input(store: &Store, context_id: ContextId, summary: &str) -> CreateDigest {
     let id = DigestId::new_v7();
-    let produced_by = EvidenceProducer::from(
-        &store
-            .space_producer("text_default_nomic_v1_5_768")
-            .expect("read the text space's model")
-            .expect("the built-in text space is declared"),
-    );
+    let produced_by = EvidenceProducer {
+        system: "digest-writer".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer("text_default_nomic_v1_5_768")
+                .expect("read the text space's model")
+                .expect("the built-in text space is declared"),
+        )
+    };
     CreateDigest {
         id,
         source: "claude-web".to_string(),

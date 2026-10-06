@@ -405,7 +405,10 @@ fn fixture(name: &str) -> Fixture {
             embedding_space_id: IMAGE_SPACE.to_string(),
             vector: other_space_vector.clone(),
             target: EmbeddingTarget::Evidence(other_space_evidence_id),
-            produced_by: EvidenceProducer::from(&image_identity()),
+            produced_by: EvidenceProducer {
+                system: "edge-memory".to_string(),
+                ..EvidenceProducer::from(&image_identity())
+            },
         }],
     });
     assert!(

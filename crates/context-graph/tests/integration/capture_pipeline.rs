@@ -111,12 +111,15 @@ fn raw_vector_ids(
 
 /// The producer a supply into `space_id` must carry: the space's one model.
 fn space_producer(store: &Store, space_id: &str) -> EvidenceProducer {
-    EvidenceProducer::from(
-        &store
-            .space_producer(space_id)
-            .expect("read the space's model")
-            .expect("the space is declared"),
-    )
+    EvidenceProducer {
+        system: "capture-test".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(space_id)
+                .expect("read the space's model")
+                .expect("the space is declared"),
+        )
+    }
 }
 
 fn context(store: &Store, name: &str) -> ContextId {

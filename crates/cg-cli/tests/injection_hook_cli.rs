@@ -327,7 +327,10 @@ fn create_digest(
                 embedding_space_id: embedder.embedding_space().embedding_space_id,
                 vector,
                 target: EmbeddingTarget::Digest(digest_id),
-                produced_by: EvidenceProducer::from(&embedder.producer()),
+                produced_by: EvidenceProducer {
+                    system: "cg-record".to_string(),
+                    ..EvidenceProducer::from(&embedder.producer())
+                },
             },
             context_id,
             properties: BTreeMap::new(),

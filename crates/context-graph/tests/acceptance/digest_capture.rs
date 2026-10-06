@@ -379,12 +379,15 @@ fn create_digest_input(
         .active_embedding_space(context_graph::EmbeddingRole::Digest)
         .expect("read the active digest space")
         .expect("the lexical model holds the digest role");
-    let produced_by = EvidenceProducer::from(
-        &store
-            .space_producer(&space)
-            .expect("read the digest space's model")
-            .expect("the digest space is declared"),
-    );
+    let produced_by = EvidenceProducer {
+        system: "digest-writer".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(&space)
+                .expect("read the digest space's model")
+                .expect("the digest space is declared"),
+        )
+    };
     CreateDigest {
         id,
         source: "claude-cli".to_string(),

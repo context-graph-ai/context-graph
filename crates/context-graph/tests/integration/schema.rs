@@ -96,12 +96,15 @@ fn text_space_producer() -> context_graph::EvidenceProducer {
                 ..Default::default()
             })
             .expect("open to read the text space's model");
-            context_graph::EvidenceProducer::from(
-                &store
-                    .space_producer(TEXT_SPACE)
-                    .expect("read the text space's model")
-                    .expect("the built-in text space is declared"),
-            )
+            context_graph::EvidenceProducer {
+                system: "schema".to_string(),
+                ..EvidenceProducer::from(
+                    &store
+                        .space_producer(TEXT_SPACE)
+                        .expect("read the text space's model")
+                        .expect("the built-in text space is declared"),
+                )
+            }
         })
         .clone()
 }

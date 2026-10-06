@@ -65,12 +65,15 @@ fn producer() -> EvidenceProducer {
 
 /// The producer a supply into `space` must carry: the space's one model.
 fn supplied_producer(store: &Store, space: &str) -> EvidenceProducer {
-    EvidenceProducer::from(
-        &store
-            .space_producer(space)
-            .expect("read the space's model")
-            .expect("the space is declared"),
-    )
+    EvidenceProducer {
+        system: "edge-memory".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(space)
+                .expect("read the space's model")
+                .expect("the space is declared"),
+        )
+    }
 }
 
 fn image_space() -> EmbeddingSpace {

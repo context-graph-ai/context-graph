@@ -904,7 +904,10 @@ fn a_foreign_vector_supplied_into_a_node_local_space_is_recomputed_never_stored(
                 embedding_space_id: space.clone(),
                 vector: text_vector("foreign"),
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: EvidenceProducer::from(&caller_identity("foreign")),
+                produced_by: EvidenceProducer {
+                    system: "placement-fixture".into(),
+                    ..EvidenceProducer::from(&caller_identity("foreign"))
+                },
             }],
         })
         .expect("a foreign supply is not an error");

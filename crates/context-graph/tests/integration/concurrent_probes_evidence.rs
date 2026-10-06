@@ -103,12 +103,15 @@ fn text_space_producer() -> EvidenceProducer {
         .get_or_init(|| {
             let (_dir, config) = shared_config();
             let store = Store::open(config).expect("open to read the text space's model");
-            EvidenceProducer::from(
-                &store
-                    .space_producer("text_default_nomic_v1_5_768")
-                    .expect("read the text space's model")
-                    .expect("the built-in text space is declared"),
-            )
+            EvidenceProducer {
+                system: "probe".to_string(),
+                ..EvidenceProducer::from(
+                    &store
+                        .space_producer("text_default_nomic_v1_5_768")
+                        .expect("read the text space's model")
+                        .expect("the built-in text space is declared"),
+                )
+            }
         })
         .clone()
 }
@@ -792,7 +795,10 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
                     embedding_space_id: "vigil_face_reid_v1".to_string(),
                     vector: vision_vector(writer_idx),
                     target: EmbeddingTarget::Evidence(evidence_id),
-                    produced_by: EvidenceProducer::from(&face_identity()),
+                    produced_by: EvidenceProducer {
+                        system: "probe".to_string(),
+                        ..EvidenceProducer::from(&face_identity())
+                    },
                 });
                 barrier.wait();
                 writer.record_observation(input)

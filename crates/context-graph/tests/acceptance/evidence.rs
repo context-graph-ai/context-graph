@@ -30,12 +30,15 @@ fn text_space_producer() -> EvidenceProducer {
     PRODUCER
         .get_or_init(|| {
             let (_dir, store) = fresh_store();
-            EvidenceProducer::from(
-                &store
-                    .space_producer(TEXT_SPACE)
-                    .expect("read the text space's model")
-                    .expect("the built-in text space is declared"),
-            )
+            EvidenceProducer {
+                system: "acceptance".to_string(),
+                ..EvidenceProducer::from(
+                    &store
+                        .space_producer(TEXT_SPACE)
+                        .expect("read the text space's model")
+                        .expect("the built-in text space is declared"),
+                )
+            }
         })
         .clone()
 }
