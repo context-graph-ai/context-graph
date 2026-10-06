@@ -7393,7 +7393,6 @@ fn finish_or_continue(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn finish_stable(
     store: &Store,
     generation: &Generation,
