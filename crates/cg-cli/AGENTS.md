@@ -53,6 +53,10 @@ search uses the core's `Embedder`/sealed `EventSearchEmbedder`, never a CLI abst
   `foreground_assessment_active_time_refusals_recover_and_exhaust_with_durable_status`,
   `foreground_selection_timeout_exhaustion_stays_failed_until_full_context_completion`, and
   `large_foreground_selections_and_repeated_failures_keep_bounded_durable_status`.
+- Import maps partial source capture to exit 5 and writable-recovery-required to exit 6 through
+  its own typed wrapper; find/show/status retain their shared refusal mappings. Guards:
+  `tests/event_import_roundtrip.rs::malformed_input_reports_source_partial_at_the_failed_position_without_silently_skipping_it`
+  and `tests/event_history.rs::import_dry_run_refuses_a_recovery_needing_store_without_writing`.
 - Capture remains durable before search; retry preserves selected scope:
   `tests/import_embedding_workers.rs::interrupted_all_scope_retry_resumes_all_sessions_in_the_same_oldest_order`.
 - Background write ceilings stay with the session identities and capture frontiers selected at

@@ -329,6 +329,14 @@ fn forgetting_a_session_erases_its_events_and_everything_derived_while_keeping_t
         "the forgotten stream's checkpoint is gone"
     );
     assert_eq!(
+        status.contexts[0].source_streams[0].event_count, 1,
+        "the surviving capture stream summary remains exact"
+    );
+    assert_eq!(
+        status.contexts[0].source_streams[0].latest_event_seq,
+        Some(1)
+    );
+    assert_eq!(
         status.contexts[0].search.state,
         EventHistorySearchState::Pending,
         "the remaining history reads as pending re-indexing, never as an error or as ready"

@@ -639,6 +639,22 @@ impl Store {
         crate::store::event_search_projection::select_work(self, context_id, policy)
     }
 
+    /// Freeze only streams pending for the supplied projection target. A replacement target
+    /// with no compatible cursor treats captured streams as pending for that new job.
+    pub fn select_event_search_work_with_spec(
+        &self,
+        context_id: ContextId,
+        policy: EventSearchWorkPolicy,
+        spec: &EventSearchWorkSpec,
+    ) -> Result<EventSearchSelectedWork> {
+        crate::store::event_search_projection::select_work_for_spec(
+            self,
+            context_id,
+            policy,
+            Some(spec),
+        )
+    }
+
     /// Whether the active compatible projection has committed every accepted source frontier.
     pub fn event_search_selected_work_complete(
         &self,
@@ -803,6 +819,22 @@ impl ConsumerReader {
         policy: EventSearchWorkPolicy,
     ) -> Result<EventSearchSelectedWork> {
         crate::store::event_search_projection::select_work(self, context_id, policy)
+    }
+
+    /// Freeze only streams pending for the supplied projection target. A replacement target
+    /// with no compatible cursor treats captured streams as pending for that new job.
+    pub fn select_event_search_work_with_spec(
+        &self,
+        context_id: ContextId,
+        policy: EventSearchWorkPolicy,
+        spec: &EventSearchWorkSpec,
+    ) -> Result<EventSearchSelectedWork> {
+        crate::store::event_search_projection::select_work_for_spec(
+            self,
+            context_id,
+            policy,
+            Some(spec),
+        )
     }
 
     /// Whether the active compatible projection has committed every accepted source frontier.

@@ -553,12 +553,13 @@ fn completed_foreground_read_refusals(
     {
         let selected_work = match &refusal.selected_work {
             Some(selected) => selected.clone(),
-            None => store.select_event_search_work(
+            None => store.select_event_search_work_with_spec(
                 context_id,
                 EventSearchWorkPolicy {
                     sessions: context_graph::EventSearchSessionScope::All,
                     ..EventSearchWorkPolicy::default()
                 },
+                spec,
             )?,
         };
         if store.event_search_selected_work_complete(context_id, spec, &selected_work)? {
@@ -716,7 +717,11 @@ pub(crate) fn completed_memory_refusals(
     {
         return Ok(Vec::new());
     }
-    let selected = store.select_event_search_work(context_id, work_policy)?;
+    let selected = store.select_event_search_work_with_spec(
+        context_id,
+        work_policy,
+        &super::search_work_spec(profile),
+    )?;
     if !store.event_search_selected_work_complete(
         context_id,
         &super::search_work_spec(profile),
@@ -2057,7 +2062,11 @@ pub(crate) fn kick(
     let work_policy = pending_background_request_checked(root)?
         .map_or(work_policy, |pending| pending.work_policy);
     let selected = store
-        .select_event_search_work(context_id, work_policy)
+        .select_event_search_work_with_spec(
+            context_id,
+            work_policy,
+            &super::search_work_spec(profile),
+        )
         .map_err(|error| error.to_string())?;
     let request = accept_background_work_with_choice(
         root,
@@ -2917,9 +2926,13 @@ fn serve(
     let queue_backed = selected_work.is_some();
     let selected_work = match selected_work {
         Some(selected) => selected,
-        None => match open_reader(root, read_memory_limit_bytes)
-            .and_then(|reader| reader.select_event_search_work(context_id, work_policy))
-        {
+        None => match open_reader(root, read_memory_limit_bytes).and_then(|reader| {
+            reader.select_event_search_work_with_spec(
+                context_id,
+                work_policy,
+                &super::search_work_spec(profile),
+            )
+        }) {
             Ok(selected) => selected,
             Err(_) => return (false, false, false, false, false),
         },
@@ -3416,6 +3429,7 @@ pub(crate) struct ForegroundOutcome {
 fn requested_foreground_selection(
     root: &Path,
     context_id: ContextId,
+    profile: &EventSearchProfile,
     work_policy: EventSearchWorkPolicy,
     read_memory_limit_bytes: NonZeroUsize,
 ) -> context_graph::Result<EventSearchSelectedWork> {
@@ -3436,8 +3450,13 @@ fn requested_foreground_selection(
             });
         }
     }
-    open_reader(root, read_memory_limit_bytes)
-        .and_then(|reader| reader.select_event_search_work(context_id, work_policy))
+    open_reader(root, read_memory_limit_bytes).and_then(|reader| {
+        reader.select_event_search_work_with_spec(
+            context_id,
+            work_policy,
+            &super::search_work_spec(profile),
+        )
+    })
 }
 
 fn requested_foreground_work(
@@ -3788,6 +3807,7 @@ pub(crate) fn run_in_foreground(
                     selected_work = Some(requested_foreground_selection(
                         root,
                         context_id,
+                        desired_profile,
                         work_policy,
                         read_memory_limit_bytes,
                     )?);

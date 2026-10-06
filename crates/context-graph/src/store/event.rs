@@ -570,6 +570,23 @@ fn append_event_attempt(
     };
     if inserted > 0 {
         update_event_context_sessions_in_tx(store, tx, &results)?;
+        let mut pending_streams = BTreeSet::new();
+        for result in results
+            .iter()
+            .filter(|result| result.disposition == EventAppendDisposition::Inserted)
+        {
+            let event = &result.event;
+            if pending_streams.insert((
+                &event.connector_id,
+                &event.source_instance_ref,
+                &event.session_ref,
+            )) {
+                super::event_search_projection::mark_captured_stream_pending_in_tx(
+                    store, tx, event,
+                )
+                .map_err(AppendAttemptError::Domain)?;
+            }
+        }
         bump_event_context_revision_in_tx(store, tx, input.context_id)?;
         let mut added = CapturedEventCounts::default();
         for result in &results {
@@ -765,6 +782,7 @@ fn is_retryable_append_error(error: &EngineError) -> bool {
                 || (table == "event_context_revisions" && column == "context_id")
                 || (table == EVENT_CONTEXT_COUNTS_TABLE && column == "context_id")
                 || (table == "event_context_sessions" && column == "context_id")
+                || (table == "event_search_pending_streams" && column == "context_id")
         }
         _ => false,
     }

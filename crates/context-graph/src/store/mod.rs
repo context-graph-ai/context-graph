@@ -501,6 +501,8 @@ impl Store {
         registrations: Vec<EmbedderRegistration>,
         consumer_schema: ConsumerSchema,
     ) -> Result<Self> {
+        #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+        event_search_read::record_writable_open_for_test();
         validate_consumer_schema(&consumer_schema)?;
         let mut config = config;
         let mut registrations = registrations;

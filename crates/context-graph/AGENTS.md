@@ -32,6 +32,17 @@ open carrying both capabilities is `Store::open_with_control_handler_and_embedde
 
 - The derived `event_search_passages` table declares `HISTORY CURRENT ONLY SYNC OFF`, so superseded passage versions from tail retirement and session publication are reclaimed by maintenance while immutable captured-event and session history remain intact: `tests/event_search_projection_correctness.rs::old_conversations_remain_searchable_after_superseded_passage_reclaim`.
 
+- Selection and source-stream status use the engine-maintained grouped event counts and
+  indexed newest-event reads; erasure updates those engine-owned facts with captured events.
+  Projection-job pending markers in `src/store/event_search_projection.rs` store only identity,
+  target generation and a boolean. Capture sets them with events; cursor commit clears them
+  only after a guarded newest-entry read. Selection and resume seek their declared pending index. Recent-session selection uses the
+  declared recency index and grouped SQL window ranking; coverage probes selected progress keys.
+  Guards: `tests/event_capture.rs::retries_are_noops_and_a_divergent_batch_leaves_events_and_checkpoint_unchanged`,
+  `tests/event_search_projection_correctness.rs::select_work_examines_no_completed_events`,
+  `tests/event_search_projection_correctness.rs::pending_marker_and_cursor_publish_together_across_process_crashes`,
+  `tests/event_search_projection_correctness.rs::recent_session_selection_retains_only_the_selected_sessions`,
+  `tests/event_search_projection_correctness.rs::recent_coverage_reads_only_selected_progress_keys`.
 - Capture retries preserve identity and checkpoint atomicity:
   `tests/event_capture.rs::retries_are_noops_and_a_divergent_batch_leaves_events_and_checkpoint_unchanged`.
 - Startup schema commits together: `tests/startup_schema_is_one_commit.rs::a_fresh_store_installs_its_whole_startup_schema_in_one_commit`.

@@ -213,6 +213,7 @@ const CONTEXT_DERIVED_TABLES: &[&str] = &[
     "event_search_work_policies",
     "event_search_leases",
     "event_search_cursors",
+    "event_search_pending_streams",
     "event_search_session_progress",
     "event_search_embedding_handles",
     "event_search_passage_sources",
@@ -579,6 +580,7 @@ fn session_plan(
     // The captured-session summary is erased with its immutable events. Other sessions survive the
     // same authoritative purge, so reads never need a post-forget archive recount.
     plan.select("event_context_sessions", session_predicate);
+    plan.select("event_search_pending_streams", session_predicate);
     plan.select("event_search_request_selections", session_predicate);
     plan.select("event_search_refusal_frontiers", session_predicate);
     let mut source_values = Vec::with_capacity(sources.len());

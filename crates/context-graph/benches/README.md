@@ -46,3 +46,26 @@ query set within each scope and mode.
 99-perfect/one-zero case, the exact 0.95 boundary, a value immediately below the floor, and a
 missing per-query recall. The minimum recall must be at least 0.95 and
 `queries_below_recall_floor` must be zero.
+
+## Event-history reads during schema replay
+
+The explicit selector below uses the 10,000-passage, eight-Context synthetic fixture and the real
+Nomic query embedder. It calls the same read-only library methods as find, show (including linked
+events), and event-history status while the held database applies its actual startup ChangeSet
+and a root migration across 100 existing FK-linked tables with vectors and an including-sync
+trigger. Schema work enters through direct replay of the real apply path. Short migrations repeat
+on fresh copies of the same fixture until every reader has at least 20 actual overlap samples.
+
+```sh
+CG_SCHEMA_OVERLAP_RECEIPT=/path/to/schema-overlap.json \
+/path/to/cg_event_history --bench event_find_show_status_during_schema_replay_and_largest_migration
+```
+
+Build with the internal-support configuration shown above. Install the Nomic artifacts before
+running; the reader does not download a model. The standalone schema-overlap-receipt/1 includes
+idle and overlap p95, wrong answers, refusals, retries, actual page-boundary read charges, writer
+charges, and whether any reader attempted to open writable state. Retry counters are sampled
+at the real consumer transition/re-execution branches; writable-open attempts are observed at
+the Store admission entry on each reader thread, including reader setup and baseline reads. Answers must match their complete idle
+baseline, including source links. The process writes the receipt before checking the 200 ms find
+and 50 ms show p95 limits.

@@ -949,7 +949,7 @@ fn cg_import_continues_past_a_malformed_file_captures_every_other_file_and_repor
         &project,
         &["import", ".", "--context", "partial", "--search", "defer"],
     );
-    assert_eq!(output.code, 1, "{}", output.describe());
+    assert_eq!(output.code, 5, "{}", output.describe());
     let receipt = output.json();
     assert_eq!(str_at(&receipt, "/state"), "source_partial");
     assert_eq!(receipt.get("ok"), Some(&Value::Bool(false)));
@@ -2007,6 +2007,10 @@ fn import_recovers_a_store_that_needs_a_writable_open_and_status_names_that_comm
 
     let status = machine.run(&project, &["status"]);
     assert_eq!(
+        status.code, 1,
+        "the import-only recovery exit does not change status"
+    );
+    assert_eq!(
         str_at(&status.json(), "/state"),
         "store_needs_recovery",
         "{}",
@@ -2078,7 +2082,7 @@ fn import_dry_run_refuses_a_recovery_needing_store_without_writing() {
         &["import", ".", "--context", "dry-run-recovery", "--dry-run"][..],
     ] {
         let refused = machine.run(&project, args);
-        assert_eq!(refused.code, 1, "{}", refused.describe());
+        assert_eq!(refused.code, 6, "{}", refused.describe());
         assert_eq!(
             str_at(&refused.json(), "/state"),
             "store_needs_recovery",
