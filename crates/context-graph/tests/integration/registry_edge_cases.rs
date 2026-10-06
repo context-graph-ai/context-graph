@@ -1,6 +1,6 @@
 use context_graph::{
     CgError, CreateContext, CreateEntity, DistanceMetric, EmbeddingSpaceDecl, EntityType,
-    EvidenceKind, EvidenceProducer, Store, StoreConfig,
+    EvidenceKind, EvidenceProducer, ModelIdentity, Store, StoreConfig, VectorPlacement,
 };
 use contextdb_core::{ColumnType, Value};
 use contextdb_engine::Database;
@@ -29,6 +29,14 @@ fn space(
         supported_evidence_kinds: supported,
         default_for_evidence_kind: default,
         bindings: Vec::new(),
+        placement: Some(VectorPlacement::TravelsWithItem),
+        media_reachable_on_every_node: false,
+        producer: ModelIdentity {
+            model: "custom".to_string(),
+            weights_revision: "1".to_string(),
+            preparation: "registry".to_string(),
+            dimension: 384,
+        },
     }
 }
 
@@ -110,6 +118,40 @@ fn embedding_space_default_for_evidence_kind_not_in_supported_evidence_kinds_ref
         Err(CgError::InconsistentEmbeddingSpaceDeclaration { ref space_id })
             if space_id == "image_default"
     ));
+
+    // A declaration that names no placement is refused before any data is accepted (owner
+    // ruling 167): placement is never inferred, at open or at runtime registration.
+    let unplaced = EmbeddingSpaceDecl {
+        placement: None,
+        ..space("unplaced_space", vec![EvidenceKind::Text], None)
+    };
+    let at_open = open_with(unplaced.clone());
+    assert!(
+        matches!(
+            &at_open,
+            Err(CgError::EmbeddingPlacementMissing { space }) if space == "unplaced_space"
+        ),
+        "{:?}",
+        at_open.as_ref().err()
+    );
+    let store = open_with(space("placed_space", vec![EvidenceKind::Text], None))
+        .expect("a declaration with a placement opens");
+    let at_registration = store.register_embedding_space(unplaced);
+    assert!(
+        matches!(
+            &at_registration,
+            Err(CgError::EmbeddingPlacementMissing { space }) if space == "unplaced_space"
+        ),
+        "{at_registration:?}"
+    );
+    assert!(
+        store
+            .list_embedding_spaces()
+            .expect("list spaces")
+            .iter()
+            .all(|declared| declared.embedding_space_id != "unplaced_space"),
+        "the refused space was never registered"
+    );
 }
 
 #[test]

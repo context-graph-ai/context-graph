@@ -116,7 +116,7 @@ fn text_space(revision: &str) -> EmbeddingSpace {
             table_name: "evidence".into(),
             vector_column: TEXT_COLUMN.into(),
         }],
-        placement: VectorPlacement::NodeLocal,
+        placement: Some(VectorPlacement::NodeLocal),
         media_reachable_on_every_node: false,
         producer: text_identity(revision),
     }
@@ -761,7 +761,7 @@ fn caller_space(revision: &str) -> EmbeddingSpace {
             table_name: "evidence".into(),
             vector_column: TEXT_COLUMN.into(),
         }],
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: caller_identity(revision),
     }
@@ -863,11 +863,54 @@ fn a_travelling_switch_preserves_and_reports_what_this_node_cannot_regenerate() 
     );
 }
 
+/// One text note whose vector the caller supplies under `producer`.
+fn supplied_note(
+    context_id: ContextId,
+    entity_id: EntityId,
+    evidence_id: EvidenceId,
+    space: &str,
+    vector: Vec<f32>,
+    producer: &ModelIdentity,
+) -> RecordObservation {
+    RecordObservation {
+        id: ObservationId::new_v7(),
+        entity_id,
+        context_id,
+        observation_type: "note".into(),
+        source: "placement-fixture".into(),
+        observed_at: chrono::DateTime::from_timestamp(1_790_000_000, 0).expect("fixed time"),
+        evidence: vec![EvidenceRef {
+            id: evidence_id,
+            kind: EvidenceKind::Text,
+            source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
+            retention_status: RetentionStatus::RetainedExternal,
+            producer: capture_producer(),
+            text_projection: Some("a supplied note".into()),
+            ..EvidenceRef::default()
+        }],
+        observed_properties: BTreeMap::new(),
+        state_delta: BTreeMap::new(),
+        properties: BTreeMap::new(),
+        embeddings: vec![context_graph::PrecomputedEmbedding {
+            id: context_graph::EmbeddingId::new_v7(),
+            embedding_space_id: space.to_string(),
+            vector,
+            target: EmbeddingTarget::Evidence(evidence_id),
+            produced_by: EvidenceProducer {
+                system: "placement-fixture".into(),
+                ..EvidenceProducer::from(producer)
+            },
+        }],
+    }
+}
+
 #[test]
-fn a_foreign_vector_supplied_into_a_node_local_space_is_recomputed_never_stored() {
-    // A caller vector from another model never lands in a reproducible space; the item is rebuilt instead.
+fn a_foreign_vector_supplied_into_a_node_local_space_is_refused_and_a_compatible_one_is_stored_as_given()
+ {
+    // A supplied vector is never silently discarded or recomputed: another model's vector is a
+    // typed refusal that writes nothing, and the space's own model's vector is kept exactly.
     let root = tempfile::tempdir().expect("tempdir");
-    let path = root.path().join("foreign-supply.db");
+    let path = root.path().join("supplied-vectors.db");
     let store = Store::open(StoreConfig {
         db_path: path,
         default_text_embedder: None,
@@ -878,88 +921,93 @@ fn a_foreign_vector_supplied_into_a_node_local_space_is_recomputed_never_stored(
     let space = text_space("rev-a").embedding_space_id;
     let context_id = create_context(&store);
     let entity_id = create_entity(&store, context_id, "notebook");
-    let evidence_id = EvidenceId::new_v7();
+    let count = |table: &str, evidence_id: EvidenceId| {
+        let column = if table == "evidence" {
+            "id"
+        } else {
+            "target_id"
+        };
+        rows(
+            &store,
+            &format!("SELECT {column} FROM {table} WHERE {column} = $id"),
+            vec![("id", Value::Uuid(evidence_id.as_uuid()))],
+        )
+        .len()
+    };
+
+    // Another model's vector, through the observation write: refused whole, nothing written.
+    let foreign = EvidenceId::new_v7();
+    let refused = store.record_observation(supplied_note(
+        context_id,
+        entity_id,
+        foreign,
+        &space,
+        text_vector("foreign"),
+        &caller_identity("foreign"),
+    ));
+    assert!(
+        matches!(
+            &refused,
+            Err(CgError::EmbeddingProducerMismatch { space: refused_space, .. }) if *refused_space == space
+        ),
+        "a foreign producer is refused with the typed error: {refused:?}"
+    );
+    assert_eq!(count("evidence", foreign), 0, "no evidence row");
+    assert_eq!(count("evidence_embeddings", foreign), 0, "no vector row");
+    assert!(node_local(&store, &space).is_empty(), "nothing is stored");
+
+    // The space's own model's vector is accepted; then another model's vector for the same
+    // item, through the direct supply door, is refused and changes nothing.
+    let compatible = EvidenceId::new_v7();
+    let supplied_vector = text_vector("kept exactly as supplied");
     let recorded = store
-        .record_observation(RecordObservation {
-            id: ObservationId::new_v7(),
-            entity_id,
+        .record_observation(supplied_note(
             context_id,
-            observation_type: "note".into(),
-            source: "placement-fixture".into(),
-            observed_at: chrono::DateTime::from_timestamp(1_790_000_000, 0).expect("fixed time"),
-            evidence: vec![EvidenceRef {
-                id: evidence_id,
-                kind: EvidenceKind::Text,
-                source_ref: format!("note://{evidence_id}"),
-                retention_status: RetentionStatus::RetainedExternal,
-                producer: capture_producer(),
-                text_projection: Some("supplied by another model".into()),
-                ..EvidenceRef::default()
-            }],
-            observed_properties: BTreeMap::new(),
-            state_delta: BTreeMap::new(),
-            properties: BTreeMap::new(),
-            embeddings: vec![context_graph::PrecomputedEmbedding {
-                id: context_graph::EmbeddingId::new_v7(),
-                embedding_space_id: space.clone(),
-                vector: text_vector("foreign"),
-                target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: EvidenceProducer {
-                    system: "placement-fixture".into(),
-                    ..EvidenceProducer::from(&caller_identity("foreign"))
-                },
-            }],
-        })
-        .expect("a foreign supply is not an error");
+            entity_id,
+            compatible,
+            &space,
+            supplied_vector.clone(),
+            &text_identity("rev-a"),
+        ))
+        .expect("a supply from the space's own model is accepted");
+    let refused_supply = store.supply_embedding(
+        EmbeddingTarget::Evidence(compatible),
+        &space,
+        caller_identity("foreign"),
+        text_vector("foreign again"),
+    );
+    assert!(
+        matches!(
+            &refused_supply,
+            Err(CgError::EmbeddingProducerMismatch { .. })
+        ),
+        "{refused_supply:?}"
+    );
+
+    // The space's own model's vector is stored as given, under the space's placement.
+    assert_eq!(
+        recorded.embedding_ids.len(),
+        1,
+        "one row written: {recorded:?}"
+    );
     assert!(
         matches!(
             recorded.supplied_vectors.as_slice(),
             [context_graph::SuppliedVectorOutcome {
-                outcome: context_graph::SuppliedVector::Recomputed {
-                    reason: context_graph::RecomputeReason::ForeignProducer,
-                },
+                outcome: context_graph::SuppliedVector::Stored { embedding_id },
                 ..
-            }]
+            }] if *embedding_id == recorded.embedding_ids[0]
         ),
-        "the write reports that the foreign vector will be recomputed: {:?}",
+        "the write reports the supplied vector as stored: {:?}",
         recorded.supplied_vectors
     );
-    assert!(
-        recorded.embedding_ids.is_empty(),
-        "no vector row was written"
-    );
-    assert!(
-        node_local(&store, &space).is_empty(),
-        "the foreign vector is never stored"
-    );
+    let stored = node_local(&store, &space);
+    assert_eq!(stored.len(), 1, "only the compatible vector is stored");
     assert_eq!(
-        rows(
-            &store,
-            "SELECT reason FROM embedding_pending WHERE target_id = $target",
-            vec![("target", Value::Uuid(evidence_id.as_uuid()))],
-        ),
-        vec![vec![Value::Text("no_embedder".into())]],
-        "the item is marked for recompute"
+        stored[&compatible.as_uuid()].1,
+        Value::Vector(supplied_vector),
+        "the supplied values are kept as given, never replaced by a recompute"
     );
-    assert_eq!(
-        status_of(&store, &space).unembedded,
-        1,
-        "and counted until then"
-    );
-
-    let stored = store
-        .supply_embedding(
-            EmbeddingTarget::Evidence(evidence_id),
-            &space,
-            text_identity("rev-a"),
-            text_vector("supplied by another model"),
-        )
-        .expect("a supply from the space's own model");
-    assert!(
-        matches!(stored, context_graph::SuppliedVector::Stored { .. }),
-        "{stored:?}"
-    );
-    assert_eq!(node_local(&store, &space).len(), 1);
     assert_eq!(status_of(&store, &space).unembedded, 0);
 }
 
@@ -984,7 +1032,7 @@ fn face_space(revision: &str) -> EmbeddingSpace {
             table_name: "evidence".into(),
             vector_column: FACE_COLUMN.into(),
         }],
-        placement: VectorPlacement::TravelsWithItem,
+        placement: Some(VectorPlacement::TravelsWithItem),
         media_reachable_on_every_node: false,
         producer: face_identity(revision),
     }
