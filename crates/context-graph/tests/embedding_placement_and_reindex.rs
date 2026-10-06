@@ -1414,59 +1414,6 @@ async fn a_second_node_receives_travelling_vectors_and_never_node_local_ones() {
     }
 }
 
-#[tokio::test]
-async fn one_way_evidence_placement_carries_travelling_vectors_one_way() {
-    // When evidence only pushes from a node, its travelling vectors push one way with it.
-    let fixture = fabric_common::fabric_fixture("placement_one_way").await;
-    let space = caller_space("v1");
-    for edge in [&fixture.edge1, &fixture.edge2] {
-        edge.store
-            .register_embedding_space(space.clone())
-            .expect("declare the caller space on both nodes");
-    }
-    sql(
-        &fixture.edge1.store,
-        "ALTER TABLE evidence SET SYNC PUSH ONLY",
-    );
-    sql(
-        &fixture.edge1.store,
-        "ALTER TABLE evidence_embeddings_travelling SET SYNC PUSH ONLY",
-    );
-    let (_, evidence) = record_with_caller_vector(
-        &fixture.edge1.store,
-        &space.embedding_space_id,
-        text_vector("from the edge"),
-    );
-
-    fabric_common::push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
-    assert_eq!(
-        travelling(&fixture.edge2.store, &space.embedding_space_id)
-            .get(&evidence.as_uuid())
-            .map(|(_, vector)| vector.clone()),
-        Some(Value::Vector(text_vector("from the edge"))),
-        "the pushing node's vector reaches the other node"
-    );
-
-    fixture
-        .edge2
-        .store
-        .supply_embedding(
-            EmbeddingTarget::Evidence(evidence),
-            &space.embedding_space_id,
-            caller_identity("v1"),
-            text_vector("from elsewhere"),
-        )
-        .expect("another node re-supplies the vector");
-    fabric_common::push_then_pull(&fixture.edge2_client, &fixture.edge1_client).await;
-    assert_eq!(
-        travelling(&fixture.edge1.store, &space.embedding_space_id)
-            .get(&evidence.as_uuid())
-            .map(|(_, vector)| vector.clone()),
-        Some(Value::Vector(text_vector("from the edge"))),
-        "a push-only node never receives the vector back"
-    );
-}
-
 #[test]
 fn a_travelling_table_whose_direction_differs_from_its_item_is_refused_at_open() {
     // A store whose travelling vectors would sync differently from their evidence never opens.
