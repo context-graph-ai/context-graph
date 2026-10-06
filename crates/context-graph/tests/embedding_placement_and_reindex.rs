@@ -484,7 +484,13 @@ fn a_skipped_item_keeps_its_old_vector_and_is_counted_until_it_is_rebuilt() {
     let refused = evidence[7].as_uuid();
     let old_space = text_space("rev-a").embedding_space_id;
     let new_space = text_space("rev-b").embedding_space_id;
-    let old_vector = node_local(&store, &old_space)[&refused].clone();
+    let before_switch = node_local(&store, &old_space);
+    assert!(
+        before_switch.contains_key(&refused),
+        "the item has a node-local vector under the old model before the switch: {:?}",
+        before_switch.keys().collect::<Vec<_>>()
+    );
+    let old_vector = before_switch[&refused].clone();
 
     store
         .switch_embedding_space(
