@@ -889,7 +889,34 @@ fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_determin
         "SELECT started_at FROM reindex_cursors WHERE embedding_space_id = $space",
         &params(vec![("space", Value::Text(TEXT_SPACE.to_string()))]),
     );
-    let entered_ids = entered_before_done.lock().expect("entered ids").clone();
+    // A writer whose record_observation returned Err committed nothing; only acknowledged writes
+    // are owed a landing in the target space.
+    let acknowledged = new_evidence_ids
+        .iter()
+        .zip(writer_results.iter())
+        .filter(|(_, result)| result.is_ok())
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    let errored = new_evidence_ids
+        .iter()
+        .zip(writer_results.iter())
+        .filter(|(_, result)| result.is_err())
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    let errored_writers_committed_nothing = errored.iter().all(|evidence_id| {
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM evidence WHERE id = $evidence_id",
+            &params(vec![("evidence_id", Value::Uuid(evidence_id.as_uuid()))]),
+        ) == 0
+    });
+    let entered_ids = entered_before_done
+        .lock()
+        .expect("entered ids")
+        .iter()
+        .copied()
+        .filter(|evidence_id| acknowledged.contains(evidence_id))
+        .collect::<Vec<_>>();
     let entered_texts = entered_ids
         .iter()
         .filter_map(|evidence_id| {
@@ -924,15 +951,16 @@ fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_determin
 
     assert!(
         reindex_result.is_ok()
-            && writer_results.iter().all(Result::is_ok)
+            && errored_writers_committed_nothing
             && entered_before_reindex_done > 0
+            && !entered_ids.is_empty()
             && cursor_rows == 1
             && cursor_last_committed == Some(expected_scan_rows as i64)
             && entered_after_scan_start
             && vector_index_matches_sources(&db, &entered_ids, &entered_texts)
             && writer_texts_embedded_only_by_writer_threads(&embed_calls, &entered_texts)
             && new_producer_rows == entered_ids.len() as i64,
-        "writes that entered before reindex completed must commit after the scan-start cursor, be embedded on the writer path from their original source text, and never be embedded by the bounded reindex scan or a reindex worker, reindex_result={reindex_result:?}, writer_results={writer_results:?}, entered_before_reindex_done={entered_before_reindex_done}, expected_scan_rows={expected_scan_rows}, cursor_rows={cursor_rows}, cursor_last_committed={cursor_last_committed:?}, scan_started_at={scan_started_at:?}, entered_created_txids={entered_created_txids:?}, entered_after_scan_start={entered_after_scan_start}, entered_ids={entered_ids:?}, entered_texts={entered_texts:?}, reindex_calls={:?}, embed_calls={:?}, new_producer_rows={new_producer_rows}",
+        "acknowledged writes that entered before reindex completed must commit after the scan-start cursor, be embedded on the writer path from their original source text, and never be embedded by the bounded reindex scan or a reindex worker, reindex_result={reindex_result:?}, writer_results={writer_results:?}, errored={errored:?}, errored_writers_committed_nothing={errored_writers_committed_nothing}, entered_before_reindex_done={entered_before_reindex_done}, expected_scan_rows={expected_scan_rows}, cursor_rows={cursor_rows}, cursor_last_committed={cursor_last_committed:?}, scan_started_at={scan_started_at:?}, entered_created_txids={entered_created_txids:?}, entered_after_scan_start={entered_after_scan_start}, entered_ids={entered_ids:?}, entered_texts={entered_texts:?}, reindex_calls={:?}, embed_calls={:?}, new_producer_rows={new_producer_rows}",
         reindex_calls.lock().expect("calls"),
         embed_calls.lock().expect("detailed calls")
     );
