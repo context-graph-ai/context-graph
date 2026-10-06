@@ -98,6 +98,24 @@ fn worker_policy(root: &std::path::Path) -> serde_json::Value {
 ))]
 const REQUEST_OBSERVER_ENV: &str = "CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER";
 
+/// The projection target the product records a request against: the default event-history
+/// profile and space (`super::search_work_spec` in the CLI).
+#[cfg(any(
+    context_graph_internal_test_support,
+    feature = "event-search-test-support"
+))]
+fn default_event_history_spec() -> context_graph::EventSearchWorkSpec {
+    context_graph::EventSearchWorkSpec {
+        profile: context_graph::EventSearchProfile::default(),
+        embedding_space_id:
+            context_graph::embedding_space::BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID
+                .into(),
+        encoding_profile_id:
+            context_graph::embedding_space::BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID
+                .into(),
+    }
+}
+
 #[cfg(any(
     context_graph_internal_test_support,
     feature = "event-search-test-support"
@@ -186,6 +204,40 @@ fn terminate_observed_background_worker(observer: &std::path::Path) {
     } else {
         assert_eq!(result, 0);
     }
+}
+
+/// Wait for `reached` with no elapsed-time bound, ending early only when the observed worker's
+/// recorded process group is gone: a worker that exited can never reach its rendezvous.
+#[cfg(any(
+    context_graph_internal_test_support,
+    feature = "event-search-test-support"
+))]
+fn wait_for_observed_worker<T>(
+    observer: &std::path::Path,
+    mut reached: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    wait_for_state(
+        std::time::Duration::MAX,
+        std::time::Duration::from_millis(20),
+        || {
+            if let Some(value) = reached() {
+                return Ok::<_, ()>(Some(Some(value)));
+            }
+            let Some(process_group) =
+                std::fs::read_to_string(observer.join("embedding-worker-process-group"))
+                    .ok()
+                    .and_then(|group| group.trim().parse::<i32>().ok())
+            else {
+                return Ok(None);
+            };
+            // SAFETY: signal 0 only probes whether the recorded process group still exists.
+            let exited = unsafe { libc::kill(-process_group, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            Ok(exited.then_some(reached()))
+        },
+    )
+    .expect("observed worker wait cannot fail")
+    .expect("a wait without an elapsed-time bound ends only on an observation")
 }
 
 #[cfg(any(
@@ -421,22 +473,13 @@ fn detached_background_import_delivers_default_cap_to_its_production_request_bui
         &observer,
     );
     assert_eq!(imported.code, 0, "{}", imported.describe());
-    let first = wait_for_state(
-        std::time::Duration::from_secs(10),
-        std::time::Duration::from_millis(20),
-        || {
-            let caps = observed_batch_caps(&observer);
-            Ok::<_, ()>((!caps.is_empty()).then_some(caps))
-        },
-    )
-    .expect("first batch observation cannot fail");
+    // Synchronise on the worker's own rendezvous, never on elapsed time: the first batch callback
+    // records its cap and then pauses at `entered`, after loading the real embedder.
+    let paused = wait_for_observed_worker(&observer, || {
+        observer.join("entered").exists().then_some(())
+    });
+    let first = Some(observed_batch_caps(&observer)).filter(|caps| !caps.is_empty());
     let (paused, later) = if first.is_some() {
-        let paused = wait_for_state(
-            std::time::Duration::from_secs(10),
-            std::time::Duration::from_millis(20),
-            || Ok::<_, ()>(observer.join("entered").exists().then_some(())),
-        )
-        .expect("batch pause observation cannot fail");
         // Replace the execution choice while preserving the accepted request's selected
         // frontiers and saved ceiling. A cap update is not a queue acknowledgement.
         let mut replacement_policy = worker_policy(&machine.data_root);
@@ -453,15 +496,10 @@ fn detached_background_import_delivers_default_cap_to_its_production_request_bui
             b"continue after policy replacement\n",
         )
         .expect("release owned background worker");
-        let later = wait_for_state(
-            std::time::Duration::from_secs(10),
-            std::time::Duration::from_millis(20),
-            || {
-                let caps = observed_batch_caps(&observer);
-                Ok::<_, ()>((caps.len() >= 2).then_some(caps))
-            },
-        )
-        .expect("later batch observation cannot fail");
+        let later = wait_for_observed_worker(&observer, || {
+            let caps = observed_batch_caps(&observer);
+            (caps.len() >= 2).then_some(caps)
+        });
         (paused, later)
     } else {
         std::fs::write(
@@ -1089,15 +1127,68 @@ mod request_write_ceilings {
         )
     }
 
-    fn await_marker(observer: &Path, marker: &str) {
-        assert_eq!(
-            wait_for_state(Duration::from_secs(30), Duration::from_millis(20), || {
-                Ok::<_, ()>(observer.join(marker).exists().then_some(()))
-            })
-            .expect("observe worker rendezvous"),
-            Some(()),
-            "worker did not reach {marker}"
-        );
+    /// The rendezvous has no elapsed-time bound: only this test-owned child writing its own PID
+    /// into the marker or its actual exit resolves it.
+    fn await_marker(worker: &mut event_support::TestChild, observer: &Path, marker: &str) {
+        let pid = worker.id();
+        let reached = wait_for_state(Duration::MAX, Duration::from_millis(20), || {
+            let reached_marker = if marker == "selection-cleanup-entered" {
+                std::fs::read_to_string(observer.join(marker))
+                    .ok()
+                    .is_some_and(|owner| owner.trim() == pid.to_string())
+            } else {
+                observer.join(marker).exists()
+            };
+            if reached_marker {
+                return Ok::<_, std::io::Error>(Some(Ok(())));
+            }
+            Ok(worker.try_wait()?.map(Err))
+        })
+        .expect("observe test-owned worker rendezvous")
+        .expect("a wait without an elapsed-time bound ends only on marker or worker exit");
+        if let Err(status) = reached {
+            panic!("test-owned worker {pid} exited with {status:?} before {marker}");
+        }
+    }
+
+    fn process_start_ticks(pid: u32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, fields) = stat.rsplit_once(") ")?;
+        fields.split_whitespace().nth(19)?.parse().ok()
+    }
+
+    /// A detached worker writes its PID and Linux start ticks to the existing handoff directory
+    /// as it is spawned. The pair identifies that exact child even if its PID is later reused.
+    fn await_detached_marker(observer: &Path, marker: &str) {
+        let mut identity = None;
+        let reached = wait_for_state(Duration::MAX, Duration::from_millis(20), || {
+            if observer.join(marker).exists() {
+                return Ok::<_, ()>(Some(Ok(())));
+            }
+            if identity.is_none() {
+                identity = std::fs::read_to_string(observer.join("embedding-worker-process-group"))
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<u32>().ok())
+                    .zip(
+                        std::fs::read_to_string(
+                            observer.join("embedding-worker-process-start-ticks"),
+                        )
+                        .ok()
+                        .and_then(|ticks| ticks.trim().parse::<u64>().ok()),
+                    );
+            }
+            let Some((pid, start_ticks)) = identity else {
+                return Ok(None);
+            };
+            Ok((process_start_ticks(pid) != Some(start_ticks)).then_some(Err((pid, start_ticks))))
+        })
+        .expect("observe detached worker rendezvous")
+        .expect("a wait without an elapsed-time bound ends only on marker or worker exit");
+        if let Err((pid, start_ticks)) = reached {
+            panic!(
+                "detached worker {pid} (start ticks {start_ticks}) exited before {marker}"
+            );
+        }
     }
 
     fn budgets(observer: &Path) -> Vec<(String, usize)> {
@@ -1369,7 +1460,7 @@ mod request_write_ceilings {
             std::fs::remove_file(observer.join("release")).unwrap();
             std::fs::write(observer.join("numbered-passes"), b"4").unwrap();
             drop(held);
-            let worker = machine.spawn_with_env(
+            let mut worker = machine.spawn_with_env(
                 &project,
                 &[
                     "__event-search-worker",
@@ -1381,7 +1472,7 @@ mod request_write_ceilings {
                 &observer,
             );
             for pass in 1..=4 {
-                await_marker(&observer, &format!("entered.{pass}"));
+                await_marker(&mut worker, &observer, &format!("entered.{pass}"));
                 if pass == 4 && unrelated_publication {
                     let other = machine.project("unrelated-stale-arrival");
                     write_session(
@@ -1498,14 +1589,14 @@ mod request_write_ceilings {
             std::fs::write(observer.join("numbered-passes"), b"2").unwrap();
             std::fs::write(observer.join("refuse-aggregate-read"), b"refuse").unwrap();
             drop(held);
-            let worker = machine.spawn_with_envs(
+            let mut worker = machine.spawn_with_envs(
                 &project,
                 &["__event-search-worker", &envelope()],
                 &[(REQUEST_OBSERVER_ENV, &observer)],
             );
-            await_marker(&observer, "entered.1");
+            await_marker(&mut worker, &observer, "entered.1");
             std::fs::write(observer.join("release.1"), b"second assessment").unwrap();
-            await_marker(&observer, "entered.2");
+            await_marker(&mut worker, &observer, "entered.2");
             let path = write_session(
                 &machine.history_root(),
                 &project,
@@ -1618,7 +1709,9 @@ mod request_write_ceilings {
             let request = &mut saved["pending_background_request"]["write_requests"][0];
             let context = serde_json::from_value(request["context_id"].clone()).unwrap();
             let policy = serde_json::from_value(request["work_policy"].clone()).unwrap();
-            let selection = store.select_event_search_work(context, policy).unwrap();
+            let selection = store
+                .select_event_search_work_with_spec(context, policy, &default_event_history_spec())
+                .unwrap();
             request["selected_work"] = serde_json::to_value(
                 store
                     .persist_event_search_selected_work(context, &selection)
@@ -1669,7 +1762,7 @@ mod request_write_ceilings {
                 .unwrap();
             }
             drop(held);
-            let worker = machine.spawn_with_envs(
+            let mut worker = machine.spawn_with_envs(
                 &project,
                 &["__event-search-worker", &envelope()],
                 &[
@@ -1678,7 +1771,7 @@ mod request_write_ceilings {
                 ],
             );
             if completion_read {
-                await_marker(&assessment, "work-assessment-complete");
+                await_marker(&mut worker, &assessment, "work-assessment-complete");
                 let db = contextdb_engine::Database::open(machine.db_path()).unwrap();
                 db.execute(
                     "DELETE FROM event_search_request_selections WHERE request_id = $identity",
@@ -1709,7 +1802,7 @@ mod request_write_ceilings {
                 )
                 .unwrap();
             }
-            await_marker(&observer, "entered.1");
+            await_marker(&mut worker, &observer, "entered.1");
             assert!(
                 actual_budgets(&observer).is_empty(),
                 "failure precedes projection"
@@ -1917,7 +2010,7 @@ mod request_write_ceilings {
                 &observer,
             );
             if racing {
-                await_marker(&observer, "selection-cleanup-entered");
+                await_marker(&mut worker, &observer, "selection-cleanup-entered");
                 if !cleanup_failure {
                     worker
                         .kill()
@@ -1941,7 +2034,7 @@ mod request_write_ceilings {
                         REQUEST_OBSERVER_ENV,
                         &observer,
                     );
-                    await_marker(&observer, "selection-cleanup-entered");
+                    await_marker(&mut worker, &observer, "selection-cleanup-entered");
                 }
                 let other = if same_context {
                     project.clone()
@@ -2249,14 +2342,14 @@ mod request_write_ceilings {
                     .unwrap();
             }
             drop(held);
-            let worker = machine.spawn_with_env(
+            let mut worker = machine.spawn_with_env(
                 &project,
                 &["__event-search-worker", &envelope()],
                 REQUEST_OBSERVER_ENV,
                 &observer,
             );
             for pass in 1..=3 {
-                await_marker(&observer, "failure-record-entered");
+                await_marker(&mut worker, &observer, "failure-record-entered");
                 let writer = context_graph::Store::open(context_graph::StoreConfig {
                     db_path: machine.db_path(),
                     default_text_embedder: None,
@@ -2269,10 +2362,10 @@ mod request_write_ceilings {
                     b"refuse failure reopen",
                 )
                 .unwrap();
-                await_marker(&observer, "failure-record-returned");
+                await_marker(&mut worker, &observer, "failure-record-returned");
                 drop(writer);
                 std::fs::write(observer.join("failure-writer-released"), b"released").unwrap();
-                await_marker(&observer, &format!("entered.{pass}"));
+                await_marker(&mut worker, &observer, &format!("entered.{pass}"));
                 for marker in [
                     "failure-record-entered",
                     "failure-record-continue",
@@ -2319,7 +2412,7 @@ mod request_write_ceilings {
             std::fs::remove_file(observer.join("hold-writer-during-failure-record")).unwrap();
             std::fs::write(observer.join("release.3"), b"serve arrival").unwrap();
             let competing_lock = competing_owner.then(|| {
-                await_marker(&observer, "failed-worker-relock-entered");
+                await_marker(&mut worker, &observer, "failed-worker-relock-entered");
                 let held = acquire_worker_lock(&machine.data_root.join("event-search-worker.lock"))
                     .expect("competing worker owns the released lock");
                 let startup = machine.run(&project, &["__event-search-worker", &envelope()]);
@@ -2496,9 +2589,10 @@ mod request_write_ceilings {
                 let request = &mut accepted["pending_background_request"]["write_requests"][0];
                 let context = serde_json::from_value(request["context_id"].clone()).unwrap();
                 let selection = store
-                    .select_event_search_work(
+                    .select_event_search_work_with_spec(
                         context,
                         serde_json::from_value(request["work_policy"].clone()).unwrap(),
+                        &default_event_history_spec(),
                     )
                     .unwrap();
                 request["selected_work"] = serde_json::to_value(
@@ -2710,7 +2804,7 @@ mod request_write_ceilings {
                 let output = worker.wait_with_output().unwrap();
                 assert!(output.status.success(), "{output:?}");
             } else {
-                await_marker(&observer, "selection-cleanup-entered");
+                await_marker(&mut worker, &observer, "selection-cleanup-entered");
                 worker.kill().unwrap();
                 worker.wait().unwrap();
             }
@@ -3111,7 +3205,7 @@ mod request_write_ceilings {
                     String::from_utf8_lossy(&output.stderr)
                 );
             } else {
-                await_marker(&observer, "selection-cleanup-entered");
+                await_marker(&mut worker, &observer, "selection-cleanup-entered");
                 worker
                     .kill()
                     .expect("interrupt this owned refusal worker before retirement");
@@ -3601,7 +3695,7 @@ mod request_write_ceilings {
                     String::from_utf8_lossy(&output.stderr)
                 );
             } else {
-                await_marker(&observer, "selection-cleanup-entered");
+                await_marker(&mut worker, &observer, "selection-cleanup-entered");
                 worker
                     .kill()
                     .expect("interrupt before accepted selection retirement");
@@ -3658,7 +3752,7 @@ mod request_write_ceilings {
                 ..Default::default()
             };
             let all_frontier = reader
-                .select_event_search_work(context, all_policy)
+                .select_event_search_work_with_spec(context, all_policy, &spec)
                 .unwrap();
             assert_eq!(all_frontier.streams.len(), 2);
             assert!(
@@ -3829,7 +3923,7 @@ mod request_write_ceilings {
                 REQUEST_OBSERVER_ENV,
                 &observer_b,
             );
-            await_marker(&observer_b, "entered.1");
+            await_marker(&mut worker_b, &observer_b, "entered.1");
             let mut queued = worker_policy(&machine.data_root);
             let b_pending = queued["pending_background_request"].clone();
             let b = b_pending["write_requests"][0].clone();
@@ -3855,9 +3949,10 @@ mod request_write_ceilings {
             let a_context: context_graph::ContextId =
                 serde_json::from_value(a["context_id"].clone()).unwrap();
             let selection = store
-                .select_event_search_work(
+                .select_event_search_work_with_spec(
                     a_context,
                     serde_json::from_value(a["work_policy"].clone()).unwrap(),
+                    &default_event_history_spec(),
                 )
                 .unwrap();
             a["selected_work"] = serde_json::to_value(
@@ -3957,9 +4052,10 @@ mod request_write_ceilings {
             for request in pending["write_requests"].as_array_mut().unwrap() {
                 let context = serde_json::from_value(request["context_id"].clone()).unwrap();
                 let selection = store
-                    .select_event_search_work(
+                    .select_event_search_work_with_spec(
                         context,
                         context_graph::EventSearchWorkPolicy::default(),
+                        &default_event_history_spec(),
                     )
                     .unwrap();
                 request["selected_work"] = serde_json::to_value(
@@ -4077,7 +4173,11 @@ mod request_write_ceilings {
         )
         .unwrap();
         let old_frontier = store
-            .select_event_search_work(old_context, Default::default())
+            .select_event_search_work_with_spec(
+                old_context,
+                Default::default(),
+                &default_event_history_spec(),
+            )
             .unwrap();
         let old_selection = store
             .persist_event_search_selected_work(old_context, &old_frontier)
@@ -4100,7 +4200,7 @@ mod request_write_ceilings {
             b"pause after assessment",
         )
         .unwrap();
-        let older = machine.spawn_with_env(
+        let mut older = machine.spawn_with_env(
             &project,
             &[
                 "import",
@@ -4113,7 +4213,7 @@ mod request_write_ceilings {
             REQUEST_OBSERVER_ENV,
             &barrier,
         );
-        await_marker(&barrier, "import-assessment-complete");
+        await_marker(&mut older, &barrier, "import-assessment-complete");
         write_session(
             &machine.history_root(),
             &project,
@@ -4401,7 +4501,7 @@ mod request_write_ceilings {
         let barrier = machine.root.join("queued-profile-embedding");
         std::fs::create_dir_all(&barrier).expect("embedding rendezvous");
         drop(held);
-        let worker = machine.spawn_with_envs(
+        let mut worker = machine.spawn_with_envs(
             &project,
             &[
                 "__event-search-worker",
@@ -4414,7 +4514,7 @@ mod request_write_ceilings {
                 ("CG_NOMIC_TEST_PREPARED_EMBEDDING_BARRIER", &barrier),
             ],
         );
-        await_marker(&barrier, "reached");
+        await_marker(&mut worker, &barrier, "reached");
         // P1 selected B+D. B is embedding; D will only be claimed after C acceptance.
         let source = machine
             .history_root()
@@ -4851,9 +4951,10 @@ mod request_write_ceilings {
                 .find(|context| context.name == "orphan-selection")
                 .expect("selected Context");
             let selection = store
-                .select_event_search_work(
+                .select_event_search_work_with_spec(
                     context.id,
                     context_graph::EventSearchWorkPolicy::default(),
+                    &default_event_history_spec(),
                 )
                 .expect("captured frontier");
             for _ in 0..70 {
@@ -5049,13 +5150,13 @@ mod request_write_ceilings {
             std::fs::write(observer.join(marker), content).unwrap();
         }
         drop(held);
-        let worker = machine.spawn_with_env(
+        let mut worker = machine.spawn_with_env(
             &low_project,
             &["__event-search-worker", &envelope()],
             REQUEST_OBSERVER_ENV,
             &observer,
         );
-        await_marker(&observer, "aggregate-active-time-refusal-entered");
+        await_marker(&mut worker, &observer, "aggregate-active-time-refusal-entered");
         let arrival = import_selected(
             &machine,
             &arriving_project,
@@ -5085,7 +5186,7 @@ mod request_write_ceilings {
             b"refuse observed statement",
         )
         .unwrap();
-        await_marker(&observer, "read-timeout-recovery-entered");
+        await_marker(&mut worker, &observer, "read-timeout-recovery-entered");
         let saved =
             worker_policy(&machine.data_root)["pending_background_request"]["write_requests"]
                 .as_array()
@@ -5305,7 +5406,7 @@ mod request_write_ceilings {
             REQUEST_OBSERVER_ENV,
             &observer,
         );
-        await_marker(&observer, "read-timeout-recovery-entered");
+        await_marker(&mut interrupted, &observer, "read-timeout-recovery-entered");
         let saved =
             worker_policy(&machine.data_root)["pending_background_request"]["write_requests"][0]
                 .clone();
@@ -5791,7 +5892,7 @@ mod request_write_ceilings {
             &observer,
         );
         for remaining in [10, 9, 8] {
-            await_marker(&observer, &format!("foreground-read-timeout-{remaining}"));
+            await_marker(&mut foreground, &observer, &format!("foreground-read-timeout-{remaining}"));
             write_session(
                 &machine.history_root(),
                 &project,
@@ -6066,7 +6167,7 @@ mod request_write_ceilings {
             REQUEST_OBSERVER_ENV,
             &observer,
         );
-        await_marker(&observer, "read-timeout-recovery-entered");
+        await_marker(&mut first, &observer, "read-timeout-recovery-entered");
         let interrupted =
             worker_policy(&machine.data_root)["pending_background_request"]["write_requests"][0]
                 .clone();
@@ -6335,7 +6436,7 @@ mod request_write_ceilings {
         std::fs::write(observer.join("refuse-next-selected-work"), b"typed refusal")
             .expect("refuse B once");
         drop(held);
-        let worker = machine.spawn_with_env(
+        let mut worker = machine.spawn_with_env(
             &project,
             &[
                 "__event-search-worker",
@@ -6346,7 +6447,7 @@ mod request_write_ceilings {
             REQUEST_OBSERVER_ENV,
             &observer,
         );
-        await_marker(&observer, "entered.1");
+        await_marker(&mut worker, &observer, "entered.1");
         let queued = worker_policy(&machine.data_root);
         let requests = queued["pending_background_request"]["write_requests"]
             .as_array()
@@ -6865,7 +6966,7 @@ mod request_write_ceilings {
             "CG_EVENT_SEARCH_TEST_PRE_CATCH_UP_BARRIER",
             &pause,
         );
-        await_marker(&pause, "pre-catch-up-entered");
+        await_marker(&mut first_worker, &pause, "pre-catch-up-entered");
         write_session(
             &machine.history_root(),
             &project,
@@ -7041,7 +7142,7 @@ mod request_write_ceilings {
         let observer = batch_observer(&machine, "overlapping-budgets");
         let first = import(&machine, &first_project, "first-budget", HIGH, &observer);
         assert_eq!(first.code, 0, "{}", first.describe());
-        await_marker(&observer, "entered");
+        await_detached_marker(&observer, "entered");
         // The active batch has a claim, but embedding retains no writable Store. A second
         // independent capture must still succeed before releasing the first batch.
         let second = import(&machine, &second_project, "second-budget", LOW, &observer);
@@ -7122,7 +7223,7 @@ mod request_write_ceilings {
             &scope_observer,
         );
         assert_eq!(older.code, 0, "{}", older.describe());
-        await_marker(&scope_observer, "entered");
+        await_detached_marker(&scope_observer, "entered");
         let already_seen = budgets(&scope_observer).len();
         let newer = scoped.run_with_env(
             &scoped_project,
@@ -7234,13 +7335,13 @@ mod request_write_ceilings {
             &orphan_pause,
         );
         assert_eq!(captured.code, 0, "{}", captured.describe());
-        await_marker(&orphan_pause, "entered");
+        await_detached_marker(&orphan_pause, "entered");
         terminate_observed_background_worker(&orphan_pause);
         orphan.wait_for_search_worker_exit();
         let lease_wait = batch_observer(&orphan, "orphan-lease-wait");
         std::fs::write(lease_wait.join("numbered-passes"), b"1")
             .expect("observe the lease-only pass");
-        let resumed = orphan.spawn_with_env(
+        let mut resumed = orphan.spawn_with_env(
             &orphan_project,
             &[
                 "__event-search-worker",
@@ -7251,7 +7352,7 @@ mod request_write_ceilings {
             REQUEST_OBSERVER_ENV,
             &lease_wait,
         );
-        await_marker(&lease_wait, "entered.1");
+        await_marker(&mut resumed, &lease_wait, "entered.1");
         assert_eq!(
             worker_policy(&orphan.data_root)["pending_background_request"]["write_requests"][0]["completed"],
             false
@@ -7306,7 +7407,7 @@ mod request_write_ceilings {
                 &observer,
             );
             assert_eq!(first.code, 0, "{}", first.describe());
-            await_marker(&observer, "entered.2");
+            await_detached_marker(&observer, "entered.2");
             // The first projection finished before the pause, so restart has no orphan lease.
             assert_ready(&machine, &project, "shared-budget");
             let additional = write_session(
@@ -7418,7 +7519,7 @@ mod request_write_ceilings {
         let imported = import(&machine, &project, "insufficient-budget", HIGH, &observer);
         assert_eq!(imported.code, 0, "{}", imported.describe());
         drop(held);
-        let worker = machine.spawn_with_env(
+        let mut worker = machine.spawn_with_env(
             &project,
             &[
                 "__event-search-worker",
@@ -7429,7 +7530,7 @@ mod request_write_ceilings {
             REQUEST_OBSERVER_ENV,
             &observer,
         );
-        await_marker(&observer, "entered");
+        await_marker(&mut worker, &observer, "entered");
         let mut pending = worker_policy(&machine.data_root);
         let token = pending["pending_background_request"]["token"].clone();
         let original = pending["pending_background_request"]["write_requests"][0].clone();
@@ -7520,7 +7621,7 @@ mod request_write_ceilings {
             &retry_observer,
         );
         assert_eq!(resumed.code, 0, "{}", resumed.describe());
-        await_marker(&retry_observer, "worker-store-write-memory-limit-bytes");
+        await_detached_marker(&retry_observer, "worker-store-write-memory-limit-bytes");
         machine.wait_for_search_worker_exit();
         assert_ready(&machine, &project, "insufficient-budget");
         // New work retires independently while the old impossible cleanup stays inspectable.
