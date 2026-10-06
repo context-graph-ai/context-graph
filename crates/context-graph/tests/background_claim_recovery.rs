@@ -1052,11 +1052,12 @@ fn a_rebooted_store_is_taken_over_immediately() {
                 .expect("copy one store file");
         }
     }
-    let rebooted = config(
-        rebooted_root
+    let rebooted = StoreConfig {
+        db_path: rebooted_root
             .path()
             .join(config.db_path.file_name().expect("store file name")),
-    );
+        ..config.clone()
+    };
     assert_eq!(
         claim_rows_at(&rebooted, context_id),
         held,
