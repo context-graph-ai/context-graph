@@ -176,6 +176,7 @@ fn status_totals_stay_correct_and_bounded_on_a_store_no_single_read_can_cross() 
         QueueCounts {
             pending: fixture.chunk_count - forced.stateful_jobs,
             in_flight: forced.in_flight,
+            interrupted: 0,
             structured: forced.structured,
             failed: forced.failed,
             skipped: forced.skipped,
@@ -291,6 +292,7 @@ fn status_totals_stay_correct_and_bounded_on_a_store_no_single_read_can_cross() 
             pending: CROWD_CHUNKS_PER_CONTEXT
                 - (CROWD_CLAIMED + CROWD_RESULTED + CROWD_FAILED + CROWD_CANCELLED),
             in_flight: CROWD_CLAIMED,
+            interrupted: 0,
             structured: CROWD_RESULTED,
             failed: CROWD_FAILED,
             skipped: CROWD_CANCELLED,

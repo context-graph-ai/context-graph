@@ -2,7 +2,7 @@
 //! Every test here is `#[ignore]`d: each needs the real pinned model in the local cache and takes
 //! seconds to minutes, so it never runs in the ordinary suite. Timing uses the seamed wallclock.
 
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use context_graph::embedder::EmbedderConfig;
@@ -170,7 +170,6 @@ fn end_to_end_projection_seconds_per_thousand_events() {
         max_events_per_batch: NonZeroU32::new(256).unwrap(),
         max_passages_per_batch: NonZeroU32::new(1_024).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
-        lease_duration_ms: NonZeroU64::new(120_000).unwrap(),
     })
     .expect("projection completes");
     eprintln!(
@@ -369,7 +368,6 @@ fn memory_probe_claim_loop() {
         max_events_per_batch: NonZeroU32::new(256).unwrap(),
         max_passages_per_batch: NonZeroU32::new(32).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
-        lease_duration_ms: NonZeroU64::new(120_000).unwrap(),
     })
     .expect("projection");
     eprintln!(

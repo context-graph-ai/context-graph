@@ -3733,7 +3733,6 @@ mod request_write_ceilings {
                         max_events_per_batch: std::num::NonZeroU32::new(256).unwrap(),
                         max_passages_per_batch: std::num::NonZeroU32::new(32).unwrap(),
                         max_bytes_per_batch: std::num::NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
-                        lease_duration_ms: std::num::NonZeroU64::new(120_000).unwrap(),
                     },
                     context_graph::EventSearchWorkPolicy {
                         sessions: context_graph::EventSearchSessionScope::All,

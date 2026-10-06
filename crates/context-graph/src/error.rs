@@ -88,7 +88,6 @@ pub enum InterpretationAdmissionRefusalReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterpretationLeaseRefusalReason {
     StaleClaim,
-    ExpiredClaim,
     SourceChanged,
     MembershipChanged,
 }
@@ -573,6 +572,20 @@ pub enum CgError {
         readers: Vec<ReaderIdentity>,
         path: std::path::PathBuf,
     },
+    /// A live process holds this unit of background work, so nothing was changed. Only a caller
+    /// that keeps its Store open is told this; a standalone runner waits for the holder instead,
+    /// and [`crate::background_work::wait_for_live_holder`] waits for the holder named here.
+    BackgroundWorkHeldByLiveWorker {
+        work: crate::BackgroundWork,
+        context_id: ContextId,
+        holder: uuid::Uuid,
+    },
+    /// The filesystem under the store cannot take the holder lock that proves a background worker
+    /// is alive, so the work was not claimed and nothing was written.
+    BackgroundClaimUnavailable {
+        path: String,
+        reason: String,
+    },
     /// One statement exhausted its declared active-time allowance. The failed read releases
     /// its resources; a caller may resume committed work under the same allowance.
     ReadActiveTimeExceeded {
@@ -710,6 +723,16 @@ impl fmt::Display for CgError {
             // Nothing is damaged and nothing was half-written: the machine would not give cg the
             // working memory this write needed. The operator is told what it asked for, what it
             // is allowed, and the two knobs that change the second number.
+            CgError::BackgroundWorkHeldByLiveWorker {
+                work, context_id, ..
+            } => write!(
+                f,
+                "{work} in Context `{context_id}` is held by a live worker, so nothing was changed; it publishes when it finishes, and a standalone run waits for it"
+            ),
+            CgError::BackgroundClaimUnavailable { path, reason } => write!(
+                f,
+                "background work cannot be claimed through {path}: {reason}; this filesystem cannot prove whether a background worker is alive, so nothing was claimed or written"
+            ),
             CgError::ReadActiveTimeExceeded { limit_ms } => {
                 write!(f, "a read exceeded its {limit_ms} ms active-time allowance")
             }
@@ -939,9 +962,6 @@ fn interpretation_lease_refusal_message(reason: InterpretationLeaseRefusalReason
     match reason {
         InterpretationLeaseRefusalReason::StaleClaim => {
             "the claim token or epoch is no longer current; discard this mapped result and request a fresh claim"
-        }
-        InterpretationLeaseRefusalReason::ExpiredClaim => {
-            "the claim expired before commit; discard this mapped result and request a fresh claim"
         }
         InterpretationLeaseRefusalReason::SourceChanged => {
             "a claimed captured event or anchor no longer matches its source hash; discard this mapped result and rebuild from a fresh source snapshot"

@@ -27,13 +27,12 @@
 #   history/import.rs:133 Instant::now — the import's elapsed time reported in its receipt
 #   history/import.rs:667 Instant::now — search_ms for a background search kick, in the receipt
 #   history/import.rs:697 Instant::now — search_ms for a foreground search run, in the receipt
-#   history/worker.rs:54 Instant::now — remaining time left in the reader-release deadline before waiting
-#   history/worker.rs:62 thread::sleep — bounded backoff after an unobservable reader wait, capped at the remaining allowance
-#   history/worker.rs:98 Instant::now — start of the reader-release allowance for the pending-work check
-#   history/worker.rs:195 Instant::now — start of the reader-release allowance for a context's search catch-up attempts
-#   history/worker.rs:273 thread::sleep — 200 ms backoff while the worker lock is held by another worker
+#   history/worker.rs pause_before_recheck thread::sleep — bounded backoff after an unobservable reader wait, capped at the remaining allowance
+#   history/worker.rs retry_while_readers Instant::now — start of one reader-refused operation's allowance
+# The worker-lock waits are kernel lock waits, and a live background-work holder is waited on
+# through its holder lock, so neither the 200 ms worker-lock backoff nor a lease recheck remains.
 "crates/cg-cli/src/history/import.rs" = 3
-"crates/cg-cli/src/history/worker.rs" = 5
+"crates/cg-cli/src/history/worker.rs" = 2
 "crates/cg-cli/src/main.rs" = 12
 # Bounded poll of a separate process's observable state with a deadline (manager ruling):
 #   :995 thread::sleep — 250 ms pause between reads of `cg status` while a background search build

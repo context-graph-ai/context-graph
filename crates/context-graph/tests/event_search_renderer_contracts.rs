@@ -5,7 +5,7 @@
 #![cfg(context_graph_internal_test_support)]
 
 use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
 use context_graph::embedder::{
@@ -313,7 +313,6 @@ fn try_run_request(
         max_events_per_batch: NonZeroU32::new(max_events_per_batch).unwrap(),
         max_passages_per_batch: NonZeroU32::new(32).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
-        lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
     })
 }
 
@@ -1104,7 +1103,6 @@ fn a_claims_passages_are_embedded_through_bounded_forward_calls_of_the_batch_ent
         max_events_per_batch: NonZeroU32::new(32).unwrap(),
         max_passages_per_batch: NonZeroU32::new(32).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
-        lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
     })
     .expect("the projection commits");
     assert_eq!(receipt.passage_count, 20);
@@ -1166,7 +1164,6 @@ fn a_claim_that_would_render_more_passages_than_the_bound_leaves_later_events_fo
         max_events_per_batch: NonZeroU32::new(256).unwrap(),
         max_passages_per_batch: NonZeroU32::new(32).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
-        lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
     })
     .expect("a claim over the passage bound is narrowed, never refused");
     assert_eq!(receipt.passage_count, 40);
@@ -1312,7 +1309,6 @@ fn a_narrowed_claim_size_carries_to_the_next_claims_instead_of_overflowing_every
         max_events_per_batch: NonZeroU32::new(256).unwrap(),
         max_passages_per_batch: NonZeroU32::new(32).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
-        lease_duration_ms: NonZeroU64::new(60_000).unwrap(),
     })
     .expect("the projection commits");
     assert_eq!(receipt.passage_count, events as u64);
@@ -1365,7 +1361,6 @@ fn the_standalone_runner_opens_the_store_once_per_committed_claim() {
         max_events_per_batch: NonZeroU32::new(8).unwrap(),
         max_passages_per_batch: NonZeroU32::new(32).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
-        lease_duration_ms: NonZeroU64::new(60_000).unwrap(),
     })
     .expect("the projection commits");
     let opens = context_graph::test_support::event_search_store_opens_for_test() - before;

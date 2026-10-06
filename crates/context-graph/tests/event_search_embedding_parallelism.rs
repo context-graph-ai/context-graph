@@ -2,7 +2,7 @@
 //! The controlled embedder reports entered calls over per-instance channels and holds only the
 //! first two calls, so overlap is an observed event rather than an elapsed-time success oracle.
 
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -382,7 +382,6 @@ fn start_projection_with_embedder(
         max_events_per_batch,
         max_passages_per_batch: NonZeroU32::new(16).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
-        lease_duration_ms: NonZeroU64::new(30_000).unwrap(),
     };
     let (wave_tx, waves) = channel();
     let runner = std::thread::spawn(move || {
@@ -437,7 +436,6 @@ fn start_held_store_projection(embedding_workers: NonZeroUsize) -> HeldStoreProj
         max_events_per_batch: NonZeroU32::new(8).unwrap(),
         max_passages_per_batch: NonZeroU32::new(16).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
-        lease_duration_ms: NonZeroU64::new(30_000).unwrap(),
     };
     let probe = store.clone();
     let (wave_tx, waves) = channel();

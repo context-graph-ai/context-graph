@@ -211,7 +211,6 @@ const CONTEXT_DERIVED_TABLES: &[&str] = &[
     "event_context_counts",
     "event_search_heads",
     "event_search_work_policies",
-    "event_search_leases",
     "event_search_cursors",
     "event_search_pending_streams",
     "event_search_session_progress",
@@ -261,6 +260,24 @@ impl PurgePlan {
                 "context_id = $context_id AND {column} IN ({})",
                 placeholders.join(", ")
             ),
+        );
+    }
+
+    /// Erase the Context's search-projection and interpretation claims with the derived state they
+    /// own. A worker still holding one fails its publication fence and publishes nothing. Claims of
+    /// other kinds of background work in the Context are not event history and are kept.
+    fn select_event_history_claims(&mut self) {
+        self.params.insert(
+            "claim_work_event_search".into(),
+            Value::Text(crate::BackgroundWork::EventSearch.as_str().into()),
+        );
+        self.params.insert(
+            "claim_work_interpretation".into(),
+            Value::Text(crate::BackgroundWork::Interpretation.as_str().into()),
+        );
+        self.select(
+            super::background_claim::CLAIMS_TABLE,
+            "context_id = $context_id AND work IN ($claim_work_event_search, $claim_work_interpretation)",
         );
     }
 
@@ -561,6 +578,7 @@ fn session_plan(
         .insert("connector_id".into(), Value::Text(connector_id.into()));
     plan.params
         .insert("session_ref".into(), Value::Text(session_ref.into()));
+    plan.select_event_history_claims();
     for table in CONTEXT_DERIVED_TABLES {
         plan.select(table, "context_id = $context_id");
     }
@@ -642,6 +660,7 @@ fn context_plan(store: &Store, context_id: ContextId) -> Result<Option<(PurgePla
         return Ok(None);
     }
     let mut plan = PurgePlan::new(context_id);
+    plan.select_event_history_claims();
     for table in CONTEXT_DERIVED_TABLES.iter().chain(
         [
             "event_search_request_selections",

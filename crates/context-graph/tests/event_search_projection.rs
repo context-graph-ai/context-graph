@@ -3,7 +3,7 @@
 
 #![cfg(context_graph_internal_test_support)]
 
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -453,7 +453,6 @@ fn projection_renders_frozen_utf8_grammar_with_ordered_source_spans_and_document
         max_events_per_batch: NonZeroU32::new(2).unwrap(),
         max_passages_per_batch: NonZeroU32::new(2).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(4_096).unwrap(),
-        lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
     })
     .expect("projection must render and commit captured events");
 
@@ -583,7 +582,6 @@ fn oversized_event_slices_advance_cover_every_body_byte_and_honor_the_declared_p
         max_events_per_batch: NonZeroU32::new(1).unwrap(),
         max_passages_per_batch: NonZeroU32::new(8).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(oversized.len() + 512).unwrap(),
-        lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
     })
     .expect("oversized event must produce advancing bounded slices");
 
@@ -722,7 +720,6 @@ fn the_public_runner_leaves_the_active_partition_on_the_maintained_indexed_route
         max_events_per_batch: NonZeroU32::new(2).unwrap(),
         max_passages_per_batch: NonZeroU32::new(2).unwrap(),
         max_bytes_per_batch: NonZeroUsize::new(4_096).unwrap(),
-        lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
     })
     .expect("projection commits and reports ready");
 

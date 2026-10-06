@@ -323,6 +323,7 @@ fn a_digest_with_no_ledger_job_is_in_no_queue_bucket() {
         QueueCounts {
             pending: CAPTURED_DIGESTS,
             in_flight: 0,
+            interrupted: 0,
             structured: 0,
             failed: 0,
             skipped: 0,
@@ -363,6 +364,7 @@ fn queued_digests_keep_moving_between_buckets_while_job_less_digests_stay_out() 
         QueueCounts {
             pending: CAPTURED_DIGESTS - 1,
             in_flight: 1,
+            interrupted: 0,
             structured: 0,
             failed: 0,
             skipped: 0,
@@ -386,6 +388,7 @@ fn queued_digests_keep_moving_between_buckets_while_job_less_digests_stay_out() 
         QueueCounts {
             pending: CAPTURED_DIGESTS - 2,
             in_flight: 1,
+            interrupted: 0,
             structured: 1,
             failed: 0,
             skipped: 0,

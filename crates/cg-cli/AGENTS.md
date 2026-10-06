@@ -15,6 +15,7 @@ embedding preparation, storage policy or a second model-cache-root rule.
 | Import/forget prompts and receipts | `src/history/import.rs`, `src/history/forget.rs` |
 | Find/show/status and selection | `src/history/read.rs`, `src/history/mod.rs` |
 | Worker wake, foreground turn, bounded request ceilings and memory refusals | `src/history/worker.rs`; filesystem primitives from `cg-node-fs` |
+| Resuming interrupted background work after any store-opening command | `resume_pending_background_work` in `src/history/worker.rs`, called from `src/main.rs` after `dispatch` |
 | Read budget | `src/read_config.rs`; positive `[read].memory_limit_bytes` and `[read].active_time_ms` reach every reader |
 | Writer resolution/admission | `src/write_config.rs`; switch, config, then core-derived policy |
 | Data root / model cache | `data_root` in `src/main.rs` resolves `CG_DATA_ROOT` else `$HOME/.cg`; cache rule delegated to `cg-catalog` |

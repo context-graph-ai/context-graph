@@ -1,4 +1,5 @@
 pub(crate) mod audit;
+pub(crate) mod background_claim;
 mod conflict_detection;
 mod consumer_tables;
 pub(crate) mod context;

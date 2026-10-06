@@ -8,6 +8,7 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctest;
 
+pub mod background_work;
 pub mod capture_sync_status;
 pub mod consumer_read;
 pub mod embedder;
@@ -36,6 +37,7 @@ pub mod types;
 pub mod understanding;
 pub mod write_budget;
 
+pub use background_work::{BackgroundWork, BackgroundWorkState};
 pub use capture_sync_status::*;
 pub use consumer_read::graph::ConsumerGraphView;
 pub use consumer_read::{ConsumerDeclaration, ConsumerReader};

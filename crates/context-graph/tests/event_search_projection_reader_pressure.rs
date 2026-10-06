@@ -8,7 +8,7 @@
 #![cfg(context_graph_internal_test_support)]
 
 use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::panic::{self, AssertUnwindSafe, PanicHookInfo};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -321,7 +321,6 @@ fn run(
     context_id: ContextId,
     embedder: &Arc<ControlledEmbedder>,
     max_events_per_batch: u32,
-    lease_ms: u64,
 ) -> Result<EventSearchBuildReceipt> {
     EventSearchProjectionRunner::catch_up(EventSearchRunRequest {
         store: config.clone(),
@@ -332,7 +331,6 @@ fn run(
         max_events_per_batch: NonZeroU32::new(max_events_per_batch).expect("nonzero batch"),
         max_passages_per_batch: NonZeroU32::new(16).expect("nonzero passage batch"),
         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
-        lease_duration_ms: NonZeroU64::new(lease_ms).expect("nonzero lease"),
     })
 }
 

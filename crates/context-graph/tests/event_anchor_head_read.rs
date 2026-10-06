@@ -5,7 +5,7 @@
 //! Matches are ordered by connector, source stream and sequence; the range's sequence bounds apply
 //! inside each stream and its limit applies once to the whole ordered answer.
 
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use context_graph::embedder::{
@@ -314,7 +314,6 @@ fn activate_renaming_release(config: &StoreConfig, context_id: ContextId) {
         contract: contract.clone(),
         max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
         max_bytes_per_batch: NonZeroUsize::new(4_096).expect("nonzero bytes"),
-        lease_duration_ms: NonZeroU64::new(10_000).expect("nonzero lease"),
     })
     .expect("build the renaming interpretation");
     let store = open(config);
@@ -331,7 +330,6 @@ fn activate_renaming_release(config: &StoreConfig, context_id: ContextId) {
             max_events_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_passages_per_batch: NonZeroU32::new(8).expect("nonzero batch"),
             max_bytes_per_batch: NonZeroUsize::new(4_096).expect("nonzero bytes"),
-            lease_duration_ms: NonZeroU64::new(10_000).expect("nonzero lease"),
         })
         .expect("build the staged replacement search");
     assert_eq!(

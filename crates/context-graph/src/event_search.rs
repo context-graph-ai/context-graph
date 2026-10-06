@@ -2,7 +2,7 @@
 //! and receipts for the derived passage projection, and the bounded, Context-authorized search and
 //! passage reads over its active head.
 
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -256,7 +256,6 @@ pub struct EventSearchBuildRequest {
     pub max_events_per_batch: NonZeroU32,
     pub max_passages_per_batch: NonZeroU32,
     pub max_bytes_per_batch: NonZeroUsize,
-    pub lease_duration_ms: NonZeroU64,
 }
 
 #[derive(Debug, Clone)]
@@ -272,7 +271,6 @@ pub struct EventSearchRebuildRequest {
     pub max_events_per_batch: NonZeroU32,
     pub max_passages_per_batch: NonZeroU32,
     pub max_bytes_per_batch: NonZeroUsize,
-    pub lease_duration_ms: NonZeroU64,
 }
 
 #[derive(Debug, Clone)]
@@ -288,7 +286,6 @@ pub struct EventSearchRunRequest {
     pub max_events_per_batch: NonZeroU32,
     pub max_passages_per_batch: NonZeroU32,
     pub max_bytes_per_batch: NonZeroUsize,
-    pub lease_duration_ms: NonZeroU64,
 }
 
 /// The requested projection identity supplied by a caller. Renderer and interpretation identity
@@ -314,7 +311,9 @@ pub struct EventSearchWorkAssessment {
     pub outside_scope_indexed_events: u64,
     pub no_searchable_text_events: u64,
     pub work_required: bool,
-    pub live_projection_lease: bool,
+    /// Whether a live worker is building this Context's search projection now, a worker that held
+    /// a claim has exited (crash, kill, restart), or nothing holds a claim.
+    pub work: crate::BackgroundWorkState,
 }
 
 /// Observations survive a failed run, including an inference API call that returned an error.
@@ -540,7 +539,7 @@ impl EventSearchProjectionRunner {
     /// The resolver receives a predicate for whether a pending policy selects this batch.
     /// Shared generation metadata accepts every policy. A changed ceiling releases the previous
     /// writable state before reopening. All writes of
-    /// an admitted batch, including lease renewal and commit, retain that batch's ceiling.
+    /// an admitted batch, including its commit, retain that batch's ceiling.
     pub fn catch_up_observed_with_policy_and_batch_limits(
         request: EventSearchRunRequest,
         policy: EventSearchWorkPolicy,
@@ -585,6 +584,25 @@ impl EventSearchProjectionRunner {
     /// atomically. It neither creates a generation nor rebuilds its source membership.
     pub fn record_refusal(request: EventSearchRunRequest, reason: &str) -> Result<()> {
         crate::store::event_search_projection::record_refusal_standalone(request, reason)
+    }
+
+    /// Wait until no live worker holds a claim on this Context's search projection, returning at
+    /// once when none does. Each wait blocks in the kernel on one holder's presence, with no timer
+    /// and no polling; a claim whose worker has exited is not waited on, because the next run takes
+    /// it over at once. Only a read-only reader is opened, and it is closed before each wait.
+    pub fn wait_for_live_holder(store: &StoreConfig, context_id: ContextId) -> Result<()> {
+        crate::store::background_claim::wait_until_no_live_holder(
+            || {
+                ConsumerReader::open_with_read_limits(
+                    &store.db_path,
+                    crate::event_history_reader_declaration(),
+                    store.read_memory_limit_bytes,
+                    store.read_active_time_ms,
+                )
+            },
+            crate::BackgroundWork::EventSearch,
+            context_id,
+        )
     }
 }
 

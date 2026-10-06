@@ -77,7 +77,8 @@ here, or move the code. Note that a grep for `std::fs` does not find all of thes
 | Change | Owner and entry point |
 |---|---|
 | Event capture, checkpoints, identity, tenant placement | `crates/context-graph/src/store/event_import.rs` and `crates/context-graph/src/store/event.rs` |
-| Passage projection, leases, retry ownership, session work policy | `crates/context-graph/src/store/event_search_projection.rs` and `crates/context-graph/src/event_search.rs` |
+| Passage projection, retry ownership, session work policy | `crates/context-graph/src/store/event_search_projection.rs` and `crates/context-graph/src/event_search.rs` |
+| Who owns a unit of background work, takeover after a crash, live-holder waits, running/interrupted status | `crates/context-graph/src/background_work.rs` and `crates/context-graph/src/store/background_claim.rs` (the only code that takes the holder lock or writes claim rows) |
 | Shared typed read SQL and decoding | `crates/context-graph/src/store/graph_rows.rs`; consumers use `crates/context-graph/src/consumer_read.rs` |
 | CLI read budget and writer admission | `crates/cg-cli/src/read_config.rs` and `crates/cg-cli/src/write_config.rs`; library defaults in `crates/context-graph/src/owner_control.rs` and `crates/context-graph/src/write_budget.rs` |
 | Detached worker handoff and command rendering | `crates/cg-cli/src/history/worker.rs` and `crates/cg-cli/src/history/read.rs` |

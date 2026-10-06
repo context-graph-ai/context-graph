@@ -3232,6 +3232,15 @@ pub(crate) fn capture_structured_harvest(
     }
 
     let total_harvest = tx.total_counts(context_id)?;
+    // A drain understanding a digest it holds publishes the graph only while it still holds the
+    // digest: if another drain took it over, this transaction is refused at commit.
+    if let Some(digest_id) = reuse_digest
+        && let Err(err) = crate::understanding::fence_held_digest_in_tx(store, tx.tx, digest_id)
+    {
+        tx.rollback();
+        return Err(err);
+    }
+    let completed_digest = completion.as_ref().map(|marker| marker.digest_id);
     // The apply-path completion marker joins THIS transaction, so the write-once completion commits
     // atomically with the structured graph it guards — a crash between the two is impossible. The
     // fault seam fires after every graph row is staged but before the marker + commit, so a test can

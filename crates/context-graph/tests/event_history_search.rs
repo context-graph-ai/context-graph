@@ -4,7 +4,7 @@
 #![cfg(context_graph_internal_test_support)]
 
 use std::collections::BTreeSet;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -293,7 +293,6 @@ fn project_ready(store: &Store, context_id: ContextId, embedder: &Arc<ReadinessE
             max_events_per_batch: NonZeroU32::new(1).unwrap(),
             max_passages_per_batch: NonZeroU32::new(1).unwrap(),
             max_bytes_per_batch: NonZeroUsize::new(4_096).unwrap(),
-            lease_duration_ms: NonZeroU64::new(1_000).unwrap(),
         })
         .expect("project captured history");
 }

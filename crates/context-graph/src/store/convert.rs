@@ -271,6 +271,11 @@ pub(crate) fn map_engine_err(err: EngineError) -> CgError {
         // them. The engine already says what is wrong and what to declare instead,
         // so its wording is what the caller reads.
         EngineError::SchemaInvalid { reason } => CgError::Engine(reason),
+        // The filesystem under the store cannot take a holder lock, so no background work can be
+        // claimed there; the claim was refused before anything was written.
+        EngineError::HolderPresenceUnavailable { path, reason, .. } => {
+            CgError::BackgroundClaimUnavailable { path, reason }
+        }
         other => CgError::Engine(format!("unexpected engine error: {other}")),
     }
 }

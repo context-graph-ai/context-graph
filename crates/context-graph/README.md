@@ -414,8 +414,8 @@ There is no `--fast` or `--slow` mode.<!-- enforced by: `explicit_cli_worker_pol
 
 Library callers set the same positive `embedding_workers` field on
 `EventSearchBuildRequest` and `EventSearchRebuildRequest`; call
-`default_event_search_embedding_workers()` for the CPU default. Those held-Store methods preserve
-their projection lease while the bounded embedding calls run.<!-- enforced by: `held_store_cap_two_overlaps_two_calls_while_its_claim_lease_stays_live`, `held_store_cap_one_serializes_calls_while_its_claim_lease_stays_live` -->
+`default_event_search_embedding_workers()` for the CPU default. Those held-Store methods keep
+their projection claim running while the bounded embedding calls run.<!-- enforced by: `held_store_cap_two_overlaps_two_calls_while_its_claim_stays_running`, `held_store_cap_one_serializes_calls_while_its_claim_stays_running` -->
 
 For `--search wait`, the chosen invocation-resolved limit stays fixed for that foreground
 projection. For the default `--search background`, each import that has pending search publishes
@@ -434,9 +434,34 @@ CPU default resolved when forget ran. A newer request cannot be cleared by the o
 <!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `requesting_import_publishes_the_cli_cap_to_the_existing_worker_handoff`, `later_requesting_import_without_a_flag_replaces_the_one_off_override` -->
 
 Writable Store admission waits for a hydrating reader through the existing 60-second allowance.
-A real second writer is still refused immediately. A projection's own claim, renewal or commit
-reopen can wait through the existing 30-second writer allowance while retaining its claim and
-rendered batch. Exhaustion preserves the typed refusal.<!-- enforced by: `a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store`, `projection_retries_real_writer_at_claim_renewal_and_commit_without_reembedding`, `shared_store_returns_real_writer_busy_immediately_and_projection_exhaustion_stays_typed` -->
+A real second writer is still refused immediately. A projection's own claim or commit reopen can
+wait through the existing 30-second writer allowance while retaining its claim and rendered batch.
+Exhaustion preserves the typed refusal.<!-- enforced by: `a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store`, `projection_retries_real_writer_at_claim_and_commit_without_reembedding`, `shared_store_returns_real_writer_busy_immediately_and_projection_exhaustion_stays_typed` -->
+
+### Crash recovery of background work
+
+Search projection and connector interpretation claim the generation a run is building, from its
+first batch until that generation is finished, and the understanding drain claims one digest at a
+time — all through one shared claim mechanism, so `cg status` reads running for as long as a run is
+alive. A worker holds a kernel lock on its claim for as long as it owns the work, whether or not its
+store is open, and the kernel drops that lock the moment the worker exits for any reason. After a crash, a kill or a machine restart, the next run
+therefore takes the claim over at once — no lease runs out first — and repeats only the batch that
+had not committed; committed passages, interpretations and understood digests are never redone.<!-- enforced by: `a_worker_killed_after_its_claim_is_taken_over_at_once`, `a_worker_killed_mid_embed_with_its_store_closed_resumes_without_waiting`, `a_rebooted_store_is_taken_over_immediately`, `an_interpretation_build_killed_after_its_claim_is_taken_over_at_once`, `a_digest_whose_drain_was_killed_is_offered_and_claimed_again_at_once` -->
+
+A live worker is never taken over, including one that is suspended or computing with its store
+closed. A run that finds one waits for it in the kernel, with no timer and no polling, and then
+continues; of two runs that reach the same interrupted work together, exactly one takes it over and
+the other finds the winner live and waits for it; a caller that keeps its store open (`Store::catch_up_event_search` and the other
+held-Store methods) gets `CgError::BackgroundWorkHeldByLiveWorker` instead, because the live worker
+needs the store to publish. A worker that has lost its claim, for whatever reason, can never
+publish: every batch is fenced on its exact claim in the publishing transaction. A store whose
+filesystem cannot take the lock refuses to claim with `CgError::BackgroundClaimUnavailable` and
+writes nothing.<!-- enforced by: `a_live_worker_computing_with_its_store_closed_is_never_taken_over`, `a_stopped_process_keeps_its_claim`, `concurrent_takeovers_between_threads_admit_exactly_one`, `concurrent_takeovers_between_processes_admit_exactly_one`, `an_obsolete_worker_never_publishes_after_takeover`, `an_obsolete_worker_never_publishes_after_forget_deletes_its_claim`, `a_filesystem_without_locks_refuses_the_claim_and_writes_nothing`, `an_interpretation_build_waits_on_a_live_holder_then_finishes` -->
+
+Every `cg` command that opens the data root — `find`, `show` and `status` included — starts the
+background search worker when queued background search work is unfinished and no worker holds the
+data root's worker lock, so interrupted work resumes without another import. A deferred or
+caught-up store starts nothing.<!-- enforced by: `a_killed_background_worker_resumes_on_the_next_import`, `a_killed_background_worker_resumes_on_the_next_read_command`, `a_read_command_on_a_caught_up_store_starts_no_worker` -->
 
 Continuation reloads only the unfinished passage's text members; a long metadata-only suffix
 adds no replay payload. Worker count preserves passage order, text, vectors and source spans.
@@ -511,8 +536,10 @@ directs the user to run `cg import <project-directory> --search defer`; that imp
 writable recovery path. For each selected Context it
 reports graph memory totals and history separately: captured events, source files and sessions,
 coverage, event placement and search. Search is exactly one of `ready`, `running` (only while a
-projection holds a live lease), `pending`, `blocked` (the local model is not installed) or
-`failed`.<!-- enforced by: `status_separates_capture_from_search_coverage_per_selected_context`, `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight`, `import_recovers_a_store_that_needs_a_writable_open_and_status_names_that_command` -->
+live worker holds a projection claim), `interrupted` (a worker stopped before finishing — a crash,
+a kill or a restart; the next run resumes it), `pending`, `blocked` (the local model is not
+installed) or `failed`. `search.work` says the same about the claim alone: `running`,
+`interrupted` or `idle`.<!-- enforced by: `status_separates_capture_from_search_coverage_per_selected_context`, `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight`, `import_recovers_a_store_that_needs_a_writable_open_and_status_names_that_command`, `status_reports_interrupted_not_running_after_a_crash`, `cg_status_reports_interrupted_not_running_after_a_crash` -->
 
 The `search` object separates an active readable head from a replacement that is still building.
 A first-build head can be active and `building` while required selected sessions remain; completing

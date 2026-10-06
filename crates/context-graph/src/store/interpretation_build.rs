@@ -5,20 +5,21 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use contextdb_core::{Value, Wallclock};
+use contextdb_core::Value;
 use contextdb_engine::ReadLimits;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    AdmittedEffectiveEvent, CapturedEventAnchor, CapturedEventAndAnchors, CgError,
+    AdmittedEffectiveEvent, BackgroundWork, CapturedEventAnchor, CapturedEventAndAnchors, CgError,
     ConversationEvent, EventCoverage, EventId, EventRenderRole, EventWatermark,
     InterpretationActivationRequest, InterpretationBuildReceipt, InterpretationBuildRequest,
     InterpretationGenerationId, InterpretationGenerationState, InterpretationLeaseRefusalReason,
     Result, Store, TxId, admit_interpretation,
 };
 
+use super::background_claim::{ClaimKey, HeldClaim, Taken};
 use super::convert::map_engine_err;
 use super::encode::{
     column_index, get_json, get_optional_text, get_optional_txid, get_text, get_uuid,
@@ -27,8 +28,6 @@ use super::event_interpretation::{
     CAPTURED_ANCHOR_COLUMNS as ANCHOR_COLUMNS, CAPTURED_EVENT_COLUMNS as EVENT_COLUMNS,
     captured_source_sha256,
 };
-
-const MAX_EXPIRED_RECLAIMS: usize = 8;
 
 #[derive(Clone, Copy)]
 struct BuildBounds {
@@ -71,9 +70,6 @@ struct InterpretationClaim {
     claim_membership_sha256: String,
     interpreted_event_count: u64,
     effective_content_sha256: String,
-    lease_token: String,
-    lease_epoch: i64,
-    lease_expires_at: i64,
     events: Vec<ClaimedEvent>,
 }
 
@@ -83,8 +79,6 @@ struct ClaimCoordinates {
     build_ordinal: u64,
     claim_end_ordinal: u64,
     claim_membership_sha256: String,
-    lease_token: String,
-    lease_epoch: i64,
 }
 
 impl ClaimCoordinates {
@@ -94,8 +88,6 @@ impl ClaimCoordinates {
             build_ordinal: claim.build_ordinal,
             claim_end_ordinal: claim.claim_end_ordinal,
             claim_membership_sha256: claim.claim_membership_sha256.clone(),
-            lease_token: claim.lease_token.clone(),
-            lease_epoch: claim.lease_epoch,
         }
     }
 }
@@ -106,8 +98,17 @@ struct BuiltEvent {
 }
 
 enum ClaimResult {
+    /// A batch this build now owns under its claim of the generation.
     Work(Box<InterpretationClaim>),
     Complete,
+}
+
+/// The shared claim key for one interpretation generation. A build takes it with its first batch
+/// and holds it, across the Store reopenings around each mapping call, until the generation is
+/// finished or the build stops: status reads running for the whole build, and a build that meets
+/// it waits for the whole build instead of mapping the live builder's next batch.
+fn generation_claim(context_id: crate::ContextId, id: InterpretationGenerationId) -> ClaimKey {
+    ClaimKey::new(BackgroundWork::Interpretation, context_id, id.as_uuid())
 }
 
 #[derive(Clone, Copy)]
@@ -163,46 +164,70 @@ pub(crate) fn build(request: InterpretationBuildRequest) -> Result<Interpretatio
             .unwrap_or(usize::MAX),
         ),
     };
+    // A store that cannot take the holder lock refuses before any generation is captured.
+    super::background_claim::require_presence(&request.store.db_path)?;
     let generation = capture_generation(&request, bounds)?;
-    let mut expired_reclaims = 0_usize;
 
-    loop {
-        let claim = {
-            let store = Store::open(request.store.clone())?;
-            let result = claim_batch(&store, &request, &generation, bounds);
-            drop(store);
-            result?
-        };
-        let ClaimResult::Work(claim) = claim else {
-            return load_receipt(&request, generation.id);
-        };
+    // Every way out before the generation is finished lets the build's claim go, so the
+    // generation reads idle at once; a claim already taken over or forgotten is left alone.
+    let mut run_claim: Option<HeldClaim> = None;
+    let result = (|| -> Result<InterpretationBuildReceipt> {
+        loop {
+            let claimed = {
+                let store = open_writable(&request.store)?;
+                let result = claim_batch(&store, &request, &generation, bounds, &mut run_claim);
+                drop(store);
+                result
+            };
+            let claim = match claimed {
+                Ok(ClaimResult::Work(claim)) => claim,
+                Ok(ClaimResult::Complete) => return load_receipt(&request, generation.id),
+                // A live builder owns this generation. Wait for it in the kernel with no Store
+                // open, then look again at whatever it published; no timer decides anything.
+                Err(refusal @ CgError::BackgroundWorkHeldByLiveWorker { .. }) => {
+                    super::background_claim::wait_for_refusal(&request.store.db_path, &refusal)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
-        let built = match map_claim(&request, bounds, *claim) {
-            Ok(built) => built,
-            Err(failure) => {
-                let _ = mark_failed(&request, &failure.claim, failure.class);
-                return Err(*failure.error);
-            }
-        };
+            let built = match map_claim(&request, bounds, *claim) {
+                Ok(built) => built,
+                Err(failure) => {
+                    let held = run_claim
+                        .take()
+                        .expect("a mapped batch is owned under the build's claim");
+                    let _ = mark_failed(&request, &failure.claim, held, failure.class);
+                    return Err(*failure.error);
+                }
+            };
 
-        let committed = {
             let store = reopen_after_mapping(request.store.clone())?;
-            let result = commit_batch(&store, &request, bounds, built);
-            drop(store);
-            result
-        };
-        match committed {
-            Ok(()) => {}
-            Err(CgError::InterpretationLeaseRefused {
-                reason: InterpretationLeaseRefusalReason::ExpiredClaim,
-                ..
-            }) if expired_reclaims < MAX_EXPIRED_RECLAIMS => {
-                expired_reclaims += 1;
-                continue;
+            let held = run_claim
+                .as_ref()
+                .expect("a mapped batch is owned under the build's claim");
+            // The batch that completes the generation ends the claim in the same commit.
+            if commit_batch(&store, &request, bounds, built, held)? {
+                run_claim = None;
             }
-            Err(error) => return Err(error),
         }
+    })();
+    if let Some(held) = run_claim.take()
+        && let Ok(store) = open_writable(&request.store)
+    {
+        let _ = held.release(&store);
     }
+    result
+}
+
+/// Open the store to write, waiting out the bounded transition while another writer — a reader of
+/// status that opened it briefly, say — closes it, as the search runner does.
+fn open_writable(config: &crate::StoreConfig) -> Result<Store> {
+    super::open_retry::retry(
+        &config.db_path,
+        super::open_retry::Contention::Writer,
+        || Store::open(config.clone()),
+    )
 }
 
 /// The connector-scoped source watermark and content hash a generation for this release would
@@ -230,7 +255,6 @@ pub(crate) fn current_source_watermark(
         contract: request.contract.clone(),
         max_events_per_batch: std::num::NonZeroU32::MAX,
         max_bytes_per_batch: NonZeroUsize::MAX,
-        lease_duration_ms: std::num::NonZeroU64::MAX,
     };
     let observed = scan_source(store, &scope, bounds, None)?;
     Ok((
@@ -244,7 +268,7 @@ pub(crate) fn current_source_watermark(
 
 fn reopen_after_mapping(config: crate::StoreConfig) -> Result<Store> {
     let Some(db) = super::existing_shared_database(&config.db_path) else {
-        return Store::open(config);
+        return open_writable(&config);
     };
     let default_embedding_spaces =
         super::default_embedding_space_map(&config.extra_embedding_spaces);
@@ -329,7 +353,7 @@ fn insert_capture_attempt(
     let started = store.begin_tx()?;
     let inserted = store.internal_db().execute_in_tx(
         started,
-        "INSERT INTO event_interpretation_generations (id, context_id, connector_id, accepted_source_declarations, target_interpretation_version, target_adapter_version, target_anchor_declaration_version, mapping_contract_id, mapping_contract_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, build_ordinal, claim_end_ordinal, claim_membership_sha256, lease_epoch, lease_token, lease_expires_at, state, eligible_event_count, interpreted_event_count, failed_event_count, effective_content_sha256, started_at) VALUES ($id, $context_id, $connector_id, $accepted, $target, $target_adapter, $target_anchors, $contract, $contract_sha, $event_count, $ordered_sha, $source_sha, $capture_ordinal, $build_ordinal, $claim_end, $claim_sha, $lease_epoch, $lease_token, $lease_expires_at, $state, $eligible, $interpreted, $failed, $effective_sha, $started_at)",
+        "INSERT INTO event_interpretation_generations (id, context_id, connector_id, accepted_source_declarations, target_interpretation_version, target_adapter_version, target_anchor_declaration_version, mapping_contract_id, mapping_contract_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, build_ordinal, claim_end_ordinal, claim_membership_sha256, state, eligible_event_count, interpreted_event_count, failed_event_count, effective_content_sha256, started_at) VALUES ($id, $context_id, $connector_id, $accepted, $target, $target_adapter, $target_anchors, $contract, $contract_sha, $event_count, $ordered_sha, $source_sha, $capture_ordinal, $build_ordinal, $claim_end, $claim_sha, $state, $eligible, $interpreted, $failed, $effective_sha, $started_at)",
         &HashMap::from([
             ("id".into(), Value::Uuid(generation_id.as_uuid())),
             ("context_id".into(), Value::Uuid(request.context_id.as_uuid())),
@@ -368,9 +392,6 @@ fn insert_capture_attempt(
             ("build_ordinal".into(), Value::Int64(0)),
             ("claim_end".into(), Value::Null),
             ("claim_sha".into(), Value::Null),
-            ("lease_epoch".into(), Value::Int64(0)),
-            ("lease_token".into(), Value::Null),
-            ("lease_expires_at".into(), Value::Null),
             ("state".into(), Value::Text("capturing".into())),
             ("eligible".into(), Value::Int64(0)),
             ("interpreted".into(), Value::Int64(0)),
@@ -730,11 +751,12 @@ fn claim_batch(
     request: &InterpretationBuildRequest,
     seal: &GenerationSeal,
     bounds: BuildBounds,
+    run_claim: &mut Option<HeldClaim>,
 ) -> Result<ClaimResult> {
     let generation = query_one(
         store,
         bounds,
-        "SELECT event_count, ordered_source_set_sha256, source_content_sha256, build_ordinal, claim_end_ordinal, claim_membership_sha256, lease_epoch, lease_token, lease_expires_at, interpreted_event_count, effective_content_sha256, state FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
+        "SELECT event_count, ordered_source_set_sha256, source_content_sha256, build_ordinal, claim_end_ordinal, claim_membership_sha256, interpreted_event_count, effective_content_sha256, state FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
         &HashMap::from([
             (
                 "context_id".into(),
@@ -772,19 +794,8 @@ fn claim_batch(
             InterpretationLeaseRefusalReason::MembershipChanged,
         ));
     }
-    let current_token = get_optional_text(&generation.0, &generation.1, "lease_token")?;
-    let current_expiry = optional_timestamp(&generation.0, &generation.1, "lease_expires_at")?;
-    if current_token.is_some() != current_expiry.is_some()
-        || current_token.is_some() && persisted_end.is_none()
-    {
-        return Err(lease_refusal(
-            request,
-            seal.id,
-            InterpretationLeaseRefusalReason::MembershipChanged,
-        ));
-    }
     if build_ordinal >= event_count {
-        if persisted_end.is_some() || current_token.is_some() {
+        if persisted_end.is_some() {
             return Err(lease_refusal(
                 request,
                 seal.id,
@@ -794,15 +805,9 @@ fn claim_batch(
         finalize_empty_or_completed(store, request, seal.id)?;
         return Ok(ClaimResult::Complete);
     }
-    let claim_checked_at = now_millis()?;
-    if current_token.is_some() && current_expiry.is_some_and(|expiry| expiry > claim_checked_at) {
-        return Err(lease_refusal(
-            request,
-            seal.id,
-            InterpretationLeaseRefusalReason::StaleClaim,
-        ));
-    }
 
+    // A batch persisted by an earlier claim is the batch this claim takes, so a takeover after a
+    // crash redoes exactly the uncommitted batch and nothing that was committed.
     let (events, claim_end_ordinal, claim_membership_sha256) =
         match (persisted_end, persisted_digest.as_deref()) {
             (Some(end), Some(digest)) => {
@@ -812,21 +817,14 @@ fn claim_batch(
             _ => unreachable!("claim end and digest pairing was checked"),
         };
 
-    let old_epoch = signed_integer(&generation.0, &generation.1, "lease_epoch")?;
-    let lease_epoch = old_epoch
-        .checked_add(1)
-        .ok_or_else(|| CgError::Engine("interpretation lease epoch exhausted i64".into()))?;
-    let lease_token = Uuid::now_v7().to_string();
-    let duration = i64::try_from(request.lease_duration_ms.get())
-        .map_err(|_| CgError::Engine("interpretation lease duration exceeds i64".into()))?;
-
     let tx = store.begin_tx()?;
-    let outcome = (|| -> Result<i64> {
+    // The build's first batch takes the generation's claim; every later batch is fenced on it.
+    let outcome = (|| -> Result<Option<HeldClaim>> {
         let checked = store
             .internal_db()
             .execute_in_tx(
                 tx,
-                "SELECT context_id, event_count, ordered_source_set_sha256, source_content_sha256, build_ordinal, claim_end_ordinal, claim_membership_sha256, lease_epoch, lease_token, lease_expires_at, interpreted_event_count, effective_content_sha256, state FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
+                "SELECT context_id, event_count, ordered_source_set_sha256, source_content_sha256, build_ordinal, claim_end_ordinal, claim_membership_sha256, interpreted_event_count, effective_content_sha256, state FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([
                     ("context_id".into(), Value::Uuid(request.context_id.as_uuid())),
                     ("id".into(), Value::Uuid(seal.id.as_uuid())),
@@ -851,10 +849,6 @@ fn claim_batch(
                 != persisted_end
             || get_optional_text(checked_row, &checked.columns, "claim_membership_sha256")?
                 != persisted_digest
-            || signed_integer(checked_row, &checked.columns, "lease_epoch")? != old_epoch
-            || get_optional_text(checked_row, &checked.columns, "lease_token")? != current_token
-            || optional_timestamp(checked_row, &checked.columns, "lease_expires_at")?
-                != current_expiry
             || nonnegative(checked_row, &checked.columns, "interpreted_event_count")?
                 != interpreted_event_count
             || get_optional_text(checked_row, &checked.columns, "effective_content_sha256")?
@@ -879,9 +873,6 @@ fn claim_batch(
                 "build_ordinal",
                 "claim_end_ordinal",
                 "claim_membership_sha256",
-                "lease_epoch",
-                "lease_token",
-                "lease_expires_at",
                 "interpreted_event_count",
                 "effective_content_sha256",
                 "state",
@@ -895,14 +886,34 @@ fn claim_batch(
             &conditions,
             InterpretationLeaseRefusalReason::StaleClaim,
         )?;
-        let lease_expires_at = now_millis()?
-            .checked_add(duration)
-            .ok_or_else(|| CgError::Engine("interpretation lease expiry exhausted i64".into()))?;
+        let taken = match run_claim.as_ref() {
+            Some(held) => {
+                if !held.fence_in_tx(store, tx)? {
+                    return Err(lease_refusal(
+                        request,
+                        seal.id,
+                        InterpretationLeaseRefusalReason::StaleClaim,
+                    ));
+                }
+                None
+            }
+            None => match generation_claim(request.context_id, seal.id).take_in_tx(store, tx)? {
+                Taken::Held(held) => Some(held),
+                Taken::Live(live) => return Err(live.refusal()),
+                Taken::Moved => {
+                    return Err(lease_refusal(
+                        request,
+                        seal.id,
+                        InterpretationLeaseRefusalReason::StaleClaim,
+                    ));
+                }
+            },
+        };
         store
             .internal_db()
             .execute_in_tx(
                 tx,
-                "UPDATE event_interpretation_generations SET claim_end_ordinal = $claim_end, claim_membership_sha256 = $claim_sha, lease_token = $lease_token, lease_epoch = $lease_epoch, lease_expires_at = $lease_expires_at, state = $state, completed_at = NULL WHERE context_id = $context_id AND id = $id",
+                "UPDATE event_interpretation_generations SET claim_end_ordinal = $claim_end, claim_membership_sha256 = $claim_sha, state = $state, completed_at = NULL WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([
                     (
                         "claim_end".into(),
@@ -912,19 +923,16 @@ fn claim_batch(
                         "claim_sha".into(),
                         Value::Text(claim_membership_sha256.clone()),
                     ),
-                    ("lease_token".into(), Value::Text(lease_token.clone())),
-                    ("lease_epoch".into(), Value::Int64(lease_epoch)),
-                    ("lease_expires_at".into(), Value::Timestamp(lease_expires_at)),
                     ("state".into(), Value::Text("building".into())),
                     ("context_id".into(), Value::Uuid(request.context_id.as_uuid())),
                     ("id".into(), Value::Uuid(seal.id.as_uuid())),
                 ]),
             )
             .map_err(map_engine_err)?;
-        Ok(lease_expires_at)
+        Ok(taken)
     })();
-    let lease_expires_at = match outcome {
-        Ok(lease_expires_at) => lease_expires_at,
+    let taken = match outcome {
+        Ok(taken) => taken,
         Err(error) => {
             let _ = store.internal_db().rollback(tx);
             return Err(error);
@@ -933,13 +941,17 @@ fn claim_batch(
     if let Err(error) = store.internal_db().commit(tx) {
         let _ = store.internal_db().rollback(tx);
         return Err(match error {
-            contextdb_core::Error::ConditionalUpdateConflict { .. } => lease_refusal(
+            contextdb_core::Error::ConditionalUpdateConflict { .. }
+            | contextdb_core::Error::UniqueViolation { .. } => lease_refusal(
                 request,
                 seal.id,
                 InterpretationLeaseRefusalReason::StaleClaim,
             ),
             other => map_engine_err(other),
         });
+    }
+    if let Some(held) = taken {
+        *run_claim = Some(held);
     }
 
     Ok(ClaimResult::Work(Box::new(InterpretationClaim {
@@ -949,9 +961,6 @@ fn claim_batch(
         claim_membership_sha256,
         interpreted_event_count,
         effective_content_sha256,
-        lease_token,
-        lease_epoch,
-        lease_expires_at,
         events,
     })))
 }
@@ -1221,13 +1230,16 @@ fn commit_batch(
     request: &InterpretationBuildRequest,
     bounds: BuildBounds,
     (claim, built): (InterpretationClaim, Vec<BuiltEvent>),
-) -> Result<()> {
+    held: &HeldClaim,
+) -> Result<bool> {
     let tx = store.internal_db().begin().map_err(map_engine_err)?;
-    let outcome = commit_batch_in_tx(store, request, bounds, tx, &claim, &built);
-    if let Err(error) = outcome {
-        let _ = store.internal_db().rollback(tx);
-        return Err(error);
-    }
+    let completed = match commit_batch_in_tx(store, request, bounds, tx, &claim, &built, held) {
+        Ok(completed) => completed,
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            return Err(error);
+        }
+    };
     if let Err(error) = store.internal_db().commit(tx) {
         let _ = store.internal_db().rollback(tx);
         return Err(match error {
@@ -1239,9 +1251,11 @@ fn commit_batch(
             other => map_engine_err(other),
         });
     }
-    Ok(())
+    Ok(completed)
 }
 
+/// Publish one mapped batch under the build's claim. `true` means the batch completed the
+/// generation and ended the claim in the same transaction.
 fn commit_batch_in_tx(
     store: &Store,
     request: &InterpretationBuildRequest,
@@ -1249,7 +1263,8 @@ fn commit_batch_in_tx(
     tx: TxId,
     claim: &InterpretationClaim,
     built: &[BuiltEvent],
-) -> Result<()> {
+    held: &HeldClaim,
+) -> Result<bool> {
     let claim_span = claim
         .claim_end_ordinal
         .checked_sub(claim.build_ordinal)
@@ -1274,7 +1289,7 @@ fn commit_batch_in_tx(
         .internal_db()
         .execute_in_tx(
             tx,
-            "SELECT context_id, event_count, ordered_source_set_sha256, source_content_sha256, build_ordinal, claim_end_ordinal, claim_membership_sha256, lease_epoch, lease_token, lease_expires_at, interpreted_event_count, effective_content_sha256, state FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
+            "SELECT context_id, event_count, ordered_source_set_sha256, source_content_sha256, build_ordinal, claim_end_ordinal, claim_membership_sha256, interpreted_event_count, effective_content_sha256, state FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
             &HashMap::from([
                 ("context_id".into(), Value::Uuid(request.context_id.as_uuid())),
                 ("id".into(), Value::Uuid(claim.generation.id.as_uuid())),
@@ -1295,10 +1310,9 @@ fn commit_batch_in_tx(
             InterpretationLeaseRefusalReason::MembershipChanged,
         ));
     }
-    if get_optional_text(row, &generation.columns, "lease_token")?.as_deref()
-        != Some(claim.lease_token.as_str())
-        || signed_integer(row, &generation.columns, "lease_epoch")? != claim.lease_epoch
-    {
+    // Publication is fenced on this build's exact claim: a claim taken over, released or forgotten
+    // since it was taken refuses the whole batch.
+    if !held.fence_in_tx(store, tx)? {
         return Err(lease_refusal(
             request,
             claim.generation.id,
@@ -1328,8 +1342,6 @@ fn commit_batch_in_tx(
             InterpretationLeaseRefusalReason::MembershipChanged,
         ));
     }
-    let persisted_expiry = optional_timestamp(row, &generation.columns, "lease_expires_at")?;
-
     let mut claim_digest = claim_membership_hasher();
     for (offset, event) in built.iter().enumerate() {
         let expected_ordinal = claim
@@ -1400,21 +1412,6 @@ fn commit_batch_in_tx(
         verify_source_in_tx(store, request, tx, claim.generation.id, event)?;
     }
 
-    let validation_time = now_millis()?;
-    if persisted_expiry.is_none_or(|expiry| expiry <= validation_time) {
-        return Err(lease_refusal(
-            request,
-            claim.generation.id,
-            InterpretationLeaseRefusalReason::ExpiredClaim,
-        ));
-    }
-    if persisted_expiry != Some(claim.lease_expires_at) {
-        return Err(lease_refusal(
-            request,
-            claim.generation.id,
-            InterpretationLeaseRefusalReason::StaleClaim,
-        ));
-    }
     let conditions = exact_row_conditions(
         row,
         &generation.columns,
@@ -1426,9 +1423,6 @@ fn commit_batch_in_tx(
             "build_ordinal",
             "claim_end_ordinal",
             "claim_membership_sha256",
-            "lease_epoch",
-            "lease_token",
-            "lease_expires_at",
             "interpreted_event_count",
             "effective_content_sha256",
             "state",
@@ -1491,12 +1485,20 @@ fn commit_batch_in_tx(
         .execute_in_tx(
             tx,
             &format!(
-                "UPDATE event_interpretation_generations SET build_ordinal = $build_ordinal, interpreted_event_count = $interpreted, effective_content_sha256 = $effective_sha, claim_end_ordinal = NULL, claim_membership_sha256 = NULL, lease_token = NULL, lease_expires_at = NULL, state = $state{completion} WHERE context_id = $context_id AND id = $id"
+                "UPDATE event_interpretation_generations SET build_ordinal = $build_ordinal, interpreted_event_count = $interpreted, effective_content_sha256 = $effective_sha, claim_end_ordinal = NULL, claim_membership_sha256 = NULL, state = $state{completion} WHERE context_id = $context_id AND id = $id"
             ),
             &params,
         )
         .map_err(map_engine_err)?;
-    Ok(())
+    // The batch that completes the generation and the end of this build's claim commit together.
+    if ready && !held.finish_in_tx(store, tx)? {
+        return Err(lease_refusal(
+            request,
+            claim.generation.id,
+            InterpretationLeaseRefusalReason::StaleClaim,
+        ));
+    }
+    Ok(ready)
 }
 
 fn verify_source_in_tx(
@@ -1680,7 +1682,7 @@ fn finalize_empty_or_completed(
     let tx = store.begin_tx()?;
     let updated = store.internal_db().execute_in_tx(
         tx,
-        "UPDATE event_interpretation_generations SET state = $state, effective_content_sha256 = $effective_sha, claim_end_ordinal = NULL, claim_membership_sha256 = NULL, lease_token = NULL, lease_expires_at = NULL, completed_at = $completed_at WHERE context_id = $context_id AND id = $id",
+        "UPDATE event_interpretation_generations SET state = $state, effective_content_sha256 = $effective_sha, claim_end_ordinal = NULL, claim_membership_sha256 = NULL, completed_at = $completed_at WHERE context_id = $context_id AND id = $id",
         &HashMap::from([
             ("state".into(), Value::Text("ready".into())),
             ("effective_sha".into(), Value::Text(empty_effective_hash())),
@@ -1769,6 +1771,7 @@ fn load_receipt(
 fn mark_failed(
     request: &InterpretationBuildRequest,
     claim: &ClaimCoordinates,
+    held: HeldClaim,
     class: MappingFailureClass,
 ) -> Result<()> {
     let store = Store::open(request.store.clone())?;
@@ -1790,8 +1793,6 @@ fn mark_failed(
             "claim_membership_sha256".into(),
             Value::Text(claim.claim_membership_sha256.clone()),
         ),
-        ("lease_token".into(), Value::Text(claim.lease_token.clone())),
-        ("lease_epoch".into(), Value::Int64(claim.lease_epoch)),
         ("state".into(), Value::Text("building".into())),
     ];
     if let Err(error) = guard_generation_in_tx(
@@ -1805,9 +1806,25 @@ fn mark_failed(
         let _ = store.internal_db().rollback(tx);
         return Err(error);
     }
+    // Only the build that still owns the claim records the failure, and the failure ends the claim.
+    match held.finish_in_tx(&store, tx) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = store.internal_db().rollback(tx);
+            return Err(lease_refusal(
+                request,
+                claim.generation_id,
+                InterpretationLeaseRefusalReason::StaleClaim,
+            ));
+        }
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            return Err(error);
+        }
+    }
     let updated = store.internal_db().execute_in_tx(
         tx,
-        "UPDATE event_interpretation_generations SET state = $state, failed_event_count = failed_event_count + 1, lease_token = NULL, lease_expires_at = NULL, sanitized_failure = $failure, completed_at = $completed_at WHERE context_id = $context_id AND id = $id",
+        "UPDATE event_interpretation_generations SET state = $state, failed_event_count = failed_event_count + 1, sanitized_failure = $failure, completed_at = $completed_at WHERE context_id = $context_id AND id = $id",
         &HashMap::from([
             ("state".into(), Value::Text("failed".into())),
             ("failure".into(), Value::Text(class.persisted().into())),
@@ -2155,11 +2172,6 @@ fn guard_generation_in_tx(
     } else {
         Err(lease_refusal(request, generation_id, refusal))
     }
-}
-
-fn now_millis() -> Result<i64> {
-    i64::try_from(Wallclock::now().0)
-        .map_err(|_| CgError::Engine("system timestamp exceeds engine TIMESTAMP".into()))
 }
 
 fn lease_refusal(
