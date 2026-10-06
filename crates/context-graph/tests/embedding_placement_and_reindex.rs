@@ -260,7 +260,7 @@ fn record_text(
             evidence: vec![EvidenceRef {
                 id: evidence_id,
                 kind: EvidenceKind::Text,
-                source_ref: format!("note://{evidence_id}"),
+                source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
                 retention_status: RetentionStatus::RetainedExternal,
                 producer: capture_producer(),
                 text_projection: Some(text.to_string()),
