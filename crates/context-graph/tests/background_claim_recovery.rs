@@ -602,8 +602,15 @@ fn background_claim_child() {
                 std::process::exit(EXIT_BEFORE_CLAIM_COMMIT)
             });
         }
-        "hold-after-claim" | "hold-after-losing-lock" => {
-            let armed = arm_after_first_commit();
+        "hold-after-claim" | "hold-after-losing-lock" | "hold-at-first-claim" => {
+            // `hold-at-first-claim` holds inside the first batch it claims, which is the taken-over
+            // batch when an earlier worker already committed the other stream; the other roles
+            // hold inside the batch claimed after their own first commit.
+            let armed = if role == "hold-at-first-claim" {
+                Arc::new(AtomicBool::new(true))
+            } else {
+                arm_after_first_commit()
+            };
             let lose_lock = role == "hold-after-losing-lock";
             let path = path.clone();
             let held = AtomicBool::new(false);
@@ -1259,7 +1266,7 @@ fn concurrent_takeovers_between_processes_admit_exactly_one() {
     let (config, context_id) = two_stream_store(root.path(), "process-takeovers");
     let committed = crash_child_at("exit-after-claim", EXIT_AFTER_CLAIM, &config, context_id);
 
-    let mut winner = ClaimChild::spawn("hold-after-claim", &config, context_id);
+    let mut winner = ClaimChild::spawn("hold-at-first-claim", &config, context_id);
     winner.expect_mark("HOLDING");
     let taken = claim_rows_at(&config, context_id);
     assert_eq!(
