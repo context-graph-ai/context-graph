@@ -175,8 +175,15 @@ fn digest_embedding_fixture(seed: &str) -> Vec<f32> {
     v
 }
 
-fn create_digest_input(context_id: ContextId, summary: &str) -> CreateDigest {
+/// A digest whose supplied vector carries the built-in text space's own model, so it is stored.
+fn create_digest_input(store: &Store, context_id: ContextId, summary: &str) -> CreateDigest {
     let id = DigestId::new_v7();
+    let produced_by = EvidenceProducer::from(
+        &store
+            .space_producer("text_default_nomic_v1_5_768")
+            .expect("read the text space's model")
+            .expect("the built-in text space is declared"),
+    );
     CreateDigest {
         id,
         source: "claude-web".to_string(),
@@ -188,7 +195,7 @@ fn create_digest_input(context_id: ContextId, summary: &str) -> CreateDigest {
             embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
             vector: digest_embedding_fixture(summary),
             target: EmbeddingTarget::Digest(id),
-            produced_by: EvidenceProducer::default(),
+            produced_by,
         },
         context_id,
         properties: BTreeMap::new(),
@@ -1946,6 +1953,7 @@ fn digest_immutable_no_update_symbol() {
     .id;
     let digest = ok!(
         store.create_digest(create_digest_input(
+            &store,
             ctx,
             "chose event stream for transport after connectivity review"
         )),

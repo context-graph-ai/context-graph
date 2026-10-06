@@ -217,10 +217,11 @@ fn entity_reference_embeddings_per_dim_table_reused_when_existing_dimension_rede
     }
     drop(second);
     let db = Database::open(&db_path).expect("raw database");
+    // Vectors live in one table per placement; none is split by a target-kind column.
     let handle_tables = [
-        "evidence_embedding_handles",
-        "entity_reference_embedding_handles",
-        "digest_embedding_handles",
+        "evidence_embeddings",
+        "evidence_embeddings_travelling",
+        "digest_embeddings",
     ]
     .into_iter()
     .filter_map(|table| db.table_meta(table).map(|meta| (table, meta)))

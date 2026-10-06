@@ -177,6 +177,9 @@ fn weight_backed_registration_and_match_round_trip_through_the_store() {
                 supported_evidence_kinds: space.supported_evidence_kinds.clone(),
                 default_for_evidence_kind: None,
                 bindings: Vec::new(),
+                placement: space.placement,
+                media_reachable_on_every_node: space.media_reachable_on_every_node,
+                producer: space.producer.clone(),
             },
             embedder: embedder.clone(),
         }],
@@ -209,11 +212,10 @@ fn weight_backed_registration_and_match_round_trip_through_the_store() {
             &space.embedding_space_id,
             Some("front".to_string()),
             reference,
+            // The space's own model, claimed by the test as supplier.
             context_graph::EvidenceProducer {
                 system: "test".to_string(),
-                model_name: space.model_name.clone(),
-                model_version: space.model_version.clone(),
-                pipeline_version: "1".to_string(),
+                ..context_graph::EvidenceProducer::from(&space.producer)
             },
         )
         .expect("enroll");

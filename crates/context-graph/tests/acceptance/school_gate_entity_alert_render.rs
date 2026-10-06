@@ -6,8 +6,8 @@ use context_graph::{
     EmbeddingId, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType,
     EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin, IntentionStatus,
     Invalidation, InvalidationSeverity, InvalidationStatus, MessageBody, MismatchKind,
-    OverrideFailureReason, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store,
-    StoreConfig,
+    ModelIdentity, OverrideFailureReason, PrecomputedEmbedding, RecordObservation, RetentionStatus,
+    Store, StoreConfig, VectorPlacement,
 };
 
 const FACE_REID_SPACE: &str = "vigil_face_reid_v1";
@@ -20,6 +20,9 @@ struct Scenario {
     detected_entity_id: EntityId,
     decision_id: DecisionId,
 }
+
+/// The gate's one face model; reference enrollments and live frames both carry it.
+const FACE_MODEL_REVISION: &str = "face-v1";
 
 fn face_producer(version: &str) -> EvidenceProducer {
     EvidenceProducer {
@@ -54,6 +57,14 @@ fn scenario() -> Scenario {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_vision".to_string(),
             }],
+            placement: VectorPlacement::TravelsWithItem,
+            media_reachable_on_every_node: false,
+            producer: ModelIdentity {
+                model: "face-local".to_string(),
+                weights_revision: FACE_MODEL_REVISION.to_string(),
+                preparation: "gate-v2".to_string(),
+                dimension: 512,
+            },
         }],
         ..Default::default()
     })
@@ -142,7 +153,7 @@ fn live_face_observation(scenario: &Scenario, axis: usize) -> RecordObservation 
             embedding_space_id: FACE_REID_SPACE.to_string(),
             vector: vector(axis),
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: face_producer("live-v1"),
+            produced_by: face_producer(FACE_MODEL_REVISION),
         }],
     }
 }
@@ -192,7 +203,7 @@ fn whatsapp_message_body_distinguishes_known_entity_from_unknown_at_school_gate(
         FACE_REID_SPACE,
         Some("student:primary-guardian-approved".to_string()),
         vector(0),
-        face_producer("reference-v1"),
+        face_producer(FACE_MODEL_REVISION),
     );
     let observation = scenario
         .store

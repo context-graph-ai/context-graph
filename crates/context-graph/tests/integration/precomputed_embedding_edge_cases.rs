@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use context_graph::{
     CG_EDGE_SYSTEM_TAG, CgError, ContextId, CreateContext, CreateDigest, CreateEntity, DigestId,
-    DistanceMetric, EmbeddingId, EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType,
-    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, PrecomputedEmbedding,
-    RecordObservation, RetentionStatus, Store, StoreConfig,
+    DistanceMetric, EmbeddingId, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget,
+    EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, ModelIdentity,
+    PrecomputedEmbedding, RecordObservation, RetentionStatus, Store, StoreConfig, SuppliedVector,
+    VectorPlacement,
 };
 use contextdb_core::{Error as EngineError, Value, VectorIndexRef};
-use contextdb_engine::{Database, QueryResult};
+use contextdb_engine::Database;
 
 const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const FACE_SPACE: &str = "face_reference_v1";
@@ -22,12 +23,44 @@ struct Fixture {
     entity_id: EntityId,
 }
 
+/// A consumer-claimed supply of the built-in text space's own model.
 fn producer() -> EvidenceProducer {
+    static PRODUCER: std::sync::OnceLock<EvidenceProducer> = std::sync::OnceLock::new();
+    PRODUCER
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = Store::open(StoreConfig {
+                db_path: dir.path().join("producer.db"),
+                ..Default::default()
+            })
+            .expect("open to read the text space's model");
+            EvidenceProducer {
+                system: "external".to_string(),
+                ..EvidenceProducer::from(
+                    &store
+                        .space_producer(TEXT_SPACE)
+                        .expect("read the text space's model")
+                        .expect("the built-in text space is declared"),
+                )
+            }
+        })
+        .clone()
+}
+
+/// The face space's one model; face supplies are consumer-claimed under it.
+fn face_identity() -> ModelIdentity {
+    ModelIdentity {
+        model: "face-reference".to_string(),
+        weights_revision: "v1".to_string(),
+        preparation: "1".to_string(),
+        dimension: 512,
+    }
+}
+
+fn face_producer() -> EvidenceProducer {
     EvidenceProducer {
         system: "external".to_string(),
-        model_name: "encoder".to_string(),
-        model_version: "1".to_string(),
-        pipeline_version: "1".to_string(),
+        ..EvidenceProducer::from(&face_identity())
     }
 }
 
@@ -42,15 +75,24 @@ fn face_space_decl() -> EmbeddingSpaceDecl {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
+        placement: VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: face_identity(),
     }
 }
 
 fn fixture(name: &str) -> Fixture {
+    fixture_with_spaces(name, Vec::new())
+}
+
+fn fixture_with_spaces(name: &str, extra: Vec<EmbeddingSpaceDecl>) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(format!("{name}.db"));
+    let mut extra_embedding_spaces = vec![face_space_decl()];
+    extra_embedding_spaces.extend(extra);
     let store = Store::open(StoreConfig {
         db_path: db_path.clone(),
-        extra_embedding_spaces: vec![face_space_decl()],
+        extra_embedding_spaces,
         ..Default::default()
     })
     .expect("open");
@@ -153,15 +195,29 @@ fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
     }
 }
 
-fn stored_vector(db: &Database, table: &str, column: &str, id: uuid::Uuid) -> Option<Vec<f32>> {
-    let sql = format!("SELECT {column} FROM {table} WHERE id = $id");
+/// The single vector row an item owns in `table`: its id and its vector.
+fn row_for_target(
+    db: &Database,
+    table: &str,
+    target_column: &str,
+    target: uuid::Uuid,
+) -> Option<(uuid::Uuid, Vec<f32>)> {
+    let vector_column = if table == "entity_reference_embeddings_512" {
+        "vector"
+    } else {
+        "vector_text"
+    };
+    let sql = format!("SELECT id, {vector_column} FROM {table} WHERE {target_column} = $target");
     let result = db
-        .execute(&sql, &params(vec![("id", Value::Uuid(id))]))
+        .execute(&sql, &params(vec![("target", Value::Uuid(target))]))
         .expect("vector select");
-    result.rows.first().and_then(|row| match row.first() {
-        Some(Value::Vector(vector)) => Some(vector.clone()),
+    match result.rows.as_slice() {
+        [row] => match (row.first(), row.get(1)) {
+            (Some(Value::Uuid(id)), Some(Value::Vector(vector))) => Some((*id, vector.clone())),
+            _ => None,
+        },
         _ => None,
-    })
+    }
 }
 
 fn vector_close_enough(left: &[f32], right: &[f32]) -> bool {
@@ -172,68 +228,8 @@ fn vector_close_enough(left: &[f32], right: &[f32]) -> bool {
             .all(|(left, right)| (left - right).abs() <= 1.0e-6)
 }
 
-fn immutable_result(result: std::result::Result<QueryResult, EngineError>, table: &str) -> bool {
-    matches!(result, Err(EngineError::ImmutableTable(ref actual)) if actual == table)
-}
-
-fn immutable_mutations_rejected_and_row_unchanged(
-    db: &Database,
-    table: &str,
-    id: EmbeddingId,
-    target_id: uuid::Uuid,
-) -> bool {
-    let row_before = count(
-        db,
-        &format!("SELECT COUNT(*) AS n FROM {table} WHERE id = $id AND target_id = $target_id"),
-        &params(vec![
-            ("id", Value::Uuid(id.as_uuid())),
-            ("target_id", Value::Uuid(target_id)),
-        ]),
-    );
-    let update_id = db.execute(
-        &format!("UPDATE {table} SET id = $new_id WHERE id = $id"),
-        &params(vec![
-            ("id", Value::Uuid(id.as_uuid())),
-            ("new_id", Value::Uuid(EmbeddingId::new_v7().as_uuid())),
-        ]),
-    );
-    let update_producer = db.execute(
-        &format!("UPDATE {table} SET produced_by = $producer WHERE id = $id"),
-        &params(vec![
-            ("id", Value::Uuid(id.as_uuid())),
-            (
-                "producer",
-                Value::Json(serde_json::to_value(producer()).expect("producer json")),
-            ),
-        ]),
-    );
-    let update_target = db.execute(
-        &format!("UPDATE {table} SET target_id = $new_target WHERE id = $id"),
-        &params(vec![
-            ("id", Value::Uuid(id.as_uuid())),
-            ("new_target", Value::Uuid(uuid::Uuid::now_v7())),
-        ]),
-    );
-    let delete = db.execute(
-        &format!("DELETE FROM {table} WHERE id = $id"),
-        &params(vec![("id", Value::Uuid(id.as_uuid()))]),
-    );
-    let row_after = count(
-        db,
-        &format!("SELECT COUNT(*) AS n FROM {table} WHERE id = $id AND target_id = $target_id"),
-        &params(vec![
-            ("id", Value::Uuid(id.as_uuid())),
-            ("target_id", Value::Uuid(target_id)),
-        ]),
-    );
-    row_before == 1
-        && row_after == 1
-        && immutable_result(update_id, table)
-        && immutable_result(update_producer, table)
-        && immutable_result(update_target, table)
-        && immutable_result(delete, table)
-}
-
+/// A raw vector-row insert whose context differs from its item's must hit the same-context
+/// composite FK. Enrollment rows name their item `entity_id`; the others name it `target_id`.
 fn cross_context_handle_insert_rejected(
     db: &Database,
     table: &str,
@@ -241,8 +237,21 @@ fn cross_context_handle_insert_rejected(
     target_id: uuid::Uuid,
     embedding_space_id: &str,
 ) -> bool {
+    let enrollment = table.starts_with("entity_reference_embeddings_");
+    let digest = table == "digest_embeddings";
+    let item_column = if enrollment { "entity_id" } else { "target_id" };
+    let extra_columns = match (enrollment, digest) {
+        (true, _) => ", is_head",
+        (false, true) => ", item_created_at",
+        (false, false) => "",
+    };
+    let extra_values = match (enrollment, digest) {
+        (true, _) => ", $is_head",
+        (false, true) => ", $item_created_at",
+        (false, false) => "",
+    };
     let sql = format!(
-        "INSERT INTO {table} (id, context_id, target_id, embedding_space_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $producer_system, $created_at)"
+        "INSERT INTO {table} (id, context_id, {item_column}, embedding_space_id, producer_key, produced_by, producer_system, created_at{extra_columns}) VALUES ($id, $context_id, $target_id, $space, $producer_key, $producer, $producer_system, $created_at{extra_values})"
     );
     let insert = db.execute(
         &sql,
@@ -252,11 +261,17 @@ fn cross_context_handle_insert_rejected(
             ("target_id", Value::Uuid(target_id)),
             ("space", Value::Text(embedding_space_id.to_string())),
             (
+                "producer_key",
+                Value::Text("cross-context-probe".to_string()),
+            ),
+            (
                 "producer",
                 Value::Json(serde_json::to_value(producer()).expect("producer json")),
             ),
             ("producer_system", Value::Text(producer().system)),
             ("created_at", Value::TxId(context_graph::TxId(1))),
+            ("item_created_at", Value::TxId(context_graph::TxId(1))),
+            ("is_head", Value::Bool(true)),
         ]),
     );
     matches!(
@@ -267,7 +282,7 @@ fn cross_context_handle_insert_rejected(
             parent_table,
             ..
         }) if child_table == table
-            && child_columns == vec!["context_id".to_string(), "target_id".to_string()]
+            && child_columns == vec!["context_id".to_string(), item_column.to_string()]
             && matches!(parent_table.as_str(), "evidence" | "digests" | "entities")
     )
 }
@@ -304,7 +319,7 @@ fn precomputed_embedding_with_nan_or_inf_floats_rejected_at_record_observation()
         let db = raw_db(&fixture.db_path, fixture.store);
         let handle_rows = count(
             &db,
-            "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
+            "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id",
             &params(vec![("target_id", Value::Uuid(evidence_id.as_uuid()))]),
         );
         assert!(
@@ -443,17 +458,17 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
     );
     let pre_evidence_handle_rows = count(
         &baseline_db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE context_id = $context_id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE context_id = $context_id",
         &context_params,
     );
     let pre_entity_reference_handle_rows = count(
         &baseline_db,
-        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE context_id = $context_id",
+        "SELECT COUNT(*) AS n FROM entity_reference_embeddings_512 WHERE context_id = $context_id",
         &context_params,
     );
     let pre_digest_handle_rows = count(
         &baseline_db,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE context_id = $context_id",
+        "SELECT COUNT(*) AS n FROM digest_embeddings WHERE context_id = $context_id",
         &context_params,
     );
     let pre_legacy_handle_rows = if baseline_db.table_meta("embedding_handles").is_some() {
@@ -467,7 +482,7 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
     };
     let pre_raw_vector_hits = baseline_db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &query_vector,
             8,
             None,
@@ -523,17 +538,17 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
     );
     let evidence_handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE context_id = $context_id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE context_id = $context_id",
         &context_params,
     );
     let entity_reference_handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE context_id = $context_id",
+        "SELECT COUNT(*) AS n FROM entity_reference_embeddings_512 WHERE context_id = $context_id",
         &context_params,
     );
     let digest_handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE context_id = $context_id",
+        "SELECT COUNT(*) AS n FROM digest_embeddings WHERE context_id = $context_id",
         &context_params,
     );
     let legacy_handle_rows = if db.table_meta("embedding_handles").is_some() {
@@ -547,7 +562,7 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
     };
     let raw_vector_hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &query_vector,
             8,
             None,
@@ -575,16 +590,11 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
 fn embedding_handle_id_update_attempt_rejected_with_typed_immutable_error_single_thread() {
     let fixture = fixture("immutable-handle");
     let evidence_id = EvidenceId::new_v7();
-    let evidence_embedding_id = EmbeddingId::new_v7();
     let evidence_result = record(
         &fixture,
-        PrecomputedEmbedding {
-            id: evidence_embedding_id,
-            ..embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id))
-        },
+        embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id)),
     );
     let digest_id = DigestId::new_v7();
-    let digest_embedding_id = EmbeddingId::new_v7();
     let digest_result = fixture.store.create_digest(CreateDigest {
         id: digest_id,
         source: "immutable-digest".to_string(),
@@ -592,7 +602,7 @@ fn embedding_handle_id_update_attempt_rejected_with_typed_immutable_error_single
         summary: "digest basis".to_string(),
         kind: EvidenceKind::Text,
         embedding: PrecomputedEmbedding {
-            id: digest_embedding_id,
+            id: EmbeddingId::new_v7(),
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: text_vector(1),
             target: EmbeddingTarget::Digest(digest_id),
@@ -606,11 +616,8 @@ fn embedding_handle_id_update_attempt_rejected_with_typed_immutable_error_single
         FACE_SPACE,
         Some("front".to_string()),
         vec![1.0; 512],
-        producer(),
+        face_producer(),
     );
-    let reference_embedding_id = reference_result
-        .as_ref()
-        .map_or(EmbeddingId::default(), |id| *id);
     let other_context = fixture
         .store
         .create_context(CreateContext {
@@ -620,51 +627,27 @@ fn embedding_handle_id_update_attempt_rejected_with_typed_immutable_error_single
         })
         .expect("other context");
     let db = raw_db(&fixture.db_path, fixture.store);
-    let evidence_handle_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
-        &params(vec![("id", Value::Uuid(evidence_embedding_id.as_uuid()))]),
-    );
-    let digest_handle_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE id = $id",
-        &params(vec![("id", Value::Uuid(digest_embedding_id.as_uuid()))]),
-    );
-    let reference_handle_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE id = $id",
-        &params(vec![("id", Value::Uuid(reference_embedding_id.as_uuid()))]),
-    );
-    let immutable_updates = [
+    let item_rows = [
+        ("evidence_embeddings", "target_id", evidence_id.as_uuid()),
+        ("digest_embeddings", "target_id", digest_id.as_uuid()),
         (
-            "evidence_embedding_handles",
-            evidence_embedding_id,
-            evidence_id.as_uuid(),
-        ),
-        (
-            "digest_embedding_handles",
-            digest_embedding_id,
-            digest_id.as_uuid(),
-        ),
-        (
-            "entity_reference_embedding_handles",
-            reference_embedding_id,
+            "entity_reference_embeddings_512",
+            "entity_id",
             fixture.entity_id.as_uuid(),
         ),
     ]
-    .iter()
-    .all(|(table, id, target_id)| {
-        immutable_mutations_rejected_and_row_unchanged(&db, table, *id, *target_id)
+    .map(|(table, column, item)| {
+        count(
+            &db,
+            &format!("SELECT COUNT(*) AS n FROM {table} WHERE {column} = $item"),
+            &params(vec![("item", Value::Uuid(item))]),
+        )
     });
     let same_context_fks = [
+        ("evidence_embeddings", evidence_id.as_uuid(), TEXT_SPACE),
+        ("digest_embeddings", digest_id.as_uuid(), TEXT_SPACE),
         (
-            "evidence_embedding_handles",
-            evidence_id.as_uuid(),
-            TEXT_SPACE,
-        ),
-        ("digest_embedding_handles", digest_id.as_uuid(), TEXT_SPACE),
-        (
-            "entity_reference_embedding_handles",
+            "entity_reference_embeddings_512",
             fixture.entity_id.as_uuid(),
             FACE_SPACE,
         ),
@@ -678,12 +661,9 @@ fn embedding_handle_id_update_attempt_rejected_with_typed_immutable_error_single
         evidence_result.is_ok()
             && digest_result.is_ok()
             && reference_result.is_ok()
-            && evidence_handle_rows == 1
-            && digest_handle_rows == 1
-            && reference_handle_rows == 1
-            && immutable_updates
+            && item_rows == [1, 1, 1]
             && same_context_fks,
-        "expected all variant handle rows to be immutable and guarded by same-context composite FKs, evidence_result={evidence_result:?}, digest_result={digest_result:?}, reference_result={reference_result:?}, evidence_handle_rows={evidence_handle_rows}, digest_handle_rows={digest_handle_rows}, reference_handle_rows={reference_handle_rows}, immutable_updates={immutable_updates}, same_context_fks={same_context_fks}"
+        "expected one vector row per variant, each guarded by its same-context composite FK, evidence_result={evidence_result:?}, digest_result={digest_result:?}, reference_result={reference_result:?}, item_rows={item_rows:?}, same_context_fks={same_context_fks}"
     );
 }
 
@@ -692,16 +672,11 @@ fn embedding_target_routing_evidence_variant_writes_to_evidence_vector_column_di
  {
     let fixture = fixture("target-routing");
     let evidence_id = EvidenceId::new_v7();
-    let evidence_embedding_id = EmbeddingId::new_v7();
     let evidence_result = record(
         &fixture,
-        PrecomputedEmbedding {
-            id: evidence_embedding_id,
-            ..embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id))
-        },
+        embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id)),
     );
     let digest_id = DigestId::new_v7();
-    let digest_embedding_id = EmbeddingId::new_v7();
     let digest_result = fixture.store.create_digest(CreateDigest {
         id: digest_id,
         source: "screen-summary".to_string(),
@@ -709,7 +684,7 @@ fn embedding_target_routing_evidence_variant_writes_to_evidence_vector_column_di
         summary: "evidence summary".to_string(),
         kind: EvidenceKind::Text,
         embedding: PrecomputedEmbedding {
-            id: digest_embedding_id,
+            id: EmbeddingId::new_v7(),
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: text_vector(1),
             target: EmbeddingTarget::Digest(digest_id),
@@ -718,71 +693,67 @@ fn embedding_target_routing_evidence_variant_writes_to_evidence_vector_column_di
         context_id: fixture.context_id,
         properties: BTreeMap::new(),
     });
-    let reference_embedding_id = EmbeddingId::new_v7();
     let reference_vector = vec![0.25; 512];
     let reference_result = record(
         &fixture,
         PrecomputedEmbedding {
-            id: reference_embedding_id,
+            id: EmbeddingId::new_v7(),
             embedding_space_id: FACE_SPACE.to_string(),
             vector: reference_vector.clone(),
             target: EmbeddingTarget::EntityReference(fixture.entity_id, Some("front".to_string())),
-            produced_by: producer(),
+            produced_by: face_producer(),
         },
     );
+    let reported_evidence_id = evidence_result
+        .as_ref()
+        .ok()
+        .and_then(|result| result.embedding_ids.first().copied());
+    let reported_digest_id: Option<EmbeddingId> = match digest_result
+        .as_ref()
+        .ok()
+        .and_then(|digest| digest.supplied_vector.as_ref())
+    {
+        Some(SuppliedVector::Stored { embedding_id }) => Some(*embedding_id),
+        _ => None,
+    };
+    let reported_reference_id = reference_result
+        .as_ref()
+        .ok()
+        .and_then(|result| result.embedding_ids.first().copied());
     let db = raw_db(&fixture.db_path, fixture.store);
-    let evidence_handles = count(
+    let evidence_row = row_for_target(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id AND target_id = $target_id",
-        &params(vec![
-            ("id", Value::Uuid(evidence_embedding_id.as_uuid())),
-            ("target_id", Value::Uuid(evidence_id.as_uuid())),
-        ]),
+        "evidence_embeddings",
+        "target_id",
+        evidence_id.as_uuid(),
     );
-    let digest_handles = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE id = $id AND target_id = $target_id",
-        &params(vec![
-            ("id", Value::Uuid(digest_embedding_id.as_uuid())),
-            ("target_id", Value::Uuid(digest_id.as_uuid())),
-        ]),
-    );
-    let reference_handles = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE id = $id AND target_id = $target_id",
-        &params(vec![
-            ("id", Value::Uuid(reference_embedding_id.as_uuid())),
-            ("target_id", Value::Uuid(fixture.entity_id.as_uuid())),
-        ]),
-    );
-    let evidence_vector = stored_vector(&db, "evidence", "vector_text", evidence_id.as_uuid());
-    let digest_vector = stored_vector(&db, "digests", "vector_text", digest_id.as_uuid());
-    let reference_vector_row = stored_vector(
+    let digest_row = row_for_target(&db, "digest_embeddings", "target_id", digest_id.as_uuid());
+    let reference_row = row_for_target(
         &db,
         "entity_reference_embeddings_512",
-        "vector",
-        reference_embedding_id.as_uuid(),
+        "entity_id",
+        fixture.entity_id.as_uuid(),
     );
     let wrong_evidence_in_digest = count(
         &db,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE target_id = $target_id",
+        "SELECT COUNT(*) AS n FROM digest_embeddings WHERE target_id = $target_id",
         &params(vec![("target_id", Value::Uuid(evidence_id.as_uuid()))]),
     );
     let wrong_digest_in_evidence = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id",
         &params(vec![("target_id", Value::Uuid(digest_id.as_uuid()))]),
     );
     let wrong_reference_in_evidence_or_digest = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id",
         &params(vec![(
             "target_id",
             Value::Uuid(fixture.entity_id.as_uuid()),
         )]),
     ) + count(
         &db,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE target_id = $target_id",
+        "SELECT COUNT(*) AS n FROM digest_embeddings WHERE target_id = $target_id",
         &params(vec![(
             "target_id",
             Value::Uuid(fixture.entity_id.as_uuid()),
@@ -793,41 +764,71 @@ fn embedding_target_routing_evidence_variant_writes_to_evidence_vector_column_di
         evidence_result.is_ok()
             && digest_result.is_ok()
             && reference_result.is_ok()
-            && evidence_handles == 1
-            && digest_handles == 1
-            && reference_handles == 1
-            && evidence_vector
-                .as_ref()
-                .is_some_and(|vector| vector_close_enough(vector, &text_vector(0)))
-            && digest_vector
-                .as_ref()
-                .is_some_and(|vector| vector_close_enough(vector, &text_vector(1)))
-            && reference_vector_row
-                .as_ref()
-                .is_some_and(|vector| vector_close_enough(vector, &reference_vector))
+            && evidence_row.as_ref().is_some_and(|(id, vector)| {
+                Some(*id) == reported_evidence_id.map(|id| id.as_uuid())
+                    && vector_close_enough(vector, &text_vector(0))
+            })
+            && digest_row.as_ref().is_some_and(|(id, vector)| {
+                Some(*id) == reported_digest_id.map(|id| id.as_uuid())
+                    && vector_close_enough(vector, &text_vector(1))
+            })
+            && reference_row.as_ref().is_some_and(|(id, vector)| {
+                Some(*id) == reported_reference_id.map(|id| id.as_uuid())
+                    && vector_close_enough(vector, &reference_vector)
+            })
             && wrong_evidence_in_digest == 0
             && wrong_digest_in_evidence == 0
             && wrong_reference_in_evidence_or_digest == 0,
-        "expected evidence, digest, and entity-reference variants to write only their intended tables/columns with exact ids/vectors, evidence_result={evidence_result:?}, digest_result={digest_result:?}, reference_result={reference_result:?}, evidence_handles={evidence_handles}, digest_handles={digest_handles}, reference_handles={reference_handles}, evidence_vector={evidence_vector:?}, digest_vector={digest_vector:?}, reference_vector_row={reference_vector_row:?}, wrong_evidence_in_digest={wrong_evidence_in_digest}, wrong_digest_in_evidence={wrong_digest_in_evidence}, wrong_reference_in_evidence_or_digest={wrong_reference_in_evidence_or_digest}"
+        "expected evidence, digest, and entity-reference variants to write only their intended tables with the reported ids and exact vectors, evidence_result={evidence_result:?}, digest_result={digest_result:?}, reference_result={reference_result:?}, evidence_row={evidence_row:?}, digest_row={digest_row:?}, reference_row={reference_row:?}, wrong_evidence_in_digest={wrong_evidence_in_digest}, wrong_digest_in_evidence={wrong_digest_in_evidence}, wrong_reference_in_evidence_or_digest={wrong_reference_in_evidence_or_digest}"
     );
 }
 
 #[test]
 fn producer_metadata_model_name_persists_full_string_up_to_documented_max() {
-    let fixture = fixture("producer-long-name");
     let long_name = "encoder-".repeat(31);
-    let embedding_id = EmbeddingId::new_v7();
+    let long_identity = ModelIdentity {
+        model: long_name.clone(),
+        weights_revision: "1".to_string(),
+        preparation: "1".to_string(),
+        dimension: 768,
+    };
+    let long_space = "long_model_name_text_768";
+    let fixture = fixture_with_spaces(
+        "producer-long-name",
+        vec![EmbeddingSpaceDecl {
+            embedding_space_id: long_space.to_string(),
+            dimension: 768,
+            metric: DistanceMetric::Cosine,
+            model_family: "text".to_string(),
+            model_name: long_name.clone(),
+            model_version: "1".to_string(),
+            supported_evidence_kinds: vec![EvidenceKind::Text],
+            default_for_evidence_kind: None,
+            bindings: vec![EmbeddingSpaceBinding {
+                embedding_space_id: long_space.to_string(),
+                table_name: "evidence".to_string(),
+                vector_column: "vector_text".to_string(),
+            }],
+            placement: VectorPlacement::NodeLocal,
+            media_reachable_on_every_node: false,
+            producer: long_identity.clone(),
+        }],
+    );
     let evidence_id = EvidenceId::new_v7();
     let mut input = embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id));
-    input.id = embedding_id;
-    input.produced_by.model_name = long_name.clone();
+    input.embedding_space_id = long_space.to_string();
+    input.produced_by = EvidenceProducer {
+        system: "external".to_string(),
+        ..EvidenceProducer::from(&long_identity)
+    };
     let result = record(&fixture, input);
     let db = raw_db(&fixture.db_path, fixture.store);
     let rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id AND produced_by = $producer",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id AND embedding_space_id = $space AND produced_by = $producer",
         &params(vec![
-            ("id", Value::Uuid(embedding_id.as_uuid())),
+            ("target_id", Value::Uuid(evidence_id.as_uuid())),
+            ("space", Value::Text(long_space.to_string())),
             (
                 "producer",
                 Value::Json(serde_json::json!({
@@ -842,7 +843,7 @@ fn producer_metadata_model_name_persists_full_string_up_to_documented_max() {
 
     assert!(
         result.is_ok() && rows == 1,
-        "expected full producer model_name to persist in handle JSON, result={result:?}, rows={rows}"
+        "expected full producer model_name to persist in the vector row's producer JSON, result={result:?}, rows={rows}"
     );
 }
 
@@ -862,7 +863,7 @@ fn producer_metadata_field_exceeding_max_rejected_at_record_observation() {
         let db = raw_db(&fixture.db_path, fixture.store);
         let handle_rows = count(
             &db,
-            "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
+            "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id",
             &params(vec![("target_id", Value::Uuid(evidence_id.as_uuid()))]),
         );
         assert!(

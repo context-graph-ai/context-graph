@@ -6,6 +6,12 @@ use contextdb_core::{ColumnType, Error, RowId, Value, VectorIndexRef};
 use contextdb_engine::Database;
 
 const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
+/// Node-local table holding the built-in text space's reproducible vectors.
+const TEXT_VECTOR_TABLE: &str = "evidence_embeddings";
+/// Travelling table holding the caller-filled vision space's vectors.
+const VISION_VECTOR_TABLE: &str = "evidence_embeddings_travelling";
+/// Node-local table holding digest vectors.
+const DIGEST_VECTOR_TABLE: &str = "digest_embeddings";
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -16,6 +22,32 @@ fn fresh_store() -> (tempfile::TempDir, Store) {
     })
     .expect("open");
     (dir, store)
+}
+
+/// The built-in text space's one model, read from a store rather than written down here.
+fn text_space_producer() -> EvidenceProducer {
+    static PRODUCER: std::sync::OnceLock<EvidenceProducer> = std::sync::OnceLock::new();
+    PRODUCER
+        .get_or_init(|| {
+            let (_dir, store) = fresh_store();
+            EvidenceProducer::from(
+                &store
+                    .space_producer(TEXT_SPACE)
+                    .expect("read the text space's model")
+                    .expect("the built-in text space is declared"),
+            )
+        })
+        .clone()
+}
+
+/// The vision space's one model: the fixture producer's own fields, so frame supplies match it.
+fn vision_identity() -> ModelIdentity {
+    ModelIdentity {
+        model: "fixture".to_string(),
+        weights_revision: "1".to_string(),
+        preparation: "1".to_string(),
+        dimension: 512,
+    }
 }
 
 fn producer() -> EvidenceProducer {
@@ -157,7 +189,7 @@ fn record_input(observation_id: ObservationId, evidence_id: EvidenceId) -> Recor
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: text_vector(),
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer(),
+            produced_by: text_space_producer(),
         }],
     )
 }
@@ -243,7 +275,15 @@ fn assert_record_failure_zero_rollback_inner<F>(
     let observation_id = input.id;
     let entity_id = input.entity_id;
     let evidence_ids = input.evidence.iter().map(|e| e.id).collect::<Vec<_>>();
-    let embedding_ids = input.embeddings.iter().map(|e| e.id).collect::<Vec<_>>();
+    let embedding_targets = input
+        .embeddings
+        .iter()
+        .filter_map(|embedding| match embedding.target {
+            EmbeddingTarget::Evidence(id) => Some(id.as_uuid()),
+            EmbeddingTarget::Digest(id) => Some(id.as_uuid()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let embedding_vectors = input
         .embeddings
         .iter()
@@ -270,7 +310,7 @@ fn assert_record_failure_zero_rollback_inner<F>(
         ] {
             assert_eq!(table_count(&db, table), 0, "{label}: {table} table changed");
         }
-        for table in EMBEDDING_HANDLE_TABLES {
+        for table in EMBEDDING_VECTOR_TABLES {
             assert_eq!(table_count(&db, table), 0, "{label}: {table} table changed");
         }
     }
@@ -306,22 +346,24 @@ fn assert_record_failure_zero_rollback_inner<F>(
             "{label}: evidence row leaked for {evidence_id:?}"
         );
     }
-    for embedding_id in embedding_ids {
+    for target in embedding_targets {
         assert_eq!(
-            embedding_handle_count_by_id(&db, embedding_id),
+            embedding_row_count_for_target(&db, target),
             0,
-            "{label}: embedding handle leaked for {embedding_id:?}"
+            "{label}: embedding row leaked for {target}"
         );
     }
     for (space, target, vector) in embedding_vectors {
         let column_and_evidence_id = match (space.as_str(), target) {
-            (TEXT_SPACE, EmbeddingTarget::Evidence(id)) => Some(("vector_text", id.as_uuid())),
+            (TEXT_SPACE, EmbeddingTarget::Evidence(id)) => {
+                Some((TEXT_VECTOR_TABLE, "vector_text", id.as_uuid()))
+            }
             ("vigil_face_reid_v1", EmbeddingTarget::Evidence(id)) => {
-                Some(("vector_vision", id.as_uuid()))
+                Some((VISION_VECTOR_TABLE, "vector_vision", id.as_uuid()))
             }
             _ => None,
         };
-        if let Some((column, evidence_id)) = column_and_evidence_id {
+        if let Some((table, column, evidence_id)) = column_and_evidence_id {
             let expected_dimension = match column {
                 "vector_text" => 768,
                 "vector_vision" => 512,
@@ -332,7 +374,7 @@ fn assert_record_failure_zero_rollback_inner<F>(
             }
             let hits = db
                 .query_vector(
-                    VectorIndexRef::new("evidence", column),
+                    VectorIndexRef::new(table, column),
                     &vector,
                     10,
                     None,
@@ -340,8 +382,8 @@ fn assert_record_failure_zero_rollback_inner<F>(
                 )
                 .expect("rollback vector query");
             assert!(
-                !vector_hits_contain_id(&db, "evidence", &hits, evidence_id),
-                "{label}: vector index entry leaked for evidence.{column} id {evidence_id}"
+                !vector_hits_contain_id(&db, table, &hits, evidence_id),
+                "{label}: vector index entry leaked for {table}.{column} target {evidence_id}"
             );
         }
     }
@@ -510,6 +552,9 @@ fn vision_config() -> StoreConfig {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_vision".to_string(),
             }],
+            placement: VectorPlacement::TravelsWithItem,
+            media_reachable_on_every_node: false,
+            producer: vision_identity(),
         }],
         ..Default::default()
     }
@@ -525,11 +570,8 @@ fn db_params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
-const EMBEDDING_HANDLE_TABLES: [&str; 3] = [
-    "evidence_embedding_handles",
-    "entity_reference_embedding_handles",
-    "digest_embedding_handles",
-];
+const EMBEDDING_VECTOR_TABLES: [&str; 3] =
+    [TEXT_VECTOR_TABLE, VISION_VECTOR_TABLE, DIGEST_VECTOR_TABLE];
 
 fn table_count(db: &Database, table: &str) -> i64 {
     let result = db
@@ -546,21 +588,21 @@ fn table_count(db: &Database, table: &str) -> i64 {
 }
 
 fn embedding_handle_count(db: &Database) -> i64 {
-    EMBEDDING_HANDLE_TABLES
+    EMBEDDING_VECTOR_TABLES
         .iter()
         .map(|table| table_count(db, table))
         .sum()
 }
 
-fn embedding_handle_count_by_id(db: &Database, id: EmbeddingId) -> i64 {
-    EMBEDDING_HANDLE_TABLES
+fn embedding_row_count_for_target(db: &Database, target: uuid::Uuid) -> i64 {
+    EMBEDDING_VECTOR_TABLES
         .iter()
         .map(|table| {
             count_where(
                 db,
                 table,
-                "id = $id",
-                db_params(vec![("id", Value::Uuid(id.as_uuid()))]),
+                "target_id = $target_id",
+                db_params(vec![("target_id", Value::Uuid(target))]),
             )
         })
         .sum()
@@ -959,8 +1001,19 @@ fn assert_core_source_has_no_raw_byte_fetch_primitives() {
 
 fn assert_evidence_vector_schema_has_no_json_shadow(
     db: &Database,
-    required_vectors: &[(&str, usize)],
+    required_vectors: &[(&str, &str, usize)],
 ) {
+    for (table, column, dimension) in required_vectors {
+        let meta = db.table_meta(table).expect("vector table meta");
+        assert_eq!(
+            meta.columns
+                .iter()
+                .find(|candidate| candidate.name == *column)
+                .map(|candidate| &candidate.column_type),
+            Some(&ColumnType::Vector(*dimension)),
+            "{table}.{column} must be an engine vector column"
+        );
+    }
     let meta = db.table_meta("evidence").expect("evidence table meta");
     let column_type = |name: &str| {
         meta.columns
@@ -968,11 +1021,10 @@ fn assert_evidence_vector_schema_has_no_json_shadow(
             .find(|column| column.name == name)
             .map(|column| &column.column_type)
     };
-    for (column, dimension) in required_vectors {
-        assert_eq!(
-            column_type(column),
-            Some(&ColumnType::Vector(*dimension)),
-            "evidence.{column} must be an engine vector column"
+    for vector_column in ["vector_text", "vector_vision"] {
+        assert!(
+            column_type(vector_column).is_none(),
+            "evidence.{vector_column} must not exist; vectors live in their placement's table"
         );
     }
     for forbidden in [
@@ -991,8 +1043,8 @@ fn assert_evidence_vector_schema_has_no_json_shadow(
 }
 
 fn assert_embedding_handles_have_no_vector_json_shadow(db: &Database) {
-    for table in EMBEDDING_HANDLE_TABLES {
-        let meta = db.table_meta(table).expect("embedding handle table meta");
+    for table in EMBEDDING_VECTOR_TABLES {
+        let meta = db.table_meta(table).expect("embedding vector table meta");
         for forbidden in [
             "embedding",
             "embedding_json",
@@ -1017,7 +1069,7 @@ fn assert_first_vector_hit_id(
 ) {
     assert!(
         !hits.is_empty(),
-        "expected at least one vector hit for {table}.id {expected}"
+        "expected at least one vector hit for {table}.target_id {expected}"
     );
     let row_id = hits[0].0;
     let rows = db
@@ -1027,7 +1079,7 @@ fn assert_first_vector_hit_id(
         .into_iter()
         .find(|row| row.row_id == row_id)
         .expect("vector hit row must still be visible");
-    assert_eq!(row.values.get("id"), Some(&Value::Uuid(expected)));
+    assert_eq!(row.values.get("target_id"), Some(&Value::Uuid(expected)));
 }
 
 fn vector_hits_contain_id(
@@ -1042,7 +1094,7 @@ fn vector_hits_contain_id(
     hits.iter().any(|(row_id, _)| {
         rows.iter()
             .find(|row| row.row_id == *row_id)
-            .is_some_and(|row| row.values.get("id") == Some(&Value::Uuid(expected)))
+            .is_some_and(|row| row.values.get("target_id") == Some(&Value::Uuid(expected)))
     })
 }
 
@@ -1057,18 +1109,21 @@ fn record_observation_text_evidence_lands_in_vector_text_hnsw_index_queryable_vi
         .expect("record");
     assert_eq!(result.evidence_ids, vec![evidence_id]);
     let db = reopen_database_for_store(store);
-    assert_evidence_vector_schema_has_no_json_shadow(&db, &[("vector_text", 768)]);
+    assert_evidence_vector_schema_has_no_json_shadow(
+        &db,
+        &[(TEXT_VECTOR_TABLE, "vector_text", 768)],
+    );
     assert_embedding_handles_have_no_vector_json_shadow(&db);
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new(TEXT_VECTOR_TABLE, "vector_text"),
             &text_vector(),
             1,
             None,
             db.snapshot(),
         )
         .expect("query");
-    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
+    assert_first_vector_hit_id(&db, TEXT_VECTOR_TABLE, &hits, evidence_id.as_uuid());
 }
 
 #[test]
@@ -1099,18 +1154,21 @@ fn record_observation_image_evidence_lands_in_vector_vision_hnsw_index_queryable
     let result = store.record_observation(input).expect("record");
     assert_eq!(result.evidence_ids, vec![evidence_id]);
     let db = reopen_database_for_store(store);
-    assert_evidence_vector_schema_has_no_json_shadow(&db, &[("vector_vision", 512)]);
+    assert_evidence_vector_schema_has_no_json_shadow(
+        &db,
+        &[(VISION_VECTOR_TABLE, "vector_vision", 512)],
+    );
     assert_embedding_handles_have_no_vector_json_shadow(&db);
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_vision"),
+            VectorIndexRef::new(VISION_VECTOR_TABLE, "vector_vision"),
             &[1.0; 512],
             1,
             None,
             db.snapshot(),
         )
         .expect("query");
-    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
+    assert_first_vector_hit_id(&db, VISION_VECTOR_TABLE, &hits, evidence_id.as_uuid());
 }
 
 #[test]
@@ -1160,7 +1218,20 @@ fn record_observation_vigil_edge_camera_frame_atomic_observation_evidence_snapsh
     let result = store.record_observation(input).expect("record");
     assert_eq!(result.observation_id, observation_id);
     assert_eq!(result.evidence_ids, vec![evidence_id]);
-    assert_eq!(result.embedding_ids, vec![embedding_id]);
+    assert_eq!(
+        result.embedding_ids.len(),
+        1,
+        "one supplied vector, one written row: {result:?}"
+    );
+    assert!(
+        matches!(
+            result.supplied_vectors.as_slice(),
+            [SuppliedVectorOutcome { outcome: SuppliedVector::Stored { embedding_id: stored }, .. }]
+                if *stored == result.embedding_ids[0]
+        ),
+        "the frame vector is stored in the travelling space: {result:?}"
+    );
+    let written_embedding_id = result.embedding_ids[0];
     let snapshot_id = result
         .snapshot_id
         .expect("state delta must create a snapshot");
@@ -1215,10 +1286,10 @@ fn record_observation_vigil_edge_camera_frame_atomic_observation_evidence_snapsh
     assert_eq!(
         count_where(
             &db,
-            "evidence_embedding_handles",
+            VISION_VECTOR_TABLE,
             "id = $id AND target_id = $target_id AND embedding_space_id = $embedding_space_id",
             db_params(vec![
-                ("id", Value::Uuid(embedding_id.as_uuid())),
+                ("id", Value::Uuid(written_embedding_id.as_uuid())),
                 ("target_id", Value::Uuid(evidence_id.as_uuid())),
                 (
                     "embedding_space_id",
@@ -1230,14 +1301,14 @@ fn record_observation_vigil_edge_camera_frame_atomic_observation_evidence_snapsh
     );
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_vision"),
+            VectorIndexRef::new(VISION_VECTOR_TABLE, "vector_vision"),
             &[1.0; 512],
             1,
             None,
             db.snapshot(),
         )
         .expect("vision query");
-    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
+    assert_first_vector_hit_id(&db, VISION_VECTOR_TABLE, &hits, evidence_id.as_uuid());
 }
 
 #[test]
@@ -1286,10 +1357,13 @@ fn record_observation_rejects_inline_data_uri_with_raw_media_not_stored_before_a
         ),
         0
     );
-    assert_eq!(embedding_handle_count_by_id(&db, embedding_id), 0);
+    assert_eq!(
+        embedding_row_count_for_target(&db, evidence_id.as_uuid()),
+        0
+    );
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new(TEXT_VECTOR_TABLE, "vector_text"),
             &text_vector(),
             10,
             None,
@@ -2416,21 +2490,29 @@ fn record_observation_per_table_vector_column_routing_image_does_not_pollute_tex
     let db = reopen_database_for_store(store);
     assert_evidence_vector_schema_has_no_json_shadow(
         &db,
-        &[("vector_text", 768), ("vector_vision", 512)],
+        &[
+            (TEXT_VECTOR_TABLE, "vector_text", 768),
+            (VISION_VECTOR_TABLE, "vector_vision", 512),
+        ],
     );
     let vision_hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_vision"),
+            VectorIndexRef::new(VISION_VECTOR_TABLE, "vector_vision"),
             &[1.0; 512],
             1,
             None,
             db.snapshot(),
         )
         .expect("vision query");
-    assert_first_vector_hit_id(&db, "evidence", &vision_hits, evidence_id.as_uuid());
+    assert_first_vector_hit_id(
+        &db,
+        VISION_VECTOR_TABLE,
+        &vision_hits,
+        evidence_id.as_uuid(),
+    );
     let text_hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new(TEXT_VECTOR_TABLE, "vector_text"),
             &text_vector(),
             10,
             None,
@@ -2439,7 +2521,7 @@ fn record_observation_per_table_vector_column_routing_image_does_not_pollute_tex
         .expect("text query");
     assert!(
         text_hits.is_empty(),
-        "image evidence must not pollute evidence.vector_text"
+        "image evidence must not pollute the text vector table"
     );
 }
 
@@ -4675,13 +4757,16 @@ fn store_open_freshly_initialized_schema_introspection_shows_no_observations_dat
             .all(|column| column.name != "data"),
         "observations.data must not exist"
     );
-    let digests = db.table_meta("digests").expect("digests meta");
+    let digest_vectors = db
+        .table_meta(DIGEST_VECTOR_TABLE)
+        .expect("digest vector table meta");
     assert!(
-        digests.columns.iter().any(|column| {
+        digest_vectors.columns.iter().any(|column| {
             column.name == "vector_text" && column.column_type == ColumnType::Vector(768)
         }),
-        "digests.vector_text VECTOR(768) must exist"
+        "digest_embeddings.vector_text VECTOR(768) must exist"
     );
+    let digests = db.table_meta("digests").expect("digests meta");
     assert!(
         digests.columns.iter().all(|column| {
             !(column.name == "embedding" && column.column_type == ColumnType::Vector(384))
@@ -5270,7 +5355,7 @@ fn create_digest_with_non_text_evidence_kind_rejected_with_unsupported_evidence_
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector: text_vector(),
                 target: EmbeddingTarget::Digest(digest_id),
-                produced_by: producer(),
+                produced_by: text_space_producer(),
             },
             context_id: ContextId::new_v7(),
             properties: BTreeMap::new(),
@@ -5303,7 +5388,7 @@ fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_hnsw_index
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector: text_vector(),
                 target: EmbeddingTarget::Digest(digest_id),
-                produced_by: producer(),
+                produced_by: text_space_producer(),
             },
             context_id: ContextId::new_v7(),
             properties: BTreeMap::new(),
@@ -5321,7 +5406,7 @@ fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_hnsw_index
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector: decoy_vector.clone(),
                 target: EmbeddingTarget::Digest(decoy_digest_id),
-                produced_by: producer(),
+                produced_by: text_space_producer(),
             },
             context_id: ContextId::new_v7(),
             properties: BTreeMap::new(),
@@ -5330,31 +5415,35 @@ fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_hnsw_index
     let db = reopen_database_for_store(store);
     let hits = db
         .query_vector(
-            VectorIndexRef::new("digests", "vector_text"),
+            VectorIndexRef::new(DIGEST_VECTOR_TABLE, "vector_text"),
             &text_vector(),
             1,
             None,
             db.snapshot(),
         )
         .expect("query");
-    assert_first_vector_hit_id(&db, "digests", &hits, digest_id.as_uuid());
+    assert_first_vector_hit_id(&db, DIGEST_VECTOR_TABLE, &hits, digest_id.as_uuid());
     let decoy_hits = db
         .query_vector(
-            VectorIndexRef::new("digests", "vector_text"),
+            VectorIndexRef::new(DIGEST_VECTOR_TABLE, "vector_text"),
             &decoy_vector,
             1,
             None,
             db.snapshot(),
         )
         .expect("decoy query");
-    assert_first_vector_hit_id(&db, "digests", &decoy_hits, decoy_digest_id.as_uuid());
+    assert_first_vector_hit_id(
+        &db,
+        DIGEST_VECTOR_TABLE,
+        &decoy_hits,
+        decoy_digest_id.as_uuid(),
+    );
     assert_eq!(
         count_where(
             &db,
-            "digest_embedding_handles",
-            "id = $id AND embedding_space_id = $embedding_space_id AND target_id = $target_id",
+            DIGEST_VECTOR_TABLE,
+            "embedding_space_id = $embedding_space_id AND target_id = $target_id",
             db_params(vec![
-                ("id", Value::Uuid(embedding_id.as_uuid())),
                 ("embedding_space_id", Value::Text(TEXT_SPACE.to_string())),
                 ("target_id", Value::Uuid(digest_id.as_uuid())),
             ])
@@ -5362,12 +5451,21 @@ fn create_digest_with_text_evidence_kind_lands_in_digests_vector_text_hnsw_index
         1,
         "create_digest must persist embedding handle lineage for the digest vector"
     );
-    let meta = db.table_meta("digests").expect("digests meta");
+    let vector_meta = db
+        .table_meta(DIGEST_VECTOR_TABLE)
+        .expect("digest vector table meta");
     assert!(
-        meta.columns.iter().any(|column| {
+        vector_meta.columns.iter().any(|column| {
             column.name == "vector_text" && column.column_type == ColumnType::Vector(768)
         }),
-        "digests.vector_text must be an engine vector column"
+        "digest_embeddings.vector_text must be an engine vector column"
+    );
+    let meta = db.table_meta("digests").expect("digests meta");
+    assert!(
+        meta.columns
+            .iter()
+            .all(|column| column.name != "vector_text"),
+        "digests.vector_text must not exist; the digest's vector lives in digest_embeddings"
     );
     for forbidden in [
         "embedding",
@@ -5397,7 +5495,7 @@ fn create_digest_with_dimension_mismatch_rejected_with_embedding_space_mismatch_
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: vec![0.0; 384],
             target: EmbeddingTarget::Digest(digest_id),
-            produced_by: producer(),
+            produced_by: text_space_producer(),
         },
         context_id: ContextId::new_v7(),
         properties: BTreeMap::new(),
@@ -5498,26 +5596,26 @@ fn record_observation_vigil_edge_multi_camera_evidence_each_carries_distinct_reg
     let db = reopen_database_for_store(reopened);
     let first_hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_vision"),
+            VectorIndexRef::new(VISION_VECTOR_TABLE, "vector_vision"),
             &[1.0; 512],
             1,
             None,
             db.snapshot(),
         )
         .expect("first vision query");
-    assert_first_vector_hit_id(&db, "evidence", &first_hits, first.as_uuid());
+    assert_first_vector_hit_id(&db, VISION_VECTOR_TABLE, &first_hits, first.as_uuid());
     let mut second_vector = vec![0.0; 512];
     second_vector[1] = 1.0;
     let second_hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_vision"),
+            VectorIndexRef::new(VISION_VECTOR_TABLE, "vector_vision"),
             &second_vector,
             1,
             None,
             db.snapshot(),
         )
         .expect("second vision query");
-    assert_first_vector_hit_id(&db, "evidence", &second_hits, second.as_uuid());
+    assert_first_vector_hit_id(&db, VISION_VECTOR_TABLE, &second_hits, second.as_uuid());
 }
 
 #[test]
@@ -5890,7 +5988,7 @@ fn record_observation_per_store_instance_isolation_store_a_writes_do_not_appear_
     let db_b = Database::open(&db_b_path).expect("raw store b");
     let hits = db_b
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new(TEXT_VECTOR_TABLE, "vector_text"),
             &text_vector(),
             10,
             None,
@@ -5976,7 +6074,7 @@ fn record_observation_duplicate_evidence_id_within_batch_rejected_with_duplicate
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: text_vector(),
             target: EmbeddingTarget::Evidence(duplicate),
-            produced_by: producer(),
+            produced_by: text_space_producer(),
         }],
     );
     let result = store.record_observation(input);
@@ -6004,10 +6102,10 @@ fn record_observation_duplicate_evidence_id_within_batch_rejected_with_duplicate
         ),
         0
     );
-    assert_eq!(embedding_handle_count_by_id(&db, embedding_id), 0);
+    assert_eq!(embedding_row_count_for_target(&db, duplicate.as_uuid()), 0);
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new(TEXT_VECTOR_TABLE, "vector_text"),
             &text_vector(),
             10,
             None,
@@ -6437,7 +6535,6 @@ fn store_initialize_fresh_against_non_empty_path_drops_all_rows_and_reseeds_defa
     let evidence_id = EvidenceId::new_v7();
     let input = record_input(observation_id, evidence_id);
     let entity_id = input.entity_id;
-    let embedding_id = input.embeddings[0].id;
     let vector = input.embeddings[0].vector.clone();
     store.record_observation(input).expect("record");
     let reopened = Store::initialize_fresh(StoreConfig {
@@ -6477,7 +6574,7 @@ fn store_initialize_fresh_against_non_empty_path_drops_all_rows_and_reseeds_defa
             "{table} rows survived fresh init"
         );
     }
-    for table in EMBEDDING_HANDLE_TABLES {
+    for table in EMBEDDING_VECTOR_TABLES {
         assert_eq!(
             table_count(&db, table),
             0,
@@ -6511,10 +6608,13 @@ fn store_initialize_fresh_against_non_empty_path_drops_all_rows_and_reseeds_defa
         ),
         0
     );
-    assert_eq!(embedding_handle_count_by_id(&db, embedding_id), 0);
+    assert_eq!(
+        embedding_row_count_for_target(&db, evidence_id.as_uuid()),
+        0
+    );
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new(TEXT_VECTOR_TABLE, "vector_text"),
             &vector,
             10,
             None,

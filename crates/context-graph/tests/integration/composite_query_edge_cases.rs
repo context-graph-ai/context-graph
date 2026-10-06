@@ -63,6 +63,16 @@ fn producer() -> EvidenceProducer {
     }
 }
 
+/// The producer a supply into `space` must carry: the space's one model.
+fn supplied_producer(store: &Store, space: &str) -> EvidenceProducer {
+    EvidenceProducer::from(
+        &store
+            .space_producer(space)
+            .expect("read the space's model")
+            .expect("the space is declared"),
+    )
+}
+
 fn image_space() -> EmbeddingSpace {
     EmbeddingSpace {
         embedding_space_id: IMAGE_SPACE.to_string(),
@@ -78,6 +88,14 @@ fn image_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: context_graph::VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: context_graph::ModelIdentity {
+            model: "clip-local".to_string(),
+            weights_revision: "v1".to_string(),
+            preparation: "image".to_string(),
+            dimension: 512,
+        },
     }
 }
 
@@ -176,7 +194,7 @@ fn seed_evidence(
             embedding_space_id: space.to_string(),
             vector,
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer(),
+            produced_by: supplied_producer(store, space),
         }],
     });
     assert!(recorded.is_ok(), "seed evidence failed: {recorded:?}");
@@ -229,7 +247,7 @@ fn seed_text_distractors(store: &Store, count: usize) {
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector,
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: producer(),
+                produced_by: supplied_producer(store, TEXT_SPACE),
             }],
         });
         assert!(recorded.is_ok(), "seed distractor failed: {recorded:?}");
@@ -285,14 +303,14 @@ fn seed_dual_space_evidence(
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector: text_vector,
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: producer(),
+                produced_by: supplied_producer(store, TEXT_SPACE),
             },
             PrecomputedEmbedding {
                 id: EmbeddingId::new_v7(),
                 embedding_space_id: IMAGE_SPACE.to_string(),
                 vector: image_vector,
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: producer(),
+                produced_by: supplied_producer(store, IMAGE_SPACE),
             },
         ],
     });
@@ -601,7 +619,7 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
     let raw_db = Database::open(&db_path).expect("raw db");
     let raw_vector_query = raw_db
         .execute(
-            "SELECT id FROM evidence ORDER BY vector_text <=> $q LIMIT 5",
+            "SELECT target_id FROM evidence_embeddings ORDER BY vector_text <=> $q LIMIT 5",
             &HashMap::from([("q".to_string(), Value::Vector(axis(768, 0)))]),
         )
         .expect("raw vector query");
@@ -614,7 +632,7 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
         })
         .collect::<Vec<_>>();
     let hnsw_stats =
-        raw_db.__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_text"));
+        raw_db.__debug_vector_hnsw_stats(VectorIndexRef::new("evidence_embeddings", "vector_text"));
     let raw_trace = format!("{:?}", raw_vector_query.trace);
 
     assert!(
@@ -634,7 +652,7 @@ fn vector_search_top_k_ordering_matches_hnsw_documented_ranking() {
                 .all(|(hit, expected)| score_close(hit.score, expected))
             && hits
                 .iter()
-                .all(|hit| hit.index_ref == "evidence.vector_text"
+                .all(|hit| hit.index_ref == "evidence_embeddings.vector_text"
                     && hit.planner_trace.as_str() == raw_trace.as_str()
                     && hit.planner_trace.contains("HNSWSearch"))
             && raw_targets == targets

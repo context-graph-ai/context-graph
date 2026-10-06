@@ -36,6 +36,16 @@ fn producer() -> EvidenceProducer {
     }
 }
 
+/// The producer a supply into `space` must carry: the space's one model.
+fn supplied_producer(store: &Store, space: &str) -> EvidenceProducer {
+    EvidenceProducer::from(
+        &store
+            .space_producer(space)
+            .expect("read the space's model")
+            .expect("the space is declared"),
+    )
+}
+
 fn seed_candidate(
     store: &Store,
     context_id: context_graph::ContextId,
@@ -67,7 +77,7 @@ fn seed_candidate(
             embedding_space_id: TEXT_SPACE.to_string(),
             vector,
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer(),
+            produced_by: supplied_producer(store, TEXT_SPACE),
         }],
     });
     assert!(result.is_ok(), "seed candidate failed: {result:?}");
@@ -181,7 +191,7 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
     let raw_db = Database::open(&db_path).expect("raw db");
     let raw_vector_query = raw_db
         .execute(
-            "SELECT id FROM evidence WHERE context_id = $context_id ORDER BY vector_text <=> $q LIMIT 5",
+            "SELECT target_id FROM evidence_embeddings WHERE context_id = $context_id ORDER BY vector_text <=> $q LIMIT 5",
             &std::collections::HashMap::from([
                 ("context_id".to_string(), Value::Uuid(allowed_context.id.as_uuid())),
                 ("q".to_string(), Value::Vector(vector(7))),
@@ -189,7 +199,7 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
         )
         .expect("raw vector query");
     let raw_explain = raw_db
-        .explain("SELECT id FROM evidence WHERE context_id = $context_id ORDER BY vector_text <=> $q LIMIT 5")
+        .explain("SELECT target_id FROM evidence_embeddings WHERE context_id = $context_id ORDER BY vector_text <=> $q LIMIT 5")
         .expect("raw vector explain");
     let raw_ids = raw_vector_query
         .rows
@@ -200,20 +210,21 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
         })
         .collect::<Vec<_>>();
     let hnsw_stats =
-        raw_db.__debug_vector_hnsw_stats(VectorIndexRef::new("evidence", "vector_text"));
+        raw_db.__debug_vector_hnsw_stats(VectorIndexRef::new("evidence_embeddings", "vector_text"));
     let raw_hnsw_rows = raw_db
         .__debug_vector_hnsw_raw_search_for_test(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &vector(7),
             8,
         )
         .unwrap_or_default();
     let expected_row_id = raw_db
-        .scan("evidence", raw_db.snapshot())
-        .expect("scan evidence")
+        .scan("evidence_embeddings", raw_db.snapshot())
+        .expect("scan node-local evidence vectors")
         .into_iter()
         .find_map(|row| {
-            (row.values.get("id") == Some(&Value::Uuid(expected.as_uuid()))).then_some(row.row_id)
+            (row.values.get("target_id") == Some(&Value::Uuid(expected.as_uuid())))
+                .then_some(row.row_id)
         });
     let hit_ids = hits
         .iter()
@@ -227,7 +238,7 @@ fn vector_search_with_context_id_in_filter_explain_uses_indexed_scan_filter_inte
     assert!(
         first.is_some_and(|hit| hit.target == EmbeddingTarget::Evidence(expected)
             && hit.context_id == Some(allowed_context.id)
-            && hit.index_ref == "evidence.vector_text"
+            && hit.index_ref == "evidence_embeddings.vector_text"
             && hit.planner_trace == format!("{:?}", raw_vector_query.trace)
             && hit.planner_trace.contains("IndexScan -> VectorSearch")
             && raw_vector_query.trace.index_used.is_some()

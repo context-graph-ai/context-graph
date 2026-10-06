@@ -50,44 +50,34 @@ fn digest_foreign_space() -> EmbeddingSpaceDecl {
             table_name: "digests".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: context_graph::VectorPlacement::NodeLocal,
+        media_reachable_on_every_node: false,
+        producer: context_graph::ModelIdentity {
+            model: "foreign-text".to_string(),
+            weights_revision: "1".to_string(),
+            preparation: "plain".to_string(),
+            dimension: DIGEST_VECTOR_DIMENSION as u32,
+        },
     }
 }
 
+/// Nearest node-local vectors of one space in one Context, as (item id, score).
 fn raw_vector_ids(
     db_path: &std::path::Path,
-    table: &str,
-    handle_table: &str,
+    vector_table: &str,
     space_id: &str,
     context_id: ContextId,
     query: Vec<f32>,
 ) -> Vec<(uuid::Uuid, f32)> {
     let db = Database::open(db_path).expect("raw db");
-    let allowed_targets = db
-        .scan(handle_table, db.snapshot())
-        .expect("scan embedding handles")
-        .into_iter()
-        .filter_map(|row| {
-            let row_space = match row.values.get("embedding_space_id")? {
-                Value::Text(row_space) if row_space == space_id => row_space,
-                _ => return None,
-            };
-            let target = match row.values.get("target_id")? {
-                Value::Uuid(id) => *id,
-                _ => return None,
-            };
-            (!row_space.is_empty()).then_some(target)
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    if allowed_targets.is_empty() {
-        return Vec::new();
-    }
     let result = db
         .execute(
             &format!(
-                "SELECT id, score FROM {table} WHERE context_id = $context_id ORDER BY vector_text <=> $query LIMIT 5"
+                "SELECT target_id, score FROM {vector_table} WHERE context_id = $context_id AND embedding_space_id = $space ORDER BY vector_text <=> $query LIMIT 5"
             ),
             &HashMap::from([
                 ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
+                ("space".to_string(), Value::Text(space_id.to_string())),
                 ("query".to_string(), Value::Vector(query)),
             ]),
         )
@@ -95,8 +85,8 @@ fn raw_vector_ids(
     let id_index = result
         .columns
         .iter()
-        .position(|column| column == "id")
-        .expect("id column");
+        .position(|column| column == "target_id")
+        .expect("target_id column");
     let score_index = result
         .columns
         .iter()
@@ -110,9 +100,6 @@ fn raw_vector_ids(
                 Value::Uuid(id) => *id,
                 _ => return None,
             };
-            if !allowed_targets.contains(&id) {
-                return None;
-            }
             let score = match row.get(score_index)? {
                 Value::Float64(score) => *score as f32,
                 _ => return None,
@@ -120,6 +107,16 @@ fn raw_vector_ids(
             Some((id, score))
         })
         .collect()
+}
+
+/// The producer a supply into `space_id` must carry: the space's one model.
+fn space_producer(store: &Store, space_id: &str) -> EvidenceProducer {
+    EvidenceProducer::from(
+        &store
+            .space_producer(space_id)
+            .expect("read the space's model")
+            .expect("the space is declared"),
+    )
 }
 
 fn context(store: &Store, name: &str) -> ContextId {
@@ -952,7 +949,7 @@ fn digest_embedding_uses_text_space_metadata() {
                 embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
                 vector: unit_vector(0),
                 target: EmbeddingTarget::Digest(digest_id),
-                produced_by: EvidenceProducer::default(),
+                produced_by: space_producer(&store, "text_default_nomic_v1_5_768"),
             },
             context_id,
             properties: BTreeMap::new(),
@@ -965,16 +962,14 @@ fn digest_embedding_uses_text_space_metadata() {
     let db_path = dir.path().join("cg.db");
     let text_hits = raw_vector_ids(
         &db_path,
-        "digests",
-        "digest_embedding_handles",
+        "digest_embeddings",
         "text_default_nomic_v1_5_768",
         context_id,
         unit_vector(0),
     );
     let foreign_hits = raw_vector_ids(
         &db_path,
-        "digests",
-        "digest_embedding_handles",
+        "digest_embeddings",
         "foreign_text_digest_768",
         context_id,
         unit_vector(0),
@@ -993,6 +988,10 @@ fn text_projection_is_derived_evidence_for_text_search() {
     let db_path = dir.path().join("cg.db");
     let context_id = context(&store, "projection");
     let entity_id = entity(&store, context_id, "auth module", "src/auth.py");
+    let text_space = store
+        .active_embedding_space(context_graph::EmbeddingRole::EvidenceText)
+        .expect("read the active text space")
+        .expect("the lexical model is the active text space");
     let observation_id = ObservationId::new_v7();
     let evidence_id = EvidenceId::new_v7();
     let mut evidence = text_evidence(observation_id, context_id);
@@ -1015,10 +1014,10 @@ fn text_projection_is_derived_evidence_for_text_search() {
             properties: BTreeMap::new(),
             embeddings: vec![PrecomputedEmbedding {
                 id: EmbeddingId::new_v7(),
-                embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
+                embedding_space_id: text_space.clone(),
                 vector: unit_vector(21),
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: EvidenceProducer::default(),
+                produced_by: space_producer(&store, &text_space),
             }],
         })
         .expect("record observation");
@@ -1028,17 +1027,15 @@ fn text_projection_is_derived_evidence_for_text_search() {
     drop(store);
     let projection_hits = raw_vector_ids(
         &db_path,
-        "evidence",
-        "evidence_embedding_handles",
-        "text_default_nomic_v1_5_768",
+        "evidence_embeddings",
+        &text_space,
         context_id,
         unit_vector(21),
     );
     let original_ref_hits = raw_vector_ids(
         &db_path,
-        "evidence",
-        "evidence_embedding_handles",
-        "text_default_nomic_v1_5_768",
+        "evidence_embeddings",
+        &text_space,
         context_id,
         unit_vector(22),
     );

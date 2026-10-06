@@ -9,16 +9,23 @@ use chrono::Utc;
 use context_graph::Result as CgResult;
 use context_graph::embedder::{Embedder, EmbeddingInput, EmbeddingOutput};
 use context_graph::{
-    CgError, CreateContext, CreateDecision, CreateEntity, CreateIntention, DistanceMetric,
-    EmbedderRegistration, EmbeddingId, EmbeddingSpace, EmbeddingSpaceBinding, EmbeddingTarget,
-    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin,
-    IntentionStatus, PrecomputedEmbedding, RecordObservation, ReindexEvent, ReindexOptions,
-    RetentionStatus, Store, StoreConfig,
+    BackgroundWork, CgError, CreateContext, CreateDecision, CreateEntity, CreateIntention,
+    DistanceMetric, EmbedderRegistration, EmbeddingId, EmbeddingRole, EmbeddingSpace,
+    EmbeddingSpaceBinding, EmbeddingTarget, EntityType, EvidenceId, EvidenceKind, EvidenceProducer,
+    EvidenceRef, IntentionOrigin, IntentionStatus, ModelIdentity, OldSpace, PrecomputedEmbedding,
+    RecordObservation, ReindexEvent, ReindexOptions, RetentionStatus, Store, StoreConfig,
+    SwitchResult, VectorPlacement,
 };
 use contextdb_core::{Value, VectorIndexRef};
 use contextdb_engine::Database;
 
-const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
+/// The old text model's space: holds the text role while items are seeded.
+const OLD_TEXT_SPACE: &str = "reindex_concurrency_old_text_768";
+/// The new text model's space: the reindex target after the forward switch.
+const TEXT_SPACE: &str = "reindex_concurrency_new_text_768";
+/// The old image model's space: holds the image role while frames are seeded.
+const OLD_IMAGE_SPACE: &str = "reindex_concurrency_old_image_512";
+/// The new image model's space: recomputable on every node from the frame's media.
 const IMAGE_SPACE: &str = "image_clip_v1_4";
 const UNBOUND_SPACE: &str = "unbound_custom_space_v1";
 
@@ -116,6 +123,10 @@ impl Embedder for BlockingSecondRowConcurrencyEmbedder {
     fn embedding_space(&self) -> EmbeddingSpace {
         RecordingConcurrencyEmbedder.embedding_space()
     }
+
+    fn producer(&self) -> ModelIdentity {
+        self.embedding_space().producer
+    }
 }
 
 #[derive(Clone)]
@@ -123,9 +134,9 @@ struct CountingVisionConcurrencyEmbedder {
     control: Arc<BlockingReindexControl>,
 }
 
+/// The new text model; each run salts its vectors so the run that wrote a row is visible.
 #[derive(Clone)]
 struct PhaseRecordingConcurrencyEmbedder {
-    producer_version: &'static str,
     vector_salt: u64,
     calls: Arc<Mutex<Vec<PhaseReindexCall>>>,
 }
@@ -152,7 +163,7 @@ impl Embedder for PhaseRecordingConcurrencyEmbedder {
                 Ok(EmbeddingOutput {
                     embedding_space_id: TEXT_SPACE.to_string(),
                     dimension: 768,
-                    producer: producer_for_space(TEXT_SPACE, self.producer_version),
+                    producer: EvidenceProducer::from(&identity_for_space(TEXT_SPACE)),
                     vector,
                 })
             }
@@ -180,6 +191,10 @@ impl Embedder for PhaseRecordingConcurrencyEmbedder {
     fn embedding_space(&self) -> EmbeddingSpace {
         text_space()
     }
+
+    fn producer(&self) -> ModelIdentity {
+        self.embedding_space().producer
+    }
 }
 
 impl Embedder for CountingVisionConcurrencyEmbedder {
@@ -199,6 +214,10 @@ impl Embedder for CountingVisionConcurrencyEmbedder {
     fn embedding_space(&self) -> EmbeddingSpace {
         RecordingVisionConcurrencyEmbedder.embedding_space()
     }
+
+    fn producer(&self) -> ModelIdentity {
+        self.embedding_space().producer
+    }
 }
 
 impl Embedder for RecordingConcurrencyEmbedder {
@@ -207,7 +226,7 @@ impl Embedder for RecordingConcurrencyEmbedder {
             EmbeddingInput::Text(text) => Ok(EmbeddingOutput {
                 embedding_space_id: TEXT_SPACE.to_string(),
                 dimension: 768,
-                producer: producer_for_space(TEXT_SPACE, "new"),
+                producer: EvidenceProducer::from(&identity_for_space(TEXT_SPACE)),
                 vector: expected_reindexed_vector(&text),
             }),
             EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
@@ -234,6 +253,10 @@ impl Embedder for RecordingConcurrencyEmbedder {
     fn embedding_space(&self) -> EmbeddingSpace {
         text_space()
     }
+
+    fn producer(&self) -> ModelIdentity {
+        self.embedding_space().producer
+    }
 }
 
 #[derive(Clone)]
@@ -245,13 +268,13 @@ impl Embedder for RecordingVisionConcurrencyEmbedder {
             EmbeddingInput::ImageFrame { uri } => Ok(EmbeddingOutput {
                 embedding_space_id: IMAGE_SPACE.to_string(),
                 dimension: 512,
-                producer: producer_for_space(IMAGE_SPACE, "new"),
+                producer: EvidenceProducer::from(&identity_for_space(IMAGE_SPACE)),
                 vector: expected_reindexed_image_vector(&uri),
             }),
             EmbeddingInput::ImageBytes(bytes) => Ok(EmbeddingOutput {
                 embedding_space_id: IMAGE_SPACE.to_string(),
                 dimension: 512,
-                producer: producer_for_space(IMAGE_SPACE, "new"),
+                producer: EvidenceProducer::from(&identity_for_space(IMAGE_SPACE)),
                 vector: expected_reindexed_image_bytes_vector(&bytes),
             }),
             EmbeddingInput::Text(_) => Err(CgError::UnsupportedEvidenceKind {
@@ -276,6 +299,10 @@ impl Embedder for RecordingVisionConcurrencyEmbedder {
     fn embedding_space(&self) -> EmbeddingSpace {
         image_space()
     }
+
+    fn producer(&self) -> ModelIdentity {
+        self.embedding_space().producer
+    }
 }
 
 struct Fixture {
@@ -298,6 +325,53 @@ fn fixture(name: &str) -> Fixture {
     )
 }
 
+/// Which model holds each role in the declared config: the old ones while items are seeded,
+/// the new ones once the roles were switched forward (every reopen after the switch).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Roles {
+    Seeding,
+    Switched,
+}
+
+fn store_config(db_path: PathBuf, roles: Roles) -> StoreConfig {
+    let seeding = roles == Roles::Seeding;
+    StoreConfig {
+        db_path,
+        extra_embedding_spaces: vec![
+            with_default(old_text_space(), seeding.then_some(EvidenceKind::Text)),
+            with_default(
+                old_image_space(),
+                seeding.then_some(EvidenceKind::ImageFrame),
+            ),
+            unbound_space(),
+        ],
+        ..Default::default()
+    }
+}
+
+fn registrations(
+    text_embedder: Arc<dyn Embedder>,
+    image_embedder: Arc<dyn Embedder>,
+    roles: Roles,
+) -> Vec<EmbedderRegistration> {
+    let switched = roles == Roles::Switched;
+    vec![
+        EmbedderRegistration {
+            space: with_default(text_space(), switched.then_some(EvidenceKind::Text)),
+            embedder: text_embedder,
+        },
+        EmbedderRegistration {
+            space: with_default(image_space(), switched.then_some(EvidenceKind::ImageFrame)),
+            embedder: image_embedder,
+        },
+    ]
+}
+
+fn with_default(mut space: EmbeddingSpace, default: Option<EvidenceKind>) -> EmbeddingSpace {
+    space.default_for_evidence_kind = default;
+    space
+}
+
 fn fixture_with_embedders(
     name: &str,
     text_embedder: Arc<dyn Embedder>,
@@ -306,21 +380,8 @@ fn fixture_with_embedders(
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(format!("{name}.db"));
     let store = Store::open_with_embedder_registrations(
-        StoreConfig {
-            db_path: db_path.clone(),
-            extra_embedding_spaces: vec![image_space(), unbound_space()],
-            ..Default::default()
-        },
-        vec![
-            EmbedderRegistration {
-                space: text_space(),
-                embedder: text_embedder,
-            },
-            EmbedderRegistration {
-                space: image_space(),
-                embedder: image_embedder,
-            },
-        ],
+        store_config(db_path.clone(), Roles::Seeding),
+        registrations(text_embedder, image_embedder, Roles::Seeding),
     )
     .expect("store opens");
     Fixture {
@@ -330,22 +391,90 @@ fn fixture_with_embedders(
     }
 }
 
-fn text_space() -> EmbeddingSpace {
-    EmbeddingSpace {
-        embedding_space_id: TEXT_SPACE.to_string(),
-        dimension: 768,
-        metric: DistanceMetric::Cosine,
-        model_family: "text".to_string(),
-        model_name: "embeddinggemma-300m".to_string(),
-        model_version: "default".to_string(),
-        supported_evidence_kinds: vec![EvidenceKind::Text],
-        default_for_evidence_kind: Some(EvidenceKind::Text),
-        bindings: vec![EmbeddingSpaceBinding {
-            embedding_space_id: TEXT_SPACE.to_string(),
-            table_name: "evidence".to_string(),
-            vector_column: "vector_text".to_string(),
-        }],
+/// Move the text and image roles forward to the new models; the old rows are rebuilt by reindex.
+fn switch_forward(store: &Store) -> SwitchResult {
+    let text = store
+        .switch_embedding_space(EmbeddingRole::EvidenceText, text_space(), OldSpace::Reindex)
+        .expect("switch the text role to the new model");
+    store
+        .switch_embedding_space(
+            EmbeddingRole::EvidenceImageFrame,
+            image_space(),
+            OldSpace::Reindex,
+        )
+        .expect("switch the image role to the new model");
+    text
+}
+
+fn identity_for_space(space: &str) -> ModelIdentity {
+    let (model, revision, dimension) = match space {
+        OLD_TEXT_SPACE => ("embeddinggemma-300m", "old", 768),
+        TEXT_SPACE => ("embeddinggemma-300m", "new", 768),
+        OLD_IMAGE_SPACE => ("clip-local", "old", 512),
+        IMAGE_SPACE => ("clip-local", "new", 512),
+        _ => ("unbound-local", "v1", 384),
+    };
+    ModelIdentity {
+        model: model.to_string(),
+        weights_revision: revision.to_string(),
+        preparation: "reindex-concurrency".to_string(),
+        dimension,
     }
+}
+
+fn node_local_space(
+    id: &str,
+    kind: EvidenceKind,
+    vector_column: &str,
+    media_reachable_on_every_node: bool,
+) -> EmbeddingSpace {
+    let identity = identity_for_space(id);
+    EmbeddingSpace {
+        embedding_space_id: id.to_string(),
+        dimension: identity.dimension,
+        metric: DistanceMetric::Cosine,
+        model_family: if kind == EvidenceKind::Text {
+            "text"
+        } else {
+            "vision"
+        }
+        .to_string(),
+        model_name: identity.model.clone(),
+        model_version: identity.weights_revision.clone(),
+        supported_evidence_kinds: vec![kind],
+        default_for_evidence_kind: None,
+        bindings: vec![EmbeddingSpaceBinding {
+            embedding_space_id: id.to_string(),
+            table_name: "evidence".to_string(),
+            vector_column: vector_column.to_string(),
+        }],
+        placement: VectorPlacement::NodeLocal,
+        media_reachable_on_every_node,
+        producer: identity,
+    }
+}
+
+fn old_text_space() -> EmbeddingSpace {
+    node_local_space(OLD_TEXT_SPACE, EvidenceKind::Text, "vector_text", false)
+}
+
+fn text_space() -> EmbeddingSpace {
+    node_local_space(TEXT_SPACE, EvidenceKind::Text, "vector_text", false)
+}
+
+/// Image vectors are recomputable on every node from the frame's media, so the image role is
+/// node-local and reindexes like text.
+fn old_image_space() -> EmbeddingSpace {
+    node_local_space(
+        OLD_IMAGE_SPACE,
+        EvidenceKind::ImageFrame,
+        "vector_vision",
+        true,
+    )
+}
+
+fn image_space() -> EmbeddingSpace {
+    node_local_space(IMAGE_SPACE, EvidenceKind::ImageFrame, "vector_vision", true)
 }
 
 fn unbound_space() -> EmbeddingSpace {
@@ -359,59 +488,22 @@ fn unbound_space() -> EmbeddingSpace {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
+        placement: VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: identity_for_space(UNBOUND_SPACE),
     }
 }
 
-fn image_space() -> EmbeddingSpace {
-    EmbeddingSpace {
-        embedding_space_id: IMAGE_SPACE.to_string(),
-        dimension: 512,
-        metric: DistanceMetric::Cosine,
-        model_family: "vision".to_string(),
-        model_name: "clip-local".to_string(),
-        model_version: "v1".to_string(),
-        supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
-        default_for_evidence_kind: Some(EvidenceKind::ImageFrame),
-        bindings: vec![EmbeddingSpaceBinding {
-            embedding_space_id: IMAGE_SPACE.to_string(),
-            table_name: "evidence".to_string(),
-            vector_column: "vector_vision".to_string(),
-        }],
-    }
-}
-
-fn producer_for_space(space: &str, version: &str) -> EvidenceProducer {
-    let model_name = if space == IMAGE_SPACE {
-        "clip-local"
-    } else {
-        "embeddinggemma-300m"
-    };
+/// A supply of `space`'s own model, as the capture pipeline writes it.
+fn producer_for_space(space: &str) -> EvidenceProducer {
     EvidenceProducer {
         system: "edge-memory".to_string(),
-        model_name: model_name.to_string(),
-        model_version: version.to_string(),
-        pipeline_version: "reindex-concurrency".to_string(),
+        ..EvidenceProducer::from(&identity_for_space(space))
     }
 }
 
-fn producer(version: &str) -> EvidenceProducer {
-    producer_for_space(TEXT_SPACE, version)
-}
-
-fn image_producer(version: &str) -> EvidenceProducer {
-    producer_for_space(IMAGE_SPACE, version)
-}
-
-fn producer_event(version: &str) -> String {
-    serde_json::to_string(&producer(version)).expect("producer json")
-}
-
-fn reindex_cursor_seed_versions() -> [&'static str; 5] {
-    ["old-a", "old-b", "pause-new", "old-c", "old-a"]
-}
-
-fn reindex_cursor_extra_history_idx() -> usize {
-    3
+fn reindex_cursor_seed_count() -> usize {
+    5
 }
 
 fn reindex_cursor_seeded_from_env(db_path: &Path) -> Vec<(EvidenceId, String)> {
@@ -526,23 +618,13 @@ fn mime_for_kind(kind: EvidenceKind) -> Option<String> {
     }
 }
 
+/// Seed `rows` items whose vectors are supplied under the old model of `space`'s role.
 fn seed_rows(
     store: &Store,
     space: &str,
     kind: EvidenceKind,
     dim: usize,
     rows: usize,
-) -> Vec<(EvidenceId, String)> {
-    let versions = vec!["old"; rows];
-    seed_rows_with_producer_versions(store, space, kind, dim, &versions)
-}
-
-fn seed_rows_with_producer_versions(
-    store: &Store,
-    space: &str,
-    kind: EvidenceKind,
-    dim: usize,
-    versions: &[&str],
 ) -> Vec<(EvidenceId, String)> {
     let context = store
         .create_context(CreateContext {
@@ -561,7 +643,7 @@ fn seed_rows_with_producer_versions(
         })
         .expect("entity");
     let mut seeded = Vec::new();
-    for (idx, version) in versions.iter().enumerate() {
+    for idx in 0..rows {
         let evidence_id = EvidenceId::new_v7();
         let source_text = format!("opaque reindex text {}", uuid::Uuid::now_v7());
         let source_ref = format!("cas://sha256:{:064x}", idx + 1);
@@ -578,7 +660,7 @@ fn seed_rows_with_producer_versions(
                 source_ref: source_ref.clone(),
                 mime_type: mime_for_kind(kind),
                 retention_status: RetentionStatus::RetainedExternal,
-                producer: producer_for_space(space, version),
+                producer: producer_for_space(space),
                 text_projection: (kind == EvidenceKind::Text).then_some(source_text.clone()),
                 ..Default::default()
             }],
@@ -590,7 +672,7 @@ fn seed_rows_with_producer_versions(
                 embedding_space_id: space.to_string(),
                 vector: axis(dim, idx),
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: producer_for_space(space, version),
+                produced_by: producer_for_space(space),
             }],
         });
         assert!(recorded.is_ok(), "seed row {idx} failed: {recorded:?}");
@@ -702,28 +784,21 @@ fn count(db_path: &Path, sql: &str, params: &HashMap<String, Value>) -> i64 {
     }
 }
 
-fn cursor_count(db_path: &Path, space: &str) -> i64 {
+/// Node-local vector rows `space` holds, read durably (the progress a reindex has committed).
+fn rows_in_space(db_path: &Path, space: &str) -> i64 {
     count(
         db_path,
-        "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE embedding_space_id = $space",
         &params(vec![("space", Value::Text(space.to_string()))]),
     )
 }
 
-fn cursor_at(db_path: &Path, space: &str, expected_cursor: i64) -> i64 {
-    count(
-        db_path,
-        "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space AND last_committed_cursor = $cursor",
-        &params(vec![
-            ("space", Value::Text(space.to_string())),
-            ("cursor", Value::Int64(expected_cursor)),
-        ]),
-    )
-}
-
-fn store_count(store: &Store, query: &str, params: &HashMap<String, Value>) -> i64 {
+fn store_rows_in_space(store: &Store, space: &str) -> i64 {
     let result = store
-        .execute_sql_for_test(query, params)
+        .execute_sql_for_test(
+            "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE embedding_space_id = $space",
+            &params(vec![("space", Value::Text(space.to_string()))]),
+        )
         .expect("store count query");
     match result.rows.first().and_then(|row| row.first()) {
         Some(Value::Int64(value)) => *value,
@@ -731,98 +806,30 @@ fn store_count(store: &Store, query: &str, params: &HashMap<String, Value>) -> i
     }
 }
 
-fn store_cursor_count(store: &Store, space: &str) -> i64 {
-    store_count(
-        store,
-        "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space",
-        &params(vec![("space", Value::Text(space.to_string()))]),
-    )
+fn embedded_in(store: &Store, space: &str) -> u64 {
+    store
+        .embedding_space_status()
+        .expect("embedding space status")
+        .into_iter()
+        .find(|status| status.space_id == space)
+        .map(|status| status.embedded)
+        .unwrap_or_else(|| panic!("status names space {space}"))
 }
 
-fn store_cursor_at(store: &Store, space: &str, expected_cursor: i64) -> i64 {
-    store_count(
-        store,
-        "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space AND last_committed_cursor = $cursor",
-        &params(vec![
-            ("space", Value::Text(space.to_string())),
-            ("cursor", Value::Int64(expected_cursor)),
-        ]),
-    )
-}
-
-fn lease_owner_run_id(db_path: &Path, space: &str) -> Option<String> {
-    let result = execute_query(
-        db_path,
-        "SELECT owner_run_id FROM reindex_cursors WHERE embedding_space_id = $space",
-        &params(vec![("space", Value::Text(space.to_string()))]),
-    );
-    result.rows.first().and_then(|row| match row.first() {
-        Some(Value::Text(owner)) => Some(owner.clone()),
-        _ => None,
-    })
-}
-
-fn durable_in_progress_lease_at(db_path: &Path, space: &str, expected_cursor: i64) -> i64 {
-    let Some(owner_run_id) = lease_owner_run_id(db_path, space) else {
-        return 0;
-    };
-    if owner_run_id.trim().is_empty() || owner_run_id == "raw-contender" {
-        return 0;
-    }
-
-    count(
-        db_path,
-        "SELECT COUNT(*) AS n FROM reindex_cursors WHERE embedding_space_id = $space AND status = $status AND owner_run_id = $owner AND lease_epoch = $epoch AND last_committed_cursor = $cursor",
-        &params(vec![
-            ("space", Value::Text(space.to_string())),
-            ("status", Value::Text("in_progress".to_string())),
-            ("owner", Value::Text(owner_run_id)),
-            ("epoch", Value::Int64(1)),
-            ("cursor", Value::Int64(expected_cursor)),
-        ]),
-    )
-}
-
-fn raw_conditional_lease_takeover_rejected(db_path: &Path, space: &str) -> bool {
-    let Some(owner_run_id) = lease_owner_run_id(db_path, space) else {
-        return false;
-    };
-    if owner_run_id.trim().is_empty() {
-        return false;
-    }
-    if durable_in_progress_lease_at(db_path, space, 1) != 1 {
-        return false;
-    }
-    let available_status_result = {
-        let store = open_reindex_store(db_path.to_path_buf()).expect("lease contender store opens");
-        store.execute_sql_for_test(
-        "UPDATE reindex_cursors SET owner_run_id = $owner, lease_epoch = $next_epoch WHERE embedding_space_id = $space AND status = $available",
-        &params(vec![
-            ("owner", Value::Text("raw-contender".to_string())),
-            ("next_epoch", Value::Int64(2)),
-            ("space", Value::Text(space.to_string())),
-            ("available", Value::Text("available".to_string())),
-        ]),
-        )
-    };
-    let stale_owner_result = {
-        let store = open_reindex_store(db_path.to_path_buf()).expect("lease contender store opens");
-        store.execute_sql_for_test(
-        "UPDATE reindex_cursors SET owner_run_id = $owner, lease_epoch = $next_epoch WHERE embedding_space_id = $space AND status = $status AND owner_run_id = $stale_owner AND lease_epoch = $epoch",
-        &params(vec![
-            ("owner", Value::Text("raw-contender".to_string())),
-            ("next_epoch", Value::Int64(2)),
-            ("space", Value::Text(space.to_string())),
-            ("status", Value::Text("in_progress".to_string())),
-            ("stale_owner", Value::Text(format!("{owner_run_id}-stale"))),
-            ("epoch", Value::Int64(1)),
-        ]),
-        )
-    };
-    matches!(available_status_result, Ok(query) if query.rows_affected == 0)
-        && matches!(stale_owner_result, Ok(query) if query.rows_affected == 0)
-        && lease_owner_run_id(db_path, space).as_deref() == Some(owner_run_id.as_str())
-        && durable_in_progress_lease_at(db_path, space, 1) == 1
+/// The item's vector row in `space` (the node-local table, by item and space).
+fn vector_row(
+    db: &Database,
+    evidence_id: EvidenceId,
+    space: &str,
+) -> Option<contextdb_core::RowId> {
+    db.scan("evidence_embeddings", db.snapshot())
+        .expect("scan evidence_embeddings")
+        .into_iter()
+        .find_map(|row| {
+            (row.values.get("target_id") == Some(&Value::Uuid(evidence_id.as_uuid()))
+                && row.values.get("embedding_space_id") == Some(&Value::Text(space.to_string())))
+            .then_some(row.row_id)
+        })
 }
 
 fn vector_score_for(
@@ -832,43 +839,32 @@ fn vector_score_for(
     query: Vec<f32>,
 ) -> Option<f32> {
     let db = open_raw_database(db_path);
+    let space = if column == "vector_vision" {
+        IMAGE_SPACE
+    } else {
+        TEXT_SPACE
+    };
+    let row_id = vector_row(&db, evidence_id, space)?;
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", column),
+            VectorIndexRef::new("evidence_embeddings", column),
             &query,
             32,
             None,
             db.snapshot(),
         )
         .expect("vector query");
-    let rows = db.scan("evidence", db.snapshot()).expect("scan evidence");
-    hits.into_iter().find_map(|(row_id, score)| {
-        rows.iter().find_map(|row| {
-            (row.row_id == row_id)
-                .then(|| row.values.get("id").cloned())
-                .flatten()
-                .and_then(|value| match value {
-                    Value::Uuid(id) if id == evidence_id.as_uuid() => Some(score),
-                    _ => None,
-                })
-        })
-    })
+    hits.into_iter()
+        .find_map(|(hit_row, score)| (hit_row == row_id).then_some(score))
 }
 
 fn stored_text_vector(db_path: &Path, evidence_id: EvidenceId) -> Option<Vec<f32>> {
     let db = open_raw_database(db_path);
     let snapshot = db.snapshot();
-    let row_id = db
-        .scan("evidence", snapshot)
-        .expect("scan evidence")
-        .into_iter()
-        .find_map(|row| match row.values.get("id") {
-            Some(Value::Uuid(id)) if *id == evidence_id.as_uuid() => Some(row.row_id),
-            _ => None,
-        })?;
+    let row_id = vector_row(&db, evidence_id, TEXT_SPACE)?;
     db.live_vector_entry(row_id, snapshot)
         .expect("admit engine read memory")
-        .filter(|entry| entry.index == VectorIndexRef::new("evidence", "vector_text"))
+        .filter(|entry| entry.index == VectorIndexRef::new("evidence_embeddings", "vector_text"))
         .map(|entry| entry.vector)
 }
 
@@ -886,156 +882,8 @@ fn evidence_text_projection(db_path: &Path, evidence_id: EvidenceId) -> Option<S
     })
 }
 
-fn evidence_context_uuid(store: &Store, evidence_id: EvidenceId) -> Option<uuid::Uuid> {
-    let result = store
-        .execute_sql_for_test(
-            "SELECT context_id FROM evidence WHERE id = $id",
-            &params(vec![("id", Value::Uuid(evidence_id.as_uuid()))]),
-        )
-        .ok()?;
-    match result.rows.first().and_then(|row| row.first()) {
-        Some(Value::Uuid(context_id)) => Some(*context_id),
-        _ => None,
-    }
-}
-
-fn insert_extra_historical_handle(store: &Store, evidence_id: EvidenceId) -> bool {
-    let Some(context_id) = evidence_context_uuid(store, evidence_id) else {
-        return false;
-    };
-    let common_params = params(vec![
-        ("id", Value::Uuid(EmbeddingId::new_v7().as_uuid())),
-        ("context_id", Value::Uuid(context_id)),
-        ("target_id", Value::Uuid(evidence_id.as_uuid())),
-        ("space", Value::Text(TEXT_SPACE.to_string())),
-        (
-            "producer",
-            Value::Json(serde_json::to_value(producer("legacy-extra")).expect("json")),
-        ),
-        ("producer_system", Value::Text("edge-memory".to_string())),
-        ("created_at", Value::TxId(context_graph::TxId(1))),
-    ]);
-    let result = store.execute_sql_for_test(
-        "INSERT INTO evidence_embedding_handles (id, context_id, target_id, embedding_space_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $producer_system, $created_at)",
-        &common_params,
-    );
-    let result = result.or_else(|_| {
-        store.execute_sql_for_test(
-            "INSERT INTO evidence_embedding_handles (id, context_id, target_id, embedding_space_id, produced_by, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $created_at)",
-            &common_params,
-        )
-    });
-    matches!(result, Ok(query) if query.rows_affected == 1)
-}
-
 fn text_vector_matches_exactly(db_path: &Path, evidence_id: EvidenceId, expected: &[f32]) -> bool {
     stored_text_vector(db_path, evidence_id).is_some_and(|stored| stored == expected)
-}
-
-fn producer_rows(db_path: &Path, producer: EvidenceProducer) -> i64 {
-    count(
-        db_path,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE produced_by = $producer",
-        &params(vec![(
-            "producer",
-            Value::Json(serde_json::to_value(producer).expect("producer json")),
-        )]),
-    )
-}
-
-fn producer_rows_for_space(db_path: &Path, space: &str, producer: EvidenceProducer) -> i64 {
-    count(
-        db_path,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE embedding_space_id = $space AND produced_by = $producer",
-        &params(vec![
-            ("space", Value::Text(space.to_string())),
-            (
-                "producer",
-                Value::Json(serde_json::to_value(producer).expect("producer json")),
-            ),
-        ]),
-    )
-}
-
-fn handle_rows_for_target_space(db_path: &Path, evidence_id: EvidenceId, space: &str) -> i64 {
-    count(
-        db_path,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id AND embedding_space_id = $space",
-        &params(vec![
-            ("target_id", Value::Uuid(evidence_id.as_uuid())),
-            ("space", Value::Text(space.to_string())),
-        ]),
-    )
-}
-
-fn handle_rows_for_target_producer(
-    db_path: &Path,
-    evidence_id: EvidenceId,
-    space: &str,
-    producer: EvidenceProducer,
-) -> i64 {
-    count(
-        db_path,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id AND embedding_space_id = $space AND produced_by = $producer",
-        &params(vec![
-            ("target_id", Value::Uuid(evidence_id.as_uuid())),
-            ("space", Value::Text(space.to_string())),
-            (
-                "producer",
-                Value::Json(serde_json::to_value(producer).expect("producer json")),
-            ),
-        ]),
-    )
-}
-
-fn target_handle_lineage_matches(
-    db_path: &Path,
-    seeded: &[(EvidenceId, String)],
-    seed_versions: &[&str],
-    pause_processed_rows: usize,
-    resume_start: Option<usize>,
-) -> bool {
-    seeded.iter().zip(seed_versions.iter()).enumerate().all(
-        |(idx, ((evidence_id, _), old_version))| {
-            let extra_expected = i64::from(idx == reindex_cursor_extra_history_idx());
-            let pause_expected =
-                i64::from(*old_version == "pause-new") + i64::from(idx < pause_processed_rows);
-            let resume_expected = i64::from(resume_start.is_some_and(|start| idx >= start));
-            let total_expected =
-                1 + extra_expected + i64::from(idx < pause_processed_rows) + resume_expected;
-            let old_expected = if *old_version == "pause-new" {
-                pause_expected
-            } else {
-                1
-            };
-
-            handle_rows_for_target_space(db_path, *evidence_id, TEXT_SPACE) == total_expected
-                && handle_rows_for_target_producer(
-                    db_path,
-                    *evidence_id,
-                    TEXT_SPACE,
-                    producer(old_version),
-                ) == old_expected
-                && handle_rows_for_target_producer(
-                    db_path,
-                    *evidence_id,
-                    TEXT_SPACE,
-                    producer("pause-new"),
-                ) == pause_expected
-                && handle_rows_for_target_producer(
-                    db_path,
-                    *evidence_id,
-                    TEXT_SPACE,
-                    producer("resume-new"),
-                ) == resume_expected
-                && handle_rows_for_target_producer(
-                    db_path,
-                    *evidence_id,
-                    TEXT_SPACE,
-                    producer("legacy-extra"),
-                ) == extra_expected
-        },
-    )
 }
 
 fn all_reindexed_vectors_visible(db_path: &Path, seeded: &[(EvidenceId, String)]) -> bool {
@@ -1133,7 +981,7 @@ fn phase_output_vectors_indexed_for_seeded_range_in_store(
     matches!(
         store.evidence_vector_visibility_counts_for_test(
             &ids,
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &queries,
         ),
         Ok((row_count, vector_count)) if row_count == calls.len() && vector_count == calls.len()
@@ -1152,19 +1000,18 @@ fn all_reindexed_image_vectors_visible(db_path: &Path, seeded: &[(EvidenceId, St
     })
 }
 
+/// Reopen after the forward switch, with the new text model's embedder registered.
 fn open_reindex_store_with_embedder(
     db_path: PathBuf,
     embedder: Arc<dyn Embedder>,
 ) -> context_graph::Result<Store> {
     Store::open_with_embedder_registrations(
-        StoreConfig {
-            db_path,
-            ..Default::default()
-        },
-        vec![EmbedderRegistration {
-            space: text_space(),
+        store_config(db_path, Roles::Switched),
+        registrations(
             embedder,
-        }],
+            Arc::new(RecordingVisionConcurrencyEmbedder),
+            Roles::Switched,
+        ),
     )
 }
 
@@ -1176,7 +1023,10 @@ fn run_two_reindexes(
     store: Store,
     first_space: &'static str,
     second_space: &'static str,
-) -> (CgResult<()>, CgResult<()>) {
+) -> (
+    CgResult<context_graph::ReindexReport>,
+    CgResult<context_graph::ReindexReport>,
+) {
     let shared = Arc::new(store);
     let barrier = Arc::new(Barrier::new(3));
     let first = {
@@ -1203,10 +1053,26 @@ fn run_two_reindexes(
     )
 }
 
+/// Every `Completed` event as (space, embedded, skipped).
+fn completions(events: &[ReindexEvent]) -> Vec<(String, u64, u64)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ReindexEvent::Completed {
+                embedding_space_id,
+                embedded,
+                skipped,
+            } => Some((embedding_space_id.clone(), *embedded, *skipped)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn reindex_concurrent_invocations_on_same_space_serialize_or_reject_typed() {
     let fixture = fixture("reindex-same-space");
-    let seeded = seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 3);
+    let seeded = seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 3);
+    switch_forward(&fixture.store);
     let db_path = fixture.db_path.clone();
     drop(fixture.store);
     let control = Arc::new(BlockingReindexControl::default());
@@ -1223,51 +1089,38 @@ fn reindex_concurrent_invocations_on_same_space_serialize_or_reject_typed() {
         (result, events)
     });
     let first_blocked_inside_active_reindex = control.wait_until_blocked_on_second_row();
-    let paused_cursor_rows = cursor_at(&db_path, TEXT_SPACE, 1);
-    let cursor_rows_during_contention = cursor_count(&db_path, TEXT_SPACE);
-    let durable_lease_rows = durable_in_progress_lease_at(&db_path, TEXT_SPACE, 1);
-    let raw_contender_rejected_by_durable_lease =
-        raw_conditional_lease_takeover_rejected(&db_path, TEXT_SPACE);
     let second_store = open_reindex_store(db_path.clone()).expect("second reindex handle opens");
+    // Durable progress seen from an independent handle while the first is inside row 2.
+    let committed_during_contention = embedded_in(&second_store, TEXT_SPACE);
     let second_result = second_store.reindex_space(TEXT_SPACE, ReindexOptions::default());
     let second_events = second_store.drain_reindex_events();
     drop(second_store);
     control.release();
     let (first_result, first_events) = first.join().expect("first reindex thread");
-    let first_completed_seeded = first_events.iter().any(|event| {
-        matches!(
-            event,
-            ReindexEvent::Completed {
-                embedding_space_id,
-                rows_processed,
-                ..
-            } if embedding_space_id == TEXT_SPACE && *rows_processed == seeded.len()
-        )
-    });
-    let completed_cursor_rows = cursor_at(&db_path, TEXT_SPACE, seeded.len() as i64);
-    let new_producer_rows = producer_rows_for_space(&db_path, TEXT_SPACE, producer("new"));
-    let old_producer_rows = producer_rows_for_space(&db_path, TEXT_SPACE, producer("old"));
+    let first_completed_seeded =
+        completions(&first_events) == vec![(TEXT_SPACE.to_string(), seeded.len() as u64, 0)];
+    let new_model_rows = rows_in_space(&db_path, TEXT_SPACE);
+    let old_model_rows = rows_in_space(&db_path, OLD_TEXT_SPACE);
     let exact_vectors = all_reindexed_vectors_visible(&db_path, &seeded);
 
     assert!(
         first_blocked_inside_active_reindex
-            && paused_cursor_rows == 1
-            && cursor_rows_during_contention == 1
-            && durable_lease_rows == 1
-            && raw_contender_rejected_by_durable_lease
+            && committed_during_contention == 1
             && matches!(
                 second_result,
-                Err(CgError::ReindexAlreadyInProgress { ref embedding_space_id })
-                    if embedding_space_id == TEXT_SPACE
+                Err(CgError::BackgroundWorkHeldByLiveWorker {
+                    work: BackgroundWork::Reindex,
+                    ..
+                })
             )
             && second_events.is_empty()
-            && first_result.is_ok()
+            && first_result
+                .as_ref()
+                .is_ok_and(|report| report.embedded == seeded.len() as u64 && report.remaining == 0)
             && first_completed_seeded
-            && completed_cursor_rows == 1
-            && new_producer_rows == seeded.len() as i64
-            && old_producer_rows == seeded.len() as i64
-            && exact_vectors,
-        "same-space reindex must use a durable cross-handle in-progress guard while the first handle is still inside active row work: the first handle blocks on row 2 with cursor 1 committed and a DB lease row status=in_progress/nonempty-owner/lease_epoch=1, a raw conditional contender using available status or a stale owner cannot take over the lease, the second independent Store handle rejects typed without progress events, then the first handle releases and completes exact vectors/producers; first_blocked_inside_active_reindex={first_blocked_inside_active_reindex}, first_result={first_result:?}, first_events={first_events:?}, second_result={second_result:?}, second_events={second_events:?}, paused_cursor_rows={paused_cursor_rows}, cursor_rows_during_contention={cursor_rows_during_contention}, durable_lease_rows={durable_lease_rows}, raw_contender_rejected_by_durable_lease={raw_contender_rejected_by_durable_lease}, completed_cursor_rows={completed_cursor_rows}, new_producer_rows={new_producer_rows}, old_producer_rows={old_producer_rows}, exact_vectors={exact_vectors}"
+            && new_model_rows == seeded.len() as i64
+            && old_model_rows == 0 && exact_vectors,
+        "same-space reindex must hold the shared background claim across handles while the first handle is inside active row work: the first handle blocks on row 2 with row 1 committed, an independent Store handle is refused with BackgroundWorkHeldByLiveWorker and emits no progress events, then the first handle releases and completes with every item rebuilt under the new model and each old row deleted with its replacement; first_blocked_inside_active_reindex={first_blocked_inside_active_reindex}, committed_during_contention={committed_during_contention}, first_result={first_result:?}, first_events={first_events:?}, second_result={second_result:?}, second_events={second_events:?}, new_model_rows={new_model_rows}, old_model_rows={old_model_rows}, exact_vectors={exact_vectors}"
     );
 }
 
@@ -1277,18 +1130,19 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
     let serial_fixture = fixture("reindex-distinct-serial");
     let serial_text_seeded = seed_rows(
         &serial_fixture.store,
-        TEXT_SPACE,
+        OLD_TEXT_SPACE,
         EvidenceKind::Text,
         768,
         row_count,
     );
     let serial_image_seeded = seed_rows(
         &serial_fixture.store,
-        IMAGE_SPACE,
+        OLD_IMAGE_SPACE,
         EvidenceKind::ImageFrame,
         512,
         row_count,
     );
+    switch_forward(&serial_fixture.store);
     let serial_text_start = Instant::now();
     let serial_text = serial_fixture
         .store
@@ -1304,10 +1158,8 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
     let serial_text_vectors = all_reindexed_vectors_visible(&serial_db_path, &serial_text_seeded);
     let serial_image_vectors =
         all_reindexed_image_vectors_visible(&serial_db_path, &serial_image_seeded);
-    let serial_text_new_producer_rows =
-        producer_rows_for_space(&serial_db_path, TEXT_SPACE, producer("new"));
-    let serial_image_new_producer_rows =
-        producer_rows_for_space(&serial_db_path, IMAGE_SPACE, image_producer("new"));
+    let serial_text_new_model_rows = rows_in_space(&serial_db_path, TEXT_SPACE);
+    let serial_image_new_model_rows = rows_in_space(&serial_db_path, IMAGE_SPACE);
 
     let text_control = Arc::new(BlockingReindexControl::default());
     let image_control = Arc::new(BlockingReindexControl::default());
@@ -1322,18 +1174,19 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
     );
     let text_seeded = seed_rows(
         &fixture.store,
-        TEXT_SPACE,
+        OLD_TEXT_SPACE,
         EvidenceKind::Text,
         768,
         row_count,
     );
     let image_seeded = seed_rows(
         &fixture.store,
-        IMAGE_SPACE,
+        OLD_IMAGE_SPACE,
         EvidenceKind::ImageFrame,
         512,
         row_count,
     );
+    switch_forward(&fixture.store);
     let db_path = fixture.db_path.clone();
     let parallel_start = Instant::now();
     let shared = Arc::new(fixture.store.clone());
@@ -1353,32 +1206,34 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
     let parallel_elapsed = parallel_start.elapsed();
     drop(shared);
     drop(fixture.store);
-    let text_cursors = cursor_count(&db_path, TEXT_SPACE);
-    let vision_cursors = cursor_count(&db_path, IMAGE_SPACE);
     let text_vectors = all_reindexed_vectors_visible(&db_path, &text_seeded);
     let image_vectors = all_reindexed_image_vectors_visible(&db_path, &image_seeded);
-    let text_new_producer_rows = producer_rows_for_space(&db_path, TEXT_SPACE, producer("new"));
-    let image_new_producer_rows =
-        producer_rows_for_space(&db_path, IMAGE_SPACE, image_producer("new"));
+    let text_new_model_rows = rows_in_space(&db_path, TEXT_SPACE);
+    let image_new_model_rows = rows_in_space(&db_path, IMAGE_SPACE);
+    let old_model_rows =
+        rows_in_space(&db_path, OLD_TEXT_SPACE) + rows_in_space(&db_path, OLD_IMAGE_SPACE);
 
     assert!(
         serial_text.is_ok()
             && serial_image.is_ok()
             && serial_text_vectors
             && serial_image_vectors
-            && serial_text_new_producer_rows == row_count as i64
-            && serial_image_new_producer_rows == row_count as i64
+            && serial_text_new_model_rows == row_count as i64
+            && serial_image_new_model_rows == row_count as i64
             && text_blocked_inside_active_reindex
             && image_progress_while_text_blocked
-            && first.is_ok()
-            && second.is_ok()
-            && text_cursors == 1
-            && vision_cursors == 1
+            && first
+                .as_ref()
+                .is_ok_and(|report| report.embedded == row_count as u64)
+            && second
+                .as_ref()
+                .is_ok_and(|report| report.embedded == row_count as u64)
             && text_vectors
             && image_vectors
-            && text_new_producer_rows == row_count as i64
-            && image_new_producer_rows == row_count as i64,
-        "distinct-space reindexes must each record durable cursors, re-embed exact text/image rows with post-reindex producers, and allow image row work to enter while text row work is actively blocked; this probe intentionally does not require overlapping long Database commit apply windows, row_count={row_count}, serial_text={serial_text:?}/{serial_text_elapsed:?}, serial_image={serial_image:?}/{serial_image_elapsed:?}, serial_text_vectors={serial_text_vectors}, serial_image_vectors={serial_image_vectors}, serial_text_new_producer_rows={serial_text_new_producer_rows}, serial_image_new_producer_rows={serial_image_new_producer_rows}, text_blocked_inside_active_reindex={text_blocked_inside_active_reindex}, image_progress_while_text_blocked={image_progress_while_text_blocked}, first={first:?}, second={second:?}, parallel={parallel_elapsed:?}, text_cursors={text_cursors}, vision_cursors={vision_cursors}, text_vectors={text_vectors}, image_vectors={image_vectors}, text_new_producer_rows={text_new_producer_rows}, image_new_producer_rows={image_new_producer_rows}"
+            && text_new_model_rows == row_count as i64
+            && image_new_model_rows == row_count as i64
+            && old_model_rows == 0,
+        "distinct-space reindexes must each re-embed exact text/image rows under their new models and allow image row work to enter while text row work is actively blocked; this probe intentionally does not require overlapping long Database commit apply windows, row_count={row_count}, serial_text={serial_text:?}/{serial_text_elapsed:?}, serial_image={serial_image:?}/{serial_image_elapsed:?}, serial_text_vectors={serial_text_vectors}, serial_image_vectors={serial_image_vectors}, serial_text_new_model_rows={serial_text_new_model_rows}, serial_image_new_model_rows={serial_image_new_model_rows}, text_blocked_inside_active_reindex={text_blocked_inside_active_reindex}, image_progress_while_text_blocked={image_progress_while_text_blocked}, first={first:?}, second={second:?}, parallel={parallel_elapsed:?}, text_vectors={text_vectors}, image_vectors={image_vectors}, text_new_model_rows={text_new_model_rows}, image_new_model_rows={image_new_model_rows}, old_model_rows={old_model_rows}"
     );
 }
 
@@ -1429,35 +1284,19 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
             ..Default::default()
         })
         .expect("positive control decision");
+    switch_forward(&fixture.store);
     let before_events = fixture.store.drain_reindex_events();
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
     let events = fixture.store.drain_reindex_events();
-    let cursors = cursor_count(&fixture.db_path, TEXT_SPACE);
-    let zero_cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 0);
+    let new_model_rows = store_rows_in_space(&fixture.store, TEXT_SPACE);
     let invalidation_rows = count(
         &fixture.db_path,
         "SELECT COUNT(*) AS n FROM invalidations",
         &HashMap::new(),
     );
-    let completions = events
-        .iter()
-        .filter_map(|event| match event {
-            ReindexEvent::Completed {
-                embedding_space_id,
-                rows_processed,
-                from_producer,
-                to_producer,
-            } => Some((
-                embedding_space_id.as_str(),
-                *rows_processed,
-                from_producer.as_deref(),
-                to_producer.as_deref(),
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let completions = completions(&events);
     let positive_observation_id = context_graph::ObservationId::new_v7();
     let positive_control = fixture.store.record_observation(RecordObservation {
         id: positive_observation_id,
@@ -1474,7 +1313,7 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
                     .to_string(),
             mime_type: Some("text/plain".to_string()),
             retention_status: RetentionStatus::RetainedExternal,
-            producer: producer("positive-control"),
+            producer: producer_for_space(TEXT_SPACE),
             text_projection: Some("state changed".to_string()),
             ..Default::default()
         }],
@@ -1490,11 +1329,12 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
 
     assert!(
         before_events.is_empty()
-            && result.is_ok()
-            && cursors == 1
-            && zero_cursor_rows == 1
+            && result.as_ref().is_ok_and(|report| report.embedded == 0
+                && report.skipped == 0
+                && report.remaining == 0)
+            && new_model_rows == 0
             && invalidation_rows == 0
-            && completions == vec![(TEXT_SPACE, 0, None, None)]
+            && completions == vec![(TEXT_SPACE.to_string(), 0, 0)]
             && positive_control
                 .as_ref()
                 .is_ok_and(|result| result.invalidations.len() == 1)
@@ -1503,23 +1343,29 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
                 .is_ok_and(|rows| rows.len() == 1
                     && rows[0].affected_decision_id == decision.id
                     && rows[0].trigger_observation_id == positive_observation_id),
-        "empty-space reindex must complete with an exact zero-row cursor, one typed completion event, and no invalidation callbacks while a same-store normal observation proves the impact-analysis trigger is active, result={result:?}, before_events={before_events:?}, events={events:?}, cursors={cursors}, zero_cursor_rows={zero_cursor_rows}, invalidation_rows={invalidation_rows}, completions={completions:?}, positive_control={positive_control:?}, positive_invalidations={positive_invalidations:?}"
+        "empty-space reindex must complete with a zero-item report, one typed completion event, and no invalidation callbacks while a same-store normal observation proves the impact-analysis trigger is active, result={result:?}, before_events={before_events:?}, events={events:?}, new_model_rows={new_model_rows}, invalidation_rows={invalidation_rows}, completions={completions:?}, positive_control={positive_control:?}, positive_invalidations={positive_invalidations:?}"
     );
 }
 
 #[test]
 fn reindex_on_single_row_space_processes_exactly_one_row() {
     let fixture = fixture("reindex-one-row");
-    seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 1);
+    seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 1);
+    switch_forward(&fixture.store);
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
+    let embedded = embedded_in(&fixture.store, TEXT_SPACE);
     drop(fixture.store);
-    let rows = cursor_at(&fixture.db_path, TEXT_SPACE, 1);
+    let rows = rows_in_space(&fixture.db_path, TEXT_SPACE);
 
     assert!(
-        result.is_ok() && rows == 1,
-        "single-row reindex must persist last_committed_cursor=1, result={result:?}, rows={rows}"
+        result
+            .as_ref()
+            .is_ok_and(|report| report.embedded == 1 && report.remaining == 0)
+            && embedded == 1
+            && rows == 1,
+        "single-row reindex must embed exactly one item and leave none remaining, result={result:?}, embedded={embedded}, rows={rows}"
     );
 }
 
@@ -1528,13 +1374,11 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
     if std::env::var_os("CG_REINDEX_CURSOR_CHILD").is_some() {
         let db_path = PathBuf::from(std::env::var("CG_REINDEX_CURSOR_DB").expect("db env"));
         let seeded = reindex_cursor_seeded_from_env(&db_path);
-        let seed_versions = reindex_cursor_seed_versions();
         let resume_salt = new_reindex_vector_salt(0x7265_7375_6d65_6e65);
         let resume_calls = Arc::new(Mutex::new(Vec::new()));
         let store = open_reindex_store_with_embedder(
             db_path.clone(),
             Arc::new(PhaseRecordingConcurrencyEmbedder {
-                producer_version: "resume-new",
                 vector_salt: resume_salt,
                 calls: Arc::clone(&resume_calls),
             }),
@@ -1543,25 +1387,18 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
         let resume_result = store.reindex_space(TEXT_SPACE, ReindexOptions::default());
         let resume_events = store.drain_reindex_events();
         drop(store);
-        let resumed_at_two = resume_events.iter().any(|event| {
+        let remaining_at_start = (seeded.len() - 2) as u64;
+        let resumed_with_three_left = resume_events.iter().any(|event| {
             matches!(
                 event,
                 ReindexEvent::Resumed {
                     embedding_space_id,
-                    resumed_at_cursor: 2,
-                } if embedding_space_id == TEXT_SPACE
+                    remaining,
+                } if embedding_space_id == TEXT_SPACE && *remaining == remaining_at_start
             )
         });
-        let completed_five = resume_events.iter().any(|event| {
-            matches!(
-                event,
-                ReindexEvent::Completed {
-                    embedding_space_id,
-                    rows_processed: 5,
-                    ..
-                } if embedding_space_id == TEXT_SPACE
-            )
-        });
+        let completed_three =
+            completions(&resume_events) == vec![(TEXT_SPACE.to_string(), remaining_at_start, 0)];
         let resume_call_records = resume_calls.lock().expect("resume calls").clone();
         let resume_call_texts = phase_call_texts(&resume_call_records);
         let resume_call_shape = resume_call_texts
@@ -1585,28 +1422,22 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
                 2,
                 &resume_call_records,
             );
-        let cursor_rows = cursor_at(&db_path, TEXT_SPACE, 5);
-        let cursor_count_final = cursor_count(&db_path, TEXT_SPACE);
-        let pause_producer_rows_after = producer_rows(&db_path, producer("pause-new"));
-        let resume_producer_rows = producer_rows(&db_path, producer("resume-new"));
-        let final_target_lineage =
-            target_handle_lineage_matches(&db_path, &seeded, &seed_versions, 2, Some(2));
+        let new_model_rows = rows_in_space(&db_path, TEXT_SPACE);
+        let old_model_rows = rows_in_space(&db_path, OLD_TEXT_SPACE);
 
         assert!(
-            resume_result.is_ok()
-                && resumed_at_two
-                && completed_five
+            resume_result
+                .as_ref()
+                .is_ok_and(|report| report.embedded == remaining_at_start && report.remaining == 0)
+                && resumed_with_three_left
+                && completed_three
                 && resume_call_shape
                 && resume_vectors_not_text_formula
                 && resume_vectors_from_output_visible
                 && resume_vectors_from_output_indexed
-                && cursor_rows == 1
-                && cursor_count_final == 1
-                && pause_producer_rows_after == 3
-                && resume_producer_rows == 3
-                && final_target_lineage
-                && resume_vectors_from_output_visible,
-            "fresh child process must resume from durable cursor 2 only, persist and index exact runtime-salted Embedder output vectors rather than text-derived vectors, and avoid parent process state or handle-derived progress, resume_result={resume_result:?}, resume_events={resume_events:?}, resume_call_texts={resume_call_texts:?}, resume_vectors_not_text_formula={resume_vectors_not_text_formula}, resume_vectors_from_output_visible={resume_vectors_from_output_visible}, resume_vectors_from_output_indexed={resume_vectors_from_output_indexed}, cursor_rows={cursor_rows}, cursor_count_final={cursor_count_final}, pause_producer_rows_after={pause_producer_rows_after}, resume_producer_rows={resume_producer_rows}, final_target_lineage={final_target_lineage}"
+                && new_model_rows == seeded.len() as i64
+                && old_model_rows == 0,
+            "fresh child process must resume with exactly the 3 unembedded items left, persist and index exact runtime-salted Embedder output vectors rather than text-derived vectors, and avoid parent process state or handle-derived progress, resume_result={resume_result:?}, resume_events={resume_events:?}, resume_call_texts={resume_call_texts:?}, resume_vectors_not_text_formula={resume_vectors_not_text_formula}, resume_vectors_from_output_visible={resume_vectors_from_output_visible}, resume_vectors_from_output_indexed={resume_vectors_from_output_indexed}, new_model_rows={new_model_rows}, old_model_rows={old_model_rows}"
         );
         println!(
             "{}{}",
@@ -1621,24 +1452,19 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
     let fixture = fixture_with_embedders(
         "reindex-cursor",
         Arc::new(PhaseRecordingConcurrencyEmbedder {
-            producer_version: "pause-new",
             vector_salt: pause_salt,
             calls: Arc::clone(&pause_calls),
         }),
         Arc::new(RecordingVisionConcurrencyEmbedder),
     );
-    let seed_versions = reindex_cursor_seed_versions();
-    let seeded = seed_rows_with_producer_versions(
+    let seeded = seed_rows(
         &fixture.store,
-        TEXT_SPACE,
+        OLD_TEXT_SPACE,
         EvidenceKind::Text,
         768,
-        &seed_versions,
+        reindex_cursor_seed_count(),
     );
-    let extra_history_inserted = insert_extra_historical_handle(
-        &fixture.store,
-        seeded[reindex_cursor_extra_history_idx()].0,
-    );
+    switch_forward(&fixture.store);
     let result = fixture.store.reindex_space(
         TEXT_SPACE,
         ReindexOptions {
@@ -1658,24 +1484,12 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
             0,
             &pause_call_records,
         );
-    let paused_cursor_rows_before_drop = store_cursor_at(&fixture.store, TEXT_SPACE, 2);
-    let paused_cursor_count_before_drop = store_cursor_count(&fixture.store, TEXT_SPACE);
-    let premature_completed_cursor_rows_before_drop =
-        store_cursor_at(&fixture.store, TEXT_SPACE, 5);
+    let embedded_before_drop = embedded_in(&fixture.store, TEXT_SPACE);
     let paused_events_shape = paused_events
         == vec![ReindexEvent::Paused {
             embedding_space_id: TEXT_SPACE.to_string(),
-            last_committed_cursor: 2,
+            remaining: 3,
         }];
-    let paused_at_two = paused_events.iter().any(|event| {
-        matches!(
-            event,
-            ReindexEvent::Paused {
-                embedding_space_id,
-                last_committed_cursor: 2,
-            } if embedding_space_id == TEXT_SPACE
-        )
-    });
     drop(fixture.store);
     let pause_vectors_from_output_visible = pause_call_records.len() == 2
         && phase_output_vectors_visible_for_seeded_range(
@@ -1693,13 +1507,8 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
         );
     let pause_vectors_only_first_two =
         reindex_cursor_pause_vectors_visible(&fixture.db_path, &seeded, pause_salt);
-    let pause_producer_rows = producer_rows(&fixture.db_path, producer("pause-new"));
-    let resume_producer_rows_before = producer_rows(&fixture.db_path, producer("resume-new"));
-    let paused_cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 2);
-    let paused_cursor_count = cursor_count(&fixture.db_path, TEXT_SPACE);
-    let premature_completed_cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 5);
-    let pre_resume_target_lineage =
-        target_handle_lineage_matches(&fixture.db_path, &seeded, &seed_versions, 2, None);
+    let paused_new_model_rows = rows_in_space(&fixture.db_path, TEXT_SPACE);
+    let paused_old_model_rows = rows_in_space(&fixture.db_path, OLD_TEXT_SPACE);
     let child = process::Command::new(std::env::current_exe().expect("current test exe"))
         .arg("--exact")
         .arg("reindex_concurrency::reindex_resumable_after_process_restart_persists_cursor_to_disk")
@@ -1737,15 +1546,8 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
                     records,
                 )
         });
-    let cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 5);
-    let cursor_count_final = cursor_count(&fixture.db_path, TEXT_SPACE);
-    let pause_producer_rows_after = producer_rows(&fixture.db_path, producer("pause-new"));
-    let resume_producer_rows = producer_rows(&fixture.db_path, producer("resume-new"));
-    let old_a_producer_rows = producer_rows(&fixture.db_path, producer("old-a"));
-    let old_b_producer_rows = producer_rows(&fixture.db_path, producer("old-b"));
-    let old_c_producer_rows = producer_rows(&fixture.db_path, producer("old-c"));
-    let final_target_lineage =
-        target_handle_lineage_matches(&fixture.db_path, &seeded, &seed_versions, 2, Some(2));
+    let final_new_model_rows = rows_in_space(&fixture.db_path, TEXT_SPACE);
+    let final_old_model_rows = rows_in_space(&fixture.db_path, OLD_TEXT_SPACE);
     let pause_vectors_still_visible = phase_output_vectors_visible_for_seeded_range(
         &fixture.db_path,
         &seeded,
@@ -1758,39 +1560,25 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
             result,
             Err(CgError::ReindexPaused {
                 ref embedding_space_id,
-                last_committed_cursor: 2,
+                remaining: 3,
             }) if embedding_space_id == TEXT_SPACE
-        ) && paused_at_two
-            && pause_call_shape
+        ) && pause_call_shape
             && pause_vectors_not_text_formula
             && pause_vectors_indexed_before_drop
             && pause_vectors_from_output_visible
             && pause_vectors_from_output_indexed
             && pause_vectors_only_first_two
-            && extra_history_inserted
-            && pause_producer_rows == 3
-            && resume_producer_rows_before == 0
-            && paused_cursor_rows_before_drop == 1
-            && paused_cursor_count_before_drop == 1
-            && premature_completed_cursor_rows_before_drop == 0
-            && paused_cursor_rows == 1
-            && paused_cursor_count == 1
-            && premature_completed_cursor_rows == 0
-            && pre_resume_target_lineage
+            && embedded_before_drop == 2
+            && paused_new_model_rows == 2
+            && paused_old_model_rows == 3
             && paused_events_shape
             && child.status.success()
-            && cursor_rows == 1
-            && cursor_count_final == 1
-            && pause_producer_rows_after == 3
-            && resume_producer_rows == 3
-            && old_a_producer_rows == 2
-            && old_b_producer_rows == 1
-            && old_c_producer_rows == 1
-            && final_target_lineage
+            && final_new_model_rows == seeded.len() as i64
+            && final_old_model_rows == 0
             && resume_vectors_from_output_visible_after_child
             && resume_vectors_from_output_indexed_after_child
             && pause_vectors_still_visible,
-        "interrupted reindex must persist cursor 2 before a fresh child-process resume, process exactly rows 0..1 before pause, emit only the typed pause event before child resume, persist and index the exact runtime-salted Embedder output vectors from persisted DB text rather than synthesized ordinal text, resume from row 2 without rewriting rows 0..1 or deriving progress from pause-new handle counts, re-embed every remaining row across mixed old producers including a post-cursor row with extra historical handle lineage, and preserve per-target old/resume producer lineage without filtering resumed candidates to the first producer, result={result:?}, paused_events={paused_events:?}, paused_events_shape={paused_events_shape}, pause_call_texts={pause_call_texts:?}, pause_vectors_not_text_formula={pause_vectors_not_text_formula}, pause_vectors_indexed_before_drop={pause_vectors_indexed_before_drop}, pause_vectors_from_output_visible={pause_vectors_from_output_visible}, pause_vectors_from_output_indexed={pause_vectors_from_output_indexed}, pause_vectors_only_first_two={pause_vectors_only_first_two}, pause_vectors_still_visible={pause_vectors_still_visible}, extra_history_inserted={extra_history_inserted}, pause_producer_rows={pause_producer_rows}, resume_producer_rows_before={resume_producer_rows_before}, paused_cursor_rows_before_drop={paused_cursor_rows_before_drop}, paused_cursor_count_before_drop={paused_cursor_count_before_drop}, premature_completed_cursor_rows_before_drop={premature_completed_cursor_rows_before_drop}, paused_cursor_rows={paused_cursor_rows}, paused_cursor_count={paused_cursor_count}, premature_completed_cursor_rows={premature_completed_cursor_rows}, pre_resume_target_lineage={pre_resume_target_lineage}, child_status={:?}, child_stdout={}, child_stderr={}, cursor_rows={cursor_rows}, cursor_count_final={cursor_count_final}, pause_producer_rows_after={pause_producer_rows_after}, resume_producer_rows={resume_producer_rows}, resume_vectors_from_output_visible_after_child={resume_vectors_from_output_visible_after_child}, resume_vectors_from_output_indexed_after_child={resume_vectors_from_output_indexed_after_child}, old_a_producer_rows={old_a_producer_rows}, old_b_producer_rows={old_b_producer_rows}, old_c_producer_rows={old_c_producer_rows}, final_target_lineage={final_target_lineage}",
+        "interrupted reindex must commit items 0..1 before a fresh child-process resume, emit only the typed pause event naming the 3 items left, persist and index the exact runtime-salted Embedder output vectors from persisted DB text rather than synthesized ordinal text, keep each not-yet-rebuilt item's old row until its replacement is written, resume with only items 2..4 without rewriting 0..1, and end with every item under the new model and no old row left, result={result:?}, paused_events={paused_events:?}, paused_events_shape={paused_events_shape}, pause_call_texts={pause_call_texts:?}, pause_vectors_not_text_formula={pause_vectors_not_text_formula}, pause_vectors_indexed_before_drop={pause_vectors_indexed_before_drop}, pause_vectors_from_output_visible={pause_vectors_from_output_visible}, pause_vectors_from_output_indexed={pause_vectors_from_output_indexed}, pause_vectors_only_first_two={pause_vectors_only_first_two}, pause_vectors_still_visible={pause_vectors_still_visible}, embedded_before_drop={embedded_before_drop}, paused_new_model_rows={paused_new_model_rows}, paused_old_model_rows={paused_old_model_rows}, child_status={:?}, child_stdout={}, child_stderr={}, final_new_model_rows={final_new_model_rows}, final_old_model_rows={final_old_model_rows}, resume_vectors_from_output_visible_after_child={resume_vectors_from_output_visible_after_child}, resume_vectors_from_output_indexed_after_child={resume_vectors_from_output_indexed_after_child}",
         child.status.code(),
         child_stdout,
         String::from_utf8_lossy(&child.stderr)
@@ -1801,7 +1589,8 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
 fn reindex_emits_observable_pause_signal_when_underlying_io_unavailable_and_resume_signal_when_restored()
  {
     let fixture = fixture("reindex-pause-resume");
-    let seeded = seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 3);
+    let seeded = seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 3);
+    switch_forward(&fixture.store);
     let result = fixture.store.reindex_space(
         TEXT_SPACE,
         ReindexOptions {
@@ -1814,36 +1603,26 @@ fn reindex_emits_observable_pause_signal_when_underlying_io_unavailable_and_resu
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
     let resume_events = fixture.store.drain_reindex_events();
     drop(fixture.store);
-    let paused_at_one = paused_events.iter().any(|event| {
+    let paused_with_two_left = paused_events.iter().any(|event| {
         matches!(
             event,
             ReindexEvent::Paused {
                 embedding_space_id,
-                last_committed_cursor: 1,
+                remaining: 2,
             } if embedding_space_id == TEXT_SPACE
         )
     });
-    let resumed_at_one = resume_events.iter().any(|event| {
+    let resumed_with_two_left = resume_events.iter().any(|event| {
         matches!(
             event,
             ReindexEvent::Resumed {
                 embedding_space_id,
-                resumed_at_cursor: 1,
+                remaining: 2,
             } if embedding_space_id == TEXT_SPACE
         )
     });
-    let completed_three = resume_events.iter().any(|event| {
-        matches!(
-            event,
-            ReindexEvent::Completed {
-                embedding_space_id,
-                rows_processed: 3,
-                ..
-            } if embedding_space_id == TEXT_SPACE
-        )
-    });
-    let cursor_rows = cursor_at(&fixture.db_path, TEXT_SPACE, 3);
-    let new_producer_rows = producer_rows(&fixture.db_path, producer("new"));
+    let completed_two = completions(&resume_events) == vec![(TEXT_SPACE.to_string(), 2, 0)];
+    let new_model_rows = rows_in_space(&fixture.db_path, TEXT_SPACE);
     let exact_vectors = all_reindexed_vectors_visible(&fixture.db_path, &seeded);
 
     assert!(
@@ -1851,16 +1630,17 @@ fn reindex_emits_observable_pause_signal_when_underlying_io_unavailable_and_resu
             result,
             Err(CgError::ReindexPaused {
                 ref embedding_space_id,
-                last_committed_cursor: 1,
+                remaining: 2,
             }) if embedding_space_id == TEXT_SPACE
-        ) && paused_at_one
-            && resume_result.is_ok()
-            && resumed_at_one
-            && completed_three
-            && cursor_rows == 1
-            && new_producer_rows == seeded.len() as i64
+        ) && paused_with_two_left
+            && resume_result
+                .as_ref()
+                .is_ok_and(|report| report.embedded == 2 && report.remaining == 0)
+            && resumed_with_two_left
+            && completed_two
+            && new_model_rows == seeded.len() as i64
             && exact_vectors,
-        "pause/resume must be observable through typed events, persisted cursor state, and exact post-resume vectors/producers, result={result:?}, paused_events={paused_events:?}, resume_result={resume_result:?}, resume_events={resume_events:?}, cursor_rows={cursor_rows}, new_producer_rows={new_producer_rows}, exact_vectors={exact_vectors}"
+        "pause/resume must be observable through typed events naming what is left, durable vector rows, and exact post-resume vectors, result={result:?}, paused_events={paused_events:?}, resume_result={resume_result:?}, resume_events={resume_events:?}, new_model_rows={new_model_rows}, exact_vectors={exact_vectors}"
     );
 }
 
@@ -1868,18 +1648,19 @@ fn reindex_emits_observable_pause_signal_when_underlying_io_unavailable_and_resu
 fn reindex_zero_invalidation_cascades_under_fleet_load_n_decisions_n_entities() {
     let fixture = fixture("reindex-fleet");
     let decisions = seed_active_basis_decisions(&fixture.store, 50);
-    seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 50);
+    seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 50);
     seed_rows(
         &fixture.store,
-        IMAGE_SPACE,
+        OLD_IMAGE_SPACE,
         EvidenceKind::ImageFrame,
         512,
         50,
     );
+    switch_forward(&fixture.store);
     let db_path = fixture.db_path.clone();
     let (first, second) = run_two_reindexes(fixture.store, TEXT_SPACE, IMAGE_SPACE);
-    let text_cursors = cursor_count(&db_path, TEXT_SPACE);
-    let vision_cursors = cursor_count(&db_path, IMAGE_SPACE);
+    let text_rows = rows_in_space(&db_path, TEXT_SPACE);
+    let image_rows = rows_in_space(&db_path, IMAGE_SPACE);
     let invalidation_rows = count(
         &db_path,
         "SELECT COUNT(*) AS n FROM invalidations",
@@ -1905,7 +1686,7 @@ fn reindex_zero_invalidation_cascades_under_fleet_load_n_decisions_n_entities() 
             ),
             mime_type: Some("text/plain".to_string()),
             retention_status: RetentionStatus::RetainedExternal,
-            producer: producer_for_space(TEXT_SPACE, "positive-control"),
+            producer: producer_for_space(TEXT_SPACE),
             text_projection: Some("fleet state changed".to_string()),
             ..Default::default()
         }],
@@ -1924,11 +1705,11 @@ fn reindex_zero_invalidation_cascades_under_fleet_load_n_decisions_n_entities() 
     );
 
     assert!(
-        first.is_ok()
-            && second.is_ok()
+        first.as_ref().is_ok_and(|report| report.embedded == 50)
+            && second.as_ref().is_ok_and(|report| report.embedded == 50)
             && decisions.len() == 50
-            && text_cursors == 1
-            && vision_cursors == 1
+            && text_rows == 50
+            && image_rows == 50
             && invalidation_rows == 0
             && trigger_control
                 .as_ref()
@@ -1938,7 +1719,7 @@ fn reindex_zero_invalidation_cascades_under_fleet_load_n_decisions_n_entities() 
                 .is_ok_and(|rows| rows.len() == 1
                     && rows[0].affected_decision_id == positive_control.decision_id
                     && rows[0].trigger_observation_id == positive_observation_id),
-        "fleet reindex must complete without invalidation callbacks while 50 active basis Decisions exist, and a same-store normal observation must prove the impact-analysis trigger is armed, first={first:?}, second={second:?}, decisions={}, text_cursors={text_cursors}, vision_cursors={vision_cursors}, invalidation_rows={invalidation_rows}, trigger_control={trigger_control:?}, positive_invalidations={positive_invalidations:?}",
+        "fleet reindex must complete without invalidation callbacks while 50 active basis Decisions exist, and a same-store normal observation must prove the impact-analysis trigger is armed, first={first:?}, second={second:?}, decisions={}, text_rows={text_rows}, image_rows={image_rows}, invalidation_rows={invalidation_rows}, trigger_control={trigger_control:?}, positive_invalidations={positive_invalidations:?}",
         decisions.len()
     );
 }
@@ -1951,73 +1732,45 @@ fn reindex_on_registered_space_with_no_bindings_returns_typed_no_op_or_error() {
         .store
         .reindex_space(UNBOUND_SPACE, ReindexOptions::default());
     let events = fixture.store.drain_reindex_events();
-    let completed_zero_rows = events
-        .iter()
-        .filter(|event| {
-            matches!(
-                event,
-                ReindexEvent::Completed {
-                    embedding_space_id,
-                    rows_processed: 0,
-                    from_producer: None,
-                    to_producer: None,
-                } if embedding_space_id == UNBOUND_SPACE
-            )
-        })
-        .count();
 
     assert!(
-        before_events.is_empty() && result.is_ok() && events.len() == 1 && completed_zero_rows == 1,
-        "unbound registered space must complete as exactly one typed zero-row no-op event and no unrelated reindex events, result={result:?}, before_events={before_events:?}, events={events:?}, completed_zero_rows={completed_zero_rows}"
+        before_events.is_empty()
+            && result.as_ref().is_ok_and(|report| report.embedded == 0
+                && report.skipped == 0
+                && report.remaining == 0)
+            && completions(&events) == vec![(UNBOUND_SPACE.to_string(), 0, 0)]
+            && events.len() == 1,
+        "unbound registered space must complete as exactly one typed zero-item no-op event and no unrelated reindex events, result={result:?}, before_events={before_events:?}, events={events:?}"
     );
 }
 
 #[test]
 fn reindex_emits_typed_completion_event_distinct_from_invalidation_callbacks() {
     let fixture = fixture("reindex-completion");
-    let seeded = seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 2);
+    let seeded = seed_rows(&fixture.store, OLD_TEXT_SPACE, EvidenceKind::Text, 768, 2);
+    let switched = switch_forward(&fixture.store);
     let before_events = fixture.store.drain_reindex_events();
     let result = fixture
         .store
         .reindex_space(TEXT_SPACE, ReindexOptions::default());
     let events = fixture.store.drain_reindex_events();
     drop(fixture.store);
-    let cursor_rows = cursor_count(&fixture.db_path, TEXT_SPACE);
+    let new_model_rows = rows_in_space(&fixture.db_path, TEXT_SPACE);
     let invalidation_rows = count(
         &fixture.db_path,
         "SELECT COUNT(*) AS n FROM invalidations",
         &HashMap::new(),
     );
-    let completions = events
-        .iter()
-        .filter_map(|event| match event {
-            ReindexEvent::Completed {
-                embedding_space_id,
-                rows_processed,
-                from_producer,
-                to_producer,
-            } => Some((
-                embedding_space_id.as_str(),
-                *rows_processed,
-                from_producer.as_deref(),
-                to_producer.as_deref(),
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let completions = completions(&events);
 
     assert!(
         result.is_ok()
-            && cursor_rows == 1
+            && switched.from_space == OLD_TEXT_SPACE
+            && switched.to_space == TEXT_SPACE
+            && new_model_rows == seeded.len() as i64
             && invalidation_rows == 0
             && before_events.is_empty()
-            && completions
-                == vec![(
-                    TEXT_SPACE,
-                    seeded.len(),
-                    Some(producer_event("old").as_str()),
-                    Some(producer_event("new").as_str())
-                )],
-        "completion signal must name real row count and old/new producers and remain distinct from invalidation rows, result={result:?}, cursor_rows={cursor_rows}, invalidation_rows={invalidation_rows}, before_events={before_events:?}, events={events:?}, completions={completions:?}"
+            && completions == vec![(TEXT_SPACE.to_string(), seeded.len() as u64, 0)],
+        "completion signal must name the real embedded count for the switched-to space, the switch must name the old and new spaces, and both stay distinct from invalidation rows, result={result:?}, switched={switched:?}, new_model_rows={new_model_rows}, invalidation_rows={invalidation_rows}, before_events={before_events:?}, events={events:?}, completions={completions:?}"
     );
 }

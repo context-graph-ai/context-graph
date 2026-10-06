@@ -9,27 +9,18 @@ use cg_catalog::{
 use context_graph::embedder::mock::MockEmbedder;
 use context_graph::{
     CreateContext, CreateEntity, Decision, DistanceMetric, Embedder, EmbedderRegistration,
-    EmbeddingId, EmbeddingInput, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget,
-    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, ObservationId,
-    PrecomputedEmbedding, RecordObservation, ReindexEvent, RetentionStatus, Store, StoreConfig,
-    SubscriptionFilter,
+    EmbeddingId, EmbeddingRole, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget,
+    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, ModelIdentity,
+    ObservationId, PrecomputedEmbedding, RecordObservation, ReindexEvent, RetentionStatus,
+    SpaceState, SpaceStatus, Store, StoreConfig, SubscriptionFilter, VectorPlacement,
 };
-use contextdb_core::{Value, VectorIndexRef};
+use contextdb_core::Value;
 use contextdb_engine::Database;
 
 use crate::common::{ALT_1024_ID, NOMIC_ID, nomic_entry};
 
 const CUSTOMER_INTERNAL_ID: &str = "customer-internal-text-v1";
-const NOMIC_TEXT_SPACE_ID: &str = "text_default_nomic_v1_5_768";
-const ALT_1024_TEXT_SPACE_ID: &str = "text_default_alt_1024_text_v1_1024";
 const IMAGE_NOISE_SPACE_ID: &str = "swap-noise-image-v1-512";
-
-#[derive(Clone, Debug)]
-struct SeededTextVector {
-    evidence_id: EvidenceId,
-    text_projection: String,
-    original_vector: Vec<f32>,
-}
 
 fn catalog_with_swap_entries(root: &std::path::Path) -> Catalog {
     let customer = CatalogEntry {
@@ -177,10 +168,34 @@ fn image_noise_space() -> EmbeddingSpaceDecl {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: image_noise_identity(),
     }
 }
 
-fn separate_store_with_noise_space() -> (tempfile::TempDir, Store) {
+/// The caller-filled noise space's one model: the seed producer's own fields.
+fn image_noise_identity() -> ModelIdentity {
+    ModelIdentity {
+        model: "image-noise-seed".to_string(),
+        weights_revision: "test".to_string(),
+        preparation: "swap-test".to_string(),
+        dimension: 512,
+    }
+}
+
+/// The space the catalog's model `model_id` embeds into.
+fn text_space_of(catalog: &Catalog, model_id: &str) -> String {
+    catalog
+        .text_embedder_producer(model_id)
+        .expect("catalog names the model's identity")
+        .space_id()
+}
+
+/// A store whose two text models stand in for the catalog's Nomic and alt entries, so the
+/// catalog's identities and the store's registered embedders name the same spaces. Nomic's
+/// stand-in holds the text role; the alt stand-in claims no role until a swap switches to it.
+fn separate_store_with_noise_space(catalog: &Catalog) -> (tempfile::TempDir, Store) {
     let temp = tempfile::tempdir().expect("store tempdir");
     let config = StoreConfig {
         db_path: temp.path().join("context-graph.db"),
@@ -188,21 +203,72 @@ fn separate_store_with_noise_space() -> (tempfile::TempDir, Store) {
         extra_embedding_spaces: vec![image_noise_space()],
         ..StoreConfig::default()
     };
-    let embedder = MockEmbedder::new(NOMIC_TEXT_SPACE_ID, 768);
-    let mut space = embedder.embedding_space();
-    space.default_for_evidence_kind = Some(EvidenceKind::Text);
-    let store = Store::open_with_embedder_registrations(
-        config,
-        vec![EmbedderRegistration {
-            space,
-            embedder: Arc::new(embedder),
-        }],
-    )
-    .expect("store opens with real text-space reindex embedder");
+    let registrations = [(NOMIC_ID, Some(EvidenceKind::Text)), (ALT_1024_ID, None)]
+        .into_iter()
+        .map(|(model_id, default_for)| {
+            let embedder = MockEmbedder::with_identity(
+                catalog
+                    .text_embedder_producer(model_id)
+                    .expect("catalog names the model's identity"),
+            );
+            let mut space = embedder.embedding_space();
+            space.default_for_evidence_kind = default_for;
+            EmbedderRegistration {
+                space,
+                embedder: Arc::new(embedder),
+            }
+        })
+        .collect();
+    let store = Store::open_with_embedder_registrations(config, registrations)
+        .expect("store opens with both text models' embedders");
     (temp, store)
 }
 
-fn seed_text_space_vectors(store: &Store, count: usize) -> Vec<SeededTextVector> {
+fn status_of(store: &Store, space_id: &str) -> SpaceStatus {
+    store
+        .embedding_space_status()
+        .expect("embedding space status")
+        .into_iter()
+        .find(|status| status.space_id == space_id)
+        .unwrap_or_else(|| panic!("status names space {space_id}"))
+}
+
+fn active_text_space(store: &Store) -> Option<String> {
+    store
+        .active_embedding_space(EmbeddingRole::EvidenceText)
+        .expect("read the active text space")
+}
+
+/// Node-local vector rows each seeded item has in `space_id`.
+fn rows_per_item(db_path: &std::path::Path, seeded: &[EvidenceId], space_id: &str) -> Vec<i64> {
+    let db = Database::open(db_path).expect("raw database opens for vector rows");
+    seeded
+        .iter()
+        .map(|evidence_id| {
+            let result = db
+                .execute(
+                    "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id AND embedding_space_id = $space",
+                    &[
+                        (
+                            "target_id".to_string(),
+                            Value::Uuid(evidence_id.as_uuid()),
+                        ),
+                        ("space".to_string(), Value::Text(space_id.to_string())),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+                .expect("vector-row count");
+            match result.rows.first().and_then(|row| row.first()) {
+                Some(Value::Int64(n)) => *n,
+                other => panic!("expected a count, got {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// Text items the active model embeds at write; returns their ids.
+fn seed_text_space_vectors(store: &Store, count: usize) -> Vec<EvidenceId> {
     let context = store
         .create_context(CreateContext {
             name: format!("swap-vector-count-{count}-{}", ObservationId::new_v7()),
@@ -223,7 +289,6 @@ fn seed_text_space_vectors(store: &Store, count: usize) -> Vec<SeededTextVector>
         let observation_id = ObservationId::new_v7();
         let evidence_id = EvidenceId::new_v7();
         let text_projection = format!("seeded text vector {index}");
-        let original_vector = unit_vector(768, index);
         let recorded = store.record_observation(RecordObservation {
             id: observation_id,
             entity_id: entity.id,
@@ -239,30 +304,20 @@ fn seed_text_space_vectors(store: &Store, count: usize) -> Vec<SeededTextVector>
                 source_ref: format!("cas://sha256:{:064x}", evidence_id.as_uuid().as_u128()),
                 mime_type: Some("text/plain".to_string()),
                 producer: producer("capture"),
-                text_projection: Some(text_projection.clone()),
+                text_projection: Some(text_projection),
                 retention_status: RetentionStatus::RetainedExternal,
                 ..EvidenceRef::default()
             }],
             observed_properties: Default::default(),
             state_delta: Default::default(),
             properties: Default::default(),
-            embeddings: vec![PrecomputedEmbedding {
-                id: EmbeddingId::new_v7(),
-                embedding_space_id: NOMIC_TEXT_SPACE_ID.to_string(),
-                vector: original_vector.clone(),
-                target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: producer("nomic-seed"),
-            }],
+            embeddings: Vec::new(),
         });
         assert!(
             recorded.is_ok(),
             "seeding vector {index} through the supplied Store should succeed: {recorded:?}"
         );
-        seeded.push(SeededTextVector {
-            evidence_id,
-            text_projection,
-            original_vector,
-        });
+        seeded.push(evidence_id);
     }
     seeded
 }
@@ -324,11 +379,11 @@ fn seed_non_swapped_image_vectors(store: &Store, count: usize) {
 
 fn assert_dimension_gate_reports_live_count(seed_count: u64) {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (_store_temp, store) = separate_store_with_noise_space();
+    let catalog = catalog_with_swap_entries(temp.path());
+    let (_store_temp, store) = separate_store_with_noise_space(&catalog);
     seed_text_space_vectors(&store, seed_count as usize);
     seed_non_swapped_image_vectors(&store, seed_count as usize + 11);
     let decisions = collect_new_decisions(&store);
-    let catalog = catalog_with_swap_entries(temp.path());
     let before_config = runtime_config(temp.path());
     let before_store_bytes = std::fs::read(store.db_path()).expect("store bytes readable");
 
@@ -365,141 +420,40 @@ fn assert_dimension_gate_reports_live_count(seed_count: u64) {
     assert_no_hidden_cache_store(temp.path());
 }
 
-fn assert_raw_1024_entity_reference_query_hits(
-    db_path: &std::path::Path,
-    embedding_id: EmbeddingId,
-    query_vector: &[f32],
-) {
-    let db = Database::open(db_path).expect("raw database opens for vector query");
-    let snapshot = db.snapshot();
-    let row_id = db
-        .scan("entity_reference_embeddings_1024", snapshot)
-        .expect("raw 1024 entity-reference scan")
-        .into_iter()
-        .find_map(|row| {
-            let matches_id = row.values.get("id") == Some(&Value::Uuid(embedding_id.as_uuid()));
-            let matches_space = row.values.get("embedding_space_id")
-                == Some(&Value::Text(ALT_1024_TEXT_SPACE_ID.to_string()));
-            (matches_id && matches_space).then_some(row.row_id)
-        })
-        .expect("new parallel-space entity-reference row");
-    let hits = db
-        .query_vector(
-            VectorIndexRef::new("entity_reference_embeddings_1024", "vector"),
-            query_vector,
-            1,
-            None,
-            snapshot,
-        )
-        .expect("raw 1024 entity-reference vector query");
-    assert!(
-        hits.first()
-            .is_some_and(|(hit_row, score)| *hit_row == row_id && *score > 0.99),
-        "new parallel space must be queryable through the 1024-dimension vector index, row_id={row_id:?}, hits={hits:?}"
+/// After a parallel-space swap the new space is the text role's active space: a new text item
+/// is embedded into it.
+fn assert_parallel_space_vector_index_is_queryable(store: &Store, catalog: &Catalog) {
+    let alt_space = text_space_of(catalog, ALT_1024_ID);
+    let before = status_of(store, &alt_space).embedded;
+    let seeded = seed_text_space_vectors(store, 1);
+    assert_eq!(
+        status_of(store, &alt_space).embedded,
+        before + 1,
+        "the new parallel space must take new text items through the store's embedder"
+    );
+    assert_eq!(
+        rows_per_item(store.db_path(), &seeded, &alt_space),
+        vec![1],
+        "the new item's vector row must land in the new parallel space"
     );
 }
 
-fn assert_seeded_text_vectors_reindexed(db_path: &std::path::Path, seeded: &[SeededTextVector]) {
-    let db = Database::open(db_path).expect("raw database opens for text-vector query");
-    let snapshot = db.snapshot();
-    let evidence_rows = db
-        .scan("evidence", snapshot)
-        .expect("raw evidence scan")
-        .into_iter()
-        .filter_map(|row| match row.values.get("id") {
-            Some(Value::Uuid(id)) => Some((*id, row.row_id)),
-            _ => None,
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    let embedder = MockEmbedder::new(NOMIC_TEXT_SPACE_ID, 768);
-    for seed in seeded {
-        let expected = embedder
-            .embed(EmbeddingInput::Text(seed.text_projection.clone()))
-            .expect("mock reindex embedding")
-            .vector;
-        assert_ne!(
-            expected, seed.original_vector,
-            "fixture must distinguish generated reindex output from the original precomputed vector"
-        );
-        let row_id = evidence_rows
-            .get(&seed.evidence_id.as_uuid())
-            .copied()
-            .expect("seeded evidence row exists");
-        let hits = db
-            .query_vector(
-                VectorIndexRef::new("evidence", "vector_text"),
-                &expected,
-                seeded.len(),
-                None,
-                snapshot,
-            )
-            .expect("raw text-vector query");
-        assert!(
-            hits.iter()
-                .any(|(hit_row, score)| *hit_row == row_id && *score > 0.99),
-            "reindex confirmation must replace seeded evidence vectors through the Store reindex path, evidence_id={}, hits={hits:?}",
-            seed.evidence_id
-        );
-    }
-}
-
-fn assert_parallel_space_vector_index_is_queryable(store: Store) {
-    let db_path = store.db_path().to_path_buf();
-    let context = store
-        .create_context(CreateContext {
-            name: format!("parallel-space-proof-{}", ObservationId::new_v7()),
-            ..Default::default()
-        })
-        .expect("context for parallel-space proof");
-    let entity = store
-        .create_entity(CreateEntity {
-            entity_type: EntityType::Configuration,
-            name: "parallel-space-proof".to_string(),
-            context_id: context.id,
-            ..Default::default()
-        })
-        .expect("entity for parallel-space proof");
-    let vector = unit_vector(1024, 17);
-    let recorded = store.enroll_entity_reference(
-        entity.id,
-        ALT_1024_TEXT_SPACE_ID,
-        Some("parallel-space-ann-proof".to_string()),
-        vector.clone(),
-        producer("alt-1024-entity-reference"),
-    );
-    assert!(
-        recorded.as_ref().is_ok_and(EmbeddingId::is_valid),
-        "new parallel space must accept an actual 1024-dimension vector-index write through the Store substrate: {recorded:?}"
-    );
-    let embedding_id = recorded.expect("embedding id");
-    let rows = store
-        .list_entity_reference_embeddings_for_entity(entity.id)
-        .expect("entity-reference rows should be listed through Store");
-    assert!(
-        rows.iter().any(|row| row.id == embedding_id
-            && row.embedding_space_id == ALT_1024_TEXT_SPACE_ID
-            && row.vector == vector),
-        "new parallel space must persist a 1024-dimension entity-reference vector row, rows={rows:?}"
-    );
-    drop(store);
-    assert_raw_1024_entity_reference_query_hits(&db_path, embedding_id, &vector);
-}
-
-fn assert_store_has_old_and_parallel_text_spaces(store: &Store) {
+fn assert_store_has_old_and_parallel_text_spaces(store: &Store, catalog: &Catalog) {
+    let nomic_space = text_space_of(catalog, NOMIC_ID);
+    let alt_space = text_space_of(catalog, ALT_1024_ID);
     let spaces = store
         .list_embedding_spaces()
         .expect("embedding spaces should be readable from the supplied Store");
     assert!(
         spaces
             .iter()
-            .any(|space| space.embedding_space_id == NOMIC_TEXT_SPACE_ID && space.dimension == 768),
+            .any(|space| space.embedding_space_id == nomic_space && space.dimension == 768),
         "parallel-space swap should preserve the old text embedding space in the Store substrate"
     );
     assert!(
         spaces
             .iter()
-            .any(|space| space.embedding_space_id == ALT_1024_TEXT_SPACE_ID
-                && space.dimension == 1024),
+            .any(|space| space.embedding_space_id == alt_space && space.dimension == 1024),
         "parallel-space swap should create the requested 1024-dimension space in the Store substrate"
     );
 }
@@ -509,9 +463,9 @@ fn swap_default_same_dimension_completes_without_extra_confirmation_and_records_
 {
     // Same-dimension swaps should be reversible operational choices with an auditable decision.
     let temp = tempfile::tempdir().expect("tempdir");
-    let (_store_temp, store) = separate_store_with_noise_space();
-    let decisions = collect_new_decisions(&store);
     let catalog = catalog_with_swap_entries(temp.path());
+    let (_store_temp, store) = separate_store_with_noise_space(&catalog);
+    let decisions = collect_new_decisions(&store);
     let result = catalog
         .set_default(&store, ModelKind::TextEmbedder, CUSTOMER_INTERNAL_ID, None)
         .expect("swap returns");
@@ -546,12 +500,14 @@ fn swap_default_different_dimension_with_explicit_reindex_confirmation_proceeds_
  {
     // Choosing reindex should be visible in the recorded model-swap decision.
     let temp = tempfile::tempdir().expect("tempdir");
-    let (_store_temp, store) = separate_store_with_noise_space();
-    let seeded_text_vectors = seed_text_space_vectors(&store, 7);
+    let catalog = catalog_with_swap_entries(temp.path());
+    let (_store_temp, store) = separate_store_with_noise_space(&catalog);
+    let nomic_space = text_space_of(&catalog, NOMIC_ID);
+    let alt_space = text_space_of(&catalog, ALT_1024_ID);
+    let seeded = seed_text_space_vectors(&store, 7);
     seed_non_swapped_image_vectors(&store, 18);
     let db_path = store.db_path().to_path_buf();
     let decisions = collect_new_decisions(&store);
-    let catalog = catalog_with_swap_entries(temp.path());
     let result = catalog
         .set_default(
             &store,
@@ -576,18 +532,32 @@ fn swap_default_different_dimension_with_explicit_reindex_confirmation_proceeds_
             event,
             ReindexEvent::Completed {
                 embedding_space_id,
-                rows_processed: 7,
-                ..
-            } if embedding_space_id == NOMIC_TEXT_SPACE_ID
+                embedded: 7,
+                skipped: 0,
+            } if *embedding_space_id == alt_space
         )),
-        "reindex confirmation must drive the Store reindex path and report the live text-space count, not echo the caller-supplied count; events={reindex_events:?}"
+        "reindex confirmation must drive the Store reindex path into the new model's space and report the live embedded count, not echo the caller-supplied count; events={reindex_events:?}"
     );
+    assert_eq!(active_text_space(&store), Some(alt_space.clone()));
+    assert_eq!(status_of(&store, &alt_space).embedded, 7);
+    assert_eq!(status_of(&store, &nomic_space).state, SpaceState::Stale);
     drop(store);
-    assert_seeded_text_vectors_reindexed(&db_path, &seeded_text_vectors);
+    assert_eq!(
+        rows_per_item(&db_path, &seeded, &alt_space),
+        vec![1; 7],
+        "every seeded item must have its vector rebuilt in the new model's space"
+    );
+    assert_eq!(
+        rows_per_item(&db_path, &seeded, &nomic_space),
+        vec![0; 7],
+        "each stale vector row must be gone once its replacement is written"
+    );
     assert_eq!(
         result,
         SwapResult::CompletedWithReindex {
-            reindexed_vectors: 7
+            reindexed_vectors: 7,
+            preserved_elsewhere: 0,
+            skipped: 0,
         }
     );
 }
@@ -597,11 +567,13 @@ fn swap_default_different_dimension_with_explicit_parallel_space_confirmation_pr
  {
     // Choosing a parallel space should preserve the old vector space and create the new one.
     let temp = tempfile::tempdir().expect("tempdir");
-    let (_store_temp, store) = separate_store_with_noise_space();
+    let catalog = catalog_with_swap_entries(temp.path());
+    let (_store_temp, store) = separate_store_with_noise_space(&catalog);
+    let nomic_space = text_space_of(&catalog, NOMIC_ID);
+    let alt_space = text_space_of(&catalog, ALT_1024_ID);
     seed_text_space_vectors(&store, 7);
     seed_non_swapped_image_vectors(&store, 18);
     let decisions = collect_new_decisions(&store);
-    let catalog = catalog_with_swap_entries(temp.path());
     let result = catalog
         .set_default(
             &store,
@@ -623,12 +595,18 @@ fn swap_default_different_dimension_with_explicit_parallel_space_confirmation_pr
         "parallel-space swap should append a structured decision naming the option to the supplied Store"
     );
     assert_no_hidden_cache_store(temp.path());
-    assert_store_has_old_and_parallel_text_spaces(&store);
-    assert_parallel_space_vector_index_is_queryable(store);
+    assert_store_has_old_and_parallel_text_spaces(&store, &catalog);
+    assert_eq!(active_text_space(&store), Some(alt_space.clone()));
+    let old = status_of(&store, &nomic_space);
+    assert!(
+        old.state == SpaceState::Retained && old.embedded == 7,
+        "a parallel-space swap keeps the old space retained with its vectors, old={old:?}"
+    );
+    assert_parallel_space_vector_index_is_queryable(&store, &catalog);
     assert_eq!(
         result,
         SwapResult::CompletedAsParallelSpace {
-            new_space_id: "text_default_alt_1024_text_v1_1024".to_string()
+            new_space_id: alt_space
         }
     );
 }
@@ -637,11 +615,13 @@ fn swap_default_different_dimension_with_explicit_parallel_space_confirmation_pr
 fn swap_default_back_to_original_after_parallel_space_creation_is_same_dimension_path() {
     // Reverting to the prior default should use the safe same-dimension path.
     let temp = tempfile::tempdir().expect("tempdir");
-    let (_store_temp, store) = separate_store_with_noise_space();
+    let catalog = catalog_with_swap_entries(temp.path());
+    let (_store_temp, store) = separate_store_with_noise_space(&catalog);
+    let nomic_space = text_space_of(&catalog, NOMIC_ID);
+    let alt_space = text_space_of(&catalog, ALT_1024_ID);
     seed_text_space_vectors(&store, 7);
     seed_non_swapped_image_vectors(&store, 18);
     let decisions = collect_new_decisions(&store);
-    let catalog = catalog_with_swap_entries(temp.path());
     let _ = catalog
         .set_default(
             &store,
@@ -661,7 +641,17 @@ fn swap_default_back_to_original_after_parallel_space_creation_is_same_dimension
         "reverting should append a same-dimension structured model-swap decision to the supplied Store"
     );
     assert_no_hidden_cache_store(temp.path());
-    assert_store_has_old_and_parallel_text_spaces(&store);
-    assert_parallel_space_vector_index_is_queryable(store);
+    assert_store_has_old_and_parallel_text_spaces(&store, &catalog);
+    assert_eq!(
+        active_text_space(&store),
+        Some(nomic_space.clone()),
+        "reverting makes the original model's space active again"
+    );
+    let original = status_of(&store, &nomic_space);
+    assert!(
+        original.state == SpaceState::Active && original.embedded == 7,
+        "the original space's vectors are intact after the round trip, original={original:?}"
+    );
+    assert_eq!(status_of(&store, &alt_space).state, SpaceState::Retained);
     assert_eq!(result, SwapResult::Completed);
 }

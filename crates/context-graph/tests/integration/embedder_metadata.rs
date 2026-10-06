@@ -458,7 +458,26 @@ fn vector(axis: usize) -> Vec<f32> {
     vector
 }
 
-fn record(fixture: &Fixture, system: &str, version: &str, axis: usize) -> EmbeddingId {
+/// A consumer-claimed supply of `space`'s own model: identity matches, system says who supplied it.
+fn customer_producer(store: &Store, space: &str) -> EvidenceProducer {
+    EvidenceProducer {
+        system: "customer".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(space)
+                .expect("read the space's model")
+                .expect("the space is declared"),
+        )
+    }
+}
+
+/// Supply one vector for a fresh evidence item; returns the id of the row actually written.
+fn record(
+    fixture: &Fixture,
+    space: &str,
+    produced_by: EvidenceProducer,
+    axis: usize,
+) -> EmbeddingId {
     let evidence_id = EvidenceId::new_v7();
     let embedding_id = EmbeddingId::new_v7();
     let result = fixture.store.record_observation(RecordObservation {
@@ -483,14 +502,19 @@ fn record(fixture: &Fixture, system: &str, version: &str, axis: usize) -> Embedd
         properties: BTreeMap::new(),
         embeddings: vec![PrecomputedEmbedding {
             id: embedding_id,
-            embedding_space_id: TEXT_SPACE.to_string(),
+            embedding_space_id: space.to_string(),
             vector: vector(axis),
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer(system, version),
+            produced_by,
         }],
     });
-    assert!(result.is_ok(), "metadata setup failed: {result:?}");
-    embedding_id
+    let written = result.expect("metadata setup").embedding_ids;
+    assert_eq!(
+        written.len(),
+        1,
+        "the supply is stored as one row: {written:?}"
+    );
+    written[0]
 }
 
 fn raw_db(path: &Path, store: Store) -> Database {
@@ -510,7 +534,7 @@ fn producer_projection_by_target(
 ) -> Option<ProducerProjection> {
     let result = db
         .execute(
-            "SELECT embedding_space_id, produced_by FROM evidence_embedding_handles WHERE target_id = $target_id",
+            "SELECT embedding_space_id, produced_by FROM evidence_embeddings WHERE target_id = $target_id",
             &params(vec![("target_id", Value::Uuid(evidence_id.as_uuid()))]),
         )
         .expect("producer projection");
@@ -663,11 +687,16 @@ fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
 #[test]
 fn embedding_metadata_includes_space_id() {
     let fixture = fixture("metadata-space");
-    let embedding_id = record(&fixture, "customer", "1", 0);
+    let embedding_id = record(
+        &fixture,
+        TEXT_SPACE,
+        customer_producer(&fixture.store, TEXT_SPACE),
+        0,
+    );
     let db = raw_db(&fixture.db_path, fixture.store);
     let rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id AND embedding_space_id = $space",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id AND embedding_space_id = $space",
         &params(vec![
             ("id", Value::Uuid(embedding_id.as_uuid())),
             ("space", Value::Text(TEXT_SPACE.to_string())),
@@ -695,11 +724,17 @@ fn embedder_metadata_distinguishes_internal_vs_external() {
         .as_ref()
         .expect("internal auto embedding")
         .embedding_ids[0];
-    let external = record(&fixture, "customer", "1", 1);
+    let mock_space = fixture
+        .store
+        .active_embedding_space(context_graph::EmbeddingRole::EvidenceText)
+        .expect("read the active text space")
+        .expect("the mock's space is the active text space");
+    let expected_external = customer_producer(&fixture.store, &mock_space);
+    let external = record(&fixture, &mock_space, expected_external.clone(), 1);
     let db = raw_db(&fixture.db_path, fixture.store);
     let internal_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id AND produced_by = $producer",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id AND produced_by = $producer",
         &params(vec![
             ("id", Value::Uuid(internal.as_uuid())),
             (
@@ -710,12 +745,12 @@ fn embedder_metadata_distinguishes_internal_vs_external() {
     );
     let external_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id AND produced_by = $producer",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id AND produced_by = $producer",
         &params(vec![
             ("id", Value::Uuid(external.as_uuid())),
             (
                 "producer",
-                Value::Json(serde_json::to_value(producer("customer", "1")).expect("json")),
+                Value::Json(serde_json::to_value(expected_external).expect("json")),
             ),
         ]),
     );
@@ -829,6 +864,7 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
     let consumer_embedder = MockEmbedder::new(CONSUMER_SPACE, 768);
     let mut registered_space = consumer_embedder.embedding_space();
     registered_space.default_for_evidence_kind = Some(EvidenceKind::Text);
+    let consumer_space_id = registered_space.embedding_space_id.clone();
     let consumer_config = StoreConfig {
         db_path: consumer_dir.path().join("consumer.db"),
         extra_embedding_spaces: vec![registered_space.clone()],
@@ -846,6 +882,7 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
     let fixture = fixture("metadata-uniform-precomputed");
     let precomputed_evidence_id = EvidenceId::new_v7();
     let precomputed_embedding_id = EmbeddingId::new_v7();
+    let precomputed_producer = customer_producer(&fixture.store, TEXT_SPACE);
     let precomputed_result = fixture.store.record_observation(RecordObservation {
         id: context_graph::ObservationId::new_v7(),
         entity_id: fixture.entity_id,
@@ -872,7 +909,7 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: vector(2),
             target: EmbeddingTarget::Evidence(precomputed_evidence_id),
-            produced_by: producer("customer", "precomputed"),
+            produced_by: precomputed_producer,
         }],
     });
     let db = raw_db(&fixture.db_path, fixture.store);
@@ -906,7 +943,7 @@ fn producer_metadata_uniform_schema_across_three_ingest_paths() {
                 .is_some_and(|projection| projection.space == TEXT_SPACE)
             && consumer_trait
                 .as_ref()
-                .is_some_and(|projection| projection.space == CONSUMER_SPACE)
+                .is_some_and(|projection| projection.space == consumer_space_id)
             && precomputed
                 .as_ref()
                 .is_some_and(|projection| projection.space == TEXT_SPACE)

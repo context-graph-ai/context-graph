@@ -75,12 +75,13 @@ fn mock_embedder_deterministic() {
         .expect("after reopen");
 
     assert!(
-        first.embedding_space_id == "mock_space"
+        first.embedding_space_id == embedder.embedding_space().embedding_space_id
+            && first.embedding_space_id == embedder.producer().space_id()
             && first.vector == second.vector
             && first.vector == after_reopen.vector
             && first.vector == expected_mock_vector("text", "same", 4)
             && (vector_l2_norm(&first.vector) - 1.0).abs() <= 1.0e-6,
-        "mock embedder must be deterministic across calls and recreated instances, return its configured space id, and emit L2-normalized vectors; first={first:?}, second={second:?}, after_reopen={after_reopen:?}"
+        "mock embedder must be deterministic across calls and recreated instances, return its identity-derived space id, and emit L2-normalized vectors; first={first:?}, second={second:?}, after_reopen={after_reopen:?}"
     );
 }
 
@@ -195,7 +196,7 @@ fn mock_embedder_configurable_producer_string() {
             Ok(db) => db,
             Err(error) => return (None, String::new(), format!("raw_open={error:?}")),
         };
-        let rows = match db.scan("evidence_embedding_handles", db.snapshot()) {
+        let rows = match db.scan("evidence_embeddings", db.snapshot()) {
             Ok(rows) => rows,
             Err(error) => return (None, String::new(), format!("scan={error:?}")),
         };
@@ -214,9 +215,9 @@ fn mock_embedder_configurable_producer_string() {
 
     assert!(
         persisted.as_ref().is_some_and(|producer| {
-            producer == &embedder.producer
+            producer == &EvidenceProducer::from(&embedder.producer())
                 && producer.system == context_graph::CG_EDGE_SYSTEM_TAG
-                && producer.pipeline_version == "mock_space"
+                && producer.model_version == "mock_space"
         }) && rendered.contains("mock_space")
             && rendered.contains("first-party, cg-attested"),
         "mock embedder must persist its configured first-party producer through a Store write and raw database reopen, not only render it from process memory; persisted={persisted:?}, rendered={rendered:?}, debug={debug}"

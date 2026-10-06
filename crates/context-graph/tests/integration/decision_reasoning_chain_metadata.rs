@@ -10,12 +10,24 @@ use context_graph::{
     ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, Decision,
     DistanceMetric, EmbedderRegistration, EmbeddingSpace, EmbeddingSpaceBinding, EntityId,
     EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin,
-    IntentionStatus, ReasoningStep, RecordObservation, ReindexOptions, Store, StoreConfig,
+    IntentionStatus, ModelIdentity, OldSpace, ReasoningStep, RecordObservation, ReindexOptions,
+    Store, StoreConfig, VectorPlacement,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
 
+/// The decision encoder's version-1 space, active when the decision is written.
 const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
+/// The version-2 encoder's own space; a new model version is a new space.
+const TEXT_SPACE_V2: &str = "decision_encoder_v2_768";
+
+fn space_for(version: &str) -> &'static str {
+    if version == "2" {
+        TEXT_SPACE_V2
+    } else {
+        TEXT_SPACE
+    }
+}
 
 fn store() -> Store {
     Store::open_with_embedder_registrations(
@@ -26,32 +38,38 @@ fn store() -> Store {
             )),
             ..Default::default()
         },
-        vec![EmbedderRegistration {
-            space: text_space(),
-            embedder: Arc::new(DecisionLineageEmbedder),
-        }],
+        vec![
+            // Registered first, so version 1 is the text role's active space.
+            EmbedderRegistration {
+                space: text_space("1"),
+                embedder: Arc::new(DecisionLineageEmbedder { version: "1" }),
+            },
+            EmbedderRegistration {
+                space: text_space("2"),
+                embedder: Arc::new(DecisionLineageEmbedder { version: "2" }),
+            },
+        ],
     )
     .expect("open")
 }
 
+/// One version of the decision encoder; each version is its own model and space.
 #[derive(Clone)]
-struct DecisionLineageEmbedder;
+struct DecisionLineageEmbedder {
+    version: &'static str,
+}
 
 impl Embedder for DecisionLineageEmbedder {
     fn embed(&self, input: EmbeddingInput) -> context_graph::Result<EmbeddingOutput> {
-        let version = match input {
-            EmbeddingInput::Text(text) if text.contains("version-2") => "2",
-            EmbeddingInput::Text(_) => "1",
-            _ => {
-                return Err(context_graph::CgError::UnsupportedEvidenceKind {
-                    kind: EvidenceKind::ImageFrame,
-                });
-            }
-        };
+        if !matches!(input, EmbeddingInput::Text(_)) {
+            return Err(context_graph::CgError::UnsupportedEvidenceKind {
+                kind: EvidenceKind::ImageFrame,
+            });
+        }
         Ok(EmbeddingOutput {
-            embedding_space_id: TEXT_SPACE.to_string(),
+            embedding_space_id: space_for(self.version).to_string(),
             dimension: 768,
-            producer: producer(version),
+            producer: producer(self.version),
             vector: vector(),
         })
     }
@@ -61,35 +79,47 @@ impl Embedder for DecisionLineageEmbedder {
     }
 
     fn embedding_space(&self) -> EmbeddingSpace {
-        text_space()
+        text_space(self.version)
+    }
+
+    fn producer(&self) -> ModelIdentity {
+        identity(self.version)
     }
 }
 
-fn text_space() -> EmbeddingSpace {
+fn text_space(version: &str) -> EmbeddingSpace {
+    let id = space_for(version);
     EmbeddingSpace {
-        embedding_space_id: TEXT_SPACE.to_string(),
+        embedding_space_id: id.to_string(),
         dimension: 768,
         metric: DistanceMetric::Cosine,
         model_family: "text".to_string(),
         model_name: "decision-encoder".to_string(),
-        model_version: "test".to_string(),
+        model_version: version.to_string(),
         supported_evidence_kinds: vec![EvidenceKind::Text],
         default_for_evidence_kind: Some(EvidenceKind::Text),
         bindings: vec![EmbeddingSpaceBinding {
-            embedding_space_id: TEXT_SPACE.to_string(),
+            embedding_space_id: id.to_string(),
             table_name: "evidence".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: VectorPlacement::NodeLocal,
+        media_reachable_on_every_node: false,
+        producer: identity(version),
+    }
+}
+
+fn identity(version: &str) -> ModelIdentity {
+    ModelIdentity {
+        model: "decision-encoder".to_string(),
+        weights_revision: version.to_string(),
+        preparation: "1".to_string(),
+        dimension: 768,
     }
 }
 
 fn producer(version: &str) -> EvidenceProducer {
-    EvidenceProducer {
-        system: context_graph::CG_EDGE_SYSTEM_TAG.to_string(),
-        model_name: "decision-encoder".to_string(),
-        model_version: version.to_string(),
-        pipeline_version: "1".to_string(),
-    }
+    EvidenceProducer::from(&identity(version))
 }
 
 fn vector() -> Vec<f32> {
@@ -194,7 +224,15 @@ fn create_decision_with_seeded_embedding(store: &Store, version: &str) -> Decisi
     }
 }
 
+/// Switch the text role to encoder version 2, then embed a decoy on the same entity under it.
 fn record_same_entity_decoy_embedding(store: &Store, fixture: &DecisionProducerFixture) {
+    store
+        .switch_embedding_space(
+            context_graph::EmbeddingRole::EvidenceText,
+            text_space("2"),
+            OldSpace::Reindex,
+        )
+        .expect("switch to encoder version 2");
     let evidence_id = EvidenceId::new_v7();
     let observation = store.record_observation(RecordObservation {
         id: context_graph::ObservationId::new_v7(),
@@ -230,7 +268,7 @@ fn persisted_handle_rows_for_version(db_path: &Path, version: &str) -> i64 {
     let db = Database::open(db_path).expect("raw db");
     let result = db
         .execute(
-            "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE produced_by = $producer",
+            "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE produced_by = $producer",
             &HashMap::from([(
                 "producer".to_string(),
                 Value::Json(serde_json::to_value(producer(version)).expect("producer json")),
@@ -278,7 +316,7 @@ fn embedding_metadata_stored_on_decision_reasoning_chain_at_write_time_not_deriv
         let store = store();
         let fixture = create_decision_with_seeded_embedding(&store, "1");
         record_same_entity_decoy_embedding(&store, &fixture);
-        let _reindex = store.reindex_space(TEXT_SPACE, ReindexOptions::default());
+        let _reindex = store.reindex_space(TEXT_SPACE_V2, ReindexOptions::default());
         (store.db_path().to_path_buf(), fixture.decision.id)
     };
     let decoy_rows = persisted_handle_rows_for_version(&db_path, "2");
@@ -305,7 +343,7 @@ fn decision_reasoning_chain_producer_remains_queryable_after_subsequent_reindex(
         let store = store();
         let fixture = create_decision_with_seeded_embedding(&store, "1");
         record_same_entity_decoy_embedding(&store, &fixture);
-        let _reindex = store.reindex_space(TEXT_SPACE, ReindexOptions::default());
+        let _reindex = store.reindex_space(TEXT_SPACE_V2, ReindexOptions::default());
         (store.db_path().to_path_buf(), fixture.decision.id)
     };
     let decoy_rows = persisted_handle_rows_for_version(&db_path, "2");

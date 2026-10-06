@@ -21,6 +21,19 @@ fn producer() -> EvidenceProducer {
     }
 }
 
+/// An edge-memory supply of the built-in text space's own model.
+fn text_space_supply(store: &Store) -> EvidenceProducer {
+    EvidenceProducer {
+        system: "edge-memory".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(TEXT_SPACE)
+                .expect("read the text space's model")
+                .expect("the built-in text space is declared"),
+        )
+    }
+}
+
 fn vector(axis: usize) -> Vec<f32> {
     let mut vector = vec![0.0; 768];
     vector[axis] = 1.0;
@@ -77,7 +90,7 @@ fn seed(store: &Store, kind: EvidenceKind, axis: usize) -> EvidenceId {
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: vector(axis),
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer(),
+            produced_by: text_space_supply(store),
         }],
     });
     assert!(recorded.is_ok(), "seed failed: {recorded:?}");

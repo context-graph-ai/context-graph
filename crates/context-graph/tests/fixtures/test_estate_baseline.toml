@@ -212,7 +212,14 @@
 # the two ownership audits, the long-batch live-claim proof, and three child-process entry points.
 # Retired: the lease-renewal, lease-TTL and expired-reclaim proofs, which no longer describe the
 # product: 1326 + 24 - 3 = 1347.
-"context-graph" = 1347
+# Per-space vector placement and reindex: sixteen design proofs in
+# `embedding_placement_and_reindex.rs`, and five committed-write rows in
+# `a_committed_write_never_reports_failure.rs` (that file is gated by a file-level
+# `#![cfg(context_graph_internal_test_support)]`, which this per-fn scanner does not see, so its
+# rows count here). Retired: `producer_metadata_query_distinguishes_model_version_within_same_embedding_space_id`,
+# whose premise (two models in one space) the one-model-per-space ruling removes; a design proof
+# covers the replacement contract. 1347 + 16 + 5 - 1 = 1367.
+"context-graph" = 1367
 # 190 -> 184: the status tests for answers read-only status no longer gives were removed with that
 # change, and the retired chunked-import, estimate and raw-chunk forget routes took their tests.
 # 184 -> 187: coverage for the reader-wait allowance and the foreground import's unusable-lock

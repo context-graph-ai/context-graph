@@ -23,8 +23,6 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use support::CliHarness;
 
-const TEXT_DEFAULT_SPACE: &str = "text_default_nomic_v1_5_768";
-
 fn settings_path(harness: &CliHarness) -> PathBuf {
     harness
         .data_root
@@ -325,10 +323,11 @@ fn create_digest(
             kind: EvidenceKind::Text,
             embedding: PrecomputedEmbedding {
                 id: EmbeddingId::new_v7(),
-                embedding_space_id: TEXT_DEFAULT_SPACE.to_string(),
+                // The embedder's own space and model, so the supplied vector is stored.
+                embedding_space_id: embedder.embedding_space().embedding_space_id,
                 vector,
                 target: EmbeddingTarget::Digest(digest_id),
-                produced_by: EvidenceProducer::default(),
+                produced_by: EvidenceProducer::from(&embedder.producer()),
             },
             context_id,
             properties: BTreeMap::new(),

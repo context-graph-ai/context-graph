@@ -28,6 +28,9 @@ fn shared_config() -> (TempDir, StoreConfig) {
                 table_name: "evidence".to_string(),
                 vector_column: "vector_vision".to_string(),
             }],
+            placement: VectorPlacement::TravelsWithItem,
+            media_reachable_on_every_node: false,
+            producer: face_identity(),
         }],
         ..Default::default()
     };
@@ -66,6 +69,7 @@ fn count_where_uuid(db: &Database, table: &str, column: &str, id: uuid::Uuid) ->
     }
 }
 
+/// Whether a vector-index hit on `table` is a vector row of the item `expected`.
 fn vector_hits_contain_id(
     db: &Database,
     table: &str,
@@ -78,8 +82,35 @@ fn vector_hits_contain_id(
     hits.iter().any(|(row_id, _)| {
         rows.iter()
             .find(|row| row.row_id == *row_id)
-            .is_some_and(|row| row.values.get("id") == Some(&Value::Uuid(expected)))
+            .is_some_and(|row| row.values.get("target_id") == Some(&Value::Uuid(expected)))
     })
+}
+
+/// The face space's one model.
+fn face_identity() -> ModelIdentity {
+    ModelIdentity {
+        model: "vigil-face".to_string(),
+        weights_revision: "1".to_string(),
+        preparation: "face".to_string(),
+        dimension: 512,
+    }
+}
+
+/// The built-in text space's one model, read from a store rather than written down here.
+fn text_space_producer() -> EvidenceProducer {
+    static PRODUCER: std::sync::OnceLock<EvidenceProducer> = std::sync::OnceLock::new();
+    PRODUCER
+        .get_or_init(|| {
+            let (_dir, config) = shared_config();
+            let store = Store::open(config).expect("open to read the text space's model");
+            EvidenceProducer::from(
+                &store
+                    .space_producer("text_default_nomic_v1_5_768")
+                    .expect("read the text space's model")
+                    .expect("the built-in text space is declared"),
+            )
+        })
+        .clone()
 }
 
 fn producer(system: &str) -> EvidenceProducer {
@@ -144,7 +175,7 @@ fn text_observation(
             embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
             vector,
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer("probe"),
+            produced_by: text_space_producer(),
         })
         .into_iter()
         .collect();
@@ -418,7 +449,7 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
     let pre_evidence = table_count(&pre_db, "evidence");
     let pre_entity_snapshots = table_count(&pre_db, "entity_snapshots");
     let pre_entity_snapshot_observations = table_count(&pre_db, "entity_snapshot_observations");
-    let pre_embedding_handles = table_count(&pre_db, "evidence_embedding_handles");
+    let pre_embedding_rows = table_count(&pre_db, "evidence_embeddings");
     let pre_evidence_availability_log = table_count(&pre_db, "evidence_availability_log");
     drop(pre_db);
 
@@ -477,10 +508,7 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
         table_count(&db, "entity_snapshot_observations"),
         pre_entity_snapshot_observations
     );
-    assert_eq!(
-        table_count(&db, "evidence_embedding_handles"),
-        pre_embedding_handles
-    );
+    assert_eq!(table_count(&db, "evidence_embeddings"), pre_embedding_rows);
     assert_eq!(
         table_count(&db, "evidence_availability_log"),
         pre_evidence_availability_log
@@ -497,15 +525,16 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
         assert_eq!(
             count_where_uuid(
                 &db,
-                "evidence_embedding_handles",
-                "id",
-                embedding_id.as_uuid()
+                "evidence_embeddings",
+                "target_id",
+                evidence_id.as_uuid()
             ),
-            0
+            0,
+            "no vector row for {embedding_id:?} survives the rolled-back write"
         );
         let hits = db
             .query_vector(
-                VectorIndexRef::new("evidence", "vector_text"),
+                VectorIndexRef::new("evidence_embeddings", "vector_text"),
                 &vector,
                 10,
                 None,
@@ -513,7 +542,7 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
             )
             .expect("query");
         assert!(
-            !vector_hits_contain_id(&db, "evidence", &hits, evidence_id.as_uuid()),
+            !vector_hits_contain_id(&db, "evidence_embeddings", &hits, evidence_id.as_uuid()),
             "failed record_observation leaked vector_text entry for {evidence_id:?}"
         );
     }
@@ -763,7 +792,7 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
                     embedding_space_id: "vigil_face_reid_v1".to_string(),
                     vector: vision_vector(writer_idx),
                     target: EmbeddingTarget::Evidence(evidence_id),
-                    produced_by: producer("probe"),
+                    produced_by: EvidenceProducer::from(&face_identity()),
                 });
                 barrier.wait();
                 writer.record_observation(input)
@@ -777,7 +806,7 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
     for (writer_idx, expected_id) in evidence_ids.iter().copied().enumerate() {
         let text_hits = db
             .execute(
-                "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+                "SELECT target_id FROM evidence_embeddings ORDER BY vector_text <=> $query LIMIT 1",
                 &raw_params(vec![("query", Value::Vector(text_vector(writer_idx)))]),
             )
             .expect("text query");
@@ -790,7 +819,7 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
 
         let vision_hits = db
             .execute(
-                "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+                "SELECT target_id FROM evidence_embeddings_travelling ORDER BY vector_vision <=> $query LIMIT 1",
                 &raw_params(vec![("query", Value::Vector(vision_vector(writer_idx)))]),
             )
             .expect("vision query");
@@ -803,7 +832,7 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
 
         assert!(matches!(
             db.execute(
-                "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+                "SELECT target_id FROM evidence_embeddings ORDER BY vector_text <=> $query LIMIT 1",
                 &raw_params(vec![("query", Value::Vector(vision_vector(writer_idx)))])
             ),
             Err(Error::VectorIndexDimensionMismatch {
@@ -814,7 +843,7 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
         ));
         assert!(matches!(
             db.execute(
-                "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+                "SELECT target_id FROM evidence_embeddings_travelling ORDER BY vector_vision <=> $query LIMIT 1",
                 &raw_params(vec![("query", Value::Vector(text_vector(writer_idx)))])
             ),
             Err(Error::VectorIndexDimensionMismatch {

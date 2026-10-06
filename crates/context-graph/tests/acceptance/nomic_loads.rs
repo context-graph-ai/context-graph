@@ -12,10 +12,10 @@ use context_graph::embedding_space::{BuiltinSpaceRegistry, default_text_embeddin
 use context_graph::{
     CG_EDGE_SYSTEM_TAG, CgError, ContextId, CreateContext, CreateEntity, DistanceMetric, Embedder,
     EmbedderConfig, EmbedderLoadEvent, EmbedderLoadObserver, EmbedderRegistration, EmbeddingId,
-    EmbeddingInput, EmbeddingOutput, EmbeddingSpace, EmbeddingSpaceDecl, EmbeddingTarget, EntityId,
-    EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, ModelSource,
-    ObservationId, PrecomputedEmbedding, RecordObservation, ReindexEvent, ReindexOptions,
-    RetentionStatus, Store, StoreConfig,
+    EmbeddingInput, EmbeddingOutput, EmbeddingRole, EmbeddingSpace, EmbeddingSpaceDecl,
+    EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef,
+    ModelIdentity, ModelSource, ObservationId, OldSpace, PrecomputedEmbedding, RecordObservation,
+    ReindexEvent, ReindexOptions, RetentionStatus, Store, StoreConfig, VectorPlacement,
 };
 use contextdb_core::{RowId, Value, VectorIndexRef};
 use contextdb_engine::Database;
@@ -222,12 +222,7 @@ impl Embedder for DeterministicSiblingTextEmbedder {
             EmbeddingInput::Text(_) => Ok(EmbeddingOutput {
                 embedding_space_id: self.space.embedding_space_id.clone(),
                 dimension: self.space.dimension,
-                producer: EvidenceProducer {
-                    system: "acceptance".to_string(),
-                    model_name: "embeddinggemma-reindex-fixture".to_string(),
-                    model_version: "1".to_string(),
-                    pipeline_version: "reindex".to_string(),
-                },
+                producer: EvidenceProducer::from(&self.space.producer),
                 vector: self.vector.clone(),
             }),
             EmbeddingInput::ImageFrame { .. } | EmbeddingInput::ImageBytes(..) => {
@@ -253,6 +248,10 @@ impl Embedder for DeterministicSiblingTextEmbedder {
 
     fn embedding_space(&self) -> EmbeddingSpace {
         self.space.clone()
+    }
+
+    fn producer(&self) -> ModelIdentity {
+        self.space.producer.clone()
     }
 }
 
@@ -320,6 +319,14 @@ fn face_space() -> EmbeddingSpaceDecl {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
+        placement: VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: ModelIdentity {
+            model: "face-reid".to_string(),
+            weights_revision: "1".to_string(),
+            preparation: "local-face".to_string(),
+            dimension: 512,
+        },
     }
 }
 
@@ -398,7 +405,7 @@ fn assert_first_vector_hit_id(
 ) {
     assert!(
         !hits.is_empty(),
-        "expected at least one vector hit for {table}.id {expected}"
+        "expected at least one vector hit for {table}.target_id {expected}"
     );
     let row_id = hits[0].0;
     let rows = db
@@ -408,7 +415,7 @@ fn assert_first_vector_hit_id(
         .into_iter()
         .find(|row| row.row_id == row_id)
         .expect("vector hit row must still be visible");
-    assert_eq!(row.values.get("id"), Some(&Value::Uuid(expected)));
+    assert_eq!(row.values.get("target_id"), Some(&Value::Uuid(expected)));
 }
 
 fn tensor_bytes(values: &[f32]) -> Vec<u8> {
@@ -585,6 +592,10 @@ fn candle_embeddinggemma_consumer_registers_via_storeconfig_extra_embedding_spac
     let space = embedder.embedding_space();
     config.extra_embedding_spaces.push(space.clone());
 
+    let sibling_supply = EvidenceProducer {
+        system: "acceptance".to_string(),
+        ..EvidenceProducer::from(&embedder.producer())
+    };
     let opened = Store::open_with_embedder_registrations(
         config,
         vec![EmbedderRegistration { space, embedder }],
@@ -628,7 +639,7 @@ fn candle_embeddinggemma_consumer_registers_via_storeconfig_extra_embedding_spac
                 embedding_space_id: EMBEDDINGGEMMA_TEXT_DEFAULT_ID.to_string(),
                 vector: sibling_vector.clone(),
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: text_producer(),
+                produced_by: sibling_supply,
             }],
         ))
         .expect("record through sibling space");
@@ -637,14 +648,14 @@ fn candle_embeddinggemma_consumer_registers_via_storeconfig_extra_embedding_spac
     let db = Database::open(&db_path).expect("raw contextdb");
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &sibling_vector,
             1,
             None,
             db.snapshot(),
         )
         .expect("query sibling vector");
-    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
+    assert_first_vector_hit_id(&db, "evidence_embeddings", &hits, evidence_id.as_uuid());
 }
 
 #[test]
@@ -801,7 +812,9 @@ fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_defaul
  {
     let store_source = read_crate_file("src/store/mod.rs");
     let sibling = embeddinggemma_embedder();
-    let sibling_space = sibling.embedding_space();
+    let mut sibling_space = sibling.embedding_space();
+    // Registered beside the Nomic default without claiming a role; the switch moves the role.
+    sibling_space.default_for_evidence_kind = None;
     let mut old_vector = vec![0.0; 768];
     old_vector[1] = 1.0;
     let mut reindexed_vector = vec![0.0; 768];
@@ -845,6 +858,15 @@ fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_defaul
             .iter()
             .any(|space| space.embedding_space_id == EMBEDDINGGEMMA_TEXT_DEFAULT_ID)
     );
+    let nomic_supply = EvidenceProducer {
+        system: "acceptance".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(NOMIC_TEXT_DEFAULT_ID)
+                .expect("read Nomic's model")
+                .expect("the built-in Nomic space is declared"),
+        )
+    };
     store
         .record_observation(text_observation(
             observation_id,
@@ -853,24 +875,36 @@ fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_defaul
             evidence,
             vec![PrecomputedEmbedding {
                 id: EmbeddingId::new_v7(),
-                embedding_space_id: EMBEDDINGGEMMA_TEXT_DEFAULT_ID.to_string(),
-                vector: old_vector,
+                embedding_space_id: NOMIC_TEXT_DEFAULT_ID.to_string(),
+                vector: old_vector.clone(),
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: text_producer(),
+                produced_by: nomic_supply,
             }],
         ))
-        .expect("seed target-space handle before reindex");
+        .expect("seed the item's vector under the Nomic default before the switch");
+    let switched = store
+        .switch_embedding_space(
+            EmbeddingRole::EvidenceText,
+            sibling_space.clone(),
+            OldSpace::Reindex,
+        )
+        .expect("switch the text role forward to the EmbeddingGemma sibling space");
     store
         .reindex_space(EMBEDDINGGEMMA_TEXT_DEFAULT_ID, ReindexOptions::default())
         .expect("reindex registered EmbeddingGemma sibling space");
     let events = store.drain_reindex_events();
     assert!(
+        switched.from_space == NOMIC_TEXT_DEFAULT_ID
+            && switched.to_space == EMBEDDINGGEMMA_TEXT_DEFAULT_ID,
+        "the switch must move the text role from Nomic to the sibling space, switched={switched:?}"
+    );
+    assert!(
         events.iter().any(|event| matches!(
             event,
             ReindexEvent::Completed {
                 embedding_space_id,
-                rows_processed: 1,
-                ..
+                embedded: 1,
+                skipped: 0,
             } if embedding_space_id == EMBEDDINGGEMMA_TEXT_DEFAULT_ID
         )),
         "expected reindex completion for the sibling space, events={events:?}"
@@ -880,14 +914,27 @@ fn runtime_cross_embedder_switch_from_text_default_nomic_v1_5_768_to_text_defaul
     let db = Database::open(&db_path).expect("raw contextdb");
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &reindexed_vector,
             1,
             None,
             db.snapshot(),
         )
         .expect("query reindexed EmbeddingGemma sibling vector");
-    assert_first_vector_hit_id(&db, "evidence", &hits, evidence_id.as_uuid());
+    assert_first_vector_hit_id(&db, "evidence_embeddings", &hits, evidence_id.as_uuid());
+    let stale_hits = db
+        .query_vector(
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
+            &old_vector,
+            1,
+            None,
+            db.snapshot(),
+        )
+        .expect("query the replaced Nomic vector");
+    assert!(
+        stale_hits.iter().all(|(_, score)| *score < 0.99),
+        "the Nomic row must be gone once its replacement is written, stale_hits={stale_hits:?}"
+    );
     assert!(
         hits.first().is_some_and(|(_, score)| *score > 0.99),
         "the sibling-space vector index must return the reindexed text evidence with a self-match score, hits={hits:?}"

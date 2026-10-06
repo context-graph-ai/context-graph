@@ -48,8 +48,6 @@ struct StagedFailureProbe {
 struct StagedFailureTarget {
     good_evidence: EvidenceId,
     bad_evidence: EvidenceId,
-    good_embedding: EmbeddingId,
-    bad_embedding: EmbeddingId,
     good_vector: Vec<f32>,
     bad_vector: Vec<f32>,
 }
@@ -101,28 +99,42 @@ impl DatabasePlugin for StagedFailureProbe {
         let bad_row = write_set_row_for_uuid(ws, "evidence", "id", target.bad_evidence.as_uuid());
         let good_handle = write_set_row_for_uuid(
             ws,
-            "evidence_embedding_handles",
-            "id",
-            target.good_embedding.as_uuid(),
+            "evidence_embeddings",
+            "target_id",
+            target.good_evidence.as_uuid(),
         );
         let bad_handle = write_set_row_for_uuid(
             ws,
-            "evidence_embedding_handles",
-            "id",
-            target.bad_embedding.as_uuid(),
+            "evidence_embeddings",
+            "target_id",
+            target.bad_evidence.as_uuid(),
         );
         let vector_inserts = ws
             .vector_inserts
             .iter()
-            .filter(|entry| entry.index.table == "evidence" && entry.index.column == "vector_text")
+            .filter(|entry| {
+                entry.index.table == "evidence_embeddings" && entry.index.column == "vector_text"
+            })
             .count();
         self.observed_vector_inserts
             .store(vector_inserts, Ordering::SeqCst);
-        let good_vector_tx = good_row.and_then(|(row_id, _)| {
-            write_set_vector_tx(ws, row_id, "evidence", "vector_text", &target.good_vector)
+        let good_vector_tx = good_handle.and_then(|(row_id, _)| {
+            write_set_vector_tx(
+                ws,
+                row_id,
+                "evidence_embeddings",
+                "vector_text",
+                &target.good_vector,
+            )
         });
-        let bad_vector_tx = bad_row.and_then(|(row_id, _)| {
-            write_set_vector_tx(ws, row_id, "evidence", "vector_text", &target.bad_vector)
+        let bad_vector_tx = bad_handle.and_then(|(row_id, _)| {
+            write_set_vector_tx(
+                ws,
+                row_id,
+                "evidence_embeddings",
+                "vector_text",
+                &target.bad_vector,
+            )
         });
         let txs = [
             good_row.map(|(_, tx)| tx),
@@ -148,7 +160,7 @@ impl DatabasePlugin for StagedFailureProbe {
         {
             self.seen_matching_write_set.store(true, Ordering::SeqCst);
             return Err(contextdb_core::Error::UniqueViolation {
-                table: "evidence_embedding_handles".to_string(),
+                table: "evidence_embeddings".to_string(),
                 column: "id".to_string(),
             });
         }
@@ -195,6 +207,29 @@ fn producer(system: &str) -> EvidenceProducer {
         model_name: "external-encoder".to_string(),
         model_version: "1".to_string(),
         pipeline_version: "1".to_string(),
+    }
+}
+
+/// A consumer-claimed supply of the built-in text space's own model.
+fn supply_producer(system: &str) -> EvidenceProducer {
+    static MODEL: std::sync::OnceLock<EvidenceProducer> = std::sync::OnceLock::new();
+    let model = MODEL.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(StoreConfig {
+            db_path: dir.path().join("producer.db"),
+            ..Default::default()
+        })
+        .expect("open to read the text space's model");
+        EvidenceProducer::from(
+            &store
+                .space_producer(TEXT_SPACE)
+                .expect("read the text space's model")
+                .expect("the built-in text space is declared"),
+        )
+    });
+    EvidenceProducer {
+        system: system.to_string(),
+        ..model.clone()
     }
 }
 
@@ -269,7 +304,7 @@ fn observation(
             embedding_space_id: space.to_string(),
             vector,
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer("external"),
+            produced_by: supply_producer("external"),
         }],
     }
 }
@@ -302,7 +337,7 @@ fn hit_contains_id(db: &Database, table: &str, hits: &[(RowId, f32)], id: uuid::
     hits.iter().any(|(row_id, _)| {
         rows.iter()
             .find(|row| row.row_id == *row_id)
-            .is_some_and(|row| row.values.get("id") == Some(&Value::Uuid(id)))
+            .is_some_and(|row| row.values.get("target_id") == Some(&Value::Uuid(id)))
     })
 }
 
@@ -319,31 +354,38 @@ fn ingest_observation_with_precomputed_embedding() {
         vector.clone(),
         TEXT_SPACE,
     ));
+    let written_id = result
+        .as_ref()
+        .ok()
+        .and_then(|output| output.embedding_ids.first().copied())
+        .unwrap_or_default();
     let db = raw_db(&fixture.db_path, fixture.store);
 
     let handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id AND target_id = $target_id AND embedding_space_id = $space",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id AND target_id = $target_id AND embedding_space_id = $space",
         &params(vec![
-            ("id", Value::Uuid(embedding_id.as_uuid())),
+            ("id", Value::Uuid(written_id.as_uuid())),
             ("target_id", Value::Uuid(evidence_id.as_uuid())),
             ("space", Value::Text(TEXT_SPACE.to_string())),
         ]),
     );
     let producer_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id AND produced_by = $producer",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id AND produced_by = $producer",
         &params(vec![
-            ("id", Value::Uuid(embedding_id.as_uuid())),
+            ("id", Value::Uuid(written_id.as_uuid())),
             (
                 "producer",
-                Value::Json(serde_json::to_value(producer("external")).expect("producer json")),
+                Value::Json(
+                    serde_json::to_value(supply_producer("external")).expect("producer json"),
+                ),
             ),
         ]),
     );
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &vector,
             1,
             None,
@@ -354,11 +396,11 @@ fn ingest_observation_with_precomputed_embedding() {
     assert!(
         result
             .as_ref()
-            .is_ok_and(|output| output.embedding_ids == vec![embedding_id])
+            .is_ok_and(|output| output.embedding_ids.len() == 1)
             && handle_rows == 1
             && producer_rows == 1
-            && hit_contains_id(&db, "evidence", &hits, evidence_id.as_uuid()),
-        "expected precomputed evidence embedding to write a variant handle, producer JSON, and queryable vector; result={result:?}, handle_rows={handle_rows}, producer_rows={producer_rows}, hits={hits:?}"
+            && hit_contains_id(&db, "evidence_embeddings", &hits, evidence_id.as_uuid()),
+        "expected precomputed evidence embedding to write one vector row with its producer JSON and a queryable vector; result={result:?}, handle_rows={handle_rows}, producer_rows={producer_rows}, hits={hits:?}"
     );
 }
 
@@ -415,7 +457,7 @@ fn precomputed_embedding_dimension_validated_at_record_observation_before_db_wri
     );
     let leaked_vectors = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &text_vector(0),
             10,
             None,
@@ -489,8 +531,6 @@ fn precomputed_embedding_atomic_with_observation_partial_failure_rolls_back_all(
     failure_probe.arm(StagedFailureTarget {
         good_evidence,
         bad_evidence,
-        good_embedding,
-        bad_embedding,
         good_vector: good_vector.clone(),
         bad_vector: bad_vector.clone(),
     });
@@ -514,7 +554,7 @@ fn precomputed_embedding_atomic_with_observation_partial_failure_rolls_back_all(
         embedding_space_id: TEXT_SPACE.to_string(),
         vector: bad_vector.clone(),
         target: EmbeddingTarget::Evidence(bad_evidence),
-        produced_by: producer("external"),
+        produced_by: supply_producer("external"),
     });
 
     let result = fixture.store.record_observation(input);
@@ -531,7 +571,7 @@ fn precomputed_embedding_atomic_with_observation_partial_failure_rolls_back_all(
     );
     let handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $good OR target_id = $bad",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $good OR target_id = $bad",
         &params(vec![
             ("good", Value::Uuid(good_evidence.as_uuid())),
             ("bad", Value::Uuid(bad_evidence.as_uuid())),
@@ -539,7 +579,7 @@ fn precomputed_embedding_atomic_with_observation_partial_failure_rolls_back_all(
     );
     let hits = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &good_vector,
             10,
             None,
@@ -548,7 +588,7 @@ fn precomputed_embedding_atomic_with_observation_partial_failure_rolls_back_all(
         .expect("vector query");
     let leaked_good_vector = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &good_vector,
             10,
             None,
@@ -559,7 +599,7 @@ fn precomputed_embedding_atomic_with_observation_partial_failure_rolls_back_all(
         .any(|(_, score)| score > 0.99);
     let leaked_bad_vector = db
         .query_vector(
-            VectorIndexRef::new("evidence", "vector_text"),
+            VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &bad_vector,
             10,
             None,
@@ -577,15 +617,15 @@ fn precomputed_embedding_atomic_with_observation_partial_failure_rolls_back_all(
                     ref table,
                     ref column,
                 }
-            }) if table == "evidence_embedding_handles" && column == "id"
+            }) if table == "evidence_embeddings" && column == "id"
         ) && evidence_rows == 0
             && handle_rows == 0
             && failure_probe.pre_commit_calls() == 1
             && failure_probe.saw_matching_write_set()
             && failure_probe.vector_insert_count() == 2
             && failure_probe.staged_tx_count() == 1
-            && !hit_contains_id(&db, "evidence", &hits, good_evidence.as_uuid())
-            && !hit_contains_id(&db, "evidence", &hits, bad_evidence.as_uuid())
+            && !hit_contains_id(&db, "evidence_embeddings", &hits, good_evidence.as_uuid())
+            && !hit_contains_id(&db, "evidence_embeddings", &hits, bad_evidence.as_uuid())
             && !leaked_good_vector
             && !leaked_bad_vector
             && after_watermark == before_watermark,

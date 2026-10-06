@@ -1325,12 +1325,13 @@ fn store_open_against_existing_v3_database_returns_legacy_schema_detected_withou
         }) if found_version == CG_SCHEMA_VERSION - 1 && expected_version == CG_SCHEMA_VERSION
     ));
     assert!(
-        reopened.table_meta("evidence_embedding_handles").is_none()
+        reopened.table_meta("evidence_embeddings").is_none()
             && reopened
-                .table_meta("entity_reference_embedding_handles")
+                .table_meta("evidence_embeddings_travelling")
                 .is_none()
-            && reopened.table_meta("digest_embedding_handles").is_none(),
-        "rejected legacy open must not mutate the schema into the new embedding-handle shape"
+            && reopened.table_meta("digest_embeddings").is_none()
+            && reopened.table_meta("embedding_pending").is_none(),
+        "rejected legacy open must not mutate the schema into the new per-placement embedding shape"
     );
 }
 

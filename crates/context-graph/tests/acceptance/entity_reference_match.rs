@@ -32,10 +32,23 @@ fn store(name: &str) -> Store {
             supported_evidence_kinds: vec![context_graph::EvidenceKind::ImageFrame],
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            // Enrollments are caller-filled and travel; the space holds one model.
+            placement: context_graph::VectorPlacement::TravelsWithItem,
+            media_reachable_on_every_node: false,
+            producer: vision_identity(),
         }],
         ..Default::default()
     })
     .expect("store opens with a registered vision space and no text embedder")
+}
+
+fn vision_identity() -> context_graph::ModelIdentity {
+    context_graph::ModelIdentity {
+        model: "joint-image-text".to_string(),
+        weights_revision: "1".to_string(),
+        preparation: "1".to_string(),
+        dimension: DIM,
+    }
 }
 
 fn producer() -> EvidenceProducer {
@@ -431,6 +444,9 @@ fn embedder_input_supports_in_memory_image_bytes() {
                 supported_evidence_kinds: vec![context_graph::EvidenceKind::ImageFrame],
                 default_for_evidence_kind: None,
                 bindings: Vec::new(),
+                placement: context_graph::VectorPlacement::TravelsWithItem,
+                media_reachable_on_every_node: false,
+                producer: vision_identity(),
             }
         }
     }

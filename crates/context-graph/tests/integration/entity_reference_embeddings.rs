@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use context_graph::{
     CG_EDGE_SYSTEM_TAG, ContextId, CreateContext, CreateEntity, DistanceMetric, EmbeddingId,
-    EmbeddingSpaceDecl, EntityId, EntityType, EvidenceKind, EvidenceProducer, Store, StoreConfig,
+    EmbeddingSpaceDecl, EntityId, EntityType, EvidenceKind, EvidenceProducer, ModelIdentity, Store,
+    StoreConfig, VectorPlacement,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -33,6 +34,10 @@ fn fixture(name: &str) -> Fixture {
             supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            // Enrollments are caller-filled and travel; the space holds one face model.
+            placement: VectorPlacement::TravelsWithItem,
+            media_reachable_on_every_node: false,
+            producer: face_identity(),
         }],
         ..Default::default()
     })
@@ -62,6 +67,16 @@ fn fixture(name: &str) -> Fixture {
     }
 }
 
+fn face_identity() -> ModelIdentity {
+    ModelIdentity {
+        model: "face-reference".to_string(),
+        weights_revision: "1".to_string(),
+        preparation: "1".to_string(),
+        dimension: 512,
+    }
+}
+
+/// The face space's own model; any other revision would be refused for this space.
 fn producer(model_version: &str) -> EvidenceProducer {
     EvidenceProducer {
         system: CG_EDGE_SYSTEM_TAG.to_string(),
@@ -182,7 +197,7 @@ fn entity_reference_embedding_re_enrollment_under_same_label_idempotent_overwrit
         FACE_REFERENCE_SPACE,
         Some("front".to_string()),
         vec![0.5; 512],
-        producer("2"),
+        producer("1"),
     );
     let rows = fixture
         .store
@@ -203,7 +218,7 @@ fn entity_reference_embedding_re_enrollment_under_same_label_idempotent_overwrit
             && first == second
             && rows.as_ref().is_ok_and(|rows| rows.len() == 1
                 && rows[0].embedding_space_id == FACE_REFERENCE_SPACE
-                && rows[0].produced_by.model_version == "2"
+                && rows[0].produced_by == producer("1")
                 && rows[0].vector == vec![0.5; 512])
             && raw_rows == 1,
         "expected same-label re-enrollment to overwrite one stored row idempotently, first={first:?}, second={second:?}, rows={rows:?}, raw_rows={raw_rows}"
@@ -218,7 +233,7 @@ fn entity_reference_embedding_query_path_uniform_across_shot_count() {
         FACE_REFERENCE_SPACE,
         None,
         vec![1.0; 512],
-        producer("single"),
+        producer("1"),
     );
     let second_entity = fixture
         .store
@@ -235,14 +250,14 @@ fn entity_reference_embedding_query_path_uniform_across_shot_count() {
         FACE_REFERENCE_SPACE,
         Some("front".to_string()),
         vec![1.0; 512],
-        producer("multi"),
+        producer("1"),
     );
     let multi_b = fixture.store.enroll_entity_reference(
         second_entity.id,
         FACE_REFERENCE_SPACE,
         Some("side".to_string()),
         vec![0.5; 512],
-        producer("multi"),
+        producer("1"),
     );
     let single_rows = fixture
         .store

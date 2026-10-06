@@ -146,7 +146,7 @@ fn raw_digest_vector_query(
     let result = db
         .execute(
         &format!(
-            "SELECT id FROM digests WHERE context_id = $context_id ORDER BY vector_text <=> $q LIMIT {top_k}"
+            "SELECT target_id FROM digest_embeddings WHERE context_id = $context_id ORDER BY vector_text <=> $q LIMIT {top_k}"
         ),
         &HashMap::from([
             ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
@@ -172,7 +172,7 @@ fn raw_unrestricted_digest_vector_ids(
     top_k: i64,
 ) -> Vec<DigestId> {
     db.execute(
-        &format!("SELECT id FROM digests ORDER BY vector_text <=> $q LIMIT {top_k}"),
+        &format!("SELECT target_id FROM digest_embeddings ORDER BY vector_text <=> $q LIMIT {top_k}"),
         &HashMap::from([("q".to_string(), Value::Vector(query_vector))]),
     )
     .expect("raw unrestricted digest vector query")
@@ -390,7 +390,7 @@ fn contains_forbidden_planner_explain(compact: &str) -> bool {
 }
 
 fn is_digest_vector_retrieval(sql: &str) -> bool {
-    sql.contains("digests") && sql.contains("vector_text") && sql.contains("<=>")
+    sql.contains("digest_embeddings") && sql.contains("vector_text") && sql.contains("<=>")
 }
 
 fn normalize_sql(sql: &str) -> String {

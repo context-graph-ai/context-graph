@@ -5,9 +5,9 @@ use context_graph::{
     CgError, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId,
     DistanceMetric, EmbeddingId, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget,
     EntityId, EntityType, EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin,
-    IntentionStatus, Invalidation, InvalidationSeverity, InvalidationStatus, OverrideFailureReason,
-    PrecomputedEmbedding, RecordObservation, RetentionStatus, Store, StoreConfig,
-    test_support::embedding::entity_reference_cosine_match,
+    IntentionStatus, Invalidation, InvalidationSeverity, InvalidationStatus, ModelIdentity,
+    OverrideFailureReason, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store,
+    StoreConfig, VectorPlacement, test_support::embedding::entity_reference_cosine_match,
 };
 
 const FACE_REID_SPACE: &str = "vigil_face_reid_v1";
@@ -39,6 +39,10 @@ fn store(name: &str) -> Store {
                     table_name: "evidence".to_string(),
                     vector_column: "vector_vision".to_string(),
                 }],
+                // Live and reference face vectors are caller-filled and travel; one face model.
+                placement: VectorPlacement::TravelsWithItem,
+                media_reachable_on_every_node: false,
+                producer: face_identity(FACE_MODEL_REVISION),
             },
             EmbeddingSpaceDecl {
                 embedding_space_id: FACE_MISMATCH_SPACE.to_string(),
@@ -50,11 +54,26 @@ fn store(name: &str) -> Store {
                 supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
                 default_for_evidence_kind: None,
                 bindings: Vec::new(),
+                placement: VectorPlacement::TravelsWithItem,
+                media_reachable_on_every_node: false,
+                producer: face_identity("face-v2"),
             },
         ],
         ..Default::default()
     })
     .expect("store opens")
+}
+
+/// The face space's one model; reference enrollments and live frames both carry it.
+const FACE_MODEL_REVISION: &str = "face-v1";
+
+fn face_identity(revision: &str) -> ModelIdentity {
+    ModelIdentity {
+        model: "face-local".to_string(),
+        weights_revision: revision.to_string(),
+        preparation: "face-pipeline-v2".to_string(),
+        dimension: 512,
+    }
 }
 
 fn face_producer(version: &str) -> EvidenceProducer {
@@ -157,7 +176,7 @@ fn live_face_observation(scenario: &Scenario, axis: usize) -> RecordObservation 
             embedding_space_id: FACE_REID_SPACE.to_string(),
             vector: vector(axis),
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: face_producer("live-v2"),
+            produced_by: face_producer(FACE_MODEL_REVISION),
         }],
     }
 }
@@ -207,7 +226,7 @@ fn local_entity_face_embedding_match_overrides_class_detection() {
         FACE_REID_SPACE,
         Some("known-person".to_string()),
         vector(0),
-        face_producer("reference-v1"),
+        face_producer(FACE_MODEL_REVISION),
     );
     let observation = scenario
         .store
@@ -235,7 +254,7 @@ fn local_entity_face_embedding_no_match_invalidates_active_decision_and_emits_cr
         FACE_REID_SPACE,
         Some("known-person".to_string()),
         vector(0),
-        face_producer("reference-v1"),
+        face_producer(FACE_MODEL_REVISION),
     );
     let observation = scenario
         .store
@@ -266,14 +285,14 @@ fn local_entity_face_embedding_match_after_multi_shot_reenrollment_re_overrides(
         FACE_REID_SPACE,
         Some("front".to_string()),
         vector(0),
-        face_producer("reference-v1"),
+        face_producer(FACE_MODEL_REVISION),
     );
     let second = scenario.store.enroll_entity_reference(
         scenario.entity_id,
         FACE_REID_SPACE,
         Some("profile".to_string()),
         vector(1),
-        face_producer("reference-v1"),
+        face_producer(FACE_MODEL_REVISION),
     );
     let observation = scenario
         .store
@@ -305,7 +324,7 @@ fn local_entity_face_embedding_v1_v2_space_mismatch_refused_with_typed_error_nam
         FACE_REID_SPACE,
         Some("known-person".to_string()),
         vector(0),
-        face_producer("face-v1"),
+        face_producer(FACE_MODEL_REVISION),
     );
     let result = enrollment
         .as_ref()

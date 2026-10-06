@@ -367,8 +367,24 @@ fn harvest_contains_text(harvest: &StructuredHarvest, needle: &str) -> bool {
         })
 }
 
-fn create_digest_input(context_id: ContextId, summary: &str, kind: EvidenceKind) -> CreateDigest {
+/// A digest whose supplied vector is the store's active digest model's own, so it is stored.
+fn create_digest_input(
+    store: &Store,
+    context_id: ContextId,
+    summary: &str,
+    kind: EvidenceKind,
+) -> CreateDigest {
     let id = context_graph::DigestId::new_v7();
+    let space = store
+        .active_embedding_space(context_graph::EmbeddingRole::Digest)
+        .expect("read the active digest space")
+        .expect("the lexical model holds the digest role");
+    let produced_by = EvidenceProducer::from(
+        &store
+            .space_producer(&space)
+            .expect("read the digest space's model")
+            .expect("the digest space is declared"),
+    );
     CreateDigest {
         id,
         source: "claude-cli".to_string(),
@@ -377,10 +393,10 @@ fn create_digest_input(context_id: ContextId, summary: &str, kind: EvidenceKind)
         kind,
         embedding: PrecomputedEmbedding {
             id: EmbeddingId::new_v7(),
-            embedding_space_id: "text_default_nomic_v1_5_768".to_string(),
+            embedding_space_id: space,
             vector: digest_vector(summary.len()),
             target: EmbeddingTarget::Digest(id),
-            produced_by: EvidenceProducer::default(),
+            produced_by,
         },
         context_id,
         properties: BTreeMap::new(),
@@ -398,6 +414,7 @@ fn digest_create_and_retrieve_persist() {
         .expect("context");
     let created = store
         .create_digest(create_digest_input(
+            &store,
             context.id,
             "Tuesday session: auth module at src/auth.py serves password-less login",
             EvidenceKind::Text,
@@ -406,12 +423,8 @@ fn digest_create_and_retrieve_persist() {
     let db_path = store.db_path().to_path_buf();
     drop(store);
 
-    let reopened = Store::open(StoreConfig {
-        db_path,
-        default_text_embedder: None,
-        ..Default::default()
-    })
-    .expect("reopen");
+    // Reopened with the same digest model, whose node-local space holds the digest's vector.
+    let reopened = open_store_with_recall_embedder(db_path);
     let fetched = reopened
         .get_digest(created.id)
         .expect("get digest")
@@ -1064,6 +1077,7 @@ fn digest_is_text_evidence_not_universal_observation() {
         .expect("context");
     let digest = store
         .create_digest(create_digest_input(
+            &store,
             context.id,
             "digest is typed text evidence, not an Observation row",
             EvidenceKind::Text,
@@ -1093,6 +1107,7 @@ fn digest_does_not_ingest_camera_streams() {
         })
         .expect("context");
     let result = store.create_digest(create_digest_input(
+        &store,
         context.id,
         "camera frame should not become a Digest",
         EvidenceKind::ImageFrame,

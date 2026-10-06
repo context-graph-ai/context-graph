@@ -67,7 +67,12 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "intentions",
         "decisions",
         "entities",
-        "reindex_cursors",
+        // Travelling vectors and enrollments converge because a repeat replaces (keep latest).
+        "evidence_embeddings_travelling",
+        "entity_reference_embeddings_128",
+        "entity_reference_embeddings_256",
+        "entity_reference_embeddings_512",
+        "entity_reference_embeddings_768",
         "outcomes",
         "invalidations",
         "entity_current_snapshots",
@@ -81,18 +86,13 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "evidence",
         "embedding_spaces",
         "embedding_space_bindings",
-        "evidence_embedding_handles",
-        "entity_reference_embedding_handles",
-        "entity_reference_embeddings_128",
-        "entity_reference_embeddings_256",
-        "entity_reference_embeddings_512",
-        "entity_reference_embeddings_768",
+        // Space succession is an append-only set of edges every node keeps.
+        "embedding_space_successions",
         "evidence_availability_log",
         "signatures",
         "signature_aggregates",
         "signature_producer_lineage",
         "digests",
-        "digest_embedding_handles",
         "blueprints",
         "edges",
         "entity_snapshots",
@@ -131,6 +131,11 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "event_source_checkpoints",
         "event_source_locators",
         "event_source_ordering",
+        // Reproducible vectors, their rebuild markers and skips stay on the node that built them.
+        "evidence_embeddings",
+        "digest_embeddings",
+        "embedding_pending",
+        "embedding_skips",
     ];
     const ENGINE_OWNED: &[&str] = &[
         "work_jobs",
@@ -142,10 +147,10 @@ fn context_graph_tables_declare_the_frozen_sync_contract() {
         "work_capabilities",
     ];
 
-    assert_eq!(KEEP_LATEST.len(), 9);
-    assert_eq!(KEEP_FIRST.len(), 33);
+    assert_eq!(KEEP_LATEST.len(), 13);
+    assert_eq!(KEEP_FIRST.len(), 27);
     assert_eq!(LOCAL_ONLY_KEEP_FIRST.len(), 2);
-    assert_eq!(SYNC_OFF.len(), 16);
+    assert_eq!(SYNC_OFF.len(), 20);
     assert_eq!(ENGINE_OWNED.len(), 7);
 
     let mut expected = BTreeMap::new();

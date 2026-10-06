@@ -10,7 +10,8 @@ use std::sync::{
 
 use context_graph::{
     CgError, CreateContext, CreateEntity, DistanceMetric, EmbeddingId, EmbeddingSpaceDecl,
-    EntityId, EntityType, EvidenceKind, EvidenceProducer, Store, StoreConfig, TxId,
+    EntityId, EntityType, EvidenceKind, EvidenceProducer, ModelIdentity, Store, StoreConfig, TxId,
+    VectorPlacement,
 };
 #[cfg(context_graph_internal_test_support)]
 use contextdb_core::{Error as EngineError, RowId};
@@ -46,6 +47,9 @@ fn store_config(db_path: PathBuf) -> StoreConfig {
             supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
             default_for_evidence_kind: None,
             bindings: Vec::new(),
+            placement: VectorPlacement::TravelsWithItem,
+            media_reachable_on_every_node: false,
+            producer: face_identity(),
         }],
         ..Default::default()
     }
@@ -113,8 +117,8 @@ impl DatabasePlugin for EntityReferenceFkProbe {
         let Some(target) = self.target.lock().expect("target").clone() else {
             return;
         };
+        // The enrollment row carries its own id, space and producer; there is no handle row.
         let reference_row = write_set_row_for_entity_reference(ws, &target);
-        let handle_row = write_set_handle_for_entity_reference(ws, &target);
         let reference_vector_tx = reference_row.and_then(|row_id| {
             write_set_vector_tx(
                 ws,
@@ -126,14 +130,12 @@ impl DatabasePlugin for EntityReferenceFkProbe {
         });
         let txs = [
             reference_row.and_then(|row_id| write_set_row_tx(ws, row_id)),
-            handle_row.and_then(|row_id| write_set_row_tx(ws, row_id)),
             reference_vector_tx,
         ]
         .into_iter()
         .flatten()
         .collect::<BTreeSet<_>>();
         if reference_row.is_some()
-            && handle_row.is_some()
             && reference_vector_tx.is_some()
             && txs.len() == 1
             && source == CommitSource::User
@@ -155,8 +157,7 @@ fn entity_reference_fk_error(error: &EngineError) -> bool {
             parent_table,
             ..
         } if parent_table == "entities"
-            && (child_table == "entity_reference_embeddings_512"
-                || child_table == "entity_reference_embedding_handles")
+            && child_table == "entity_reference_embeddings_512"
             && child_columns.iter().any(|column| column == "context_id")
             && child_columns.iter().any(|column| column == "entity_id" || column == "target_id")
     )
@@ -172,23 +173,6 @@ fn write_set_row_for_entity_reference(
         .filter(|(table_name, _)| table_name == "entity_reference_embeddings_512")
         .find_map(|(_, row)| {
             (row.values.get("entity_id") == Some(&Value::Uuid(target.entity_id))
-                && row.values.get("context_id") == Some(&Value::Uuid(target.context_id))
-                && row.values.get("embedding_space_id")
-                    == Some(&Value::Text(FACE_REFERENCE_SPACE.to_string())))
-            .then_some(row.row_id)
-        })
-}
-
-#[cfg(context_graph_internal_test_support)]
-fn write_set_handle_for_entity_reference(
-    ws: &WriteSet,
-    target: &EntityReferenceFkTarget,
-) -> Option<RowId> {
-    ws.relational_inserts
-        .iter()
-        .filter(|(table_name, _)| table_name == "entity_reference_embedding_handles")
-        .find_map(|(_, row)| {
-            (row.values.get("target_id") == Some(&Value::Uuid(target.entity_id))
                 && row.values.get("context_id") == Some(&Value::Uuid(target.context_id))
                 && row.values.get("embedding_space_id")
                     == Some(&Value::Text(FACE_REFERENCE_SPACE.to_string())))
@@ -289,12 +273,13 @@ fn raw_entity_reference_rows(db_path: &PathBuf, entity_id: EntityId) -> Vec<(Emb
     rows
 }
 
-fn raw_entity_reference_handle_count(db_path: &PathBuf, entity_id: EntityId) -> usize {
+/// Every enrollment row of the entity; each row is its own handle.
+fn raw_entity_reference_enrollment_count(db_path: &PathBuf, entity_id: EntityId) -> usize {
     let db = Database::open(db_path).expect("raw database open");
-    db.scan("entity_reference_embedding_handles", db.snapshot())
-        .expect("raw entity reference handle scan")
+    db.scan("entity_reference_embeddings_512", db.snapshot())
+        .expect("raw entity reference enrollment scan")
         .into_iter()
-        .filter(|row| row.values.get("target_id") == Some(&Value::Uuid(entity_id.as_uuid())))
+        .filter(|row| row.values.get("entity_id") == Some(&Value::Uuid(entity_id.as_uuid())))
         .count()
 }
 
@@ -323,13 +308,19 @@ fn seed_entity(store: &Store, name: &str) -> context_graph::Entity {
         .expect("entity")
 }
 
-fn producer() -> EvidenceProducer {
-    EvidenceProducer {
-        system: context_graph::CG_EDGE_SYSTEM_TAG.to_string(),
-        model_name: "reference".to_string(),
-        model_version: "1".to_string(),
-        pipeline_version: "1".to_string(),
+/// The face-reference space's one model.
+fn face_identity() -> ModelIdentity {
+    ModelIdentity {
+        model: "face-reference".to_string(),
+        weights_revision: "v1".to_string(),
+        preparation: "face".to_string(),
+        dimension: 512,
     }
+}
+
+/// An enrollment's producer is the space's own model.
+fn producer() -> EvidenceProducer {
+    EvidenceProducer::from(&face_identity())
 }
 
 #[test]
@@ -450,14 +441,6 @@ fn assert_unknown_entity_reference_enrollment_reaches_engine_fk() {
             ("context_id", Value::Uuid(context.id.as_uuid())),
         ]),
     );
-    let handle_rows = count_from_store(
-        &store,
-        "SELECT COUNT(*) AS n FROM entity_reference_embedding_handles WHERE target_id = $entity_id AND context_id = $context_id",
-        &params(vec![
-            ("entity_id", Value::Uuid(unknown_entity_id.as_uuid())),
-            ("context_id", Value::Uuid(context.id.as_uuid())),
-        ]),
-    );
     let engine_fk_path_seen = probe.saw_engine_fk_path();
     drop(store);
     let leaked_vectors = leaked_entity_reference_vector_count(&db_path, &vector);
@@ -466,11 +449,11 @@ fn assert_unknown_entity_reference_enrollment_reaches_engine_fk() {
             result,
             Err(CgError::EntityNotFound { entity_id }) if entity_id == unknown_entity_id
         ),
-        "expected typed missing-entity rejection from engine FK path with no durable row or vector leak, result={result:?}, engine_fk_path_seen={engine_fk_path_seen}, reference_rows={reference_rows}, handle_rows={handle_rows}, leaked_vectors={leaked_vectors}"
+        "expected typed missing-entity rejection from engine FK path with no durable row or vector leak, result={result:?}, engine_fk_path_seen={engine_fk_path_seen}, reference_rows={reference_rows}, leaked_vectors={leaked_vectors}"
     );
     assert!(
-        engine_fk_path_seen && reference_rows == 0 && handle_rows == 0 && leaked_vectors == 0,
-        "unknown entity enrollment must reach a failed contextdb WriteSet with entity-reference row, handle, and row-bound vector in one tx, then roll all of it back; result={result:?}, engine_fk_path_seen={engine_fk_path_seen}, reference_rows={reference_rows}, handle_rows={handle_rows}, leaked_vectors={leaked_vectors}"
+        engine_fk_path_seen && reference_rows == 0 && leaked_vectors == 0,
+        "unknown entity enrollment must reach a failed contextdb WriteSet with the entity-reference row and its row-bound vector in one tx, then roll all of it back; result={result:?}, engine_fk_path_seen={engine_fk_path_seen}, reference_rows={reference_rows}, leaked_vectors={leaked_vectors}"
     );
 }
 
@@ -565,7 +548,7 @@ fn entity_reference_embedding_parent_entity_archive_does_not_orphan_child_rows()
     drop(fixture.store);
     let raw_rows_after_rejected_write = raw_entity_reference_rows(&db_path, entity.id);
     let raw_handle_count_after_rejected_write =
-        raw_entity_reference_handle_count(&db_path, entity.id);
+        raw_entity_reference_enrollment_count(&db_path, entity.id);
     let rejected_vector_hits_after_rejected_write =
         leaked_entity_reference_vector_count(&db_path, &rejected_vector);
     let reopened_store = Store::open(store_config(db_path.clone())).expect("reopen after archive");
@@ -581,7 +564,7 @@ fn entity_reference_embedding_parent_entity_archive_does_not_orphan_child_rows()
         .unwrap_or_default();
     drop(reopened_store);
     let raw_rows_after_reopen = raw_entity_reference_rows(&db_path, entity.id);
-    let raw_handle_count_after_reopen = raw_entity_reference_handle_count(&db_path, entity.id);
+    let raw_handle_count_after_reopen = raw_entity_reference_enrollment_count(&db_path, entity.id);
     let rejected_vector_hits_after_reopen =
         leaked_entity_reference_vector_count(&db_path, &rejected_vector);
 

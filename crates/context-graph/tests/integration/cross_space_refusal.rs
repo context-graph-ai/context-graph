@@ -8,7 +8,8 @@ use context_graph::test_support::embedding::{
 use context_graph::{
     CreateContext, CreateEntity, DistanceMetric, EmbeddingId, EmbeddingSpace,
     EmbeddingSpaceBinding, EmbeddingTarget, EntityType, EvidenceId, EvidenceKind, EvidenceProducer,
-    EvidenceRef, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store, StoreConfig,
+    EvidenceRef, ModelIdentity, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store,
+    StoreConfig, VectorPlacement,
 };
 
 const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
@@ -38,6 +39,27 @@ fn image_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: ModelIdentity {
+            model: "clip-local".to_string(),
+            weights_revision: "v1".to_string(),
+            preparation: "cross-space".to_string(),
+            dimension: 512,
+        },
+    }
+}
+
+/// An edge-memory supply of `space`'s own model.
+fn space_supply(store: &Store, space: &str) -> EvidenceProducer {
+    EvidenceProducer {
+        system: "edge-memory".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(space)
+                .expect("read the space's model")
+                .expect("the space is declared"),
+        )
     }
 }
 
@@ -107,7 +129,7 @@ fn seed_evidence(store: &Store, space: &str, kind: EvidenceKind, vector: Vec<f32
             embedding_space_id: space.to_string(),
             vector,
             target: EmbeddingTarget::Evidence(evidence_id),
-            produced_by: producer(),
+            produced_by: space_supply(store, space),
         }],
     });
     assert!(recorded.is_ok(), "seed evidence failed: {recorded:?}");

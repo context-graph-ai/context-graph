@@ -18,7 +18,8 @@ use context_graph::{
     DigestId, DistanceMetric, Embedder, EmbedderRegistration, EmbeddingId, EmbeddingInput,
     EmbeddingOutput, EmbeddingSpace, EmbeddingSpaceBinding, EmbeddingTarget, EntityId, EntityType,
     EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin, IntentionStatus,
-    ObservationId, PrecomputedEmbedding, RecordObservation, ReindexEvent, Store, StoreConfig,
+    ModelIdentity, ObservationId, PrecomputedEmbedding, RecordObservation, ReindexEvent, Store,
+    StoreConfig, VectorPlacement,
 };
 use contextdb_core::{TxId, Value};
 use contextdb_engine::Database;
@@ -28,6 +29,8 @@ use contextdb_engine::plugin::{DatabasePlugin, QueryOutcome};
 const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
 const NEW_TEXT_SPACE: &str = "text_default_embeddinggemma_500m_768";
 const IMAGE_SPACE: &str = "image_clip_v1_4";
+/// The semantic-search fixture's own text model and space; it holds the text role there.
+const AXIS_TEXT_SPACE: &str = "screenshot_semantic_axis_text_768";
 
 fn producer(version: &str) -> EvidenceProducer {
     EvidenceProducer {
@@ -92,6 +95,15 @@ fn image_space() -> EmbeddingSpace {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        // Caller-filled image vectors travel; the model is the vision producer's own fields.
+        placement: VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: ModelIdentity {
+            model: "clip-local".to_string(),
+            weights_revision: "vision-v1".to_string(),
+            preparation: "2026-05-15".to_string(),
+            dimension: 512,
+        },
     }
 }
 
@@ -110,7 +122,73 @@ fn new_text_space() -> EmbeddingSpace {
             table_name: "digests".to_string(),
             vector_column: "vector_text".to_string(),
         }],
+        placement: VectorPlacement::NodeLocal,
+        media_reachable_on_every_node: false,
+        producer: ModelIdentity {
+            model: "clip-local".to_string(),
+            weights_revision: "text-v2".to_string(),
+            preparation: "2026-05-15".to_string(),
+            dimension: 768,
+        },
     }
+}
+
+/// An edge-memory supply of `space`'s own model.
+fn space_supply(store: &Store, space: &str) -> EvidenceProducer {
+    EvidenceProducer {
+        system: "edge-memory".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(space)
+                .expect("read the space's model")
+                .expect("the space is declared"),
+        )
+    }
+}
+
+fn axis_text_identity() -> ModelIdentity {
+    ModelIdentity {
+        model: "embeddinggemma-300m".to_string(),
+        weights_revision: "semantic-test".to_string(),
+        preparation: "2026-05-19".to_string(),
+        dimension: 768,
+    }
+}
+
+fn axis_text_space() -> EmbeddingSpace {
+    EmbeddingSpace {
+        embedding_space_id: AXIS_TEXT_SPACE.to_string(),
+        dimension: 768,
+        metric: DistanceMetric::Cosine,
+        model_family: "text".to_string(),
+        model_name: "embeddinggemma-300m".to_string(),
+        model_version: "semantic-test".to_string(),
+        supported_evidence_kinds: vec![EvidenceKind::Text],
+        default_for_evidence_kind: Some(EvidenceKind::Text),
+        bindings: vec![
+            EmbeddingSpaceBinding {
+                embedding_space_id: AXIS_TEXT_SPACE.to_string(),
+                table_name: "evidence".to_string(),
+                vector_column: "vector_text".to_string(),
+            },
+            EmbeddingSpaceBinding {
+                embedding_space_id: AXIS_TEXT_SPACE.to_string(),
+                table_name: "digests".to_string(),
+                vector_column: "vector_text".to_string(),
+            },
+        ],
+        placement: VectorPlacement::NodeLocal,
+        media_reachable_on_every_node: false,
+        producer: axis_text_identity(),
+    }
+}
+
+/// The semantic-search store: the axis model's space holds the text role from the first open,
+/// so the seeds written before the embedder is registered land in the space it later searches.
+fn semantic_store_config(db_path: PathBuf) -> StoreConfig {
+    let mut config = store_config(db_path);
+    config.extra_embedding_spaces.push(axis_text_space());
+    config
 }
 
 fn store_config(db_path: PathBuf) -> StoreConfig {
@@ -175,14 +253,9 @@ impl Embedder for AxisTextEmbedder {
                     .expect("embedder outputs")
                     .push(vector.clone());
                 Ok(EmbeddingOutput {
-                    embedding_space_id: TEXT_SPACE.to_string(),
+                    embedding_space_id: AXIS_TEXT_SPACE.to_string(),
                     dimension: 768,
-                    producer: EvidenceProducer {
-                        system: "cg-edge".to_string(),
-                        model_name: "embeddinggemma-300m".to_string(),
-                        model_version: "semantic-test".to_string(),
-                        pipeline_version: "2026-05-19".to_string(),
-                    },
+                    producer: EvidenceProducer::from(&axis_text_identity()),
                     vector,
                 })
             }
@@ -208,28 +281,11 @@ impl Embedder for AxisTextEmbedder {
     }
 
     fn embedding_space(&self) -> EmbeddingSpace {
-        EmbeddingSpace {
-            embedding_space_id: TEXT_SPACE.to_string(),
-            dimension: 768,
-            metric: DistanceMetric::Cosine,
-            model_family: "text".to_string(),
-            model_name: "embeddinggemma-300m".to_string(),
-            model_version: "semantic-test".to_string(),
-            supported_evidence_kinds: vec![EvidenceKind::Text],
-            default_for_evidence_kind: Some(EvidenceKind::Text),
-            bindings: vec![
-                EmbeddingSpaceBinding {
-                    embedding_space_id: TEXT_SPACE.to_string(),
-                    table_name: "evidence".to_string(),
-                    vector_column: "vector_text".to_string(),
-                },
-                EmbeddingSpaceBinding {
-                    embedding_space_id: TEXT_SPACE.to_string(),
-                    table_name: "digests".to_string(),
-                    vector_column: "vector_text".to_string(),
-                },
-            ],
-        }
+        axis_text_space()
+    }
+
+    fn producer(&self) -> ModelIdentity {
+        axis_text_identity()
     }
 }
 
@@ -245,7 +301,7 @@ fn open_store_with_axis_text_embedder_and_probe(
     let outputs = Arc::clone(&embedder.outputs);
     let space = embedder.embedding_space();
     let store = Store::open_with_database_plugin_and_embedder_registrations(
-        store_config(db_path),
+        semantic_store_config(db_path),
         probe,
         vec![EmbedderRegistration {
             space,
@@ -333,14 +389,16 @@ impl DatabasePlugin for VectorPrimitiveQueryProbe {
             || normalized.contains("e.")
             || normalized.contains("vector_text")
             || normalized.contains("vector_vision");
-        let expected_evidence_row_vector_query = normalized.contains("from evidence")
+        let expected_evidence_row_vector_query = normalized
+            .contains("from evidence_embeddings_travelling")
             && normalized.contains("order by")
-            && normalized
-                .contains("vector_vision <=> row_vector('evidence','vector_vision',$query_id)")
+            && normalized.contains(
+                "vector_vision <=> row_vector('evidence_embeddings_travelling','vector_vision',$query_id)",
+            )
             && query_has_exact_limit(&normalized, 2)
             && ordered_query_has_context_id_filter(&normalized)
             && !query_has_forbidden_context_region(&normalized);
-        let expected_semantic_vector_query = normalized.contains("from evidence")
+        let expected_semantic_vector_query = normalized.contains("from evidence_embeddings ")
             && normalized.contains("order by")
             && normalized.contains("vector_text <=> $query")
             && query_has_exact_limit(&normalized, 1)
@@ -624,7 +682,7 @@ impl DatabasePlugin for DedupQueryPathProbe {
             .collect::<Vec<_>>()
             .join(" ");
         if !self.dedup_phase.load(Ordering::SeqCst) {
-            if normalized.contains("from digests")
+            if normalized.contains("from digest_embeddings")
                 && (normalized.contains("vector_text") || normalized.contains("select *"))
             {
                 self.pre_dedup_forbidden_queries
@@ -635,7 +693,7 @@ impl DatabasePlugin for DedupQueryPathProbe {
             return Ok(());
         }
         self.sql.lock().expect("dedup sql").push(normalized.clone());
-        if normalized.contains("from digests") && normalized.contains("vector_text") {
+        if normalized.contains("from digest_embeddings") && normalized.contains("vector_text") {
             if normalized.contains("order by") && normalized.contains("vector_text <=>") {
                 self.vector_order_queries.fetch_add(1, Ordering::SeqCst);
                 if ordered_query_has_digest_id_filter(&normalized)
@@ -790,7 +848,9 @@ fn raw_top_digest_ids(db_path: &Path, query: &[f32], top_k: usize) -> Vec<Digest
         .into_iter()
         .collect();
     db.execute(
-        &format!("SELECT id FROM digests ORDER BY vector_text <=> $query LIMIT {top_k}"),
+        &format!(
+            "SELECT target_id FROM digest_embeddings ORDER BY vector_text <=> $query LIMIT {top_k}"
+        ),
         &params,
     )
     .expect("raw digest vector query")
@@ -1754,8 +1814,12 @@ fn dedup_source_forbidden_vector_bypass_markers() -> Vec<String> {
         &[
             "from digests",
             "fromdigests",
+            "from digest_embeddings",
+            "fromdigest_embeddings",
             ".scan(\"digests\"",
             "::scan(\"digests\"",
+            ".scan(\"digest_embeddings\"",
+            "::scan(\"digest_embeddings\"",
             "::scan(&",
         ],
     ) && source_contains_any(&store_open_source, &["vector_text", "Value::Vector"])
@@ -1858,17 +1922,23 @@ fn vector_primitive_source_forbidden_bypass_markers(root: &str) -> Vec<String> {
                     "get_vector(",
                 ],
             );
-        let scan_vector_projection =
-            source_contains_any(&source, &[".scan(\"evidence\"", "::scan(\"evidence\""])
-                && source_contains_any(
-                    &source,
-                    &[
-                        "Value::Vector",
-                        "get_vector(",
-                        ".query_vector(",
-                        "::query_vector",
-                    ],
-                );
+        let scan_vector_projection = source_contains_any(
+            &source,
+            &[
+                ".scan(\"evidence\"",
+                "::scan(\"evidence\"",
+                ".scan(\"evidence_embeddings",
+                "::scan(\"evidence_embeddings",
+            ],
+        ) && source_contains_any(
+            &source,
+            &[
+                "Value::Vector",
+                "get_vector(",
+                ".query_vector(",
+                "::query_vector",
+            ],
+        );
         let direct_vector_api = source_contains_string_literal(&source, "evidence")
             && source_contains_any(&source, &["vector_text", "vector_vision"])
             && (source_contains_any(
@@ -1973,7 +2043,7 @@ fn assert_same_space_dedup_results(
                 && rows[0].target == EmbeddingTarget::Digest(candidate_digest)
                 && rows[0].embedding_space_id == TEXT_SPACE
                 && rows[0].context_id == Some(context_id)
-                && rows[0].index_ref == "digests.vector_text"
+                && rows[0].index_ref == "digest_embeddings.vector_text"
                 && dedup_engine_vector_trace(&rows[0].planner_trace)
                 && rows[0].score > 0.99
         }) && unlike_result.as_ref().is_ok_and(|rows| {
@@ -1981,7 +2051,7 @@ fn assert_same_space_dedup_results(
                 && rows[0].target == EmbeddingTarget::Digest(decoy_digest)
                 && rows[0].embedding_space_id == TEXT_SPACE
                 && rows[0].context_id == Some(context_id)
-                && rows[0].index_ref == "digests.vector_text"
+                && rows[0].index_ref == "digest_embeddings.vector_text"
                 && dedup_engine_vector_trace(&rows[0].planner_trace)
                 && rows[0].score < 0.25
         }) && other_query_result.as_ref().is_ok_and(|rows| {
@@ -1989,11 +2059,11 @@ fn assert_same_space_dedup_results(
                 && rows[0].target == EmbeddingTarget::Digest(candidate_digest)
                 && rows[0].embedding_space_id == TEXT_SPACE
                 && rows[0].context_id == Some(context_id)
-                && rows[0].index_ref == "digests.vector_text"
+                && rows[0].index_ref == "digest_embeddings.vector_text"
                 && dedup_engine_vector_trace(&rows[0].planner_trace)
                 && rows[0].score < 0.25
         }) && source_forbidden_vector_bypass_markers.is_empty(),
-        "same-space dedup must compare the supplied query Digest vector with each supplied candidate Digest vector through the contextdb digests.vector_text vector path from durable contextdb state after Store reopen and fresh-process execution, and the reachable production dedup helper code must not hide a broad vector primitive call or cg-side cosine fallback behind probe SQL; proof={proof}; source_forbidden_vector_bypass_markers={source_forbidden_vector_bypass_markers:?}; result={result:?}, unlike_result={unlike_result:?}, other_query_result={other_query_result:?}"
+        "same-space dedup must compare the supplied query Digest vector with each supplied candidate Digest vector through the contextdb digest_embeddings.vector_text vector path from durable contextdb state after Store reopen and fresh-process execution, and the reachable production dedup helper code must not hide a broad vector primitive call or cg-side cosine fallback behind probe SQL; proof={proof}; source_forbidden_vector_bypass_markers={source_forbidden_vector_bypass_markers:?}; result={result:?}, unlike_result={unlike_result:?}, other_query_result={other_query_result:?}"
     );
     [result_trace, unlike_trace, other_query_trace]
 }
@@ -2003,16 +2073,46 @@ fn dedup_engine_vector_trace(trace: &str) -> bool {
 }
 
 #[cfg(context_graph_internal_test_support)]
+/// The id of the vector row `item` owns in `table` (vector-row ids, not item ids, feed ROW_VECTOR).
+#[cfg(context_graph_internal_test_support)]
+fn vector_row_id(store: &Store, table: &str, item: uuid::Uuid) -> uuid::Uuid {
+    let result = store
+        .execute_sql_for_test(
+            &format!("SELECT id FROM {table} WHERE target_id = $target_id"),
+            &HashMap::from([("target_id".to_string(), Value::Uuid(item))]),
+        )
+        .expect("vector-row id lookup");
+    match result.rows.as_slice() {
+        [row] => match row.first() {
+            Some(Value::Uuid(id)) => *id,
+            other => panic!("expected a vector-row id, got {other:?}"),
+        },
+        rows => panic!("expected one vector row for {item} in {table}, got {rows:?}"),
+    }
+}
+
+#[cfg(context_graph_internal_test_support)]
 fn raw_dedup_trace(store: &Store, query_digest: DigestId, candidate_digest: DigestId) -> String {
     let result = store
         .execute_sql_for_test(
-            "SELECT id, context_id, score FROM digests WHERE id = $candidate_id ORDER BY vector_text <=> ROW_VECTOR('digests','vector_text',$query_id) LIMIT 1",
+            "SELECT target_id, context_id, score FROM digest_embeddings WHERE id = $candidate_id ORDER BY vector_text <=> ROW_VECTOR('digest_embeddings','vector_text',$query_id) LIMIT 1",
             &HashMap::from([
                 (
                     "candidate_id".to_string(),
-                    Value::Uuid(candidate_digest.as_uuid()),
+                    Value::Uuid(vector_row_id(
+                        store,
+                        "digest_embeddings",
+                        candidate_digest.as_uuid(),
+                    )),
                 ),
-                ("query_id".to_string(), Value::Uuid(query_digest.as_uuid())),
+                (
+                    "query_id".to_string(),
+                    Value::Uuid(vector_row_id(
+                        store,
+                        "digest_embeddings",
+                        query_digest.as_uuid(),
+                    )),
+                ),
             ]),
         )
         .expect("raw dedup trace query");
@@ -2029,16 +2129,21 @@ fn raw_evidence_row_vector_hits(
     let result = store
         .execute_sql_for_test(
             &format!(
-                "SELECT id, context_id, score FROM evidence WHERE context_id = $context_id ORDER BY vector_vision <=> ROW_VECTOR('evidence','vector_vision',$query_id) LIMIT {limit}"
+                "SELECT target_id, context_id, score FROM evidence_embeddings_travelling WHERE context_id = $context_id AND embedding_space_id = $space ORDER BY vector_vision <=> ROW_VECTOR('evidence_embeddings_travelling','vector_vision',$query_id) LIMIT {limit}"
             ),
             &HashMap::from([
                 (
                     "context_id".to_string(),
                     Value::Uuid(context_id.as_uuid()),
                 ),
+                ("space".to_string(), Value::Text(IMAGE_SPACE.to_string())),
                 (
                     "query_id".to_string(),
-                    Value::Uuid(query_evidence_id.as_uuid()),
+                    Value::Uuid(vector_row_id(
+                        store,
+                        "evidence_embeddings_travelling",
+                        query_evidence_id.as_uuid(),
+                    )),
                 ),
             ]),
         )
@@ -2068,12 +2173,13 @@ fn raw_semantic_vector_hits(
 ) -> (Vec<EmbeddingTarget>, Vec<f32>, String) {
     let result = store
         .execute_sql_for_test(
-            &format!("SELECT id, context_id, score FROM evidence WHERE context_id = $context_id ORDER BY vector_text <=> $query LIMIT {limit}"),
+            &format!("SELECT target_id, context_id, score FROM evidence_embeddings WHERE context_id = $context_id AND embedding_space_id = $space ORDER BY vector_text <=> $query LIMIT {limit}"),
             &HashMap::from([
                 (
                     "context_id".to_string(),
                     Value::Uuid(context_id.as_uuid()),
                 ),
+                ("space".to_string(), Value::Text(AXIS_TEXT_SPACE.to_string())),
                 ("query".to_string(), Value::Vector(query_vector)),
             ]),
         )
@@ -2130,7 +2236,7 @@ fn create_screenshot_digest(
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: vector(768, axis),
             target: EmbeddingTarget::Digest(digest_id),
-            produced_by: producer("digest-seed-v1"),
+            produced_by: space_supply(store, TEXT_SPACE),
         },
         context_id,
         properties: BTreeMap::new(),
@@ -2171,7 +2277,6 @@ fn screenshot_review_ingest_and_internal_search() {
         digest_summary,
         0,
     );
-    let digest_embedding_id = EmbeddingId::new_v7();
     let result = store.record_observation(observation_with_evidence(
         context_id,
         entity_id,
@@ -2185,11 +2290,11 @@ fn screenshot_review_ingest_and_internal_search() {
                 produced_by: producer("vision-v1"),
             },
             PrecomputedEmbedding {
-                id: digest_embedding_id,
+                id: EmbeddingId::new_v7(),
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector: vector(768, 0),
                 target: EmbeddingTarget::Digest(digest_id),
-                produced_by: producer("caption-v1"),
+                produced_by: space_supply(&store, TEXT_SPACE),
             },
         ],
     ));
@@ -2214,17 +2319,17 @@ fn screenshot_review_ingest_and_internal_search() {
     drop(store);
     let evidence_handle_rows = count_rows(
         &db_path,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id AND embedding_space_id = $space",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings_travelling WHERE target_id = $target_id AND embedding_space_id = $space",
         vec![
             ("target_id", Value::Uuid(evidence_id.as_uuid())),
             ("space", Value::Text(IMAGE_SPACE.to_string())),
         ],
     );
+    // The seed's digest vector and this call's share one deterministic row: the repeat replaces it.
     let digest_handle_rows = count_rows(
         &db_path,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE id = $id AND target_id = $target_id AND embedding_space_id = $space",
+        "SELECT COUNT(*) AS n FROM digest_embeddings WHERE target_id = $target_id AND embedding_space_id = $space",
         vec![
-            ("id", Value::Uuid(digest_embedding_id.as_uuid())),
             ("target_id", Value::Uuid(digest_id.as_uuid())),
             ("space", Value::Text(TEXT_SPACE.to_string())),
         ],
@@ -2322,7 +2427,7 @@ fn screenshot_review_evidence_search_uses_persisted_evidence_vector_as_query() {
                 && source_forbidden_vector_bypass_markers.is_empty()
                 && dedup_engine_vector_trace(&raw_trace)
                 && hits.iter().all(|hit| hit.embedding_space_id == IMAGE_SPACE
-                    && hit.index_ref == "evidence.vector_vision"
+                    && hit.index_ref == "evidence_embeddings_travelling.vector_vision"
                     && hit.context_id == Some(context_id)
                     && hit.planner_trace == raw_trace),
             "evidence_search must reopen durable contextdb state in a fresh process under an already-enabled query probe, bind the query Evidence id to ROW_VECTOR, restrict the vector query to the requested context, and return the same ordered ids/scores/trace as the raw contextdb query. The aligned row is deliberately similar but not identical, and a wrong-context row is closer than the aligned row, so binding the aligned id, ignoring context scope, or replaying a Store-local cache changes order/scores; hits={hits:?}, targets={targets:?}, scores={scores:?}, raw_targets={raw_targets:?}, raw_scores={raw_scores:?}, raw_trace={raw_trace:?}, returned_traces={returned_traces:?}, evidence_row_vector_query_count={evidence_row_vector_query_count}, unexpected_vector_queries={unexpected_vector_queries:?}, source_forbidden_vector_bypass_markers={source_forbidden_vector_bypass_markers:?}, observed_sql={observed_sql:?}, query_evidence_id={query_evidence_id:?}, aligned_evidence_id={aligned_evidence_id:?}, decoy_evidence_id={decoy_evidence_id:?}, wrong_context_evidence_id={wrong_context_evidence_id:?}"
@@ -2513,8 +2618,8 @@ fn screenshot_review_semantic_search_uses_registered_default_text_embedder_and_e
                 && unexpected_vector_queries.is_empty()
                 && source_forbidden_vector_bypass_markers.is_empty()
                 && dedup_engine_vector_trace(&raw_trace)
-                && hits[0].embedding_space_id == TEXT_SPACE
-                && hits[0].index_ref == "evidence.vector_text"
+                && hits[0].embedding_space_id == AXIS_TEXT_SPACE
+                && hits[0].index_ref == "evidence_embeddings.vector_text"
                 && hits[0].context_id == Some(context_id)
                 && hits[0].planner_trace == raw_trace,
             "semantic_search must reopen durable contextdb state in a fresh process under an already-enabled query probe, embed the query exactly once with the registered default text Embedder, bind that runtime output vector into a context-restricted engine query, and return the same ordered ids/scores/trace as raw contextdb. The matching row vector is deliberately similar but not identical to the Embedder output, and a wrong-context row exactly matches the Embedder output, so ignoring the output, binding the row vector, or ignoring context scope changes the score/target; hits={hits:?}, targets={targets:?}, scores={scores:?}, raw_targets={raw_targets:?}, raw_scores={raw_scores:?}, raw_trace={raw_trace:?}, embedder_calls={}, embedder_inputs={embedder_inputs:?}, embedder_outputs={embedder_outputs:?}, query_axis={query_axis}, semantic_vector_query_count={semantic_vector_query_count}, unexpected_vector_queries={unexpected_vector_queries:?}, source_forbidden_vector_bypass_markers={source_forbidden_vector_bypass_markers:?}, observed_sql={observed_sql:?}, matching_evidence_id={matching_evidence_id:?}, decoy_evidence_id={decoy_evidence_id:?}, wrong_context_evidence_id={wrong_context_evidence_id:?}",
@@ -2530,7 +2635,7 @@ fn screenshot_review_semantic_search_uses_registered_default_text_embedder_and_e
     let query_axis = ((uuid::Uuid::now_v7().as_u128() as usize) % 600) + 100;
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("screenshot-semantic-search-embedder.db");
-    let store = Store::open(store_config(db_path.clone())).expect("store opens");
+    let store = Store::open(semantic_store_config(db_path.clone())).expect("store opens");
     let (context_id, entity_id) = context_and_entity(&store);
     let (wrong_context_id, wrong_context_entity_id) = context_and_entity(&store);
     for (evidence_id, text, vector) in [
@@ -2551,7 +2656,7 @@ fn screenshot_review_semantic_search_uses_registered_default_text_embedder_and_e
             text_evidence(evidence_id, text),
             vec![PrecomputedEmbedding {
                 id: EmbeddingId::new_v7(),
-                embedding_space_id: TEXT_SPACE.to_string(),
+                embedding_space_id: AXIS_TEXT_SPACE.to_string(),
                 vector,
                 target: EmbeddingTarget::Evidence(evidence_id),
                 produced_by: semantic_fixture_producer(),
@@ -2568,7 +2673,7 @@ fn screenshot_review_semantic_search_uses_registered_default_text_embedder_and_e
             text_evidence(wrong_context_evidence_id, "wrong context exact query match"),
             vec![PrecomputedEmbedding {
                 id: EmbeddingId::new_v7(),
-                embedding_space_id: TEXT_SPACE.to_string(),
+                embedding_space_id: AXIS_TEXT_SPACE.to_string(),
                 vector: vector(768, query_axis),
                 target: EmbeddingTarget::Evidence(wrong_context_evidence_id),
                 produced_by: semantic_fixture_producer(),
@@ -2666,7 +2771,7 @@ fn screenshot_review_dedup_classifier_compares_same_space_digest_vectors() {
                     && pre_dedup_forbidden_queries.is_empty()
                     && forbidden_queries.is_empty()
                     && returned_traces == raw_traces,
-                "same-space dedup must execute exactly one candidate-id-constrained contextdb digests.vector_text <=> query per comparison after Store::open, propagate the exact contextdb QueryResult.trace from the equivalent ROW_VECTOR query, and must not preload digest vectors before the helper call, broad-search then filter, or read digest vectors into cg memory for scoring, vector_order_query_count={vector_order_query_count}, constrained_vector_order_query_count={constrained_vector_order_query_count}, unconstrained_vector_order_query_count={unconstrained_vector_order_query_count}, direct_digest_vector_read_count={direct_digest_vector_read_count}, pre_dedup_forbidden_queries={pre_dedup_forbidden_queries:?}, forbidden_queries={forbidden_queries:?}, observed_sql={observed_sql:?}, returned_traces={returned_traces:?}, raw_traces={raw_traces:?}"
+                "same-space dedup must execute exactly one candidate-id-constrained contextdb digest_embeddings.vector_text <=> query per comparison after Store::open, propagate the exact contextdb QueryResult.trace from the equivalent ROW_VECTOR query, and must not preload digest vectors before the helper call, broad-search then filter, or read digest vectors into cg memory for scoring, vector_order_query_count={vector_order_query_count}, constrained_vector_order_query_count={constrained_vector_order_query_count}, unconstrained_vector_order_query_count={unconstrained_vector_order_query_count}, direct_digest_vector_read_count={direct_digest_vector_read_count}, pre_dedup_forbidden_queries={pre_dedup_forbidden_queries:?}, forbidden_queries={forbidden_queries:?}, observed_sql={observed_sql:?}, returned_traces={returned_traces:?}, raw_traces={raw_traces:?}"
             );
         }
         #[cfg(not(context_graph_internal_test_support))]
@@ -2786,7 +2891,7 @@ fn screenshot_review_dedup_classifier_refuses_cross_space_compare_when_text_defa
             embedding_space_id: TEXT_SPACE.to_string(),
             vector: vector(768, 0),
             target: EmbeddingTarget::Digest(tuesday),
-            produced_by: producer("text-v1"),
+            produced_by: space_supply(&store, TEXT_SPACE),
         },
         context_id,
         properties: BTreeMap::new(),
@@ -2802,7 +2907,7 @@ fn screenshot_review_dedup_classifier_refuses_cross_space_compare_when_text_defa
             embedding_space_id: NEW_TEXT_SPACE.to_string(),
             vector: vector(768, 0),
             target: EmbeddingTarget::Digest(friday),
-            produced_by: producer("text-v2"),
+            produced_by: space_supply(&store, NEW_TEXT_SPACE),
         },
         context_id,
         properties: BTreeMap::new(),
@@ -2911,8 +3016,6 @@ fn screenshot_review_two_parallel_embeddings_land_atomically_in_one_record_obser
         "dual embedding screenshot digest",
         1,
     );
-    let image_embedding_id = EmbeddingId::new_v7();
-    let digest_embedding_id = EmbeddingId::new_v7();
     let observation = RecordObservation {
         id: ObservationId::new_v7(),
         entity_id,
@@ -2926,18 +3029,18 @@ fn screenshot_review_two_parallel_embeddings_land_atomically_in_one_record_obser
         properties: BTreeMap::new(),
         embeddings: vec![
             PrecomputedEmbedding {
-                id: image_embedding_id,
+                id: EmbeddingId::new_v7(),
                 embedding_space_id: "image_clip_v1_4".to_string(),
                 vector: vector(512, 0),
                 target: EmbeddingTarget::Evidence(evidence_id),
                 produced_by: producer("vision-v1"),
             },
             PrecomputedEmbedding {
-                id: digest_embedding_id,
+                id: EmbeddingId::new_v7(),
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector: vector(768, 1),
                 target: EmbeddingTarget::Digest(digest_id),
-                produced_by: producer("digest-v1"),
+                produced_by: space_supply(&store, TEXT_SPACE),
             },
         ],
     };
@@ -2969,14 +3072,20 @@ fn screenshot_review_two_parallel_embeddings_land_atomically_in_one_record_obser
                 embedding_space_id: TEXT_SPACE.to_string(),
                 vector: vec![0.1, 0.2],
                 target: EmbeddingTarget::Digest(bad_digest_id),
-                produced_by: producer("digest-v1"),
+                produced_by: space_supply(&store, TEXT_SPACE),
             },
         ],
     });
     drop(store);
+    let written = result
+        .as_ref()
+        .map(|out| out.embedding_ids.clone())
+        .unwrap_or_default();
+    let image_embedding_id = written.first().copied().unwrap_or_default();
+    let digest_embedding_id = written.get(1).copied().unwrap_or_default();
     let handle_rows = count_rows(
         &db_path,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id AND target_id = $target_id AND embedding_space_id = $space",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings_travelling WHERE id = $id AND target_id = $target_id AND embedding_space_id = $space",
         vec![
             ("id", Value::Uuid(image_embedding_id.as_uuid())),
             ("target_id", Value::Uuid(evidence_id.as_uuid())),
@@ -2984,7 +3093,7 @@ fn screenshot_review_two_parallel_embeddings_land_atomically_in_one_record_obser
         ],
     ) + count_rows(
         &db_path,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE id = $id AND target_id = $target_id AND embedding_space_id = $space",
+        "SELECT COUNT(*) AS n FROM digest_embeddings WHERE id = $id AND target_id = $target_id AND embedding_space_id = $space",
         vec![
             ("id", Value::Uuid(digest_embedding_id.as_uuid())),
             ("target_id", Value::Uuid(digest_id.as_uuid())),
@@ -2993,12 +3102,12 @@ fn screenshot_review_two_parallel_embeddings_land_atomically_in_one_record_obser
     );
     let evidence_txids = txids(
         &db_path,
-        "SELECT created_at FROM evidence_embedding_handles WHERE id = $id",
+        "SELECT created_at FROM evidence_embeddings_travelling WHERE id = $id",
         vec![("id", Value::Uuid(image_embedding_id.as_uuid()))],
     );
     let digest_txids = txids(
         &db_path,
-        "SELECT created_at FROM digest_embedding_handles WHERE id = $id",
+        "SELECT created_at FROM digest_embeddings WHERE id = $id",
         vec![("id", Value::Uuid(digest_embedding_id.as_uuid()))],
     );
     let bad_rows = count_rows(
@@ -3007,11 +3116,11 @@ fn screenshot_review_two_parallel_embeddings_land_atomically_in_one_record_obser
         vec![("target_id", Value::Uuid(bad_evidence_id.as_uuid()))],
     ) + count_rows(
         &db_path,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings_travelling WHERE target_id = $target_id",
         vec![("target_id", Value::Uuid(bad_evidence_id.as_uuid()))],
     ) + count_rows(
         &db_path,
-        "SELECT COUNT(*) AS n FROM digest_embedding_handles WHERE target_id = $target_id",
+        "SELECT COUNT(*) AS n FROM digest_embeddings WHERE target_id = $target_id",
         vec![("target_id", Value::Uuid(bad_digest_id.as_uuid()))],
     ) + count_rows(
         &db_path,
@@ -3029,6 +3138,6 @@ fn screenshot_review_two_parallel_embeddings_land_atomically_in_one_record_obser
             && evidence_txids[0] == digest_txids[0]
             && bad.is_err()
             && bad_rows == 0,
-        "both screenshot embeddings must land atomically in variant handle tables at the same commit txid against an existing durable Digest, and validation failure must roll back the whole call, digest_seed={digest_seed:?}, result={result:?}, handle_rows={handle_rows}, evidence_txids={evidence_txids:?}, digest_txids={digest_txids:?}, bad={bad:?}, bad_rows={bad_rows}"
+        "both screenshot embeddings must land atomically in their placement tables at the same commit txid against an existing durable Digest, and validation failure must roll back the whole call, digest_seed={digest_seed:?}, result={result:?}, handle_rows={handle_rows}, evidence_txids={evidence_txids:?}, digest_txids={digest_txids:?}, bad={bad:?}, bad_rows={bad_rows}"
     );
 }

@@ -359,7 +359,7 @@ fn raw_digest_vector_query(
     let result = db
         .execute(
             &format!(
-                "SELECT id FROM digests WHERE context_id = $context_id ORDER BY vector_text <=> $query LIMIT {limit}"
+                "SELECT target_id FROM digest_embeddings WHERE context_id = $context_id ORDER BY vector_text <=> $query LIMIT {limit}"
             ),
             &HashMap::from([
                 ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
@@ -711,7 +711,7 @@ fn find_via_digests_uses_contextdb_vector_index_and_graph_traversal_not_local_sc
                 .is_some_and(|hit| hit.graph_walk.target_digest_id == target_digest.id
                     && hit.graph_walk.relationship == "EXTRACTED_FROM"
                     && hit.graph_walk.source_ids == raw_graph_source_ids)
-            && public_trace.contains("digests.vector_text"),
+            && public_trace.contains("digest_embeddings.vector_text"),
         "digest retrieval must use ContextDB's disclosed indexed AUTO plan and GRAPH_TABLE EXTRACTED_FROM walk; hits={hits:?}, raw_ids={raw_ids:?}, raw_trace={raw_trace:?}, raw_graph_source_ids={raw_graph_source_ids:?}, raw_graph_trace={raw_graph_trace:?}, indexed_vectors={indexed_vectors}, public_trace={public_trace:?}"
     );
 }

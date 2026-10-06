@@ -10,8 +10,8 @@ use chrono::Utc;
 use context_graph::{
     ContextId, CreateContext, CreateEntity, DistanceMetric, EmbeddingId, EmbeddingSpaceBinding,
     EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind,
-    EvidenceProducer, EvidenceRef, PrecomputedEmbedding, RecordObservation, RetentionStatus, Store,
-    StoreConfig,
+    EvidenceProducer, EvidenceRef, ModelIdentity, PrecomputedEmbedding, RecordObservation,
+    RetentionStatus, Store, StoreConfig, VectorPlacement,
 };
 use contextdb_core::{Error as EngineError, RowId, TxId, Value, VectorIndexRef};
 use contextdb_engine::Database;
@@ -48,9 +48,9 @@ struct StagedDuplicateHandleProbe {
     concurrent_writer_reached_handle_sql: AtomicBool,
 }
 
+/// Writers that share one evidence id; each is told apart by its vector.
 #[derive(Clone)]
 struct DuplicateHandleTarget {
-    embedding_id: EmbeddingId,
     writes: Vec<(EvidenceId, Vec<f32>)>,
 }
 
@@ -114,24 +114,18 @@ impl StagedDuplicateHandleProbe {
             .store(false, Ordering::SeqCst);
     }
 
-    fn full_staged_write_for(
-        &self,
-        evidence_id: EvidenceId,
-    ) -> Option<ObservedDuplicateHandleWrite> {
-        self.full_staged_write_for_phase(evidence_id, DuplicateHandleObservationPhase::PreCommit)
+    fn full_staged_write_for(&self, vector: &[f32]) -> Option<ObservedDuplicateHandleWrite> {
+        self.full_staged_write_for_phase(vector, DuplicateHandleObservationPhase::PreCommit)
     }
 
-    fn failed_full_staged_write_for(
-        &self,
-        evidence_id: EvidenceId,
-    ) -> Option<ObservedDuplicateHandleWrite> {
-        self.full_staged_write_for_phase(evidence_id, DuplicateHandleObservationPhase::CommitFailed)
+    fn failed_full_staged_write_for(&self, vector: &[f32]) -> Option<ObservedDuplicateHandleWrite> {
+        self.full_staged_write_for_phase(vector, DuplicateHandleObservationPhase::CommitFailed)
             .filter(|write| write.failed_unique_violation)
     }
 
     fn full_staged_write_for_phase(
         &self,
-        evidence_id: EvidenceId,
+        vector: &[f32],
         phase: DuplicateHandleObservationPhase,
     ) -> Option<ObservedDuplicateHandleWrite> {
         self.observed
@@ -141,7 +135,7 @@ impl StagedDuplicateHandleProbe {
             .find(|write| {
                 write.phase == phase
                     && write.source == CommitSource::User
-                    && write.evidence_id == evidence_id
+                    && write.vector == vector
                     && write.saw_observation_row
                     && write.saw_evidence_row
                     && write.saw_snapshot_row
@@ -153,15 +147,9 @@ impl StagedDuplicateHandleProbe {
             .cloned()
     }
 
-    fn observed_phase_for(
-        &self,
-        evidence_id: EvidenceId,
-        phase: DuplicateHandleObservationPhase,
-    ) -> bool {
+    fn observed_phase_for(&self, vector: &[f32], phase: DuplicateHandleObservationPhase) -> bool {
         self.observed.lock().expect("observed").iter().any(|write| {
-            write.phase == phase
-                && write.source == CommitSource::User
-                && write.evidence_id == evidence_id
+            write.phase == phase && write.source == CommitSource::User && write.vector == vector
         })
     }
 
@@ -196,7 +184,7 @@ impl StagedDuplicateHandleProbe {
         let failed_unique_violation = matches!(
             error,
             Some(EngineError::UniqueViolation { table, column })
-                if table == "evidence_embedding_handles" && column == "id"
+                if table == "evidence" && column == "id"
         );
 
         for (evidence_id, vector) in &target.writes {
@@ -224,9 +212,14 @@ impl StagedDuplicateHandleProbe {
             });
             let snapshot_row =
                 snapshot_id.and_then(|id| write_set_row_for_uuid(ws, "entity_snapshots", "id", id));
-            let handle_row = write_set_embedding_handle_row(ws, target.embedding_id, *evidence_id);
-            let vector_tx = evidence_row.and_then(|(row_id, _)| {
-                write_set_vector_tx(ws, row_id, "evidence", "vector_text", vector)
+            let handle_row = write_set_row_for_uuid(
+                ws,
+                "evidence_embeddings",
+                "target_id",
+                evidence_id.as_uuid(),
+            );
+            let vector_tx = handle_row.and_then(|(row_id, _)| {
+                write_set_vector_tx(ws, row_id, "evidence_embeddings", "vector_text", vector)
             });
             let txs = [
                 observation_row.map(|(_, tx)| tx),
@@ -239,7 +232,8 @@ impl StagedDuplicateHandleProbe {
             .into_iter()
             .flatten()
             .collect::<BTreeSet<_>>();
-            if evidence_row.is_some() || handle_row.is_some() || vector_tx.is_some() {
+            // The writers share the evidence id, so only this writer's vector attributes the write set.
+            if vector_tx.is_some() {
                 self.observed
                     .lock()
                     .expect("observed")
@@ -297,7 +291,7 @@ impl DatabasePlugin for StagedDuplicateHandleProbe {
         if sql.starts_with("INSERT INTO evidence ") {
             self.evidence_insert_queries.fetch_add(1, Ordering::SeqCst);
         }
-        if sql.starts_with("INSERT INTO evidence_embedding_handles ") {
+        if sql.starts_with("INSERT INTO evidence_embeddings ") {
             let count = self.handle_insert_queries.fetch_add(1, Ordering::SeqCst) + 1;
             if count >= 2 && self.first_full_precommit_open.load(Ordering::SeqCst) {
                 self.concurrent_writer_reached_handle_sql
@@ -380,6 +374,9 @@ fn vision_space() -> EmbeddingSpaceDecl {
             table_name: "evidence".to_string(),
             vector_column: "vector_vision".to_string(),
         }],
+        placement: VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: probe_identity(512),
     }
 }
 
@@ -394,6 +391,50 @@ fn face_reference_space() -> EmbeddingSpaceDecl {
         supported_evidence_kinds: vec![EvidenceKind::ImageFrame],
         default_for_evidence_kind: None,
         bindings: Vec::new(),
+        placement: VectorPlacement::TravelsWithItem,
+        media_reachable_on_every_node: false,
+        producer: ModelIdentity {
+            model: "face-reference".to_string(),
+            weights_revision: "1".to_string(),
+            preparation: "1".to_string(),
+            dimension: 512,
+        },
+    }
+}
+
+/// The caller-filled vision space's one model: `producer("record")`'s own fields.
+fn probe_identity(dimension: usize) -> ModelIdentity {
+    ModelIdentity {
+        model: "probe-model".to_string(),
+        weights_revision: "record".to_string(),
+        preparation: "1".to_string(),
+        dimension,
+    }
+}
+
+/// A supply of `space`'s own model: the built-in text space's, read from a store, or the probe's.
+fn supply_producer(space: &str) -> EvidenceProducer {
+    static TEXT_MODEL: std::sync::OnceLock<EvidenceProducer> = std::sync::OnceLock::new();
+    if space != TEXT_SPACE {
+        return producer("record");
+    }
+    let model = TEXT_MODEL.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(StoreConfig {
+            db_path: dir.path().join("producer.db"),
+            ..Default::default()
+        })
+        .expect("open to read the text space's model");
+        EvidenceProducer::from(
+            &store
+                .space_producer(TEXT_SPACE)
+                .expect("read the text space's model")
+                .expect("the built-in text space is declared"),
+        )
+    });
+    EvidenceProducer {
+        system: "probe-record".to_string(),
+        ..model.clone()
     }
 }
 
@@ -419,11 +460,11 @@ fn text_vector(axis: usize) -> Vec<f32> {
 }
 
 fn text_index() -> VectorIndexRef {
-    VectorIndexRef::new("evidence", "vector_text")
+    VectorIndexRef::new("evidence_embeddings", "vector_text")
 }
 
 fn vision_index() -> VectorIndexRef {
-    VectorIndexRef::new("evidence", "vector_vision")
+    VectorIndexRef::new("evidence_embeddings_travelling", "vector_vision")
 }
 
 fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
@@ -508,52 +549,30 @@ fn raw_duplicate_evidence_insert(
     )
 }
 
-fn raw_evidence_embedding_handle_insert(
+fn raw_evidence_vector_row_insert(
     db: &Database,
-    embedding_id: EmbeddingId,
+    row_id: EmbeddingId,
     context_id: ContextId,
     target_id: EvidenceId,
     producer_label: &str,
     created_at: TxId,
 ) -> contextdb_core::Result<contextdb_engine::QueryResult> {
-    let has_producer_system = db
-        .table_meta("evidence_embedding_handles")
-        .expect("evidence_embedding_handles table meta")
-        .columns
-        .iter()
-        .any(|column| column.name == "producer_system");
-    if has_producer_system {
-        db.execute(
-            "INSERT INTO evidence_embedding_handles (id, context_id, target_id, embedding_space_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $producer_system, $created_at)",
-            &params(vec![
-                ("id", Value::Uuid(embedding_id.as_uuid())),
-                ("context_id", Value::Uuid(context_id.as_uuid())),
-                ("target_id", Value::Uuid(target_id.as_uuid())),
-                ("space", Value::Text(TEXT_SPACE.to_string())),
-                (
-                    "producer",
-                    Value::Json(serde_json::to_value(producer(producer_label)).expect("json")),
-                ),
-                ("producer_system", Value::Text("cg-edge".to_string())),
-                ("created_at", Value::TxId(created_at)),
-            ]),
-        )
-    } else {
-        db.execute(
-            "INSERT INTO evidence_embedding_handles (id, context_id, target_id, embedding_space_id, produced_by, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $created_at)",
-            &params(vec![
-                ("id", Value::Uuid(embedding_id.as_uuid())),
-                ("context_id", Value::Uuid(context_id.as_uuid())),
-                ("target_id", Value::Uuid(target_id.as_uuid())),
-                ("space", Value::Text(TEXT_SPACE.to_string())),
-                (
-                    "producer",
-                    Value::Json(serde_json::to_value(producer(producer_label)).expect("json")),
-                ),
-                ("created_at", Value::TxId(created_at)),
-            ]),
-        )
-    }
+    db.execute(
+        "INSERT INTO evidence_embeddings (id, context_id, target_id, embedding_space_id, producer_key, produced_by, producer_system, created_at) VALUES ($id, $context_id, $target_id, $space, $producer_key, $producer, $producer_system, $created_at)",
+        &params(vec![
+            ("id", Value::Uuid(row_id.as_uuid())),
+            ("context_id", Value::Uuid(context_id.as_uuid())),
+            ("target_id", Value::Uuid(target_id.as_uuid())),
+            ("space", Value::Text(TEXT_SPACE.to_string())),
+            ("producer_key", Value::Text(format!("raw-{producer_label}"))),
+            (
+                "producer",
+                Value::Json(serde_json::to_value(producer(producer_label)).expect("json")),
+            ),
+            ("producer_system", Value::Text("cg-edge".to_string())),
+            ("created_at", Value::TxId(created_at)),
+        ]),
+    )
 }
 
 fn raw_observation_insert(
@@ -710,7 +729,7 @@ fn record_embedding_with_state_delta(
             embedding_space_id: write.embedding_space_id.to_string(),
             vector: write.vector,
             target: EmbeddingTarget::Evidence(write.evidence_id),
-            produced_by: producer("record"),
+            produced_by: supply_producer(write.embedding_space_id),
         }],
     })
 }
@@ -788,14 +807,15 @@ fn first_hit_id_and_score(
     index: VectorIndexRef,
     query: Vec<f32>,
 ) -> Option<(uuid::Uuid, f32)> {
+    let table = index.table.clone();
     let hits = db
         .query_vector(index, &query, 1, None, db.snapshot())
         .expect("vector query");
     let (row_id, score) = *hits.first()?;
-    let rows = db.scan("evidence", db.snapshot()).expect("scan evidence");
+    let rows = db.scan(&table, db.snapshot()).expect("scan vector table");
     rows.into_iter().find_map(|row| {
         (row.row_id == row_id)
-            .then(|| row.values.get("id").cloned())
+            .then(|| row.values.get("target_id").cloned())
             .flatten()
             .and_then(|value| match value {
                 Value::Uuid(id) => Some(id),
@@ -841,21 +861,6 @@ fn write_set_uuid_value_for_uuid(
         })
 }
 
-fn write_set_embedding_handle_row(
-    ws: &WriteSet,
-    embedding_id: EmbeddingId,
-    evidence_id: EvidenceId,
-) -> Option<(RowId, u64)> {
-    ws.relational_inserts
-        .iter()
-        .filter(|(table_name, _)| table_name == "evidence_embedding_handles")
-        .find_map(|(_, row)| {
-            (row.values.get("id") == Some(&Value::Uuid(embedding_id.as_uuid()))
-                && row.values.get("target_id") == Some(&Value::Uuid(evidence_id.as_uuid())))
-            .then_some((row.row_id, row.created_tx.0))
-        })
-}
-
 fn write_set_vector_tx(
     ws: &WriteSet,
     row_id: RowId,
@@ -872,12 +877,13 @@ fn write_set_vector_tx(
     })
 }
 
-fn evidence_row_id(db: &Database, evidence_id: EvidenceId) -> Option<RowId> {
-    db.scan("evidence", db.snapshot())
-        .expect("scan evidence")
+/// The row holding the item's vector in `table`.
+fn vector_row_id(db: &Database, table: &str, evidence_id: EvidenceId) -> Option<RowId> {
+    db.scan(table, db.snapshot())
+        .expect("scan vector table")
         .into_iter()
         .find_map(|row| {
-            let id = row.values.get("id").and_then(|value| match value {
+            let id = row.values.get("target_id").and_then(|value| match value {
                 Value::Uuid(id) => Some(*id),
                 _ => None,
             });
@@ -904,22 +910,62 @@ fn seed_hnsw_padding(
     context_id: ContextId,
     observation_id: uuid::Uuid,
 ) -> Result<(), String> {
+    let producer_json = Value::Json(serde_json::to_value(producer("padding")).expect("json"));
     for i in 0..HNSW_PADDING_ROWS {
+        let evidence_id = uuid::Uuid::now_v7();
         db.execute(
-            "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order, vector_text, vector_vision) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order, $text, $vision)",
+            "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order)",
             &params(vec![
-                ("id", Value::Uuid(uuid::Uuid::now_v7())),
+                ("id", Value::Uuid(evidence_id)),
                 ("observation_id", Value::Uuid(observation_id)),
                 ("context_id", Value::Uuid(context_id.as_uuid())),
                 ("kind", Value::Text("text".to_string())),
                 ("source_ref", Value::Text(format!("cas://sha256:{i:064x}"))),
                 ("retention_status", Value::Text("retained_external".to_string())),
                 ("supply_order", Value::Int64(10_000 + i as i64)),
-                ("text", Value::Vector(text_vector(100))),
-                ("vision", Value::Vector(vector(100))),
             ]),
         )
         .map_err(|err| format!("{err:?}"))?;
+        for (table, space, column, padding, head) in [
+            (
+                "evidence_embeddings",
+                TEXT_SPACE,
+                "vector_text",
+                text_vector(100),
+                None,
+            ),
+            (
+                "evidence_embeddings_travelling",
+                VISION_SPACE,
+                "vector_vision",
+                vector(100),
+                Some(true),
+            ),
+        ] {
+            let head_column = if head.is_some() { ", is_head" } else { "" };
+            let head_value = if head.is_some() { ", $is_head" } else { "" };
+            let mut values = vec![
+                ("id", Value::Uuid(uuid::Uuid::now_v7())),
+                ("context_id", Value::Uuid(context_id.as_uuid())),
+                ("target_id", Value::Uuid(evidence_id)),
+                ("space", Value::Text(space.to_string())),
+                ("producer_key", Value::Text("padding".to_string())),
+                ("producer", producer_json.clone()),
+                ("producer_system", Value::Text("probe-padding".to_string())),
+                ("created_at", Value::TxId(TxId(1))),
+                ("vector", Value::Vector(padding)),
+            ];
+            if let Some(head) = head {
+                values.push(("is_head", Value::Bool(head)));
+            }
+            db.execute(
+                &format!(
+                    "INSERT INTO {table} (id, context_id, target_id, embedding_space_id, producer_key, produced_by, producer_system, created_at, {column}{head_column}) VALUES ($id, $context_id, $target_id, $space, $producer_key, $producer, $producer_system, $created_at, $vector{head_value})"
+                ),
+                &params(values),
+            )
+            .map_err(|err| format!("{err:?}"))?;
+        }
     }
     Ok(())
 }
@@ -957,7 +1003,7 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
     let context_id = fixture.context_id;
     drop(fixture.store);
     let db = Arc::new(Database::open(&db_path).expect("open raw contextdb"));
-    let vision_row_id = evidence_row_id(&db, vision_evidence);
+    let vision_row_id = vector_row_id(&db, "evidence_embeddings_travelling", vision_evidence);
     let padding_seed = match text_seed.as_ref() {
         Ok(result) => seed_hnsw_padding(&db, context_id, result.observation_id.as_uuid()),
         Err(err) => Err(format!("text seed failed: {err:?}")),
@@ -992,7 +1038,7 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
     let vision_row_for_thread = vision_row_id;
     thread::spawn(move || {
         let result = vision_row_for_thread
-            .ok_or_else(|| "missing vision evidence row".to_string())
+            .ok_or_else(|| "missing vision vector row".to_string())
             .and_then(|row_id| {
                 replace_vector(Arc::clone(&vision_db), vision_index(), row_id, vector(4))
                     .map_err(|err| format!("{err:?}"))
@@ -1106,11 +1152,11 @@ fn engine_probe_named_vector_index_concurrent_writes_same_index_ref_serialize_no
     );
     let handle_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id",
         &params(vec![("target_id", Value::Uuid(first_evidence.as_uuid()))]),
     ) + count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id",
         &params(vec![("target_id", Value::Uuid(second_evidence.as_uuid()))]),
     );
     let monotonic_counts = observed_counts
@@ -1139,89 +1185,7 @@ fn engine_probe_named_vector_index_concurrent_writes_same_index_ref_serialize_no
             && observed_counts.last() == Some(&2)
             && observed_vector_counts.last() == Some(&2)
             && duration.as_millis() >= 1,
-        "same VectorIndexRef writes must serialize without torn index state, persist both handle rows, and expose one-then-both MVCC progression through both row reads and vector search during overlap, results={results:?}, first_hit={first_hit:?}, second_hit={second_hit:?}, evidence_rows={evidence_rows}, handle_rows={handle_rows}, observed_counts={observed_counts:?}, observed_vector_counts={observed_vector_counts:?}, monotonic_counts={monotonic_counts}, monotonic_vector_counts={monotonic_vector_counts}, row_and_vector_snapshots_move_together={row_and_vector_snapshots_move_together}, duration={duration:?}"
-    );
-}
-
-#[test]
-fn engine_probe_immutable_embedding_handle_id_rejects_update_under_contention() {
-    let fixture = fixture("immutable-handle");
-    let evidence_id = EvidenceId::new_v7();
-    let handle_id = EmbeddingId::new_v7();
-    let seed = record_text_embedding(
-        fixture.store.clone(),
-        fixture.context_id,
-        fixture.entity_id,
-        evidence_id,
-        handle_id,
-        0,
-    );
-    let db_path = fixture.db_path.clone();
-    let entity_id = fixture.entity_id;
-    drop(fixture.store);
-    let db = Arc::new(Database::open(&db_path).expect("open raw contextdb"));
-    let barrier = Arc::new(Barrier::new(4));
-    let update_a = {
-        let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
-        thread::spawn(move || {
-            barrier.wait();
-            db.execute(
-                "UPDATE evidence_embedding_handles SET id = $new_id WHERE id = $id",
-                &params(vec![
-                    ("new_id", Value::Uuid(EmbeddingId::new_v7().as_uuid())),
-                    ("id", Value::Uuid(handle_id.as_uuid())),
-                ]),
-            )
-        })
-    };
-    let update_b = {
-        let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
-        thread::spawn(move || {
-            barrier.wait();
-            db.execute(
-                "UPDATE evidence_embedding_handles SET id = $new_id WHERE id = $id",
-                &params(vec![
-                    ("new_id", Value::Uuid(EmbeddingId::new_v7().as_uuid())),
-                    ("id", Value::Uuid(handle_id.as_uuid())),
-                ]),
-            )
-        })
-    };
-    let mutable_control = {
-        let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
-        thread::spawn(move || {
-            barrier.wait();
-            db.execute(
-                "UPDATE entities SET properties = $properties WHERE id = $id",
-                &params(vec![
-                    ("properties", Value::Json(json!({"control": "updated"}))),
-                    ("id", Value::Uuid(entity_id.as_uuid())),
-                ]),
-            )
-        })
-    };
-    barrier.wait();
-    let update_a = update_a.join().expect("update a joined");
-    let update_b = update_b.join().expect("update b joined");
-    let mutable_control = mutable_control.join().expect("control joined");
-    let handle_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
-        &params(vec![("id", Value::Uuid(handle_id.as_uuid()))]),
-    );
-
-    assert!(
-        seed.is_ok()
-            && matches!(update_a, Err(EngineError::ImmutableTable(ref table)) if table == "evidence_embedding_handles")
-            && matches!(update_b, Err(EngineError::ImmutableTable(ref table)) if table == "evidence_embedding_handles")
-            && mutable_control
-                .as_ref()
-                .is_ok_and(|result| result.rows_affected == 1)
-            && handle_rows == 1,
-        "contended handle-id updates must be rejected as ImmutableTable while mutable sibling update succeeds, seed={seed:?}, update_a={update_a:?}, update_b={update_b:?}, mutable_control={mutable_control:?}, handle_rows={handle_rows}"
+        "same VectorIndexRef writes must serialize without torn index state, persist both vector rows, and expose one-then-both MVCC progression through both row reads and vector search during overlap, results={results:?}, first_hit={first_hit:?}, second_hit={second_hit:?}, evidence_rows={evidence_rows}, handle_rows={handle_rows}, observed_counts={observed_counts:?}, observed_vector_counts={observed_vector_counts:?}, monotonic_counts={monotonic_counts}, monotonic_vector_counts={monotonic_vector_counts}, row_and_vector_snapshots_move_together={row_and_vector_snapshots_move_together}, duration={duration:?}"
     );
 }
 
@@ -1258,20 +1222,13 @@ fn engine_probe_composite_fk_same_context_rejects_cross_context_embedding_handle
         let barrier = Arc::clone(&barrier);
         thread::spawn(move || {
             barrier.wait();
-            db.execute(
-                "INSERT INTO evidence_embedding_handles (id, context_id, target_id, embedding_space_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $target_id, $space, $producer, $producer_system, $created_at)",
-                &params(vec![
-                    ("id", Value::Uuid(handle_id.as_uuid())),
-                    ("context_id", Value::Uuid(context_id.as_uuid())),
-                    ("target_id", Value::Uuid(target_evidence.as_uuid())),
-                    ("space", Value::Text(TEXT_SPACE.to_string())),
-                    (
-                        "producer",
-                        Value::Json(serde_json::to_value(producer("cross-context")).expect("json")),
-                    ),
-                    ("producer_system", Value::Text("cg-edge".to_string())),
-                    ("created_at", Value::TxId(txid)),
-                ]),
+            raw_evidence_vector_row_insert(
+                &db,
+                handle_id,
+                context_id,
+                target_evidence,
+                &format!("cross-context-{}", handle_id.as_uuid()),
+                txid,
             )
         })
     };
@@ -1282,12 +1239,12 @@ fn engine_probe_composite_fk_same_context_rejects_cross_context_embedding_handle
     let valid = valid_writer.join().expect("valid writer joined");
     let valid_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id",
         &params(vec![("id", Value::Uuid(valid_handle.as_uuid()))]),
     );
     let invalid_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id",
         &params(vec![("id", Value::Uuid(invalid_handle.as_uuid()))]),
     );
 
@@ -1301,7 +1258,7 @@ fn engine_probe_composite_fk_same_context_rejects_cross_context_embedding_handle
                     ref child_columns,
                     ref parent_table,
                     ..
-                }) if child_table == "evidence_embedding_handles"
+                }) if child_table == "evidence_embeddings"
                     && *child_columns == vec!["context_id".to_string(), "target_id".to_string()]
                     && parent_table == "evidence"
             )
@@ -1317,9 +1274,9 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
     let staging_probe = Arc::new(StagedDuplicateHandleProbe::default());
     let plugin: Arc<dyn DatabasePlugin> = staging_probe.clone();
     let fixture = fixture_with_plugin("atomic-rollback", Some(plugin));
-    let embedding_id = EmbeddingId::new_v7();
-    let first_evidence = EvidenceId::new_v7();
-    let second_evidence = EvidenceId::new_v7();
+    // Both writers claim one evidence id, so exactly one commit can land; each writes its own
+    // observation, snapshot, vector row and vector, told apart by its vector.
+    let shared_evidence = EvidenceId::new_v7();
     let second_entity = fixture
         .store
         .create_entity(CreateEntity {
@@ -1333,22 +1290,19 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
     let barrier = Arc::new(Barrier::new(3));
     let first_entity_id = fixture.entity_id;
     let second_entity_id = second_entity.id;
-    let writes = [
-        (first_evidence, first_entity_id, 0),
-        (second_evidence, second_entity_id, 1),
-    ];
+    let writes = [(first_entity_id, 0_usize), (second_entity_id, 1_usize)];
     let context_params = params(vec![(
         "context_id",
         Value::Uuid(fixture.context_id.as_uuid()),
     )]);
-    let first_entity_params = params(vec![
-        ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-        ("entity_id", Value::Uuid(first_entity_id.as_uuid())),
-    ]);
-    let second_entity_params = params(vec![
-        ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
-        ("entity_id", Value::Uuid(second_entity_id.as_uuid())),
-    ]);
+    let entity_params = |entity_id: EntityId| {
+        params(vec![
+            ("context_id", Value::Uuid(fixture.context_id.as_uuid())),
+            ("entity_id", Value::Uuid(entity_id.as_uuid())),
+        ])
+    };
+    let snapshot_count_sql = "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id";
+    let snapshot_observation_count_sql = "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id";
     let pre_observation_rows = store_count(
         &fixture.store,
         "SELECT COUNT(*) AS n FROM observations WHERE context_id = $context_id",
@@ -1359,42 +1313,35 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
         "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id",
         &context_params,
     );
-    let pre_first_snapshot_rows = store_count(
-        &fixture.store,
-        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
-        &first_entity_params,
-    );
-    let pre_second_snapshot_rows = store_count(
-        &fixture.store,
-        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
-        &second_entity_params,
-    );
     let pre_snapshot_observation_rows = store_count(
         &fixture.store,
         "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id",
         &context_params,
     );
-    let pre_first_snapshot_observation_rows = store_count(
-        &fixture.store,
-        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
-        &first_entity_params,
-    );
-    let pre_second_snapshot_observation_rows = store_count(
-        &fixture.store,
-        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
-        &second_entity_params,
-    );
+    let pre_entity_rows = writes.map(|(entity_id, _)| {
+        (
+            store_count(
+                &fixture.store,
+                snapshot_count_sql,
+                &entity_params(entity_id),
+            ),
+            store_count(
+                &fixture.store,
+                snapshot_observation_count_sql,
+                &entity_params(entity_id),
+            ),
+        )
+    });
     let fixture_context_id = fixture.context_id;
     staging_probe.arm(DuplicateHandleTarget {
-        embedding_id,
         writes: writes
             .iter()
-            .map(|(evidence_id, _, axis)| (*evidence_id, text_vector(*axis)))
+            .map(|(_, axis)| (shared_evidence, text_vector(*axis)))
             .collect(),
     });
     let handles = writes
         .into_iter()
-        .map(|(evidence_id, entity_id, axis)| {
+        .map(|(entity_id, axis)| {
             let writer = fixture.store.clone();
             let barrier = Arc::clone(&barrier);
             let context_id = fixture.context_id;
@@ -1404,8 +1351,8 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
                     writer,
                     context_id,
                     entity_id,
-                    evidence_id,
-                    embedding_id,
+                    shared_evidence,
+                    EmbeddingId::new_v7(),
                     axis,
                 )
             })
@@ -1421,31 +1368,33 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
     let db_path = fixture.db_path.clone();
     drop(fixture.store);
     let db = Database::open(&db_path).expect("open raw contextdb");
-    let variant_handles = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
-        &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
-    );
-    let first_evidence_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM evidence WHERE id = $id",
-        &params(vec![("id", Value::Uuid(first_evidence.as_uuid()))]),
-    );
-    let second_evidence_rows = count(
+    let winner = results.iter().position(Result::is_ok);
+    let loser = winner.map(|winner| 1 - winner);
+    let winner_vector = winner.map(|winner| text_vector(writes[winner].1));
+    let loser_vector = loser.map(|loser| text_vector(writes[loser].1));
+    let winner_row_id = winner
+        .and_then(|winner| results[winner].as_ref().ok())
+        .and_then(|result| result.embedding_ids.first().copied());
+    let evidence_rows = count(
         &db,
         "SELECT COUNT(*) AS n FROM evidence WHERE id = $id",
-        &params(vec![("id", Value::Uuid(second_evidence.as_uuid()))]),
+        &params(vec![("id", Value::Uuid(shared_evidence.as_uuid()))]),
     );
-    let first_handle_rows = count(
+    let vector_rows = count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
-        &params(vec![("target_id", Value::Uuid(first_evidence.as_uuid()))]),
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id",
+        &params(vec![("target_id", Value::Uuid(shared_evidence.as_uuid()))]),
     );
-    let second_handle_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE target_id = $target_id",
-        &params(vec![("target_id", Value::Uuid(second_evidence.as_uuid()))]),
-    );
+    let winner_row_rows = winner_row_id.map(|row_id| {
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id AND target_id = $target_id",
+            &params(vec![
+                ("id", Value::Uuid(row_id.as_uuid())),
+                ("target_id", Value::Uuid(shared_evidence.as_uuid())),
+            ]),
+        )
+    });
     let observation_rows = count(
         &db,
         "SELECT COUNT(*) AS n FROM observations WHERE context_id = $context_id",
@@ -1456,62 +1405,26 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
         "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id",
         &context_params,
     );
-    let first_snapshot_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
-        &first_entity_params,
-    );
-    let second_snapshot_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM entity_snapshots WHERE context_id = $context_id AND entity_id = $entity_id",
-        &second_entity_params,
-    );
     let snapshot_observation_rows = count(
         &db,
         "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id",
         &context_params,
     );
-    let first_snapshot_observation_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
-        &first_entity_params,
-    );
-    let second_snapshot_observation_rows = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM entity_snapshot_observations WHERE context_id = $context_id AND entity_id = $entity_id",
-        &second_entity_params,
-    );
-    let successful_evidence_id = results
-        .iter()
-        .find_map(|result| result.as_ref().ok())
-        .and_then(|result| result.evidence_ids.first().copied());
-    let winner_durable_identity = match successful_evidence_id {
-        Some(id) if id == first_evidence => {
-            first_evidence_rows == 1
-                && first_handle_rows == 1
-                && second_evidence_rows == 0
-                && second_handle_rows == 0
-        }
-        Some(id) if id == second_evidence => {
-            second_evidence_rows == 1
-                && second_handle_rows == 1
-                && first_evidence_rows == 0
-                && first_handle_rows == 0
-        }
-        _ => false,
-    };
-    let winner_entity_progress = match successful_evidence_id {
-        Some(id) if id == first_evidence => {
-            first_snapshot_rows == pre_first_snapshot_rows + 1
-                && first_snapshot_observation_rows == pre_first_snapshot_observation_rows + 1
-                && second_snapshot_rows == pre_second_snapshot_rows
-                && second_snapshot_observation_rows == pre_second_snapshot_observation_rows
-        }
-        Some(id) if id == second_evidence => {
-            second_snapshot_rows == pre_second_snapshot_rows + 1
-                && second_snapshot_observation_rows == pre_second_snapshot_observation_rows + 1
-                && first_snapshot_rows == pre_first_snapshot_rows
-                && first_snapshot_observation_rows == pre_first_snapshot_observation_rows
+    let entity_rows = writes.map(|(entity_id, _)| {
+        (
+            count(&db, snapshot_count_sql, &entity_params(entity_id)),
+            count(
+                &db,
+                snapshot_observation_count_sql,
+                &entity_params(entity_id),
+            ),
+        )
+    });
+    let winner_entity_progress = match (winner, loser) {
+        (Some(winner), Some(loser)) => {
+            entity_rows[winner].0 == pre_entity_rows[winner].0 + 1
+                && entity_rows[winner].1 == pre_entity_rows[winner].1 + 1
+                && entity_rows[loser] == pre_entity_rows[loser]
         }
         _ => false,
     };
@@ -1520,12 +1433,12 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
     let store_concurrent_writer_reached_handle_sql =
         staging_probe.concurrent_writer_reached_handle_sql();
     let raw_duplicate_created_at = db.committed_watermark();
-    let raw_duplicate_handle_insert = successful_evidence_id.map(|target_id| {
-        raw_evidence_embedding_handle_insert(
+    let raw_duplicate_handle_insert = winner_row_id.map(|row_id| {
+        raw_evidence_vector_row_insert(
             &db,
-            embedding_id,
+            row_id,
             fixture_context_id,
-            target_id,
+            shared_evidence,
             "raw-duplicate",
             raw_duplicate_created_at,
         )
@@ -1535,45 +1448,31 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
         Some(Err(EngineError::UniqueViolation {
             ref table,
             ref column,
-        })) if table == "evidence_embedding_handles" && column == "id"
+        })) if table == "evidence_embeddings" && column == "id"
     );
-    let variant_handles_after_raw_duplicate = count(
-        &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
-        &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
-    );
-    let loser_evidence_id = match successful_evidence_id {
-        Some(id) if id == first_evidence => Some(second_evidence),
-        Some(id) if id == second_evidence => Some(first_evidence),
-        _ => None,
-    };
-    let first_hit = first_hit_id_and_score(&db, text_index(), text_vector(0));
-    let second_hit = first_hit_id_and_score(&db, text_index(), text_vector(1));
-    let successful_reachable = successful_evidence_id.is_some_and(|winner| {
-        first_hit.is_some_and(|(id, score)| id == winner.as_uuid() && score > 0.99)
-            || second_hit.is_some_and(|(id, score)| id == winner.as_uuid() && score > 0.99)
+    let winner_rows_after_raw_duplicate = winner_row_id.map(|row_id| {
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE id = $id",
+            &params(vec![("id", Value::Uuid(row_id.as_uuid()))]),
+        )
     });
-    let loser_mapped_to_committed_evidence = loser_evidence_id.is_some_and(|loser| {
-        first_hit.is_some_and(|(id, _)| id == loser.as_uuid())
-            || second_hit.is_some_and(|(id, _)| id == loser.as_uuid())
+    let successful_reachable = winner_vector.as_ref().is_some_and(|query| {
+        first_hit_id_and_score(&db, text_index(), query.clone())
+            .is_some_and(|(id, score)| id == shared_evidence.as_uuid() && score > 0.99)
     });
-    let successful_staged_write =
-        successful_evidence_id.and_then(|winner| staging_probe.full_staged_write_for(winner));
-    let successful_staged_full_write = successful_staged_write.is_some();
-    let failed_staged_write =
-        loser_evidence_id.and_then(|loser| staging_probe.failed_full_staged_write_for(loser));
-    let failed_staged_full_write = failed_staged_write.is_some();
-    let loser_precommit_observed = loser_evidence_id.is_some_and(|loser| {
-        staging_probe.observed_phase_for(loser, DuplicateHandleObservationPhase::PreCommit)
+    let successful_staged_full_write = winner_vector
+        .as_ref()
+        .and_then(|vector| staging_probe.full_staged_write_for(vector))
+        .is_some();
+    let failed_staged_full_write = loser_vector
+        .as_ref()
+        .and_then(|vector| staging_probe.failed_full_staged_write_for(vector))
+        .is_some();
+    let loser_precommit_observed = loser_vector.as_ref().is_some_and(|vector| {
+        staging_probe.observed_phase_for(vector, DuplicateHandleObservationPhase::PreCommit)
     });
-    let loser_query_vector = loser_evidence_id.map(|loser| {
-        if loser == first_evidence {
-            text_vector(0)
-        } else {
-            text_vector(1)
-        }
-    });
-    let loser_orphan_vector_leaked = loser_query_vector.as_ref().is_some_and(|query| {
+    let loser_orphan_vector_leaked = loser_vector.as_ref().is_some_and(|query| {
         db.query_vector(text_index(), query, 10, None, db.snapshot())
             .expect("raw vector leak query")
             .into_iter()
@@ -1585,33 +1484,27 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
         results.iter().filter(|result| result.is_ok()).count() == 1
             && results.iter().any(|result| matches!(
                 result,
-                Err(context_graph::CgError::EngineFault {
-                    source: context_graph::error::EngineError::UniqueViolation { table, column },
-                }) if table == "evidence_embedding_handles" && column == "id"
+                Err(context_graph::CgError::DuplicateEvidenceId { id }) if *id == shared_evidence
             ))
-            && variant_handles == 1
-            && first_evidence_rows + second_evidence_rows == 1
-            && first_handle_rows + second_handle_rows == 1
+            && evidence_rows == 1
+            && vector_rows == 1
+            && winner_row_rows == Some(1)
             && observation_rows == pre_observation_rows + 1
             && snapshot_rows == pre_snapshot_rows + 1
             && snapshot_observation_rows == pre_snapshot_observation_rows + 1
             && winner_entity_progress
-            && successful_evidence_id.is_some()
             && raw_duplicate_id_rejected
-            && variant_handles_after_raw_duplicate == 1
-            && loser_evidence_id.is_some()
-            && winner_durable_identity
+            && winner_rows_after_raw_duplicate == Some(1)
             && successful_staged_full_write
             && failed_staged_full_write
             && successful_reachable
-            && !loser_mapped_to_committed_evidence
             && !loser_orphan_vector_leaked
             && !loser_precommit_observed
             && store_evidence_insert_query_count == 2
             && store_handle_insert_query_count == 2
             && store_concurrent_writer_reached_handle_sql
             && duration.as_millis() >= 1,
-        "duplicate embedding handle under contention must surface the exact engine unique violation, stage the successful observation/evidence/snapshot/handle/vector write in one tx, expose the losing failed WriteSet with the exact observation/evidence/snapshot/handle/vector write and structured UniqueViolation before pre_commit, commit durable evidence/handle/snapshot lineage only for the winning entity, and roll back the losing write without committed-row or raw-vector leaks while the second Store writer reaches the contended handle SQL before the first commit returns; raw Database duplicate id insert must also fail through the durable contextdb constraint; results={results:?}, variant_handles={variant_handles}, raw_duplicate_handle_insert={raw_duplicate_handle_insert:?}, raw_duplicate_id_rejected={raw_duplicate_id_rejected}, variant_handles_after_raw_duplicate={variant_handles_after_raw_duplicate}, first_evidence_rows={first_evidence_rows}, second_evidence_rows={second_evidence_rows}, first_handle_rows={first_handle_rows}, second_handle_rows={second_handle_rows}, winner_durable_identity={winner_durable_identity}, observation_rows={observation_rows}, pre_observation_rows={pre_observation_rows}, snapshot_rows={snapshot_rows}, pre_snapshot_rows={pre_snapshot_rows}, first_snapshot_rows={first_snapshot_rows}, pre_first_snapshot_rows={pre_first_snapshot_rows}, second_snapshot_rows={second_snapshot_rows}, pre_second_snapshot_rows={pre_second_snapshot_rows}, snapshot_observation_rows={snapshot_observation_rows}, pre_snapshot_observation_rows={pre_snapshot_observation_rows}, first_snapshot_observation_rows={first_snapshot_observation_rows}, pre_first_snapshot_observation_rows={pre_first_snapshot_observation_rows}, second_snapshot_observation_rows={second_snapshot_observation_rows}, pre_second_snapshot_observation_rows={pre_second_snapshot_observation_rows}, winner_entity_progress={winner_entity_progress}, first_hit={first_hit:?}, second_hit={second_hit:?}, successful_evidence_id={successful_evidence_id:?}, loser_evidence_id={loser_evidence_id:?}, successful_staged_full_write={successful_staged_full_write}, failed_staged_full_write={failed_staged_full_write}, loser_precommit_observed={loser_precommit_observed}, observed_staged_writes={observed_staged_writes:?}, successful_reachable={successful_reachable}, loser_mapped_to_committed_evidence={loser_mapped_to_committed_evidence}, loser_orphan_vector_leaked={loser_orphan_vector_leaked}, store_evidence_insert_query_count={store_evidence_insert_query_count}, store_handle_insert_query_count={store_handle_insert_query_count}, store_concurrent_writer_reached_handle_sql={store_concurrent_writer_reached_handle_sql}, duration={duration:?}"
+        "a duplicate evidence id under contention must commit exactly one writer: stage its observation/evidence/snapshot/vector-row/vector write in one tx, expose the losing failed WriteSet with the same full write and the structured evidence UniqueViolation before pre_commit, report DuplicateEvidenceId to the loser, keep the winner's lineage only, and roll back the losing write without committed-row or raw-vector leaks while the second Store writer reaches its vector-row SQL before the first commit returns; a raw duplicate vector-row id must also fail through the durable contextdb constraint; results={results:?}, evidence_rows={evidence_rows}, vector_rows={vector_rows}, winner_row_id={winner_row_id:?}, winner_row_rows={winner_row_rows:?}, raw_duplicate_handle_insert={raw_duplicate_handle_insert:?}, raw_duplicate_id_rejected={raw_duplicate_id_rejected}, winner_rows_after_raw_duplicate={winner_rows_after_raw_duplicate:?}, observation_rows={observation_rows}, pre_observation_rows={pre_observation_rows}, snapshot_rows={snapshot_rows}, pre_snapshot_rows={pre_snapshot_rows}, snapshot_observation_rows={snapshot_observation_rows}, pre_snapshot_observation_rows={pre_snapshot_observation_rows}, entity_rows={entity_rows:?}, pre_entity_rows={pre_entity_rows:?}, winner_entity_progress={winner_entity_progress}, successful_staged_full_write={successful_staged_full_write}, failed_staged_full_write={failed_staged_full_write}, loser_precommit_observed={loser_precommit_observed}, observed_staged_writes={observed_staged_writes:?}, successful_reachable={successful_reachable}, loser_orphan_vector_leaked={loser_orphan_vector_leaked}, store_evidence_insert_query_count={store_evidence_insert_query_count}, store_handle_insert_query_count={store_handle_insert_query_count}, store_concurrent_writer_reached_handle_sql={store_concurrent_writer_reached_handle_sql}, duration={duration:?}"
     );
 }
 
@@ -1728,10 +1621,10 @@ fn reindex_space_via_database_insert_vector_does_not_fire_observation_trigger() 
 
     let db = Arc::new(Database::open(&db_path).expect("open raw contextdb"));
     let trigger_counter = register_counting_impact_trigger(&db);
-    let row_id = evidence_row_id(&db, evidence_id);
+    let row_id = vector_row_id(&db, "evidence_embeddings", evidence_id);
     let before_vector_write = trigger_counter.load(Ordering::SeqCst);
     let vector_write = row_id
-        .ok_or_else(|| "missing seeded evidence row".to_string())
+        .ok_or_else(|| "missing seeded vector row".to_string())
         .and_then(|row_id| {
             replace_vector(Arc::clone(&db), text_index(), row_id, text_vector(2))
                 .map_err(|err| format!("{err:?}"))

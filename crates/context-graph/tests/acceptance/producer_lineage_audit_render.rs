@@ -1,11 +1,10 @@
 use chrono::Utc;
 use context_graph::embedder::mock::MockEmbedder;
 use context_graph::{
-    ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId,
-    DistanceMetric, Embedder, EmbedderRegistration, EmbeddingId, EmbeddingSpaceBinding,
-    EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType, EvidenceId, EvidenceKind,
-    EvidenceProducer, EvidenceRef, IntentionOrigin, IntentionStatus, PrecomputedEmbedding,
-    RecordObservation, RecordObservationResult, Store, StoreConfig,
+    ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId, Embedder,
+    EmbedderRegistration, EmbeddingId, EmbeddingTarget, EntityId, EntityType, EvidenceId,
+    EvidenceKind, EvidenceProducer, EvidenceRef, IntentionOrigin, IntentionStatus,
+    PrecomputedEmbedding, RecordObservation, RecordObservationResult, Store, StoreConfig,
 };
 use contextdb_core::Value;
 use contextdb_engine::Database;
@@ -21,9 +20,6 @@ use std::sync::{
 };
 #[cfg(context_graph_internal_test_support)]
 use std::time::Duration;
-
-const TEXT_SPACE: &str = "text_default_nomic_v1_5_768";
-const PROCUREMENT_SPACE: &str = "procurement_evidence_v1";
 
 #[cfg(context_graph_internal_test_support)]
 #[derive(Default)]
@@ -76,11 +72,33 @@ fn producer_with_system(system: &str) -> EvidenceProducer {
     }
 }
 
-fn cg_edge_registration(space_id: &str) -> EmbedderRegistration {
-    let embedder = Arc::new(MockEmbedder::new(space_id, 768));
+/// The edge's text model, registered as the text default; its space is identity-derived.
+fn cg_edge_registration(model_name: &str) -> EmbedderRegistration {
+    let embedder = Arc::new(MockEmbedder::new(model_name, 768));
     let mut space = embedder.embedding_space();
     space.default_for_evidence_kind = Some(EvidenceKind::Text);
     EmbedderRegistration { space, embedder }
+}
+
+/// The text role's active space, which the edge's text model fills.
+fn text_space(store: &Store) -> String {
+    store
+        .active_embedding_space(context_graph::EmbeddingRole::EvidenceText)
+        .expect("read the active text space")
+        .expect("the edge's text model holds the text role")
+}
+
+/// A consumer-claimed supply of `space`'s own model.
+fn consumer_supply(store: &Store, space: &str, system: &str) -> EvidenceProducer {
+    EvidenceProducer {
+        system: system.to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(space)
+                .expect("read the space's model")
+                .expect("the space is declared"),
+        )
+    }
 }
 
 fn store(name: &str) -> (tempfile::TempDir, std::path::PathBuf, Store) {
@@ -91,7 +109,7 @@ fn store(name: &str) -> (tempfile::TempDir, std::path::PathBuf, Store) {
             db_path: db_path.clone(),
             ..Default::default()
         },
-        vec![cg_edge_registration(TEXT_SPACE)],
+        vec![cg_edge_registration("audit-edge-text")],
     )
     .expect("open");
     (dir, db_path, store)
@@ -104,24 +122,10 @@ fn procurement_store() -> context_graph::Result<Store> {
                 "producer-lineage-procurement-{}.db",
                 uuid::Uuid::now_v7()
             )),
-            extra_embedding_spaces: vec![EmbeddingSpaceDecl {
-                embedding_space_id: PROCUREMENT_SPACE.to_string(),
-                dimension: 768,
-                metric: DistanceMetric::Cosine,
-                model_family: "text".to_string(),
-                model_name: "embeddinggemma-300m".to_string(),
-                model_version: "procurement".to_string(),
-                supported_evidence_kinds: vec![EvidenceKind::Text],
-                default_for_evidence_kind: Some(EvidenceKind::Text),
-                bindings: vec![EmbeddingSpaceBinding {
-                    embedding_space_id: PROCUREMENT_SPACE.to_string(),
-                    table_name: "evidence".to_string(),
-                    vector_column: "vector_text".to_string(),
-                }],
-            }],
             ..Default::default()
         },
-        vec![cg_edge_registration(PROCUREMENT_SPACE)],
+        // The consumer's procurement model overrides the text default for this boot.
+        vec![cg_edge_registration("procurement-evidence")],
     )
 }
 
@@ -138,12 +142,7 @@ fn raw_lineage_query(decision_ids: &[DecisionId]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT decision_basis_snapshots.decision_id, evidence_embedding_handles.embedding_space_id, evidence_embedding_handles.produced_by, evidence_embedding_handles.created_at \
-     FROM decision_basis_snapshots \
-     INNER JOIN entity_snapshot_observations ON entity_snapshot_observations.context_id = decision_basis_snapshots.context_id AND entity_snapshot_observations.entity_id = decision_basis_snapshots.entity_id AND entity_snapshot_observations.snapshot_id = decision_basis_snapshots.snapshot_id \
-     INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id \
-     INNER JOIN evidence_embedding_handles ON evidence_embedding_handles.context_id = evidence.context_id AND evidence_embedding_handles.target_id = evidence.id \
-     WHERE decision_basis_snapshots.decision_id IN ({decision_placeholders}) AND evidence_embedding_handles.embedding_space_id = $space"
+        "SELECT decision_id, embedding_space_id, produced_by, vector_created_at FROM decision_producer_lineage WHERE decision_id IN ({decision_placeholders}) AND embedding_space_id = $space"
     )
 }
 
@@ -184,12 +183,7 @@ fn raw_decision_producer_display(
     let db = Database::open(db_path).expect("raw db");
     let result = db
         .execute(
-            "SELECT evidence_embedding_handles.embedding_space_id, evidence_embedding_handles.produced_by, evidence_embedding_handles.created_at \
-             FROM decision_basis_snapshots \
-             INNER JOIN entity_snapshot_observations ON entity_snapshot_observations.context_id = decision_basis_snapshots.context_id AND entity_snapshot_observations.entity_id = decision_basis_snapshots.entity_id AND entity_snapshot_observations.snapshot_id = decision_basis_snapshots.snapshot_id \
-             INNER JOIN evidence ON evidence.context_id = entity_snapshot_observations.context_id AND evidence.observation_id = entity_snapshot_observations.observation_id \
-             INNER JOIN evidence_embedding_handles ON evidence_embedding_handles.context_id = evidence.context_id AND evidence_embedding_handles.target_id = evidence.id \
-             WHERE decision_basis_snapshots.decision_id = $decision_id AND evidence_embedding_handles.embedding_space_id = $space",
+            "SELECT embedding_space_id, produced_by, vector_created_at FROM decision_producer_lineage WHERE decision_id = $decision_id AND embedding_space_id = $space",
             &HashMap::from([
                 (
                     "decision_id".to_string(),
@@ -292,7 +286,7 @@ fn record_text_basis_observation(
                 embedding_space_id: embedding_space_id.to_string(),
                 vector: vector(),
                 target: EmbeddingTarget::Evidence(evidence_id),
-                produced_by: producer_with_system(producer_system),
+                produced_by: consumer_supply(store, embedding_space_id, producer_system),
             }]
         },
     })
@@ -321,7 +315,8 @@ fn create_audit_lineage_decision(
             context_id: context.id,
         })
         .expect("entity");
-    let basis = record_text_basis_observation(store, context.id, entity.id, system, TEXT_SPACE)
+    let space = text_space(store);
+    let basis = record_text_basis_observation(store, context.id, entity.id, system, &space)
         .expect("basis observation");
     let basis_snapshot = basis.snapshot_id.expect("basis snapshot");
     let intention = store
@@ -365,7 +360,7 @@ fn create_audit_lineage_decision(
         } else {
             "cg-edge"
         };
-        record_text_basis_observation(store, context.id, entity.id, decoy_system, TEXT_SPACE)
+        record_text_basis_observation(store, context.id, entity.id, decoy_system, &space)
             .expect("decoy observation");
     }
     decision.id
@@ -390,12 +385,13 @@ fn executive_pdf_paragraph_includes_human_readable_producer_string() {
             context_id: context.id,
         })
         .expect("entity");
+    let space = text_space(&store);
     let basis = record_text_basis_observation(
         &store,
         context.id,
         entity.id,
         context_graph::CG_EDGE_SYSTEM_TAG,
-        TEXT_SPACE,
+        &space,
     )
     .expect("basis observation");
     let basis_snapshot = basis.snapshot_id.expect("basis snapshot");
@@ -423,11 +419,11 @@ fn executive_pdf_paragraph_includes_human_readable_producer_string() {
             ..Default::default()
         })
         .expect("decision");
-    record_text_basis_observation(&store, context.id, entity.id, "vendor-decoy", TEXT_SPACE)
+    record_text_basis_observation(&store, context.id, entity.id, "vendor-decoy", &space)
         .expect("decoy observation");
     let rendered = store.render_decision_producer_audit_paragraph(decision.id);
     drop(store);
-    let expected = raw_decision_producer_display(&db_path, decision.id, TEXT_SPACE);
+    let expected = raw_decision_producer_display(&db_path, decision.id, &space);
 
     assert!(
         expected
@@ -453,9 +449,10 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
             ..Default::default()
         },
         query_counter.clone(),
-        vec![cg_edge_registration(TEXT_SPACE)],
+        vec![cg_edge_registration("audit-edge-text")],
     )
     .expect("open");
+    let space = text_space(&store);
     let mut decision_ids = Vec::new();
 
     for index in 0..20 {
@@ -474,29 +471,17 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
     let public_query_count = query_counter.count();
     let public_sql = query_counter.sql();
     let public_trace = store.last_query_trace().unwrap_or_default();
+    // Lineage is the decision-time record, never a live join to vector rows a reindex replaces.
     let public_lineage_tables_are_in_one_sql = public_sql.len() == 1
-        && [
-            "decision_basis_snapshots",
-            "entity_snapshot_observations",
-            "evidence",
-            "evidence_embedding_handles",
-        ]
-        .iter()
-        .all(|fragment| public_sql[0].contains(fragment))
-        && !public_sql[0].contains("reasoning");
-    let public_trace_matches_engine_query = [
-        "decision_basis_snapshots",
-        "entity_snapshot_observations",
-        "evidence",
-        "evidence_embedding_handles",
-    ]
-    .iter()
-    .all(|fragment| public_trace.contains(fragment));
+        && public_sql[0].contains("decision_producer_lineage")
+        && !public_sql[0].contains("reasoning")
+        && !public_sql[0].contains("evidence_embeddings");
+    let public_trace_matches_engine_query = public_trace.contains("decision_producer_lineage");
 
     drop(store);
     let db = Database::open(&db_path).expect("raw db");
     let sql = raw_lineage_query(&decision_ids);
-    let raw_params = raw_lineage_params(&decision_ids, TEXT_SPACE);
+    let raw_params = raw_lineage_params(&decision_ids, &space);
     let raw_result = db.execute(&sql, &raw_params);
     let explain = db.explain(&sql).unwrap_or_default();
     let rows = raw_result
@@ -517,14 +502,7 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
             )
         })
         .collect::<Vec<_>>();
-    let lineage_tables_are_in_one_sql = [
-        "decision_basis_snapshots",
-        "entity_snapshot_observations",
-        "evidence",
-        "evidence_embedding_handles",
-    ]
-    .iter()
-    .all(|table| sql.contains(table));
+    let lineage_tables_are_in_one_sql = sql.contains("decision_producer_lineage");
 
     assert!(
         raw_result.is_ok()
@@ -535,7 +513,7 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
                         public_rows.iter().any(|row| {
                             row.decision_id == *id
                                 && row.producer_system == *system
-                                && row.embedding_space_id == TEXT_SPACE
+                                && row.embedding_space_id == space
                                 && !row.write_txid.is_empty()
                         })
                     })
@@ -560,7 +538,7 @@ fn regulator_one_query_joins_decision_lineage_to_producer_system_across_n_observ
             && rows
                 .iter()
                 .any(|row| row.1 == "cg-edge" && row.2 == "first-party")
-            && rows.iter().all(|row| row.3 == TEXT_SPACE && row.4)
+            && rows.iter().all(|row| row.3 == space && row.4)
             && rows
                 .iter()
                 .any(|row| row.1 == "vendor-camera" && row.2 == "third-party")
@@ -575,9 +553,10 @@ fn architect_departure_end_to_end_procurement_demo() {
     let store_result = procurement_store();
     assert!(
         store_result.is_ok(),
-        "procurement audit requires a consumer text-default override space that can own evidence.vector_text for this boot, store={store_result:?}"
+        "procurement audit requires a consumer text-default override space that owns the text role for this boot, store={store_result:?}"
     );
     let store = store_result.expect("asserted procurement store open");
+    let procurement_space = text_space(&store);
     let context = store
         .create_context(CreateContext {
             name: "procurement-audit".to_string(),
@@ -599,7 +578,7 @@ fn architect_departure_end_to_end_procurement_demo() {
         context.id,
         entity.id,
         context_graph::CG_EDGE_SYSTEM_TAG,
-        PROCUREMENT_SPACE,
+        &procurement_space,
     );
     assert!(
         observation
@@ -635,8 +614,14 @@ fn architect_departure_end_to_end_procurement_demo() {
             ..Default::default()
         })
         .expect("decision");
-    record_text_basis_observation(&store, context.id, entity.id, "vendor-decoy", TEXT_SPACE)
-        .expect("decoy observation");
+    record_text_basis_observation(
+        &store,
+        context.id,
+        entity.id,
+        "vendor-decoy",
+        &procurement_space,
+    )
+    .expect("decoy observation");
     let result = store.decision_lineage_producer_systems(&[decision.id]);
 
     assert!(
@@ -644,7 +629,7 @@ fn architect_departure_end_to_end_procurement_demo() {
             && result.as_ref().is_ok_and(|rows| rows.len() == 1
                 && rows[0].decision_id == decision.id
                 && rows[0].producer_system == context_graph::CG_EDGE_SYSTEM_TAG
-                && rows[0].embedding_space_id == PROCUREMENT_SPACE),
+                && rows[0].embedding_space_id == procurement_space),
         "expected procurement decision lineage to point at the cited procurement-space snapshot, not merely at a registered space or same-entity decoy, observation={observation:?}, lineage={result:?}"
     );
 }

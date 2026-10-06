@@ -79,14 +79,31 @@ fn cg_observation_with_text_embedding(
         embedding_space_id: TEXT_SPACE.to_string(),
         vector,
         target: context_graph::EmbeddingTarget::Evidence(evidence_id),
-        produced_by: context_graph::EvidenceProducer {
-            system: "schema".to_string(),
-            model_name: "embeddinggemma-300m".to_string(),
-            model_version: "default".to_string(),
-            pipeline_version: "1".to_string(),
-        },
+        produced_by: text_space_producer(),
     }];
     observation
+}
+
+/// The built-in text space's one model, read from a store rather than written down here.
+fn text_space_producer() -> context_graph::EvidenceProducer {
+    static PRODUCER: std::sync::OnceLock<context_graph::EvidenceProducer> =
+        std::sync::OnceLock::new();
+    PRODUCER
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = context_graph::Store::open(context_graph::StoreConfig {
+                db_path: dir.path().join("producer.db"),
+                ..Default::default()
+            })
+            .expect("open to read the text space's model");
+            context_graph::EvidenceProducer::from(
+                &store
+                    .space_producer(TEXT_SPACE)
+                    .expect("read the text space's model")
+                    .expect("the built-in text space is declared"),
+            )
+        })
+        .clone()
 }
 
 fn text_vector_with_axis(axis: usize) -> Vec<f32> {
@@ -559,9 +576,48 @@ fn insert_signature(db: &Database, id: Uuid, status: &str) {
     .unwrap();
 }
 
+/// A space row with every NOT NULL column; raw schemas are not seeded by `initialize_schema`.
+fn insert_embedding_space_row(db: &Database, space_id: &str, model_name: &str) {
+    insert_embedding_space_row_with(db, space_id, model_name, 768, "node_local");
+}
+
+fn insert_embedding_space_row_with(
+    db: &Database,
+    space_id: &str,
+    model_name: &str,
+    dimension: i64,
+    placement: &str,
+) {
+    db.execute(
+        "INSERT INTO embedding_spaces (embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings, placement, media_reachable_on_every_node, producer_model, producer_weights_revision, producer_preparation, created_at) VALUES ($embedding_space_id, $dimension, $metric, $model_family, $model_name, $model_version, $supported_evidence_kinds, $default_for_evidence_kind, $bindings, $placement, $media_reachable_on_every_node, $producer_model, $producer_weights_revision, $producer_preparation, $created_at)",
+        &params(vec![
+            ("embedding_space_id", Value::Text(space_id.into())),
+            ("dimension", Value::Int64(dimension)),
+            ("metric", Value::Text("cosine".into())),
+            ("model_family", Value::Text("embeddinggemma".into())),
+            ("model_name", Value::Text(model_name.into())),
+            ("model_version", Value::Text("default".into())),
+            ("supported_evidence_kinds", Value::Json(json!(["text"]))),
+            ("default_for_evidence_kind", Value::Null),
+            (
+                "bindings",
+                Value::Json(json!([{"table_name": "evidence", "vector_column": "vector_text"}])),
+            ),
+            ("placement", Value::Text(placement.into())),
+            ("media_reachable_on_every_node", Value::Bool(false)),
+            ("producer_model", Value::Text(model_name.into())),
+            ("producer_weights_revision", Value::Text("default".into())),
+            ("producer_preparation", Value::Text("schema".into())),
+            ("created_at", Value::TxId(TxId(1_u64))),
+        ]),
+    )
+    .expect("seed embedding space");
+}
+
+/// A digest row plus its node-local vector row in the text space.
 fn insert_digest(db: &Database, id: Uuid, context_id: Uuid, embedding: Vec<f32>) {
     db.execute(
-        "INSERT INTO digests (id, source, session_ref, summary, kind, vector_text, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $vector_text, $dimension, $context_id, $properties, $created_at)",
+        "INSERT INTO digests (id, source, session_ref, summary, kind, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $dimension, $context_id, $properties, $created_at)",
         &params(vec![
             ("id", Value::Uuid(id)),
             ("source", Value::Text("claude-cli".into())),
@@ -569,13 +625,51 @@ fn insert_digest(db: &Database, id: Uuid, context_id: Uuid, embedding: Vec<f32>)
             ("summary", Value::Text("Discussed auth module refactoring".into())),
             ("kind", Value::Text("Text".into())),
             ("dimension", Value::Int64(embedding.len() as i64)),
-            ("vector_text", Value::Vector(embedding)),
             ("context_id", Value::Uuid(context_id)),
             ("properties", Value::Json(json!({"modality": "text"}))),
             ("created_at", Value::TxId(TxId(1_u64))),
         ]),
     )
     .unwrap();
+    if scalar_count(
+        db,
+        "SELECT COUNT(*) AS n FROM embedding_spaces WHERE embedding_space_id = $id",
+        &params(vec![("id", Value::Text(TEXT_SPACE.into()))]),
+    ) == 0
+    {
+        insert_embedding_space_row(db, TEXT_SPACE, "embeddinggemma-300m");
+    }
+    db.execute(
+        "INSERT INTO digest_embeddings (id, context_id, target_id, embedding_space_id, producer_key, produced_by, producer_system, item_created_at, created_at, vector_text) VALUES ($id, $context_id, $target_id, $space, $producer_key, $produced_by, $producer_system, $item_created_at, $created_at, $vector_text)",
+        &params(vec![
+            ("id", Value::Uuid(Uuid::from_u128(id.as_u128() ^ 0xD1_6E57))),
+            ("context_id", Value::Uuid(context_id)),
+            ("target_id", Value::Uuid(id)),
+            ("space", Value::Text(TEXT_SPACE.into())),
+            ("producer_key", Value::Text("schema".into())),
+            (
+                "produced_by",
+                Value::Json(json!({"system": "schema", "model_name": "embeddinggemma-300m", "model_version": "default", "pipeline_version": "schema"})),
+            ),
+            ("producer_system", Value::Text("schema".into())),
+            ("item_created_at", Value::TxId(TxId(1_u64))),
+            ("created_at", Value::TxId(TxId(1_u64))),
+            ("vector_text", Value::Vector(embedding)),
+        ]),
+    )
+    .unwrap();
+}
+
+/// The digest's vector, read from its node-local vector row.
+fn digest_vector(db: &Database, id: Uuid) -> Value {
+    let result = db
+        .execute(
+            "SELECT vector_text FROM digest_embeddings WHERE target_id = $id",
+            &params(vec![("id", Value::Uuid(id))]),
+        )
+        .unwrap();
+    assert_one_row(&result);
+    row_value(&result, 0, "vector_text").clone()
 }
 
 fn insert_blueprint(db: &Database, id: Uuid) {
@@ -1154,10 +1248,7 @@ fn test_digests_table_insert() {
         row_value(&result, 0, "summary"),
         &Value::Text("Discussed auth module refactoring".into())
     );
-    assert_eq!(
-        row_value(&result, 0, "vector_text"),
-        &Value::Vector(embedding)
-    );
+    assert_eq!(digest_vector(&db, id), Value::Vector(embedding));
     assert_eq!(
         row_value(&result, 0, "dimension"),
         &Value::Int64(DIGEST_VECTOR_DIMENSION as i64)
@@ -2305,17 +2396,13 @@ fn test_fk_entity_invalid_context_id_rejected() {
 fn test_fk_digest_invalid_context_id_rejected() {
     let db = fresh_db();
     assert_error_is_fk(db.execute(
-        "INSERT INTO digests (id, source, session_ref, summary, kind, vector_text, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $vector_text, $dimension, $context_id, $properties, $created_at)",
+        "INSERT INTO digests (id, source, session_ref, summary, kind, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $dimension, $context_id, $properties, $created_at)",
         &params(vec![
             ("id", Value::Uuid(Uuid::from_u128(1016))),
             ("source", Value::Text("source".into())),
             ("session_ref", Value::Null),
             ("summary", Value::Text("summary".into())),
             ("kind", Value::Text("Text".into())),
-            (
-                "vector_text",
-                Value::Vector(vec![0.0; DIGEST_VECTOR_DIMENSION]),
-            ),
             ("dimension", Value::Int64(DIGEST_VECTOR_DIMENSION as i64)),
             ("context_id", Value::Uuid(Uuid::from_u128(1017))),
             ("properties", Value::Json(json!({}))),
@@ -2503,7 +2590,7 @@ fn test_unique_context_name_noop() {
     assert_eq!(rows.rows.len(), 1);
 }
 
-// digests.vector_text is a fixed-dimension vector column (DIGEST_VECTOR_DIMENSION); the engine must round-trip a full-dimension embedding without truncation or dimension drift.
+// digest_embeddings.vector_text is a fixed-dimension vector column (DIGEST_VECTOR_DIMENSION); the engine must round-trip a full-dimension embedding without truncation or dimension drift.
 #[test]
 fn test_digest_vector_column_accepts_embedding() {
     let db = fresh_db();
@@ -2513,20 +2600,13 @@ fn test_digest_vector_column_accepts_embedding() {
     let embedding = vec![0.0_f32; DIGEST_VECTOR_DIMENSION];
     insert_digest(&db, id, context_id, embedding.clone());
 
-    let result = db
-        .execute(
-            "SELECT * FROM digests WHERE id = $id",
-            &params(vec![("id", Value::Uuid(id))]),
-        )
-        .unwrap();
-    assert_one_row(&result);
-    match row_value(&result, 0, "vector_text") {
+    match digest_vector(&db, id) {
         Value::Vector(v) => assert_eq!(v.len(), DIGEST_VECTOR_DIMENSION),
         other => panic!("expected vector embedding, got {other:?}"),
     }
 }
 
-// the cosine-distance operator on digests.vector_text must honor context_id scoping during ANN ordering so semantic search never surfaces a closer digest from a sibling context.
+// the cosine-distance operator on digest_embeddings.vector_text must honor context_id scoping during ANN ordering so semantic search never surfaces a closer digest from a sibling context.
 #[test]
 fn test_digest_vector_cosine_distance_query() {
     let db = fresh_db();
@@ -2550,7 +2630,7 @@ fn test_digest_vector_cosine_distance_query() {
     query[0] = 1.0;
     let result = db
         .execute(
-            "SELECT id, context_id FROM digests WHERE context_id = $context_id ORDER BY vector_text <=> $query LIMIT 2",
+            "SELECT target_id, context_id FROM digest_embeddings WHERE context_id = $context_id ORDER BY vector_text <=> $query LIMIT 2",
             &params(vec![
                 ("context_id", Value::Uuid(ctx_a)),
                 ("query", Value::Vector(query)),
@@ -2559,7 +2639,7 @@ fn test_digest_vector_cosine_distance_query() {
         .unwrap();
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
-        row_value(&result, 0, "id"),
+        row_value(&result, 0, "target_id"),
         &Value::Uuid(farther_right_context)
     );
     assert_eq!(row_value(&result, 0, "context_id"), &Value::Uuid(ctx_a));
@@ -2619,10 +2699,11 @@ fn combination_record_observation_observation_evidence_snapshot_embedding_atomic
         "record_observation must surface the evidence ids it committed"
     );
     assert_eq!(
-        recorded.embedding_ids,
-        vec![embedding_id],
+        recorded.embedding_ids.len(),
+        1,
         "record_observation must surface the embedding ids it committed"
     );
+    let committed_embedding_id = recorded.embedding_ids[0];
     let snapshot_id = recorded
         .snapshot_id
         .expect("non-empty state_delta must commit an entity snapshot");
@@ -2692,11 +2773,15 @@ fn combination_record_observation_observation_evidence_snapshot_embedding_atomic
 
     let embedding = db
         .execute(
-            "SELECT id, embedding_space_id, target_id, created_at FROM evidence_embedding_handles WHERE id = $id",
-            &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
+            "SELECT id, embedding_space_id, target_id, created_at FROM evidence_embeddings WHERE target_id = $target_id",
+            &params(vec![("target_id", Value::Uuid(evidence_id.as_uuid()))]),
         )
-        .expect("embedding handle row");
+        .expect("embedding row");
     assert_one_row(&embedding);
+    assert_eq!(
+        row_value(&embedding, 0, "id"),
+        &Value::Uuid(committed_embedding_id.as_uuid())
+    );
     assert_eq!(
         row_value(&embedding, 0, "embedding_space_id"),
         &Value::Text(TEXT_SPACE.to_string())
@@ -2709,13 +2794,13 @@ fn combination_record_observation_observation_evidence_snapshot_embedding_atomic
 
     let vector_hits = db
         .execute(
-            "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+            "SELECT target_id FROM evidence_embeddings ORDER BY vector_text <=> $query LIMIT 1",
             &params(vec![("query", Value::Vector(vector))]),
         )
         .expect("vector search");
     assert_one_row(&vector_hits);
     assert_eq!(
-        row_value(&vector_hits, 0, "id"),
+        row_value(&vector_hits, 0, "target_id"),
         &Value::Uuid(evidence_id.as_uuid())
     );
 }
@@ -2783,12 +2868,15 @@ fn combination_record_observation_rollback_on_validation_error_after_tx_open_lea
     );
     let embedding_rows = scalar_count(
         &db,
-        "SELECT COUNT(*) AS n FROM evidence_embedding_handles WHERE id = $id",
-        &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
+        "SELECT COUNT(*) AS n FROM evidence_embeddings WHERE target_id = $target_id",
+        &params(vec![(
+            "target_id",
+            Value::Uuid(valid_evidence_id.as_uuid()),
+        )]),
     );
     let vector_hits = db
         .query_vector(
-            contextdb_core::VectorIndexRef::new("evidence", "vector_text"),
+            contextdb_core::VectorIndexRef::new("evidence_embeddings", "vector_text"),
             &vector,
             10,
             None,
@@ -3303,27 +3391,7 @@ fn combination_embedding_space_bindings_composite_primary_key_identity() {
         ("text_default_nomic_v1_5_768", "embeddinggemma-300m"),
         ("other_text_space", "other-text"),
     ] {
-        db.execute(
-        "INSERT INTO embedding_spaces (embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings) VALUES ($embedding_space_id, $dimension, $metric, $model_family, $model_name, $model_version, $supported_evidence_kinds, $default_for_evidence_kind, $bindings)",
-        &params(vec![
-            (
-                "embedding_space_id",
-                Value::Text(space_id.into()),
-            ),
-            ("dimension", Value::Int64(768)),
-            ("metric", Value::Text("cosine".into())),
-            ("model_family", Value::Text("embeddinggemma".into())),
-            ("model_name", Value::Text(model_name.into())),
-            ("model_version", Value::Text("default".into())),
-            ("supported_evidence_kinds", Value::Json(json!(["text"]))),
-            ("default_for_evidence_kind", Value::Null),
-            (
-                "bindings",
-                Value::Json(json!([{"table_name": "evidence", "vector_column": "vector_text"}])),
-            ),
-        ]),
-    )
-    .expect("seed embedding space");
+        insert_embedding_space_row(&db, space_id, model_name);
     }
     let binding_params = params(vec![
         (
@@ -3411,12 +3479,14 @@ fn combination_evidence_multi_vector_columns_per_row_text_and_vision_independent
     let target_vision = vision_vector_with_axis(1);
     let decoy_text = text_vector_with_axis(1);
     let decoy_vision = vision_vector_with_axis(0);
+    insert_embedding_space_row(&db, TEXT_SPACE, "embeddinggemma-300m");
+    insert_embedding_space_row_with(&db, "vision_v1", "vigil-face", 512, "travels_with_item");
     for (supply_order, id, vector_text, vector_vision) in [
         (0_i64, target_id, target_text.clone(), target_vision.clone()),
         (1_i64, decoy_id, decoy_text, decoy_vision),
     ] {
         db.execute(
-            "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order, vector_text, vector_vision) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order, $vector_text, $vector_vision)",
+            "INSERT INTO evidence (id, observation_id, context_id, kind, source_ref, retention_status, supply_order) VALUES ($id, $observation_id, $context_id, $kind, $source_ref, $retention_status, $supply_order)",
             &params(vec![
                 ("id", Value::Uuid(id)),
                 ("observation_id", Value::Uuid(observation_id)),
@@ -3425,33 +3495,74 @@ fn combination_evidence_multi_vector_columns_per_row_text_and_vision_independent
                 ("source_ref", Value::Text(format!("vigil-edge://camera-1/frame/{supply_order}"))),
                 ("retention_status", Value::Text("retained_external".into())),
                 ("supply_order", Value::Int64(supply_order)),
-                ("vector_text", Value::Vector(vector_text)),
-                ("vector_vision", Value::Vector(vector_vision)),
             ]),
         )
-        .expect("insert vector-backed evidence");
+        .expect("insert evidence");
+        // The item's reproducible text vector is node-local; its caller-filled vision vector travels.
+        for (table, space, column, vector, head) in [
+            (
+                "evidence_embeddings",
+                TEXT_SPACE,
+                "vector_text",
+                vector_text,
+                "",
+            ),
+            (
+                "evidence_embeddings_travelling",
+                "vision_v1",
+                "vector_vision",
+                vector_vision,
+                ", is_head",
+            ),
+        ] {
+            let head_value = if head.is_empty() { "" } else { ", $is_head" };
+            db.execute(
+                &format!(
+                    "INSERT INTO {table} (id, context_id, target_id, embedding_space_id, producer_key, produced_by, producer_system, created_at, {column}{head}) VALUES ($id, $context_id, $target_id, $space, $producer_key, $produced_by, $producer_system, $created_at, $vector{head_value})"
+                ),
+                &params(vec![
+                    ("id", Value::Uuid(Uuid::new_v4())),
+                    ("context_id", Value::Uuid(context_id)),
+                    ("target_id", Value::Uuid(id)),
+                    ("space", Value::Text(space.into())),
+                    ("producer_key", Value::Text("schema".into())),
+                    ("produced_by", Value::Json(json!({"system": "schema"}))),
+                    ("producer_system", Value::Text("schema".into())),
+                    ("created_at", Value::TxId(TxId(1_u64))),
+                    ("vector", Value::Vector(vector)),
+                    ("is_head", Value::Bool(true)),
+                ]),
+            )
+            .expect("insert the item's vector row");
+        }
     }
 
     let text_hit = db
         .execute(
-            "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+            "SELECT target_id FROM evidence_embeddings ORDER BY vector_text <=> $query LIMIT 1",
             &params(vec![("query", Value::Vector(target_text))]),
         )
         .expect("text vector query");
     assert_one_row(&text_hit);
-    assert_eq!(row_value(&text_hit, 0, "id"), &Value::Uuid(target_id));
+    assert_eq!(
+        row_value(&text_hit, 0, "target_id"),
+        &Value::Uuid(target_id)
+    );
 
     let vision_hit = db
         .execute(
-            "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+            "SELECT target_id FROM evidence_embeddings_travelling ORDER BY vector_vision <=> $query LIMIT 1",
             &params(vec![("query", Value::Vector(target_vision))]),
         )
         .expect("vision vector query");
     assert_one_row(&vision_hit);
-    assert_eq!(row_value(&vision_hit, 0, "id"), &Value::Uuid(target_id));
+    assert_eq!(
+        row_value(&vision_hit, 0, "target_id"),
+        &Value::Uuid(target_id)
+    );
 
     let text_wrong_dimension = db.execute(
-        "SELECT id FROM evidence ORDER BY vector_text <=> $query LIMIT 1",
+        "SELECT target_id FROM evidence_embeddings ORDER BY vector_text <=> $query LIMIT 1",
         &params(vec![("query", Value::Vector(vec![0.0; 512]))]),
     );
     assert!(matches!(
@@ -3463,7 +3574,7 @@ fn combination_evidence_multi_vector_columns_per_row_text_and_vision_independent
         })
     ));
     let vision_wrong_dimension = db.execute(
-        "SELECT id FROM evidence ORDER BY vector_vision <=> $query LIMIT 1",
+        "SELECT target_id FROM evidence_embeddings_travelling ORDER BY vector_vision <=> $query LIMIT 1",
         &params(vec![("query", Value::Vector(vec![0.0; 768]))]),
     );
     assert!(matches!(

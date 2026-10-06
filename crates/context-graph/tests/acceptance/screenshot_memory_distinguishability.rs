@@ -2,8 +2,8 @@ use chrono::Utc;
 use context_graph::{
     CgError, ContextId, CreateContext, CreateDigest, CreateEntity, DigestId, DistanceMetric,
     EmbeddingId, EmbeddingSpaceBinding, EmbeddingSpaceDecl, EmbeddingTarget, EntityId, EntityType,
-    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, PrecomputedEmbedding,
-    RecordObservation, ReindexEvent, Store, StoreConfig,
+    EvidenceId, EvidenceKind, EvidenceProducer, EvidenceRef, ModelIdentity, PrecomputedEmbedding,
+    RecordObservation, ReindexEvent, Store, StoreConfig, VectorPlacement,
     test_support::embedding::{VectorSearchFilters, dedup_compare_digest_spaces, vector_search},
 };
 use std::collections::BTreeMap;
@@ -31,6 +31,14 @@ fn store() -> Store {
                 table_name: "digests".to_string(),
                 vector_column: "vector_text".to_string(),
             }],
+            placement: VectorPlacement::NodeLocal,
+            media_reachable_on_every_node: false,
+            producer: ModelIdentity {
+                model: "embeddinggemma-500m".to_string(),
+                weights_revision: "v1".to_string(),
+                preparation: "screenshot-review".to_string(),
+                dimension: 768,
+            },
         }],
         ..Default::default()
     })
@@ -63,6 +71,19 @@ fn producer(model_name: &str, model_version: &str) -> EvidenceProducer {
         model_name: model_name.to_string(),
         model_version: model_version.to_string(),
         pipeline_version: "screenshot-review".to_string(),
+    }
+}
+
+/// An edge-memory supply of `space`'s own model.
+fn space_supply(store: &Store, space: &str) -> EvidenceProducer {
+    EvidenceProducer {
+        system: "edge-memory".to_string(),
+        ..EvidenceProducer::from(
+            &store
+                .space_producer(space)
+                .expect("read the space's model")
+                .expect("the space is declared"),
+        )
     }
 }
 
@@ -121,7 +142,7 @@ fn record_caption_text_evidence(
             embedding_space_id: OLD_TEXT_SPACE.to_string(),
             vector: vector(768, 0),
             target: EmbeddingTarget::Evidence(evidence.id),
-            produced_by: producer("embeddinggemma-300m", "v1"),
+            produced_by: space_supply(store, OLD_TEXT_SPACE),
         }],
     })?;
     Ok(())
@@ -132,7 +153,6 @@ fn create_digest_in_space(
     digest_id: DigestId,
     context_id: ContextId,
     space_id: &str,
-    model_name: &str,
 ) -> context_graph::Result<()> {
     store.create_digest(CreateDigest {
         id: digest_id,
@@ -145,7 +165,7 @@ fn create_digest_in_space(
             embedding_space_id: space_id.to_string(),
             vector: vector(768, 0),
             target: EmbeddingTarget::Digest(digest_id),
-            produced_by: producer(model_name, "v1"),
+            produced_by: space_supply(store, space_id),
         },
         context_id,
         properties: BTreeMap::new(),
@@ -168,13 +188,7 @@ fn screenshot_review_result_row_distinguishes_digest_target_from_evidence_target
         image_frame_evidence(image_evidence_id),
         caption_text_evidence(evidence_id, image_evidence_id),
     );
-    let digest = create_digest_in_space(
-        &store,
-        digest_id,
-        context_id,
-        OLD_TEXT_SPACE,
-        "embeddinggemma-300m",
-    );
+    let digest = create_digest_in_space(&store, digest_id, context_id, OLD_TEXT_SPACE);
     let hits = vector_search(
         &store,
         &vector(768, 0),
@@ -207,20 +221,8 @@ fn screenshot_review_dedup_classifier_refuses_cross_space_compare_under_realisti
     let (context_id, _entity_id) = context_and_entity(&store);
     let tuesday_digest = DigestId::new_v7();
     let friday_digest = DigestId::new_v7();
-    let tuesday = create_digest_in_space(
-        &store,
-        tuesday_digest,
-        context_id,
-        OLD_TEXT_SPACE,
-        "embeddinggemma-300m",
-    );
-    let friday = create_digest_in_space(
-        &store,
-        friday_digest,
-        context_id,
-        NEW_TEXT_SPACE,
-        "embeddinggemma-500m",
-    );
+    let tuesday = create_digest_in_space(&store, tuesday_digest, context_id, OLD_TEXT_SPACE);
+    let friday = create_digest_in_space(&store, friday_digest, context_id, NEW_TEXT_SPACE);
     let result = dedup_compare_digest_spaces(
         &store,
         friday_digest,
@@ -253,10 +255,10 @@ fn screenshot_review_dedup_classifier_refuses_cross_space_compare_under_realisti
             && friday.is_ok()
             && friday_hits.as_ref().is_ok_and(|rows| rows.len() == 1
                 && rows[0].target == context_graph::EmbeddingTarget::Digest(friday_digest)
-                && rows[0].index_ref == "digests.vector_text")
+                && rows[0].index_ref == "digest_embeddings.vector_text")
             && tuesday_hits.as_ref().is_ok_and(|rows| rows.len() == 1
                 && rows[0].target == context_graph::EmbeddingTarget::Digest(tuesday_digest)
-                && rows[0].index_ref == "digests.vector_text")
+                && rows[0].index_ref == "digest_embeddings.vector_text")
             && matches!(
                 &result,
                 Err(CgError::CrossSpaceQueryRefused {
@@ -272,6 +274,6 @@ fn screenshot_review_dedup_classifier_refuses_cross_space_compare_under_realisti
                     to_space
                 } if from_space == OLD_TEXT_SPACE && to_space == NEW_TEXT_SPACE
             )),
-        "realistic text-default version bump must persist each Digest under its own space-filtered digests.vector_text binding, refuse exact spaces, and emit exact reindex trigger, tuesday={tuesday:?}, friday={friday:?}, friday_hits={friday_hits:?}, tuesday_hits={tuesday_hits:?}, result={result:?}, events={events:?}"
+        "realistic text-default version bump must persist each Digest under its own space-filtered digest_embeddings.vector_text binding, refuse exact spaces, and emit exact reindex trigger, tuesday={tuesday:?}, friday={friday:?}, friday_hits={friday_hits:?}, tuesday_hits={tuesday_hits:?}, result={result:?}, events={events:?}"
     );
 }
