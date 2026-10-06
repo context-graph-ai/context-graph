@@ -505,8 +505,9 @@ fn maybe_kick_understanding_worker(args: &[String]) {
         .args(["understand", "--worker"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    history::detach_from_spawner_descriptors(&mut command);
+    let _ = command.spawn();
 }
 
 /// Current wall-clock time in unix epoch milliseconds, for the retention window comparison.

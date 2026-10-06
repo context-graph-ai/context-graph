@@ -238,6 +238,106 @@ fn queued_forget_uses_configured_cap_and_finishes_after_foreground_releases() {
     assert!(!found.json()["hits"].as_array().unwrap().is_empty());
 }
 
+/// A pipe whose write end every child spawned from now on inherits, as a shell pipeline or a lock
+/// held by an ancestor hands one to `cg`.
+#[cfg(any(
+    context_graph_internal_test_support,
+    feature = "event-search-test-support"
+))]
+fn inheritable_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd;
+    let mut ends = [0; 2];
+    // SAFETY: pipe2 fills two descriptors this function then owns.
+    assert_eq!(
+        unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+        0,
+        "create the pipe"
+    );
+    // SAFETY: ends[1] is the write end just created; clearing close-on-exec lets children inherit it.
+    assert_eq!(unsafe { libc::fcntl(ends[1], libc::F_SETFD, 0) }, 0);
+    // SAFETY: both descriptors are open and owned by nothing else.
+    unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(ends[0]),
+            std::os::fd::OwnedFd::from_raw_fd(ends[1]),
+        )
+    }
+}
+
+/// Whether the pipe's read end reaches end-of-file within `allowance`: no process holds its write
+/// end any more.
+#[cfg(any(
+    context_graph_internal_test_support,
+    feature = "event-search-test-support"
+))]
+fn reaches_end_of_file(read_end: &std::os::fd::OwnedFd, allowance: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: read_end.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let allowance_ms = i32::try_from(allowance.as_millis()).expect("allowance fits");
+    // SAFETY: poll reads one initialized pollfd for a descriptor this test owns.
+    let ready = unsafe { libc::poll(&mut poll, 1, allowance_ms) };
+    if ready != 1 {
+        return false;
+    }
+    let mut byte = [0_u8; 1];
+    // SAFETY: the buffer is one writable byte; read returns 0 only at end-of-file.
+    unsafe { libc::read(read_end.as_raw_fd(), byte.as_mut_ptr().cast(), 1) == 0 }
+}
+
+/// A detached worker owns none of its spawner's descriptors: a pipe the caller of `cg import` still
+/// reads reaches end-of-file once the import exits, while the worker it started keeps running.
+#[test]
+#[cfg(any(
+    context_graph_internal_test_support,
+    feature = "event-search-test-support"
+))]
+fn a_detached_worker_keeps_none_of_the_descriptors_its_import_inherited() {
+    let machine = Machine::with_nomic();
+    let project = machine.project("inherited-descriptor");
+    write_session(
+        &machine.history_root(),
+        &project,
+        "inherited-descriptor-session",
+        &[("keep this pipe open", "only while the import runs")],
+    );
+    let observer = observer(&machine, "inherited-descriptor-observer", true);
+    let (read_end, write_end) = inheritable_pipe();
+    let imported = machine.run_with_env(
+        &project,
+        &[
+            "import",
+            ".",
+            "--context",
+            "inherited-descriptor",
+            "--search",
+            "background",
+            "--embedding-workers",
+            "1",
+        ],
+        OBSERVER_ENV,
+        &observer,
+    );
+    drop(write_end);
+    assert_eq!(imported.code, 0, "{}", imported.describe());
+    let paused = wait_for_state(Duration::from_secs(10), Duration::from_millis(20), || {
+        Ok::<_, ()>(observer.join("entered").exists().then_some(()))
+    })
+    .expect("worker pause observation cannot fail");
+    assert_eq!(paused, Some(()), "the detached worker is still running");
+    assert!(
+        reaches_end_of_file(&read_end, Duration::from_secs(10)),
+        "the running detached worker kept the pipe its import inherited open"
+    );
+
+    std::fs::write(observer.join("release"), b"continue\n").expect("release worker");
+    terminate_observed_worker(&observer);
+    machine.wait_for_search_worker_exit();
+}
+
 #[test]
 #[cfg(any(
     context_graph_internal_test_support,

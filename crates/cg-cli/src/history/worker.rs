@@ -2241,6 +2241,57 @@ fn kick_after_admission(
     }
 }
 
+/// A process `cg` starts and does not wait for owns none of its spawner's descriptors. A pipe the
+/// caller still reads, a terminal, or a lock some ancestor holds would otherwise stay open for as
+/// long as that process runs, so the reader never sees end-of-file and the lock never frees.
+pub(crate) fn detach_from_spawner_descriptors(command: &mut Command) {
+    let descriptor_ceiling = descriptor_ceiling();
+    // SAFETY: the hook runs in the forked child before exec and makes only async-signal-safe
+    // system calls, on descriptors the child is about to give up anyway.
+    unsafe {
+        command.pre_exec(move || {
+            close_inherited_descriptors_on_exec(descriptor_ceiling);
+            Ok(())
+        });
+    }
+}
+
+/// One past the highest descriptor this process can have open, read before forking because the
+/// forked child may only make async-signal-safe calls.
+fn descriptor_ceiling() -> libc::c_int {
+    // SAFETY: sysconf reads a process limit and has no other effect.
+    let ceiling = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    libc::c_int::try_from(ceiling)
+        .ok()
+        .filter(|ceiling| *ceiling > 3)
+        .unwrap_or(1024)
+        .min(1 << 20)
+}
+
+/// Mark every descriptor above stderr close-on-exec in the forked child, so exec drops them all.
+fn close_inherited_descriptors_on_exec(ceiling: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        // `CLOSE_RANGE_CLOEXEC` (Linux 5.11): one call marks the whole range.
+        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+        // SAFETY: close_range only changes descriptor flags in this child.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, CLOSE_RANGE_CLOEXEC) }
+            == 0
+        {
+            return;
+        }
+    }
+    for descriptor in 3..ceiling {
+        // SAFETY: setting close-on-exec on a descriptor that is not open fails harmlessly.
+        unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
+/// Set once this process has started a detached worker. The worker takes the data root's worker
+/// lock only after it starts, so until then the lock reads free; the resume hook that runs after
+/// the command must not start a second worker in that window.
+static STARTED_WORKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn spawn_worker(envelope: WorkerEnvelope) -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot locate the cg executable: {error}"))?;
@@ -2253,9 +2304,12 @@ fn spawn_worker(envelope: WorkerEnvelope) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .process_group(0)
+        .process_group(0);
+    detach_from_spawner_descriptors(&mut command);
+    let child = command
         .spawn()
         .map_err(|error| format!("could not start the background search worker: {error}"))?;
+    STARTED_WORKER.store(true, std::sync::atomic::Ordering::SeqCst);
     #[cfg(any(
         context_graph_internal_test_support,
         feature = "event-search-test-support"
