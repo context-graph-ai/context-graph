@@ -49,11 +49,7 @@ pub struct SignatureProducerLineageRow {
 }
 
 pub fn persist_signature_aggregate(store: &Store, aggregate: SignatureAggregate) -> Result<()> {
-    store
-        .embedding_space_for_id(&aggregate.embedding_space_id)
-        .map_err(|_| CgError::UnknownEmbeddingSpace {
-            id: aggregate.embedding_space_id.clone(),
-        })?;
+    store.embedding_space_for_id(&aggregate.embedding_space_id)?;
     let tx = store.begin_tx()?;
     let params = HashMap::from([
         (

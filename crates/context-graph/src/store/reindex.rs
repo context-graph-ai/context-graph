@@ -51,11 +51,7 @@ struct ReindexCommit<'a> {
 
 impl Store {
     pub fn reindex_space(&self, embedding_space_id: &str, options: ReindexOptions) -> Result<()> {
-        let space = self
-            .embedding_space_for_id(embedding_space_id)
-            .map_err(|_| CgError::UnknownEmbeddingSpace {
-                id: embedding_space_id.to_string(),
-            })?;
+        let space = self.embedding_space_for_id(embedding_space_id)?;
         let lease = self.acquire_reindex_lease(embedding_space_id)?;
         let candidates = self.reindex_candidates(&space.embedding_space_id, lease.started_at)?;
 

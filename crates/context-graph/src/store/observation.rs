@@ -553,11 +553,7 @@ impl Store {
     ) -> Result<EmbeddingRoute> {
         match embedding.target {
             EmbeddingTarget::Evidence(target_id) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_id(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -585,11 +581,7 @@ impl Store {
                 })
             }
             EmbeddingTarget::EntityReference(_, _) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_id(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -612,11 +604,7 @@ impl Store {
                 })
             }
             EmbeddingTarget::Digest(_) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_id(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -1336,11 +1324,7 @@ impl Store {
         embedding_space_id: &str,
         query_vector: &[f32],
     ) -> Result<Option<f32>> {
-        let space = self
-            .embedding_space_for_id(embedding_space_id)
-            .map_err(|_| CgError::UnknownEmbeddingSpace {
-                id: embedding_space_id.to_string(),
-            })?;
+        let space = self.embedding_space_for_id(embedding_space_id)?;
         if query_vector.len() != space.dimension {
             return Err(CgError::EmbeddingDimensionMismatch {
                 space_id: embedding_space_id.to_string(),

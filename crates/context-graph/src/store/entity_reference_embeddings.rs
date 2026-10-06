@@ -53,11 +53,7 @@ impl Store {
         query_vector: &[f32],
         options: EntityReferenceMatchOptions,
     ) -> Result<Vec<EntityMatch>> {
-        let space = self
-            .embedding_space_for_id(embedding_space_id)
-            .map_err(|_| CgError::UnknownEmbeddingSpace {
-                id: embedding_space_id.to_string(),
-            })?;
+        let space = self.embedding_space_for_id(embedding_space_id)?;
         if query_vector.len() != space.dimension {
             return Err(CgError::EmbeddingDimensionMismatch {
                 space_id: embedding_space_id.to_string(),
@@ -168,11 +164,7 @@ impl Store {
                 .first_context_id_for_entity_reference_enrollment()?
                 .unwrap_or_else(ContextId::new_v7),
         };
-        let space = self
-            .embedding_space_for_id(embedding_space_id)
-            .map_err(|_| CgError::UnknownEmbeddingSpace {
-                id: embedding_space_id.to_string(),
-            })?;
+        let space = self.embedding_space_for_id(embedding_space_id)?;
         if vector.len() != space.dimension {
             return Err(CgError::EmbeddingDimensionMismatch {
                 space_id: embedding_space_id.to_string(),
