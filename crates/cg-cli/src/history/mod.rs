@@ -302,6 +302,7 @@ pub(crate) fn library_refusal(format: OutputFormat, error: &CgError) -> i32 {
     // The condition name is the CLI's settled vocabulary for a store refusal, carried in both
     // formats so a script can branch on it rather than on the exit code.
     let condition = match error {
+        CgError::StoreNeedsWritableRecovery { .. } => "StoreNeedsWritableRecovery",
         CgError::StoreLocked { .. } => "StoreBusy",
         CgError::StoreHeldByReaders { .. } => "StoreHeldByReaders",
         CgError::ReaderCoordinationUnavailable { .. } => "ReaderCoordinationUnavailable",
@@ -309,7 +310,6 @@ pub(crate) fn library_refusal(format: OutputFormat, error: &CgError) -> i32 {
         CgError::WriteDidNotFitTheMemoryLimit { .. } => "WriteDidNotFitTheMemoryLimit",
         CgError::Engine(_)
         | CgError::StoreUnreadable { .. }
-        | CgError::StoreNeedsWritableRecovery { .. }
         | CgError::LegacySchemaDetected { .. } => "MemoryError",
         _ => "Error",
     };

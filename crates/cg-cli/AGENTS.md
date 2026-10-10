@@ -54,7 +54,8 @@ search uses the core's `Embedder`/sealed `EventSearchEmbedder`, never a CLI abst
   `foreground_selection_timeout_exhaustion_stays_failed_until_full_context_completion`, and
   `large_foreground_selections_and_repeated_failures_keep_bounded_durable_status`.
 - Import maps partial source capture to exit 5 and writable-recovery-required to exit 6 through
-  its own typed wrapper; find/show/status retain their shared refusal mappings. Guards:
+  its own typed wrapper; find/show/status report `StoreNeedsWritableRecovery` through the shared
+  refusal mapping and preserve the instruction to run `cg import <project-directory> --search defer`. Guards:
   `tests/event_import_roundtrip.rs::malformed_input_reports_source_partial_at_the_failed_position_without_silently_skipping_it`
   and `tests/event_history.rs::import_dry_run_refuses_a_recovery_needing_store_without_writing`.
 - Capture remains durable before search; retry preserves selected scope:
