@@ -48,6 +48,110 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Engine charges sampled while the real event-history cursors hold their pages. This recorder
+/// is confined to the calling test thread and never estimates bytes from retained row counts.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[derive(Debug, Clone, Default)]
+pub struct EventHistoryReadCost {
+    pub read_retries: u64,
+    pub writable_open_attempts: u64,
+    pub charged_bytes: u64,
+    pub statements: usize,
+    pub reads: Vec<EventHistoryStatementReadCost>,
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[derive(Debug, Clone, Default)]
+pub struct EventHistoryStatementReadCost {
+    pub sql: String,
+    pub charged_bytes: u64,
+    pub rows_examined: Option<u64>,
+    pub trace: Option<contextdb_engine::QueryTrace>,
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+thread_local! {
+    static RECORDED_READ_COST: std::cell::RefCell<Option<EventHistoryReadCost>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub fn record_event_history_read_cost_for_test() {
+    RECORDED_READ_COST.with(|slot| *slot.borrow_mut() = Some(EventHistoryReadCost::default()));
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub fn take_event_history_read_cost_for_test() -> EventHistoryReadCost {
+    RECORDED_READ_COST.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) fn record_consumer_retry_for_test() {
+    RECORDED_READ_COST.with(|slot| {
+        if let Some(cost) = slot.borrow_mut().as_mut() {
+            cost.read_retries += 1;
+        }
+    });
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) fn record_writable_open_for_test() {
+    RECORDED_READ_COST.with(|slot| {
+        if let Some(cost) = slot.borrow_mut().as_mut() {
+            cost.writable_open_attempts += 1;
+        }
+    });
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn record_page_charge(charged: impl FnOnce() -> Result<u64>) -> Result<()> {
+    if RECORDED_READ_COST.with(|slot| slot.borrow().is_some()) {
+        let charged = charged()?;
+        RECORDED_READ_COST.with(|slot| {
+            if let Some(cost) = slot.borrow_mut().as_mut() {
+                cost.charged_bytes = cost.charged_bytes.max(charged);
+                if let Some(read) = cost.reads.last_mut() {
+                    read.charged_bytes = read.charged_bytes.max(charged);
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+#[inline(always)]
+fn record_page_charge(_charged: impl FnOnce() -> Result<u64>) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn record_cursor_trace<'a>(
+    trace: impl FnOnce() -> Result<&'a contextdb_engine::QueryTrace>,
+) -> Result<()> {
+    if RECORDED_READ_COST.with(|slot| slot.borrow().is_some()) {
+        let trace = trace()?;
+        RECORDED_READ_COST.with(|slot| {
+            if let Some(read) = slot
+                .borrow_mut()
+                .as_mut()
+                .and_then(|cost| cost.reads.last_mut())
+            {
+                read.rows_examined = Some(trace.rows_examined);
+                read.trace = Some(trace.clone());
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+#[inline(always)]
+fn record_cursor_trace<'a>(
+    _trace: impl FnOnce() -> Result<&'a contextdb_engine::QueryTrace>,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Start recording event-history statements on this thread, discarding anything already recorded.
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 #[doc(hidden)]
@@ -64,6 +168,15 @@ pub fn take_recorded_event_history_statements_for_test() -> Vec<String> {
 
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 fn record_statement(sql: &str) {
+    RECORDED_READ_COST.with(|slot| {
+        if let Some(cost) = slot.borrow_mut().as_mut() {
+            cost.statements += 1;
+            cost.reads.push(EventHistoryStatementReadCost {
+                sql: sql.to_owned(),
+                ..Default::default()
+            });
+        }
+    });
     RECORDED_STATEMENTS.with(|slot| {
         if let Ok(mut slot) = slot.try_borrow_mut()
             && let Some(recorded) = slot.as_mut()
@@ -83,9 +196,12 @@ impl EventSearchRows for Store {
     fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
         record_statement(sql);
         self.require_application_ready()?;
-        self.internal_db()
+        let answer = self
+            .internal_db()
             .execute(sql, params)
-            .map_err(map_engine_err)
+            .map_err(map_engine_err)?;
+        record_cursor_trace(|| Ok(&answer.trace))?;
+        Ok(answer)
     }
 
     fn stream_rows(
@@ -103,12 +219,14 @@ impl EventSearchRows for Store {
         let mut cursor = session.open_cursor(sql, params).map_err(map_engine_err)?;
         let read = (|| -> Result<()> {
             let first = cursor.first_page();
+            record_page_charge(|| session.charged_bytes().map_err(map_engine_err))?;
             let mut has_more = first.has_more;
             for row in &first.rows {
                 visit(&first.columns, row)?;
             }
             while has_more {
                 let page = cursor.fetch(None).map_err(map_engine_err)?;
+                record_page_charge(|| session.charged_bytes().map_err(map_engine_err))?;
                 has_more = page.has_more;
                 for row in &page.rows {
                     visit(&page.columns, row)?;
@@ -116,8 +234,10 @@ impl EventSearchRows for Store {
             }
             Ok(())
         })();
+        let traced = record_cursor_trace(|| Ok(cursor.trace()));
         let closed = cursor.close().map_err(map_engine_err);
         read?;
+        traced?;
         closed
     }
 
@@ -136,11 +256,13 @@ impl EventSearchRows for ConsumerReader {
         let mut cursor = self.open_cursor(sql, params)?;
         let paged = (|| -> Result<(Vec<String>, Vec<Vec<Value>>)> {
             let first = cursor.first_page()?;
+            record_page_charge(|| self.charged_bytes())?;
             let mut columns = first.columns.clone();
             let mut rows = first.rows.clone();
             let mut has_more = first.has_more;
             while has_more {
                 let page = cursor.fetch(None)?;
+                record_page_charge(|| self.charged_bytes())?;
                 if columns.is_empty() {
                     columns = page.columns;
                 }
@@ -149,8 +271,10 @@ impl EventSearchRows for ConsumerReader {
             }
             Ok((columns, rows))
         })();
+        let traced = record_cursor_trace(|| cursor.query_trace());
         let closed = cursor.close();
         let (columns, rows) = paged?;
+        traced?;
         closed?;
         Ok(QueryResult {
             columns,
@@ -169,12 +293,14 @@ impl EventSearchRows for ConsumerReader {
         let mut cursor = self.open_cursor(sql, params)?;
         let read = (|| -> Result<()> {
             let first = cursor.first_page()?;
+            record_page_charge(|| self.charged_bytes())?;
             let mut has_more = first.has_more;
             for row in &first.rows {
                 visit(&first.columns, row)?;
             }
             while has_more {
                 let page = cursor.fetch(None)?;
+                record_page_charge(|| self.charged_bytes())?;
                 has_more = page.has_more;
                 for row in &page.rows {
                     visit(&page.columns, row)?;
@@ -182,8 +308,10 @@ impl EventSearchRows for ConsumerReader {
             }
             Ok(())
         })();
+        let traced = record_cursor_trace(|| cursor.query_trace());
         let closed = cursor.close();
         read?;
+        traced?;
         closed
     }
 
@@ -1082,19 +1210,6 @@ pub(crate) fn bind_contexts(
     bind_uuid_values(
         params,
         "context_id",
-        prefix,
-        values.into_iter().map(|id| id.as_uuid()),
-    )
-}
-
-pub(crate) fn bind_generations(
-    params: &mut HashMap<String, Value>,
-    prefix: &str,
-    values: impl IntoIterator<Item = EventSearchGenerationId>,
-) -> String {
-    bind_uuid_values(
-        params,
-        "generation_id",
         prefix,
         values.into_iter().map(|id| id.as_uuid()),
     )

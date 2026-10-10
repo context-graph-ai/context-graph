@@ -95,7 +95,9 @@ pub mod test_support {
     pub use crate::store::pause_next_event_search_finalization_for_test;
 
     pub use crate::store::event_search_projection::{
+        after_next_event_search_batch_commit_for_test,
         after_next_event_search_membership_read_page_for_test,
+        before_next_event_search_batch_commit_for_test,
         observe_event_search_batch_admission_for_test,
         set_event_search_projection_read_deadline_ms_for_test,
     };
@@ -105,7 +107,9 @@ pub mod test_support {
     /// Every statement the event-history reads issue on this thread, so a proof can assert what a
     /// `find`, a `status` or a projection pass COSTS in statements -- never how long it took.
     pub use crate::store::event_search_read::{
-        record_event_history_statements_for_test, take_recorded_event_history_statements_for_test,
+        EventHistoryReadCost, EventHistoryStatementReadCost,
+        record_event_history_read_cost_for_test, record_event_history_statements_for_test,
+        take_event_history_read_cost_for_test, take_recorded_event_history_statements_for_test,
     };
 
     /// Failure-ownership controls for the projection's internal regression suite.

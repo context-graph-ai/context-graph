@@ -628,7 +628,8 @@ async fn authenticated_hub() -> AuthenticatedHub {
             tenant.clone(),
             node_id,
             identity,
-        ),
+        )
+        .expect("admit engine read memory"),
     );
     for (table, policy) in [("events", EVENT_POLICY), ("event_anchors", ANCHOR_POLICY)] {
         database
@@ -676,7 +677,8 @@ async fn authenticated_binding(
         hub.broker.client_as(&node_id),
         hub.tenant.clone(),
         identity,
-    );
+    )
+    .expect("admit engine read memory");
     let binding = client
         .bind_application_table_policy(policy_expectation())
         .await

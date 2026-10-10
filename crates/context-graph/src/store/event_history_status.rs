@@ -5,7 +5,7 @@
 //! and search coverage as separate facts: captured events are durable even while search is behind,
 //! and search is `running` only while a live unexpired projection lease exists.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 
 use contextdb_core::{Value, Wallclock};
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,7 @@ const EVENT_HISTORY_READ_TABLES: &[&str] = &[
     "event_search_refusal_headers",
     "event_search_refusal_frontiers",
     "event_search_cursors",
+    "event_search_pending_streams",
     "event_search_leases",
     "cg_local_settings",
     "work_inputs",
@@ -508,59 +509,44 @@ fn source_streams(
     context_id: ContextId,
 ) -> Result<Vec<EventSourceStreamStatus>> {
     let params = context_params(context_id);
-    let distinct = source.query_rows(
-        "SELECT DISTINCT connector_id, source_instance_ref, session_ref, adapter_version, anchor_declaration_version FROM events WHERE context_id = $context_id",
+    let groups = source.query_rows(
+        "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref",
         &params,
     )?;
-    let mut streams = BTreeMap::new();
-    for row in &distinct.rows {
-        let connector_id = text(row, &distinct.columns, "connector_id")?;
-        let source_instance_ref = text(row, &distinct.columns, "source_instance_ref")?;
-        let key = (connector_id.clone(), source_instance_ref.clone());
-        if streams.contains_key(&key) {
-            // One source instance carries one session and one declaration; a second combination
-            // is a store the event core never writes.
-            return Err(CgError::Engine(format!(
-                "source instance {source_instance_ref} carries more than one session or declaration"
-            )));
-        }
-        let mut stream_params = params.clone();
-        stream_params.insert("connector_id".into(), Value::Text(connector_id.clone()));
-        stream_params.insert(
-            "source_instance_ref".into(),
-            Value::Text(source_instance_ref.clone()),
-        );
-        let event_count = count(
-            source,
-            "SELECT COUNT(*) AS n FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source_instance_ref",
-            &stream_params,
-        )?;
+    let mut streams = Vec::new();
+    for row in &groups.rows {
+        let connector_id = text(row, &groups.columns, "connector_id")?;
+        let source_instance_ref = text(row, &groups.columns, "source_instance_ref")?;
+        let mut latest_params = params.clone();
+        latest_params.insert("connector".into(), Value::Text(connector_id.clone()));
+        latest_params.insert("source".into(), Value::Text(source_instance_ref.clone()));
         let latest = source.query_rows(
-            "SELECT seq FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source_instance_ref ORDER BY seq DESC LIMIT 1",
-            &stream_params,
+            "SELECT session_ref, adapter_version, anchor_declaration_version, seq FROM events WHERE context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1",
+            &latest_params,
         )?;
-        let latest_event_seq = match latest.rows.first() {
-            Some(row) => Some(unsigned(row, &latest.columns, "seq")?),
-            None => None,
-        };
-        streams.insert(
-            key,
-            EventSourceStreamStatus {
-                connector_id,
-                source_instance_ref,
-                session_ref: text(row, &distinct.columns, "session_ref")?,
-                adapter_version: text(row, &distinct.columns, "adapter_version")?,
-                anchor_declaration_version: text(
-                    row,
-                    &distinct.columns,
-                    "anchor_declaration_version",
-                )?,
-                event_count,
-                latest_event_seq,
-            },
-        );
+        let newest = latest
+            .rows
+            .first()
+            .ok_or_else(|| CgError::Engine("captured source group has no newest event".into()))?;
+        streams.push(EventSourceStreamStatus {
+            connector_id,
+            source_instance_ref,
+            session_ref: text(newest, &latest.columns, "session_ref")?,
+            adapter_version: text(newest, &latest.columns, "adapter_version")?,
+            anchor_declaration_version: text(
+                newest,
+                &latest.columns,
+                "anchor_declaration_version",
+            )?,
+            event_count: unsigned(row, &groups.columns, "event_count")?,
+            latest_event_seq: Some(unsigned(newest, &latest.columns, "seq")?),
+        });
     }
-    Ok(streams.into_values().collect())
+    streams.sort_by(|left, right| {
+        (&left.connector_id, &left.source_instance_ref)
+            .cmp(&(&right.connector_id, &right.source_instance_ref))
+    });
+    Ok(streams)
 }
 
 fn search_status(

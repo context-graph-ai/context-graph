@@ -19,10 +19,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     OutputFormat, SelectionSource, Terminal, configured_passage_profile, configured_placement,
-    grouped, import_retry_command, library_refusal, nearest_binding, open_reader, parse,
-    parse_embedding_workers, parse_search_order, parse_search_sessions, print_json, refuse,
-    resolved_embedding_workers, resolved_search_work_policy, search_artifact_available,
-    store_config, usage, worker, workspace_binding_key,
+    grouped, import_retry_command, library_refusal as shared_library_refusal, nearest_binding,
+    open_reader, parse, parse_embedding_workers, parse_search_order, parse_search_sessions,
+    print_json, refuse, resolved_embedding_workers, resolved_search_work_policy,
+    search_artifact_available, store_config, usage, worker, workspace_binding_key,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,7 +600,11 @@ pub(crate) fn handle_import(
         && artifact_available
         && failed.is_empty()
     {
-        match store.select_event_search_work(context_id, work_policy) {
+        match store.select_event_search_work_with_spec(
+            context_id,
+            work_policy,
+            &super::search_work_spec(&desired_profile),
+        ) {
             Ok(selected) => Some(worker::accept_background_work(
                 &root,
                 &store,
@@ -903,7 +907,7 @@ fn finish(
         SearchOutcome {
             state: "source_partial",
             ok: false,
-            code: 1,
+            code: 5,
             search_status: if work.work_required {
                 "pending"
             } else {
@@ -1431,6 +1435,17 @@ fn apply_context_plan(
     }
 }
 
+/// Import drivers distinguish interrupted source capture and recovery from a completed capture
+/// whose search work is still behind. Other read commands retain their own exit mappings.
+fn library_refusal(format: OutputFormat, error: &CgError) -> i32 {
+    let code = shared_library_refusal(format, error);
+    if matches!(error, CgError::StoreNeedsWritableRecovery { .. }) {
+        6
+    } else {
+        code
+    }
+}
+
 const IMPORT_HELP: &str = "Usage: cg import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer] [--embedding-workers N] [--search-order newest|oldest] [--search-sessions N|all] [--session REF] [--dry-run] [--format json|text]
 
 Example:
@@ -1475,6 +1490,8 @@ background and wait need the local Nomic model (`cg model fetch --defaults`); no
 downloaded by import. JSON is the default output; --format text prints a human summary.
 --dry-run resolves the sources and the Context and writes nothing.
 
-Exit: 0 complete / scheduled / deferred; 1 captured_search_behind, source_partial,
-schema_mismatch, store_needs_recovery, tenant_policy_blocked, config_error; 2 project_history_not_found,
-context_binding_required, context_binding_conflict, usage_error; 4 store_busy.";
+Exit: 0 complete / scheduled / deferred; 1 captured_search_behind, schema_mismatch,
+tenant_policy_blocked, config_error and other failures; 2 project_history_not_found,
+context_binding_required, context_binding_conflict, usage_error; 4 store_busy;
+5 source_partial (some source records were not captured);
+6 store_needs_recovery (a writable recovery is required).";

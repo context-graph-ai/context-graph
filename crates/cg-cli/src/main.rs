@@ -737,7 +737,16 @@ fn handle_worker(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsiz
     // Build the SyncClient against the hub, dialing FROM the enrolled identity. Its ordinary sync
     // behavior comes from the durable table declarations installed with this store.
     let dial_spec = worker_dial_spec(hub_endpoint, &key_path);
-    let client = SyncClient::new(store.sync_database(), &dial_spec, TenantId::from(tenant));
+    let client = match SyncClient::new(store.sync_database(), &dial_spec, TenantId::from(tenant)) {
+        Ok(client) => client,
+        Err(err) => {
+            return worker_failure(
+                1,
+                "StoreUnavailable",
+                &format!("cg worker cannot initialize sync: {err}"),
+            );
+        }
+    };
 
     // Advertise this node's understanding capability; sharing follows the fabric config.
     let mut worker_config = FabricWorkerConfig::for_node(&node_id);
@@ -2539,7 +2548,11 @@ fn handle_sync(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize)
         Err(err) => return memory_error(err, &db_path, &context_label),
     };
     let store = &stores.scoped;
-    let boundary = CliSyncBoundary::new(&stores.admin, &stores.admin, &remote_url, &tenant_id);
+    let boundary = match CliSyncBoundary::new(&stores.admin, &stores.admin, &remote_url, &tenant_id)
+    {
+        Ok(boundary) => boundary,
+        Err(err) => return cg_failure(sync_client_error(err), &db_path, &context_label),
+    };
 
     match action {
         "status" => {
@@ -2643,16 +2656,21 @@ struct CliSyncBoundary {
 }
 
 impl CliSyncBoundary {
-    fn new(data_store: &Store, _admin_store: &Store, remote_url: &str, tenant_id: &str) -> Self {
+    fn new(
+        data_store: &Store,
+        _admin_store: &Store,
+        remote_url: &str,
+        tenant_id: &str,
+    ) -> Result<Self, contextdb_core::Error> {
         let client = SyncClient::new(
             data_store.sync_database(),
             remote_url,
             TenantId::from(tenant_id),
-        );
-        Self {
+        )?;
+        Ok(Self {
             client,
             hub_connection_opened: Mutex::new(false),
-        }
+        })
     }
 
     fn mark_connected(&self) {

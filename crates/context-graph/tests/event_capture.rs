@@ -469,13 +469,100 @@ fn append_derives_occurrence_identity_and_source_order_without_caller_control() 
     );
 }
 
+fn capture_stream_summary(
+    store: &Store,
+    context_id: context_graph::ContextId,
+) -> Vec<Vec<DbValue>> {
+    let params = HashMap::from([("context_id".into(), DbValue::Uuid(context_id.as_uuid()))]);
+    let db = store.sync_database();
+    let groups = db.execute(
+        "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref",
+        &params,
+    ).expect("read maintained capture stream counts");
+    let rows = db.execute(
+        "SELECT connector_id, session_ref, source_instance_ref, seq FROM events WHERE context_id = $context_id",
+        &params,
+    ).expect("read fixture events for test-only session breakdown");
+    let mut sessions = std::collections::BTreeMap::new();
+    for row in &rows.rows {
+        let [
+            DbValue::Text(connector),
+            DbValue::Text(session),
+            DbValue::Text(source),
+            DbValue::Int64(seq),
+        ] = row.as_slice()
+        else {
+            panic!("unexpected fixture event row: {row:?}");
+        };
+        let entry = sessions
+            .entry((connector.clone(), session.clone(), source.clone()))
+            .or_insert((0_i64, 0_i64));
+        entry.0 += 1;
+        entry.1 = entry.1.max(*seq);
+    }
+    for group in &groups.rows {
+        let [connector, source, count] = group.as_slice() else {
+            panic!("unexpected maintained group: {group:?}");
+        };
+        let mut newest_params = params.clone();
+        newest_params.insert("connector".into(), connector.clone());
+        newest_params.insert("source".into(), source.clone());
+        let newest = db.execute(
+            "SELECT seq FROM events WHERE context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1",
+            &newest_params,
+        ).expect("read indexed newest sequence");
+        let stream_rows: Vec<_> = rows
+            .rows
+            .iter()
+            .filter(|row| &row[0] == connector && &row[2] == source)
+            .collect();
+        assert_eq!(
+            count,
+            &DbValue::Int64(stream_rows.len() as i64),
+            "maintained stream count equals fixture rows"
+        );
+        let max = stream_rows
+            .iter()
+            .map(|row| match row[3] {
+                DbValue::Int64(seq) => seq,
+                _ => panic!("sequence is an integer"),
+            })
+            .max()
+            .unwrap();
+        assert_eq!(
+            newest.rows,
+            vec![vec![DbValue::Int64(max)]],
+            "indexed newest entry equals fixture frontier"
+        );
+    }
+    sessions
+        .into_iter()
+        .map(|((connector, session, source), (count, max))| {
+            vec![
+                DbValue::Text(connector),
+                DbValue::Text(session),
+                DbValue::Text(source),
+                DbValue::Int64(count),
+                DbValue::Int64(max),
+            ]
+        })
+        .collect()
+}
+
 #[test]
 fn retries_are_noops_and_a_divergent_batch_leaves_events_and_checkpoint_unchanged() {
     let root = TempDir::new().expect("tempdir");
     let store = store(&root, "retry", None);
     let context_id = context(&store, "atomic retry");
     let initial = append(&store, context_id, vec![draft("one", "original")]);
+    let summary = capture_stream_summary(&store, context_id);
+    assert_eq!(summary[0][3..], [DbValue::Int64(1), DbValue::Int64(1)]);
     let retry = append(&store, context_id, vec![draft("one", "original")]);
+    assert_eq!(
+        capture_stream_summary(&store, context_id),
+        summary,
+        "retry leaves the authoritative stream frontier unchanged"
+    );
 
     assert_eq!(retry.inserted, 0);
     assert_eq!(retry.already_present, 1);
@@ -509,6 +596,12 @@ fn retries_are_noops_and_a_divergent_batch_leaves_events_and_checkpoint_unchange
         "the new row was rolled back with the divergent row"
     );
 
+    assert_eq!(
+        capture_stream_summary(&store, context_id),
+        summary,
+        "divergent capture rolls the stream facts back with its events"
+    );
+
     let (mut recovery, _, decoded) = ScriptedSource::records(vec![adapted(13, "two", "recovered")]);
     import(&store, context_id, &mut recovery, b"first\nsecond\n")
         .expect("the failed batch did not advance checkpoint");
@@ -518,6 +611,11 @@ fn retries_are_noops_and_a_divergent_batch_leaves_events_and_checkpoint_unchange
         "the uncommitted tail is parsed again"
     );
     assert_eq!(all_events(&store, context_id).len(), 2);
+    assert_eq!(
+        capture_stream_summary(&store, context_id)[0][3..],
+        [DbValue::Int64(2), DbValue::Int64(2)],
+        "committed retry advances count and frontier together"
+    );
 }
 
 #[test]
@@ -734,7 +832,8 @@ async fn authenticated_hub() -> AuthenticatedHub {
             tenant.clone(),
             hub_node,
             identity,
-        ),
+        )
+        .expect("admit engine read memory"),
     );
     for (table, policy) in [("events", EVENT_POLICY), ("event_anchors", ANCHOR_POLICY)] {
         db.execute(
@@ -783,7 +882,8 @@ async fn bind_tenant_store(
         hub.broker.client_as(&node_id),
         hub.tenant.clone(),
         identity,
-    );
+    )
+    .expect("admit engine read memory");
     let binding = client
         .bind_application_table_policy(policy_expectation())
         .await

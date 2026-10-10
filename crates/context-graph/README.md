@@ -466,7 +466,7 @@ Changing these settings makes the next import rebuild search under the new profi
 
 A malformed or divergent file stops only itself: every other selected file is captured, the failed
 file's committed prefix stays durable, no worker starts, and the receipt returns `source_partial`
-(exit 1) naming the failed file, its position and the reason.<!-- enforced by: `cg_import_continues_past_a_malformed_file_captures_every_other_file_and_reports_source_partial_naming_the_failed_file` -->
+(exit 5) naming the failed file, its position and the reason.<!-- enforced by: `cg_import_continues_past_a_malformed_file_captures_every_other_file_and_reports_source_partial_naming_the_failed_file` -->
 
 The JSON receipt carries `ok`, `state`, the Context and whether it came from the project binding or
 an explicit name, separate `capture` and `search` objects, pending counts and a `retry` command. It

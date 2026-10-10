@@ -630,13 +630,32 @@ impl Store {
         crate::store::event_search_projection::reconcile_refusal_work(self, retained)
     }
 
-    /// Freeze the session identities and source frontiers selected by this policy.
+    /// The bounded pending selection: exactly the streams with pending work under this policy,
+    /// found without examining completed history.
     pub fn select_event_search_work(
         &self,
         context_id: ContextId,
         policy: EventSearchWorkPolicy,
     ) -> Result<EventSearchSelectedWork> {
         crate::store::event_search_projection::select_work(self, context_id, policy)
+    }
+
+    /// Freeze the session identities and source frontiers selected by this policy for the
+    /// supplied projection target, completed streams included, so an accepted request records
+    /// every identity it observed. A replacement target with no compatible cursor treats
+    /// captured streams as pending for that new job.
+    pub fn select_event_search_work_with_spec(
+        &self,
+        context_id: ContextId,
+        policy: EventSearchWorkPolicy,
+        spec: &EventSearchWorkSpec,
+    ) -> Result<EventSearchSelectedWork> {
+        crate::store::event_search_projection::select_work_for_spec(
+            self,
+            context_id,
+            policy,
+            Some(spec),
+        )
     }
 
     /// Whether the active compatible projection has committed every accepted source frontier.
@@ -796,13 +815,32 @@ impl ConsumerReader {
         crate::store::event_search_projection::load_selected_work(self, context_id, request_id)
     }
 
-    /// Freeze the session identities and source frontiers selected by this policy.
+    /// The bounded pending selection: exactly the streams with pending work under this policy,
+    /// found without examining completed history.
     pub fn select_event_search_work(
         &self,
         context_id: ContextId,
         policy: EventSearchWorkPolicy,
     ) -> Result<EventSearchSelectedWork> {
         crate::store::event_search_projection::select_work(self, context_id, policy)
+    }
+
+    /// Freeze the session identities and source frontiers selected by this policy for the
+    /// supplied projection target, completed streams included, so an accepted request records
+    /// every identity it observed. A replacement target with no compatible cursor treats
+    /// captured streams as pending for that new job.
+    pub fn select_event_search_work_with_spec(
+        &self,
+        context_id: ContextId,
+        policy: EventSearchWorkPolicy,
+        spec: &EventSearchWorkSpec,
+    ) -> Result<EventSearchSelectedWork> {
+        crate::store::event_search_projection::select_work_for_spec(
+            self,
+            context_id,
+            policy,
+            Some(spec),
+        )
     }
 
     /// Whether the active compatible projection has committed every accepted source frontier.

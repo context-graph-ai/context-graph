@@ -136,6 +136,11 @@ pub(crate) const LOCAL_DERIVED_TABLES: &[TableSpec] = &[
         name: "event_search_work_policies",
         ddl: "CREATE TABLE event_search_work_policies (context_id UUID CONTEXT_ID PRIMARY KEY REFERENCES contexts(id), search_order TEXT NOT NULL, search_sessions INTEGER) SYNC OFF",
     },
+    // Projection scheduling state only; counts and frontiers remain engine-owned.
+    TableSpec {
+        name: "event_search_pending_streams",
+        ddl: "CREATE TABLE event_search_pending_streams (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL, connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, pending BOOLEAN NOT NULL, PRIMARY KEY (context_id, generation_id, connector_id, source_instance_ref, session_ref)) SYNC OFF",
+    },
     TableSpec {
         name: "event_search_cursors",
         ddl: "CREATE TABLE event_search_cursors (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL REFERENCES event_search_generations(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, committed_sequence INTEGER NOT NULL, open_tail_start_sequence INTEGER, open_tail_members JSON NOT NULL, open_tail_passage_id UUID, watermark_sha256 TEXT NOT NULL, updated_at TXID NOT NULL, PRIMARY KEY (context_id, generation_id, connector_id, source_instance_ref, session_ref), FOREIGN KEY (context_id, generation_id) REFERENCES event_search_generations(context_id, id)) SYNC OFF",
@@ -525,6 +530,11 @@ pub const INDEXES: &[IndexSpec] = &[
 /// [`INDEXES`], whose every table is one [`TABLES`] declares.
 pub(crate) const LOCAL_DERIVED_INDEXES: &[IndexSpec] = &[
     IndexSpec {
+        table: "event_context_sessions",
+        name: "idx_event_context_sessions_recency",
+        ddl: "CREATE INDEX idx_event_context_sessions_recency ON event_context_sessions (context_id, latest_occurred_at DESC, connector_id ASC, session_ref ASC)",
+    },
+    IndexSpec {
         table: "adapter_coverage_gaps",
         name: "idx_adapter_coverage_gaps_page",
         ddl: "CREATE INDEX idx_adapter_coverage_gaps_page ON adapter_coverage_gaps (context_id, connector_id, id)",
@@ -538,6 +548,16 @@ pub(crate) const LOCAL_DERIVED_INDEXES: &[IndexSpec] = &[
         table: "event_interpretation_anchors",
         name: "idx_event_interpretation_anchors_exact",
         ddl: "CREATE INDEX idx_event_interpretation_anchors_exact ON event_interpretation_anchors (context_id, generation_id, key, canonical_value, identity_value)",
+    },
+    IndexSpec {
+        table: "event_search_pending_streams",
+        name: "idx_event_search_pending_streams_selection",
+        ddl: "CREATE INDEX idx_event_search_pending_streams_selection ON event_search_pending_streams (context_id, generation_id, pending, connector_id, session_ref, source_instance_ref)",
+    },
+    IndexSpec {
+        table: "event_search_generations",
+        name: "idx_event_search_generations_job_state",
+        ddl: "CREATE INDEX idx_event_search_generations_job_state ON event_search_generations (context_id, state, id)",
     },
     IndexSpec {
         table: "event_search_source_events",

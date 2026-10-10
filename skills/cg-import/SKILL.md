@@ -43,13 +43,14 @@ Common states (not exhaustive); also inspect capture progress and search status:
 | `captured_search_deferred` | 0 | Run the `retry` template with the original project directory or session file when search is wanted. |
 | `captured_search_behind` | 1 | Run the `retry` template with the original input; it installs the model with `cg model fetch --defaults` if `search.status` is `blocked`. |
 | `write_memory_limit` | 1 | Read committed capture progress, raise the writer budget, then retry the same import; earlier commits remain. |
-| `source_partial` | 1 | Fix or remove the files in `capture.failed_sources`; everything else was captured. |
+| `source_partial` | 5 | Fix or remove the files in `capture.failed_sources`; everything else was captured. |
 | `schema_mismatch` | 1 | The unsupported schema contents are left untouched. Move data from an earlier build aside, then set `CG_DATA_ROOT` to a new empty directory and recreate the store. |
 | `tenant_policy_blocked` | 1 | Finish tenant enrollment for this data root, then run `retry`; nothing was written. |
 | `project_history_not_found` | 2 | Import the directory the sessions were started in, or name the file. |
 | `context_binding_required` | 2 | Run `retry`. |
 | `context_binding_conflict` | 2 | Import without `--context`; the project is linked elsewhere. |
 | `store_busy` | 4 | Retry after the other writer exits. |
+| `store_needs_recovery` | 6 | Run a writable import with `--search defer` before retrying the dry-run. |
 | `dry_run` | 0 | Configuration is valid; `capture` lists new, grown, unchanged and diverged sources and bytes to capture without writing. |
 | `config_error` | 1 | Correct the named configuration setting or command-line value, then retry. |
 
@@ -117,8 +118,8 @@ outside-scope, and no-searchable-text event counts. Outside scope means outside 
 selection, so retained indexed results can be outside scope; output reports that indexed subset
 separately. An `all` first build can take much longer.<!-- enforced by: `recent_session_scope_builds_the_ten_most_recent_newest_first_and_widens_without_reembedding`, `oldest_order_builds_the_ten_oldest_sessions_oldest_first`, `search_work_policy_defaults_to_newest_ten_and_cli_overrides_config`, `invalid_search_config_is_refused_even_when_cli_values_are_present` -->
 
-`store_needs_recovery` is a read-only command result, not an import receipt state. `cg status`
-and `cg import --dry-run` exit 1 and direct the user to run `cg import <project-directory> --search
+`store_needs_recovery` is a read-only command result. `cg status` returns exit 1 and
+`cg import --dry-run` returns exit 6; both direct the user to run `cg import <project-directory> --search
 defer`; neither command opens the store for recovery.<!-- enforced by: `import_recovers_a_store_that_needs_a_writable_open_and_status_names_that_command`, `import_dry_run_refuses_a_recovery_needing_store_without_writing` -->
 
 ## Choose embedding parallelism

@@ -146,6 +146,8 @@ fn open_through_owner_transitions(
                 if now >= deadline {
                     return Err(error);
                 }
+                #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+                crate::store::event_search_read::record_consumer_retry_for_test();
                 std::thread::sleep(pause.min(deadline - now));
                 pause = (pause * 2).min(LONGEST_PAUSE);
             }
@@ -565,6 +567,8 @@ impl ConsumerReader {
                     if owner_in_transition(&error, started.elapsed(), &session.options())
                         && Instant::now() < deadline =>
                 {
+                    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+                    crate::store::event_search_read::record_consumer_retry_for_test();
                     *session =
                         open_through_owner_transitions(&self.path, session.options(), deadline)?;
                 }
@@ -768,6 +772,11 @@ impl ConsumerCursor {
             .narrowed_first_page
             .as_ref()
             .unwrap_or_else(|| cursor.first_page()))
+    }
+
+    /// The substrate's cumulative cursor trace, while the actual cursor remains open.
+    pub(crate) fn query_trace(&self) -> Result<&contextdb_engine::QueryTrace> {
+        Ok(self.cursor.as_ref().ok_or_else(already_closed)?.trace())
     }
 
     /// Whether this cursor still holds the read it was opened with.
@@ -1062,6 +1071,9 @@ fn admit_expr(
             }
             Ok(())
         }
+        // Window specifications contain column references only; they cannot introduce a
+        // nested statement or row-vector source. Their input tables are admitted by the body.
+        Expr::RowNumber(_) | Expr::WindowRank(_) => Ok(()),
         Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
     }
 }

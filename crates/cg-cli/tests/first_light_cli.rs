@@ -1371,11 +1371,14 @@ async fn cli_sync_fixture(label: &str) -> CliSyncFixture {
     .expect("CLI authenticated hub bind stays bounded")
     .expect("bind CLI authenticated hub");
     let remote_url = endpoint.ticket();
-    let server = Arc::new(SyncServer::new(
-        Arc::clone(&hub_db),
-        &endpoint,
-        contextdb_core::TenantId::from(&tenant_id),
-    ));
+    let server = Arc::new(
+        SyncServer::new(
+            Arc::clone(&hub_db),
+            &endpoint,
+            contextdb_core::TenantId::from(&tenant_id),
+        )
+        .expect("admit engine read memory"),
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_task = {
         let server = Arc::clone(&server);
@@ -1419,7 +1422,8 @@ fn cli_expected_pending_push_change_count(
         store.sync_database(),
         remote_url,
         contextdb_core::TenantId::from(tenant_id),
-    );
+    )
+    .expect("admit engine read memory");
     context_graph_pending_push_change_count(&client)
         .expect("count the exact pending push set for the CLI fixture")
 }

@@ -1215,7 +1215,7 @@ fn per_context_fifo_ordering_preserved_under_concurrent_commits_via_lsn_ordering
     assert_eq!(payload_ids, committed_ids);
     drop(store);
     let raw = RawDatabase::open(&path).expect("open raw database");
-    let changes = raw.changes_since(Lsn(0));
+    let changes = raw.changes_since(Lsn(0)).expect("admit engine read memory");
     for payload in captured {
         let decision_lsn = changes
             .rows

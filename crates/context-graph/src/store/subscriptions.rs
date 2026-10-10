@@ -163,7 +163,7 @@ impl ScopedStore<'_> {
 
     pub fn unsubscribe(&self, subscription_id: SubscriptionId) -> SubscriptionResult<()> {
         let ddl_db = self.store.resource_owner.as_ref().unwrap_or(&self.store.db);
-        if !route_is_active(ddl_db, subscription_id.route_name()) {
+        if !route_is_active(ddl_db, subscription_id.route_name())? {
             return Err(SubscriptionError::UnknownSubscription(subscription_id));
         }
         ddl_db
@@ -180,7 +180,7 @@ impl ScopedStore<'_> {
         subscription_id: &SubscriptionId,
     ) -> SubscriptionResult<SubscriptionMetrics> {
         let ddl_db = self.store.resource_owner.as_ref().unwrap_or(&self.store.db);
-        if !sink_is_declared(ddl_db, subscription_id.sink_name()) {
+        if !sink_is_declared(ddl_db, subscription_id.sink_name())? {
             return Err(SubscriptionError::UnknownSubscription(
                 subscription_id.clone(),
             ));
@@ -456,25 +456,34 @@ fn scoped_database_for_contexts(db: &Arc<Database>, contexts: &BTreeSet<ContextI
     )
 }
 
-fn route_is_active(db: &Database, route_name: &str) -> bool {
+fn route_is_active(db: &Database, route_name: &str) -> SubscriptionResult<bool> {
     let mut active = false;
-    for ddl in db.changes_since(Lsn(0)).ddl {
+    for ddl in db
+        .changes_since(Lsn(0))
+        .map_err(subscription_engine_err)?
+        .ddl
+    {
         match ddl {
             DdlChange::CreateRoute { name, .. } if name == route_name => active = true,
             DdlChange::DropRoute { name, .. } if name == route_name => active = false,
             _ => {}
         }
     }
-    active
+    Ok(active)
 }
 
-fn sink_is_declared(db: &Database, sink_name: &str) -> bool {
-    db.changes_since(Lsn(0)).ddl.iter().any(|ddl| {
-        matches!(
-            ddl,
-            DdlChange::CreateSink { name, .. } if name == sink_name
-        )
-    })
+fn sink_is_declared(db: &Database, sink_name: &str) -> SubscriptionResult<bool> {
+    Ok(db
+        .changes_since(Lsn(0))
+        .map_err(subscription_engine_err)?
+        .ddl
+        .iter()
+        .any(|ddl| {
+            matches!(
+                ddl,
+                DdlChange::CreateSink { name, .. } if name == sink_name
+            )
+        }))
 }
 
 fn ensure_subscription_can_resume(
@@ -482,14 +491,18 @@ fn ensure_subscription_can_resume(
     event_name: &str,
     subscription_id: &SubscriptionId,
 ) -> SubscriptionResult<()> {
-    if !sink_is_declared(db, subscription_id.sink_name()) {
+    if !sink_is_declared(db, subscription_id.sink_name())? {
         return Err(SubscriptionError::SinkDdlMissing(format!(
             "sink not found: {}",
             subscription_id.sink_name()
         )));
     }
     let mut active = false;
-    for ddl in db.changes_since(Lsn(0)).ddl {
+    for ddl in db
+        .changes_since(Lsn(0))
+        .map_err(subscription_engine_err)?
+        .ddl
+    {
         match ddl {
             DdlChange::CreateRoute {
                 name,

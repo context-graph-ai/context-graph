@@ -38,21 +38,28 @@ fn imported_project(machine: &Machine, name: &str) -> std::path::PathBuf {
     project
 }
 
-fn write_many_turns(path: &Path, project: &Path) {
+/// Turns per request's session; writer memory per batch does not depend on event count, so a
+/// small session measures the same ceiling as a large one.
+const FIXTURE_TURNS: usize = 32;
+const FIXTURE_EVENTS: u64 = 2 * FIXTURE_TURNS as u64;
+const MIB: u64 = 1 << 20;
+
+/// One session file of `FIXTURE_TURNS` user/assistant turns.
+fn write_many_turns(path: &Path, project: &Path, session: &str) {
     let mut lines = String::new();
-    for index in 0..350 {
+    for index in 0..FIXTURE_TURNS {
         let hour = 9 + index / 60;
         let minute = index % 60;
         let timestamp = format!("2026-09-01T{hour:02}:{minute:02}:00Z");
         let user = json!({
             "type": "user", "uuid": uuid::Uuid::new_v4(),
-            "sessionId": "mid-budget-session", "cwd": project, "timestamp": timestamp,
+            "sessionId": session, "cwd": project, "timestamp": timestamp,
             "message": {"role": "user", "content": format!("question {index} {}", "reasoning ".repeat(40))},
         });
         let assistant = json!({
             "type": "assistant", "uuid": uuid::Uuid::new_v4(),
-            "sessionId": "mid-budget-session", "cwd": project, "timestamp": timestamp,
-            "message": {"id": format!("mid-budget-m{index}"), "role": "assistant",
+            "sessionId": session, "cwd": project, "timestamp": timestamp,
+            "message": {"id": format!("{session}-m{index}"), "role": "assistant",
                 "content": [{"type": "text", "text": format!("answer {index} {}", "detail ".repeat(40))}]},
         });
         lines.push_str(&user.to_string());
@@ -61,6 +68,90 @@ fn write_many_turns(path: &Path, project: &Path) {
         lines.push('\n');
     }
     fs::write(path, lines).expect("write multi-batch session");
+}
+
+/// Scratch stores for measuring request 2's ceiling. Each holds request 1 committed under the
+/// default writer budget; a refused request 2 writes nothing, so the store is reused until a
+/// probe admits request 2.
+#[derive(Default)]
+struct RequestTwoProbe {
+    scratch: Option<(Machine, std::path::PathBuf, std::path::PathBuf)>,
+}
+
+impl RequestTwoProbe {
+    /// Events request 2 commits under `limit`.
+    fn committed_under(&mut self, limit: u64) -> u64 {
+        let (machine, project, later) = self.scratch.take().unwrap_or_else(|| {
+            let machine = Machine::without_model();
+            let project = machine.project("mid-budget-probe");
+            let first = project.join("mid-budget-probe.jsonl");
+            let later = project.join("mid-budget-probe-later.jsonl");
+            write_many_turns(&first, &project, "mid-budget-probe-session");
+            write_many_turns(&later, &project, "mid-budget-probe-later-session");
+            let request_one = machine.run(
+                &project,
+                &[
+                    "import",
+                    first.to_str().expect("UTF-8 probe path"),
+                    "--context",
+                    "mid-budget-probe",
+                    "--search",
+                    "defer",
+                ],
+            );
+            assert_eq!(request_one.code, 0, "{}", request_one.describe());
+            (machine, project, later)
+        });
+        let probe = machine.run(
+            &project,
+            &[
+                "import",
+                later.to_str().expect("UTF-8 probe path"),
+                "--context",
+                "mid-budget-probe",
+                "--search",
+                "defer",
+                "--write-memory-limit-bytes",
+                &limit.to_string(),
+            ],
+        );
+        let committed = match probe.code {
+            0 => u64_at(&probe.json(), "/capture/events/inserted"),
+            // A refusal before capture began carries no capture section: nothing was written.
+            1 if str_at(&probe.json(), "/state") == "write_memory_limit" => probe
+                .json()
+                .pointer("/capture/events/inserted")
+                .map_or(0, |_| u64_at(&probe.json(), "/capture/events/inserted")),
+            _ => panic!("scratch import under {limit} bytes: {}", probe.describe()),
+        };
+        if committed == 0 {
+            self.scratch = Some((machine, project, later));
+        }
+        committed
+    }
+}
+
+/// The writer limits on either side of `admits`, to one MiB: the largest measured limit it
+/// refuses and the smallest it admits.
+fn limit_bracket(mut admits: impl FnMut(u64) -> bool) -> (u64, u64) {
+    let mut admitted = MIB;
+    while !admits(admitted) {
+        assert!(
+            admitted < 64 << 30,
+            "no writer limit up to 64 GiB admits the fixture"
+        );
+        admitted *= 2;
+    }
+    let mut refused = if admitted > MIB { admitted / 2 } else { 0 };
+    while admitted - refused > MIB {
+        let middle = (refused + (admitted - refused) / 2) / MIB * MIB;
+        if admits(middle) {
+            admitted = middle;
+        } else {
+            refused = middle;
+        }
+    }
+    (refused, admitted)
 }
 
 #[test]
@@ -336,11 +427,49 @@ fn a_write_that_does_not_fit_the_declared_budget_is_refused_in_words_that_name_b
 
 #[test]
 fn an_import_that_exceeds_writer_memory_after_a_batch_reports_committed_progress_and_resumes() {
+    // Writer memory per batch does not grow with payload, so work already committed comes from
+    // an earlier request: each import carries its own writer ceiling. The ceiling is measured on
+    // this build, never a literal: request 2 gets the largest measured limit its first batch does
+    // not fit, after request 1 committed its own session under the default writer budget.
+    let mut probe = RequestTwoProbe::default();
+    let (refused_limit, admitted_limit) =
+        limit_bracket(|limit| probe.committed_under(limit) == FIXTURE_EVENTS);
+    let limit = refused_limit;
+    let bracket = format!(
+        "request 2 is refused at {refused_limit} and admitted from {admitted_limit}; limit {limit}"
+    );
+    assert!(
+        limit > 0,
+        "empty bracket: request 2 is admitted at every measured writer limit; {bracket}"
+    );
+
     let machine = Machine::without_model();
     let project = machine.project("mid-budget");
-    let source = project.join("mid-budget.jsonl");
-    write_many_turns(&source, &project);
-    let source = source.to_str().expect("UTF-8 source path");
+    let first = project.join("mid-budget.jsonl");
+    let later = project.join("mid-budget-later.jsonl");
+    write_many_turns(&first, &project, "mid-budget-session");
+    write_many_turns(&later, &project, "mid-budget-later-session");
+    let first = first.to_str().expect("UTF-8 source path");
+    let source = later.to_str().expect("UTF-8 source path");
+    let committed = machine.run(
+        &project,
+        &[
+            "import",
+            first,
+            "--context",
+            "mid-budget",
+            "--search",
+            "defer",
+        ],
+    );
+    assert_eq!(committed.code, 0, "{}", committed.describe());
+    assert_eq!(
+        u64_at(&committed.json(), "/capture/events/inserted"),
+        FIXTURE_EVENTS
+    );
+    let before = machine.run(&project, &["status", "--context", "mid-budget"]);
+    assert_eq!(before.code, 0, "{}", before.describe());
+
     let limited = machine.run(
         &project,
         &[
@@ -351,37 +480,52 @@ fn an_import_that_exceeds_writer_memory_after_a_batch_reports_committed_progress
             "--search",
             "defer",
             "--write-memory-limit-bytes",
-            "41943040",
+            &limit.to_string(),
         ],
     );
-    assert_eq!(limited.code, 1, "{}", limited.describe());
+    assert_eq!(limited.code, 1, "{}; {bracket}", limited.describe());
     let refusal = limited.json();
     assert_eq!(str_at(&refusal, "/state"), "write_memory_limit");
     assert_eq!(
         str_at(&refusal, "/condition"),
         "WriteDidNotFitTheMemoryLimit"
     );
-    assert_eq!(u64_at(&refusal, "/limit_bytes"), 40 * 1024 * 1024);
+    assert_eq!(u64_at(&refusal, "/limit_bytes"), limit);
     assert!(u64_at(&refusal, "/requested_bytes") > 0);
     assert_eq!(str_at(&refusal, "/capture/status"), "partial");
-    assert_eq!(u64_at(&refusal, "/capture/events/inserted"), 512);
-    assert!(u64_at(&refusal, "/capture/last_committed_position/committed_bytes") > 0);
+    assert_eq!(
+        u64_at(&refusal, "/capture/events/inserted"),
+        0,
+        "request 2 wrote nothing; {bracket}"
+    );
+    assert_eq!(
+        u64_at(&refusal, "/capture/last_committed_position/committed_bytes"),
+        0
+    );
     assert_eq!(str_at(&refusal, "/search/status"), "not_run");
     let message = str_at(&refusal, "/message");
     assert!(
         message.contains("cg import stopped")
-            && message.contains("40.0 MiB")
+            && message.contains(&context_graph::write_budget::human_bytes(limit))
             && message.contains("Earlier committed events remain")
             && message.contains("--write-memory-limit-bytes")
             && message.contains("[write] memory_limit_bytes")
             && !message.contains("nothing was written"),
-        "{}",
+        "{}; {bracket}",
         limited.describe()
     );
 
     let status = machine.run(&project, &["status", "--context", "mid-budget"]);
     assert_eq!(status.code, 0, "{}", status.describe());
-    assert_eq!(u64_at(&status.json(), "/history/captured_events"), 512);
+    assert_eq!(
+        status.json()["history"],
+        before.json()["history"],
+        "request 1's committed work is unchanged by the refused request"
+    );
+    assert_eq!(
+        u64_at(&status.json(), "/history/captured_events"),
+        FIXTURE_EVENTS
+    );
 
     let retry = machine.run(
         &project,
@@ -393,21 +537,27 @@ fn an_import_that_exceeds_writer_memory_after_a_batch_reports_committed_progress
             "--search",
             "defer",
             "--write-memory-limit-bytes",
-            "268435456",
+            &admitted_limit.max(268_435_456).to_string(),
         ],
     );
-    assert_eq!(retry.code, 0, "{}", retry.describe());
-    assert_eq!(u64_at(&retry.json(), "/capture/events/inserted"), 188);
+    assert_eq!(retry.code, 0, "{}; {bracket}", retry.describe());
+    assert_eq!(
+        u64_at(&retry.json(), "/capture/events/inserted"),
+        FIXTURE_EVENTS
+    );
     assert_eq!(u64_at(&retry.json(), "/capture/local_embedding_calls"), 0);
     let status = machine.run(&project, &["status", "--context", "mid-budget"]);
     assert_eq!(status.code, 0, "{}", status.describe());
-    assert_eq!(u64_at(&status.json(), "/history/captured_events"), 700);
+    assert_eq!(
+        u64_at(&status.json(), "/history/captured_events"),
+        2 * FIXTURE_EVENTS
+    );
 
     let repeated = machine.run(
         &project,
         &[
             "import",
-            source,
+            first,
             "--context",
             "mid-budget",
             "--search",
