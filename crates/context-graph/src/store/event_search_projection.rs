@@ -55,6 +55,44 @@ fn open_for_run(
     )
 }
 
+fn open_for_run_with_vector_session(
+    config: &crate::StoreConfig,
+    embedder: &crate::EmbedderRegistration,
+    session: &std::sync::Arc<contextdb_engine::WriterVectorSession>,
+) -> Result<Store> {
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
+    super::open_retry::retry(
+        &config.db_path,
+        super::open_retry::Contention::Writer,
+        || {
+            Store::open_with_projection_vector_session(
+                config.clone(),
+                vec![embedder.clone()],
+                session.clone(),
+            )
+        },
+    )
+}
+
+fn carry_projection_vector_tail(
+    store: &Store,
+    generation: &Generation,
+    session: &contextdb_engine::WriterVectorSession,
+) {
+    let partition = contextdb_engine::VectorPartitionRef::new(
+        contextdb_core::VectorIndexRef::new("event_search_passages", "vector_text"),
+        contextdb_core::VectorPartitionKey::from_values(&[
+            Value::Uuid(generation.context_id.as_uuid()),
+            Value::Uuid(generation.id.as_uuid()),
+        ])
+        .expect("UUID partition components"),
+    );
+    store
+        .internal_db()
+        .detach_writer_vector_session(session, &partition);
+}
+
 /// Admission shared by every projection door that has selected an event-search registration.
 /// Capability support stays a typed embedder condition; a supported embedder's finite ceiling is
 /// then checked without normalizing the caller's profile.
@@ -1224,6 +1262,7 @@ fn catch_up_standalone_run(
     mut resolve_selected_limit: Option<&mut SelectedBatchLimitResolver<'_>>,
     observations: &mut RunObservations,
 ) -> Result<EventSearchBuildReceipt> {
+    let vector_session = std::sync::Arc::new(contextdb_engine::WriterVectorSession::default());
     let context_ids = request.contexts.context_ids();
     if context_ids.len() != 1 {
         return Err(CgError::Engine(
@@ -1245,7 +1284,8 @@ fn catch_up_standalone_run(
         Some(resolve) => resolve(None)?.memory_limit_bytes,
         None => resolve_write_memory_limit(&|_| Ok(true))?,
     };
-    let store = open_for_run(&request.store, &request.embedder)?;
+    let store =
+        open_for_run_with_vector_session(&request.store, &request.embedder, &vector_session)?;
     let mut generation = measured(&mut observations.event_read, || {
         ensure_generation(
             &store,
@@ -1273,7 +1313,11 @@ fn catch_up_standalone_run(
     loop {
         let mut store = match open.take() {
             Some(store) => store,
-            None => open_for_run(&request.store, &request.embedder)?,
+            None => open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?,
         };
         let mut pending = measured(&mut observations.event_read, || {
             first_pending_stream(&store, &generation, &session_work, bounds)
@@ -1313,9 +1357,14 @@ fn catch_up_standalone_run(
             resolve_write_memory_limit(&|_| Ok(true))?
         };
         if limit != request.store.write_memory_limit_bytes {
+            carry_projection_vector_tail(&store, &generation, &vector_session);
             drop(store);
             request.store.write_memory_limit_bytes = limit;
-            store = open_for_run(&request.store, &request.embedder)?;
+            store = open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?;
         }
         #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
         if let Some(pending) = &pending {
@@ -1391,6 +1440,7 @@ fn catch_up_standalone_run(
                 FinishResult::Rebuild => unreachable!("rebuild handled while Store was open"),
             }
         };
+        carry_projection_vector_tail(&store, &generation, &vector_session);
         drop(store);
         let embedding_workers = resolve_embedding_workers();
 
@@ -1402,8 +1452,18 @@ fn catch_up_standalone_run(
             if !renewal_due(expires_at, bounds)? {
                 return Ok(expires_at);
             }
-            let store = open_for_run(&request.store, &request.embedder)?;
-            renew_claim(&store, &held, expires_at, bounds)
+            let store = open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?;
+            let result = renew_claim(&store, &held, expires_at, bounds);
+            if result.is_ok() {
+                carry_projection_vector_tail(&store, &generation, &vector_session);
+            } else {
+                vector_session.clear();
+            }
+            result
         };
         let rendered = render_and_embed(
             *claim,
@@ -1418,7 +1478,11 @@ fn catch_up_standalone_run(
             Ok(Rendered::Batch(built)) => *built,
             Ok(Rendered::OverPassageBound { fitting_events }) => {
                 // Nothing was embedded: let the claim go and take the events that fit.
-                let store = open_for_run(&request.store, &request.embedder)?;
+                let store = open_for_run_with_vector_session(
+                    &request.store,
+                    &request.embedder,
+                    &vector_session,
+                )?;
                 release_claim_in(&store, &held);
                 event_limit = fitting_events;
                 open = Some(store);
@@ -1426,6 +1490,7 @@ fn catch_up_standalone_run(
             }
             Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
                 // The claim was taken over while this run embedded; nothing is left to release.
+                vector_session.clear();
                 retries += 1;
                 continue;
             }
@@ -1435,7 +1500,11 @@ fn catch_up_standalone_run(
             }
         };
         let rendered_passages = built.passages.len();
-        let store = match open_for_run(&request.store, &request.embedder) {
+        let store = match open_for_run_with_vector_session(
+            &request.store,
+            &request.embedder,
+            &vector_session,
+        ) {
             Ok(store) => store,
             Err(error) => {
                 release_claim(&request.store, &request.embedder, &held);
@@ -1455,6 +1524,7 @@ fn catch_up_standalone_run(
             // a real takeover remains untouched because the exact delete no longer matches.
             if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) {
                 try_release_claim_in(&store, &held)?;
+                vector_session.clear();
                 retries += 1;
                 open = Some(store);
                 continue;

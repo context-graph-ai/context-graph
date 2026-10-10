@@ -444,6 +444,10 @@ adds no replay payload. Worker count preserves passage order, text, vectors and 
 
 Appending a new session preserves the completed passage digest prefix across writable reopens.
 Completing its generation digest examines only the new passages.<!-- enforced by: `appending_a_session_folds_only_new_passages_at_n_and_four_n_history` -->
+The standalone runner carries only owned vector tail working memory between its physical opens.
+It validates that tail against each reopened writer and releases every Store before inference,
+so another writer can still commit between batches.
+<!-- enforced by: event_search_projection_correctness::projection_retries_real_writer_at_claim_renewal_and_commit_without_reembedding -->
 
 ### Passage configuration
 

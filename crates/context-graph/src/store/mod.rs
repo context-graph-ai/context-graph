@@ -250,6 +250,20 @@ impl Store {
         )
     }
 
+    pub(crate) fn open_with_projection_vector_session(
+        config: StoreConfig,
+        registrations: Vec<EmbedderRegistration>,
+        session: Arc<contextdb_engine::WriterVectorSession>,
+    ) -> Result<Self> {
+        let extras = DatabaseOpenExtras {
+            vector_session: Some(session),
+            ..DatabaseOpenExtras::default()
+        };
+        Self::open_with_config_inner_with_plugin(
+            config, false, None, None, extras, registrations, ConsumerSchema::none(),
+        )
+    }
+
     /// Opens the store and, in it, creates the tables `consumer_schema` declares.
     ///
     /// For a consumer that embeds this library and wants its own rows to live in
@@ -964,6 +978,7 @@ impl graph_rows::GraphRows for Store {
 #[derive(Clone, Default)]
 pub(crate) struct DatabaseOpenExtras {
     plugin: Option<Arc<dyn DatabasePlugin>>,
+    vector_session: Option<Arc<contextdb_engine::WriterVectorSession>>,
     owner_control: Option<ControlHandler>,
     /// Whether this open may bring the store into existence. The default is the creating
     /// disposition every opener that came before has always had.
@@ -978,6 +993,7 @@ impl DatabaseOpenExtras {
     pub(crate) fn with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Self {
         Self {
             plugin: Some(plugin),
+            vector_session: None,
             owner_control: None,
             open_disposition: OpenDisposition::default(),
         }
@@ -986,6 +1002,7 @@ impl DatabaseOpenExtras {
     fn with_owner_control(handler: ControlHandler) -> Self {
         Self {
             plugin: None,
+            vector_session: None,
             owner_control: Some(handler),
             open_disposition: OpenDisposition::default(),
         }
@@ -995,6 +1012,7 @@ impl DatabaseOpenExtras {
     fn existing_only() -> Self {
         Self {
             plugin: None,
+            vector_session: None,
             owner_control: None,
             open_disposition: OpenDisposition::ExistingOnly,
         }
@@ -1066,17 +1084,23 @@ fn open_bootstrapped_database(
                 && !replace_shared_handle
                 && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
             {
+                if let Some(session) = &extras.vector_session {
+                    existing.reattach_writer_vector_session(session);
+                }
                 return Ok((guard, existing, true));
             }
             let db = Arc::new(
-                Database::open_with_options(
-                    db_path,
-                    extras.open_options(
+                {
+                    let options = extras.open_options(
                         config.read_memory_limit_bytes,
                         config.read_active_time_ms,
                         config.write_memory_limit_bytes,
-                    ),
-                )
+                    );
+                    match &extras.vector_session {
+                        Some(session) => Database::open_with_writer_vector_session(db_path, options, session),
+                        None => Database::open_with_options(db_path, options),
+                    }
+                }
                 .map_err(|error| extras.map_refusal(db_path, error))?,
             );
             Ok((guard, db, false))
