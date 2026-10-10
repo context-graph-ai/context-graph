@@ -7103,7 +7103,10 @@ fn interpreted_capture_units_charge_every_statement_within_the_allowance() {
     let store = open(&cfg);
     let context = create_context(&store);
     let source_streams = [("interpreted", 120)];
-    let captured_events = source_streams.iter().map(|(_, events)| *events as u64).sum::<u64>();
+    let captured_events = source_streams
+        .iter()
+        .map(|(_, events)| *events)
+        .sum::<u64>();
     for (session, events) in source_streams {
         append_sparse_projection_stream(&store, context, session, events);
     }
@@ -7160,7 +7163,11 @@ fn interpreted_capture_units_charge_every_statement_within_the_allowance() {
             })
             .enumerate()
             .map(|(page, row)| {
-                let manifest_rows = if page == 0 { source_streams.len() as u64 } else { 0 };
+                let manifest_rows = if page == 0 {
+                    source_streams.len() as u64
+                } else {
+                    0
+                };
                 (row.returned_rows - manifest_rows, row.examined_entries)
             })
             .collect::<Vec<_>>()
