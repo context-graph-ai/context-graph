@@ -206,7 +206,7 @@
 # Typed active-time mapping and committed-prefix projection recovery add two proofs.
 # The session claim and strict upstream count work proofs join the default tier: 1320 + 2 = 1322.
 # Completion reuse of a certified capture adds its stamp-move proof: 1326 + 1 = 1327.
-"context-graph" = 1333
+"context-graph" = 1334
 # 190 -> 184: the status tests for answers read-only status no longer gives were removed with that
 # change, and the retired chunked-import, estimate and raw-chunk forget routes took their tests.
 # 184 -> 187: coverage for the reader-wait allowance and the foreground import's unusable-lock

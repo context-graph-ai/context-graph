@@ -7188,3 +7188,115 @@ fn interpreted_capture_units_charge_every_statement_within_the_allowance() {
         );
     }
 }
+
+#[test]
+fn appending_a_session_folds_only_new_passages_at_n_and_four_n_history() {
+    use sha2::{Digest, Sha256};
+    fn population(history: u64) -> (u64, u64) {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path().join("append-fold.db"));
+        let store = open(&cfg);
+        let context = create_context(&store);
+        let body = "short searchable event";
+        let events = (1..=history)
+            .map(|ordinal| {
+                draft(
+                    &format!("prefix-{ordinal}"),
+                    ordinal,
+                    EventRenderRole::HumanMessage,
+                    body,
+                )
+            })
+            .collect();
+        store
+            .append_event_batch(AppendEventBatch::live(
+                context,
+                declaration(),
+                "prefix",
+                events,
+            ))
+            .unwrap();
+        drop(store);
+        let embedder = ControlledEmbedder::new();
+        let before = run_until_projection_completes(&cfg, context, &embedder, 256);
+        take_projection_unit_receipts();
+        // A different session appends generation ordinals without retiring the saved prefix.
+        let store = open(&cfg);
+        let events = (1..=8)
+            .map(|ordinal| {
+                let mut event = draft(
+                    &format!("new-{ordinal}"),
+                    ordinal,
+                    EventRenderRole::HumanMessage,
+                    body,
+                );
+                event.session_ref = "new-session".into();
+                event
+            })
+            .collect();
+        store
+            .append_event_batch(AppendEventBatch::live(
+                context,
+                declaration(),
+                "new-source",
+                events,
+            ))
+            .unwrap();
+        drop(store);
+        let after = run_until_projection_completes(&cfg, context, &embedder, 256);
+        assert_eq!(before.generation_id, after.generation_id);
+        let receipts = take_projection_unit_receipts();
+        let examined = receipts
+            .iter()
+            .filter(|row| row.fold == ProjectionFold::Passages)
+            .map(|row| row.examined_entries)
+            .sum();
+        let returned = receipts
+            .iter()
+            .filter(|row| row.fold == ProjectionFold::Passages)
+            .map(|row| row.returned_rows)
+            .sum();
+        // Reopen and independently hash the entire current set: prefix reuse must preserve
+        // the established digest, not merely skip its verification.
+        let store = open(&cfg);
+        let rows = store.execute_sql_for_test(
+            "SELECT passage_ordinal, content_sha256 FROM event_search_passages WHERE generation_id = $generation_id AND is_current = true ORDER BY passage_ordinal ASC, id ASC",
+            &HashMap::from([("generation_id".into(), Value::Uuid(after.generation_id.as_uuid()))]),
+        ).unwrap().rows;
+        let mut digest = Sha256::new();
+        digest.update(b"context-graph/event-search-generation/v1");
+        for row in &rows {
+            let [Value::Int64(ordinal), Value::Text(content)] = row.as_slice() else {
+                panic!("typed passage: {row:?}");
+            };
+            let ordinal = u64::try_from(*ordinal).unwrap().to_be_bytes();
+            for bytes in [ordinal.as_slice(), content.as_bytes()] {
+                digest.update(u64::try_from(bytes.len()).unwrap().to_be_bytes());
+                digest.update(bytes);
+            }
+        }
+        assert_eq!(
+            after.generation_content_sha256,
+            format!("{:x}", digest.finalize())
+        );
+        assert_eq!(after.passage_count, rows.len() as u64);
+        eprintln!(
+            "append_fold history={history} prefix_passages={} examined={examined} returned={returned}",
+            before.passage_count
+        );
+        (examined, returned)
+    }
+    let receipts = [64, 256].map(|history| {
+        std::thread::spawn(move || population(history))
+            .join()
+            .unwrap()
+    });
+    assert_eq!(
+        receipts[0].1, receipts[1].1,
+        "a fixed new session folds the same suffix at N and 4N: {receipts:?}"
+    );
+    assert!(
+        receipts[0].0.abs_diff(receipts[1].0) <= 32,
+        "append fold examined work is bounded by the suffix and index height: {receipts:?}"
+    );
+}

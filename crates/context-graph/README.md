@@ -442,6 +442,9 @@ Continuation reloads only the unfinished passage's text members; a long metadata
 adds no replay payload. Worker count preserves passage order, text, vectors and source spans.
 <!-- enforced by: `open_tail_loads_only_text_members_across_a_long_metadata_suffix`, `missing_or_mismatched_open_tail_member_ids_are_refused_before_embedding`, `serial_and_concurrent_runs_commit_identical_passages_vectors_order_and_coverage` -->
 
+Appending a new session preserves the completed passage digest prefix across writable reopens.
+Completing its generation digest examines only the new passages.<!-- enforced by: `appending_a_session_folds_only_new_passages_at_n_and_four_n_history` -->
+
 ### Passage configuration
 
 New search generations use the version-2 passage profile by default: a 256-token target and a

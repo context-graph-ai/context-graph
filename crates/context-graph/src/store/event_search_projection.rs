@@ -9172,6 +9172,16 @@ fn commit_batch_in_tx(
             ("id".into(), Value::Uuid(claim.generation.id.as_uuid())),
         ]),
     ).map_err(map_engine_err)?;
+    if !built.passages.is_empty() {
+        carry_unchanged_passage_fold_prefix_in_tx(
+            store,
+            tx,
+            claim,
+            built,
+            get_u64(generation_row, &generation.columns, "passage_revision")?,
+            passage_revision,
+        )?;
+    }
     let deleted = store.internal_db().execute_in_tx(
         tx,
         "DELETE FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id AND owner_token = $owner_token AND lease_epoch = $lease_epoch",
@@ -10429,13 +10439,88 @@ fn guard_final_interpretations_in_tx(
     Ok(())
 }
 
+/// Move a verified SHA prefix across an append in the same transaction as its passages.
+/// A replacement inside that prefix invalidates it; no interior SHA contribution is subtracted.
+fn carry_unchanged_passage_fold_prefix_in_tx(
+    store: &Store,
+    tx: TxId,
+    claim: &Claim,
+    built: &BuiltBatch,
+    prior_revision: u64,
+    next_revision: u64,
+) -> Result<()> {
+    let result = execute_in_tx_tallied(
+        store,
+        tx,
+        "SELECT id, attempt_token, unit, passage_revision, complete, state FROM event_search_fold_progress WHERE context_id = $context_id AND generation_id = $generation_id AND fold = $fold",
+        &HashMap::from([
+            ("context_id".into(), Value::Uuid(claim.generation.context_id.as_uuid())),
+            ("generation_id".into(), Value::Uuid(claim.generation.id.as_uuid())),
+            ("fold".into(), Value::Text(PASSAGE_FOLD.into())),
+        ]),
+    ).map_err(map_engine_err)?;
+    let Some(row) = result.rows.first() else {
+        return Ok(());
+    };
+    let prior = FoldRow {
+        id: get_uuid(row, &result.columns, "id")?,
+        attempt_token: get_uuid(row, &result.columns, "attempt_token")?,
+        unit: get_u64(row, &result.columns, "unit")?,
+        passage_revision: get_u64(row, &result.columns, "passage_revision")?,
+        complete: get_bool(row, &result.columns, "complete")?,
+        state: get_json(row, &result.columns, "state")?,
+    };
+    if prior.passage_revision != prior_revision {
+        return Ok(());
+    }
+    let previous = prior.state.get("previous").and_then(JsonValue::as_u64);
+    if previous.is_some_and(|previous| {
+        built
+            .passages
+            .iter()
+            .any(|passage| passage.ordinal <= previous)
+            || claim.superseded_tail.iter().any(|passage| {
+                let Some((_, Value::Int64(ordinal))) = passage
+                    .conditions
+                    .iter()
+                    .find(|(name, _)| name == "passage_ordinal")
+                else {
+                    return true;
+                };
+                u64::try_from(*ordinal)
+                    .ok()
+                    .is_none_or(|ordinal| ordinal <= previous)
+            })
+    }) {
+        return Ok(());
+    }
+    let mut state = prior.state.clone();
+    state
+        .as_object_mut()
+        .ok_or_else(|| CgError::Engine("passage fold state is not an object".into()))?
+        .remove("digest");
+    save_fold_row_in_tx(
+        store,
+        tx,
+        claim.generation.context_id,
+        claim.generation.id,
+        PASSAGE_FOLD,
+        Some(&prior),
+        prior.attempt_token,
+        next_revision,
+        false,
+        state,
+    )?;
+    Ok(())
+}
+
 /// The generation's current-passage digest and count behind its build receipt, folded in bounded
 /// units of at most one passage batch over `(passage_ordinal, id)`: a strict continuation of
 /// equality-prefix seeks on the current-passage index, so retired passages are never examined and a
 /// duplicate ordinal is always read beside its twin and refused. Progress, the running digest and
 /// the passage revision it was read under commit with every unit. A completed result is reused only
-/// while the generation's passage revision is unchanged; any passage insertion or retirement since
-/// moves the revision and the fold starts over.
+/// while the generation's passage revision is unchanged. A passage commit carries a verified
+/// unchanged prefix to its new revision atomically; a retirement inside that prefix restarts it.
 fn fold_current_generation_passages(
     store: &Store,
     generation: &Generation,
@@ -10590,8 +10675,9 @@ fn fold_current_generation_passages(
             });
             let saved = refused_unit(UnitFold::Passages, &before, saved)?;
             let Some(saved) = saved else {
-                // A passage was inserted or retired since this fold began: start over under the
-                // new revision rather than continue a digest of a population that no longer exists.
+                // A passage commit may have advanced an unchanged prefix. Reload its guarded
+                // successor before continuing under the new revision.
+                row = load_fold_row(store, bounds, context_id, id, PASSAGE_FOLD)?;
                 continue 'fold;
             };
             row = Some(saved);
