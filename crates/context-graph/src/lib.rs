@@ -102,6 +102,12 @@ pub mod test_support {
         observe_event_search_batch_admission_for_test,
         set_event_search_projection_read_deadline_ms_for_test,
     };
+    /// Bounded projection read units: a cut after the n-th durable unit, a pause before the n-th
+    /// unit's commit, and per-unit receipts.
+    pub use crate::store::event_search_projection_correctness::{
+        ProjectionFold, ProjectionUnitReceipt, pause_projection_unit_before_commit,
+        set_projection_unit_cut, take_projection_unit_receipts,
+    };
     /// How many Stores the event-search runner has opened on the calling thread.
     pub use crate::store::event_search_store_opens_for_test;
 

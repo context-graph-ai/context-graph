@@ -50,7 +50,7 @@ contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev 
 contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
 contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
 safetensors = "0.7.0"
-sha2 = "0.10.9"
+sha2 = { version = "0.10.9", features = ["compress"] }
 tempfile = "3.23.0"
 tokenizers = "0.23.1"
 tracing = "0.1.43"

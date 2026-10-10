@@ -79,7 +79,7 @@ pub(crate) const LOCAL_DERIVED_TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "event_search_generations",
-        ddl: "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), interpretation_generation_id UUID, interpretation_snapshot JSON NOT NULL, interpretation_snapshot_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, source_content_sha256 TEXT NOT NULL DEFAULT '', capture_ordinal INTEGER NOT NULL DEFAULT 0, renderer_id TEXT NOT NULL, renderer_version TEXT NOT NULL, renderer_profile JSON NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), encoding_profile TEXT NOT NULL, state TEXT NOT NULL, required_event_count INTEGER NOT NULL DEFAULT 0, searchable_event_count INTEGER NOT NULL DEFAULT 0, searchable_excluded_event_count INTEGER NOT NULL DEFAULT 0, eligible_event_count INTEGER NOT NULL DEFAULT 0, rendered_event_count INTEGER NOT NULL DEFAULT 0, embedded_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, passage_count INTEGER NOT NULL DEFAULT 0, started_at TXID NOT NULL, completed_at TXID, finalized_event_revision_tx TXID, last_attempt_at TXID, last_attempt_token UUID NOT NULL, sanitized_failure TEXT, capture_ordered_sha256 TEXT NOT NULL DEFAULT '', capture_content_sha256 TEXT NOT NULL DEFAULT '', interpretation_verified_stamp JSON, UNIQUE (context_id, id), FOREIGN KEY (context_id, interpretation_generation_id) REFERENCES event_interpretation_generations(context_id, id)) SYNC OFF",
+        ddl: "CREATE TABLE event_search_generations (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), interpretation_generation_id UUID, interpretation_snapshot JSON NOT NULL, interpretation_snapshot_sha256 TEXT NOT NULL, event_count INTEGER NOT NULL, ordered_source_set_sha256 TEXT NOT NULL, source_content_sha256 TEXT NOT NULL DEFAULT '', capture_ordinal INTEGER NOT NULL DEFAULT 0, renderer_id TEXT NOT NULL, renderer_version TEXT NOT NULL, renderer_profile JSON NOT NULL, embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(embedding_space_id), encoding_profile TEXT NOT NULL, state TEXT NOT NULL, required_event_count INTEGER NOT NULL DEFAULT 0, searchable_event_count INTEGER NOT NULL DEFAULT 0, searchable_excluded_event_count INTEGER NOT NULL DEFAULT 0, eligible_event_count INTEGER NOT NULL DEFAULT 0, rendered_event_count INTEGER NOT NULL DEFAULT 0, embedded_event_count INTEGER NOT NULL DEFAULT 0, excluded_event_count INTEGER NOT NULL DEFAULT 0, failed_event_count INTEGER NOT NULL DEFAULT 0, passage_count INTEGER NOT NULL DEFAULT 0, started_at TXID NOT NULL, completed_at TXID, finalized_event_revision_tx TXID, last_attempt_at TXID, last_attempt_token UUID NOT NULL, sanitized_failure TEXT, capture_ordered_sha256 TEXT NOT NULL DEFAULT '', capture_content_sha256 TEXT NOT NULL DEFAULT '', interpretation_verified_stamp JSON, passage_revision INTEGER NOT NULL DEFAULT 0, UNIQUE (context_id, id), FOREIGN KEY (context_id, interpretation_generation_id) REFERENCES event_interpretation_generations(context_id, id)) SYNC OFF",
     },
     TableSpec {
         name: "event_search_source_events",
@@ -140,6 +140,20 @@ pub(crate) const LOCAL_DERIVED_TABLES: &[TableSpec] = &[
     TableSpec {
         name: "event_search_pending_streams",
         ddl: "CREATE TABLE event_search_pending_streams (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL, connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, pending BOOLEAN NOT NULL, capture_open BOOLEAN NOT NULL DEFAULT false, capture_pending_tx TXID, PRIMARY KEY (context_id, generation_id, connector_id, source_instance_ref, session_ref)) SYNC OFF",
+    },
+    // Resumable projection fold units: one row per fold of a generation, holding the fold's saved
+    // key, its carried digest state and the fences it was read under. Purged with the generation.
+    TableSpec {
+        name: "event_search_fold_progress",
+        ddl: "CREATE TABLE event_search_fold_progress (id UUID PRIMARY KEY, context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL, fold TEXT NOT NULL, attempt_token UUID NOT NULL, unit INTEGER NOT NULL DEFAULT 0, passage_revision INTEGER NOT NULL DEFAULT 0, complete BOOLEAN NOT NULL DEFAULT false, state JSON NOT NULL, UNIQUE (context_id, generation_id, fold)) SYNC OFF",
+    },
+    // The input of one capture pass: each source stream it reads, frozen at the newest sequence and
+    // event count it was enumerated with, and for an incremental pass each capture mark it closes
+    // with the mark's transaction as frozen (a full pass keys its one row per stream by an empty
+    // session). A row is consumed in the transaction that captures its stream through that frontier.
+    TableSpec {
+        name: "event_search_capture_manifest",
+        ddl: "CREATE TABLE event_search_capture_manifest (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), generation_id UUID NOT NULL, connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, upper_seq INTEGER NOT NULL, frozen_count INTEGER NOT NULL, marked_tx INTEGER, PRIMARY KEY (context_id, generation_id, connector_id, source_instance_ref, session_ref)) SYNC OFF",
     },
     TableSpec {
         name: "event_search_cursors",
@@ -593,6 +607,11 @@ pub(crate) const LOCAL_DERIVED_INDEXES: &[IndexSpec] = &[
         table: "event_search_passages",
         name: "event_search_passages_generation_ordinal_idx",
         ddl: "CREATE INDEX event_search_passages_generation_ordinal_idx ON event_search_passages (generation_id, passage_ordinal)",
+    },
+    IndexSpec {
+        table: "event_search_passages",
+        name: "idx_event_search_passages_current_page",
+        ddl: "CREATE INDEX idx_event_search_passages_current_page ON event_search_passages (generation_id, is_current, passage_ordinal, id)",
     },
     IndexSpec {
         table: "event_search_passages",

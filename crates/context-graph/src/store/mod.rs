@@ -17,6 +17,8 @@ mod event_history_status;
 mod event_import;
 pub(crate) mod event_interpretation;
 pub(crate) mod event_search_projection;
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) mod event_search_projection_correctness;
 pub(crate) mod event_search_read;
 pub(crate) mod evidence;
 pub(crate) mod graph_rows;
