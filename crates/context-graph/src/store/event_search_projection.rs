@@ -6102,62 +6102,7 @@ fn observe_source_membership(
     Ok(chain.membership_source_snapshot(count))
 }
 
-fn observe_source_membership(
-    store: &Store,
-    context_id: crate::ContextId,
-    bindings: &BTreeMap<String, InterpretationBinding>,
-    bounds: Bounds,
-) -> Result<SourceSnapshot> {
-    let mut count = 0_u64;
-    let mut chain = MembershipChain::start();
-    let mut after: Option<(String, String, u64)> = None;
-    loop {
-        let mut params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
-        let continuation = if let Some((connector, source, seq)) = &after {
-            params.insert("after_connector".into(), Value::Text(connector.clone()));
-            params.insert("after_source".into(), Value::Text(source.clone()));
-            params.insert("after_seq".into(), integer(*seq, "capture sequence")?);
-            " AND (connector_id > $after_connector OR (connector_id = $after_connector AND source_instance_ref > $after_source) OR (connector_id = $after_connector AND source_instance_ref = $after_source AND seq > $after_seq))"
-        } else {
-            ""
-        };
-        let page = query_rows(
-            store,
-            bounds,
-            &format!(
-                "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id{continuation} ORDER BY connector_id ASC, source_instance_ref ASC, seq ASC LIMIT {}",
-                bounds.events.max(1)
-            ),
-            &params,
-        )?;
-        after_membership_read_page();
-        let Some(last) = page.rows.last() else { break };
-        after = Some((
-            get_text(last, &page.columns, "connector_id")?,
-            get_text(last, &page.columns, "source_instance_ref")?,
-            get_u64(last, &page.columns, "seq")?,
-        ));
-        for member in claimed_members_from_rows(
-            store,
-            context_id,
-            bindings,
-            bounds,
-            &page.columns,
-            &page.rows,
-            count,
-        )? {
-            chain = chain.extend(&member);
-            count += 1;
-        }
-        if page.rows.len() < bounds.events.max(1) {
-            break;
-        }
-    }
-    Ok(chain.membership_source_snapshot(count))
-}
 
-/// The member already persisted for this event in the generation, verified field by field against
-/// the event just re-read, or `None` when the event is not yet a member.
 fn retained_search_membership(
     store: &Store,
     context_id: crate::ContextId,
@@ -9662,6 +9607,7 @@ fn finish_or_continue(
                 generation.context_id,
                 &bindings,
                 Some(generation.id),
+                generation.attempt_token,
                 bounds,
             )
         })?
