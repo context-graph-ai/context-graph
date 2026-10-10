@@ -152,7 +152,7 @@ impl HeldClaim {
 /// that has already been taken over is left alone. A late result carrying this token is still
 /// refused afterwards, because the commit path requires its own lease row to still be there.
 ///
-/// Best effort by nature: a process that is killed outright releases nothing, and its lease expiry
+/// Best effort by nature: a process that is killed outright releases its kernel presence; lease expiry
 /// remains the backstop.
 fn release_claim(
     config: &crate::StoreConfig,
@@ -177,6 +177,7 @@ fn release_claim_in(store: &Store, held: &HeldClaim) {
 /// retryable stale claim; the caller must surface it instead of hiding failed cleanup behind the
 /// next claim attempt.
 fn try_release_claim_in(store: &Store, held: &HeldClaim) -> Result<()> {
+    release_claim_presence(store.db_path(), &held.owner_token);
     store
         .internal_db()
         .execute(
@@ -199,6 +200,36 @@ fn try_release_claim_in(store: &Store, held: &HeldClaim) -> Result<()> {
     )
         .map(|_| ())
         .map_err(map_engine_err)
+}
+
+/// An unexpired lease blocks another worker only while its process still holds presence.
+/// Memory stores and platforms without holder locks retain the lease's existing TTL contract.
+fn claim_owner_live(store: &Store, owner: &str, expires_at: i64, now: i64) -> Result<bool> {
+    if expires_at <= now {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    if store.db_path() != std::path::Path::new(":memory:") {
+        let token = uuid::Uuid::parse_str(owner)
+            .map_err(|_| CgError::Engine("invalid event-search claim owner token".into()))?;
+        return contextdb_engine::persistence::holder_presence::probe(
+            store.db_path(),
+            *token.as_bytes(),
+        )
+        .map(|holder| holder == contextdb_engine::persistence::holder_presence::Holder::Present)
+        .map_err(map_engine_err);
+    }
+    let _ = (store, owner);
+    Ok(true)
+}
+
+fn release_claim_presence(store_path: &std::path::Path, owner: &str) {
+    if let Ok(token) = uuid::Uuid::parse_str(owner) {
+        let _ = contextdb_engine::persistence::holder_presence::release_kept(
+            store_path,
+            *token.as_bytes(),
+        );
+    }
 }
 
 /// The claim's current expiry and renewal, carried through preparation and every embed call.
@@ -1068,7 +1099,12 @@ fn write_generation_attempt(
         let lease = store.internal_db().execute_in_tx(tx,
             "SELECT owner_token, lease_epoch, expires_at FROM event_search_leases WHERE context_id = $context_id AND generation_id = $id", &params).map_err(map_engine_err)?;
         if let Some(row) = lease.rows.first() {
-            if get_timestamp(row, &lease.columns, "expires_at")? > now_millis()? {
+            if claim_owner_live(
+                store,
+                &get_text(row, &lease.columns, "owner_token")?,
+                get_timestamp(row, &lease.columns, "expires_at")?,
+                now_millis()?,
+            )? {
                 return Err(stale_claim(
                     "another event-search worker owns the unexpired claim",
                 ));
@@ -1425,6 +1461,7 @@ fn catch_up_standalone_run(
                 continue;
             }
             Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
+                release_claim_presence(&request.store.db_path, &held.owner_token);
                 // The claim was taken over while this run embedded; nothing is left to release.
                 retries += 1;
                 continue;
@@ -1651,6 +1688,7 @@ fn run_with_store(
                     continue;
                 }
                 Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
+                    release_claim_presence(store.db_path(), &held.owner_token);
                     retries += 1;
                     continue;
                 }
@@ -3678,8 +3716,14 @@ fn ensure_generation(
         existing.attempt_tx = Some(projection_attempt.tx);
         existing.attempt_token = Some(projection_attempt.token);
         *attempt = Some(projection_attempt);
-        let (captured, certified) =
-            capture_source_membership(store, context_id, &bindings, Some(existing.id), existing.attempt_token, bounds)?;
+        let (captured, certified) = capture_source_membership(
+            store,
+            context_id,
+            &bindings,
+            Some(existing.id),
+            existing.attempt_token,
+            bounds,
+        )?;
         if was_capturing {
             finalize_capture_attempt(store, context_id, existing.id, &captured)?;
             existing.event_count = captured.event_count;
@@ -3703,8 +3747,14 @@ fn ensure_generation(
         profile,
     )?;
     *attempt = Some(projection_attempt);
-    let (captured, certified) =
-        capture_source_membership(store, context_id, &bindings, Some(id), Some(projection_attempt.token), bounds)?;
+    let (captured, certified) = capture_source_membership(
+        store,
+        context_id,
+        &bindings,
+        Some(id),
+        Some(projection_attempt.token),
+        bounds,
+    )?;
     finalize_capture_attempt(store, context_id, id, &captured)?;
     Ok(Generation {
         id,
@@ -4424,7 +4474,10 @@ fn capture_source_membership(
         }
     }
     let Some(generation_id) = generation_id else {
-        return Ok((observe_source_membership(store, context_id, bindings, bounds)?, None));
+        return Ok((
+            observe_source_membership(store, context_id, bindings, bounds)?,
+            None,
+        ));
     };
     let snapshot_sha256 = hash_json(&snapshot_json(bindings));
     match capture_incremental_membership(
@@ -4445,7 +4498,8 @@ fn capture_source_membership(
             &snapshot_sha256,
             attempt_token,
             bounds,
-        ).map(|(snapshot, certificate)| (snapshot, Some(certificate))),
+        )
+        .map(|(snapshot, certificate)| (snapshot, Some(certificate))),
     }
 }
 
@@ -5615,17 +5669,23 @@ fn certify_capture_pass(
         }
         if let JsonValue::Object(bound) = &pass.stamp {
             for value in bound.values() {
-                let JsonValue::Object(entry) = value else { continue };
+                let JsonValue::Object(entry) = value else {
+                    continue;
+                };
                 let id = entry
                     .get("generation_id")
                     .and_then(JsonValue::as_str)
                     .and_then(|id| uuid::Uuid::parse_str(id).ok())
-                    .ok_or_else(|| CgError::Engine("interpretation stamp lacks its generation".into()))?;
+                    .ok_or_else(|| {
+                        CgError::Engine("interpretation stamp lacks its generation".into())
+                    })?;
                 let ordinal = |name: &str| -> Result<Value> {
                     entry
                         .get(name)
                         .and_then(JsonValue::as_u64)
-                        .ok_or_else(|| CgError::Engine(format!("interpretation stamp lacks {name}")))
+                        .ok_or_else(|| {
+                            CgError::Engine(format!("interpretation stamp lacks {name}"))
+                        })
                         .and_then(|value| integer(value, name))
                 };
                 if !store
@@ -5676,7 +5736,10 @@ fn certify_capture_pass(
                 })?;
             Ok(CapturePassEnd::Certified(
                 chain.membership_source_snapshot(capture_ordinal),
-                CaptureCertificate { revision: TxId(pass.revision), stamp: pass.stamp.clone() },
+                CaptureCertificate {
+                    revision: TxId(pass.revision),
+                    stamp: pass.stamp.clone(),
+                },
             ))
         }
         Ok(false) => {
@@ -6101,7 +6164,6 @@ fn observe_source_membership(
     }
     Ok(chain.membership_source_snapshot(count))
 }
-
 
 fn retained_search_membership(
     store: &Store,
@@ -7080,7 +7142,22 @@ fn claim_pending_batch(
     });
     let cursor_sha256 = claim_hash(open_tail_events.iter().chain(events.iter()));
     let passage_ordinal = generation_passage_count(store, generation.id, bounds)?;
-    let owner_token = uuid::Uuid::now_v7().to_string();
+    let owner = uuid::Uuid::now_v7();
+    let owner_token = owner.to_string();
+    // Acquire presence before publishing the lease. The kept guard spans Store closes and
+    // unwinding inside this still-live process; SIGKILL releases it in the kernel.
+    #[cfg(target_os = "linux")]
+    let presence = if store.db_path() == std::path::Path::new(":memory:") {
+        None
+    } else {
+        Some(
+            contextdb_engine::persistence::holder_presence::hold(
+                store.db_path(),
+                *owner.as_bytes(),
+            )
+            .map_err(map_engine_err)?,
+        )
+    };
     let now = now_millis()?;
     let expires_at = now
         .checked_add(
@@ -7103,7 +7180,12 @@ fn claim_pending_batch(
     ).map_err(map_engine_err)?;
     let lease_epoch = if let Some(row) = existing.rows.first() {
         let persisted_expiry = get_timestamp(row, &existing.columns, "expires_at")?;
-        if persisted_expiry > now {
+        if claim_owner_live(
+            store,
+            &get_text(row, &existing.columns, "owner_token")?,
+            persisted_expiry,
+            now,
+        )? {
             let _ = store.internal_db().rollback(tx);
             return Err(stale_claim(
                 "another event-search worker owns the unexpired claim",
@@ -7170,6 +7252,10 @@ fn claim_pending_batch(
         }
     }
     store.internal_db().commit(tx).map_err(map_engine_err)?;
+    #[cfg(target_os = "linux")]
+    if let Some(presence) = presence {
+        presence.keep(*owner.as_bytes()).map_err(map_engine_err)?;
+    }
     Ok(ClaimResult::Work(Box::new(Claim {
         publication_event_count,
         generation: generation.clone(),
@@ -8720,6 +8806,7 @@ fn commit_batch(
             other => map_engine_err(other),
         })
     })?;
+    release_claim_presence(store.db_path(), &built.claim.owner_token);
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     if let Some(hook) = AFTER_BATCH_COMMIT.with(|slot| slot.borrow_mut().take()) {
         hook(store);

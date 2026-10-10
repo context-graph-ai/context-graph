@@ -65,7 +65,10 @@ open carrying both capabilities is `Store::open_with_control_handler_and_embedde
 - A typed active-time refusal releases the failed projection read and preserves committed
   passages for continuation, without duplicate passage identities. Guard:
   `tests/event_search_projection_correctness.rs::a_typed_active_time_refusal_retains_committed_passages_and_resumes`.
-- Projection retry retains claim and rendered work; failure is recorded only for its owner:
+- Projection retry retains claim and rendered work; failure is recorded only for its owner.
+  Linux file-store claims hold kernel presence across Store closes; a dead process releases it
+  so the next importer can reclaim its unexpired lease. Memory stores retain TTL fencing, and
+  epoch/token checks continue to reject results from superseded owners. Guards:
   `tests/event_search_projection_correctness.rs::projection_retries_real_writer_at_claim_renewal_and_commit_without_reembedding`
   and `post_commit_readback_refuses_a_competing_owner_and_a_later_run_completes` in that file.
 - The worker cap bounds calls and retains the held Store's lease:

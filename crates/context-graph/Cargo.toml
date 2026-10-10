@@ -39,7 +39,7 @@ chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 contextdb-parser.workspace = true
-contextdb-server = { path = "../../../contextdb-bs-composer-sol-01/crates/contextdb-server", features = ["iroh"], optional = true }
+contextdb-server = { path = "../../../contextdb-crashfix-rc/crates/contextdb-server", features = ["iroh"], optional = true }
 fs4.workspace = true
 pollster.workspace = true
 rayon.workspace = true
@@ -63,7 +63,7 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }
 cg-connector-claude-code.workspace = true
-contextdb-server = { path = "../../../contextdb-bs-composer-sol-01/crates/contextdb-server", features = ["iroh", "test-seams"] }
+contextdb-server = { path = "../../../contextdb-crashfix-rc/crates/contextdb-server", features = ["iroh", "test-seams"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }

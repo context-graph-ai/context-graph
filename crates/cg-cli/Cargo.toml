@@ -40,7 +40,7 @@ cg-cli-conventions.workspace = true
 context-graph = { path = "../context-graph", features = ["fabric-sync"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
-contextdb-server = { path = "../../../contextdb-bs-composer-sol-01/crates/contextdb-server", features = ["iroh"] }
+contextdb-server = { path = "../../../contextdb-crashfix-rc/crates/contextdb-server", features = ["iroh"] }
 fs4.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -60,6 +60,6 @@ context-graph-cli = { path = ".", features = ["status-fault-injection"] }
 # compiled behind contextdb-engine's `test-seams` feature. This is a test-only activation — the
 # `cg` binary's own dependency edge on contextdb-engine is unchanged.
 contextdb-engine = { workspace = true, features = ["test-seams"] }
-contextdb-server = { path = "../../../contextdb-bs-composer-sol-01/crates/contextdb-server", features = ["iroh", "test-seams"] }
+contextdb-server = { path = "../../../contextdb-crashfix-rc/crates/contextdb-server", features = ["iroh", "test-seams"] }
 libc = "0.2"
 tempfile.workspace = true
