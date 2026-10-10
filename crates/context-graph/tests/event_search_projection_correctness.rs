@@ -7102,7 +7102,11 @@ fn interpreted_capture_units_charge_every_statement_within_the_allowance() {
     let cfg = config(root.path().join("cg090-interpreted.db"));
     let store = open(&cfg);
     let context = create_context(&store);
-    append_sparse_projection_stream(&store, context, "interpreted", 120);
+    let source_streams = [("interpreted", 120)];
+    let captured_events = source_streams.iter().map(|(_, events)| *events as u64).sum::<u64>();
+    for (session, events) in source_streams {
+        append_sparse_projection_stream(&store, context, session, events);
+    }
     drop(store);
     take_projection_unit_receipts();
     run_until_projection_completes(&cfg, context, &embedder, 64);
@@ -7146,15 +7150,19 @@ fn interpreted_capture_units_charge_every_statement_within_the_allowance() {
     let interpreted = take_projection_unit_receipts();
     assert_projection_receipt_bounds(&interpreted);
 
-    // The capture pages: durable capture units that returned events (manifest units return one
-    // stream row, membership pages return no events).
+    // The first capture page also reads the fixture's stream manifest. Charge
+    // interpretation reads to the events only; membership pages return no events.
     let pages = |receipts: &[context_graph::test_support::ProjectionUnitReceipt]| {
         receipts
             .iter()
             .filter(|row| {
                 row.durable && row.fold == ProjectionFold::Capture && row.returned_rows > 1
             })
-            .map(|row| (row.returned_rows, row.examined_entries))
+            .enumerate()
+            .map(|(page, row)| {
+                let manifest_rows = if page == 0 { source_streams.len() as u64 } else { 0 };
+                (row.returned_rows - manifest_rows, row.examined_entries)
+            })
             .collect::<Vec<_>>()
     };
     let plain_pages = pages(&plain);
@@ -7163,12 +7171,18 @@ fn interpreted_capture_units_charge_every_statement_within_the_allowance() {
         !interpreted_pages.is_empty() && interpreted_pages.len() == plain_pages.len(),
         "both captures read the same pages: {plain_pages:?} vs {interpreted_pages:?}"
     );
+    assert_eq!(
+        plain_pages.iter().map(|(events, _)| events).sum::<u64>(),
+        captured_events,
+        "capture pages account for every event in the fixture, excluding manifests"
+    );
     for ((plain_rows, plain_examined), (rows, examined)) in
         plain_pages.iter().zip(&interpreted_pages)
     {
         assert_eq!(plain_rows, rows, "the same events per page");
-        assert!(
-            *examined >= plain_examined + 2 * rows,
+        assert_eq!(
+            examined - plain_examined,
+            2 * rows,
             "an interpreted page is charged its two interpretation reads per event: \
              {examined} vs plain {plain_examined} over {rows} events"
         );
