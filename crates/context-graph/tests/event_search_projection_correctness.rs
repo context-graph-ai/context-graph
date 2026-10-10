@@ -28,7 +28,7 @@ use context_graph::embedder::{
 };
 use context_graph::owner_control::{ReaderRelease, wait_for_reader_release_within};
 use context_graph::test_support::{
-    after_next_event_search_attempt_commit_before_readback_for_test,
+    ProjectionFold, after_next_event_search_attempt_commit_before_readback_for_test,
     after_next_event_search_completion_commit_before_readback_for_test,
     after_next_event_search_membership_read_page_for_test,
     before_next_event_search_attempt_commit_for_test,
@@ -37,9 +37,9 @@ use context_graph::test_support::{
     clear_event_search_discovery_observations_for_test,
     event_search_discovery_observations_for_test,
     fail_next_event_search_membership_capture_for_test,
-    pause_next_event_search_finalization_for_test,
-    set_event_search_projection_read_deadline_ms_for_test,
-    take_event_search_membership_captures_for_test,
+    pause_next_event_search_finalization_for_test, pause_projection_unit_before_commit,
+    set_event_search_projection_read_deadline_ms_for_test, set_projection_unit_cut,
+    take_event_search_membership_captures_for_test, take_projection_unit_receipts,
 };
 use context_graph::{
     AppendEventBatch, CgError, ContextId, ContextSelector, CreateContext, DistanceMetric, Embedder,
@@ -48,11 +48,12 @@ use context_graph::{
     EventSearchBuildRequest, EventSearchFailureDisposition, EventSearchFilter, EventSearchOrder,
     EventSearchProfile, EventSearchProjectionRunner, EventSearchRebuildRequest,
     EventSearchRunRequest, EventSearchSessionScope, EventSearchWorkAssessment,
-    EventSearchWorkPolicy, EventSearchWorkSpec, EvidenceKind, EvidenceProducer, Result, Store,
-    StoreConfig, event_history_reader_declaration,
+    EventSearchWorkPolicy, EventSearchWorkSpec, EvidenceKind, EvidenceProducer, ForgetSelection,
+    Result, Store, StoreConfig, event_history_reader_declaration,
 };
 use contextdb_core::{Value, Wallclock};
 use serde_json::json;
+use uuid::Uuid;
 
 const CONNECTOR: &str = "event-search-correctness";
 const SESSION: &str = "event-search-correctness-session";
@@ -562,6 +563,31 @@ fn run_request_with_workers(
         max_bytes_per_batch: NonZeroUsize::new(32_768).expect("nonzero byte batch"),
         lease_duration_ms: NonZeroU64::new(lease_ms).expect("nonzero lease"),
     }
+}
+
+fn run_until_projection_completes(
+    config: &StoreConfig,
+    context_id: ContextId,
+    embedder: &Arc<ControlledEmbedder>,
+    max_events_per_batch: u32,
+) -> EventSearchBuildReceipt {
+    for _ in 0..64 {
+        match run(
+            config,
+            context_id,
+            embedder,
+            max_events_per_batch,
+            OBSERVED_LEASE_MS,
+        ) {
+            Ok(receipt) if receipt.completed_at.is_some() => return receipt,
+            Ok(_) | Err(CgError::ReadActiveTimeExceeded { .. }) => {
+                // The 5 s active-time ceiling ends a unit run. A fresh attempt resumes the
+                // persisted frontier; it never changes the unit allowance.
+            }
+            Err(error) => panic!("projection completion failed: {error:?}"),
+        }
+    }
+    panic!("projection did not finish after repeated bounded-unit resumptions");
 }
 
 fn commit_later_begun_audit_transaction(
@@ -5955,4 +5981,1196 @@ fn recent_coverage_reads_only_selected_progress_keys() {
         measured[0], measured[1],
         "forty then one hundred sixty total sessions keep the same ten keyed progress probes and charged bytes"
     );
+}
+
+fn append_projection_fixture_stream(
+    store: &Store,
+    context_id: ContextId,
+    source: &str,
+    count: u64,
+    text: &str,
+) {
+    let events = (1..=count)
+        .map(|ordinal| {
+            let mut event = draft(
+                &format!("{source}-event-{ordinal}"),
+                ordinal,
+                EventRenderRole::HumanMessage,
+                text,
+            );
+            event.session_ref = "one-large-session".into();
+            event
+        })
+        .collect();
+    store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            source,
+            events,
+        ))
+        .expect("append bounded-fold fixture stream");
+}
+
+fn append_large_metadata_stream(
+    store: &Store,
+    context_id: ContextId,
+    source: &str,
+    first_ordinal: u64,
+) {
+    let events = (first_ordinal..first_ordinal + 3)
+        .map(|ordinal| {
+            let mut event = draft(
+                &format!("{source}-metadata-{ordinal}"),
+                ordinal,
+                EventRenderRole::Metadata,
+                "metadata-only",
+            );
+            event.session_ref = "one-large-session".into();
+            event.text = None;
+            event.payload = json!({ "padding": "x".repeat(1_600_000) });
+            event
+        })
+        .collect();
+    store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            source,
+            events,
+        ))
+        .expect("append metadata large enough to split capture pages by bytes");
+}
+
+fn append_sparse_projection_stream(store: &Store, context_id: ContextId, source: &str, count: u64) {
+    let events = (1..=count)
+        .map(|ordinal| {
+            let mut event = draft(
+                &format!("{source}-event-{ordinal}"),
+                ordinal,
+                EventRenderRole::HumanMessage,
+                "short searchable event",
+            );
+            event.session_ref = "one-large-session".into();
+            if ordinal % 64 != 1 {
+                event.text = None;
+                event.render_role = EventRenderRole::Metadata;
+            }
+            event
+        })
+        .collect();
+    store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            source,
+            events,
+        ))
+        .expect("append sparse large-session fixture events");
+}
+
+/// The engine's examined-entry meter, measured once per test process on the engine under test, so
+/// the unit bound follows the meter rather than one engine's numbers. `seek` is the most any one
+/// positioning statement the projection runs is charged when it returns at most one row: a seek
+/// that finds a row, a seek that misses, a point lookup, one event's anchor read, a pending-stream,
+/// cursor, membership, passage or session-progress read, and the commit transaction's generation,
+/// capture-mark, session-progress and fold-row reads. `row` is the most each further returned
+/// row adds. The probe store holds 200 events so each table's scan window is as full as in the rows.
+#[derive(Clone, Copy, Debug)]
+struct EngineMeter {
+    seek: u64,
+    row: u64,
+}
+
+fn engine_meter() -> EngineMeter {
+    static METER: std::sync::OnceLock<EngineMeter> = std::sync::OnceLock::new();
+    *METER.get_or_init(measure_engine_meter)
+}
+
+fn measure_engine_meter() -> EngineMeter {
+    let embedder = ControlledEmbedder::new();
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(root.path().join("cg090-meter.db"));
+    let store = open(&cfg);
+    let context = create_context(&store);
+    append_sparse_projection_stream(&store, context, "meter", 200);
+    drop(store);
+    let generation = run_until_projection_completes(&cfg, context, &embedder, 256).generation_id;
+    let store = open(&cfg);
+    let examined = |sql: &str, extra: &[(&str, Value)]| {
+        let mut params = HashMap::from([
+            ("context_id".to_string(), Value::Uuid(context.as_uuid())),
+            (
+                "generation_id".to_string(),
+                Value::Uuid(generation.as_uuid()),
+            ),
+            ("connector".to_string(), Value::Text(CONNECTOR.into())),
+            ("source".to_string(), Value::Text("meter".into())),
+            (
+                "session".to_string(),
+                Value::Text("one-large-session".into()),
+            ),
+        ]);
+        params.extend(
+            extra
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone())),
+        );
+        let answer = store
+            .execute_sql_for_test(sql, &params)
+            .expect("meter probe statement");
+        (answer.trace.rows_examined, answer.rows)
+    };
+    let stream =
+        "context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source";
+    let (one, first) = examined(
+        &format!("SELECT id FROM events WHERE {stream} AND seq > 0 ORDER BY seq ASC LIMIT 1"),
+        &[],
+    );
+    let (many, _) = examined(
+        &format!("SELECT id FROM events WHERE {stream} AND seq > 0 ORDER BY seq ASC LIMIT 101"),
+        &[],
+    );
+    let event_id = first[0][0].clone();
+    let membership = "context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session";
+    let positioning = [
+        one,
+        examined(
+            &format!("SELECT id FROM events WHERE {stream} AND seq > 10000 ORDER BY seq ASC LIMIT 1"),
+            &[],
+        )
+        .0,
+        examined(
+            &format!("SELECT seq FROM events WHERE {stream} ORDER BY seq DESC LIMIT 1"),
+            &[],
+        )
+        .0,
+        examined(
+            "SELECT id FROM events WHERE context_id = $context_id AND id = $event_id",
+            &[("event_id", event_id.clone())],
+        )
+        .0,
+        examined(
+            "SELECT key FROM event_anchors WHERE event_id = $event_id AND context_id = $context_id ORDER BY declaration_version ASC, key ASC, identity_value ASC",
+            &[("event_id", event_id.clone())],
+        )
+        .0,
+        examined(
+            "SELECT ordinal FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND event_id = $event_id",
+            &[("event_id", event_id)],
+        )
+        .0,
+        examined(
+            &format!("SELECT ordinal FROM event_search_source_events WHERE {membership} AND source_sequence > 100 ORDER BY source_sequence ASC LIMIT 1"),
+            &[],
+        )
+        .0,
+        examined(
+            &format!("SELECT committed_sequence FROM event_search_cursors WHERE {membership}"),
+            &[],
+        )
+        .0,
+        examined(
+            "SELECT connector_id FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND pending = false ORDER BY connector_id ASC LIMIT 1",
+            &[],
+        )
+        .0,
+        examined(
+            "SELECT event_count FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session",
+            &[],
+        )
+        .0,
+        examined(
+            "SELECT passage_ordinal FROM event_search_passages WHERE generation_id = $generation_id AND is_current = true ORDER BY passage_ordinal ASC LIMIT 1",
+            &[],
+        )
+        .0,
+        // The commit transaction's read shapes: the generation fence, the capture mark, the
+        // session progress row and the fold row.
+        examined(
+            "SELECT interpretation_snapshot_sha256, last_attempt_token, passage_revision FROM event_search_generations WHERE context_id = $context_id AND id = $generation_id",
+            &[],
+        )
+        .0,
+        examined(
+            "SELECT capture_open, capture_pending_tx FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+            &[],
+        )
+        .0,
+        examined(
+            "SELECT event_count, is_required FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session",
+            &[],
+        )
+        .0,
+        examined(
+            "SELECT id, attempt_token, unit FROM event_search_fold_progress WHERE context_id = $context_id AND generation_id = $generation_id",
+            &[],
+        )
+        .0,
+    ];
+    let meter = EngineMeter {
+        seek: positioning.into_iter().max().unwrap().max(1),
+        row: many.saturating_sub(one).div_ceil(100).max(1),
+    };
+    eprintln!("measured engine meter: {meter:?} (positioning {positioning:?}, rows {one}/{many})");
+    meter
+}
+
+fn unit_allowance(fold: ProjectionFold, returned_rows: u64) -> u64 {
+    let meter = engine_meter();
+    // Every statement a unit runs, its commit transaction included, counted from the statement
+    // shapes in `event_search_projection.rs`; the receipt charges each one's examined entries.
+    let (statements, statements_per_row) = match fold {
+        // The largest capture unit is a capture page. Reads: up to three manifest-key branches, the
+        // stream's newest member and member count, and the event page. Commit: the generation fence,
+        // the manifest-frontier fence, the member append's generation and head reads and its
+        // generation update, the capture mark's read and close, the manifest row's delete and the
+        // fold row's compare-and-set. Each captured event: its anchor read, the retained-member check,
+        // the interpretation member and effective-value reads, the member insert, the session
+        // progress read and write, the generation's required-count read and write, and the cursor
+        // read and insert. The manifest unit (at most nine statements, one stream), the membership
+        // page (three) and the manifest reset (three plus one delete per row) all fit inside it.
+        ProjectionFold::Capture => (15, 11),
+        // Up to three pending-stream branches; each stream reads its cursor and first pending member.
+        // Discovery and session-scope pages commit nothing.
+        ProjectionFold::Pending => (3, 2),
+        // Two passage-key branches, the generation fence and the fold row's compare-and-set.
+        ProjectionFold::Passages => (4, 0),
+    };
+    statements * meter.seek + returned_rows * (meter.row + statements_per_row * meter.seek)
+}
+
+fn assert_projection_receipt_bounds(
+    receipts: &[context_graph::test_support::ProjectionUnitReceipt],
+) {
+    for receipt in receipts {
+        let returned_ceiling = match receipt.fold {
+            ProjectionFold::Capture | ProjectionFold::Pending => 256,
+            ProjectionFold::Passages => 32,
+        };
+        assert!(
+            receipt.returned_rows <= returned_ceiling,
+            "returned rows stay inside the fold's fixed batch allowance: {receipt:?}"
+        );
+        assert!(
+            receipt.examined_entries <= unit_allowance(receipt.fold, receipt.returned_rows),
+            "examined entries stay within the unit's fixed statement allowance: {receipt:?}"
+        );
+    }
+}
+
+fn hash_membership_rows(rows: &[Vec<Value>]) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    fn part(hash: &mut Sha256, bytes: &[u8]) {
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    let mut ordered = format!(
+        "{:x}",
+        Sha256::digest(b"context-graph/event-search-ordered-source-set/v1")
+    );
+    let mut content = format!(
+        "{:x}",
+        Sha256::digest(b"context-graph/event-search-source-content/v1")
+    );
+    for row in rows {
+        let [
+            Value::Int64(ordinal),
+            Value::Uuid(event_id),
+            Value::Text(connector),
+            Value::Text(source),
+            Value::Text(session),
+            Value::Int64(sequence),
+            Value::Text(captured_hash),
+            Value::Text(effective_hash),
+        ] = row.as_slice()
+        else {
+            panic!("membership row has the expected typed columns: {row:?}");
+        };
+        let mut next_ordered = Sha256::new();
+        next_ordered.update(b"context-graph/event-search-ordered-source-set/v1");
+        part(&mut next_ordered, ordered.as_bytes());
+        part(&mut next_ordered, &ordinal.to_be_bytes());
+        part(&mut next_ordered, event_id.as_bytes());
+        part(&mut next_ordered, connector.as_bytes());
+        part(&mut next_ordered, source.as_bytes());
+        part(&mut next_ordered, session.as_bytes());
+        part(&mut next_ordered, &sequence.to_be_bytes());
+        part(&mut next_ordered, captured_hash.as_bytes());
+        let mut next_content = Sha256::new();
+        next_content.update(b"context-graph/event-search-source-content/v1");
+        part(&mut next_content, content.as_bytes());
+        part(&mut next_content, effective_hash.as_bytes());
+        ordered = format!("{:x}", next_ordered.finalize());
+        content = format!("{:x}", next_content.finalize());
+    }
+    (ordered, content)
+}
+
+/// CG-090: a run stopped after two durable units resumes at the saved frontier under a new
+/// attempt, never redoes a committed unit, reuses an unchanged completed passage fold and refolds
+/// it after the passage population changes.
+#[test]
+fn projection_cut_resumes_at_the_saved_frontier_under_a_new_attempt() {
+    // Measure the engine meter alongside the row; the first bound check waits for it.
+    std::thread::spawn(engine_meter);
+    // A single 260-event session cannot be one unit. The run stops after two committed units,
+    // then resumes under a new attempt and adopts the durable frontier.
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(root.path().join("cg090-large-session.db"));
+    let store = open(&cfg);
+    let context = create_context(&store);
+    append_sparse_projection_stream(&store, context, "large", 260);
+    drop(store);
+
+    let embedder = ControlledEmbedder::new();
+    set_projection_unit_cut(Some(2));
+    let partial = run(&cfg, context, &embedder, 256, OBSERVED_LEASE_MS)
+        .expect("a deterministic cut returns the last committed partial result");
+    assert!(
+        partial.completed_at.is_none(),
+        "two units did not finish the whole projection"
+    );
+    let first = take_projection_unit_receipts();
+    assert_eq!(
+        first.iter().filter(|row| row.durable).count(),
+        2,
+        "the cut follows exactly two durable units"
+    );
+    assert_projection_receipt_bounds(&first);
+    let prior_attempt = attempt_owner_row(&cfg, context);
+
+    set_projection_unit_cut(None);
+    let resumed = run_until_projection_completes(&cfg, context, &embedder, 256);
+    let resumed_attempt = attempt_owner_row(&cfg, context);
+    assert_ne!(
+        prior_attempt[3], resumed_attempt[3],
+        "the saved frontier is adopted under a new attempt token"
+    );
+    // Every 64th of the 260 events carries text: 1, 65, 129, 193 and 257.
+    assert_eq!(resumed.embedded_event_count, 5);
+    assert!(resumed.completed_at.is_some());
+    assert_eq!(
+        open(&cfg)
+            .event_history_status(ContextSelector::one(context))
+            .unwrap()
+            .contexts[0]
+            .captured_events,
+        260,
+        "all source events are captured across the bounded units"
+    );
+    let continuation = take_projection_unit_receipts();
+    assert_projection_receipt_bounds(&continuation);
+    let capture_units = first
+        .iter()
+        .chain(&continuation)
+        .filter(|row| row.durable && row.fold == ProjectionFold::Capture)
+        .count();
+    assert!(
+        capture_units >= 2,
+        "260 source events require multiple fixed-size capture units: {capture_units}"
+    );
+    for receipt in &continuation {
+        assert!(
+            !receipt.durable
+                || !first.iter().any(|prior| {
+                    prior.durable
+                        && prior.fold == receipt.fold
+                        && prior.frontier_after == receipt.frontier_after
+                }),
+            "resume must not redo an already committed frontier: {receipt:?}"
+        );
+    }
+    run(&cfg, context, &embedder, 256, OBSERVED_LEASE_MS)
+        .expect("an unchanged completed generation remains readable");
+    let unchanged = take_projection_unit_receipts();
+    assert!(
+        unchanged
+            .iter()
+            .all(|row| !row.durable && row.fold != ProjectionFold::Passages),
+        "an unchanged completed result commits no unit and does not refold passages: {unchanged:?}"
+    );
+
+    // Grow the passage population after completion. The old complete fold cannot answer for the
+    // changed population; new durable passage work is required.
+    let store = open(&cfg);
+    let mut later = draft(
+        "large-event-261",
+        261,
+        EventRenderRole::HumanMessage,
+        "new population member extends the open passage tail",
+    );
+    later.session_ref = "one-large-session".into();
+    store
+        .append_event_batch(AppendEventBatch::live(
+            context,
+            declaration(),
+            "large",
+            vec![later],
+        ))
+        .expect("append to the completed generation's existing source stream");
+    drop(store);
+    let mut changed_receipts = Vec::new();
+    for _ in 0..4 {
+        set_projection_unit_cut(Some(1));
+        match run(&cfg, context, &embedder, 256, OBSERVED_LEASE_MS) {
+            Ok(_) | Err(CgError::ReadActiveTimeExceeded { .. }) => {}
+            Err(error) => panic!("changed-passage fold failed: {error:?}"),
+        }
+        changed_receipts.extend(take_projection_unit_receipts());
+        if changed_receipts
+            .iter()
+            .any(|row| row.durable && row.fold == ProjectionFold::Passages)
+        {
+            break;
+        }
+    }
+    set_projection_unit_cut(None);
+    assert!(
+        changed_receipts
+            .iter()
+            .any(|row| row.durable && row.fold == ProjectionFold::Passages),
+        "passage revision change forces a fresh passage fold"
+    );
+    assert_projection_receipt_bounds(&changed_receipts);
+}
+
+/// CG-090: appends to a partly captured stream, to a later stream and a new stream landing while the
+/// capture pass is paused inside the first stream stay outside the pass's frozen manifest. The
+/// finished pass holds exactly the 520 frozen events, both chains recomputed from its rows match the
+/// certified ones, and the next pass captures exactly the three appends.
+#[test]
+fn capture_reads_only_inside_the_frozen_stream_frontiers() {
+    // Measure the engine meter alongside the row; the first bound check waits for it.
+    std::thread::spawn(engine_meter);
+    let embedder = ControlledEmbedder::new();
+    // Stream a and stream z each hold 260 events, so stream a cannot be captured in one unit. The
+    // run stops once stream a is partly captured, with both frontiers frozen in the manifest. Then
+    // sequence 261 lands on stream a, sequence 261 on stream z and a new stream m (ordered between
+    // a and z) gets its first event. The frozen pass must finish with exactly the 520 events at or
+    // below its frontiers; the next pass picks the three appends up.
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(root.path().join("cg090-multistream.db"));
+    let store = open(&cfg);
+    let context = create_context(&store);
+    append_sparse_projection_stream(&store, context, "stream-a", 260);
+    append_sparse_projection_stream(&store, context, "stream-z", 260);
+    drop(store);
+    let member_query = "SELECT ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, captured_source_sha256, effective_source_sha256 FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY ordinal";
+    let generation_params = |generation_id: context_graph::EventSearchGenerationId| {
+        HashMap::from([
+            ("context_id".to_string(), Value::Uuid(context.as_uuid())),
+            (
+                "generation_id".to_string(),
+                Value::Uuid(generation_id.as_uuid()),
+            ),
+        ])
+    };
+    let source_and_sequence = |row: &Vec<Value>| match row.as_slice() {
+        [_, _, _, Value::Text(source), _, Value::Int64(sequence), ..] => {
+            (source.clone(), *sequence)
+        }
+        other => panic!("captured membership exposes its source and sequence: {other:?}"),
+    };
+    let mut paused: Option<(context_graph::EventSearchGenerationId, usize)> = None;
+    let mut manifest = HashMap::<String, i64>::new();
+    for _ in 0..8 {
+        set_projection_unit_cut(Some(1));
+        let partial = run(&cfg, context, &embedder, 256, OBSERVED_LEASE_MS)
+            .expect("single-unit cut leaves a resumable capture");
+        assert_projection_receipt_bounds(&take_projection_unit_receipts());
+        let store = open(&cfg);
+        let params = generation_params(partial.generation_id);
+        let captured_a = store
+            .execute_sql_for_test(member_query, &params)
+            .expect("read the captured membership")
+            .rows
+            .iter()
+            .map(&source_and_sequence)
+            .filter(|(source, _)| source == "stream-a")
+            .count();
+        if (1..260).contains(&captured_a) {
+            manifest = store
+                .execute_sql_for_test(
+                    "SELECT source_instance_ref, upper_seq FROM event_search_capture_manifest WHERE context_id = $context_id AND generation_id = $generation_id",
+                    &params,
+                )
+                .expect("read the committed stream frontiers")
+                .rows
+                .into_iter()
+                .map(|row| match row.as_slice() {
+                    [Value::Text(source), Value::Int64(upper)] => (source.clone(), *upper),
+                    other => panic!("manifest frontier has typed source and sequence: {other:?}"),
+                })
+                .collect();
+            paused = Some((partial.generation_id, captured_a));
+            break;
+        }
+    }
+    let (generation_id, captured_before) =
+        paused.expect("capture pauses inside stream a within bounded units");
+    assert_eq!(
+        manifest,
+        HashMap::from([("stream-a".to_string(), 260), ("stream-z".to_string(), 260)]),
+        "both streams' frontiers are frozen before the appends"
+    );
+
+    let store = open(&cfg);
+    let mut excluded = Vec::new();
+    for (source, ordinal) in [("stream-a", 261), ("stream-z", 261), ("stream-m", 1)] {
+        let mut appended = draft(
+            &format!("{source}-after-frontier"),
+            ordinal,
+            EventRenderRole::HumanMessage,
+            "post-frontier append",
+        );
+        appended.session_ref = "one-large-session".into();
+        store
+            .append_event_batch(AppendEventBatch::live(
+                context,
+                declaration(),
+                source,
+                vec![appended],
+            ))
+            .expect("append while capture is paused inside stream a");
+        excluded.push((source.to_string(), ordinal as i64));
+    }
+    drop(store);
+
+    // Finish the frozen pass and nothing more: one durable unit at a time until the pass certifies
+    // (its interpretation stamp is published). A run left uncut would go straight on into the next
+    // capture pass, which picks the appends up.
+    let mut certified = false;
+    for _ in 0..16 {
+        set_projection_unit_cut(Some(1));
+        match run(&cfg, context, &embedder, 256, OBSERVED_LEASE_MS) {
+            Ok(receipt) => assert_eq!(receipt.generation_id, generation_id),
+            Err(CgError::ReadActiveTimeExceeded { .. }) => {}
+            Err(error) => panic!("the frozen pass resumes: {error:?}"),
+        }
+        assert_projection_receipt_bounds(&take_projection_unit_receipts());
+        let stamp = open(&cfg)
+            .execute_sql_for_test(
+                "SELECT interpretation_verified_stamp FROM event_search_generations WHERE id = $generation_id",
+                &generation_params(generation_id),
+            )
+            .expect("read the generation's certification")
+            .rows;
+        if stamp.first().is_some_and(|row| row[0] != Value::Null) {
+            certified = true;
+            break;
+        }
+    }
+    set_projection_unit_cut(None);
+    assert!(certified, "the frozen pass certifies within bounded units");
+    let store = open(&cfg);
+    let members = store
+        .execute_sql_for_test(member_query, &generation_params(generation_id))
+        .expect("read the frozen pass's membership")
+        .rows;
+    let oracle = ["stream-a", "stream-z"]
+        .into_iter()
+        .flat_map(|source| (1..=260).map(move |sequence| (source.to_string(), sequence)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        members.iter().map(&source_and_sequence).collect::<Vec<_>>(),
+        oracle,
+        "the frozen pass holds exactly the 520 events at or below its frontiers, in key order \
+         (stream a was paused after {captured_before} members)"
+    );
+    for (index, row) in members.iter().enumerate() {
+        assert_eq!(
+            row[0],
+            Value::Int64(index as i64),
+            "ordinals are contiguous"
+        );
+    }
+    let (ordered_hash, content_hash) = hash_membership_rows(&members);
+    assert_eq!(
+        store
+            .execute_sql_for_test(
+                "SELECT capture_ordinal, capture_ordered_sha256, capture_content_sha256 FROM event_search_generations WHERE id = $generation_id",
+                &generation_params(generation_id),
+            )
+            .expect("read the generation's certified capture")
+            .rows,
+        vec![vec![
+            Value::Int64(520),
+            Value::Text(ordered_hash),
+            Value::Text(content_hash)
+        ]],
+        "both chains, recomputed from the 520 member rows, equal the certified ones"
+    );
+    drop(store);
+
+    // The excluded appends were deferred, not lost: the next pass captures exactly them, after the
+    // frozen 520, in key order (a, m, z).
+    run_until_projection_completes(&cfg, context, &embedder, 256);
+    take_projection_unit_receipts();
+    let later = open(&cfg)
+        .execute_sql_for_test(member_query, &generation_params(generation_id))
+        .expect("read the next pass's membership")
+        .rows;
+    assert_eq!(later.len(), 523);
+    assert_eq!(
+        later[520..]
+            .iter()
+            .map(&source_and_sequence)
+            .collect::<Vec<_>>(),
+        vec![
+            excluded[0].clone(),
+            excluded[2].clone(),
+            excluded[1].clone()
+        ],
+    );
+}
+
+fn flatness_population(
+    prefix_events: u64,
+) -> Vec<context_graph::test_support::ProjectionUnitReceipt> {
+    let embedder = ControlledEmbedder::new();
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(root.path().join(format!("cg090-flat-{prefix_events}.db")));
+    let store = open(&cfg);
+    let context = create_context(&store);
+    // A completed prefix that grows N/2N/4N, then an identical tail stream and an identical
+    // metadata stream whose 1.6 MB events force byte-split capture pages.
+    for (source, count, every) in [("a-prefix", prefix_events, 8_u64), ("z-tail", 64, 2)] {
+        let events = (1..=count)
+            .map(|ordinal| {
+                let mut event = draft(
+                    &format!("{source}-event-{ordinal}"),
+                    ordinal,
+                    EventRenderRole::HumanMessage,
+                    "short searchable event",
+                );
+                event.session_ref = "one-large-session".into();
+                if ordinal % every != 1 {
+                    event.text = None;
+                    event.render_role = EventRenderRole::Metadata;
+                }
+                event
+            })
+            .collect();
+        store
+            .append_event_batch(AppendEventBatch::live(
+                context,
+                declaration(),
+                source,
+                events,
+            ))
+            .expect("append flatness fixture stream");
+    }
+    append_large_metadata_stream(&store, context, "zz-meta", 1);
+    drop(store);
+    let _ = take_projection_unit_receipts();
+    run_until_projection_completes(&cfg, context, &embedder, 256);
+    take_projection_unit_receipts()
+}
+
+/// CG-090 proof row 2: the work of a unit over the identical tail, including byte-split capture
+/// pages, the last discovery unit and the last full passage unit, stays flat while the completed
+/// population grows N/2N/4N. A unit that scanned the completed prefix would add at least the
+/// prefix's growth to these counts. The three populations run on their own threads.
+#[test]
+fn unit_work_stays_flat_as_the_population_grows_n_2n_4n() {
+    // Same-shape units measured 0-1 entries apart across populations on the pinned engine; a read
+    // proportional to the prefix adds at least 3N/8 = 24 entries at 4N even over the sparse
+    // prefix's passages, and at least one examined row per prefix row on a rows-only meter.
+    const FLAT_TOLERANCE: u64 = 16;
+    let sizes = [64_u64, 128, 256];
+    let meter = std::thread::spawn(engine_meter);
+    let receipts = sizes
+        .map(|size| std::thread::spawn(move || flatness_population(size)))
+        .map(|handle| handle.join().expect("flatness population thread"));
+    meter.join().expect("engine meter thread");
+    for population in &receipts {
+        assert_projection_receipt_bounds(population);
+    }
+    let tail_capture = |population: &[context_graph::test_support::ProjectionUnitReceipt]| {
+        population
+            .iter()
+            .filter(|row| {
+                row.durable
+                    && row.fold == ProjectionFold::Capture
+                    && (row.frontier_after.contains("\"z-tail\"")
+                        || row.frontier_after.contains("\"zz-meta\""))
+            })
+            .map(|row| (row.returned_rows, row.examined_entries))
+            .collect::<Vec<_>>()
+    };
+    let byte_split_pages = receipts[0]
+        .iter()
+        .filter(|row| {
+            row.durable
+                && row.fold == ProjectionFold::Capture
+                && row.frontier_after.contains("\"zz-meta\", ")
+        })
+        .count();
+    assert!(
+        byte_split_pages >= 2,
+        "the 4.8 MB metadata stream is captured in more than one byte-bounded page: {:?}",
+        receipts[0]
+    );
+    let last_discovery = |population: &[context_graph::test_support::ProjectionUnitReceipt]| {
+        population
+            .iter()
+            .filter(|row| row.fold == ProjectionFold::Pending && row.returned_rows > 0)
+            .map(|row| (row.returned_rows, row.examined_entries))
+            .next_back()
+            .expect("a discovery unit found pending work")
+    };
+    // The first passage unit seeks with no saved key; later units continue after one, so the
+    // comparison takes the last full continuing unit.
+    let last_full_passages =
+        |population: &[context_graph::test_support::ProjectionUnitReceipt]| {
+            let full = population
+                .iter()
+                .filter(|row| row.fold == ProjectionFold::Passages)
+                .map(|row| row.returned_rows)
+                .max()
+                .expect("a passage unit ran");
+            population
+                .iter()
+                .filter(|row| {
+                    row.fold == ProjectionFold::Passages
+                        && row.returned_rows == full
+                        && row.frontier_before != "None"
+                })
+                .map(|row| (row.returned_rows, row.examined_entries))
+                .next_back()
+                .expect("a full passage unit continued after a saved key")
+        };
+    let within = |label: &str, values: Vec<(u64, u64)>| {
+        assert!(
+            values.windows(2).all(|pair| pair[0].0 == pair[1].0),
+            "{label}: the compared units have the same shape at N/2N/4N: {values:?}"
+        );
+        let low = values.iter().map(|value| value.1).min().unwrap();
+        let high = values.iter().map(|value| value.1).max().unwrap();
+        assert!(
+            high - low <= FLAT_TOLERANCE,
+            "{label}: examined entries stay flat at N/2N/4N: {values:?}"
+        );
+    };
+    let tails = receipts
+        .iter()
+        .map(|population| tail_capture(population))
+        .collect::<Vec<_>>();
+    assert!(
+        tails.windows(2).all(|pair| pair[0].len() == pair[1].len()),
+        "the identical tail is captured in the same units at N/2N/4N: {tails:?}"
+    );
+    for position in 0..tails[0].len() {
+        within(
+            &format!("tail capture unit {position}"),
+            tails.iter().map(|units| units[position]).collect(),
+        );
+    }
+    within(
+        "last discovery unit",
+        receipts
+            .iter()
+            .map(|population| last_discovery(population))
+            .collect(),
+    );
+    within(
+        "last full passage unit",
+        receipts
+            .iter()
+            .map(|population| last_full_passages(population))
+            .collect(),
+    );
+}
+
+/// CG-090: a duplicate current passage ordinal is refused on sight by one non-durable passage unit.
+#[test]
+fn a_duplicate_current_passage_ordinal_is_refused_inside_one_unit() {
+    // Measure the engine meter alongside the row; the first bound check waits for it.
+    std::thread::spawn(engine_meter);
+    let embedder = ControlledEmbedder::new();
+    // Passage ordinals are generation-wide, so create one duplicate directly in the current
+    // passage index and advance the publication revision to force the completed fold to recheck.
+    let duplicate_root = tempfile::tempdir().unwrap();
+    let duplicate_cfg = config(duplicate_root.path().join("cg090-duplicate.db"));
+    let duplicate_store = open(&duplicate_cfg);
+    let duplicate_context = create_context(&duplicate_store);
+    append_projection_fixture_stream(
+        &duplicate_store,
+        duplicate_context,
+        "duplicate-source",
+        80,
+        "duplicate fanout text",
+    );
+    drop(duplicate_store);
+    let duplicate_generation =
+        run_until_projection_completes(&duplicate_cfg, duplicate_context, &embedder, 256)
+            .generation_id;
+    let duplicate_store = open(&duplicate_cfg);
+    let source_passage = duplicate_store
+        .execute_sql_for_test(
+            "SELECT context_id, generation_id, connector_id, session_ref, passage_ordinal, first_event_sequence, last_event_sequence, rendered_text, content_sha256, vector_text, dimension, is_searchable, created_at FROM event_search_passages WHERE generation_id = $generation_id AND is_current = true ORDER BY passage_ordinal LIMIT 1",
+            &HashMap::from([(
+                "generation_id".into(),
+                Value::Uuid(duplicate_generation.as_uuid()),
+            )]),
+        )
+        .expect("read the first current passage")
+        .rows
+        .remove(0);
+    let mut duplicate_values = [
+        "context_id",
+        "generation_id",
+        "connector_id",
+        "session_ref",
+        "passage_ordinal",
+        "first",
+        "last",
+        "text",
+        "sha",
+        "vector",
+        "dimension",
+        "searchable",
+        "created_at",
+    ]
+    .into_iter()
+    .zip(source_passage)
+    .map(|(name, value)| (name.to_string(), value))
+    .collect::<HashMap<_, _>>();
+    duplicate_values.insert("new_id".into(), Value::Uuid(Uuid::new_v4()));
+    duplicate_store
+        .execute_sql_for_test(
+            "INSERT INTO event_search_passages (id, context_id, generation_id, connector_id, session_ref, source_instance_ref, passage_ordinal, first_event_sequence, last_event_sequence, rendered_text, content_sha256, vector_text, dimension, is_current, is_searchable, created_at) VALUES ($new_id, $context_id, $generation_id, $connector_id, $session_ref, 'duplicate-injected', $passage_ordinal, $first, $last, $text, $sha, $vector, $dimension, true, $searchable, $created_at)",
+            &duplicate_values,
+        )
+        .expect("inject one current passage with a duplicate generation ordinal");
+    duplicate_store
+        .execute_sql_for_test(
+            "UPDATE event_search_generations SET passage_revision = passage_revision + 1 WHERE id = $generation_id",
+            &HashMap::from([(
+                "generation_id".into(),
+                Value::Uuid(duplicate_generation.as_uuid()),
+            )]),
+        )
+        .expect("advance the passage publication revision with the injected duplicate");
+    drop(duplicate_store);
+    let _setup_receipts = take_projection_unit_receipts();
+    assert!(
+        run(
+            &duplicate_cfg,
+            duplicate_context,
+            &embedder,
+            256,
+            OBSERVED_LEASE_MS
+        )
+        .is_err(),
+        "equal ordinals across sources are refused at their second occurrence"
+    );
+    let duplicate_receipts = take_projection_unit_receipts();
+    let duplicate = duplicate_receipts
+        .iter()
+        .find(|row| row.fold == ProjectionFold::Passages)
+        .expect("the refusing passage unit reports its examined entries");
+    assert!(
+        !duplicate.durable,
+        "the duplicate passage unit is refused before commit"
+    );
+    assert!(
+        duplicate.returned_rows <= 32,
+        "the refusing unit reads at most one passage page: {duplicate:?}"
+    );
+    assert!(
+        duplicate.examined_entries
+            <= unit_allowance(ProjectionFold::Passages, duplicate.returned_rows),
+        "duplicate refusal stays within one passage unit's statement allowance: {duplicate:?}"
+    );
+}
+
+/// CG-090: forget purges the generation's fold progress and frozen manifest, and a unit in flight
+/// across the forget is refused at its commit with the stale claim.
+#[test]
+fn forget_purges_fold_progress_and_fences_an_in_flight_unit() {
+    // Measure the engine meter alongside the row; the first bound check waits for it.
+    std::thread::spawn(engine_meter);
+    let embedder = ControlledEmbedder::new();
+    // Forget the selected session after a durable unit. It purges the partial generation and both
+    // persisted fold inputs, so a later call cannot adopt stale progress.
+    let forget_root = tempfile::tempdir().unwrap();
+    let forget_cfg = config(forget_root.path().join("cg090-forget.db"));
+    let forget_store = open(&forget_cfg);
+    let forget_context = create_context(&forget_store);
+    append_sparse_projection_stream(&forget_store, forget_context, "forget", 300);
+    drop(forget_store);
+    set_projection_unit_cut(Some(1));
+    let partial = run(
+        &forget_cfg,
+        forget_context,
+        &embedder,
+        256,
+        OBSERVED_LEASE_MS,
+    )
+    .unwrap();
+    let before_forget = take_projection_unit_receipts();
+    assert_eq!(before_forget.iter().filter(|row| row.durable).count(), 1);
+    let forget_store = open(&forget_cfg);
+    forget_store
+        .forget_event_history(ForgetSelection::Session {
+            context_id: forget_context,
+            connector_id: CONNECTOR.into(),
+            session_ref: "one-large-session".into(),
+        })
+        .unwrap();
+    let remaining_progress = forget_store
+        .execute_sql_for_test(
+            "SELECT id FROM event_search_fold_progress WHERE context_id = $context_id AND generation_id = $generation_id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(forget_context.as_uuid())),
+                (
+                    "generation_id".into(),
+                    Value::Uuid(partial.generation_id.as_uuid()),
+                ),
+            ]),
+        )
+        .unwrap()
+        .rows;
+    let remaining_manifest = forget_store
+        .execute_sql_for_test(
+            "SELECT connector_id FROM event_search_capture_manifest WHERE context_id = $context_id AND generation_id = $generation_id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(forget_context.as_uuid())),
+                (
+                    "generation_id".into(),
+                    Value::Uuid(partial.generation_id.as_uuid()),
+                ),
+            ]),
+        )
+        .unwrap()
+        .rows;
+    assert!(remaining_progress.is_empty());
+    assert!(remaining_manifest.is_empty());
+    drop(forget_store);
+    set_projection_unit_cut(None);
+
+    // Forget while a unit is in flight. The pause seam stops the run inside the named unit after its
+    // reads, the forget runs there, and the unit then continues into its own production commit with
+    // the generation, attempt, fold row and manifest frontier it read under. Its fences must refuse
+    // it; were they gone, the unit would commit into the forgotten generation. Unit 1 is the
+    // manifest unit, whose only fence is the generation re-read (it has no prior fold row and no
+    // frozen frontier yet); unit 2 is the first capture page, fenced by the generation, its fold
+    // row's compare-and-set and its manifest frontier.
+    for paused_unit in [1, 2] {
+        let fence_root = tempfile::tempdir().unwrap();
+        let fence_cfg = config(fence_root.path().join("cg090-in-flight-forget.db"));
+        let fence_store = open(&fence_cfg);
+        let fence_context = create_context(&fence_store);
+        append_sparse_projection_stream(&fence_store, fence_context, "in-flight", 300);
+        drop(fence_store);
+        let forgotten = Rc::new(RefCell::new(None));
+        let forgotten_in_flight = forgotten.clone();
+        pause_projection_unit_before_commit(paused_unit, move |store| {
+            let receipt = store
+                .forget_event_history(ForgetSelection::Session {
+                    context_id: fence_context,
+                    connector_id: CONNECTOR.into(),
+                    session_ref: "one-large-session".into(),
+                })
+                .expect("forget the session while a unit is in flight");
+            *forgotten_in_flight.borrow_mut() = Some(receipt.events);
+        });
+        match run(&fence_cfg, fence_context, &embedder, 256, OBSERVED_LEASE_MS) {
+            Err(CgError::Engine(reason)) => assert!(
+                reason.starts_with("event-search claim refused:"),
+                "unit {paused_unit} is refused with the stale claim: {reason}"
+            ),
+            other => panic!("unit {paused_unit} must be fenced after forget: {other:?}"),
+        }
+        assert_eq!(
+            *forgotten.borrow(),
+            Some(300),
+            "the forget ran inside unit {paused_unit}"
+        );
+        let fenced = take_projection_unit_receipts();
+        assert_eq!(
+            fenced.iter().filter(|row| row.durable).count(),
+            paused_unit as usize - 1,
+            "only the units before the paused one committed: {fenced:?}"
+        );
+        assert!(
+            fenced
+                .last()
+                .is_some_and(|row| !row.durable && row.frontier_after == "refused"),
+            "the paused unit's commit was refused: {fenced:?}"
+        );
+        let fence_store = open(&fence_cfg);
+        let params = HashMap::from([("context_id".into(), Value::Uuid(fence_context.as_uuid()))]);
+        for table in [
+            "event_search_fold_progress",
+            "event_search_capture_manifest",
+            "event_search_source_events",
+            "event_search_generations",
+        ] {
+            assert!(
+                fence_store
+                    .execute_sql_for_test(
+                        &format!("SELECT context_id FROM {table} WHERE context_id = $context_id"),
+                        &params,
+                    )
+                    .unwrap()
+                    .rows
+                    .is_empty(),
+                "the refused unit {paused_unit} left nothing in {table}"
+            );
+        }
+        drop(fence_store);
+    }
+}
+
+const CG090_INTERPRETATION: &str = "cg090-released-v1";
+
+fn cg090_released() -> context_graph::ReleasedInterpretationDeclaration {
+    context_graph::ReleasedInterpretationDeclaration {
+        connector_id: CONNECTOR.into(),
+        target_interpretation_version: CG090_INTERPRETATION.into(),
+        target_adapter_version: "correctness-v1".into(),
+        target_anchor_declaration_version: "correctness-v1".into(),
+        accepted_source_declarations: vec![context_graph::EventDeclarationVersion {
+            adapter_version: "correctness-v1".into(),
+            anchor_declaration_version: "correctness-v1".into(),
+        }],
+        mapping_contract_id: "cg090-interpretation-contract".into(),
+        mapping_contract_sha256: "cg090-interpretation-contract-v1".into(),
+    }
+}
+
+/// Keeps every captured field and gives each event one interpreted anchor, so every captured event
+/// has an interpretation member and an effective value the capture must read.
+struct Cg090Mapper(context_graph::ReleasedInterpretationDeclaration);
+
+impl context_graph::ReleasedConnectorInterpretation for Cg090Mapper {
+    fn declaration(&self) -> &context_graph::ReleasedInterpretationDeclaration {
+        &self.0
+    }
+
+    fn interpret_event(
+        &self,
+        captured: &context_graph::ConversationEvent,
+    ) -> Result<context_graph::EffectiveEventFields> {
+        Ok(context_graph::EffectiveEventFields {
+            occurred_at: captured.occurred_at,
+            author: captured.author.clone(),
+            kind: captured.kind.clone(),
+            render_role: captured.render_role,
+            interaction_ref: captured.interaction_ref.clone(),
+            text: captured.text.clone(),
+            payload: captured.payload.clone(),
+            anchors: json!([{
+                "key": "file",
+                "canonical_value": "src/interpreted.rs",
+                "original_value": "src/interpreted.rs"
+            }]),
+            coverage: captured.coverage,
+        })
+    }
+}
+
+struct Cg090Contract(context_graph::ReleasedInterpretationDeclaration);
+
+impl context_graph::InstalledInterpretationContract for Cg090Contract {
+    fn declaration(&self) -> &context_graph::ReleasedInterpretationDeclaration {
+        &self.0
+    }
+
+    fn validate(
+        &self,
+        _captured: &context_graph::CapturedEventAndAnchors,
+        _candidate: &context_graph::EffectiveEventFields,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// CG-090: a capture unit's receipt charges every statement the unit runs, including the two
+/// interpretation reads per interpreted event and the commit transaction's fence reads and member
+/// writes, and still fits the fixed per-unit allowance. The same 120 events are captured twice, in 64-event units,
+/// once plainly and once through a released interpretation; the interpreted capture pages must be
+/// charged at least the two extra reads per event on top of the plain ones.
+#[test]
+fn interpreted_capture_units_charge_every_statement_within_the_allowance() {
+    std::thread::spawn(engine_meter);
+    let embedder = ControlledEmbedder::new();
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(root.path().join("cg090-interpreted.db"));
+    let store = open(&cfg);
+    let context = create_context(&store);
+    append_sparse_projection_stream(&store, context, "interpreted", 120);
+    drop(store);
+    take_projection_unit_receipts();
+    run_until_projection_completes(&cfg, context, &embedder, 64);
+    let plain = take_projection_unit_receipts();
+    assert_projection_receipt_bounds(&plain);
+
+    let mapper: Arc<dyn context_graph::ReleasedConnectorInterpretation> =
+        Arc::new(Cg090Mapper(cg090_released()));
+    let contract: Arc<dyn context_graph::InstalledInterpretationContract> =
+        Arc::new(Cg090Contract(cg090_released()));
+    let interpretation = context_graph::ConnectorInterpretationRunner::build(
+        context_graph::InterpretationBuildRequest {
+            store: cfg.clone(),
+            context_id: context,
+            connector_id: CONNECTOR.into(),
+            target_interpretation_version: CG090_INTERPRETATION.into(),
+            mapper,
+            contract,
+            max_events_per_batch: NonZeroU32::new(64).unwrap(),
+            max_bytes_per_batch: NonZeroUsize::new(4 * 1024 * 1024).unwrap(),
+            lease_duration_ms: NonZeroU64::new(OBSERVED_LEASE_MS).unwrap(),
+        },
+    )
+    .expect("build the released interpretation over all 120 events");
+    take_projection_unit_receipts();
+    let store = open(&cfg);
+    store
+        .rebuild_event_search(EventSearchRebuildRequest {
+            context_id: context,
+            interpretation_generation_id: Some(interpretation.generation_id),
+            embedder: embedder.registration(),
+            profile: profile(),
+            embedding_workers: NonZeroUsize::MIN,
+            max_events_per_batch: NonZeroU32::new(64).unwrap(),
+            max_passages_per_batch: NonZeroU32::new(16).unwrap(),
+            max_bytes_per_batch: NonZeroUsize::new(32_768).unwrap(),
+            lease_duration_ms: NonZeroU64::new(OBSERVED_LEASE_MS).unwrap(),
+        })
+        .expect("stage the interpreted search generation");
+    drop(store);
+    let interpreted = take_projection_unit_receipts();
+    assert_projection_receipt_bounds(&interpreted);
+
+    // The capture pages: durable capture units that returned events (manifest units return one
+    // stream row, membership pages return no events).
+    let pages = |receipts: &[context_graph::test_support::ProjectionUnitReceipt]| {
+        receipts
+            .iter()
+            .filter(|row| {
+                row.durable && row.fold == ProjectionFold::Capture && row.returned_rows > 1
+            })
+            .map(|row| (row.returned_rows, row.examined_entries))
+            .collect::<Vec<_>>()
+    };
+    let plain_pages = pages(&plain);
+    let interpreted_pages = pages(&interpreted);
+    assert!(
+        !interpreted_pages.is_empty() && interpreted_pages.len() == plain_pages.len(),
+        "both captures read the same pages: {plain_pages:?} vs {interpreted_pages:?}"
+    );
+    for ((plain_rows, plain_examined), (rows, examined)) in
+        plain_pages.iter().zip(&interpreted_pages)
+    {
+        assert_eq!(plain_rows, rows, "the same events per page");
+        assert!(
+            *examined >= plain_examined + 2 * rows,
+            "an interpreted page is charged its two interpretation reads per event: \
+             {examined} vs plain {plain_examined} over {rows} events"
+        );
+    }
 }
