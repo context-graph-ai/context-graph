@@ -70,6 +70,8 @@ pub use self::event_correlation::{
     observe_public_store_resolver_for_test,
 };
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub use self::event_search_projection::EventSearchGenerationVerification;
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 #[doc(hidden)]
 pub use self::event_search_projection::pause_next_event_search_finalization_for_test;
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
@@ -85,7 +87,7 @@ pub use self::event_search_projection::{
     event_search_discovery_observations_for_test, event_search_store_opens_for_test,
     fail_next_event_search_membership_capture_for_test,
     fail_next_event_search_membership_capture_with_error_for_test,
-    take_event_search_membership_captures_for_test,
+    advance_bound_interpretation_stamp_for_test, take_event_search_membership_captures_for_test,
 };
 // The read door holds a declaration to the persisted table too, and must decide that the same way
 // this door does: one conversion from declared text to the store's own scope vocabulary.

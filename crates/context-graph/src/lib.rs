@@ -67,7 +67,8 @@ pub use store::{
 pub use store::{
     EventHistoryContextStatus, EventHistoryInterpretationHead, EventHistoryMemoryCounts,
     EventHistorySearchState, EventHistorySearchStatus, EventHistoryStatusSet,
-    EventSourcePrefixCheck, EventSourceStreamStatus, ForgetReceipt, ForgetSelection,
+    EventSourcePrefixCheck, EventSourceStreamStatus,
+    ForgetReceipt, ForgetSelection,
     ForgetTableCount, RetiredInterpretation, event_history_reader_declaration,
 };
 pub use types::*;
@@ -121,8 +122,11 @@ pub mod test_support {
         before_next_event_search_failure_record_for_test,
         fail_next_event_search_membership_capture_for_test,
         fail_next_event_search_membership_capture_with_error_for_test,
-        take_event_search_membership_captures_for_test,
+        advance_bound_interpretation_stamp_for_test, take_event_search_membership_captures_for_test,
     };
+
+    /// The explicit full verification of a search generation's membership chain.
+    pub use crate::store::EventSearchGenerationVerification;
 
     /// Consumer-side row and cursor work performed by each pending-stream discovery pass.
     pub use crate::store::{

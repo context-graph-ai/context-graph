@@ -349,6 +349,47 @@ pub fn take_event_search_membership_captures_for_test() -> usize {
     MEMBERSHIP_CAPTURES.with(|count| count.replace(0))
 }
 
+/// Move the connector's active, ready interpretation generation forward by one ordinal while it
+/// stays a completely sealed ready input (`event_count`, `capture_ordinal` and `build_ordinal`
+/// advance together) and no event is appended: the stamp a search generation was certified
+/// against no longer describes it, while the Context's event revision and the interpretation
+/// binding are unchanged. The product's own builds seal a new generation instead; this fixture
+/// isolates the stamp half of completion's reuse check.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn advance_bound_interpretation_stamp_for_test(
+    store: &Store,
+    context_id: crate::ContextId,
+    connector_id: &str,
+) -> Result<()> {
+    let params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("connector_id".into(), Value::Text(connector_id.into())),
+    ]);
+    let head = store
+        .internal_db()
+        .execute(
+            "SELECT generation_id FROM event_interpretation_heads WHERE context_id = $context_id AND connector_id = $connector_id",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+    let row = head
+        .rows
+        .first()
+        .ok_or_else(|| CgError::Engine("the connector has no active interpretation".into()))?;
+    let id = get_uuid(row, &head.columns, "generation_id")?;
+    let mut params = params;
+    params.insert("id".into(), Value::Uuid(id));
+    store
+        .internal_db()
+        .execute(
+            "UPDATE event_interpretation_generations SET event_count = event_count + 1, capture_ordinal = capture_ordinal + 1, build_ordinal = build_ordinal + 1 WHERE context_id = $context_id AND connector_id = $connector_id AND id = $id AND state = 'ready'",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+    Ok(())
+}
+
 /// Run one rendezvous immediately before the next matching-attempt failure write.
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 #[doc(hidden)]
@@ -545,6 +586,7 @@ struct Generation {
     ordered_source_set_sha256: String,
     source_content_sha256: String,
     target: SourceSnapshot,
+    certified: Option<CaptureCertificate>,
     started_at: TxId,
     attempt_tx: Option<TxId>,
     attempt_token: Option<uuid::Uuid>,
@@ -575,6 +617,15 @@ struct SourceSnapshot {
     event_count: u64,
     ordered_source_set_sha256: String,
     source_content_sha256: String,
+}
+
+/// The Context revision and interpretation stamp a membership capture was certified against.
+/// Completion reuses the capture while both are unchanged, and refuses to finalize past a
+/// revision the capture never saw.
+#[derive(Clone, Debug, PartialEq)]
+struct CaptureCertificate {
+    revision: TxId,
+    stamp: JsonValue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1653,6 +1704,68 @@ impl Store {
     }
 }
 
+/// The full membership verification of one event-search generation.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSearchGenerationVerification {
+    pub member_count: u64,
+    pub ordered_source_set_sha256: String,
+    pub source_content_sha256: String,
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+impl Store {
+    /// Recompute a generation's membership chain from every persisted member's fields, refuse any
+    /// member whose stored chain value differs, and refuse a generation whose carried digests or
+    /// capture ordinal differ from the recomputed chain. Ordinary capture never runs this full walk;
+    /// every full capture runs the same fold. Test support only: the Store's public surface is
+    /// pinned (tests/acceptance/nomic_loads.rs).
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    pub fn verify_event_search_generation(
+        &self,
+        context_id: crate::ContextId,
+        generation_id: uuid::Uuid,
+    ) -> Result<EventSearchGenerationVerification> {
+        let generation_id = EventSearchGenerationId::from(generation_id);
+        let bounds = bounds(1024, 1024, usize::MAX, 60_000);
+        let folded = fold_source_membership(self, context_id, generation_id, bounds)?;
+        let generation = query_rows(
+            self,
+            bounds,
+            "SELECT capture_ordinal, capture_ordered_sha256, capture_content_sha256 FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("id".into(), Value::Uuid(generation_id.as_uuid())),
+            ]),
+        )?;
+        let row = generation.rows.first().ok_or(CgError::NotFound {
+            id: Some(generation_id.as_uuid().to_string()),
+            missing: Some("event-search generation"),
+        })?;
+        let capture_ordinal = get_u64(row, &generation.columns, "capture_ordinal")?;
+        let carried = MembershipChain::carried(
+            get_text(row, &generation.columns, "capture_ordered_sha256")?,
+            get_text(row, &generation.columns, "capture_content_sha256")?,
+            capture_ordinal,
+        );
+        let recomputed = MembershipChain {
+            ordered: folded.ordered_source_set_sha256.clone(),
+            content: folded.source_content_sha256.clone(),
+        };
+        if capture_ordinal != folded.event_count || carried.as_ref() != Some(&recomputed) {
+            return Err(CgError::Engine(format!(
+                "{MEMBERSHIP_CHAIN_CORRUPT}generation {} carries digests or a capture ordinal that differ from its members",
+                generation_id.as_uuid()
+            )));
+        }
+        Ok(EventSearchGenerationVerification {
+            member_count: folded.event_count,
+            ordered_source_set_sha256: folded.ordered_source_set_sha256,
+            source_content_sha256: folded.source_content_sha256,
+        })
+    }
+}
+
 fn bounds(events: u32, passages: u32, bytes: usize, lease_ms: u64) -> Bounds {
     let ceiling = crate::owner_control::context_graph_read_limits();
     Bounds {
@@ -2087,6 +2200,26 @@ pub(crate) fn mark_captured_stream_pending_in_tx(
             &event.session_ref,
             true,
         )?;
+        if target == UNASSIGNED_SEARCH_GENERATION {
+            continue;
+        }
+        // The capture mark names this append, so a capture that read the stream before it commits
+        // cannot clear the mark and leave these events uncaptured.
+        store
+            .internal_db()
+            .execute_in_tx(
+                tx,
+                "UPDATE event_search_pending_streams SET capture_open = true, capture_pending_tx = $tx WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+                &HashMap::from([
+                    ("tx".into(), Value::TxId(tx)),
+                    ("context_id".into(), Value::Uuid(event.context_id.as_uuid())),
+                    ("generation_id".into(), Value::Uuid(target)),
+                    ("connector".into(), Value::Text(event.connector_id.clone())),
+                    ("source".into(), Value::Text(event.source_instance_ref.clone())),
+                    ("session".into(), Value::Text(event.session_ref.clone())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
     }
     Ok(())
 }
@@ -3452,7 +3585,7 @@ fn ensure_generation(
         existing.attempt_tx = Some(projection_attempt.tx);
         existing.attempt_token = Some(projection_attempt.token);
         *attempt = Some(projection_attempt);
-        let captured =
+        let (captured, certified) =
             capture_source_membership(store, context_id, &bindings, Some(existing.id), bounds)?;
         if was_capturing {
             finalize_capture_attempt(store, context_id, existing.id, &captured)?;
@@ -3461,6 +3594,7 @@ fn ensure_generation(
             existing.source_content_sha256 = captured.source_content_sha256.clone();
         }
         existing.target = captured;
+        existing.certified = certified;
         return Ok(existing);
     }
 
@@ -3476,7 +3610,8 @@ fn ensure_generation(
         profile,
     )?;
     *attempt = Some(projection_attempt);
-    let captured = capture_source_membership(store, context_id, &bindings, Some(id), bounds)?;
+    let (captured, certified) =
+        capture_source_membership(store, context_id, &bindings, Some(id), bounds)?;
     finalize_capture_attempt(store, context_id, id, &captured)?;
     Ok(Generation {
         id,
@@ -3487,6 +3622,7 @@ fn ensure_generation(
         ordered_source_set_sha256: captured.ordered_source_set_sha256.clone(),
         source_content_sha256: captured.source_content_sha256.clone(),
         target: captured,
+        certified,
         started_at,
         attempt_tx: Some(projection_attempt.tx),
         attempt_token: Some(projection_attempt.token),
@@ -3899,6 +4035,7 @@ fn current_ready_head(
                 ordered_source_set_sha256,
                 source_content_sha256,
             },
+            certified: None,
             started_at: get_txid(row, &result.columns, "started_at")?,
             attempt_tx: None,
             attempt_token: None,
@@ -3980,6 +4117,7 @@ fn incomplete_generation(
                 ordered_source_set_sha256,
                 source_content_sha256,
             },
+            certified: None,
             started_at: get_txid(row, &result.columns, "started_at")?,
             attempt_tx: None,
             attempt_token: None,
@@ -4182,7 +4320,7 @@ fn capture_source_membership(
     bindings: &BTreeMap<String, InterpretationBinding>,
     generation_id: Option<EventSearchGenerationId>,
     bounds: Bounds,
-) -> Result<SourceSnapshot> {
+) -> Result<(SourceSnapshot, Option<CaptureCertificate>)> {
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     {
         MEMBERSHIP_CAPTURES.with(|count| count.set(count.get() + 1));
@@ -4191,125 +4329,106 @@ fn capture_source_membership(
             return Err(reason);
         }
     }
-    let mut next_ordinal = generation_id
-        .map(|generation_id| {
-            generation_capture_high_water(store, context_id, generation_id, bounds)
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let starting_events = captured_event_counts(store, &[context_id])?
-        .get(&context_id)
-        .map_or(0, |counts| counts.captured);
-    let mut count = 0_u64;
-    let mut ordered = Sha256::new();
-    ordered.update(b"context-graph/event-search-ordered-source-set/v1");
-    let mut content = Sha256::new();
-    content.update(b"context-graph/event-search-source-content/v1");
-    let captured = (|| -> Result<()> {
-        let mut after: Option<(String, String, u64)> = None;
-        loop {
-            // Materialize one configured event batch before decoding or persisting any member.
-            // Membership work can take much longer than the engine's read-statement lifetime.
-            let mut params =
-                HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
-            let continuation = if let Some((connector, source, seq)) = &after {
-                params.insert("after_connector".into(), Value::Text(connector.clone()));
-                params.insert("after_source".into(), Value::Text(source.clone()));
-                params.insert("after_seq".into(), integer(*seq, "capture sequence")?);
-                " AND (connector_id > $after_connector OR (connector_id = $after_connector AND source_instance_ref > $after_source) OR (connector_id = $after_connector AND source_instance_ref = $after_source AND seq > $after_seq))"
-            } else {
-                ""
-            };
-            let page = query_rows(
-                store,
-                bounds,
-                &format!(
-                    "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id{continuation} ORDER BY connector_id ASC, source_instance_ref ASC, seq ASC LIMIT {}",
-                    bounds.events.max(1)
-                ),
-                &params,
-            )?;
-            #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
-            AFTER_MEMBERSHIP_READ_PAGE.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().take() {
-                    hook();
-                }
-            });
-            let Some(last) = page.rows.last() else { break };
-            after = Some((
-                get_text(last, &page.columns, "connector_id")?,
-                get_text(last, &page.columns, "source_instance_ref")?,
-                get_u64(last, &page.columns, "seq")?,
-            ));
-            let page_len = page.rows.len();
-            capture_search_page(
-                store,
-                context_id,
-                bindings,
-                generation_id,
-                bounds,
-                &page.columns,
-                &page.rows,
-                &mut count,
-                &mut next_ordinal,
-                &mut ordered,
-                &mut content,
-            )?;
-            if page_len < bounds.events.max(1) {
-                break;
-            }
-        }
-        Ok(())
-    })();
-    captured?;
-    let current_events = captured_event_counts(store, &[context_id])?
-        .get(&context_id)
-        .map_or(0, |counts| counts.captured);
-    if current_events != starting_events {
-        return Err(stale_claim(
-            "captured events changed while event-search membership was paged",
-        ));
-    }
-    let observed = SourceSnapshot {
-        event_count: count,
-        ordered_source_set_sha256: finish_hash(ordered),
-        source_content_sha256: finish_hash(content),
+    let Some(generation_id) = generation_id else {
+        return Ok((observe_source_membership(store, context_id, bindings, bounds)?, None));
     };
-    if let Some(generation_id) = generation_id {
-        let persisted = fold_source_membership(store, context_id, generation_id, bounds)?;
-        let capture_high_water =
-            generation_capture_high_water(store, context_id, generation_id, bounds)?;
-        if persisted.event_count != observed.event_count
-            || capture_high_water != persisted.event_count
-        {
-            return Err(stale_claim(
-                "event-search persisted membership differs from the fixed source snapshot",
-            ));
-        }
-        Ok(persisted)
-    } else {
-        Ok(observed)
-    }
+    let (snapshot, certificate) =
+        match capture_incremental_membership(store, context_id, bindings, generation_id, bounds)? {
+            Some(captured) => captured,
+            None => capture_full_membership(store, context_id, bindings, generation_id, bounds)?,
+        };
+    Ok((snapshot, Some(certificate)))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn capture_search_page(
+/// Which bound interpretation versions a generation's retained members were last verified
+/// against: per connector, the ready interpretation generation and its capture/build progress, or
+/// null for the captured base. This is mutable verification progress, kept apart from the binding
+/// identity that decides reuse and rebuild.
+fn current_interpretation_stamp(
     store: &Store,
     context_id: crate::ContextId,
     bindings: &BTreeMap<String, InterpretationBinding>,
-    generation_id: Option<EventSearchGenerationId>,
+    bounds: Bounds,
+) -> Result<JsonValue> {
+    let mut stamp = JsonMap::new();
+    for (connector, binding) in bindings {
+        let value = match binding.generation_id() {
+            None => JsonValue::Null,
+            Some(id) => {
+                let result = query_rows(
+                    store,
+                    bounds,
+                    "SELECT capture_ordinal, build_ordinal FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
+                    &HashMap::from([
+                        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                        ("id".into(), Value::Uuid(id.as_uuid())),
+                    ]),
+                )?;
+                let row = result
+                    .rows
+                    .first()
+                    .ok_or_else(|| stale_claim("bound interpretation generation disappeared"))?;
+                json!({
+                    "generation_id": id.to_string(),
+                    "capture_ordinal": get_u64(row, &result.columns, "capture_ordinal")?,
+                    "build_ordinal": get_u64(row, &result.columns, "build_ordinal")?,
+                })
+            }
+        };
+        stamp.insert(connector.clone(), value);
+    }
+    Ok(canonicalize_json(&JsonValue::Object(stamp)))
+}
+
+fn read_event_context_revision(
+    store: &Store,
+    context_id: crate::ContextId,
+    bounds: Bounds,
+) -> Result<TxId> {
+    let result = query_rows(
+        store,
+        bounds,
+        "SELECT revision_tx FROM event_context_revisions WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )?;
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| stale_claim("event Context revision disappeared before capture"))?;
+    get_txid(row, &result.columns, "revision_tx")
+}
+
+fn count_rows(
+    store: &Store,
+    bounds: Bounds,
+    sql: &str,
+    params: &HashMap<String, Value>,
+) -> Result<u64> {
+    let result = query_rows(store, bounds, sql, params)?;
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| CgError::Engine("event-search count returned no row".into()))?;
+    get_u64(row, &result.columns, "n")
+}
+
+/// Members of one page of events, decoded and resolved against the bindings, with successive
+/// ordinals from `first_ordinal`. Nothing is persisted here.
+fn claimed_members_from_rows(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
     bounds: Bounds,
     columns: &[String],
     rows: &[Vec<Value>],
-    count: &mut u64,
-    next_ordinal: &mut u64,
-    ordered: &mut Sha256,
-    content: &mut Sha256,
-) -> Result<()> {
+    first_ordinal: u64,
+) -> Result<Vec<ClaimedEvent>> {
     let session = store
         .internal_db()
         .read_session(read_limits(store, bounds))
         .map_err(map_engine_err)?;
+    let mut members = Vec::with_capacity(rows.len());
+    let mut ordinal = first_ordinal;
     for row in rows {
         let raw = captured_raw_from_row(&session, bounds, context_id, columns, row)?;
         let captured_sha256 = captured_source_sha256(
@@ -4320,54 +4439,708 @@ fn capture_search_page(
         );
         let (event, effective_generation_id, effective_sha256) =
             effective_captured_event(&session, bindings, raw.event, &captured_sha256)?;
-        let candidate = ClaimedEvent {
+        members.push(ClaimedEvent {
             membership_id: uuid::Uuid::now_v7(),
-            ordinal: generation_id.map_or(*count, |_| *next_ordinal),
+            ordinal,
             event,
             effective_interpretation_generation_id: effective_generation_id,
             captured_source_sha256: captured_sha256,
             effective_source_sha256: effective_sha256,
+        });
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| CgError::Engine("event-search capture ordinal exhausted u64".into()))?;
+    }
+    Ok(members)
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn after_membership_read_page() {
+    AFTER_MEMBERSHIP_READ_PAGE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+fn after_membership_read_page() {}
+
+/// Extend a generation's membership with only the events appended since its last capture.
+///
+/// Changed source streams come from the capture marks append leaves on
+/// `event_search_pending_streams`, paged in `(connector_id, source_instance_ref)` order; within a
+/// stream, new events are those past the stream's captured maximum sequence, in sequence order.
+/// That is exactly the order today's full walk gives newly encountered events, so ordinals and
+/// chained digests equal a full capture's from the same persisted prefix.
+///
+/// Returns `None` whenever the incremental path cannot certify the result — a generation still in
+/// its first capture, interpretation progress not yet verified, a carried digest that disagrees with
+/// the last member, or a count that does not reconcile — and the caller then runs the full verifying
+/// capture. A Context revision that moved during the run is stale, exactly as for the full walk.
+fn capture_incremental_membership(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    generation_id: EventSearchGenerationId,
+    bounds: Bounds,
+) -> Result<Option<(SourceSnapshot, CaptureCertificate)>> {
+    let generation_params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+    ]);
+    let generation = query_rows(
+        store,
+        bounds,
+        "SELECT capture_ordinal, state, capture_ordered_sha256, capture_content_sha256, interpretation_verified_stamp FROM event_search_generations WHERE context_id = $context_id AND id = $generation_id",
+        &generation_params,
+    )?;
+    let row = generation
+        .rows
+        .first()
+        .ok_or_else(|| stale_claim("event-search capture generation disappeared"))?;
+    if get_text(row, &generation.columns, "state")? == "capturing" {
+        return Ok(None);
+    }
+    let verified = match row.get(column_index(&generation.columns, "interpretation_verified_stamp")?) {
+        Some(Value::Json(value)) => canonicalize_json(value),
+        _ => return Ok(None),
+    };
+    let stamp = current_interpretation_stamp(store, context_id, bindings, bounds)?;
+    if verified != stamp {
+        return Ok(None);
+    }
+    let revision = read_event_context_revision(store, context_id, bounds)?;
+    let capture_ordinal = get_u64(row, &generation.columns, "capture_ordinal")?;
+    let Some(mut chain) = MembershipChain::carried(
+        get_text(row, &generation.columns, "capture_ordered_sha256")?,
+        get_text(row, &generation.columns, "capture_content_sha256")?,
+        capture_ordinal,
+    ) else {
+        return Ok(None);
+    };
+    if capture_ordinal > 0 {
+        let last = query_rows(
+            store,
+            bounds,
+            "SELECT ordinal, ordered_after, content_after FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY ordinal DESC LIMIT 1",
+            &generation_params,
+        )?;
+        let Some(last) = last.rows.first().map(|row| (row, &last.columns)) else {
+            return Ok(None);
         };
-        let member = if let Some(generation_id) = generation_id {
-            let member = reuse_or_persist_search_membership(
+        if get_u64(last.0, last.1, "ordinal")?.checked_add(1) != Some(capture_ordinal)
+            || get_text(last.0, last.1, "ordered_after")? != chain.ordered
+            || get_text(last.0, last.1, "content_after")? != chain.content
+        {
+            // The carried digest disagrees with the last member: never extend it. The full
+            // verifier recomputes the chain from member fields and refuses a corrupted member.
+            return Ok(None);
+        }
+    }
+    let mut next_ordinal = capture_ordinal;
+    let page_limit = bounds.events.max(1);
+    let mut after: Option<(String, String, String)> = None;
+    let mut last_stream: Option<(String, String)> = None;
+    loop {
+        let mut params = generation_params.clone();
+        let continuation = if let Some((connector, source, session)) = &after {
+            params.insert("after_connector".into(), Value::Text(connector.clone()));
+            params.insert("after_source".into(), Value::Text(source.clone()));
+            params.insert("after_session".into(), Value::Text(session.clone()));
+            " AND (connector_id > $after_connector OR (connector_id = $after_connector AND source_instance_ref > $after_source) OR (connector_id = $after_connector AND source_instance_ref = $after_source AND session_ref > $after_session))"
+        } else {
+            ""
+        };
+        let marks = query_rows(
+            store,
+            bounds,
+            &format!(
+                "SELECT connector_id, source_instance_ref, session_ref, capture_pending_tx FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND capture_open = true{continuation} ORDER BY connector_id ASC, source_instance_ref ASC, session_ref ASC LIMIT {page_limit}"
+            ),
+            &params,
+        )?;
+        let Some(last_mark) = marks.rows.last() else { break };
+        after = Some((
+            get_text(last_mark, &marks.columns, "connector_id")?,
+            get_text(last_mark, &marks.columns, "source_instance_ref")?,
+            get_text(last_mark, &marks.columns, "session_ref")?,
+        ));
+        for mark in &marks.rows {
+            let connector = get_text(mark, &marks.columns, "connector_id")?;
+            let source = get_text(mark, &marks.columns, "source_instance_ref")?;
+            let session = get_text(mark, &marks.columns, "session_ref")?;
+            let marked_at = match mark.get(column_index(&marks.columns, "capture_pending_tx")?) {
+                Some(Value::TxId(tx)) => Some(*tx),
+                _ => None,
+            };
+            // A stream's marks (one per session) are adjacent; capture the stream once.
+            let stream = (connector.clone(), source.clone());
+            if last_stream.as_ref() != Some(&stream) {
+                let Some(captured) = capture_stream_increment(
+                    store,
+                    context_id,
+                    bindings,
+                    generation_id,
+                    bounds,
+                    &connector,
+                    &source,
+                    next_ordinal,
+                    &chain,
+                )?
+                else {
+                    return Ok(None);
+                };
+                (next_ordinal, chain) = captured;
+                last_stream = Some(stream);
+            }
+            if !close_capture_mark(
                 store,
                 context_id,
                 generation_id,
-                &candidate,
-                bounds,
-            )?;
-            *next_ordinal =
-                (*next_ordinal).max(member.ordinal.checked_add(1).ok_or_else(|| {
-                    CgError::Engine("event-search capture ordinal exhausted u64".into())
-                })?);
-            member
-        } else {
-            candidate
-        };
-        if generation_id.is_none() {
-            hash_part(ordered, &member.ordinal.to_be_bytes());
-            hash_part(ordered, member.event.id.as_uuid().as_bytes());
-            hash_part(ordered, member.event.connector_id.as_bytes());
-            hash_part(ordered, member.event.source_instance_ref.as_bytes());
-            hash_part(ordered, member.event.session_ref.as_bytes());
-            hash_part(ordered, &member.event.seq.to_be_bytes());
-            hash_part(ordered, member.captured_source_sha256.as_bytes());
-            hash_part(content, member.effective_source_sha256.as_bytes());
+                &connector,
+                &source,
+                &session,
+                marked_at,
+            )? {
+                // An append to this stream landed after its events were read. The committed
+                // pages stay; the retried run resumes past them.
+                return Err(stale_claim(
+                    "captured events changed while event-search membership was paged",
+                ));
+            }
         }
-        *count = count
-            .checked_add(1)
-            .ok_or_else(|| CgError::Engine("event-search source count exhausted u64".into()))?;
+        if marks.rows.len() < page_limit {
+            break;
+        }
     }
-    Ok(())
+    if !certify_capture(store, context_id, generation_id, revision, &stamp, next_ordinal)? {
+        return Ok(None);
+    }
+    Ok(Some((
+        chain.membership_source_snapshot(next_ordinal),
+        CaptureCertificate { revision, stamp },
+    )))
 }
 
-fn reuse_or_persist_search_membership(
+/// Capture one source stream's events past its captured maximum, in sequence order, and check the
+/// stream's member count against its event count. `None` means the counts do not reconcile.
+#[allow(clippy::too_many_arguments)]
+fn capture_stream_increment(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    generation_id: EventSearchGenerationId,
+    bounds: Bounds,
+    connector: &str,
+    source: &str,
+    mut next_ordinal: u64,
+    chain: &MembershipChain,
+) -> Result<Option<(u64, MembershipChain)>> {
+    let stream_params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+        ("connector_id".into(), Value::Text(connector.into())),
+        ("source".into(), Value::Text(source.into())),
+    ]);
+    let maximum = query_rows(
+        store,
+        bounds,
+        "SELECT source_sequence FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source ORDER BY source_sequence DESC LIMIT 1",
+        &stream_params,
+    )?;
+    let mut after_sequence = match maximum.rows.first() {
+        Some(row) => get_u64(row, &maximum.columns, "source_sequence")?,
+        None => 0,
+    };
+    let mut chain = chain.clone();
+    let page_limit = bounds.events.max(1);
+    loop {
+        let mut params = stream_params.clone();
+        params.insert("after_seq".into(), integer(after_sequence, "capture sequence")?);
+        let page = query_rows(
+            store,
+            bounds,
+            &format!(
+                "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source AND seq > $after_seq ORDER BY seq ASC LIMIT {page_limit}"
+            ),
+            &params,
+        )?;
+        after_membership_read_page();
+        let Some(last) = page.rows.last() else { break };
+        after_sequence = get_u64(last, &page.columns, "seq")?;
+        let members = claimed_members_from_rows(
+            store,
+            context_id,
+            bindings,
+            bounds,
+            &page.columns,
+            &page.rows,
+            next_ordinal,
+        )?;
+        chain = persist_search_member_page(store, context_id, generation_id, &members, &chain)?;
+        next_ordinal = next_ordinal
+            .checked_add(members.len() as u64)
+            .ok_or_else(|| CgError::Engine("event-search capture ordinal exhausted u64".into()))?;
+        if page.rows.len() < page_limit {
+            break;
+        }
+    }
+    let events = count_rows(
+        store,
+        bounds,
+        "SELECT COUNT(*) AS n FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source",
+        &stream_params,
+    )?;
+    let members = count_rows(
+        store,
+        bounds,
+        "SELECT COUNT(*) AS n FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source",
+        &stream_params,
+    )?;
+    if events != members {
+        return Ok(None);
+    }
+    Ok(Some((next_ordinal, chain)))
+}
+
+/// Clear one capture mark, only if no append rewrote it since it was read. Returns whether the mark
+/// was cleared.
+fn close_capture_mark(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    connector: &str,
+    source: &str,
+    session: &str,
+    marked_at: Option<TxId>,
+) -> Result<bool> {
+    let tx = store.begin_tx()?;
+    let result = (|| -> Result<bool> {
+        let params = HashMap::from([
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+            ("connector".into(), Value::Text(connector.into())),
+            ("source".into(), Value::Text(source.into())),
+            ("session".into(), Value::Text(session.into())),
+        ]);
+        let current = store
+            .internal_db()
+            .execute_in_tx(
+                tx,
+                "SELECT capture_open, capture_pending_tx FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let Some(row) = current.rows.first() else {
+            return Ok(false);
+        };
+        let now = match row.get(column_index(&current.columns, "capture_pending_tx")?) {
+            Some(Value::TxId(tx)) => Some(*tx),
+            _ => None,
+        };
+        if !get_bool(row, &current.columns, "capture_open")? || now != marked_at {
+            return Ok(false);
+        }
+        let updated = store
+            .internal_db()
+            .execute_in_tx(
+                tx,
+                "UPDATE event_search_pending_streams SET capture_open = false, capture_pending_tx = NULL WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        Ok(updated.rows_affected == 1)
+    })();
+    match result {
+        Ok(true) => {
+            store.internal_db().commit(tx).map_err(map_engine_err)?;
+            Ok(true)
+        }
+        Ok(false) => {
+            let _ = store.internal_db().rollback(tx);
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            Err(error)
+        }
+    }
+}
+
+/// Certify a capture at the Context revision it was discovered at, and only then publish the
+/// interpretation stamp its retained members were verified against. The transaction guards that
+/// exact revision, reconciles the generation's member count with the Context's event count, and
+/// guards every bound interpretation generation at the stamped progress. `false` means the counts
+/// do not reconcile; a moved revision or interpretation is stale.
+fn certify_capture(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    revision: TxId,
+    stamp: &JsonValue,
+    capture_ordinal: u64,
+) -> Result<bool> {
+    let tx = store.begin_tx()?;
+    let result = (|| -> Result<bool> {
+        let context = Value::Uuid(context_id.as_uuid());
+        if !store
+            .internal_db()
+            .guard_row_conditions_in_tx(
+                tx,
+                "event_context_revisions",
+                "context_id",
+                &context,
+                &[("revision_tx".into(), Value::TxId(revision))],
+            )
+            .map_err(map_engine_err)?
+        {
+            return Err(stale_claim(
+                "captured events changed while event-search membership was paged",
+            ));
+        }
+        let params = HashMap::from([
+            ("context_id".into(), context.clone()),
+            ("id".into(), Value::Uuid(generation_id.as_uuid())),
+        ]);
+        let generation = store
+            .internal_db()
+            .execute_in_tx(
+                tx,
+                "SELECT capture_ordinal FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let row = generation
+            .rows
+            .first()
+            .ok_or_else(|| stale_claim("event-search capture generation disappeared"))?;
+        if get_u64(row, &generation.columns, "capture_ordinal")? != capture_ordinal
+            || !store
+                .internal_db()
+                .guard_row_conditions_in_tx(
+                    tx,
+                    "event_search_generations",
+                    "id",
+                    &Value::Uuid(generation_id.as_uuid()),
+                    &[(
+                        "capture_ordinal".into(),
+                        integer(capture_ordinal, "capture ordinal")?,
+                    )],
+                )
+                .map_err(map_engine_err)?
+        {
+            return Err(stale_claim(
+                "event-search generation changed before capture certification",
+            ));
+        }
+        let events = store
+            .internal_db()
+            .execute_in_tx(
+                tx,
+                "SELECT COUNT(*) AS n FROM events WHERE context_id = $context_id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let events = events
+            .rows
+            .first()
+            .map(|row| get_u64(row, &events.columns, "n"))
+            .transpose()?
+            .unwrap_or(0);
+        if events != capture_ordinal {
+            return Ok(false);
+        }
+        if let JsonValue::Object(bound) = stamp {
+            for value in bound.values() {
+                let JsonValue::Object(entry) = value else { continue };
+                let id = entry
+                    .get("generation_id")
+                    .and_then(JsonValue::as_str)
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    .ok_or_else(|| CgError::Engine("interpretation stamp lacks its generation".into()))?;
+                let ordinal = |name: &str| -> Result<Value> {
+                    entry
+                        .get(name)
+                        .and_then(JsonValue::as_u64)
+                        .ok_or_else(|| CgError::Engine(format!("interpretation stamp lacks {name}")))
+                        .and_then(|value| integer(value, name))
+                };
+                if !store
+                    .internal_db()
+                    .guard_row_conditions_in_tx(
+                        tx,
+                        "event_interpretation_generations",
+                        "id",
+                        &Value::Uuid(id),
+                        &[
+                            ("capture_ordinal".into(), ordinal("capture_ordinal")?),
+                            ("build_ordinal".into(), ordinal("build_ordinal")?),
+                        ],
+                    )
+                    .map_err(map_engine_err)?
+                {
+                    return Err(stale_claim(
+                        "bound interpretation advanced before capture certification",
+                    ));
+                }
+            }
+        }
+        let mut update = params;
+        update.insert("stamp".into(), Value::Json(stamp.clone()));
+        store
+            .internal_db()
+            .execute_in_tx(
+                tx,
+                "UPDATE event_search_generations SET interpretation_verified_stamp = $stamp WHERE context_id = $context_id AND id = $id",
+                &update,
+            )
+            .map_err(map_engine_err)?;
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => {
+            store.internal_db().commit(tx).map_err(map_engine_err)?;
+            Ok(true)
+        }
+        Ok(false) => {
+            let _ = store.internal_db().rollback(tx);
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            Err(error)
+        }
+    }
+}
+
+/// The full verifying capture: fold and verify every persisted member's chain, re-read every event
+/// of the Context in `(connector_id, source_instance_ref, seq)` order, re-verify each retained
+/// member against it, append the new ones in that order, then certify and publish the stamp. This is
+/// the path for a generation's first capture, interpretation progress not yet verified, a carried
+/// digest that disagrees with its members, and a count that did not reconcile.
+fn capture_full_membership(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    generation_id: EventSearchGenerationId,
+    bounds: Bounds,
+) -> Result<(SourceSnapshot, CaptureCertificate)> {
+    let revision = read_event_context_revision(store, context_id, bounds)?;
+    let stamp = current_interpretation_stamp(store, context_id, bindings, bounds)?;
+    let persisted = fold_source_membership(store, context_id, generation_id, bounds)?;
+    let mut next_ordinal = generation_capture_high_water(store, context_id, generation_id, bounds)?;
+    if persisted.event_count != next_ordinal {
+        return Err(stale_claim(
+            "event-search persisted membership differs from its capture ordinal",
+        ));
+    }
+    let mut chain = MembershipChain {
+        ordered: persisted.ordered_source_set_sha256,
+        content: persisted.source_content_sha256,
+    };
+    reseal_generation_chain(store, context_id, generation_id, next_ordinal, &chain)?;
+    let starting_events = captured_event_counts(store, &[context_id])?
+        .get(&context_id)
+        .map_or(0, |counts| counts.captured);
+    let mut count = 0_u64;
+    let mut after: Option<(String, String, u64)> = None;
+    loop {
+        // Materialize one configured event batch before decoding or persisting any member.
+        // Membership work can take much longer than the engine's read-statement lifetime.
+        let mut params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+        let continuation = if let Some((connector, source, seq)) = &after {
+            params.insert("after_connector".into(), Value::Text(connector.clone()));
+            params.insert("after_source".into(), Value::Text(source.clone()));
+            params.insert("after_seq".into(), integer(*seq, "capture sequence")?);
+            " AND (connector_id > $after_connector OR (connector_id = $after_connector AND source_instance_ref > $after_source) OR (connector_id = $after_connector AND source_instance_ref = $after_source AND seq > $after_seq))"
+        } else {
+            ""
+        };
+        let page = query_rows(
+            store,
+            bounds,
+            &format!(
+                "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id{continuation} ORDER BY connector_id ASC, source_instance_ref ASC, seq ASC LIMIT {}",
+                bounds.events.max(1)
+            ),
+            &params,
+        )?;
+        after_membership_read_page();
+        let Some(last) = page.rows.last() else { break };
+        after = Some((
+            get_text(last, &page.columns, "connector_id")?,
+            get_text(last, &page.columns, "source_instance_ref")?,
+            get_u64(last, &page.columns, "seq")?,
+        ));
+        let candidates = claimed_members_from_rows(
+            store,
+            context_id,
+            bindings,
+            bounds,
+            &page.columns,
+            &page.rows,
+            0,
+        )?;
+        let mut appended = Vec::new();
+        for mut candidate in candidates {
+            if retained_search_membership(store, context_id, generation_id, &candidate, bounds)?
+                .is_none()
+            {
+                candidate.ordinal = next_ordinal
+                    .checked_add(appended.len() as u64)
+                    .ok_or_else(|| {
+                        CgError::Engine("event-search capture ordinal exhausted u64".into())
+                    })?;
+                appended.push(candidate);
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| CgError::Engine("event-search source count exhausted u64".into()))?;
+        }
+        chain = persist_search_member_page(store, context_id, generation_id, &appended, &chain)?;
+        next_ordinal += appended.len() as u64;
+        if page.rows.len() < bounds.events.max(1) {
+            break;
+        }
+    }
+    let current_events = captured_event_counts(store, &[context_id])?
+        .get(&context_id)
+        .map_or(0, |counts| counts.captured);
+    if current_events != starting_events || count != next_ordinal {
+        return Err(stale_claim(
+            "captured events changed while event-search membership was paged",
+        ));
+    }
+    if !certify_capture(store, context_id, generation_id, revision, &stamp, next_ordinal)? {
+        return Err(stale_claim(
+            "event-search persisted membership differs from the fixed source snapshot",
+        ));
+    }
+    Ok((
+        chain.membership_source_snapshot(next_ordinal),
+        CaptureCertificate { revision, stamp },
+    ))
+}
+
+/// Make the generation's carried digests equal the chain just verified from its members. Guarded on
+/// the capture ordinal the fold saw; a no-op when they already agree.
+fn reseal_generation_chain(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    capture_ordinal: u64,
+    chain: &MembershipChain,
+) -> Result<()> {
+    let tx = store.begin_tx()?;
+    let result = (|| -> Result<()> {
+        if !store
+            .internal_db()
+            .guard_row_conditions_in_tx(
+                tx,
+                "event_search_generations",
+                "id",
+                &Value::Uuid(generation_id.as_uuid()),
+                &[(
+                    "capture_ordinal".into(),
+                    integer(capture_ordinal, "capture ordinal")?,
+                )],
+            )
+            .map_err(map_engine_err)?
+        {
+            return Err(stale_claim(
+                "event-search generation changed before its chain was resealed",
+            ));
+        }
+        store
+            .internal_db()
+            .execute_in_tx(
+                tx,
+                "UPDATE event_search_generations SET capture_ordered_sha256 = $ordered, capture_content_sha256 = $content WHERE context_id = $context_id AND id = $id",
+                &HashMap::from([
+                    ("ordered".into(), Value::Text(chain.ordered.clone())),
+                    ("content".into(), Value::Text(chain.content.clone())),
+                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                    ("id".into(), Value::Uuid(generation_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => store.internal_db().commit(tx).map_err(map_engine_err),
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            Err(error)
+        }
+    }
+}
+
+/// The membership a capture would assign with no generation to persist into: every event in walk
+/// order, ordinals from zero.
+fn observe_source_membership(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    bounds: Bounds,
+) -> Result<SourceSnapshot> {
+    let mut count = 0_u64;
+    let mut chain = MembershipChain::start();
+    let mut after: Option<(String, String, u64)> = None;
+    loop {
+        let mut params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+        let continuation = if let Some((connector, source, seq)) = &after {
+            params.insert("after_connector".into(), Value::Text(connector.clone()));
+            params.insert("after_source".into(), Value::Text(source.clone()));
+            params.insert("after_seq".into(), integer(*seq, "capture sequence")?);
+            " AND (connector_id > $after_connector OR (connector_id = $after_connector AND source_instance_ref > $after_source) OR (connector_id = $after_connector AND source_instance_ref = $after_source AND seq > $after_seq))"
+        } else {
+            ""
+        };
+        let page = query_rows(
+            store,
+            bounds,
+            &format!(
+                "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id{continuation} ORDER BY connector_id ASC, source_instance_ref ASC, seq ASC LIMIT {}",
+                bounds.events.max(1)
+            ),
+            &params,
+        )?;
+        after_membership_read_page();
+        let Some(last) = page.rows.last() else { break };
+        after = Some((
+            get_text(last, &page.columns, "connector_id")?,
+            get_text(last, &page.columns, "source_instance_ref")?,
+            get_u64(last, &page.columns, "seq")?,
+        ));
+        for member in claimed_members_from_rows(
+            store,
+            context_id,
+            bindings,
+            bounds,
+            &page.columns,
+            &page.rows,
+            count,
+        )? {
+            chain = chain.extend(&member);
+            count += 1;
+        }
+        if page.rows.len() < bounds.events.max(1) {
+            break;
+        }
+    }
+    Ok(chain.membership_source_snapshot(count))
+}
+
+/// The member already persisted for this event in the generation, verified field by field against
+/// the event just re-read, or `None` when the event is not yet a member.
+fn retained_search_membership(
     store: &Store,
     context_id: crate::ContextId,
     generation_id: EventSearchGenerationId,
     member: &ClaimedEvent,
     bounds: Bounds,
-) -> Result<ClaimedEvent> {
+) -> Result<Option<ClaimedEvent>> {
     let result = query_rows(
         store,
         bounds,
@@ -4407,10 +5180,9 @@ fn reuse_or_persist_search_membership(
         let mut retained = member.clone();
         retained.membership_id = get_uuid(row, &result.columns, "membership_id")?;
         retained.ordinal = get_u64(row, &result.columns, "ordinal")?;
-        return Ok(retained);
+        return Ok(Some(retained));
     }
-    persist_search_membership(store, context_id, generation_id, member)?;
-    Ok(member.clone())
+    Ok(None)
 }
 
 fn generation_capture_high_water(
@@ -4442,6 +5214,99 @@ fn generation_capture_high_water(
     get_u64(row, &result.columns, "capture_ordinal")
 }
 
+const ORDERED_SOURCE_SET_DOMAIN: &[u8] = b"context-graph/event-search-ordered-source-set/v1";
+const SOURCE_CONTENT_DOMAIN: &[u8] = b"context-graph/event-search-source-content/v1";
+/// Prefix of every refusal for persisted membership whose stored chain does not match its fields.
+const MEMBERSHIP_CHAIN_CORRUPT: &str = "event-search membership chain is corrupted: ";
+
+/// The generation's two membership digests as per-member chains. Each member's value commits to
+/// its predecessor's, so a capture extends the stored value with only the members it appends, and a
+/// fold over the persisted members in ordinal order reproduces it exactly. The value depends only on
+/// the ordered member list, never on how capture runs were split. An empty membership hashes the
+/// bare domain, as before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MembershipChain {
+    ordered: String,
+    content: String,
+}
+
+impl MembershipChain {
+    fn start() -> Self {
+        let mut ordered = Sha256::new();
+        ordered.update(ORDERED_SOURCE_SET_DOMAIN);
+        let mut content = Sha256::new();
+        content.update(SOURCE_CONTENT_DOMAIN);
+        Self {
+            ordered: finish_hash(ordered),
+            content: finish_hash(content),
+        }
+    }
+
+    /// The carried value of a generation row; an untouched generation carries empty text.
+    fn carried(ordered: String, content: String, capture_ordinal: u64) -> Option<Self> {
+        if ordered.is_empty() && content.is_empty() {
+            return (capture_ordinal == 0).then(Self::start);
+        }
+        Some(Self { ordered, content })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extend_parts(
+        &self,
+        ordinal: u64,
+        event_id: uuid::Uuid,
+        connector_id: &str,
+        source_instance_ref: &str,
+        session_ref: &str,
+        source_sequence: u64,
+        captured_source_sha256: &str,
+        effective_source_sha256: &str,
+    ) -> Self {
+        let mut ordered = Sha256::new();
+        ordered.update(ORDERED_SOURCE_SET_DOMAIN);
+        hash_part(&mut ordered, self.ordered.as_bytes());
+        hash_part(&mut ordered, &ordinal.to_be_bytes());
+        hash_part(&mut ordered, event_id.as_bytes());
+        hash_part(&mut ordered, connector_id.as_bytes());
+        hash_part(&mut ordered, source_instance_ref.as_bytes());
+        hash_part(&mut ordered, session_ref.as_bytes());
+        hash_part(&mut ordered, &source_sequence.to_be_bytes());
+        hash_part(&mut ordered, captured_source_sha256.as_bytes());
+        let mut content = Sha256::new();
+        content.update(SOURCE_CONTENT_DOMAIN);
+        hash_part(&mut content, self.content.as_bytes());
+        hash_part(&mut content, effective_source_sha256.as_bytes());
+        Self {
+            ordered: finish_hash(ordered),
+            content: finish_hash(content),
+        }
+    }
+
+    fn extend(&self, member: &ClaimedEvent) -> Self {
+        self.extend_parts(
+            member.ordinal,
+            member.event.id.as_uuid(),
+            &member.event.connector_id,
+            &member.event.source_instance_ref,
+            &member.event.session_ref,
+            member.event.seq,
+            &member.captured_source_sha256,
+            &member.effective_source_sha256,
+        )
+    }
+
+    fn membership_source_snapshot(&self, event_count: u64) -> SourceSnapshot {
+        SourceSnapshot {
+            event_count,
+            ordered_source_set_sha256: self.ordered.clone(),
+            source_content_sha256: self.content.clone(),
+        }
+    }
+}
+
+/// Recompute the membership chain from every persisted member's fields in ordinal order and refuse
+/// any member whose stored chain value differs. This is the full verifier: it runs on every full
+/// capture and on explicit verification, never on the ordinary incremental path.
 fn fold_source_membership(
     store: &Store,
     context_id: crate::ContextId,
@@ -4449,15 +5314,12 @@ fn fold_source_membership(
     bounds: Bounds,
 ) -> Result<SourceSnapshot> {
     let mut count = 0_u64;
-    let mut ordered = Sha256::new();
-    ordered.update(b"context-graph/event-search-ordered-source-set/v1");
-    let mut content = Sha256::new();
-    content.update(b"context-graph/event-search-source-content/v1");
+    let mut chain = MembershipChain::start();
     stream_rows(
         store,
         bounds,
         &format!(
-            "SELECT {SOURCE_MEMBER_COLUMNS} FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY ordinal ASC"
+            "SELECT {SOURCE_MEMBER_COLUMNS}, ordered_after, content_after FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY ordinal ASC"
         ),
         &HashMap::from([
             ("context_id".into(), Value::Uuid(context_id.as_uuid())),
@@ -4470,43 +5332,31 @@ fn fold_source_membership(
                     "event-search persisted membership has an ordinal gap",
                 ));
             }
-            hash_part(&mut ordered, &ordinal.to_be_bytes());
-            hash_part(&mut ordered, get_uuid(row, columns, "event_id")?.as_bytes());
-            hash_part(
-                &mut ordered,
-                get_text(row, columns, "connector_id")?.as_bytes(),
+            chain = chain.extend_parts(
+                ordinal,
+                get_uuid(row, columns, "event_id")?,
+                &get_text(row, columns, "connector_id")?,
+                &get_text(row, columns, "source_instance_ref")?,
+                &get_text(row, columns, "session_ref")?,
+                get_u64(row, columns, "source_sequence")?,
+                &get_text(row, columns, "captured_source_sha256")?,
+                &get_text(row, columns, "effective_source_sha256")?,
             );
-            hash_part(
-                &mut ordered,
-                get_text(row, columns, "source_instance_ref")?.as_bytes(),
-            );
-            hash_part(
-                &mut ordered,
-                get_text(row, columns, "session_ref")?.as_bytes(),
-            );
-            hash_part(
-                &mut ordered,
-                &get_u64(row, columns, "source_sequence")?.to_be_bytes(),
-            );
-            hash_part(
-                &mut ordered,
-                get_text(row, columns, "captured_source_sha256")?.as_bytes(),
-            );
-            hash_part(
-                &mut content,
-                get_text(row, columns, "effective_source_sha256")?.as_bytes(),
-            );
+            if get_text(row, columns, "ordered_after")? != chain.ordered
+                || get_text(row, columns, "content_after")? != chain.content
+            {
+                return Err(CgError::Engine(format!(
+                    "{MEMBERSHIP_CHAIN_CORRUPT}member {ordinal} of generation {} does not match its stored chain value",
+                    generation_id.as_uuid()
+                )));
+            }
             count = count
                 .checked_add(1)
                 .ok_or_else(|| CgError::Engine("event-search source count exhausted u64".into()))?;
             Ok(())
         },
     )?;
-    Ok(SourceSnapshot {
-        event_count: count,
-        ordered_source_set_sha256: finish_hash(ordered),
-        source_content_sha256: finish_hash(content),
-    })
+    Ok(chain.membership_source_snapshot(count))
 }
 
 fn captured_raw_from_row(
@@ -4674,19 +5524,26 @@ fn effective_source_hash(
     ]))
 }
 
-fn persist_search_membership(
+/// Append one page of new members, their chain values, the generation's capture ordinal and its
+/// carried digests in one transaction. The generation is guarded on its ordinal, state and carried
+/// digests, so a page applies only on top of exactly the chain it extends.
+fn persist_search_member_page(
     store: &Store,
     context_id: crate::ContextId,
     generation_id: EventSearchGenerationId,
-    member: &ClaimedEvent,
-) -> Result<()> {
+    members: &[ClaimedEvent],
+    before: &MembershipChain,
+) -> Result<MembershipChain> {
+    let Some(first) = members.first() else {
+        return Ok(before.clone());
+    };
     let tx = store.begin_tx()?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<MembershipChain> {
         let generation = store
             .internal_db()
             .execute_in_tx(
                 tx,
-                "SELECT context_id, capture_ordinal, state FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+                "SELECT context_id, capture_ordinal, state, capture_ordered_sha256, capture_content_sha256 FROM event_search_generations WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([
                     ("context_id".into(), Value::Uuid(context_id.as_uuid())),
                     ("id".into(), Value::Uuid(generation_id.as_uuid())),
@@ -4698,8 +5555,15 @@ fn persist_search_membership(
             .first()
             .ok_or_else(|| stale_claim("event-search capture attempt disappeared"))?;
         let state = get_text(row, &generation.columns, "state")?;
+        let capture_ordinal = get_u64(row, &generation.columns, "capture_ordinal")?;
+        let carried = MembershipChain::carried(
+            get_text(row, &generation.columns, "capture_ordered_sha256")?,
+            get_text(row, &generation.columns, "capture_content_sha256")?,
+            capture_ordinal,
+        );
         if generation.rows.len() != 1
-            || get_u64(row, &generation.columns, "capture_ordinal")? != member.ordinal
+            || capture_ordinal != first.ordinal
+            || carried.as_ref() != Some(before)
             || (state != "capturing" && state != "building" && state != "ready")
         {
             return Err(stale_claim(
@@ -4727,7 +5591,13 @@ fn persist_search_membership(
         let generation_guard = exact_conditions(
             row,
             &generation.columns,
-            &["context_id", "capture_ordinal", "state"],
+            &[
+                "context_id",
+                "capture_ordinal",
+                "state",
+                "capture_ordered_sha256",
+                "capture_content_sha256",
+            ],
         )?;
         if !store
             .internal_db()
@@ -4744,78 +5614,90 @@ fn persist_search_membership(
                 "event-search generation changed during membership append",
             ));
         }
+        let mut chain = before.clone();
+        let mut expected = first.ordinal;
+        for member in members {
+            if member.ordinal != expected {
+                return Err(CgError::Engine(
+                    "event-search membership page is not contiguous".into(),
+                ));
+            }
+            chain = chain.extend(member);
+            store
+                .internal_db()
+                .execute_in_tx(
+                    tx,
+                    "INSERT INTO event_search_source_events (membership_id, context_id, generation_id, ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, effective_interpretation_generation_id, captured_source_sha256, effective_source_sha256, ordered_after, content_after) VALUES ($membership_id, $context_id, $generation_id, $ordinal, $event_id, $connector_id, $source, $session, $sequence, $effective_generation_id, $captured_sha256, $effective_sha256, $ordered_after, $content_after)",
+                    &HashMap::from([
+                        ("membership_id".into(), Value::Uuid(member.membership_id)),
+                        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                        ("ordinal".into(), integer(member.ordinal, "capture ordinal")?),
+                        ("event_id".into(), Value::Uuid(member.event.id.as_uuid())),
+                        ("connector_id".into(), Value::Text(member.event.connector_id.clone())),
+                        ("source".into(), Value::Text(member.event.source_instance_ref.clone())),
+                        ("session".into(), Value::Text(member.event.session_ref.clone())),
+                        ("sequence".into(), integer(member.event.seq, "source sequence")?),
+                        (
+                            "effective_generation_id".into(),
+                            member
+                                .effective_interpretation_generation_id
+                                .map(|id| Value::Uuid(id.as_uuid()))
+                                .unwrap_or(Value::Null),
+                        ),
+                        (
+                            "captured_sha256".into(),
+                            Value::Text(member.captured_source_sha256.clone()),
+                        ),
+                        (
+                            "effective_sha256".into(),
+                            Value::Text(member.effective_source_sha256.clone()),
+                        ),
+                        ("ordered_after".into(), Value::Text(chain.ordered.clone())),
+                        ("content_after".into(), Value::Text(chain.content.clone())),
+                    ]),
+                )
+                .map_err(map_engine_err)?;
+            update_generation_session_capture_in_tx(store, tx, context_id, generation_id, member)?;
+            ensure_generation_cursor_in_tx(
+                store,
+                tx,
+                context_id,
+                generation_id,
+                &member.event.connector_id,
+                &member.event.source_instance_ref,
+                &member.event.session_ref,
+            )?;
+            expected = expected.checked_add(1).ok_or_else(|| {
+                CgError::Engine("event-search capture ordinal exhausted u64".into())
+            })?;
+        }
         store
             .internal_db()
             .execute_in_tx(
                 tx,
-                "INSERT INTO event_search_source_events (membership_id, context_id, generation_id, ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, effective_interpretation_generation_id, captured_source_sha256, effective_source_sha256) VALUES ($membership_id, $context_id, $generation_id, $ordinal, $event_id, $connector_id, $source, $session, $sequence, $effective_generation_id, $captured_sha256, $effective_sha256)",
+                "UPDATE event_search_generations SET capture_ordinal = $next_ordinal, capture_ordered_sha256 = $ordered, capture_content_sha256 = $content WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([
-                    ("membership_id".into(), Value::Uuid(member.membership_id)),
-                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                    ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
-                    ("ordinal".into(), integer(member.ordinal, "capture ordinal")?),
-                    ("event_id".into(), Value::Uuid(member.event.id.as_uuid())),
-                    ("connector_id".into(), Value::Text(member.event.connector_id.clone())),
-                    ("source".into(), Value::Text(member.event.source_instance_ref.clone())),
-                    ("session".into(), Value::Text(member.event.session_ref.clone())),
-                    ("sequence".into(), integer(member.event.seq, "source sequence")?),
-                    (
-                        "effective_generation_id".into(),
-                        member
-                            .effective_interpretation_generation_id
-                            .map(|id| Value::Uuid(id.as_uuid()))
-                            .unwrap_or(Value::Null),
-                    ),
-                    (
-                        "captured_sha256".into(),
-                        Value::Text(member.captured_source_sha256.clone()),
-                    ),
-                    (
-                        "effective_sha256".into(),
-                        Value::Text(member.effective_source_sha256.clone()),
-                    ),
-                ]),
-            )
-            .map_err(map_engine_err)?;
-        update_generation_session_capture_in_tx(store, tx, context_id, generation_id, member)?;
-        ensure_generation_cursor_in_tx(
-            store,
-            tx,
-            context_id,
-            generation_id,
-            &member.event.connector_id,
-            &member.event.source_instance_ref,
-            &member.event.session_ref,
-        )?;
-        store
-            .internal_db()
-            .execute_in_tx(
-                tx,
-                "UPDATE event_search_generations SET capture_ordinal = $next_ordinal WHERE context_id = $context_id AND id = $id",
-                &HashMap::from([
-                    (
-                        "next_ordinal".into(),
-                        integer(
-                            member.ordinal.checked_add(1).ok_or_else(|| {
-                                CgError::Engine(
-                                    "event-search capture ordinal exhausted u64".into(),
-                                )
-                            })?,
-                            "capture ordinal",
-                        )?,
-                    ),
+                    ("next_ordinal".into(), integer(expected, "capture ordinal")?),
+                    ("ordered".into(), Value::Text(chain.ordered.clone())),
+                    ("content".into(), Value::Text(chain.content.clone())),
                     ("context_id".into(), Value::Uuid(context_id.as_uuid())),
                     ("id".into(), Value::Uuid(generation_id.as_uuid())),
                 ]),
             )
             .map_err(map_engine_err)?;
-        Ok(())
+        Ok(chain)
     })();
-    if let Err(error) = result {
-        let _ = store.internal_db().rollback(tx);
-        return Err(error);
+    match result {
+        Ok(chain) => {
+            store.internal_db().commit(tx).map_err(map_engine_err)?;
+            Ok(chain)
+        }
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            Err(error)
+        }
     }
-    store.internal_db().commit(tx).map_err(map_engine_err)
 }
 
 fn update_generation_session_capture_in_tx(
@@ -7567,18 +8449,35 @@ fn finish_or_continue(
     if hash_json(&snapshot_json(&bindings)) != generation.snapshot_sha256 {
         return Ok(FinishResult::Rebuild);
     }
-    let target = measured(&mut observations.event_read, || {
-        capture_source_membership(
-            store,
-            generation.context_id,
-            &bindings,
-            Some(generation.id),
-            bounds,
-        )
-    })?;
+    // The run's certified capture still describes the Context when neither its event revision nor
+    // the bound interpretations moved; anything else captures again. Completion re-checks the
+    // revision under its own guard.
+    let unchanged = match &generation.certified {
+        Some(certificate) => {
+            read_event_context_revision(store, generation.context_id, bounds)?
+                == certificate.revision
+                && current_interpretation_stamp(store, generation.context_id, &bindings, bounds)?
+                    == certificate.stamp
+        }
+        None => false,
+    };
+    let (target, certified) = if unchanged {
+        (generation.target.clone(), generation.certified.clone())
+    } else {
+        measured(&mut observations.event_read, || {
+            capture_source_membership(
+                store,
+                generation.context_id,
+                &bindings,
+                Some(generation.id),
+                bounds,
+            )
+        })?
+    };
     let mut next = generation.clone();
     next.bindings = bindings;
     next.target = target;
+    next.certified = certified;
     if next.target != generation.target {
         return Ok(FinishResult::Continue(Box::new(next)));
     }
@@ -7708,6 +8607,16 @@ fn finish_stable(
             return Err(error);
         }
     };
+    // Never finalize past a revision the certified capture did not see: the next pass captures
+    // the newer events first.
+    if generation
+        .certified
+        .as_ref()
+        .is_some_and(|certificate| certificate.revision != event_revision)
+    {
+        let _ = store.internal_db().rollback(tx);
+        return Ok(None);
+    }
     let live_count = store
         .internal_db()
         .execute_in_tx(
@@ -8996,6 +9905,7 @@ mod bounded_preparation_tests {
                     ordered_source_set_sha256: String::new(),
                     source_content_sha256: String::new(),
                 },
+                certified: None,
                 started_at: TxId(1),
                 attempt_tx: None,
                 attempt_token: None,
