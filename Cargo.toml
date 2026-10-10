@@ -44,11 +44,11 @@ candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
 criterion = { version = "0.8", features = ["html_reports"] }
-contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
-contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
-contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
-contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
-contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
+contextdb-core = { path = "../contextdb-bs-composer-sol-01/crates/contextdb-core" }
+contextdb-engine = { path = "../contextdb-bs-composer-sol-01/crates/contextdb-engine" }
+contextdb-parser = { path = "../contextdb-bs-composer-sol-01/crates/contextdb-parser" }
+contextdb-tx = { path = "../contextdb-bs-composer-sol-01/crates/contextdb-tx" }
+contextdb-vector = { path = "../contextdb-bs-composer-sol-01/crates/contextdb-vector" }
 safetensors = "0.7.0"
 sha2 = { version = "0.10.9", features = ["compress"] }
 tempfile = "3.23.0"
