@@ -352,6 +352,12 @@ independently for your shell. Nothing is downloaded.
 A projection that fails after capture leaves every captured event durable and also returns
 `captured_search_behind`.<!-- enforced by: `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight`, `cg_import_search_wait_embedding_failure_returns_durable_capture_receipt_and_typed_behind_status`, `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
 
+An import is complete when its selected passages have durable maintained graph coverage and
+can be searched with the required recall. A default-triggered index replacement can remain
+queued after completion. It is pending maintenance, survives restart, and resumes in finite
+maintenance batches while imports and reads continue. Completion does not wait for that
+replacement to land; failed maintenance still fails the import.<!-- enforced by: `passage_completion_keeps_durable_search_while_replacement_is_pending` -->
+
 An import's `search.covered_events` and `search.pending_events` describe the requested projection:
 its renderer, passage profile, embedding space, encoding profile and current interpretation.
 Coverage from a different projection is excluded. Committed replacement progress can reach zero
@@ -441,6 +447,13 @@ rendered batch. Exhaustion preserves the typed refusal.<!-- enforced by: `a_real
 Continuation reloads only the unfinished passage's text members; a long metadata-only suffix
 adds no replay payload. Worker count preserves passage order, text, vectors and source spans.
 <!-- enforced by: `open_tail_loads_only_text_members_across_a_long_metadata_suffix`, `missing_or_mismatched_open_tail_member_ids_are_refused_before_embedding`, `serial_and_concurrent_runs_commit_identical_passages_vectors_order_and_coverage` -->
+
+Appending a new session preserves the completed passage digest prefix across writable reopens.
+Completing its generation digest examines only the new passages.<!-- enforced by: `appending_a_session_folds_only_new_passages_at_n_and_four_n_history` -->
+The standalone runner carries only owned vector tail working memory between its physical opens.
+It validates that tail against each reopened writer and releases every Store before inference,
+so another writer can still commit between batches.
+<!-- enforced by: `projection_retries_real_writer_at_claim_renewal_and_commit_without_reembedding` -->
 
 ### Passage configuration
 

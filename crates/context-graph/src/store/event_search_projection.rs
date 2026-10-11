@@ -55,6 +55,44 @@ fn open_for_run(
     )
 }
 
+fn open_for_run_with_vector_session(
+    config: &crate::StoreConfig,
+    embedder: &crate::EmbedderRegistration,
+    session: &std::sync::Arc<contextdb_engine::WriterVectorSession>,
+) -> Result<Store> {
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
+    super::open_retry::retry(
+        &config.db_path,
+        super::open_retry::Contention::Writer,
+        || {
+            Store::open_with_projection_vector_session(
+                config.clone(),
+                vec![embedder.clone()],
+                session.clone(),
+            )
+        },
+    )
+}
+
+fn carry_projection_vector_tail(
+    store: &Store,
+    generation: &Generation,
+    session: &contextdb_engine::WriterVectorSession,
+) {
+    let partition = contextdb_engine::VectorPartitionRef::new(
+        contextdb_core::VectorIndexRef::new("event_search_passages", "vector_text"),
+        contextdb_core::VectorPartitionKey::from_values(&[
+            Value::Uuid(generation.context_id.as_uuid()),
+            Value::Uuid(generation.id.as_uuid()),
+        ])
+        .expect("UUID partition components"),
+    );
+    store
+        .internal_db()
+        .detach_writer_vector_session(session, &partition);
+}
+
 /// Admission shared by every projection door that has selected an event-search registration.
 /// Capability support stays a typed embedder condition; a supported embedder's finite ceiling is
 /// then checked without normalizing the caller's profile.
@@ -1260,6 +1298,7 @@ fn catch_up_standalone_run(
     mut resolve_selected_limit: Option<&mut SelectedBatchLimitResolver<'_>>,
     observations: &mut RunObservations,
 ) -> Result<EventSearchBuildReceipt> {
+    let vector_session = std::sync::Arc::new(contextdb_engine::WriterVectorSession::default());
     let context_ids = request.contexts.context_ids();
     if context_ids.len() != 1 {
         return Err(CgError::Engine(
@@ -1281,7 +1320,8 @@ fn catch_up_standalone_run(
         Some(resolve) => resolve(None)?.memory_limit_bytes,
         None => resolve_write_memory_limit(&|_| Ok(true))?,
     };
-    let store = open_for_run(&request.store, &request.embedder)?;
+    let store =
+        open_for_run_with_vector_session(&request.store, &request.embedder, &vector_session)?;
     let mut generation = measured(&mut observations.event_read, || {
         ensure_generation(
             &store,
@@ -1309,7 +1349,11 @@ fn catch_up_standalone_run(
     loop {
         let mut store = match open.take() {
             Some(store) => store,
-            None => open_for_run(&request.store, &request.embedder)?,
+            None => open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?,
         };
         let mut pending = measured(&mut observations.event_read, || {
             first_pending_stream(&store, &generation, &session_work, bounds)
@@ -1349,9 +1393,14 @@ fn catch_up_standalone_run(
             resolve_write_memory_limit(&|_| Ok(true))?
         };
         if limit != request.store.write_memory_limit_bytes {
+            carry_projection_vector_tail(&store, &generation, &vector_session);
             drop(store);
             request.store.write_memory_limit_bytes = limit;
-            store = open_for_run(&request.store, &request.embedder)?;
+            store = open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?;
         }
         #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
         if let Some(pending) = &pending {
@@ -1427,6 +1476,7 @@ fn catch_up_standalone_run(
                 FinishResult::Rebuild => unreachable!("rebuild handled while Store was open"),
             }
         };
+        carry_projection_vector_tail(&store, &generation, &vector_session);
         drop(store);
         let embedding_workers = resolve_embedding_workers();
 
@@ -1438,8 +1488,18 @@ fn catch_up_standalone_run(
             if !renewal_due(expires_at, bounds)? {
                 return Ok(expires_at);
             }
-            let store = open_for_run(&request.store, &request.embedder)?;
-            renew_claim(&store, &held, expires_at, bounds)
+            let store = open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?;
+            let result = renew_claim(&store, &held, expires_at, bounds);
+            if result.is_ok() {
+                carry_projection_vector_tail(&store, &generation, &vector_session);
+            } else {
+                vector_session.clear();
+            }
+            result
         };
         let rendered = render_and_embed(
             *claim,
@@ -1454,7 +1514,11 @@ fn catch_up_standalone_run(
             Ok(Rendered::Batch(built)) => *built,
             Ok(Rendered::OverPassageBound { fitting_events }) => {
                 // Nothing was embedded: let the claim go and take the events that fit.
-                let store = open_for_run(&request.store, &request.embedder)?;
+                let store = open_for_run_with_vector_session(
+                    &request.store,
+                    &request.embedder,
+                    &vector_session,
+                )?;
                 release_claim_in(&store, &held);
                 event_limit = fitting_events;
                 open = Some(store);
@@ -1463,6 +1527,7 @@ fn catch_up_standalone_run(
             Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
                 release_claim_presence(&request.store.db_path, &held.owner_token);
                 // The claim was taken over while this run embedded; nothing is left to release.
+                vector_session.clear();
                 retries += 1;
                 continue;
             }
@@ -1472,7 +1537,11 @@ fn catch_up_standalone_run(
             }
         };
         let rendered_passages = built.passages.len();
-        let store = match open_for_run(&request.store, &request.embedder) {
+        let store = match open_for_run_with_vector_session(
+            &request.store,
+            &request.embedder,
+            &vector_session,
+        ) {
             Ok(store) => store,
             Err(error) => {
                 release_claim(&request.store, &request.embedder, &held);
@@ -1492,6 +1561,7 @@ fn catch_up_standalone_run(
             // a real takeover remains untouched because the exact delete no longer matches.
             if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) {
                 try_release_claim_in(&store, &held)?;
+                vector_session.clear();
                 retries += 1;
                 open = Some(store);
                 continue;
@@ -1727,31 +1797,37 @@ fn run_with_store(
     })
 }
 
-/// Leave every passage vector partition with a complete maintained graph before a projection
-/// reports ready. ContextDB builds and repairs vector graphs only through maintenance, never inside
-/// a write or a query, and persists them with the store; so a find after this, including the first
-/// find of a fresh process, searches a built graph instead of falling back to exact work or refusing
-/// for want of one. Each maintenance cycle builds every partition still missing its graph; a cycle
-/// that builds nothing while partitions remain is reported rather than retried.
+/// Publish durable graph coverage for every completed passage. The finite
+/// maintenance scheduler owns queued replacement work after import readiness.
 fn maintain_passage_vectors(store: &Store) -> Result<()> {
     loop {
+        let before = store
+            .db
+            .persist_import_vector_tails()
+            .map_err(map_engine_err)?;
         let vector = store
             .db
             .run_maintenance_cycle()
             .map_err(map_engine_err)?
             .vector;
-        if vector.remaining_partitions == 0 {
-            return Ok(());
-        }
         if let Some(failure) = vector.first_failure {
             return Err(CgError::Engine(format!(
                 "the search index for {} passage partitions could not be built: {failure:?}",
                 vector.remaining_partitions
             )));
         }
-        if vector.built_partitions == 0 {
+        // A replacement can publish during this finite wake. Validate and
+        // cover that committed catalog before reporting the import ready.
+        let after = store
+            .db
+            .persist_import_vector_tails()
+            .map_err(map_engine_err)?;
+        if after || vector.remaining_partitions == 0 {
+            return Ok(());
+        }
+        if before && vector.built_partitions == 0 {
             return Err(CgError::Engine(format!(
-                "the search index for {} passage partitions was not built by maintenance",
+                "durable passage graph coverage was lost while maintenance remained queued for {} partitions",
                 vector.remaining_partitions
             )));
         }
@@ -9259,6 +9335,16 @@ fn commit_batch_in_tx(
             ("id".into(), Value::Uuid(claim.generation.id.as_uuid())),
         ]),
     ).map_err(map_engine_err)?;
+    if !built.passages.is_empty() {
+        carry_unchanged_passage_fold_prefix_in_tx(
+            store,
+            tx,
+            claim,
+            built,
+            get_u64(generation_row, &generation.columns, "passage_revision")?,
+            passage_revision,
+        )?;
+    }
     let deleted = store.internal_db().execute_in_tx(
         tx,
         "DELETE FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id AND owner_token = $owner_token AND lease_epoch = $lease_epoch",
@@ -10516,13 +10602,88 @@ fn guard_final_interpretations_in_tx(
     Ok(())
 }
 
+/// Move a verified SHA prefix across an append in the same transaction as its passages.
+/// A replacement inside that prefix invalidates it; no interior SHA contribution is subtracted.
+fn carry_unchanged_passage_fold_prefix_in_tx(
+    store: &Store,
+    tx: TxId,
+    claim: &Claim,
+    built: &BuiltBatch,
+    prior_revision: u64,
+    next_revision: u64,
+) -> Result<()> {
+    let result = execute_in_tx_tallied(
+        store,
+        tx,
+        "SELECT id, attempt_token, unit, passage_revision, complete, state FROM event_search_fold_progress WHERE context_id = $context_id AND generation_id = $generation_id AND fold = $fold",
+        &HashMap::from([
+            ("context_id".into(), Value::Uuid(claim.generation.context_id.as_uuid())),
+            ("generation_id".into(), Value::Uuid(claim.generation.id.as_uuid())),
+            ("fold".into(), Value::Text(PASSAGE_FOLD.into())),
+        ]),
+    ).map_err(map_engine_err)?;
+    let Some(row) = result.rows.first() else {
+        return Ok(());
+    };
+    let prior = FoldRow {
+        id: get_uuid(row, &result.columns, "id")?,
+        attempt_token: get_uuid(row, &result.columns, "attempt_token")?,
+        unit: get_u64(row, &result.columns, "unit")?,
+        passage_revision: get_u64(row, &result.columns, "passage_revision")?,
+        complete: get_bool(row, &result.columns, "complete")?,
+        state: get_json(row, &result.columns, "state")?,
+    };
+    if prior.passage_revision != prior_revision {
+        return Ok(());
+    }
+    let previous = prior.state.get("previous").and_then(JsonValue::as_u64);
+    if previous.is_some_and(|previous| {
+        built
+            .passages
+            .iter()
+            .any(|passage| passage.ordinal <= previous)
+            || claim.superseded_tail.iter().any(|passage| {
+                let Some((_, Value::Int64(ordinal))) = passage
+                    .conditions
+                    .iter()
+                    .find(|(name, _)| name == "passage_ordinal")
+                else {
+                    return true;
+                };
+                u64::try_from(*ordinal)
+                    .ok()
+                    .is_none_or(|ordinal| ordinal <= previous)
+            })
+    }) {
+        return Ok(());
+    }
+    let mut state = prior.state.clone();
+    state
+        .as_object_mut()
+        .ok_or_else(|| CgError::Engine("passage fold state is not an object".into()))?
+        .remove("digest");
+    save_fold_row_in_tx(
+        store,
+        tx,
+        claim.generation.context_id,
+        claim.generation.id,
+        PASSAGE_FOLD,
+        Some(&prior),
+        prior.attempt_token,
+        next_revision,
+        false,
+        state,
+    )?;
+    Ok(())
+}
+
 /// The generation's current-passage digest and count behind its build receipt, folded in bounded
 /// units of at most one passage batch over `(passage_ordinal, id)`: a strict continuation of
 /// equality-prefix seeks on the current-passage index, so retired passages are never examined and a
 /// duplicate ordinal is always read beside its twin and refused. Progress, the running digest and
 /// the passage revision it was read under commit with every unit. A completed result is reused only
-/// while the generation's passage revision is unchanged; any passage insertion or retirement since
-/// moves the revision and the fold starts over.
+/// while the generation's passage revision is unchanged. A passage commit carries a verified
+/// unchanged prefix to its new revision atomically; a retirement inside that prefix restarts it.
 fn fold_current_generation_passages(
     store: &Store,
     generation: &Generation,
@@ -10677,8 +10838,9 @@ fn fold_current_generation_passages(
             });
             let saved = refused_unit(UnitFold::Passages, &before, saved)?;
             let Some(saved) = saved else {
-                // A passage was inserted or retired since this fold began: start over under the
-                // new revision rather than continue a digest of a population that no longer exists.
+                // A passage commit may have advanced an unchanged prefix. Reload its guarded
+                // successor before continuing under the new revision.
+                row = load_fold_row(store, bounds, context_id, id, PASSAGE_FOLD)?;
                 continue 'fold;
             };
             row = Some(saved);
