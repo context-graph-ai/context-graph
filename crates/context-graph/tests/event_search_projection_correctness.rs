@@ -7300,3 +7300,93 @@ fn appending_a_session_folds_only_new_passages_at_n_and_four_n_history() {
         "append fold examined work is bounded by the suffix and index height: {receipts:?}"
     );
 }
+
+#[test]
+fn passage_completion_keeps_durable_search_while_replacement_is_pending() {
+    let _clock = Wallclock::test_clock_guard(|| 1_800_000_000_000);
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config(root.path().join("completion-pending.db"));
+    cfg.write_memory_limit_bytes = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
+    let store = open(&cfg);
+    let db = store.sync_database();
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    // The completion coordinator handles the same engine routes regardless
+    // of dimension; use a small synthetic route to isolate its lifecycle.
+    db.execute("CREATE TABLE completion_points (id INT PRIMARY KEY, bucket INT NOT NULL, embedding VECTOR(3) PARTITION_KEY (bucket) MAX_PARTITIONS 2 SEARCH_MODE INDEXED AUTO_INDEX_AT 1 HNSW (M = 8, EF_CONSTRUCTION = 32, EF_SEARCH = 512))", &HashMap::new()).unwrap();
+    let append = |id: i64| {
+        let vector = if id == 10000 {
+            vec![1.0, 0.0, 0.0]
+        } else {
+            vec![0.0, 1.0, id as f32 + 1.0]
+        };
+        db.execute(
+            "INSERT INTO completion_points VALUES ($id, 1, $vector)",
+            &HashMap::from([
+                ("id".into(), Value::Int64(id)),
+                ("vector".into(), Value::Vector(vector)),
+            ]),
+        )
+        .unwrap();
+    };
+    for id in 0..16 {
+        append(id);
+    }
+    store.maintain_event_search_vectors_for_test().unwrap();
+    for id in 16..2064 {
+        append(id);
+    }
+    append(10000);
+    store.maintain_event_search_vectors_for_test().unwrap();
+    let status = db
+        .execute(
+            "SHOW VECTOR_PARTITIONS FOR completion_points.embedding",
+            &HashMap::new(),
+        )
+        .unwrap();
+    let status: HashMap<_, _> = status
+        .columns
+        .into_iter()
+        .zip(status.rows.into_iter().next().unwrap())
+        .collect();
+    assert_eq!(status["query_state"], Value::Text("ready".into()));
+    assert_eq!(
+        status["maintenance_state"],
+        Value::Text("compacting".into())
+    );
+    assert!(matches!(status["maintenance_vectors_remaining"], Value::Int64(n) if n > 0));
+    drop(store);
+    let store = open(&cfg);
+    let db = store.sync_database();
+    db.set_maintenance_policy(contextdb_engine::MaintenancePolicy::CallerDriven);
+    let params = HashMap::from([("q".into(), Value::Vector(vec![1.0, 0.0, 0.0]))]);
+    let query = "SELECT id FROM completion_points WHERE bucket = 1 ORDER BY embedding <=> $q USE VECTOR INDEXED LIMIT 1";
+    assert_eq!(
+        db.execute(query, &params).unwrap().rows,
+        vec![vec![Value::Int64(10000)]]
+    );
+    let mut landed = false;
+    for _ in 0..128 {
+        let report = db.run_maintenance_cycle().unwrap().vector;
+        assert!(report.first_failure.is_none(), "{:?}", report.first_failure);
+        let status = db
+            .execute(
+                "SHOW VECTOR_PARTITIONS FOR completion_points.embedding",
+                &HashMap::new(),
+            )
+            .unwrap();
+        let status: HashMap<_, _> = status
+            .columns
+            .into_iter()
+            .zip(status.rows.into_iter().next().unwrap())
+            .collect();
+        if status["maintenance_state"] == Value::Text("idle".into()) {
+            landed = true;
+            break;
+        }
+    }
+    assert!(landed);
+    assert_eq!(
+        db.execute(query, &params).unwrap().rows,
+        vec![vec![Value::Int64(10000)]]
+    );
+}
