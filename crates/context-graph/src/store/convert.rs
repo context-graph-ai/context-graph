@@ -106,6 +106,9 @@ pub(crate) fn map_consumer_open_err(store_path: &Path, err: EngineError) -> CgEr
                 failure.detail(),
                 ReadFailureDetail::HeldByWriter(_) | ReadFailureDetail::HeldByReaders(_)
             ) => {}
+        err @ EngineError::MemoryBudgetExceeded { subsystem, .. } if subsystem == "reader" => {
+            return CgError::Engine(err.to_string());
+        }
         EngineError::MemoryBudgetExceeded {
             budget_limit_bytes, ..
         } => {
@@ -255,6 +258,11 @@ pub(crate) fn map_engine_err(err: EngineError) -> CgError {
             }
         }
         EngineError::ReadFailure(failure) => CgError::Engine(failure.to_string()),
+        ref err @ EngineError::MemoryBudgetExceeded { ref subsystem, .. }
+            if subsystem == "reader" =>
+        {
+            CgError::Engine(err.to_string())
+        }
         // The working memory cg is allowed on this machine ran out. Nothing is damaged and the
         // statement wrote nothing, so this is a budget the operator can raise -- not an engine
         // fault, and not prose for them to parse.
