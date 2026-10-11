@@ -1759,31 +1759,37 @@ fn run_with_store(
     })
 }
 
-/// Leave every passage vector partition with a complete maintained graph before a projection
-/// reports ready. ContextDB builds and repairs vector graphs only through maintenance, never inside
-/// a write or a query, and persists them with the store; so a find after this, including the first
-/// find of a fresh process, searches a built graph instead of falling back to exact work or refusing
-/// for want of one. Each maintenance cycle builds every partition still missing its graph; a cycle
-/// that builds nothing while partitions remain is reported rather than retried.
+/// Publish durable graph coverage for every completed passage. The finite
+/// maintenance scheduler owns queued replacement work after import readiness.
 fn maintain_passage_vectors(store: &Store) -> Result<()> {
     loop {
+        let before = store
+            .db
+            .persist_import_vector_tails()
+            .map_err(map_engine_err)?;
         let vector = store
             .db
             .run_maintenance_cycle()
             .map_err(map_engine_err)?
             .vector;
-        if vector.remaining_partitions == 0 {
-            return Ok(());
-        }
         if let Some(failure) = vector.first_failure {
             return Err(CgError::Engine(format!(
                 "the search index for {} passage partitions could not be built: {failure:?}",
                 vector.remaining_partitions
             )));
         }
-        if vector.built_partitions == 0 {
+        // A replacement can publish during this finite wake. Validate and
+        // cover that committed catalog before reporting the import ready.
+        let after = store
+            .db
+            .persist_import_vector_tails()
+            .map_err(map_engine_err)?;
+        if after || vector.remaining_partitions == 0 {
+            return Ok(());
+        }
+        if before && vector.built_partitions == 0 {
             return Err(CgError::Engine(format!(
-                "the search index for {} passage partitions was not built by maintenance",
+                "durable passage graph coverage was lost while maintenance remained queued for {} partitions",
                 vector.remaining_partitions
             )));
         }
