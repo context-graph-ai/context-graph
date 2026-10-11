@@ -571,6 +571,52 @@ mod tests {
             ),
             "another read limit must remain a terminal unrelated failure"
         );
+
+        let reader_refusal = || EngineError::MemoryBudgetExceeded {
+            subsystem: "reader".into(),
+            operation: "open_cursor".into(),
+            requested_bytes: 144,
+            available_bytes: 13,
+            budget_limit_bytes: 128,
+            hint: "close a cursor before opening another".into(),
+        };
+        let expected_reader_display = "memory budget exceeded: reader/open_cursor requested 144 bytes, 13 available of 128 budget. Hint: close a cursor before opening another";
+        assert_eq!(
+            map_engine_err(reader_refusal()),
+            CgError::Engine(expected_reader_display.into()),
+            "a reader refusal keeps the substrate display instead of becoming writer advice"
+        );
+        assert_eq!(
+            map_consumer_open_err(Path::new(HELD_STORE_PATH), reader_refusal()),
+            CgError::Engine(expected_reader_display.into()),
+            "a reader open refusal keeps the substrate display instead of becoming a generic read limit"
+        );
+        assert!(
+            !expected_reader_display.contains("write-memory-limit")
+                && !expected_reader_display.contains("nothing was written"),
+            "reader advice never claims a writer knob or a write that did not happen"
+        );
+
+        let writer_refusal = || EngineError::MemoryBudgetExceeded {
+            subsystem: "writer".into(),
+            operation: "commit".into(),
+            requested_bytes: 4_096,
+            available_bytes: 512,
+            budget_limit_bytes: 2_048,
+            hint: "raise the write allowance".into(),
+        };
+        assert_eq!(
+            map_engine_err(writer_refusal()),
+            CgError::WriteDidNotFitTheMemoryLimit {
+                requested_bytes: 4_096,
+                limit_bytes: 2_048,
+            },
+            "the writer refusal keeps its existing typed mapping"
+        );
+        assert!(matches!(
+            map_engine_err(EngineError::BfsDepthExceeded(3)),
+            CgError::Engine(message) if message == "bfs depth exceeded: 3"
+        ));
     }
 
     /// The store path a refusal is about, as the substrate renders it: a string, always present.
