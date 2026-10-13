@@ -60,7 +60,7 @@ if ! grep -q "unbound claim(s) in a file this change touched" "$report"; then
     cat "$report" >&2
     exit 1
 fi
-if ! grep -q 'crates/fixture_crate/README.md:13:' "$report"; then
+if ! grep -qE 'crates/fixture_crate/README.md:13([[:space:]]|:)' "$report"; then
     echo "the validator must report the comment-led unbound paragraph at README.md:13" >&2
     cat "$report" >&2
     exit 1
