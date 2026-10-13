@@ -8,6 +8,166 @@ fn agent(name: &str) -> Principal {
     Principal::Agent(name.to_string())
 }
 
+fn record_basis_change(
+    store: &Store,
+    context_id: ContextId,
+    entity_id: EntityId,
+    path: &str,
+) -> RecordObservationResult {
+    let observation_id = ObservationId::new_v7();
+    let observed_at = chrono::DateTime::from_timestamp_millis(
+        i64::try_from(contextdb_core::Wallclock::now().0).expect("timestamp fits i64"),
+    )
+    .expect("valid observation timestamp");
+    store
+        .record_observation(RecordObservation {
+            id: observation_id,
+            entity_id,
+            context_id,
+            observation_type: "change".to_string(),
+            source: "file-state".to_string(),
+            observed_at,
+            evidence: vec![EvidenceRef {
+                id: EvidenceId::new_v7(),
+                source_ref: format!("file:{path}"),
+                ..Default::default()
+            }],
+            observed_properties: Default::default(),
+            state_delta: std::collections::BTreeMap::from([(
+                "path".to_string(),
+                Some(serde_json::json!(path)),
+            )]),
+            properties: Default::default(),
+            embeddings: Vec::new(),
+        })
+        .expect("record basis-changing observation")
+}
+
+fn seed_detected_fixture() -> InvalidationFixture {
+    let (dir, config, store) = fresh_store();
+    let context = create_context(&store, "detected-basis");
+    let entity = create_entity(&store, context.id, "detected-basis");
+    let intention = create_intention(&store, context.id, "detected-basis");
+    let decision = create_decision(
+        &store,
+        context.id,
+        entity.id,
+        intention.id,
+        "detected-basis",
+        false,
+    );
+    assert_eq!(decision.status, DecisionStatus::Active);
+    let detected = record_basis_change(&store, context.id, entity.id, "src/current.rs");
+    assert_eq!(detected.invalidations.len(), 1);
+    let rows = store
+        .list_invalidations(context.id, Some(decision.id), None)
+        .expect("list detected invalidation");
+    assert_eq!(rows.len(), 1);
+    let invalidation = rows.into_iter().next().expect("one invalidation");
+    assert_eq!(detected.invalidations[0].id, invalidation.id);
+    assert_eq!(invalidation.status, InvalidationStatus::Pending);
+    assert_eq!(invalidation.affected_decision_id, decision.id);
+    assert_eq!(invalidation.trigger_observation_id, detected.observation_id);
+    assert_eq!(invalidation.cascade_from, None);
+    assert_eq!(
+        store.get_decision(decision.id).unwrap().unwrap().status,
+        DecisionStatus::Invalidated
+    );
+    drop(store);
+    InvalidationFixture {
+        _dir: dir,
+        config,
+        context_id: context.id,
+        entity_id: entity.id,
+        intention_id: intention.id,
+        decision_id: decision.id,
+        observation_id: detected.observation_id,
+        invalidation,
+    }
+}
+
+/// Answering basis still valid restores a flagged decision and preserves its earlier flag when a later observation flags it again.
+#[test]
+fn basis_still_valid_restores_a_detected_decision_that_a_later_observation_flags_again() {
+    let fixture = seed_detected_fixture();
+    let store = reopen(&fixture.config);
+    let original = store.get_decision(fixture.decision_id).unwrap().unwrap();
+    assert_eq!(original.status, DecisionStatus::Invalidated);
+    let scoped = store.with_principal(agent("operator"));
+    let acknowledged = scoped
+        .acknowledge_invalidation(fixture.invalidation.id)
+        .expect("acknowledge detected invalidation");
+    assert_ack_shape(&fixture.invalidation, &acknowledged);
+    let resolution = scoped.resolve_invalidation(
+        fixture.invalidation.id,
+        ResolveAction::BasisStillValid,
+        None,
+    );
+    assert!(
+        resolution.is_ok(),
+        "basis still valid must restore the decision: {resolution:?}"
+    );
+    let resolved = resolution.unwrap();
+    assert_resolved_shape(&fixture.invalidation, &resolved, "basis_still_valid", None);
+    let restored = store.get_decision(fixture.decision_id).unwrap().unwrap();
+    assert_eq!(restored.status, DecisionStatus::Active);
+    let mut expected = original;
+    expected.status = DecisionStatus::Active;
+    assert_eq!(restored, expected);
+    drop(store);
+
+    let store = reopen(&fixture.config);
+    assert_eq!(
+        store.get_decision(fixture.decision_id).unwrap().unwrap(),
+        restored
+    );
+    assert_eq!(
+        store
+            .with_principal(agent("operator"))
+            .get_invalidation(resolved.id)
+            .unwrap(),
+        resolved
+    );
+    let second = record_basis_change(
+        &store,
+        fixture.context_id,
+        fixture.entity_id,
+        "src/later.rs",
+    );
+    assert_eq!(second.invalidations.len(), 1);
+    let pending = store
+        .list_invalidations(
+            fixture.context_id,
+            Some(fixture.decision_id),
+            Some(InvalidationStatus::Pending),
+        )
+        .expect("list new pending invalidation");
+    assert_eq!(pending.len(), 1);
+    assert_ne!(pending[0].id, resolved.id);
+    assert_eq!(pending[0].id, second.invalidations[0].id);
+    assert_eq!(pending[0].affected_decision_id, fixture.decision_id);
+    assert_eq!(pending[0].trigger_observation_id, second.observation_id);
+    assert_ne!(second.observation_id, fixture.observation_id);
+    assert_eq!(pending[0].status, InvalidationStatus::Pending);
+    assert_eq!(pending[0].resolution_action, None);
+    assert_eq!(
+        store
+            .get_decision(fixture.decision_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DecisionStatus::Invalidated
+    );
+    let history = store
+        .list_invalidations(fixture.context_id, Some(fixture.decision_id), None)
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(
+        history.iter().find(|row| row.id == resolved.id),
+        Some(&resolved)
+    );
+}
+
 #[test]
 fn get_invalidation_preserves_row_shape_byte_identical() {
     let fixture = seed_pending_fixture();
