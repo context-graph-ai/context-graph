@@ -146,7 +146,7 @@
 # crate outside the ratchet, and the audit reports it rather than exempting it.
 "candle-embeddinggemma" = 7
 "cg-bench" = 10
-"cg-catalog" = 110
+"cg-catalog" = 111
 "cg-cli-conventions" = 0
 "cg-connector-claude-code" = 23
 # 2 -> 3: `update_guard_reads_and_replaces_one_bounded_record` covers the policy-update lock's

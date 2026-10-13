@@ -576,3 +576,57 @@ fn install_script_writes_uninstall_with_executable_permission_and_shebang() {
         "uninstall help should document purge and default .cg preservation"
     );
 }
+
+/// Uninstall cleans its real Claude Code settings and preserves unrelated settings under HOME.
+#[test]
+fn uninstall_touches_only_the_claude_code_settings_it_installed_into() {
+    let fixture = tempfile::tempdir().expect("isolated installation");
+    let home = fixture.path().join("home");
+    let prefix = fixture.path().join("prefix");
+    let real = real_claude_settings(&home);
+    fs::create_dir_all(real.parent().unwrap()).expect("real settings directory");
+    let original = serde_json::json!({
+        "custom": "keep-me",
+        "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo user-kept"}]}]}
+    });
+    fs::write(&real, serde_json::to_vec_pretty(&original).unwrap()).expect("real user settings");
+    let install = run_install(&home, &prefix, &[]);
+    assert_success(&install, "install into real Claude Code settings");
+    let installed = fs::read_to_string(&real).expect("installed settings");
+
+    // Plant a similarly named file outside the installation target after installation.
+    let decoy = home.join("unrelated-project/agent-config/claude-code/settings.json");
+    write_agent_config(&decoy, CLAUDE_AGENT, 1);
+    let decoy_before = fs::read(&decoy).expect("decoy bytes");
+    let uninstall = run_uninstall(&home, &prefix, &[]);
+    assert_success(&uninstall, "generated uninstall");
+    assert_eq!(
+        fs::read(&decoy).expect("decoy remains"),
+        decoy_before,
+        "uninstall must not glob another project's agent-config settings"
+    );
+    assert!(
+        installed.contains("cg hook claude-code SessionStart"),
+        "the installer writes the real SessionStart hook: {installed}"
+    );
+    assert!(
+        installed.contains("cg hook claude-code UserPromptSubmit"),
+        "the installer writes the real UserPromptSubmit hook: {installed}"
+    );
+    let cleaned_text = fs::read_to_string(&real).expect("real settings remain");
+    assert!(
+        !cleaned_text.contains("cg hook claude-code"),
+        "uninstall removes every hook installed in the real settings: {cleaned_text}"
+    );
+    let cleaned: serde_json::Value =
+        serde_json::from_str(&cleaned_text).expect("valid cleaned JSON");
+    assert_eq!(
+        cleaned["custom"], original["custom"],
+        "unrelated settings survive"
+    );
+    assert_eq!(
+        cleaned.pointer("/hooks/SessionStart/0"),
+        original.pointer("/hooks/SessionStart/0"),
+        "the user's original SessionStart hook survives exactly"
+    );
+}
