@@ -1151,6 +1151,7 @@ fn both_claim_checkers_classify_the_same_fixture_pages_identically() {
         ("bare", "crates/bare/README.md", "unbound"),
     ];
     let mut rust = Vec::new();
+    let mut rust_rejections = Vec::new();
     let mut expected = Vec::new();
     for (name, relative, verdict) in pages {
         let text = std::fs::read_to_string(repo.join(format!(
@@ -1160,6 +1161,9 @@ fn both_claim_checkers_classify_the_same_fixture_pages_identically() {
         let target = fixture.path().join(relative);
         std::fs::create_dir_all(target.parent().expect("page parent")).expect("page directory");
         std::fs::write(target, &text).expect("copy shared fixture page");
+        for (line, _) in unbound_claim_blocks(&text) {
+            rust_rejections.push((relative.to_string(), line));
+        }
         for (line, block) in claim_blocks(&text) {
             let concept = block.trim_start().starts_with("<!-- concept -->");
             let classification = if is_claim_block(&block) {
@@ -1228,4 +1232,14 @@ fn both_claim_checkers_classify_the_same_fixture_pages_identically() {
         );
     }
     assert_eq!(rust, expected, "Rust fixture classifications");
+    rust_rejections.sort();
+    let expected_rejections = expected
+        .iter()
+        .filter(|(_, _, verdict)| verdict == "unbound" || verdict == "concept-binding")
+        .map(|(path, line, _)| (path.clone(), *line))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rust_rejections, expected_rejections,
+        "the published-page detector rejects concept paragraphs carrying proof tags too"
+    );
 }
