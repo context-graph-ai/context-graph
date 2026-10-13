@@ -1907,6 +1907,16 @@ fn ci_workflow_uses_swatinem_rust_cache_v2_replacing_hand_rolled_actions_cache_v
 #[test]
 fn ci_workflow_model_cache_key_hashes_pinned_revision_constant_source_file_not_cargo_lock_parsed_yaml()
  {
+    // CI uses an explicit root; fallback pins still name the root the loader reads.
+    assert_eq!(
+        cg_catalog::DEFAULT_CACHE_ROOT_LINUX_MACOS,
+        "~/.cache/cg/models"
+    );
+    assert_eq!(
+        cg_catalog::DEFAULT_CACHE_ROOT_WINDOWS,
+        "%LOCALAPPDATA%\\cg\\models"
+    );
+
     let yaml = read_workflow_yaml();
     let model_cache_steps = workflow_steps(&yaml)
         .into_iter()

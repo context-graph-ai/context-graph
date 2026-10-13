@@ -669,19 +669,20 @@ fn cache_path_is_model_cache_only(value: &YamlValue) -> bool {
 }
 
 fn allowed_model_cache_path(path: &str) -> bool {
+    // The catalog delegates these fallback roots to the bundled loader.
     [
         "${{ env.CG_MODEL_CACHE_ROOT }}",
-        "~/.cache/cg/embedders",
-        "~/AppData/Local/cg/embedders",
-        "~/Library/Caches/cg/embedders",
-        "$HOME/.cache/cg/embedders",
-        "${HOME}/.cache/cg/embedders",
-        "$HOME/AppData/Local/cg/embedders",
-        "${HOME}/AppData/Local/cg/embedders",
-        "$HOME/Library/Caches/cg/embedders",
-        "${HOME}/Library/Caches/cg/embedders",
-        "$LOCALAPPDATA/cg/embedders",
-        "${LOCALAPPDATA}/cg/embedders",
+        cg_catalog::DEFAULT_CACHE_ROOT_LINUX_MACOS,
+        "~/AppData/Local/cg/models",
+        "$HOME/.cache/cg/models",
+        "${HOME}/.cache/cg/models",
+        "$HOME/AppData/Local/cg/models",
+        "${HOME}/AppData/Local/cg/models",
+        "$LOCALAPPDATA/cg/models",
+        "${LOCALAPPDATA}/cg/models",
+        "%LOCALAPPDATA%/cg/models",
+        "$XDG_CACHE_HOME/cg/models",
+        "${XDG_CACHE_HOME}/cg/models",
     ]
     .iter()
     .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
@@ -1751,6 +1752,17 @@ fn run_contains_consecutive_lines(run: &str, expected: &[&str]) -> bool {
 
 #[test]
 fn ci_runs_cargo_deny_and_cargo_expand_symbol_check() {
+    assert!(allowed_model_cache_path(
+        cg_catalog::DEFAULT_CACHE_ROOT_LINUX_MACOS
+    ));
+    assert!(allowed_model_cache_path(
+        &cg_catalog::DEFAULT_CACHE_ROOT_WINDOWS.replace('\\', "/")
+    ));
+    assert!(
+        !allowed_model_cache_path("~/.cache/cg/embedders"),
+        "the retired cache root is not read by the loader"
+    );
+
     assert_no_cargo_audit_aliases();
     let yaml = read_workflow_yaml();
     let steps = workflow_steps(&yaml);
