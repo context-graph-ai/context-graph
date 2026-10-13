@@ -1466,10 +1466,17 @@ fn regression_get_invalidations_filter_cross_context_returns_only_scoped_rows() 
     );
 }
 
+/// Dismissing a detected suggestion leaves its decision invalidated until its basis is answered.
 #[test]
 fn regression_invalidations_are_suggestions_not_actions_on_dismiss() {
-    let fixture = seed_acknowledged_fixture();
+    let mut fixture = seed_detected_fixture();
     let store = reopen(&fixture.config);
+    let acknowledged = store
+        .with_principal(agent("agent-test"))
+        .acknowledge_invalidation(fixture.invalidation.id)
+        .expect("acknowledge detected invalidation");
+    assert_ack_shape(&fixture.invalidation, &acknowledged);
+    fixture.invalidation = acknowledged;
 
     let dismissed = store
         .with_principal(agent("agent-test"))
@@ -1481,13 +1488,26 @@ fn regression_invalidations_are_suggestions_not_actions_on_dismiss() {
         .get_decision(fixture.decision_id)
         .expect("get decision")
         .expect("decision");
-    assert_eq!(decision.status, DecisionStatus::Active);
+    assert_eq!(decision.status, DecisionStatus::Invalidated);
+    assert_eq!(
+        store
+            .list_invalidations(fixture.context_id, Some(fixture.decision_id), None)
+            .unwrap(),
+        vec![dismissed]
+    );
 }
 
+/// Resolving a detected suggestion records its active replacement and leaves the flagged decision invalidated.
 #[test]
 fn regression_invalidations_are_suggestions_not_actions_on_resolve() {
-    let fixture = seed_acknowledged_fixture();
+    let mut fixture = seed_detected_fixture();
     let store = reopen(&fixture.config);
+    let acknowledged = store
+        .with_principal(agent("agent-test"))
+        .acknowledge_invalidation(fixture.invalidation.id)
+        .expect("acknowledge detected invalidation");
+    assert_ack_shape(&fixture.invalidation, &acknowledged);
+    fixture.invalidation = acknowledged;
     let new_decision =
         create_serving_decision(&store, fixture.context_id, fixture.intention_id, "new");
 
@@ -1510,7 +1530,17 @@ fn regression_invalidations_are_suggestions_not_actions_on_resolve() {
         .get_decision(fixture.decision_id)
         .expect("get decision")
         .expect("decision");
-    assert_eq!(decision.status, DecisionStatus::Active);
+    assert_eq!(decision.status, DecisionStatus::Invalidated);
+    assert_eq!(
+        store.get_decision(new_decision.id).unwrap().unwrap().status,
+        DecisionStatus::Active
+    );
+    assert_eq!(
+        store
+            .list_invalidations(fixture.context_id, Some(fixture.decision_id), None)
+            .unwrap(),
+        vec![resolved]
+    );
 }
 
 #[test]
