@@ -749,7 +749,11 @@ fn unbound_claim_blocks(text: &str) -> Vec<(usize, String)> {
 fn published_pages_carry_no_unbound_behavior_claim() {
     let repo = repository_root();
     let mut pages = vec![repo.join("README.md")];
-    pages.extend(crate_dirs(&repo).into_iter().map(|dir| dir.join("README.md")));
+    pages.extend(
+        crate_dirs(&repo)
+            .into_iter()
+            .map(|dir| dir.join("README.md")),
+    );
     pages.extend(["docs/ontology.md", "docs/data-model.md"].map(|path| repo.join(path)));
     let mut failures = Vec::new();
     for page in pages {
@@ -1125,4 +1129,103 @@ fn a_changed_crate_with_no_agents_md_is_reported_missing_and_a_guided_one_is_not
         "cg-catalog must be reported exactly once even though two of its src/ files changed: \
          got {missing_repeated:?}"
     );
+}
+
+/// Both claim checkers classify the same pages and always check published reference pages.
+#[test]
+fn both_claim_checkers_classify_the_same_fixture_pages_identically() {
+    use std::process::Command;
+
+    let repo = repository_root();
+    let fixture = tempfile::tempdir().expect("fixture repository");
+    let pages = [
+        ("bound", "README.md", "bound"),
+        ("unbound", "crates/unbound/README.md", "unbound"),
+        ("concept", "docs/ontology.md", "concept"),
+        ("note", "docs/data-model.md", "unbound"),
+        (
+            "concept_bound",
+            "crates/conflict/README.md",
+            "concept-binding",
+        ),
+        ("bare", "crates/bare/README.md", "unbound"),
+    ];
+    let mut rust = Vec::new();
+    let mut expected = Vec::new();
+    for (name, relative, verdict) in pages {
+        let text = std::fs::read_to_string(repo.join(format!(
+            "crates/context-graph/tests/fixtures/doc_claims/{name}.md"
+        )))
+        .expect("read shared fixture page");
+        let target = fixture.path().join(relative);
+        std::fs::create_dir_all(target.parent().expect("page parent")).expect("page directory");
+        std::fs::write(target, &text).expect("copy shared fixture page");
+        for (line, block) in claim_blocks(&text) {
+            let concept = block.trim_start().starts_with("<!-- concept -->");
+            let classification = if is_claim_block(&block) {
+                if is_bound_block(&block) {
+                    if concept { "concept-binding" } else { "bound" }
+                } else {
+                    "unbound"
+                }
+            } else if concept {
+                "concept"
+            } else {
+                "exempt"
+            };
+            rust.push((relative.to_string(), line, classification.to_string()));
+        }
+        expected.push((relative.to_string(), 1usize, verdict.to_string()));
+    }
+    rust.sort();
+    expected.sort();
+    let tests = fixture.path().join("crates/unbound/tests");
+    std::fs::create_dir_all(&tests).expect("fixture tests directory");
+    std::fs::write(tests.join("proof.rs"), "#[test]\nfn fixture_proof() {}\n")
+        .expect("fixture proof");
+
+    // --paths accepts comma-separated repository-relative pages; --json emits the
+    // complete paragraph verdicts, not just defects, and the fixed scope declaration.
+    let explicit = pages.map(|(_, relative, _)| relative).join(",");
+    for args in [
+        vec!["--paths", explicit.as_str()],
+        vec!["--changed-files", "unrelated.txt"],
+    ] {
+        let output = Command::new("python3")
+            .arg(repo.join("scripts/validate-doc-coverage.py"))
+            .arg("--repo")
+            .arg(fixture.path())
+            .args(args)
+            .arg("--json")
+            .output()
+            .expect("run Python claim checker");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "the shared fixtures contain unbound and concept-binding defects: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("Python checker emits JSON for --json");
+        assert_eq!(
+            report["always_checked_docs"],
+            serde_json::json!([
+                "README.md",
+                "crates/*/README.md",
+                "docs/ontology.md",
+                "docs/data-model.md"
+            ]),
+            "the fixed scope is scanned even when the changed-file list contains no docs"
+        );
+        let mut python: Vec<(String, usize, String)> =
+            serde_json::from_value(report["verdicts"].clone())
+                .expect("file, line, verdict triples");
+        python.sort();
+        assert_eq!(python, expected, "Python fixture classifications");
+        assert_eq!(
+            rust, python,
+            "both checkers classify identical fixture bytes"
+        );
+    }
+    assert_eq!(rust, expected, "Rust fixture classifications");
 }
