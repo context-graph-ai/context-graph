@@ -255,7 +255,7 @@
 # A retired refusal survives Context forget and is acknowledged after foreground re-import.
 # One saved-frontier broad-refusal proof covers retired and unretired evidence.
 # Read-time configuration and eleven selected-request recovery paths add twelve proofs.
-"context-graph-cli" = 276
+"context-graph-cli" = 277
 
 [gate_wall_seconds_policy]
 # A test binary's ceiling is `recorded seconds * tolerance_factor + slack_seconds`. Both terms are

@@ -879,3 +879,90 @@ fn inline_media_is_captured_as_metadata_only_without_persisting_the_forbidden_pa
     );
     assert_no_forbidden_persisted_bytes(&data_root);
 }
+
+/// Importing history writes events and searchable passages without creating graph rows.
+#[test]
+fn importing_history_writes_events_and_passages_and_no_graph_rows() {
+    use context_graph::{ConsumerReader, ConsumerTable, event_history_reader_declaration};
+    use std::collections::HashMap;
+
+    let workspace = tempfile::tempdir().expect("isolated import workspace");
+    let data_root = workspace.path().join("data-root");
+    let source = workspace.path().join("history.jsonl");
+    fs::copy(fixture("roundtrip.jsonl"), &source).expect("stage repository history fixture");
+    let cache = existing_nomic_cache_root();
+    let imported = run_cg(
+        &data_root,
+        Some(&cache),
+        &[
+            "import".into(),
+            source.display().to_string(),
+            "--context".into(),
+            "history-only".into(),
+            "--search".into(),
+            "wait".into(),
+        ],
+    );
+    assert_eq!(
+        imported.code, 0,
+        "stdout={} stderr={}",
+        imported.stdout, imported.stderr
+    );
+    let receipt = json(&imported, "cg import --search wait");
+    assert_eq!(
+        json_string_at(&receipt, "/state", "import state"),
+        "complete"
+    );
+    assert_eq!(
+        json_string_at(&receipt, "/search/status", "search status"),
+        "ready"
+    );
+    let mut declaration = event_history_reader_declaration();
+    let graph_tables = ["intentions", "decisions", "entities", "observations"];
+    for name in graph_tables {
+        if declaration
+            .schema
+            .tables
+            .iter()
+            .any(|table| table.name == name)
+        {
+            continue;
+        }
+        let spec = context_graph::schema::TABLES
+            .iter()
+            .find(|table| table.name == name)
+            .expect("published graph table");
+        declaration.schema.tables.push(ConsumerTable {
+            name: name.to_string(),
+            ddl: spec.ddl.to_string(),
+        });
+    }
+    let reader = ConsumerReader::open(data_root.join("context-graph.db"), declaration)
+        .expect("open imported history read-only");
+    let count = |table: &str| {
+        let result = reader
+            .execute(
+                &format!("SELECT COUNT(*) AS n FROM {table}"),
+                &HashMap::new(),
+            )
+            .expect("bounded table total");
+        assert_eq!(result.rows.len(), 1, "one aggregate row for {table}");
+        assert_eq!(result.rows[0].len(), 1, "one aggregate value for {table}");
+        match result.rows[0][0] {
+            contextdb_core::Value::Int64(value) => value,
+            ref value => panic!("integer total for {table}, got {value:?}"),
+        }
+    };
+    assert!(count("events") > 0, "the fixture produces captured events");
+    assert!(
+        count("event_search_passages") > 0,
+        "the fixture produces searchable passages"
+    );
+    for table in graph_tables {
+        assert_eq!(
+            count(table),
+            0,
+            "history import must not synthesize {table}"
+        );
+    }
+}
