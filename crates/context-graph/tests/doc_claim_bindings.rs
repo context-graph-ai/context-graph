@@ -874,6 +874,10 @@ opens afterwards never observes a partial commit.
 
 Reopening the store after a crash replays the write-ahead log before answering any read.
 <!-- enforced by: `the_store_replays_the_write_ahead_log_after_a_crash` -->
+
+<!-- note -->
+The store preserves every committed row when a reader opens it after the writer closes.
+
 ";
     std::fs::write(crate_dir.join("README.md"), readme_with_defects)
         .expect("write fixture README with defects");
@@ -898,14 +902,16 @@ Reopening the store after a crash replays the write-ahead log before answering a
     let unbound = unbound_claim_blocks(readme_with_defects);
     assert_eq!(
         unbound.len(),
-        1,
-        "a behaviour paragraph with no test binding must be reported exactly once, and the two \
-         bound paragraphs must not be, got: {unbound:?}"
+        2,
+        "ordinary and comment-led unbound paragraphs must both be reported: {unbound:?}"
     );
     assert!(
         unbound[0].1.starts_with("Closing the store flushes"),
         "the reported unbound claim must be the paragraph carrying no binding, got: {unbound:?}"
     );
+
+    assert_eq!(unbound[1].0, 13, "comment-led claim starts at its comment");
+    assert!(unbound[1].1.contains("preserves every committed row"));
 
     let readme_repaired = "\
 # Fixture crate

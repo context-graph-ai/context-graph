@@ -32,6 +32,10 @@ opens afterwards never observes a partial commit.
 
 Reopening the store after a crash replays the write-ahead log before answering any read.
 <!-- enforced by: `the_store_replays_the_write_ahead_log_after_a_crash` -->
+
+<!-- note -->
+The store preserves every committed row when a reader opens it after the writer closes.
+
 FIXTURE_README
 
 report="$fixture/report.txt"
@@ -53,6 +57,11 @@ if ! grep -q "the_store_replays_the_write_ahead_log_after_a_crash" "$report"; th
 fi
 if ! grep -q "unbound claim(s) in a file this change touched" "$report"; then
     echo "the validator must report the unbound claim paragraph it found. Report:" >&2
+    cat "$report" >&2
+    exit 1
+fi
+if ! grep -q 'crates/fixture_crate/README.md:13:' "$report"; then
+    echo "the validator must report the comment-led unbound paragraph at README.md:13" >&2
     cat "$report" >&2
     exit 1
 fi
