@@ -6,6 +6,123 @@ use contextdb_core::{Error as EngineError, TxId, Value};
 use contextdb_engine::{Database, TriggerAuditStatus};
 use serde_json::json;
 
+/// A basis-changing observation invalidates its root decision and every active citer, retaining the exact citation parent for each flag.
+#[test]
+fn a_detected_invalidation_moves_its_decision_and_every_cascaded_citer_to_invalidated() {
+    let (_dir, store) = fresh_store();
+    let ctx = context(&store, "citation-basis");
+    let ent = entity(
+        &store,
+        ctx.id,
+        "module",
+        props(&[("path", json!("src/initial.rs"))]),
+    );
+    let intent = intention(&store, ctx.id, "Keep cited file choices current");
+    let root = decision(
+        &store,
+        ctx.id,
+        "root file choice",
+        Some(0.9),
+        vec![intent.id],
+        vec![ent.id],
+        None,
+        Vec::new(),
+    );
+    let left = decision(
+        &store,
+        ctx.id,
+        "left cites root",
+        Some(0.8),
+        vec![intent.id],
+        Vec::new(),
+        None,
+        vec![root.id],
+    );
+    let right = decision(
+        &store,
+        ctx.id,
+        "right cites root",
+        Some(0.8),
+        vec![intent.id],
+        Vec::new(),
+        None,
+        vec![root.id],
+    );
+    let leaf = decision(
+        &store,
+        ctx.id,
+        "leaf cites left",
+        Some(0.7),
+        vec![intent.id],
+        Vec::new(),
+        None,
+        vec![left.id],
+    );
+    for id in [root.id, left.id, right.id, leaf.id] {
+        assert_eq!(
+            store.get_decision(id).unwrap().unwrap().status,
+            DecisionStatus::Active
+        );
+    }
+    let observation_id = ObservationId::new_v7();
+    let detected = store
+        .record_observation(RecordObservation {
+            id: observation_id,
+            entity_id: ent.id,
+            context_id: ctx.id,
+            observation_type: "change".to_string(),
+            source: "file-state".to_string(),
+            observed_at: chrono::DateTime::from_timestamp_millis(
+                i64::try_from(contextdb_core::Wallclock::now().0).expect("timestamp fits i64"),
+            )
+            .expect("valid observation timestamp"),
+            evidence: vec![EvidenceRef {
+                id: EvidenceId::new_v7(),
+                source_ref: "file:src/changed.rs".to_string(),
+                ..Default::default()
+            }],
+            observed_properties: BTreeMap::new(),
+            state_delta: delta(&[("path", json!("src/changed.rs"))]),
+            properties: BTreeMap::new(),
+            embeddings: Vec::new(),
+        })
+        .expect("record basis-changing observation");
+    assert_eq!(detected.invalidations.len(), 4);
+    let rows = store.list_invalidations(ctx.id, None, None).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<HashSet<_>>().len(),
+        4
+    );
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<HashSet<_>>(),
+        detected
+            .invalidations
+            .iter()
+            .map(|row| row.id)
+            .collect::<HashSet<_>>()
+    );
+    for (id, precedent) in [
+        (root.id, None),
+        (left.id, Some(root.id)),
+        (right.id, Some(root.id)),
+        (leaf.id, Some(left.id)),
+    ] {
+        assert_eq!(
+            store.get_decision(id).unwrap().unwrap().status,
+            DecisionStatus::Invalidated
+        );
+        let flags = store.list_invalidations(ctx.id, Some(id), None).unwrap();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].affected_decision_id, id);
+        assert_eq!(flags[0].trigger_observation_id, observation_id);
+        assert_eq!(flags[0].cascade_from, precedent);
+        assert_eq!(flags[0].status, InvalidationStatus::Pending);
+        assert_eq!(flags[0].resolution_action, None);
+        assert_eq!(flags[0].resolution_decision_id, None);
+    }
+}
+
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::open(StoreConfig {
