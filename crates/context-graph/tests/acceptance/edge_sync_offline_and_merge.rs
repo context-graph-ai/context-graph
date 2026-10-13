@@ -11,12 +11,238 @@ use chrono::{DateTime, Utc};
 use context_graph::{
     ContextId, CreateContext, CreateDecision, CreateEntity, CreateIntention, DecisionId,
     DecisionStatus, EntityId, EntitySnapshotId, EntityType, EvidenceId, EvidenceKind, EvidenceRef,
-    IntentionId, IntentionOrigin, IntentionStatus, ObservationId, Outcome, RecordObservation,
-    Store, TxId,
+    IntentionId, IntentionOrigin, IntentionStatus, InvalidationStatus, ObservationId, Outcome,
+    Principal, RecordObservation, ResolveAction, Store, TxId,
 };
 use contextdb_core::{Lsn, Value as DbValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
+
+/// Two synced machines preserve one invalidation per triggering observation, including a later observation after the basis is confirmed.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_synced_machines_record_one_invalidation_per_triggering_observation() {
+    let fixture = ticketed_memory_fixture("invalidation_per_observation").await;
+    let edge_a = fixture.open_edge("basis-edge-a");
+    let edge_b = fixture.open_edge("basis-edge-b");
+    let context = edge_a
+        .store
+        .create_context(CreateContext {
+            name: "shared-basis".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    let intention = edge_a
+        .store
+        .create_intention(CreateIntention {
+            description: "Keep the shared file choice current".to_string(),
+            context_id: context.id,
+            ..Default::default()
+        })
+        .unwrap();
+    let entity = edge_a
+        .store
+        .create_entity(CreateEntity {
+            entity_type: EntityType::File,
+            name: "shared file".to_string(),
+            properties: BTreeMap::from([("path".to_string(), serde_json::json!("src/initial.rs"))]),
+            context_id: context.id,
+            ..Default::default()
+        })
+        .unwrap();
+    let decision = edge_a
+        .store
+        .create_decision(CreateDecision {
+            decision_type: "file-choice".to_string(),
+            description: "Use the shared file".to_string(),
+            intention_ids: vec![intention.id],
+            based_on_entity_ids: vec![entity.id],
+            context_id: context.id,
+            ..Default::default()
+        })
+        .unwrap();
+    drain_ticketed_push(&edge_a.client).await;
+    drain_ticketed_pull(&edge_b.client).await;
+    for store in [&edge_a.store, &edge_b.store] {
+        let shared_decision = store.get_decision(decision.id).unwrap().unwrap();
+        assert_eq!(shared_decision.id, decision.id);
+        assert_eq!(shared_decision.status, DecisionStatus::Active);
+        assert_eq!(shared_decision.description, decision.description);
+        assert_eq!(shared_decision.intention_ids, vec![intention.id]);
+        assert_eq!(
+            shared_decision.based_on_snapshots,
+            decision.based_on_snapshots
+        );
+        let shared_entity = store.get_entity(entity.id).unwrap().unwrap();
+        assert_eq!(shared_entity.id, entity.id);
+        assert_eq!(shared_entity.properties, entity.properties);
+    }
+
+    let observation_id = ObservationId::new_v7();
+    let observation = RecordObservation {
+        id: observation_id,
+        entity_id: entity.id,
+        context_id: context.id,
+        observation_type: "change".to_string(),
+        source: "shared-file-state".to_string(),
+        observed_at: DateTime::from_timestamp_millis(
+            i64::try_from(contextdb_core::Wallclock::now().0).expect("timestamp fits i64"),
+        )
+        .expect("valid observation timestamp"),
+        evidence: vec![EvidenceRef {
+            id: EvidenceId::new_v7(),
+            source_ref: "file:src/changed.rs".to_string(),
+            ..Default::default()
+        }],
+        observed_properties: BTreeMap::new(),
+        state_delta: BTreeMap::from([(
+            "path".to_string(),
+            Some(serde_json::json!("src/changed.rs")),
+        )]),
+        properties: BTreeMap::new(),
+        embeddings: Vec::new(),
+    };
+    // Both machines detect the same immutable observation locally before either sends it.
+    for store in [&edge_a.store, &edge_b.store] {
+        let detected = store.record_observation(observation.clone()).unwrap();
+        assert_eq!(detected.observation_id, observation_id);
+        assert_eq!(detected.invalidations.len(), 1);
+        assert_eq!(detected.invalidations[0].affected_decision_id, decision.id);
+        assert_eq!(
+            detected.invalidations[0].trigger_observation_id,
+            observation_id
+        );
+        assert_eq!(
+            detected.invalidations[0].status,
+            InvalidationStatus::Pending
+        );
+        assert_eq!(
+            store.get_decision(decision.id).unwrap().unwrap().status,
+            DecisionStatus::Invalidated
+        );
+    }
+    drain_ticketed_push(&edge_a.client).await;
+    drain_ticketed_push(&edge_b.client).await;
+    drain_ticketed_pull(&edge_a.client).await;
+    drain_ticketed_pull(&edge_b.client).await;
+    let mut first_id = None;
+    for store in [fixture.hub_store(), &edge_a.store, &edge_b.store] {
+        let rows = store
+            .list_invalidations(context.id, Some(decision.id), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].trigger_observation_id, observation_id);
+        assert_eq!(rows[0].affected_decision_id, decision.id);
+        assert_eq!(rows[0].status, InvalidationStatus::Pending);
+        assert_eq!(
+            store.get_decision(decision.id).unwrap().unwrap().status,
+            DecisionStatus::Invalidated
+        );
+        match first_id {
+            None => first_id = Some(rows[0].id),
+            Some(id) => assert_eq!(rows[0].id, id),
+        }
+    }
+    let first_id = first_id.unwrap();
+    let scoped = edge_a
+        .store
+        .with_principal(Principal::Agent("operator".to_string()));
+    let acknowledged = scoped.acknowledge_invalidation(first_id).unwrap();
+    assert_eq!(acknowledged.status, InvalidationStatus::Acknowledged);
+    let resolution = scoped.resolve_invalidation(first_id, ResolveAction::BasisStillValid, None);
+    assert!(
+        resolution.is_ok(),
+        "basis still valid must restore a synced decision: {resolution:?}"
+    );
+    let resolved = resolution.unwrap();
+    assert_eq!(resolved.status, InvalidationStatus::Resolved);
+    assert_eq!(
+        resolved.resolution_action.as_deref(),
+        Some("basis_still_valid")
+    );
+    assert_eq!(resolved.resolution_decision_id, None);
+    drain_ticketed_push(&edge_a.client).await;
+    drain_ticketed_pull(&edge_a.client).await;
+    drain_ticketed_pull(&edge_b.client).await;
+    for store in [fixture.hub_store(), &edge_a.store, &edge_b.store] {
+        assert_eq!(
+            store.get_decision(decision.id).unwrap().unwrap().status,
+            DecisionStatus::Active
+        );
+        let rows = store
+            .list_invalidations(context.id, Some(decision.id), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, first_id);
+        assert_eq!(rows[0].status, InvalidationStatus::Resolved);
+        assert_eq!(
+            rows[0].resolution_action.as_deref(),
+            Some("basis_still_valid")
+        );
+        assert_eq!(rows[0].trigger_observation_id, observation_id);
+    }
+
+    let second_id = ObservationId::new_v7();
+    assert_ne!(second_id, observation_id);
+    let second = edge_b
+        .store
+        .record_observation(RecordObservation {
+            id: second_id,
+            state_delta: BTreeMap::from([(
+                "path".to_string(),
+                Some(serde_json::json!("src/later.rs")),
+            )]),
+            evidence: vec![EvidenceRef {
+                id: EvidenceId::new_v7(),
+                source_ref: "file:src/later.rs".to_string(),
+                ..Default::default()
+            }],
+            observed_at: DateTime::from_timestamp_millis(
+                i64::try_from(contextdb_core::Wallclock::now().0).expect("timestamp fits i64"),
+            )
+            .expect("valid observation timestamp"),
+            ..observation
+        })
+        .unwrap();
+    assert_eq!(second.invalidations.len(), 1);
+    let second_invalidation_id = second.invalidations[0].id;
+    assert_ne!(second_invalidation_id, first_id);
+    drain_ticketed_push(&edge_b.client).await;
+    drain_ticketed_pull(&edge_a.client).await;
+    drain_ticketed_pull(&edge_b.client).await;
+    for store in [fixture.hub_store(), &edge_a.store, &edge_b.store] {
+        let rows = store
+            .list_invalidations(context.id, Some(decision.id), None)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let first = rows
+            .iter()
+            .filter(|row| row.trigger_observation_id == observation_id)
+            .collect::<Vec<_>>();
+        let later = rows
+            .iter()
+            .filter(|row| row.trigger_observation_id == second_id)
+            .collect::<Vec<_>>();
+        assert_eq!(first.len(), 1);
+        assert_eq!(later.len(), 1);
+        assert_eq!(first[0].id, first_id);
+        assert_eq!(first[0].status, InvalidationStatus::Resolved);
+        assert_eq!(
+            first[0].resolution_action.as_deref(),
+            Some("basis_still_valid")
+        );
+        assert_eq!(later[0].id, second_invalidation_id);
+        assert_eq!(later[0].status, InvalidationStatus::Pending);
+        assert_eq!(later[0].resolution_action, None);
+        assert_eq!(later[0].affected_decision_id, decision.id);
+        assert_eq!(
+            store.get_decision(decision.id).unwrap().unwrap().status,
+            DecisionStatus::Invalidated
+        );
+    }
+    drop(edge_a);
+    drop(edge_b);
+    fixture.shutdown().await;
+}
 
 struct IndependentHistory {
     author: String,
