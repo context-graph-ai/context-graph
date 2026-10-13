@@ -744,29 +744,29 @@ fn unbound_claim_blocks(text: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
+/// Published reference pages carry a test binding on every behaviour paragraph.
 #[test]
-fn context_graph_readme_carries_no_unbound_behavior_claim() {
+fn published_pages_carry_no_unbound_behavior_claim() {
     let repo = repository_root();
-    let readme_path = repo.join("crates/context-graph/README.md");
-    let text = std::fs::read_to_string(&readme_path).unwrap_or_else(|err| {
-        panic!(
-            "expected the context-graph crate README at {}: {err}",
-            readme_path.display()
-        )
-    });
-
-    let unbound = unbound_claim_blocks(&text);
-
+    let mut pages = vec![repo.join("README.md")];
+    pages.extend(crate_dirs(&repo).into_iter().map(|dir| dir.join("README.md")));
+    pages.extend(["docs/ontology.md", "docs/data-model.md"].map(|path| repo.join(path)));
+    let mut failures = Vec::new();
+    for page in pages {
+        // A reference page joins the check as soon as it exists.
+        if !page.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&page).expect("read published page");
+        let relative = page.strip_prefix(&repo).expect("repository page");
+        for (line, preview) in unbound_claim_blocks(&text) {
+            failures.push(format!("{}:{line}: {preview}", relative.display()));
+        }
+    }
     assert!(
-        unbound.is_empty(),
-        "crates/context-graph/README.md carries {} unbound behavior claim(s) — a paragraph of \
-         12+ words with no `enforced by` test binding anywhere in it — starting at: {}",
-        unbound.len(),
-        unbound
-            .iter()
-            .map(|(lineno, preview)| format!("{lineno}: {preview}..."))
-            .collect::<Vec<_>>()
-            .join(" | ")
+        failures.is_empty(),
+        "published pages carry unbound behaviour claims:\n{}",
+        failures.join("\n")
     );
 }
 
