@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="1" failures="0" errors="0">
+    <testsuite name="context-graph::without_recorded_limit" tests="1" failures="0" errors="0">
+        <testcase name="one" classname="context-graph::without_recorded_limit" time="0.5">
+        </testcase>
+    </testsuite>
+</testsuites>

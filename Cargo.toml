@@ -12,6 +12,8 @@ members = [
     "crates/cg-connector-claude-code",
 ]
 
+exclude = ["vendor/candle-core", "vendor/candle-nn", "vendor/candle-transformers"]
+
 [workspace.package]
 keywords = ["agent-memory", "knowledge-graph", "embeddings", "claude-code", "local-first"]
 categories = ["database", "command-line-utilities"]
@@ -38,15 +40,15 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 strum = { version = "0.28.0", features = ["derive"] }
 chrono = { version = "0.4.44", features = ["serde"] }
-candle-core = "0.10.2"
-candle-nn = "0.10.2"
-candle-transformers = "0.10.2"
+candle-core = { path = "vendor/candle-core", version = "=0.10.2" }
+candle-nn = { path = "vendor/candle-nn", version = "=0.10.2" }
+candle-transformers = { path = "vendor/candle-transformers", version = "=0.10.2" }
 criterion = { version = "0.8", features = ["html_reports"] }
-contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
-contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
-contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
-contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
-contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9" }
+contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905" }
+contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905" }
+contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905" }
+contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905" }
+contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905" }
 safetensors = "0.7.0"
 sha2 = "0.10.9"
 tempfile = "3.23.0"

@@ -471,7 +471,9 @@ fn status_reports_last_injection_tier_and_token_stats() {
 
     let status = harness.run(&["status", "--format", "json"]);
     let value: Value = serde_json::from_str(&status.stdout).expect("status json");
-    let injection = value.get("last_injection").expect("last_injection field");
+    let injection = value
+        .get("last_injection")
+        .unwrap_or_else(|| panic!("last_injection field absent from status JSON: {value}"));
     assert!(
         injection
             .get("structured")

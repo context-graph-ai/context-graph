@@ -1,4 +1,6 @@
 [package]
+# This internal example shares private source available only in the Git workspace.
+exclude = ["examples/ci_model_seed.rs"]
 publish = false
 keywords.workspace = true
 categories.workspace = true
@@ -42,7 +44,7 @@ chrono = { workspace = true, features = ["serde"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
 contextdb-parser.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9", features = ["iroh"], optional = true }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905", features = ["iroh"], optional = true }
 fs4.workspace = true
 pollster.workspace = true
 rayon.workspace = true
@@ -57,6 +59,7 @@ ureq = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 
 [dev-dependencies]
+zip = { version = "=9.0.4", default-features = false }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
 # Enable the fabric-sync worker seam for THIS crate's own integration tests (the frozen fabric
@@ -68,7 +71,7 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 cg-catalog = { path = "../cg-catalog", features = ["embeddinggemma-test-support"] }
 cg-connector-claude-code.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9", features = ["iroh", "test-seams"] }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905", features = ["iroh", "test-seams"] }
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-tx.workspace = true
 contextdb-vector = { workspace = true, features = ["test-seams"] }

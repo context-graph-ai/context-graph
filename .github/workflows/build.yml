@@ -1,0 +1,452 @@
+name: Build development binaries
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TRIGGER_SHA: ${{ github.sha }}
+
+jobs:
+  build:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev' &&
+       github.repository == 'context-graph-ai/context-graph' &&
+       github.workflow_ref == 'context-graph-ai/context-graph/.github/workflows/ci.yml@refs/heads/dev') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dev' &&
+       github.repository == 'context-graph-ai/context-graph')
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    env:
+      TARGET: ${{ matrix.target }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Verify manual selection against dev and successful push CI
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/dev" --jq .object.sha)
+          test "$GITHUB_REF" = refs/heads/dev
+          test "$SHA" = "$tip"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=push&head_sha=$SHA&per_page=100" > "$RUNNER_TEMP/ci-runs.json"
+          python3 - <<'PY_RUNS' > "$RUNNER_TEMP/ci-run-ids"
+          import json, os, pathlib
+          from types import SimpleNamespace
+          # gh pagination emits consecutive JSON objects.
+          raw = pathlib.Path(os.environ['RUNNER_TEMP'], 'ci-runs.json').read_text()
+          decoder = json.JSONDecoder(object_hook=lambda obj: SimpleNamespace(**obj))
+          while raw.strip():
+              page, end = decoder.raw_decode(raw.lstrip())
+              raw = raw.lstrip()[end:]
+              for run in page.workflow_runs:
+                  if (run.head_sha == os.environ['SHA'] and run.head_branch == 'dev'
+                      and run.head_repository.full_name == os.environ['GITHUB_REPOSITORY']
+                      and run.event == 'push' and run.status == 'completed'
+                      and run.path == '.github/workflows/ci.yml'
+                      and run.conclusion in ('success', 'failure')):
+                      print(int(run.id))
+          PY_RUNS
+          verified=false
+          while read -r run_id; do
+            gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" > "$RUNNER_TEMP/ci-jobs.json"
+            if python3 - <<'PY_JOBS'
+          import json, os, pathlib
+          from types import SimpleNamespace
+          raw = pathlib.Path(os.environ['RUNNER_TEMP'], 'ci-jobs.json').read_text()
+          decoder = json.JSONDecoder(object_hook=lambda obj: SimpleNamespace(**obj))
+          jobs = []
+          while raw.strip():
+              page, end = decoder.raw_decode(raw.lstrip())
+              raw = raw.lstrip()[end:]
+              jobs.extend(page.jobs)
+          # Exactly one aggregate from the latest attempt must have succeeded.
+          # Called workflow jobs appear beneath the caller's job name.
+          correctness = [job for job in jobs if job.name != 'development-binaries'
+                         and not job.name.startswith('development-binaries / ')]
+          expected = {'source', 'docs', 'PR checks',
+                      'Feature compatibility — default and minimal libraries (ubuntu-latest)',
+                      'Feature compatibility — sync, CLI and doctests (ubuntu-latest)'}
+          for os_name in ('ubuntu-latest',):
+              expected.update({f'lint ({os_name})', f'CI controls ({os_name})'})
+              expected.update(f'Default tests — {bundle} ({os_name})' for bundle in
+                              ('acceptance', 'integration-and-rest', 'import-and-cli'))
+              expected.update(f'Event-search support tests — {bundle} ({os_name})' for bundle in
+                              ('acceptance', 'integration-and-rest', 'import-and-cli'))
+          valid = (len(correctness) == len(expected)
+                   and {job.name for job in correctness} == expected
+                   and all(job.conclusion == 'success' for job in correctness))
+          raise SystemExit(0 if valid else 1)
+          PY_JOBS
+            then verified=true; break; fi
+          done < "$RUNNER_TEMP/ci-run-ids"
+          test "$verified" = true
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          ref: ${{ env.TRIGGER_SHA }}
+          persist-credentials: false
+      - name: Read pinned toolchain and assert native architecture
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        id: toolchain
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TRIGGER_SHA"
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu) test "$(uname -m)" = x86_64 ;;
+            aarch64-apple-darwin) test "$(uname -m)" = arm64 ;;
+            *) exit 1 ;;
+          esac
+          python3 - <<'PY_TOOLCHAIN' >> "$GITHUB_OUTPUT"
+          import tomllib
+          print('channel=' + tomllib.load(open('rust-toolchain.toml', 'rb'))['toolchain']['channel'])
+          PY_TOOLCHAIN
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          path: ${{ env.CG_MODEL_CACHE_ROOT }}
+          key: cg-nomic-${{ runner.os }}-${{ hashFiles('crates/context-graph/src/embedder/nomic.rs') }}
+      - name: Build, package and smoke the published archive
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p context-graph-cli --target "$TARGET"
+          mkdir -p "$RUNNER_TEMP/package" "$RUNNER_TEMP/assets"
+          cp "target/$TARGET/release/cg" LICENSE "$RUNNER_TEMP/package/"
+          python3 - <<'PY_README'
+          import os, pathlib
+          readme = pathlib.Path('README.md').read_text().split('## First import and search')[0]
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'package', 'README.md').write_text(readme)
+          PY_README
+          tar -czf "$RUNNER_TEMP/assets/cg-${TARGET}.tar.gz" -C "$RUNNER_TEMP/package" cg LICENSE README.md
+          python3 - "$RUNNER_TEMP/assets/cg-${TARGET}.tar.gz.sha256" "$RUNNER_TEMP/assets/cg-${TARGET}.json" <<'PY_RECEIPT'
+          import hashlib, json, os, pathlib, re, subprocess, sys, tomllib
+          target = os.environ['TARGET']
+          assets = pathlib.Path(os.environ['RUNNER_TEMP'], 'assets')
+          name = f'cg-{target}.tar.gz'
+          digest = hashlib.sha256((assets / name).read_bytes()).hexdigest()
+          pathlib.Path(sys.argv[1]).write_text(f'{digest}  {name}\n')
+          version = tomllib.load(open('crates/cg-cli/Cargo.toml', 'rb'))['package']['version']
+          if isinstance(version, dict):
+              version = tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version']
+          receipt = dict(context_graph_sha=os.environ['TRIGGER_SHA'],
+                         contextdb_rev=re.search(r'contextdb[?]rev=([0-9a-f]{40})', pathlib.Path('Cargo.lock').read_text())[1],
+                         rustc_vV=subprocess.check_output(['rustc', '-vV'], text=True), target=target,
+                         runner_image={'os': os.environ['RUNNER_OS'], 'arch': os.environ['RUNNER_ARCH'],
+                                       'image': os.environ['ImageOS'], 'version': os.environ['ImageVersion']},
+                         version=version, sha256=digest, run_id=os.environ['GITHUB_RUN_ID'],
+                         run_attempt=os.environ['GITHUB_RUN_ATTEMPT'])
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(receipt, sort_keys=True, indent=2) + '\n')
+          PY_RECEIPT
+          smoke=$(mktemp -d)
+          tar -xzf "$RUNNER_TEMP/assets/cg-${TARGET}.tar.gz" -C "$smoke"
+          "$smoke/cg" --version
+          "$smoke/cg" --help
+          python3 scripts/development-build-smoke.py "$smoke/cg"
+      - name: Explain skipped publication for a different event source
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        if: github.sha != env.TRIGGER_SHA
+        run: echo 'Publication and attestation skipped because github.sha differs from the built trigger SHA.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        env:
+          CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+        with:
+          name: development-${{ matrix.target }}
+          path: ${{ runner.temp }}/assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    concurrency:
+      group: build-publish
+      cancel-in-progress: false
+      queue: max
+    env:
+      GH_REPO: ${{ github.repository }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: development-*
+          path: artifacts
+          merge-multiple: true
+      - name: Bind the workflow revision to the built source and every receipt
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$TRIGGER_SHA"
+          python3 - <<'PY_BIND'
+          import json, os, pathlib
+          for target in ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin'):
+              receipt = json.loads(pathlib.Path(f'artifacts/cg-{target}.json').read_text())
+              if receipt['context_graph_sha'] != os.environ['GITHUB_SHA']:
+                  raise SystemExit('receipt source differs from workflow revision')
+          PY_BIND
+      - name: Validate the exact assets and receipts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_VALIDATE'
+          import hashlib, json, os, pathlib, re
+          root = pathlib.Path('artifacts')
+          targets = ['x86_64-unknown-linux-gnu', 'aarch64-apple-darwin']
+          expected = {f'cg-{t}{s}' for t in targets for s in ['.tar.gz', '.tar.gz.sha256', '.json']}
+          assert {p.name for p in root.iterdir()} == expected, 'unexpected asset set'
+          assert all(p.is_file() and not p.is_symlink() for p in root.iterdir()), 'non-file asset'
+          receipts = []
+          for target in targets:
+              name = f'cg-{target}.tar.gz'
+              receipt = json.loads((root / f'cg-{target}.json').read_text())
+              digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+              assert receipt['context_graph_sha'] == os.environ['TRIGGER_SHA'], 'source mismatch'
+              assert re.fullmatch(r'[0-9a-f]{40}', receipt['context_graph_sha'])
+              assert str(receipt['run_id']) == os.environ['GITHUB_RUN_ID'], 'run mismatch'
+              assert str(receipt['run_attempt']) == os.environ['GITHUB_RUN_ATTEMPT'], 'attempt mismatch'
+              assert receipt['target'] == target and receipt['sha256'] == digest, 'receipt mismatch'
+              assert (root / (name + '.sha256')).read_text() == f'{digest}  {name}\n', 'checksum mismatch'
+              assert re.fullmatch(r'[0-9a-f]{40}', receipt['contextdb_rev'])
+              assert re.fullmatch(r'[0-9A-Za-z.+-]+', receipt['version'])
+              assert receipt['rustc_vV'] and receipt['runner_image']
+              receipts.append(receipt)
+          assert receipts[0]['version'] == receipts[1]['version'], 'version disagreement'
+          assert receipts[0]['contextdb_rev'] == receipts[1]['contextdb_rev'], 'dependency disagreement'
+          PY_VALIDATE
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: artifacts/*
+      - name: Publish only if the selected commit is still the dev tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_NOTES'
+          import datetime, json, os, pathlib
+          receipt = json.loads(pathlib.Path('artifacts/cg-x86_64-unknown-linux-gnu.json').read_text())
+          date = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+          title = f"Development {receipt['version']} | CG {receipt['context_graph_sha']} | ContextDB {receipt['contextdb_rev']} | {date}"
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'release-title').write_text(title)
+          notes = f"Development build, not a stable release.\n\nVersion: {receipt['version']}\nContext Graph SHA: {receipt['context_graph_sha']}\nContextDB rev: {receipt['contextdb_rev']}\nDate: {date}\n\nSingle rolling build with write-once run-named copies retained for the newest three complete publications plus the stable receipt group.\n"
+          names = [f"cg-{target}-{os.environ['TRIGGER_SHA'][:12]}-r{os.environ['GITHUB_RUN_ID']}a{os.environ['GITHUB_RUN_ATTEMPT']}{suffix}"
+                   for target in ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')
+                   for suffix in ('.tar.gz', '.tar.gz.sha256', '.json')]
+          notes += '\nRun-named downloads:\n' + '\n'.join('- ' + name for name in names) + '\n'
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'release-notes').write_text(notes)
+          PY_NOTES
+          check_tip() {
+            tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/dev" --jq .object.sha)
+            if [[ "$TRIGGER_SHA" != "$tip" ]]; then
+              echo 'dev advanced; skip stale publication' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          }
+          check_tip
+          # Capture the authoritative POST object; only failed creation permits rediscovery.
+          python3 - <<'PY_RELEASE' > "$RUNNER_TEMP/release-id"
+          import json, os, re, subprocess
+          repo = 'repos/' + os.environ['GITHUB_REPOSITORY']
+          def api(endpoint, *args):
+              return json.loads(subprocess.check_output(['gh', 'api', endpoint, *args]))
+          def listing():
+              pages = api(repo + '/releases?per_page=100', '--paginate', '--slurp', '-H', 'Cache-Control: no-cache')
+              matches = [r for page in pages for r in page if r['tag_name'] == 'dev-latest']
+              if len(matches) > 1:
+                  raise SystemExit('multiple dev-latest releases; publication refused')
+              return matches
+          def guard(release):
+              if not (type(release.get('id')) is int and release['id'] > 0
+                      and release.get('tag_name') == 'dev-latest'
+                      and release.get('prerelease') is True
+                      and type(release.get('draft')) is bool
+                      and not release.get('immutable', False)):
+                  raise SystemExit('invalid rolling release ID/object')
+          matches = listing()
+          if not matches:
+              branch = api(repo)['default_branch']
+              bootstrap = api(repo + '/git/ref/heads/' + branch)['object']['sha']
+              if not re.fullmatch(r'[0-9a-f]{40}', bootstrap):
+                  raise SystemExit('invalid bootstrap SHA')
+              try:
+                  release = api(repo + '/releases', '--method', 'POST',
+                      '-f', 'tag_name=dev-latest', '-f', 'target_commitish=' + bootstrap,
+                      '-F', 'draft=true', '-F', 'prerelease=true', '-f', 'make_latest=false',
+                      '-f', 'name=Development binaries pending', '-f', 'body=Uploads pending.')
+              except subprocess.CalledProcessError:
+                  matches = listing()
+                  if len(matches) != 1:
+                      raise SystemExit('release POST failed; no unique release in fresh lookup')
+              else:
+                  guard(release)
+                  if not release['draft'] or release.get('target_commitish') != bootstrap:
+                      raise SystemExit('created release must be hidden at bootstrap SHA')
+          if matches:
+              guard(matches[0])
+              release = api(repo + '/releases/' + str(matches[0]['id']))
+              guard(release)
+              if release['id'] != matches[0]['id']:
+                  raise SystemExit('release identity changed')
+          print(release['id'])
+          PY_RELEASE
+          release_id=$(cat "$RUNNER_TEMP/release-id")
+          get_assets() {
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" -H 'Cache-Control: no-cache' > "$RUNNER_TEMP/asset-pages.json"
+            python3 - <<'PY_ASSETS'
+          import json, os, pathlib
+          pages = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'asset-pages.json').read_text())
+          assets = [a for page in pages for a in page]
+          if (any(type(a.get('id')) is not int or a['id'] <= 0 or not isinstance(a.get('name'), str) for a in assets)
+                  or len({a['id'] for a in assets}) != len(assets)
+                  or len({a['name'] for a in assets}) != len(assets)):
+              raise SystemExit('invalid or duplicate remote asset')
+          print(json.dumps({'assets': assets}))
+          PY_ASSETS
+          }
+          upload_asset() {
+            local name="$1"
+            if [[ "${2:-}" == clobber ]]; then
+              get_assets > "$RUNNER_TEMP/clobber-assets.json"
+              asset_id=$(python3 - "$name" <<'PY_CLOBBER'
+          import json, os, pathlib, sys
+          assets = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'clobber-assets.json').read_text())['assets']
+          print(next((a['id'] for a in assets if a['name'] == sys.argv[1]), ''))
+          PY_CLOBBER
+              )
+              if [[ -n "$asset_id" ]]; then
+                check_tip
+                gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" --method DELETE
+              fi
+            fi
+            check_tip
+            gh api "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$name" --method POST -H 'Content-Type: application/octet-stream' --input "artifacts/$name"
+          }
+          python3 - <<'PY_COPIES'
+          import os, pathlib
+          root = pathlib.Path('artifacts')
+          sha = os.environ['TRIGGER_SHA'][:12] + '-r' + os.environ['GITHUB_RUN_ID'] + 'a' + os.environ['GITHUB_RUN_ATTEMPT']
+          for target in ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin'):
+              for suffix in ('.tar.gz', '.tar.gz.sha256', '.json'):
+                  source = root / f'cg-{target}{suffix}'
+                  data = source.read_bytes()
+                  if suffix == '.tar.gz.sha256':
+                      data = data.replace(f'cg-{target}.tar.gz'.encode(), f'cg-{target}-{sha}.tar.gz'.encode())
+                  (root / f'cg-{target}-{sha}{suffix}').write_bytes(data)
+          PY_COPIES
+          get_assets > "$RUNNER_TEMP/existing-assets.json"
+          python3 - <<'PY_EXISTING'
+          import json, os, pathlib
+          assets = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'existing-assets.json').read_text())['assets']
+          names = {asset['name'] for asset in assets}
+          copies = {path.name for path in pathlib.Path('artifacts').iterdir() if '-r' in path.name}
+          if names & copies:
+              raise SystemExit('run-named asset already exists; publication refused')
+          PY_EXISTING
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            for suffix in .tar.gz .tar.gz.sha256 .json; do
+              name="cg-${target}-${TRIGGER_SHA:0:12}-r${GITHUB_RUN_ID}a${GITHUB_RUN_ATTEMPT}${suffix}"
+              upload_asset "$name"
+            done
+          done
+          get_assets > "$RUNNER_TEMP/uploaded-assets.json"
+          python3 - <<'PY_READBACK'
+          import hashlib, json, os, pathlib, subprocess
+          assets = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'uploaded-assets.json').read_text())['assets']
+          remote = {asset['name']: asset for asset in assets}
+          root = pathlib.Path('artifacts')
+          for path in sorted(root.iterdir()):
+              if '-r' not in path.name:
+                  continue
+              data = subprocess.check_output(['gh', 'api',
+                  f'repos/{os.environ["GITHUB_REPOSITORY"]}/releases/assets/{remote[path.name]["id"]}',
+                  '-H', 'Accept: application/octet-stream'])
+              if hashlib.sha256(data).digest() != hashlib.sha256(path.read_bytes()).digest():
+                  raise SystemExit('run-named asset read-back mismatch: ' + path.name)
+          PY_READBACK
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            for suffix in .tar.gz .tar.gz.sha256 .json; do
+              check_tip
+              upload_asset "cg-${target}${suffix}" clobber
+            done
+          done
+          check_tip
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" --method PATCH -F draft=false -F prerelease=true -f make_latest=false -f "name=$(cat "$RUNNER_TEMP/release-title")" -F "body=@$RUNNER_TEMP/release-notes"
+          get_assets > "$RUNNER_TEMP/release-assets.json"
+          python3 - <<'PY_PRUNE' > "$RUNNER_TEMP/prune-names"
+          import json, os, pathlib, re, subprocess
+          assets = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'release-assets.json').read_text())['assets']
+          remote = {asset['name']: asset for asset in assets}
+          targets = ('x86_64-unknown-linux-gnu', 'aarch64-apple-darwin')
+          suffixes = ('.tar.gz', '.tar.gz.sha256', '.json')
+          pattern = re.compile(r'^cg-(?:x86_64-unknown-linux-gnu|aarch64-apple-darwin)-([a-f0-9]{12}-r[0-9]+a[0-9]+)(?:\.tar\.gz(?:\.sha256)?|\.json)$')
+          groups = {}
+          for asset in assets:
+              match = pattern.fullmatch(asset['name'])
+              if match:
+                  groups.setdefault(match[1], []).append(asset)
+          complete = {}
+          for identity, members in groups.items():
+              expected = {f'cg-{target}-{identity}{suffix}' for target in targets for suffix in suffixes}
+              if {asset['name'] for asset in members} == expected:
+                  complete[identity] = max(asset['created_at'] for asset in members)
+          keep = set(sorted(complete, key=lambda key: (complete[key], key), reverse=True)[:3])
+          # Protect every complete group whose receipt equals a current stable receipt.
+          for target in targets:
+              stable = subprocess.check_output(['gh', 'api',
+                  f'repos/{os.environ["GITHUB_REPOSITORY"]}/releases/assets/{remote[f"cg-{target}.json"]["id"]}',
+                  '-H', 'Accept: application/octet-stream'])
+              receipt = json.loads(stable)
+              identity = (receipt['context_graph_sha'][:12] + '-r' + str(receipt['run_id'])
+                          + 'a' + str(receipt['run_attempt']))
+              if identity in complete:
+                  candidate = subprocess.check_output(['gh', 'api',
+                      f'repos/{os.environ["GITHUB_REPOSITORY"]}/releases/assets/{remote[f"cg-{target}-{identity}.json"]["id"]}',
+                      '-H', 'Accept: application/octet-stream'])
+                  if candidate != stable:
+                      raise SystemExit('stable receipt differs from its run group')
+                  keep.add(identity)
+          for identity in sorted(complete):
+              if identity not in keep:
+                  for asset in groups[identity]:
+                      print(asset['id'])
+          PY_PRUNE
+          while read -r asset_id; do
+            check_tip
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" --method DELETE
+          done < "$RUNNER_TEMP/prune-names"

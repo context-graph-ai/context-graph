@@ -2,6 +2,7 @@
 
 ![context-graph: memory with evidence](assets/banner.svg)
 
+[![CI](https://github.com/context-graph-ai/context-graph/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/context-graph-ai/context-graph/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust 1.94.1](https://img.shields.io/badge/Rust-1.94.1-orange)](rust-toolchain.toml)
 
@@ -16,23 +17,49 @@ Use `cg forget` to remove selected imported history from subsequent searches. <!
 
 Maintained by the [context-graph-ai organisation on GitHub](https://github.com/context-graph-ai), under the [Apache-2.0 licence](LICENSE).
 
-## Build from source
+## Download a development build
 
-Have Git and rustup available, then build from the repository root:
+Development build, not a stable release. The first development build is published by the first run of the Build development binaries workflow. <!-- enforced by: `ci_runs_cargo_deny_and_cargo_expand_symbol_check` -->
 
 ```sh
-git clone https://github.com/context-graph-ai/context-graph.git
-cd context-graph
-cargo install --locked --path crates/cg-cli
+set -eu
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+  Darwin/arm64) target=aarch64-apple-darwin ;;
+  *) echo "No development binary for this platform" >&2; exit 1 ;;
+esac
+base=https://github.com/context-graph-ai/context-graph/releases/download/dev-latest
+curl -fLO "$base/cg-$target.tar.gz"
+curl -fLO "$base/cg-$target.tar.gz.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "cg-$target.tar.gz.sha256"
+else
+  shasum -a 256 -c "cg-$target.tar.gz.sha256"
+fi
+curl -fLO "$base/cg-$target.json"
+python3 - "$target" <<'PY_RECEIPT'
+import hashlib, json, pathlib, sys
+stem = 'cg-' + sys.argv[1]
+digest = hashlib.sha256(pathlib.Path(stem + '.tar.gz').read_bytes()).hexdigest()
+receipt = json.loads(pathlib.Path(stem + '.json').read_text())
+if receipt['sha256'] != digest:
+    raise SystemExit('Receipt digest mismatch; download a complete matching asset set again')
+print('Verified source commit:', receipt['context_graph_sha'])
+PY_RECEIPT
+tar -xzf "cg-$target.tar.gz"
+./cg --version
+export PATH="$PWD:$PATH"
 cg model fetch --defaults
 ```
 
-See [Contributing](CONTRIBUTING.md#build-from-source) for build details.
+<!-- concept -->
+Use the [download guide](docs/download.md) for wget, receipts and provenance verification, or the newest complete run-named fallback if verification fails. The receipt identifies the source commit, workflow run and attempt. <!-- enforced by: `ci_runs_cargo_deny_and_cargo_expand_symbol_check` --> For a source build, see [Contributing](CONTRIBUTING.md#build-from-source).
 
 The pinned toolchain in `rust-toolchain.toml` is Rust **1.94.1**. <!-- enforced by: `readme_states_the_rust_version_rust_toolchain_toml_pins` -->
 
-ContextDB is pinned to `5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9` in the manifests and lockfile. <!-- enforced by: `manifests_lockfile_and_readme_name_the_same_exact_contextdb_revision` -->
+ContextDB is pinned to `bc9cce955eb85fb1488f5304426eedeb6d97e905` in the manifests and lockfile. <!-- enforced by: `manifests_lockfile_and_readme_name_the_same_exact_contextdb_revision` -->
 
+Linux is required by `PR checks`; macOS runs in the separate, nonblocking `macOS advisory` workflow. See the [macOS qualification follow-up](.github/CI.md#macos-qualification-follow-up). <!-- enforced by: `cg_github_actions_workflow_runs_on_matrix_of_macos_latest_ubuntu_latest_and_documents_the_deliberate_windows_exclusion` -->
 
 The default local Nomic model download is 546,938,168 bytes (about 547 MB). <!-- enforced by: `first_touch_lazy_fetch_observer_event_payload_carries_resolved_source_and_byte_budget` -->
 

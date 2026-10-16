@@ -72,6 +72,7 @@ static NOMIC_MODEL_CACHE: OnceLock<Mutex<HashMap<NomicModelCacheKey, Arc<LoadedN
 struct NomicModelCacheKey {
     model_dir: PathBuf,
     pinned_revision: Option<String>,
+    installed_revision: Option<String>,
 }
 
 #[derive(Clone)]
@@ -83,8 +84,9 @@ pub struct NomicTextEmbedder {
     /// What the artifact this embedder resolves to is, once there are files to judge: the verified
     /// canonical event-history artifact, or something installed that is not canonical. Decided
     /// once, on first use over a present installation, and shared by every clone of this embedder
-    /// — the check reads the revision marker, the model config and the tokenizer, never the
-    /// weights, and preparing a passage must never pay it again. An installation that is simply
+    /// — config/tokenizer parsing is remembered; publication state and revision are still checked
+    /// under the cache lock before reusing a canonical verdict. Neither check reads weights.
+    /// An installation that is simply
     /// not there yet is deliberately NOT remembered: see
     /// [`NomicTextEmbedder::event_history_artifact`].
     canonical_event_history_artifact: Arc<OnceLock<EventHistoryArtifact>>,
@@ -174,46 +176,69 @@ impl NomicTextEmbedder {
             return Err(CgError::TextEmbedderDisabled);
         }
         let model_dir = resolve_model_dir(&self.config)?;
-        let cache_key = NomicModelCacheKey {
-            model_dir: model_dir.clone(),
-            pinned_revision: self.config.pinned_revision.clone(),
-        };
-        let cache = NOMIC_MODEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut guard = cache
-            .lock()
-            .map_err(|_| CgError::Engine("nomic model cache lock poisoned".to_string()))?;
-        if let Some(model) = guard.get(&cache_key) {
-            let loaded = Arc::clone(model);
-            let revision_path = model_dir.join("REVISION");
-            check_revision_marker(&revision_path, self.config.pinned_revision.as_deref())?;
-            self.observe(EmbedderLoadEvent::CacheHit {
-                model_id: NOMIC_MODEL_ID.to_string(),
-                destination: model_dir,
+        // Keep the cache directory stable from revision checking through all model reads.
+        // The catalog's mutating operations use the same persistent .lock inode.
+        if !(model_dir
+            .try_exists()
+            .map_err(|err| cache_io_error(&model_dir, err))?
+            || (matches!(fetch, FetchPolicy::MayInstall) && config_can_fetch(&self.config)))
+        {
+            return Err(CgError::EmbedderModelNotAvailable {
+                source: source_name(&self.config),
+                path: model_dir.display().to_string(),
             });
-            return Ok(loaded);
         }
+        NomicCacheAccess::with(&model_dir, |access| {
+            let mut cache_key = NomicModelCacheKey {
+                model_dir: model_dir.clone(),
+                pinned_revision: self.config.pinned_revision.clone(),
+                installed_revision: installed_revision(&model_dir)?,
+            };
+            let cache = NOMIC_MODEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = cache
+                .lock()
+                .map_err(|_| CgError::Engine("nomic model cache lock poisoned".to_string()))?;
+            if let Some(model) = guard.get(&cache_key) {
+                let loaded = Arc::clone(model);
+                let revision_path = model_dir.join("REVISION");
+                check_revision_marker(&revision_path, self.config.pinned_revision.as_deref())?;
+                self.observe(EmbedderLoadEvent::CacheHit {
+                    model_id: NOMIC_MODEL_ID.to_string(),
+                    destination: model_dir.clone(),
+                });
+                return Ok(loaded);
+            }
 
-        self.ensure_cache_ready(&model_dir, fetch)?;
-        self.observe(EmbedderLoadEvent::LoadStarted {
-            model_id: NOMIC_MODEL_ID.to_string(),
-            byte_size: None,
-            destination: model_dir.clone(),
-        });
-        let (artifacts, elapsed) = timed(|| load_nomic_artifacts(&model_dir));
-        let loaded = Arc::new(artifacts?);
-        self.observe(EmbedderLoadEvent::LoadCompleted {
-            model_id: NOMIC_MODEL_ID.to_string(),
-            byte_size: file_system::metadata(model_dir.join("model.safetensors"))
-                .map(|metadata| metadata.len())
-                .ok(),
-            destination: model_dir,
-            elapsed,
-        });
-        guard.insert(cache_key, Arc::clone(&loaded));
-        Ok(loaded)
+            self.ensure_cache_ready(&model_dir, fetch, access)?;
+            // A successful install may have changed the revision since the lookup above.
+            // Unpinned warm readers must not reuse a different installed revision's model.
+            cache_key.installed_revision = installed_revision(&model_dir)?;
+            self.observe(EmbedderLoadEvent::LoadStarted {
+                model_id: NOMIC_MODEL_ID.to_string(),
+                byte_size: None,
+                destination: model_dir.clone(),
+            });
+            let (artifacts, elapsed) = timed(|| load_nomic_artifacts(&model_dir));
+            let loaded = Arc::new(artifacts?);
+            self.observe(EmbedderLoadEvent::LoadCompleted {
+                model_id: NOMIC_MODEL_ID.to_string(),
+                byte_size: file_system::metadata(model_dir.join("model.safetensors"))
+                    .map(|metadata| metadata.len())
+                    .ok(),
+                destination: model_dir.clone(),
+                elapsed,
+            });
+            guard.insert(cache_key, Arc::clone(&loaded));
+            Ok(loaded)
+        })
     }
 
-    fn ensure_cache_ready(&self, model_dir: &Path, fetch: FetchPolicy) -> Result<()> {
+    fn ensure_cache_ready(
+        &self,
+        model_dir: &Path,
+        fetch: FetchPolicy,
+        access: &NomicCacheAccess,
+    ) -> Result<()> {
         if matches!(self.config.source, ModelSource::Disabled) {
             return Ok(());
         }
@@ -264,39 +289,48 @@ impl NomicTextEmbedder {
                     model_dir.display()
                 ))
             })?;
-            let repo = match &self.config.source {
-                ModelSource::HuggingFace { repo } => repo.as_str(),
-                _ => unreachable!("source checked above"),
-            };
-            let revision = self.config.pinned_revision.as_deref().unwrap_or("main");
-            download_hf_file(
-                repo,
-                revision,
-                "model.safetensors",
-                &model_path,
-                NOMIC_MODEL_DOWNLOAD_LIMIT_BYTES,
-            )?;
-            download_hf_file(
-                repo,
-                revision,
-                "tokenizer.json",
-                &tokenizer_path,
-                64 * 1024 * 1024,
-            )?;
-            download_hf_file(repo, revision, "config.json", &config_path, 1024 * 1024)?;
-            file_system::write(&revision_path, revision).map_err(|err| {
-                CgError::Engine(format!(
-                    "nomic cache revision write failed at {}: {err}",
-                    revision_path.display()
-                ))
-            })?;
-            cache_files_parse(
-                &model_path,
-                &tokenizer_path,
-                &config_path,
-                &revision_path,
-                self.config.pinned_revision.as_deref(),
-            )
+            let staging = NomicDownloadDirectory::new(model_dir)?;
+            let staged = (|| -> Result<()> {
+                let repo = match &self.config.source {
+                    ModelSource::HuggingFace { repo } => repo.as_str(),
+                    _ => unreachable!("source checked above"),
+                };
+                let revision = self.config.pinned_revision.as_deref().unwrap_or("main");
+                download_hf_file(
+                    repo,
+                    revision,
+                    "model.safetensors",
+                    &staging.0.join("model.safetensors"),
+                    NOMIC_MODEL_DOWNLOAD_LIMIT_BYTES,
+                )?;
+                download_hf_file(
+                    repo,
+                    revision,
+                    "tokenizer.json",
+                    &staging.0.join("tokenizer.json"),
+                    64 * 1024 * 1024,
+                )?;
+                download_hf_file(
+                    repo,
+                    revision,
+                    "config.json",
+                    &staging.0.join("config.json"),
+                    1024 * 1024,
+                )?;
+                file_system::write(staging.0.join("REVISION"), revision).map_err(|err| {
+                    CgError::Engine(format!(
+                        "nomic cache revision write failed at {}: {err}",
+                        revision_path.display()
+                    ))
+                })?;
+                publish_download(
+                    access,
+                    &staging.0,
+                    model_dir,
+                    self.config.pinned_revision.as_deref(),
+                )
+            })();
+            staged.map_err(|error| artifact_error_at_destination(error, &staging.0, model_dir))
         });
         fetched?;
         let model_byte_size = file_system::metadata(&model_path)
@@ -431,8 +465,9 @@ impl NomicTextEmbedder {
     /// A verdict reached on files that are actually there — canonical, or installed and not
     /// canonical — is decided once and remembered for the life of the embedder and every clone of
     /// it: that check reads the revision marker, the model config and the tokenizer, never the
-    /// weights, so preparing fifty thousand passages costs it exactly once and the weights are
-    /// still read only by the loader.
+    /// weights. Config/tokenizer parsing happens once; repeated admission still locks the cache,
+    /// rejects pending publications and checks that the installed revision has not changed.
+    /// The weights are still read only by the loader.
     ///
     /// "Nothing installed" is NOT a verdict about an artifact and is never remembered. A handle
     /// held by a running application that installs the model on first use would otherwise keep
@@ -442,6 +477,27 @@ impl NomicTextEmbedder {
     /// appears later is admitted only if it is the canonical artifact.
     fn event_history_artifact(&self) -> EventHistoryArtifact {
         if let Some(decided) = self.canonical_event_history_artifact.get() {
+            if *decided == EventHistoryArtifact::Canonical {
+                let Ok(model_dir) = resolve_model_dir(&self.config) else {
+                    return EventHistoryArtifact::Noncanonical;
+                };
+                if !model_dir.exists() {
+                    return EventHistoryArtifact::Absent;
+                }
+                let Ok(_access) = NomicCacheAccess::acquire(&model_dir) else {
+                    return EventHistoryArtifact::Noncanonical;
+                };
+                // Cache expensive canonical parsing, never admission of a pending publisher
+                // or a different revision installed since that parsing took place.
+                if check_revision_marker(
+                    &model_dir.join("REVISION"),
+                    Some(crate::embedder::NOMIC_DEFAULT_REVISION),
+                )
+                .is_err()
+                {
+                    return EventHistoryArtifact::Noncanonical;
+                }
+            }
             return *decided;
         }
         let observed = self.observe_event_history_artifact();
@@ -458,6 +514,12 @@ impl NomicTextEmbedder {
             return EventHistoryArtifact::Noncanonical;
         }
         let Ok(model_dir) = resolve_model_dir(&self.config) else {
+            return EventHistoryArtifact::Noncanonical;
+        };
+        if !model_dir.exists() {
+            return EventHistoryArtifact::Absent;
+        }
+        let Ok(_access) = NomicCacheAccess::acquire(&model_dir) else {
             return EventHistoryArtifact::Noncanonical;
         };
         if !event_history_artifact_files_installed(&model_dir) {
@@ -522,7 +584,8 @@ impl NomicTextEmbedder {
     /// applied again once the load has succeeded, when an installation is present by definition, so
     /// a noncanonical one is refused before the role method continues rather than being stamped
     /// with the reserved identity. After the first verdict reached on present files, repeating it
-    /// costs nothing: that verdict is remembered, and neither pass reads the weights.
+    /// reuses the parsed verdict while checking publication state and revision under the cache
+    /// lock. Neither admission pass reads the weights.
     fn load_model_admitted_for_event_search(&self) -> Result<Arc<LoadedNomicModel>> {
         self.require_event_search_capability()?;
         let loaded = self.load_model_without_installing()?;
@@ -935,7 +998,8 @@ impl EventHistoryTextEmbedder {
                 )));
             }
             EventHistoryArtifact::Noncanonical => {
-                let reason = verify_local_event_history_artifact(&model_dir)
+                let reason = NomicCacheAccess::acquire(&model_dir)
+                    .and_then(|_access| verify_local_event_history_artifact(&model_dir))
                     .err()
                     .map_or_else(
                         || "it is not the canonical installed revision".to_string(),
@@ -1453,6 +1517,111 @@ fn load_nomic_artifacts(model_dir: &Path) -> Result<LoadedNomicModel> {
     })
 }
 
+#[path = "nomic_publication.rs"]
+mod publication;
+#[cfg(test)]
+use publication::NOMIC_ARTIFACT_FILES;
+use publication::{NomicCacheAccess, NomicTemporaryArtifact, cache_io_error, publish_artifact};
+
+/// Each fetch owns its directory, including cleanup after an error or unwinding.
+struct NomicDownloadDirectory(PathBuf);
+
+impl NomicDownloadDirectory {
+    fn new(model_dir: &Path) -> Result<Self> {
+        let path = model_dir.join(format!(".download-{}", uuid::Uuid::new_v4()));
+        file_system::create_dir(&path).map_err(|err| {
+            CgError::Engine(format!(
+                "nomic download directory create failed at {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for NomicDownloadDirectory {
+    fn drop(&mut self) {
+        let _ = file_system::remove_dir_all(&self.0);
+    }
+}
+
+// Temporary paths are private installation details; typed failures still name the selected cache.
+fn artifact_error_at_destination(error: CgError, staging: &Path, model_dir: &Path) -> CgError {
+    let resolved = |path: String| {
+        Path::new(&path)
+            .strip_prefix(staging)
+            .map(|relative| model_dir.join(relative).display().to_string())
+            .unwrap_or(path)
+    };
+    match error {
+        CgError::EmbedderModelNotAvailable { source, path } => CgError::EmbedderModelNotAvailable {
+            source,
+            path: resolved(path),
+        },
+        CgError::EmbedderModelCorrupt { path } => CgError::EmbedderModelCorrupt {
+            path: resolved(path),
+        },
+        other => other,
+    }
+}
+
+fn installed_revision(model_dir: &Path) -> Result<Option<String>> {
+    let path = model_dir.join("REVISION");
+    match file_system::read_to_string(&path) {
+        Ok(revision) => Ok(Some(revision.trim().to_string())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(cache_io_error(&path, error)),
+    }
+}
+
+fn publish_download(
+    access: &NomicCacheAccess,
+    staging: &Path,
+    model_dir: &Path,
+    revision: Option<&str>,
+) -> Result<()> {
+    debug_assert_eq!(access.model_dir, model_dir);
+    access.publish(
+        staging,
+        |staging| {
+            cache_files_parse(
+                &staging.join("model.safetensors"),
+                &staging.join("tokenizer.json"),
+                &staging.join("config.json"),
+                &staging.join("REVISION"),
+                revision,
+            )
+        },
+        |_| Ok(()),
+    )
+}
+
+fn install_artifact(reader: &mut impl io::Read, destination: &Path, source: &str) -> Result<()> {
+    let path = destination.with_file_name(format!(".artifact-{}", uuid::Uuid::new_v4()));
+    let out = file_system::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| {
+            CgError::Engine(format!(
+                "nomic artifact temp create failed at {}: {err}",
+                path.display()
+            ))
+        })?;
+    // Own the cleanup only after exclusive creation succeeds.
+    let temporary = NomicTemporaryArtifact(path);
+    // Declare the handle after the guard so unwinding closes it before cleanup too.
+    let mut out = out;
+    let copied = io::copy(reader, &mut out);
+    // Close before cleanup or rename, including on Windows and on a failed read.
+    drop(out);
+    copied.map_err(|_| CgError::EmbedderModelNotAvailable {
+        source: source.to_string(),
+        path: destination.display().to_string(),
+    })?;
+    publish_artifact(&temporary.0, destination)
+}
+
 fn download_hf_file(
     repo: &str,
     revision: &str,
@@ -1461,7 +1630,6 @@ fn download_hf_file(
     byte_limit: u64,
 ) -> Result<()> {
     let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{file_name}");
-    let tmp = destination.with_extension("download");
     let mut response = ureq::get(&url)
         .call()
         .map_err(|_| CgError::EmbedderModelNotAvailable {
@@ -1469,32 +1637,12 @@ fn download_hf_file(
             path: destination.display().to_string(),
         })?;
     let mut reader = response.body_mut().with_config().limit(byte_limit).reader();
-    let mut out = file_system::File::create(&tmp).map_err(|err| {
-        CgError::Engine(format!(
-            "nomic artifact temp create failed at {}: {err}",
-            tmp.display()
-        ))
-    })?;
-    io::copy(&mut reader, &mut out).map_err(|_| CgError::EmbedderModelNotAvailable {
-        source: format!("HuggingFace({repo})"),
-        path: destination.display().to_string(),
-    })?;
-    if destination.exists() {
-        file_system::remove_file(destination).map_err(|err| {
-            CgError::Engine(format!(
-                "nomic artifact replace failed at {}: {err}",
-                destination.display()
-            ))
-        })?;
-    }
-    file_system::rename(&tmp, destination).map_err(|err| {
-        CgError::Engine(format!(
-            "nomic artifact move failed {} -> {}: {err}",
-            tmp.display(),
-            destination.display()
-        ))
-    })
+    install_artifact(&mut reader, destination, &format!("HuggingFace({repo})"))
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/nomic_artifact_install.rs"]
+mod artifact_install_tests;
 
 fn cache_file_present(path: &Path) -> Result<bool> {
     path.try_exists().map_err(|err| {
@@ -1601,3 +1749,7 @@ fn timed<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration) {
 fn candle_err(err: candle_core::Error) -> CgError {
     CgError::Engine(format!("nomic candle tensor: {err}"))
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/nomic_cached_admission.rs"]
+mod cached_admission_tests;

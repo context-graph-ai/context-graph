@@ -143,13 +143,13 @@
 # crate outside the ratchet, and the audit reports it rather than exempting it.
 "candle-embeddinggemma" = 7
 "cg-bench" = 10
-"cg-catalog" = 99
+"cg-catalog" = 118
 "cg-cli-conventions" = 0
 "cg-connector-claude-code" = 23
 "cg-node-fs" = 3
 "cg-vision-embedder" = 5
 # Tests in test_estate_audit.rs are excluded from the default-tier inventory.
-"context-graph" = 1317
+"context-graph" = 1338
 "context-graph-cli" = 279
 
 [gate_wall_seconds_policy]
@@ -194,6 +194,8 @@ slack_seconds = 0.235
 "candle-embeddinggemma::acceptance" = 0.171
 "cg-bench::bench_contract" = 0.096
 "cg-bench::driver_contract" = 0.612
+# Catalog library: complete five-case native gate-profile JUnit; sum of per-case seconds.
+"cg-catalog" = 0.042
 "cg-catalog::acceptance" = 359.561
 "cg-catalog::production_guards" = 0.022
 "cg-connector-claude-code::history_prefix" = 0.040

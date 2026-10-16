@@ -1879,7 +1879,16 @@ fn cli_status() {
         combined(&empty)
     );
     assert!(!combined(&empty).contains("goals:"), "{}", combined(&empty));
-    assert!(combined(&first).contains("goals: 1"));
+    assert!(
+        combined(&first).contains("goals: 1"),
+        "first status exit={} stdout={:?} stderr={:?}; second status exit={} stdout={:?} stderr={:?}",
+        first.code,
+        first.stdout,
+        first.stderr,
+        second.code,
+        second.stdout,
+        second.stderr
+    );
     assert!(combined(&first).contains("decisions: 2"));
     assert!(combined(&first).contains("observations: 1"));
     assert!(combined(&second).contains("goals: 2"));
@@ -1931,7 +1940,12 @@ fn cli_status_idempotent_on_same_session_recaptured() {
             Some((1, 1, 1)),
             true,
             first_decision_id.into_iter().collect::<Vec<_>>(),
-        )
+        ),
+        "status bodies first={:?} second={:?}; exits first={} second={}",
+        output_json(&first),
+        output_json(&second),
+        first.code,
+        second.code
     );
 }
 

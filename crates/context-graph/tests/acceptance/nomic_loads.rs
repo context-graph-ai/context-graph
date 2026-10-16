@@ -277,23 +277,7 @@ fn nomic_acceptance_cache_root() -> PathBuf {
     if let Some(path) = std::env::var_os("CG_NOMIC_TEST_CACHE") {
         return PathBuf::from(path);
     }
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("cg")
-            .join("embedders");
-    }
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cache"))
-        })
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cg")
-        .join("embedders")
+    context_graph::embedder::nomic::default_cache_root()
 }
 
 fn nomic_live_config() -> EmbedderConfig {
@@ -1277,6 +1261,87 @@ fn vigil_pattern_extra_embedding_space_declares_face_reid_v1_under_dim_512_entit
     assert!(rows.iter().any(|row| {
         row.id == embedding_id && row.embedding_space_id == FACE_REID_SPACE && row.vector == vector
     }));
+}
+
+#[test]
+fn cg_github_actions_workflow_runs_on_matrix_of_macos_latest_ubuntu_latest_and_documents_the_deliberate_windows_exclusion()
+ {
+    for (filename, system, stage, aggregate) in [
+        (
+            "ci.yml",
+            "ubuntu-latest",
+            "shard-union-linux-isolated",
+            "required",
+        ),
+        (
+            "macos-advisory.yml",
+            "macos-latest",
+            "shard-union-macos",
+            "macos-advisory",
+        ),
+    ] {
+        let workflow = read_workspace_file(&format!(".github/workflows/{filename}"));
+        let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&workflow).expect("workflow YAML");
+        for job in ["lint", "controls"] {
+            assert_eq!(
+                yaml["jobs"][job]["strategy"]["matrix"]["os"],
+                serde_yaml_ng::to_value([system]).unwrap()
+            );
+        }
+        for job in ["test", "features"] {
+            let rows = yaml["jobs"][job]["strategy"]["matrix"]["include"]
+                .as_sequence()
+                .unwrap();
+            let expected_bundles = if system == "ubuntu-latest" {
+                vec!["acceptance", "import-and-cli", "integration-and-rest"]
+            } else if job == "features" {
+                vec!["integration-and-rest + import-and-cli + acceptance"]
+            } else {
+                vec!["acceptance", "integration-and-rest + import-and-cli"]
+            };
+            let mut actual_bundles = rows
+                .iter()
+                .map(|row| row["bundle"].as_str().expect("matrix bundle"))
+                .collect::<Vec<_>>();
+            actual_bundles.sort_unstable();
+            assert_eq!(actual_bundles, expected_bundles);
+            assert!(rows.iter().all(|row| row["os"].as_str() == Some(system)));
+        }
+        assert!(workflow.contains("windows-latest is intentionally excluded"));
+        assert!(workflow.contains("python3 scripts/ci-test-shards.py bundle default"));
+        assert!(
+            yaml["jobs"][aggregate]["steps"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|step| step["run"].as_str() == Some(&format!("bash scripts/gate.sh {stage}")))
+        );
+    }
+    assert!(read_workspace_file("scripts/gate.sh").contains("cargo test --workspace"));
+}
+
+/// The contributor guide discloses CI platforms and the shared artifact-cache policy.
+#[test]
+fn cg_readme_ci_section_documents_two_runner_matrix_and_shared_model_cache_root_keyed_off_embedder_source()
+ {
+    let readme = read_workspace_file("CONTRIBUTING.md");
+    let lower = readme.to_lowercase();
+
+    assert!(lower.contains("continuous integration") || lower.contains("## ci"));
+    assert!(readme.contains("Required PR test and feature jobs run on `ubuntu-latest`"));
+    assert!(readme.contains(
+        "separate `macOS advisory` workflow retains the same coverage on `macos-latest`"
+    ));
+    assert!(readme.contains("`windows-latest` is excluded deliberately"));
+    assert!(readme.contains("CG_MODEL_CACHE_ROOT` at runner temporary space"));
+    assert!(readme.contains("actions/cache"));
+    assert!(readme.contains("falls back to `~/.cache/cg/models`"));
+    assert!(readme.contains("$XDG_CACHE_HOME` replacing `~/.cache` when set"));
+    assert!(readme.contains("Key the cache on the embedder"));
+    assert!(readme.contains("source file rather than on `Cargo.lock`"));
+    assert!(readme.contains(
+        "hashFiles('workspace/context-graph/crates/context-graph/src/embedder/nomic.rs')"
+    ));
 }
 
 const EXPECTED_STORE_PUBLIC_METHODS: &[&str] = &[

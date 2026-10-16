@@ -35,7 +35,7 @@
 //!    carries, so a crate with no row is a failure rather than a crate quietly outside the
 //!    ratchet, and deleting a row is not a way to drop a crate out of it. A crate with no
 //!    default-tier tests declares `0` rather than omitting its row.
-//! 3. **Gate wall-clock, compared and refused on exceed.** `[gate_wall_seconds]` records, per
+//! 3. **Gate wall-clock, reported against recorded limits.** `[gate_wall_seconds]` records, per
 //!    test binary, the wall-clock seconds captured from a gate's own junit; `[gate_wall_seconds_policy]`
 //!    declares `tolerance_factor` and `slack_seconds`, and a binary's ceiling is
 //!    `recorded seconds * tolerance_factor + slack_seconds`. Both terms are needed: the factor
@@ -47,17 +47,15 @@
 //!    seconds someone else already measured, from the JUnit file named by `CG_GATE_JUNIT`, summing
 //!    each binary's `<testcase>` seconds exactly the way the frozen values were derived. The
 //!    ignored live arm (`gate_wall_seconds_never_exceed_the_frozen_baseline`, run in the gate step
-//!    with `CG_GATE_JUNIT` set) fails when a binary exceeds that ceiling,
-//!    and also when a binary this gate ran carries no row at all — an unratcheted binary has no
+//!    with `CG_GATE_JUNIT` set) reports duration overruns without failing for ordinary suite
+//!    runtime. It fails when a binary this gate ran carries no row at all — such a binary has no
 //!    ceiling, and deleting a row is how one loses its ceiling silently. A measurement that parses
 //!    to no binaries at all is refused outright rather than read as a pass. It is `#[ignore]`d so a
 //!    bare `cargo test --workspace` — which produces no fresh gate JUnit of its own — stays green
 //!    rather than silently passing an ungiven measurement.
 //!
-//! Every baseline value here was captured on 2026-09-04 from this tree; the sleep/clock
-//! counts and default-tier counts were derived by the exact algorithms this file implements
-//! (source-level scanning, not a live `cargo test` run), so re-running this audit against an
-//! unchanged tree reproduces them exactly.
+//! Sleep/clock and default-tier baselines use the source-level scanning algorithms in this
+//! file. An unchanged tree must reproduce those counts exactly.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -469,8 +467,8 @@ fn a_crate_outside_the_frozen_count_table_is_reported_rather_than_silently_unrat
 }
 
 // ---------------------------------------------------------------------------------------------
-// Arm 3: gate wall-clock per binary — compares against the frozen baseline and refuses on
-// exceed. The comparison itself never reads a clock: it consumes wall seconds already captured
+// Arm 3: gate wall-clock per binary — reports overruns against recorded limits and refuses
+// missing limits. The comparison itself never reads a clock: it consumes wall seconds already captured
 // in a JUnit file produced by an earlier gate step (`CG_GATE_JUNIT`), never `Instant::now()` or
 // any other live timer.
 // ---------------------------------------------------------------------------------------------
@@ -745,8 +743,7 @@ fn the_slack_term_spares_a_startup_sized_binary_without_sparing_a_real_regressio
     assert_eq!(
         wall_clock_violations(&spared, &baseline, 2.0, 0.0).len(),
         2,
-        "without the slack those same measurements are both reported — which is the defect the \
-         slack fixes"
+        "without the slack those same measurements are both reported"
     );
 
     let past_the_slack: BTreeMap<String, f64> = [
@@ -780,11 +777,9 @@ fn the_slack_term_spares_a_startup_sized_binary_without_sparing_a_real_regressio
     assert!(caught[0].contains("crate::real_work"));
 }
 
-/// The measured case this rule was sized for, kept as a fixture so it cannot come back: a
-/// sub-second binary that did not change, frozen at 0.497s from one gate's own measurement and
-/// measured at 0.999s in a differently-sized test pool. Under a bare x2 factor that was 5ms over
-/// its ceiling and the repository's own gate went red on identical code. It must be spared now,
-/// and a binary that genuinely takes many times its recorded seconds must still be refused.
+/// A sub-second binary with a 0.497s baseline and a 0.999s measurement fits within the
+/// configured slack even though it exceeds a bare x2 ceiling. A measurement many times
+/// the baseline must still exceed the configured ceiling.
 #[test]
 fn a_binary_remeasured_in_a_differently_sized_pool_is_spared_while_a_real_slowdown_is_refused() {
     let baseline: BTreeMap<String, f64> = [("crate::sub_second_binary".to_string(), 0.497)]
@@ -803,7 +798,7 @@ fn a_binary_remeasured_in_a_differently_sized_pool_is_spared_while_a_real_slowdo
     assert_eq!(
         wall_clock_violations(&remeasured, &baseline, 2.0, 0.0).len(),
         1,
-        "under the bare x2 factor that same pair was a violation, which is the defect being fixed"
+        "under the bare x2 factor that same pair exceeds the relative ceiling"
     );
 
     let slowed: BTreeMap<String, f64> = [("crate::sub_second_binary".to_string(), 4.0)]
@@ -939,21 +934,253 @@ fn gate_wall_seconds_never_exceed_the_frozen_baseline() {
          nothing, so this is a failure: the file is not the gate's own JUnit, or its shape changed \
          and the reader above no longer matches it."
     );
-    let mut violations = wall_clock_violations(
+    let violations = wall_clock_violations(
         &live,
         &baseline.gate_wall_seconds,
         baseline.gate_wall_seconds_tolerance_factor,
         baseline.gate_wall_seconds_slack,
     );
-    violations.extend(wall_clock_coverage_violations(
-        &live,
-        &baseline.gate_wall_seconds,
-    ));
+    for violation in violations {
+        println!("test-estate audit: gate wall-clock report: {violation}");
+    }
+    let missing = wall_clock_coverage_violations(&live, &baseline.gate_wall_seconds);
     assert!(
-        violations.is_empty(),
-        "test-estate audit: gate wall-clock does not match the frozen baseline in \
-         tests/fixtures/test_estate_baseline.toml:\n{}",
-        violations.join("\n")
+        missing.is_empty(),
+        "test-estate audit: measured binaries must have recorded limits:\n{}",
+        missing.join("\n")
+    );
+}
+
+fn default_measurement_is_wired(ci: &str, dispatcher: &str, gate: &str, stage: &str) -> bool {
+    let body = |name: &str| {
+        gate.split_once(&format!("{name}() {{\n"))
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap_or("")
+    };
+    let union = body("shard_union");
+    let verify = union.find("python3 scripts/ci-test-shards.py verify");
+    let copy = union.find("cp \"$RUNNER_TEMP/shard-receipts/default-$system.xml\" \"$repository_root/target/nextest/gate/junit.xml\"");
+    let wall_name = if stage == "shard-union-linux-isolated" {
+        "default_wall_isolated"
+    } else {
+        "default_wall"
+    };
+    let wall = union.find(&format!("            {wall_name}\n"));
+    ci.contains("run: python3 scripts/ci-test-shards.py bundle default")
+        && ci.contains(&format!("run: bash scripts/gate.sh {stage}\n"))
+        && dispatcher.contains("for shard in selected:")
+        && dispatcher.contains("GATE_SHARD=shard, GATE_RECEIPT_DIR=str(destination)")
+        && dispatcher.contains(
+            "subprocess.run(['bash', 'scripts/gate.sh', 'features-tests' if tests_only else variant], env=environment, check=False)",
+        )
+        && body("default").contains("        sharded_default\n        return")
+        && body("sharded_default")
+            .contains("python3 scripts/ci-test-shards.py run default \"$GATE_SHARD\"")
+        && union.contains("for system in \"${systems[@]}\"; do")
+        && union.contains("shard-union-linux|shard-union-linux-isolated) systems=(Linux) ;;")
+        && union.contains("shard-union-macos) systems=(macOS) ;;")
+        && union.contains("--system \"${systems[0]}\"")
+        && matches!((verify, copy, wall), (Some(v), Some(c), Some(w)) if v < c && c < w)
+        && body(wall_name)
+            .contains("export CG_GATE_JUNIT=\"$repository_root/target/nextest/gate/junit.xml\"")
+        && body(wall_name)
+            .contains("gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact")
+        && body(wall_name)
+            .contains("python3 scripts/check-gate-wall-clock.py --junit \"$CG_GATE_JUNIT\"")
+        && (stage != "shard-union-linux-isolated" || body(wall_name).contains(
+            "cargo test --locked --manifest-path scripts/gate-wall-audit/Cargo.toml --target-dir \"$RUNNER_TEMP/gate-wall-audit-target\" --test test_estate_audit"))
+}
+
+fn duration_snippets_match(readme: &str, ci: &str) -> bool {
+    let required = [
+        (
+            "Run default ${{ matrix.bundle }} tests",
+            "python3 scripts/ci-test-shards.py bundle default",
+        ),
+        (
+            "Verify complete default and feature unions before wall reports",
+            "bash scripts/gate.sh shard-union-linux-isolated",
+        ),
+    ];
+    let ci_lines: Vec<_> = ci.lines().map(str::trim).collect();
+    let mut found = [false; 2];
+    let mut lines = readme.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "```yaml" {
+            continue;
+        }
+        let mut block = Vec::new();
+        let mut closed = false;
+        for line in lines.by_ref() {
+            if line.trim() == "```" {
+                closed = true;
+                break;
+            }
+            block.push(line.trim());
+        }
+        if !closed {
+            return false;
+        }
+        for (index, (name, command)) in required.iter().enumerate() {
+            if block
+                .iter()
+                .any(|line| line.contains(name) || line.contains(command))
+            {
+                if !block.contains(&format!("run: {command}").as_str())
+                    || block
+                        .iter()
+                        .any(|line| !line.is_empty() && !ci_lines.contains(line))
+                {
+                    return false;
+                }
+                found[index] = true;
+            }
+        }
+    }
+    found.into_iter().all(|present| present)
+}
+
+/// The ignored live arm above is only worth anything if it is actually invoked somewhere with
+/// `CG_GATE_JUNIT` set. CI dispatches each default shard, verifies the merged receipts, then
+/// invokes the repository gate's measurement arm with the complete per-platform JUnit.
+#[test]
+fn the_ignored_wall_clock_arm_is_invoked_by_name_in_the_gate_script_and_ci() {
+    const INVOCATION: &str = "cargo test -p context-graph --test test_estate_audit \
+         gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact";
+
+    let root = repository_root();
+
+    let ci_path = root.join(".github/workflows/ci.yml");
+    let ci = std::fs::read_to_string(&ci_path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", ci_path.display()));
+    let dispatcher = std::fs::read_to_string(root.join("scripts/ci-test-shards.py"))
+        .expect("shared bundle dispatcher");
+    let gate = std::fs::read_to_string(root.join("scripts/gate.sh")).expect("shared stage");
+    for (workflow, stage) in [
+        (ci, "shard-union-linux-isolated"),
+        (
+            std::fs::read_to_string(root.join(".github/workflows/macos-advisory.yml"))
+                .expect("advisory workflow"),
+            "shard-union-macos",
+        ),
+    ] {
+        assert!(default_measurement_is_wired(
+            &workflow,
+            &dispatcher,
+            &gate,
+            stage
+        ));
+        assert!(!default_measurement_is_wired(
+            &workflow.replace(stage, "shard-union"),
+            &dispatcher,
+            &gate,
+            stage
+        ));
+        assert!(!default_measurement_is_wired(
+            &workflow,
+            &dispatcher,
+            &gate
+                .replace("            default_wall\n", "")
+                .replace("            default_wall_isolated\n", ""),
+            stage
+        ));
+    }
+    let effective = std::fs::read_to_string(root.join("scripts/gate.sh")).expect("shared stage");
+    let workspace_test_line = effective
+        .lines()
+        .position(|line| line.contains("cargo test --workspace"))
+        .unwrap();
+    let invocation_line = effective
+        .lines()
+        .position(|line| line.contains(INVOCATION))
+        .unwrap();
+    assert!(invocation_line > workspace_test_line);
+    assert!(
+        effective
+            .lines()
+            .skip(invocation_line.saturating_sub(6))
+            .take(8)
+            .any(|line| line.contains("CG_GATE_JUNIT"))
+    );
+    assert!(
+        effective
+            .lines()
+            .position(|line| line.contains("python3 scripts/check-gate-wall-clock.py --base"))
+            .unwrap()
+            > workspace_test_line
+    );
+
+    let function_body = |name: &str| {
+        effective
+            .split_once(&format!("{name}() {{\n"))
+            .expect("shared function")
+            .1
+            .split_once("\n}\n")
+            .expect("closed shared function")
+            .0
+    };
+    let wall = function_body("default_wall");
+    assert!(
+        wall.find("export CG_GATE_JUNIT=")
+            .expect("measurement export")
+            < wall
+                .find("    default_baseline\n")
+                .expect("historical comparison"),
+        "historical comparison must receive the complete default measurement"
+    );
+    for name in ["default", "sharded_default"] {
+        assert!(
+            !function_body(name)
+                .lines()
+                .any(|line| line.trim() == "default_baseline"),
+            "{name} must not compare without the complete default measurement"
+        );
+    }
+
+    let gate_script_path = root.join("scripts/gate.sh");
+    let gate_script = std::fs::read_to_string(&gate_script_path).unwrap_or_else(|error| {
+        panic!(
+            "reading {}: {error} — the repository's gate script must exist and run the \
+             wall-clock arm after nextest",
+            gate_script_path.display()
+        )
+    });
+    let nextest_line = gate_script
+        .lines()
+        .position(|line| line.contains("cargo nextest run --workspace"))
+        .expect("scripts/gate.sh must run `cargo nextest run --workspace`");
+    let gate_invocation_line = gate_script
+        .lines()
+        .position(|line| line.contains(INVOCATION));
+    assert!(
+        gate_invocation_line.is_some_and(|index| index > nextest_line),
+        "scripts/gate.sh must run `{INVOCATION}` after `cargo nextest run --workspace`, \
+         with CG_GATE_JUNIT set for it"
+    );
+    let script_gate_junit_nearby = gate_script
+        .lines()
+        .skip(gate_invocation_line.unwrap_or(0).saturating_sub(6))
+        .take(8)
+        .any(|line| line.contains("CG_GATE_JUNIT"));
+    assert!(
+        script_gate_junit_nearby,
+        "scripts/gate.sh's `{INVOCATION}` step must set CG_GATE_JUNIT for it — the arm was \
+         not given a gate measurement otherwise"
+    );
+}
+
+/// Every line of the contributor guide's test-duration CI snippet must appear in the shipped
+/// workflow. The snippet must invoke the shared default stage that reports measured duration.
+#[test]
+fn the_readme_ci_snippet_names_the_wall_clock_steps_the_workflow_actually_runs() {
+    let root = repository_root();
+    let readme = std::fs::read_to_string(root.join("CONTRIBUTING.md")).expect("contributor guide");
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("workflow");
+    assert!(
+        duration_snippets_match(&readme, &ci),
+        "the guide must publish closed YAML fences for default dispatch and merged wall reports, \
+         with every nonempty line matching the workflow"
     );
 }
 

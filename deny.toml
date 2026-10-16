@@ -56,6 +56,11 @@ ignore = [
     # genawaiter-proc-macro); compiled only on the host at build time, never linked
     # into a shipped artifact; no upgrade path until bao-tree/genawaiter drop it.
     "RUSTSEC-2024-0370",
+    # Unmaintained-crate notice for unsafe-libyaml via serde_yaml_ng, not a
+    # vulnerability; no safe upgrade. Used only by the unpublished cg-bench
+    # tool and test-only dev-dependencies. Replacement is tracked in the
+    # project's issue list.
+    "RUSTSEC-2024-0449",
 ]
 
 [sources]

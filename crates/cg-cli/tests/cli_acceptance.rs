@@ -2254,7 +2254,13 @@ timeout_ms = 700
     );
     assert_eq!(output.code, 1);
     assert!(output.stdout.contains("model/codex/flags-in-help"));
-    assert!(output.stdout.contains("help check timed out"));
+    assert!(
+        output.stdout.contains("help check timed out"),
+        "provider help check status={} stdout={:?} stderr={:?}",
+        output.code,
+        output.stdout,
+        output.stderr
+    );
     assert_eq!(completion_count(&harness), 0, "doctor never spends");
 }
 

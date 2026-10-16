@@ -1,4 +1,6 @@
 [package]
+# This internal example shares private CLI source available only in the Git workspace.
+exclude = ["examples/ci_catalog_model_seed.rs"]
 publish = false
 keywords.workspace = true
 categories.workspace = true
