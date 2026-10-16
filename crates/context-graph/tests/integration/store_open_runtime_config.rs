@@ -855,6 +855,7 @@ fn unit_vector_768() -> Vec<f32> {
 
 #[test]
 fn default_text_embedder_lazy_loaded_no_cost_when_unused() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let cache_dir = tempfile::tempdir().expect("cache");
     let (artifact_dir, _unique_token, _golden) = stage_local_embeddinggemma_cache(cache_dir.path());
@@ -895,6 +896,7 @@ fn default_text_embedder_lazy_loaded_no_cost_when_unused() {
 
 #[test]
 fn default_text_embedder_opt_out_at_store_open_skips_load_path_entirely() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     EmbeddingGemmaTextEmbedder::reset_loader_entry_count();
     let embedder = EmbeddingGemmaTextEmbedder::new(EmbedderConfig::disabled());
     let dir = tempfile::tempdir().expect("tempdir");
@@ -921,6 +923,7 @@ fn default_text_embedder_opt_out_at_store_open_skips_load_path_entirely() {
 
 #[test]
 fn embedder_offline_mode_warm_cache_validates_artifacts_before_success() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let cache_dir = tempfile::tempdir().expect("cache");
     let (model_dir, unique_token, expected_vector) =
         stage_local_embeddinggemma_cache(cache_dir.path());
@@ -978,6 +981,7 @@ fn embedder_offline_mode_warm_cache_validates_artifacts_before_success() {
 
 #[test]
 fn embedder_offline_mode_cold_cache_returns_typed_model_not_available_naming_path_and_source() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let cache_dir = tempfile::tempdir().expect("cache");
     let path = cache_dir.path().join("missing-hf-cache");
     let embedder = EmbeddingGemmaTextEmbedder::new(config(
@@ -1008,6 +1012,7 @@ fn embedder_offline_mode_cold_cache_returns_typed_model_not_available_naming_pat
 
 #[test]
 fn embedder_cache_dir_override_routes_load_to_explicit_path() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let cache_dir = tempfile::tempdir().expect("cache");
     let embedder = EmbeddingGemmaTextEmbedder::new(config(
         ModelSource::HuggingFace {
@@ -1030,6 +1035,7 @@ fn embedder_cache_dir_override_routes_load_to_explicit_path() {
 
 #[test]
 fn embedder_pinned_revision_mismatch_returns_typed_revision_mismatch_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let cache_dir = tempfile::tempdir().expect("cache");
     let (model_dir, _unique_token, _golden) = stage_local_embeddinggemma_cache(cache_dir.path());
     std::fs::write(model_dir.join("REVISION"), b"rev-b").expect("mismatch revision");
@@ -1056,6 +1062,7 @@ fn embedder_pinned_revision_mismatch_returns_typed_revision_mismatch_error() {
 
 #[test]
 fn embedder_partially_downloaded_cache_returns_typed_model_corrupt_no_silent_redownload() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let cache_dir = tempfile::tempdir().expect("cache");
     let partial_dir = cache_dir.path().join("embeddinggemma-300m");
     std::fs::create_dir_all(&partial_dir).expect("partial dir");
@@ -1085,6 +1092,7 @@ fn embedder_partially_downloaded_cache_returns_typed_model_corrupt_no_silent_red
 
 #[test]
 fn embedder_first_use_emits_observable_progress_signal_naming_model_version_path_revision() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let cache_dir = tempfile::tempdir().expect("cache");
     let (model_dir, _unique_token, warm_cache_vector) =
         stage_local_embeddinggemma_cache(cache_dir.path());
@@ -1225,6 +1233,7 @@ fn embedder_first_use_emits_observable_progress_signal_naming_model_version_path
 
 #[test]
 fn store_open_against_mismatched_cg_schema_version_returns_legacy_schema_detected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("schema.db");
     let config = StoreConfig {
@@ -1292,6 +1301,7 @@ fn store_open_against_mismatched_cg_schema_version_returns_legacy_schema_detecte
 #[test]
 fn store_open_against_existing_v3_database_returns_legacy_schema_detected_without_embedding_space_mutation()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("existing-v3.db");
     let db = Database::open(&db_path).expect("raw db");
@@ -1336,6 +1346,7 @@ fn store_open_against_existing_v3_database_returns_legacy_schema_detected_withou
 
 #[test]
 fn embedder_cold_start_budget_smoke_rejects_invalid_local_artifacts() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let cache_dir = tempfile::tempdir().expect("cache");
     let model_dir = stage_invalid_embeddinggemma_cache(cache_dir.path());
     let embedder = EmbeddingGemmaTextEmbedder::new(config(
@@ -1359,6 +1370,7 @@ fn embedder_cold_start_budget_smoke_rejects_invalid_local_artifacts() {
 
 #[test]
 fn vector_search_latency_budget_smoke_returns_seeded_evidence() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = Store::open(StoreConfig {
         db_path: std::env::temp_dir().join(format!("latency-budget-{}.db", uuid::Uuid::now_v7())),
         ..Default::default()

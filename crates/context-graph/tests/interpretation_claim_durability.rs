@@ -1,4 +1,4 @@
-//! RED contracts for frame-5 durable interpretation claims.
+//! Durable interpretation claims persist across store reopen.
 //!
 //! Every source row is captured through `append_event_batch`.  The controls only inspect rows
 //! which the public runner created; they never manufacture a generation, membership, ID, or hash.

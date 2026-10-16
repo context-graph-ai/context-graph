@@ -1101,7 +1101,7 @@ fn installed_cli_default_path_records_floor_enforcement_level() {
     assert_eq!(
         first_reliability_level(&output).as_deref(),
         Some("Floor"),
-        "the installed CLI default path must report the achieved Floor level until a schema flag is wired"
+        "the installed CLI default path must report the achieved Floor level"
     );
 }
 
@@ -1894,7 +1894,7 @@ fn cli_status_idempotent_on_same_session_recaptured() {
     let first = harness.run(&["status"]);
     let second_capture = harness.run_with_stdin(&["record", "--understand-now"], AUTH_INITIAL);
     let second = harness.run(&["status"]);
-    // The decision id is emitted by the FIRST capture. The identical second capture is a tier-0
+    // The decision id is emitted by the FIRST capture. The identical second capture is a model-free
     // NO-OP: the verbatim digest already exists, so it is skipped and nothing is re-understood —
     // the strongest idempotency (recapture writes zero new rows). Proven against the persisted
     // store: after both captures the intention still holds exactly ONE decision, with the same id

@@ -148,15 +148,10 @@ pub struct CaptureReport {
     pub resolved_chunk_window: Option<usize>,
     pub model_context_tokens: Option<usize>,
     pub model_usage: Vec<ModelCallUsage>,
-    /// Placeholder: always empty. The real implementation lists entities captured from the harvest.
     pub captured_entities: Vec<CapturedEntityInfo>,
-    /// Placeholder: always empty. The real implementation lists decisions captured from the harvest.
     pub captured_decisions: Vec<CapturedDecisionInfo>,
-    /// Placeholder: always empty. The real implementation lists observations captured from the harvest.
     pub captured_observations: Vec<CapturedObservationInfo>,
-    /// Placeholder: always empty. The real implementation lists outcomes captured from the harvest.
     pub captured_outcomes: Vec<CapturedOutcomeInfo>,
-    /// Placeholder: always empty. The real implementation lists items the grounding check flagged.
     pub flagged_items: Vec<FlaggedItem>,
 }
 
@@ -270,9 +265,8 @@ pub struct GoalSeed {
     pub key: String,
     #[serde(default, deserialize_with = "deserialize_string_default_on_null")]
     pub text: String,
-    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
-    /// under the emitted context instead of the capture context (cross-tenant leak). The
-    /// correct impl ignores this field and always uses the capture context.
+    /// Untrusted model-emitted context_id. Capture ignores this field and always uses the
+    /// capture context, preventing model output from selecting a different tenant.
     #[serde(default)]
     pub context_id: Option<String>,
 }
@@ -296,9 +290,8 @@ pub struct EntitySeed {
     /// silently dropped.
     #[serde(default)]
     pub entity_type_raw: Option<String>,
-    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
-    /// under the emitted context instead of the capture context (cross-tenant leak). The
-    /// correct impl ignores this field and always uses the capture context.
+    /// Untrusted model-emitted context_id. Capture ignores this field and always uses the
+    /// capture context, preventing model output from selecting a different tenant.
     #[serde(default)]
     pub context_id: Option<String>,
 }
@@ -444,9 +437,8 @@ pub struct DecisionSeed {
     /// from the chunk, the agent_id is flagged (a fabricated attribution).
     #[serde(default)]
     pub agent_id_span: Option<ExtractedSpan>,
-    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
-    /// under the emitted context instead of the capture context (cross-tenant leak). The
-    /// correct impl ignores this field and always uses the capture context.
+    /// Untrusted model-emitted context_id. Capture ignores this field and always uses the
+    /// capture context, preventing model output from selecting a different tenant.
     #[serde(default)]
     pub context_id: Option<String>,
 }
@@ -497,9 +489,8 @@ pub struct ObservationSeed {
     /// flagged (a fabricated observation). When absent, the observation value is not span-grounded.
     #[serde(default)]
     pub value_span: Option<ExtractedSpan>,
-    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
-    /// under the emitted context instead of the capture context (cross-tenant leak). The
-    /// correct impl ignores this field and always uses the capture context.
+    /// Untrusted model-emitted context_id. Capture ignores this field and always uses the
+    /// capture context, preventing model output from selecting a different tenant.
     #[serde(default)]
     pub context_id: Option<String>,
 }
@@ -521,9 +512,8 @@ pub struct OutcomeSeed {
     /// (a fabricated outcome). When absent, the outcome value is not span-grounded.
     #[serde(default)]
     pub value_span: Option<ExtractedSpan>,
-    /// Untrusted model-emitted context_id. The wrong harness trusts this and stores the row
-    /// under the emitted context instead of the capture context (cross-tenant leak). The
-    /// correct impl ignores this field and always uses the capture context.
+    /// Untrusted model-emitted context_id. Capture ignores this field and always uses the
+    /// capture context, preventing model output from selecting a different tenant.
     #[serde(default)]
     pub context_id: Option<String>,
 }
@@ -563,9 +553,8 @@ pub enum EntityIdentityVerdict {
     Separate,
 }
 
-/// Which extraction pass a staged capture is requesting. `Full` is the shipped single-pass behavior; the focused passes are the probe-2
-/// staged recipe as production behavior; `SessionIntention` is the session-level goal
-/// reconciliation pass.
+/// The extraction pass requested by a staged capture. `Full` extracts all categories;
+/// focused passes request entities or decisions. `SessionIntention` reconciles session goals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractionPass {
     Full,
@@ -846,8 +835,7 @@ fn resolve_intention_grouping(
 }
 
 /// One vendor-neutral transcript item: dialogue, or a tool event a vendor parser extracted.
-/// Vendor parsers (Claude jsonl today; Codex/Gemini connectors and Plan-22 formats later) emit
-/// these; the SHARED selection/rendering policy (`render_import_transcript`) decides what
+/// Vendor parsers emit these; the SHARED selection/rendering policy (`render_import_transcript`) decides what
 /// survives — the "what is decision-bearing" rule lives once, vendor-independently.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptItem {
@@ -1118,7 +1106,7 @@ pub trait ImportParser: Send + Sync {
 pub struct ClaudeJsonlParser;
 
 impl ClaudeJsonlParser {
-    /// Phase 1 of import parse: extract vendor-neutral items — dialogue AND tool events —
+    /// Extract vendor-neutral items — dialogue AND tool events —
     /// from Claude session jsonl. Tool events are emitted at their RESULT's position (the
     /// selection policy's "assistant then discussed it" lookahead reads forward from there);
     /// a `tool_use` whose result never arrives is emitted header-only at the end.
@@ -1155,8 +1143,8 @@ impl ImportParser for ClaudeJsonlParser {
     }
 }
 
-/// Parse one Claude jsonl line into items. Text blocks join into one dialogue turn (noise
-/// stripped exactly as the legacy line path did); `tool_use` blocks queue as pending;
+/// Parse one Claude jsonl line into items. Text blocks join into one dialogue turn with noise
+/// stripped; `tool_use` blocks queue as pending;
 /// `tool_result` blocks resolve their pending `tool_use` (by id, else oldest) into a ToolEvent.
 fn claude_line_into_items(
     line: &str,
@@ -2199,7 +2187,7 @@ fn reuse_prior_goals_for_entity_decisions(
 /// Key and text of the SYNTHETIC fallback goal the backfill fabricates when a harvest carries
 /// decisions but no goals. Single-sourced so the session reconciliation pass can recognize its
 /// own marker: a decision serving ONLY this synthetic goal is "unattached" for review purposes
-/// (the hollow-intention shape is a trunk failure, not real attachment).
+/// (the hollow-intention shape is a goal linkage failure, not real attachment).
 pub(crate) const FALLBACK_GOAL_KEY: &str = "G_context";
 
 pub(crate) fn fallback_goal_text(context_label: &str) -> String {
@@ -2443,8 +2431,7 @@ fn validate_harvest_relations(
 
 /// The default closed vocabulary of `decision_type` labels the grounding check measures a model's
 /// `decision_type` against. A `decision_type` not in this set is flagged out-of-vocab. This is the
-/// `decision_type` analogue of the entity-type vocabulary single source; a later plan can widen it
-/// per tenant without touching the grounding logic.
+/// `decision_type` analogue of the entity-type vocabulary single source.
 pub(crate) fn default_decision_type_vocabulary() -> &'static [&'static str] {
     &[
         "technology_choice",
@@ -2469,9 +2456,8 @@ pub(crate) fn default_decision_type_vocabulary() -> &'static [&'static str] {
 ///
 /// `legal_vocab` is the CONFIGURED vocabulary (user-supplied, one source with the
 /// schema/prompt): a value in the configured list but outside the built-in enum is flagged with an
-/// honest distinct reason (typed storage for custom vocabularies is cg-open-entity-vocabulary's
-/// remaining scope), and every flag carries the configured legal list, so `cg why` shows the
-/// user's own nouns.
+/// honest distinct reason because typed storage accepts only built-in variants. Every flag carries
+/// the configured legal list, so `cg why` shows the user's own nouns.
 pub(crate) fn resolve_raw_entity_types(
     harvest: &mut StructuredHarvest,
     legal_vocab: &[String],
@@ -2554,7 +2540,7 @@ pub(crate) fn grounding_check_harvest(
 ) -> Vec<FlaggedItem> {
     let mut flagged = Vec::new();
 
-    // Entities (name + chosen type), as before. Flags carry the CONFIGURED vocabulary.
+    // Entities (name + chosen type). Flags carry the CONFIGURED vocabulary.
     for seed in &harvest.entities {
         if seed.key.trim().is_empty() || seed.name.trim().is_empty() {
             continue;
@@ -2679,12 +2665,6 @@ fn span_text(span: Option<&ExtractedSpan>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// A completion marker to write in the SAME transaction as the capture's graph mutation, so an apply
-/// path's write-once completion commits atomically with the structured graph it guards. Passed to
-/// [`crate::harness::run_capture_into_digest`] / [`capture_structured_harvest`]; every non-apply caller
-/// passes `None` and is unaffected. Before the fix, the fabric apply path committed the graph and the
-/// marker on two separate transactions, so a crash between them could leave the graph written but the
-/// marker missing.
 pub struct CaptureCompletionMarker<'a> {
     /// The context the completed digest belongs to.
     pub context_id: ContextId,
@@ -2744,7 +2724,7 @@ pub(crate) fn capture_structured_harvest(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| compact_summary(transcript));
     // The understanding-queue drainer passes the id of the digest it is understanding: the
-    // structured graph anchors onto that existing tier-0 verbatim digest instead of minting a
+    // structured graph anchors onto that existing model-free verbatim digest instead of minting a
     // second one, so a chunk stays exactly ONE (immutable) digest — it is provenance, kept verbatim,
     // with the structured Intention/Decision/Observation graph now attached via EXTRACTED_FROM. The
     // digest's own summary/vector are its verbatim source text, which in real capture contains the
@@ -3651,7 +3631,7 @@ impl<'a> CaptureTxn<'a> {
         };
 
         // Build state_delta_map: prefer seed.state_delta; fall back to seed.path_change
-        // (the arrow-value field that the old ensure_observation_with_invalidations handled).
+        // The arrow-value field carries the observation value.
         let state_delta_map: BTreeMap<String, Option<JsonValue>> = match &seed.state_delta {
             serde_json::Value::Object(map) if !map.contains_key("format") && !map.is_empty() => map
                 .iter()
@@ -5446,7 +5426,7 @@ fn capture_zero_harvest_digest(
     transcript: &str,
     reuse_digest: Option<DigestId>,
 ) -> Result<CaptureReport> {
-    // When understanding an existing tier-0 digest that yielded no structured items, reuse that
+    // When understanding an existing model-free digest that yielded no structured items, reuse that
     // digest (it already carries the verbatim summary) rather than minting a second one; every
     // other caller mints a fresh digest for this transcript.
     let (digest_summary, wrote_digest) = match reuse_digest {

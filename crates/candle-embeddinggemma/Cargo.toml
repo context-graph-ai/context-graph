@@ -1,4 +1,7 @@
 [package]
+publish = false
+keywords.workspace = true
+categories.workspace = true
 name = "candle-embeddinggemma"
 version.workspace = true
 authors.workspace = true

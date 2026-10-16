@@ -3,7 +3,7 @@
 //! back onto the original capture.
 //!
 //! A node plays two roles that collapse onto one machine in the single-node case: a SUBMITTER (owns
-//! the tier-0 digest and the permanent raw store) and a WORKER (any enrolled capable node that runs
+//! the model-free digest and the permanent raw store) and a WORKER (any enrolled capable node that runs
 //! the model). Submission, the movement knob, apply, retention, and status are always-compiled
 //! library surfaces over the shipped contextdb work ledger; the CLI renders over them. Only the
 //! `SyncClient`-consuming worker poll ([`run_worker_once`]) is gated behind `fabric-sync`, so the
@@ -63,7 +63,7 @@ impl Default for FabricConfig {
             // Sharing is ON by default — proven by input material actually moving, never a silent
             // constant. The one visible off knob is `sharing = false` in fabric.toml.
             sharing: true,
-            // A day, on the order the ratified retention contract specifies.
+            // A day, on the order the documented retention contract specifies.
             grace_ms: 86_400_000,
             per_source_opt_out: Vec::new(),
         }
@@ -127,10 +127,9 @@ pub fn acquire_worker_lock(data_root: &Path) -> Option<WorkerLock> {
     cg_node_fs::acquire_worker_lock(&data_root.join("understand-worker.lock")).ok()
 }
 
-/// A capture that submits its per-chunk understanding onto the fabric ledger rather than the old
-/// private single-machine queue.
+/// A capture that submits its per-chunk understanding onto the fabric ledger.
 pub struct FabricCapture<'a> {
-    /// The tier-0 capture request (verbatim digest, local embedding, kept raw — unchanged).
+    /// The model-free capture request (verbatim digest, local embedding, kept raw — unchanged).
     pub request: Tier0CaptureRequest,
     /// The node's fabric config, or `None` for a single-node install.
     pub config: Option<&'a FabricConfig>,
@@ -160,7 +159,7 @@ pub trait CaptureFault {
     fn fail_after_digest(&self) -> Result<()>;
 }
 
-/// Capture a conversation onto the fabric: tier-0 verbatim digest + local embedding + kept raw
+/// Capture a conversation onto the fabric: model-free verbatim digest + local embedding + kept raw
 /// chunk, and — in the SAME atomic $0 transaction — a ledger understanding-job row plus its copied
 /// input rows. A source named in the node's `per_source_opt_out` list, or flagged `source_opt_out`
 /// on this capture, keeps its understanding input local (an `InputRef::local_path`, no copied
@@ -187,7 +186,7 @@ pub fn capture(store: &Store, capture: FabricCapture<'_>) -> Result<Tier0Capture
     capture_tier0_inner(store, capture.request, opt_out, capture.fault)
 }
 
-/// Derive the ledger job id for a tier-0 digest — a deterministic 1:1 function of the `DigestId`.
+/// Derive the ledger job id for a model-free digest — a deterministic 1:1 function of the `DigestId`.
 /// Re-importing identical content yields the same digest and thus the same job id, so the ledger's
 /// insert-if-not-exists dedups the resubmit and apply maps the job id back to its digest. This is the
 /// same derivation the submission path uses, kept single-sourced in `tier0`.
@@ -269,7 +268,7 @@ pub enum ApplyOutcome {
 
 /// Apply a completed result onto the original digest, anchor-checked and idempotent.
 ///
-/// The job id maps back to its anchor digest (a job id is derived 1:1 from the tier-0 `DigestId`).
+/// The job id maps back to its anchor digest (a job id is derived 1:1 from the model-free `DigestId`).
 /// Apply is anchor-checked: if the anchor digest is absent locally — never captured, or `cg
 /// forget`-purged — nothing is written, no digest is resurrected, and the outcome is observable at
 /// the library level (`AnchorMissing`). The retained write-once completion marker makes a second
@@ -749,9 +748,8 @@ pub fn run_worker_once<E: ConversationExtractor + Sync>(
 /// run the inner [`run_worker_once`] claim/execute/record poll, then push the recorded result/failure
 /// back to the hub. This is what makes a genuine remote worker functional.
 ///
-/// Without the leading pull the worker scans only its own local db and never sees a job another node
-/// submitted — the two-root rehearsal defect where a worker polled for minutes while a remote job
-/// stayed `pending`. Without the trailing push a worker that executed its last job then idled would
+/// Without the leading pull the worker scans only its own local db and cannot see jobs submitted
+/// by other nodes. Without the trailing push a worker that executed its last job then idled would
 /// strand that result locally: the outcome would otherwise only reach the hub piggybacked on the NEXT
 /// claim's push, which never happens once there is no more work to claim.
 ///
@@ -786,7 +784,7 @@ enum HubDirection {
 }
 
 /// A best-effort hub drain run on a dedicated thread with its own runtime, mirroring
-/// [`run_worker_once`]'s scaffolding: the poll surface is synchronous and may be called from inside
+/// [`run_worker_once`]'s runtime isolation: the poll surface is synchronous and may be called from inside
 /// another runtime (the test hub runs on the caller's runtime), so the transport is driven on a fresh
 /// thread. A hub round-trip that errors is the offline single-node path, never a worker failure, so
 /// pull/push errors are deliberately swallowed (the loop simply stops); only a runtime-build or

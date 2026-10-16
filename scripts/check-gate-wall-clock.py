@@ -11,7 +11,7 @@ drift that scales with the binary, while the slack covers the part that does not
 spawn per test, and a first file read a later run finds already cached. On a binary whose whole
 run is a few spawns that fixed cost is many times the binary's own seconds, so a purely relative
 ceiling reports the machine's scheduling as a runtime regression. The slack is also what lets a
-measurement taken in one test pool be compared against a value frozen from a differently-sized
+measurement taken in one test pool be compared with a value frozen from a differently-sized
 one, which is otherwise a different amount of contention over the same cores and disk. Neither
 this script nor the Rust arm beside it ever reads a clock: both consume seconds someone else
 already measured and wrote into a JUnit file.

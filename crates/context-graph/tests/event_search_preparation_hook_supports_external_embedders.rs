@@ -1,18 +1,18 @@
-//! R01-1 proof (a) — an `Embedder` implementation this crate does not own (test support only,
+//! An `Embedder` implementation this crate does not own (test support only,
 //! never Nomic) can produce a real `PreparedEventSearchDocument`/`PreparedEventSearchQuery`
 //! purely through the implementer-facing hook (`prepare_document_hook`/`prepare_query_hook` plus
 //! the library-created `EventSearchSeal`'s `document_builder`/`query_builder`). This file links
 //! against `context_graph` exactly the way an external consumer would, so if the hook were not
 //! public and reachable from `context_graph::embedder`, this file would not compile.
 //!
-//! R01-1 proof (c) — a value sealed under one embedder's encoding profile is refused, with the
+//! A value sealed under one embedder's encoding profile is refused, with the
 //! typed `CgError::EventSearchPreparationProfileMismatch`, by a different embedder's
 //! `embed_prepared_document`/`embed_prepared_query` — even though the double's own
 //! `embed_prepared_document_hook`/`embed_prepared_query_hook` never calls a verification helper,
 //! because the library-owned `embed_prepared_document`/`embed_prepared_query` wrapper verifies
 //! before the hook ever runs.
 //!
-//! These are guards on the sealing/verification mechanism itself, not RED tests against product
+//! These are guards on the sealing/verification mechanism itself, not Behavior tests against product
 //! behavior: no embedder shipped by this crate (Nomic included) implements real preparation here,
 //! only this file's own deterministic test doubles.
 

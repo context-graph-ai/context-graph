@@ -32,7 +32,7 @@ async fn decision_observation_and_extracted_from_edge_appear_on_second_edge_afte
         seeded.evidence_id,
         seeded.observation_id,
         context_graph::EvidenceKind::Text,
-        "vigil-edge:session/core convergence",
+        "s3:session/core convergence",
     );
     assert_real_entity_snapshot(
         &fixture.edge2.store,
@@ -81,7 +81,7 @@ async fn evidence_and_outcome_rows_converge_by_id() {
         seeded.evidence_id,
         seeded.observation_id,
         context_graph::EvidenceKind::Text,
-        "vigil-edge:session/evidence outcome",
+        "s3:session/evidence outcome",
     );
     assert_real_outcome_state(
         &fixture.edge2.store,
@@ -123,7 +123,7 @@ async fn existing_backlog_captured_before_first_sync_appears_on_second_edge() {
         seeded.evidence_id,
         seeded.observation_id,
         context_graph::EvidenceKind::Text,
-        "vigil-edge:session/preconnect backlog",
+        "s3:session/preconnect backlog",
     );
     assert_real_entity_snapshot(
         &fixture.edge2.store,
@@ -313,7 +313,7 @@ async fn wiped_edge_pull_restores_full_committed_state_including_decision_status
         seeded.evidence_id,
         seeded.observation_id,
         context_graph::EvidenceKind::Text,
-        "vigil-edge:session/wiped restore",
+        "s3:session/wiped restore",
     );
     assert_real_entity_snapshot(
         &restored_edge.store,

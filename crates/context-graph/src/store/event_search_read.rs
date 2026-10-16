@@ -332,10 +332,7 @@ pub(crate) fn captured_event_counts<R: EventSearchRows + ?Sized>(
     rows: &R,
     context_ids: &[ContextId],
 ) -> Result<HashMap<ContextId, CapturedEventCounts>> {
-    // A reader that did not declare the count table used to fall through to the recount below
-    // without saying so: the same answer, five `COUNT(*)` statements per Context, and nothing in
-    // the output to tell anyone it had happened. It is refused by the table's own name instead,
-    // the way every other undeclared read in this crate is, so a consumer fixes its declaration.
+    // A reader that omits the count table is refused by table name before any recount.
     if !rows.reads_event_context_counts() {
         return Err(CgError::UndeclaredTableRefused {
             table: EVENT_CONTEXT_COUNTS_TABLE.to_string(),

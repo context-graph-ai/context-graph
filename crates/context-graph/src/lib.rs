@@ -1,3 +1,12 @@
+//! Durable structured memory and event-history search for agents and applications.
+//!
+//! [`Store`] provides writable memory operations; [`consumer_read`] provides bounded reads.
+//! Embedding implementations share the [`Embedder`] trait and explicit embedding spaces.
+//! The bundled default text embedder is enabled by the `nomic-embedder` feature.
+//! Disable default features for a core without bundled model fetching.
+//!
+//! See the repository's library quickstart and library API guides for application examples.
+
 // The README's example is compiled by the doctest harness. An example nothing builds drifts
 // silently: the symbols it names are renamed or moved by ordinary work, and the first person to
 // find out is a reader who copied it.

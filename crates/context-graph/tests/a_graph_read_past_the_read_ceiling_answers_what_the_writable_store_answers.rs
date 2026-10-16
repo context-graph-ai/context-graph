@@ -24,8 +24,8 @@
 //! ## Why the fixture is this size
 //!
 //! The ceiling is 500 result rows, so a fixture under it proves nothing about paging at all — the
-//! shipped parity file next door seeds five observations and passes today. This one seeds enough
-//! that a single bounded execute cannot carry the answer, and it seeds them through the ordinary
+//! fixture here seeds enough observations that a single bounded execute cannot carry the answer.
+//! It seeds them through the ordinary
 //! writable calls, so every row is a real row with real evidence and a real audit entry behind it
 //! rather than an arrangement that only exists in a test.
 //!
@@ -168,7 +168,7 @@ fn record_run(store: &Store, context_name: &str, camera: &str, count: usize) -> 
                 observed_at: Utc::now(),
                 evidence: vec![text_evidence(
                     detection_id,
-                    &format!("vigil-edge://{camera}/{index:06}"),
+                    &format!("s3://{camera}/{index:06}"),
                 )],
                 observed_properties: BTreeMap::from([
                     ("class_name".to_string(), json!("person")),

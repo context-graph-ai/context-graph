@@ -249,6 +249,7 @@ fn invalidations_by_decision(rows: &[Invalidation]) -> BTreeMap<DecisionId, Vec<
 
 #[test]
 fn closure_incoming_anchored_depth_equiv_per_hop() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = Database::open_memory();
     db.execute("CREATE TABLE nodes (id UUID PRIMARY KEY)", &HashMap::new())
         .expect("create nodes");
@@ -336,6 +337,7 @@ fn closure_incoming_anchored_depth_equiv_per_hop() {
 
 #[test]
 fn closure_equiv_with_non_active_midchain_matches_invalidation_semantics() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let ctx = context(&store, "non-active-midchain");
     let ent = entity(&store, ctx.id, "router");
@@ -389,6 +391,7 @@ fn closure_equiv_with_non_active_midchain_matches_invalidation_semantics() {
 
 #[test]
 fn cascade_does_not_leak_across_context_via_cites() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let ctx_a = context(&store, "context-a");
     let ctx_b = context(&store, "context-b");
@@ -450,6 +453,7 @@ fn cascade_does_not_leak_across_context_via_cites() {
 
 #[test]
 fn diamond_cites_attribution_through_public_surface() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let ctx = context(&store, "diamond-cites");
     let ent = entity(&store, ctx.id, "checkout-api");
@@ -503,6 +507,7 @@ fn diamond_cites_attribution_through_public_surface() {
 
 #[test]
 fn concurrent_record_observation_two_root_serializes_with_typed_error_on_refusal() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let ctx = context(&store, "concurrent-two-root");
     let ent = entity(&store, ctx.id, "search-api");

@@ -20,6 +20,8 @@ event identity, SQL, or embedding. This crate consumes no ContextDB read route o
 
 ## Invariants and guards
 
+Ownership boundaries above are review-only architectural constraints unless a guard below covers them.
+
 | Invariant | Guarding test (paths relative to repository root) |
 |---|---|
 | Config IO failures other than absence surface to the caller. | `crates/cg-cli/tests/read_memory_policy.rs::unreadable_read_config_is_a_config_error_before_status_can_open_or_write_the_store` |

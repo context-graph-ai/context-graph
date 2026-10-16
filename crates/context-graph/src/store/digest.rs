@@ -155,8 +155,7 @@ impl Store {
             let _ = self.db.rollback(tx);
             return Err(map_engine_err(e));
         }
-        // Digests use a dedicated audit target kind downstream. For now context_id
-        // scoping covers provenance; no audit_log row is needed here.
+        // context_id scoping covers provenance; no audit_log row is written here.
         self.db.commit(tx).map_err(map_engine_err)?;
 
         Ok(Digest {

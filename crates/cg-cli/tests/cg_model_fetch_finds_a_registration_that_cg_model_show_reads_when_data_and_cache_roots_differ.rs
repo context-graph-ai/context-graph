@@ -9,8 +9,7 @@
 //! whose license requires manual acceptance answers with its manual-install instructions, never
 //! `NotFound`.
 //!
-//! Both fixtures are the two registration records that reproduced the split-root regression,
-//! inlined here as TOML so this test carries its own fixture and needs no network access.
+//! Inline TOML fixtures keep the registration checks independent of network access.
 
 use std::fs;
 use std::path::Path;

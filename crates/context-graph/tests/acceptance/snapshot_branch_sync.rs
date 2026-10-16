@@ -35,7 +35,7 @@ fn append_successor_snapshot(
             observed_at: at,
             evidence: vec![EvidenceRef {
                 id: EvidenceId::new_v7(),
-                source_ref: format!("vigil-edge:session/{author}"),
+                source_ref: format!("s3:session/{author}"),
                 ..Default::default()
             }],
             observed_properties: BTreeMap::from([(

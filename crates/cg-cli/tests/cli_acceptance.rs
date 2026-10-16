@@ -324,6 +324,7 @@ fn sandboxed_install(prefix: &std::path::Path, home: &std::path::Path) -> Comman
     }
 }
 
+/// Root help presents public verbs and hidden integration commands keep their own help.
 #[test]
 fn cli_help_root() {
     let harness = CliHarness::new();
@@ -333,11 +334,25 @@ fn cli_help_root() {
         help.stdout.contains("model")
             && help.stdout.contains("status")
             && help.stdout.contains("selftest")
-            && help.stdout.contains("disconnect <agent>")
-            && help.stdout.contains("connect <agent> --remove-all"),
+            && help.stdout.contains("model fetch --defaults"),
         "root help must list the shipped verb groups; stdout={:?}",
         help.stdout
     );
+    for command in ["connect", "disconnect"] {
+        assert!(
+            !help
+                .stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(command))
+        );
+        let command_help = harness.run(&[command, "--help"]);
+        assert_eq!(command_help.code, 0);
+        assert!(
+            command_help
+                .stdout
+                .contains(&format!("cg {command} <agent>"))
+        );
+    }
     let model_pos = help.stdout.find("model auth login");
     let status_pos = help.stdout.find("status");
     assert!(
@@ -350,14 +365,11 @@ fn cli_help_root() {
         "bare cg must show help text, got {:?}",
         bare.stdout
     );
-    // STALE-CONTRACT FIX (2026-07-03): this assertion predated the daily-loop work, which made
-    // `cg connect claude-code` the real injection-hook installer (exit 0, hooks written into
-    // the harness-isolated HOME). That work documented this failure as a known baseline instead
-    // of updating it; updated here to the shipped contract.
+    // `cg connect claude-code` installs injection hooks into the isolated HOME and exits 0.
     let install = harness.run(&["connect", "claude-code"]);
     assert_eq!(
         install.code, 0,
-        "connect claude-code installs the injection hooks (daily-loop shipped contract)"
+        "connect claude-code installs the injection hooks (capture shipped contract)"
     );
 }
 
@@ -677,8 +689,8 @@ fn cli_status_connection_slice_shows_name_quota_kind_of_spend_and_expectation() 
 #[test]
 fn cli_status_without_connection_says_so_and_points_at_connect() {
     let output = CliHarness::new().run(&["model", "status"]);
-    // `cg model status` reports a missing connection with its own settled exit code 4
-    // (`model_byok_status_exit_code`), where the retired top-level status exited 0.
+    // `cg model status` reports a missing connection with exit code 4
+    // (`model_byok_status_exit_code`).
     assert_eq!(output.code, 4);
     let parsed = parse_single_json_object(&output.stdout);
     assert!(
@@ -1716,7 +1728,7 @@ fn no_host_session_message_guides_to_model_connect() {
     for output in [connect, selftest] {
         assert!(
             !output.stdout.to_lowercase().contains("local model"),
-            "no-host-session guidance must not recommend the removed local-model path: {}",
+            "no-host-session guidance must not recommend a local-model path: {}",
             output.stdout
         );
         assert!(
@@ -2045,10 +2057,7 @@ fn install_writes_no_agent_hook_and_changes_no_agent_config() {
     let output = sandboxed_install(&prefix, &home);
     assert_eq!(output.code, 0, "install script must complete in sandbox");
     let after = fs::read_to_string(&config).expect("read config after install");
-    assert_eq!(
-        after, before,
-        "install must not inject an agent hook before observe ships"
-    );
+    assert_eq!(after, before, "install must not inject an observe hook");
     assert!(
         !catalog_disk_contains(&home, "cg observe --agent claude-code"),
         "sandbox must not contain an injected cg observe hook"
@@ -2128,7 +2137,7 @@ fn cg_doctor_runs_only_free_checks_names_drift_and_spends_nothing() {
     assert!(output.stdout.contains("OK: model/codex/flags-in-help"));
     assert!(
         !output.stdout.contains("model/agy/flags-in-help"),
-        "doctor must not enumerate a provider withdrawn from embedded specs"
+        "doctor must not enumerate providers absent from embedded specs"
     );
     assert!(
         !output
@@ -2347,7 +2356,7 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
     }
     assert!(
         !specs.providers.contains_key("agy"),
-        "agy must not ship as an embedded provider until a pure-completion drive is verified"
+        "agy must be absent from the embedded provider list"
     );
     let claude = specs.providers.get("claude");
     assert!(
@@ -2387,7 +2396,7 @@ fn provider_spec_loads_embedded_and_user_override_layers() {
             && agy
                 .last_verified
                 .contains("pure-completion drive not embedded"),
-        "agy may return through a full user override, not through the embedded catalog"
+        "agy requires a full user override rather than an embedded catalog entry"
     );
 
     let overrides = [ProviderOverride {

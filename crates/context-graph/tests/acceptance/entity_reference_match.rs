@@ -371,7 +371,7 @@ fn entity_type_vocabulary_covers_animal_and_vehicle() {
                 tags: Vec::new(),
                 context_id: site.context_id,
             })
-            .expect("entity with the new type");
+            .expect("entity with the requested type");
         let read_back = site
             .store
             .get_entity(created.id)
@@ -385,7 +385,7 @@ fn entity_type_vocabulary_covers_animal_and_vehicle() {
     assert!(
         EntityType::ALL.contains(&EntityType::Animal)
             && EntityType::ALL.contains(&EntityType::Vehicle),
-        "the vocabulary constant carries the new types"
+        "the vocabulary constant includes the supported types"
     );
 }
 

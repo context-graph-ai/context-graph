@@ -10,12 +10,10 @@
 //! permission, a mount, real damage — reaching for a writable handle is the worst available move:
 //! it takes a mutating open on a store nobody has diagnosed.
 //!
-//! The substrate already keeps the two apart, by type and all the way down: redb's `RepairAborted`
-//! becomes contextdb's `LoadReadImageError::RequiresWriter`, which is surfaced as the first-class
-//! `ReadFailureKind::DirectReadRequiresWriter`. Context-graph is where the distinction is lost —
-//! the consumer-door conversion's catch-all folds it into `CgError::StoreUnreadable`, whose only
-//! record of it is prose inside `reason`. A consumer that has to regex an error string to decide
-//! whether to open a store writable does not have a contract; it has a guess.
+//! The substrate keeps the two apart by type: redb's `RepairAborted` becomes contextdb's
+//! `LoadReadImageError::RequiresWriter`, surfaced as `ReadFailureKind::DirectReadRequiresWriter`.
+//! The consumer-door conversion preserves that distinction so callers need not parse prose to
+//! choose a recovery path.
 //!
 //! ## What is proved here
 //!
@@ -23,15 +21,14 @@
 //! [`ConsumerReader::open`] as its OWN typed outcome — not
 //! [`CgError::StoreUnreadable`], not [`CgError::StoreMissing`] — carrying the store's path and the
 //! substrate's own words for the condition. A genuinely damaged store keeps
-//! [`CgError::StoreUnreadable`] exactly as it is today. And the two are different typed answers,
+//! [`CgError::StoreUnreadable`]. The two are different typed answers,
 //! not one answer with two strings in it.
 //!
 //! ## Why the outcome is pinned by behavior rather than by name
 //!
-//! Nothing below names the new variant. What a consumer needs is that the answer is DISTINCT from
-//! the two it already branches on, that it carries the path, and that it carries the engine's
-//! reason; the identifier is the implementer's to choose. The one thing named here is the
-//! substrate's typed kind, which already exists and is not ours to rename.
+//! The assertions compare typed discriminants: recovery-required is distinct from missing and
+//! unreadable, carries the path, and carries the engine's reason. The substrate's typed kind
+//! establishes the fixture condition independently.
 //!
 //! ## Why this is arranged end to end rather than over the conversion
 //!
@@ -147,9 +144,7 @@ fn consumer_refusal(db_path: &Path) -> CgError {
 }
 
 // A store whose committed image the engine says needs a writable reopen is told exactly that, by
-// type. Today it comes back as StoreUnreadable with the fact buried in a string, and a consumer
-// that must not risk a writable open on damage cannot act on a string: it either never recovers a
-// store it could have recovered, or it takes a mutating open on one it should not touch.
+// type. A consumer can choose recovery without risking a writable open on genuinely damaged data.
 #[test]
 fn a_store_needing_writable_recovery_is_its_own_typed_outcome() {
     let directory = tempfile::tempdir().expect("scratch directory");
@@ -196,8 +191,7 @@ fn a_store_needing_writable_recovery_is_its_own_typed_outcome() {
     );
 }
 
-// The other half of the same promise: a store that is genuinely unreadable keeps the answer it has
-// today. Splitting out the recoverable case must not quietly widen it to cover damage.
+// A genuinely unreadable store is reported as unreadable; the recoverable case never covers damage.
 #[test]
 fn a_genuinely_damaged_store_is_still_reported_unreadable() {
     let directory = tempfile::tempdir().expect("scratch directory");
@@ -219,7 +213,7 @@ fn a_genuinely_damaged_store_is_still_reported_unreadable() {
 
     let CgError::StoreUnreadable { path, reason } = &refusal else {
         panic!(
-            "a genuinely damaged store must keep the unreadable answer it has today, got: \
+            "a genuinely damaged store must give the unreadable answer, got: \
              {refusal:?}"
         );
     };
@@ -239,9 +233,8 @@ fn a_genuinely_damaged_store_is_still_reported_unreadable() {
     );
 }
 
-// The whole point, in one assertion: a consumer branching on the answer sees two different
-// answers. One typed outcome carrying two different strings is what it has today, and it is why
-// the decision cannot be made without parsing prose.
+// A consumer branching on the typed answer distinguishes recoverable and damaged stores without
+// parsing prose.
 #[test]
 fn recoverable_and_unreadable_are_two_typed_answers_not_one() {
     let directory = tempfile::tempdir().expect("scratch directory");

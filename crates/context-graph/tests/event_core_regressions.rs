@@ -1,4 +1,4 @@
-//! Regression coverage for accepted event-core defects.
+//! Event capture preserves checkpoints, source identity, and committed prefixes under races.
 //!
 //! Each case drives the public Store surface. The line adapter is deliberately
 //! independent of store internals: its source positions are fixture constants,

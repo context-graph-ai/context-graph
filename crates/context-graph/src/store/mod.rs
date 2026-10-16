@@ -339,8 +339,7 @@ impl Store {
     /// created and checked exactly as [`Store::open_with_consumer_schema`] does, and its scope
     /// labels narrow the returned handle exactly as
     /// [`Store::open_with_consumer_schema_scoped`] does — a declaration naming no label narrows
-    /// nothing. The door is ADDITIVE: every opener that came before goes on creating an absent
-    /// store exactly as it always has.
+    /// nothing. Create-capable openers create an absent store.
     ///
     /// [`CgError::StoreMissing`]: crate::CgError::StoreMissing
     /// [`CgError::StoreUnreadable`]: crate::CgError::StoreUnreadable
@@ -959,8 +958,7 @@ impl graph_rows::GraphRows for Store {
 pub(crate) struct DatabaseOpenExtras {
     plugin: Option<Arc<dyn DatabasePlugin>>,
     owner_control: Option<ControlHandler>,
-    /// Whether this open may bring the store into existence. The default is the creating
-    /// disposition every opener that came before has always had.
+    /// Whether this open may bring the store into existence. The default permits creation.
     open_disposition: OpenDisposition,
 }
 
@@ -1033,7 +1031,7 @@ impl DatabaseOpenExtras {
     /// Say what a refused open means, in the vocabulary the door that asked for it promised.
     ///
     /// The consumer edit door owes its caller the missing-versus-unreadable answer it was opened
-    /// to give; every opener that creates an absent store keeps the wording it has always had.
+    /// to give; create-capable openers use their own refusal vocabulary.
     fn map_refusal(&self, db_path: &Path, error: EngineError) -> CgError {
         match self.open_disposition {
             OpenDisposition::ExistingOnly => map_consumer_open_err(db_path, error),
@@ -1565,7 +1563,7 @@ fn initialize_schema(
     let mut plan = StartupSchemaPlan::new(db);
     // The shipped work-ledger schema (the seven append-only fabric tables and their two keyed
     // history indexes) is declared alongside cg's own, so a fresh store's whole startup schema
-    // becomes visible in one commit. The fabric slice consumes this ledger; the tables are inert
+    // becomes visible in one commit. Fabric consumes this ledger; the tables are inert
     // on a single-node install.
     for ddl in contextdb_engine::work_ledger::LEDGER_TABLE_DECLARATIONS {
         plan.declare(ddl)?;
@@ -1615,9 +1613,8 @@ fn initialize_schema(
 
 /// The startup declarations a store does not carry yet, collected so they install together.
 ///
-/// A peer replays every schema commit it receives over its whole schema, so a startup schema
-/// authored one statement per commit made a node's first push and pull cost the square of the
-/// schema size. Every missing declaration -- the tables carrying a vector column, a rank policy or
+/// A peer replays every schema commit over its whole schema. Installing declarations together
+/// avoids repeated schema replay. Every missing declaration -- tables carrying a vector column, a rank policy or
 /// DAG edges included, every index and every subscription event type -- joins one transaction, so
 /// a fresh store's whole startup schema becomes visible at once or not at all.
 struct StartupSchemaPlan<'a> {

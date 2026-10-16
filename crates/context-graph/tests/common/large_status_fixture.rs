@@ -2,7 +2,7 @@
 //!
 //! Shared by the library proof (`context-graph/tests/status_totals_are_bounded_on_a_large_store.rs`)
 //! and the command-line proof (`cg-cli/tests/status_is_bounded.rs`) so both assert against the SAME
-//! arithmetic. Everything is written through the production tier-0 capture door; the expected
+//! arithmetic. Everything is written through the production model-free capture door; the expected
 //! totals are computed from what was handed to it, using the same public windowing function capture
 //! itself uses, and cross-checked against capture's own receipts.
 
@@ -147,7 +147,7 @@ fn capture_into(
                 chunk_window: CHUNK_WINDOW,
             },
         )
-        .expect("tier-0 capture of a fixture batch");
+        .expect("model-free capture of a fixture batch");
 
         assert_eq!(
             report.skipped_existing, 0,
@@ -184,7 +184,7 @@ fn capture_into(
     assert_eq!(
         digest_ids.len(),
         chunk_count,
-        "tier-0 writes one digest per kept chunk"
+        "model-free writes one digest per kept chunk"
     );
 
     CapturedContext {
@@ -195,7 +195,7 @@ fn capture_into(
     }
 }
 
-/// Fill `store` through the production tier-0 capture door until the context holds more than
+/// Fill `store` through the production model-free capture door until the context holds more than
 /// [`TARGET_CHUNKS`] raw chunks, returning the totals computed from what was handed in.
 pub fn fill(store: &Store) -> LargeStore {
     let captured = capture_into(store, CONTEXT, 0, TARGET_CHUNKS);
@@ -249,7 +249,7 @@ pub struct ForcedStates {
     pub bytes_purged: u64,
 }
 
-/// The work-ledger job id tier-0 capture submits for a digest.
+/// The work-ledger job id model-free capture submits for a digest.
 ///
 /// A worker recording a claim, a result, a failure or a cancellation names the job it did the work
 /// for, so a fixture standing in for that worker has to name it the same way.

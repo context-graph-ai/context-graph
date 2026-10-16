@@ -584,7 +584,7 @@ pub fn seed_decision_graph(store: &Store, context_name: &str, suffix: &str) -> S
             observed_at: Utc::now(),
             evidence: vec![EvidenceRef {
                 id: evidence_id,
-                source_ref: format!("vigil-edge:session/{suffix}"),
+                source_ref: format!("s3:session/{suffix}"),
                 ..Default::default()
             }],
             observed_properties: BTreeMap::new(),
@@ -602,7 +602,7 @@ pub fn seed_decision_graph(store: &Store, context_name: &str, suffix: &str) -> S
         .create_digest(CreateDigest {
             id: digest_id,
             source: "agent-session".to_string(),
-            session_ref: Some(format!("vigil-edge:session/{suffix}")),
+            session_ref: Some(format!("s3:session/{suffix}")),
             summary: digest_summary.clone(),
             kind: EvidenceKind::Text,
             embedding: PrecomputedEmbedding {
@@ -841,7 +841,7 @@ fn record_basis_touch_observation(
             observed_at: Utc::now(),
             evidence: vec![EvidenceRef {
                 id: EvidenceId::new_v7(),
-                source_ref: format!("vigil-edge:session/{source}"),
+                source_ref: format!("s3:session/{source}"),
                 ..Default::default()
             }],
             observed_properties: BTreeMap::new(),
@@ -1223,7 +1223,7 @@ fn expected_sync_table_policies() -> BTreeMap<&'static str, (&'static str, Optio
     // Captured event history declares its local placement in `TABLES`: the event tables keep the
     // write-once conflict policy they carry when a tenant hub binding installs them, and the
     // placement, binding, locator, checkpoint and ordering tables stay node-local in both modes
-    // (cg-event-backed-import intent §6, "context_bindings, event_source_checkpoints, …").
+    // (event capture atomicity, "context_bindings, event_source_checkpoints, …").
     let local_event_capture = ("SYNC OFF", Some("SYNC CONFLICT KEEP FIRST"));
     BTreeMap::from([
         ("cg_schema_version", write_once),

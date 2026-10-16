@@ -9,19 +9,13 @@
 //! and never to be handed a Rust value printed at them, a stack trace, or a sentence claiming the
 //! engine did something unexpected.
 //!
-//! ## What is observed today
-//!
-//! `map_store_open_err` (crates/cg-cli/src/main.rs:3910-3917) keeps `StoreLocked` as a typed
-//! condition and funnels EVERYTHING ELSE — the busy-with-readers condition included — into
-//! `MemoryCliError::Store(format!("{other:?}"))`. So the one condition that already carries a
-//! written-for-humans `Display` (count, store, each verified reader's process id and process name)
-//! reaches the operator as its `Debug` dump instead. The typed writer-held answer beside it is
-//! unaffected, and this file pins that it stays unaffected.
+//! Both reader-held and writer-held refusals retain typed conditions through CLI rendering.
+//! The reader-held answer carries the count, store, and each verified reader's identity.
 //!
 //! ## What this file does NOT pin
 //!
-//! The EXIT CODE for a reader-held store. That is a parked owner proposal, not a settled contract,
-//! so asserting a number here would invent one. What is asserted is that the command FAILS — a
+//! Reader-held stores have no dedicated numeric exit contract. This file asserts that the
+//! command FAILS — a
 //! refused command that reports success would send an agent on with no memory and no warning — and
 //! everything about what the operator reads. The writer-held case does have a settled mapping
 //! (`StoreLocked` → 4, main.rs:5249-5267) and is pinned at it.
@@ -174,7 +168,7 @@ fn a_command_refused_by_a_writer_held_store_keeps_its_typed_answer() {
     );
     assert!(
         said.contains("store busy / already in use"),
-        "the writer-held wording is unchanged by anything the reader-held answer needs: {said}"
+        "the writer-held answer carries the busy-store wording: {said}"
     );
     assert!(
         said.contains(&format!("pid {}", holder.process_id())),

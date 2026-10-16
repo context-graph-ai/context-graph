@@ -569,8 +569,7 @@ pub struct Intention {
     pub tags: Vec<String>,
     pub created_at: TxId,
     /// Which catalog group this intention belongs to. None means unassigned (no grouping
-    /// resolution has run). The correct impl sets this during Stage-3 grouping; the wrong
-    /// stub never sets it, so captures always store None here.
+    /// resolution has run). Stage-3 grouping assigns the catalog group.
     pub blueprint_catalog_id: Option<String>,
 }
 

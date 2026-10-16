@@ -1,7 +1,7 @@
-//! Fabric first-light — capture atomicity with the new ledger job + input writes.
+//! Fabric capture atomically writes the digest, ledger job, and input copies.
 //!
 //! One $0 capture must commit the verbatim digest, exactly one understanding-job row, and its input
-//! copies TOGETHER in one atomic model-free transaction. Tier-0's shipped output (verbatim digest,
+//! copies TOGETHER in one atomic model-free transaction. model-free's shipped output (verbatim digest,
 //! local embedding, kept raw) is unchanged. Inputs travel as refs, never inlined.
 
 use context_graph::fabric::{self, FabricCapture, FabricConfig};
@@ -15,11 +15,12 @@ const TRANSCRIPT: &str = "User: Goal G1: ship password-less login. Assistant: De
 
 #[test]
 fn capture_writes_digest_job_and_inputs_in_one_transaction() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("cap_one_txn");
     let extractor = CountingExtractor::new();
     let report = fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", TRANSCRIPT)),
+        FabricCapture::new(tier0_request("capture", "s1", TRANSCRIPT)),
     )
     .expect("fabric capture");
 
@@ -45,9 +46,10 @@ fn capture_writes_digest_job_and_inputs_in_one_transaction() {
 
 #[test]
 fn capture_abort_between_digest_and_job_strands_nothing() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("cap_abort");
     let fault = ArmedCaptureFault::armed();
-    let mut capture = FabricCapture::new(tier0_request("daily-loop", "s1", TRANSCRIPT));
+    let mut capture = FabricCapture::new(tier0_request("capture", "s1", TRANSCRIPT));
     capture.fault = Some(&fault);
 
     let result = fabric::capture(&node.store, capture);
@@ -76,13 +78,14 @@ fn capture_abort_between_digest_and_job_strands_nothing() {
 
 #[test]
 fn capture_makes_zero_model_calls_and_costs_zero() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("cap_zero_cost");
     let config = FabricConfig {
         hub_endpoint: Some("ticket-abc".to_string()),
         tenant: Some("tenant-alpha".to_string()),
         ..Default::default()
     };
-    let mut capture = FabricCapture::new(tier0_request("daily-loop", "s1", TRANSCRIPT));
+    let mut capture = FabricCapture::new(tier0_request("capture", "s1", TRANSCRIPT));
     capture.config = Some(&config);
 
     let report = fabric::capture(&node.store, capture).expect("fabric capture");
@@ -98,10 +101,11 @@ fn capture_makes_zero_model_calls_and_costs_zero() {
 
 #[test]
 fn capture_still_produces_verbatim_digest_and_local_embedding() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("cap_verbatim");
     let report = fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", TRANSCRIPT)),
+        FabricCapture::new(tier0_request("capture", "s1", TRANSCRIPT)),
     )
     .expect("fabric capture");
 
@@ -120,7 +124,7 @@ fn capture_still_produces_verbatim_digest_and_local_embedding() {
         digest.vector_text.is_some(),
         "capture still writes a local embedding for the digest"
     );
-    let ctx = context_id(&node.store, "daily-loop").expect("context exists");
+    let ctx = context_id(&node.store, "capture").expect("context exists");
     let footprint = context_graph::tier0::raw_footprint(&node.store, ctx).expect("raw footprint");
     assert!(
         footprint.chunk_count >= 1,
@@ -130,13 +134,14 @@ fn capture_still_produces_verbatim_digest_and_local_embedding() {
 
 #[tokio::test]
 async fn offline_single_machine_drains_its_own_jobs_locally() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("offline_drain");
     let config = FabricConfig {
         hub_endpoint: Some("unreachable-hub".to_string()),
         tenant: Some("tenant-alpha".to_string()),
         ..Default::default()
     };
-    let mut capture = FabricCapture::new(tier0_request("daily-loop", "s1", TRANSCRIPT));
+    let mut capture = FabricCapture::new(tier0_request("capture", "s1", TRANSCRIPT));
     capture.config = Some(&config);
     fabric::capture(&node.store, capture).expect("fabric capture");
 
@@ -148,7 +153,7 @@ async fn offline_single_machine_drains_its_own_jobs_locally() {
         "a hub-unreachable machine still drains its own job locally"
     );
 
-    let ctx = context_id(&node.store, "daily-loop").expect("context exists");
+    let ctx = context_id(&node.store, "capture").expect("context exists");
     assert!(
         memory_total(&node.store, ctx) > 0,
         "local drain produces memory even with the hub unreachable"
@@ -164,10 +169,11 @@ async fn offline_single_machine_drains_its_own_jobs_locally() {
 
 #[test]
 fn inputs_travel_as_refs_never_inlined() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("inputs_as_refs");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", TRANSCRIPT)),
+        FabricCapture::new(tier0_request("capture", "s1", TRANSCRIPT)),
     )
     .expect("fabric capture");
 
@@ -190,6 +196,7 @@ fn inputs_travel_as_refs_never_inlined() {
 
 #[test]
 fn worker_lockfile_second_worker_is_noop_when_held() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("worker_lock");
     let root = node.data_root();
     let first = acquire_worker_lock_at(&root);

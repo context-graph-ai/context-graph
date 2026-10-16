@@ -1,7 +1,4 @@
-//! RED test for the staged-merge intra-pass dedupe defect (external review finding, 2026-07-04):
-//! the merge built its known-sets once and appended focused-pass items without inserting, so
-//! DUPLICATES WITHIN a focused pass leaked through. Committed failing before the fix; the fix
-//! commit may not touch this file.
+//! Staged merging deduplicates repeated items within a focused pass as well as across passes.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -43,6 +40,7 @@ impl ConversationExtractor for DupeEntityExtractor {
 
 #[test]
 fn staged_merge_dedupes_within_the_focused_pass() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let store = open_store_with_lexical_embedder(StoreConfig {
         db_path: dir.path().join("cg.db"),

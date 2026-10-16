@@ -25,13 +25,11 @@
 //! wrong table or copy a declaration from a sibling table. Either way, the declaration fails to
 //! describe the persisted table it names.
 //!
-//! ## What the writable door already does
+//! ## Shared declaration validation
 //!
-//! The consumer's WRITABLE doors refuse exactly this drift: a declaration that no longer describes
-//! the persisted table comes back `CgError::ConsumerTableDrifted`, naming the table and the
-//! differences (`store::consumer_tables::verify_existing_table`). The reading door is the one
-//! consumer surface that does not check, so the same forged declaration that is refused for
-//! writing is accepted for reading.
+//! Both writable and read-only consumer doors verify declarations against the persisted table.
+//! A drift refusal names the table and the differences, matching the writable verification in
+//! `store::consumer_tables::verify_existing_table`.
 //!
 //! ## What is proved here
 //!
@@ -310,8 +308,8 @@ fn a_write_scoped_table_forged_as_unscoped_is_refused_before_any_row_is_served()
 
 // The positive control, and the reason this is a verification rather than a ban. A declaration that
 // DOES describe the persisted table opens and answers, in both of the shapes a consumer brings: the
-// write-scoped table declared truthfully with no labels is served unnarrowed, exactly as it always
-// has been, and the read-scoped table declared truthfully as `edge` is narrowed by the engine to
+// write-scoped table declared truthfully with no labels is served unnarrowed, and the
+// read-scoped table declared truthfully as `edge` is narrowed by the engine to
 // the edge row.
 #[test]
 fn a_truthful_declaration_over_the_same_store_still_opens_and_answers() {
@@ -327,8 +325,7 @@ fn a_truthful_declaration_over_the_same_store_still_opens_and_answers() {
     assert_eq!(
         vec!["edge-1".to_string(), "server-1".to_string()],
         ids_in(&unnarrowed, "vigil_signals"),
-        "a truthful declaration claiming no label narrows nothing and is served every row, as it \
-         always has been",
+        "a truthful declaration claiming no label narrows nothing and is served every row",
     );
     unnarrowed.close().expect("close the reader");
 

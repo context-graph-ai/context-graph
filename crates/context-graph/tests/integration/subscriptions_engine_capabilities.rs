@@ -80,6 +80,7 @@ fn wait_for_metric(db: &Database, sink: &str, predicate: impl Fn(u64, u64, u64, 
 // Use case: queued sink events survive reopening and resume once the subscriber is registered again.
 #[test]
 fn engine_sink_queue_persists_across_reopen_subscriber_re_registers_resumes_delivery() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("event-bus.redb");
     let ctx = Uuid::new_v4();
@@ -111,6 +112,7 @@ fn engine_sink_queue_persists_across_reopen_subscriber_re_registers_resumes_deli
 // Use case: permanent delivery failures are acknowledged once and counted distinctly from retries.
 #[test]
 fn engine_callback_returning_sink_error_permanent_drops_event_without_retry_metrics_distinguish() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = Database::open_memory();
     let ctx = Uuid::new_v4();
     declare_event_schema(&db);
@@ -131,6 +133,7 @@ fn engine_callback_returning_sink_error_permanent_drops_event_without_retry_metr
 // Use case: a failing sink cannot block an independent sink under sustained delivery.
 #[test]
 fn engine_per_sink_queue_isolation_one_sink_panic_does_not_block_other_sink_delivery_at_scale() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = Database::open_memory();
     let ctx = Uuid::new_v4();
     declare_event_schema(&db);
@@ -178,6 +181,7 @@ fn engine_per_sink_queue_isolation_one_sink_panic_does_not_block_other_sink_deli
 // Use case: cross-context events are filtered by the engine before typed payload handling.
 #[test]
 fn cross_context_isolation_enforced_at_engine_route_not_at_typed_wrapper() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = Database::open_memory();
     let ctx_a = Uuid::new_v4();
     let ctx_b = Uuid::new_v4();
@@ -212,6 +216,7 @@ fn cross_context_isolation_enforced_at_engine_route_not_at_typed_wrapper() {
 // Use case: sink metrics expose route-side filtering using shipped dispatcher counters only.
 #[test]
 fn engine_sink_metrics_for_test_distinguishes_route_filter_from_dispatcher_filter() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = Database::open_memory();
     let ctx_a = Uuid::new_v4();
     let ctx_b = Uuid::new_v4();

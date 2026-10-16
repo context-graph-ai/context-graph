@@ -29,7 +29,7 @@
 //! - DIFFERENT roots — the reader does not reach the owner, so the variable is what carried it and
 //!   not some other agreement the two processes could have reached anyway;
 //! - the variable unset on both sides, with the platform's own locator in force — the ordinary path
-//!   still works exactly as it did, and the provisioned root nobody was told about stays empty.
+//!   works, and a provisioned root nobody was told about stays empty.
 //!
 //! Nothing waits on elapsed time: the parent advances when the owner has printed that it is
 //! holding the store.
@@ -503,7 +503,7 @@ fn with_nothing_provisioned_the_platform_locator_works_exactly_as_it_did() {
             RuntimeLocation::PlatformLocator(platform.path())
         ),
         ReaderOutcome::Answered(ANSWER.to_string()),
-        "the ordinary owner plane is untouched by the new variable: a deployment that provisions \
+        "the ordinary owner plane works when a deployment provisions \
          nothing still has a reader that reaches its owner"
     );
     assert!(

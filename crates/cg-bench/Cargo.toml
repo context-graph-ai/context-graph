@@ -1,13 +1,17 @@
 [package]
+keywords.workspace = true
+categories.workspace = true
 name = "cg-bench"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+repository.workspace = true
+description = "Correctness scoring for extracted goals and decisions against reference answers"
 publish = false
 
 # Correctness bench (NOT a shipped product surface): grades understanding output against a
 # curated gold set under a pre-registered scoring method. The scoring thresholds in this crate
-# are that registration; changing them is a product-frame change, not engineering.
+# define the scoring contract; keep them fixed so measurements remain comparable.
 
 [dependencies]
 context-graph = { path = "../context-graph" }

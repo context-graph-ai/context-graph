@@ -1,4 +1,7 @@
 [package]
+publish = false
+keywords.workspace = true
+categories.workspace = true
 name = "context-graph-cli"
 version.workspace = true
 authors.workspace = true
@@ -54,11 +57,11 @@ uuid.workspace = true
 # those. Cargo resolves dev-dependency features for `cargo test` and leaves them out of
 # `cargo build`/`cargo install`, which is the boundary a profile check does not give.
 context-graph-cli = { path = ".", features = ["status-fault-injection"] }
-# The store-contention harness (tests/support/store_contention.rs) parks a real direct reader
+# The store-contention fixture (tests/support/store_contention.rs) parks a real direct reader
 # inside contextdb's shipped read-image hydration checkpoint, which is the only honest way to
 # produce reader contention: it exists only WHILE a committed image is loading. That checkpoint is
 # compiled behind contextdb-engine's `test-seams` feature. This is a test-only activation — the
-# `cg` binary's own dependency edge on contextdb-engine is unchanged.
+# `cg` binary's own dependency edge on contextdb-engine does not enable it.
 contextdb-engine = { workspace = true, features = ["test-seams"] }
 contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9", features = ["iroh", "test-seams"] }
 libc = "0.2"

@@ -1,6 +1,6 @@
-//! CLI acceptance tests for WP2 `cg understand` — the queue drainer.
+//! CLI acceptance tests for  `cg understand` — the queue drainer.
 //!
-//! The contract: tier-0 `cg record`/`cg import` leave a pending backlog and write zero graph; a
+//! The contract: model-free `cg record`/`cg import` leave a pending backlog and write zero graph; a
 //! later `cg understand` (foreground) or `cg understand --worker` (the detached post-capture kick)
 //! drains that backlog through the connected model into structured Intention/Decision/Entity/
 //! Observation memory, stopping at the budget ceiling, with exactly one worker per data root.
@@ -16,7 +16,7 @@ use serde_json::Value as JsonValue;
 use support::{CliHarness, CommandOutput, CompletionBehavior, LoginState, Provider};
 
 /// Read the structured graph a store persisted, as sorted description lists — the comparable shape
-/// modulo row ids. Used to prove `--understand-now` and tier-0-then-`cg understand` are ONE path.
+/// modulo row ids. Used to prove `--understand-now` and model-free-then-`cg understand` are ONE path.
 fn graph_snapshot(harness: &CliHarness, context: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
     let status = harness.run(&["status", "--context", context]);
     let json = output_json(&status);
@@ -105,13 +105,13 @@ fn record_then_understand_structures_the_graph() {
     assert_eq!(
         record.code,
         0,
-        "tier-0 record failed: {}",
+        "model-free record failed: {}",
         combined(&record)
     );
 
-    // Tier-0 capture wrote zero graph and left a pending backlog.
+    // model-free capture wrote zero graph and left a pending backlog.
     let before = status_json(&harness, "loop");
-    assert_eq!(goals(&before), 0, "tier-0 capture writes no graph");
+    assert_eq!(goals(&before), 0, "model-free capture writes no graph");
 
     // Drain the backlog through the connected model.
     let understand = harness.run(&["understand", "--context", "loop"]);
@@ -172,7 +172,7 @@ fn understand_worker_drains_then_repeat_is_noop() {
 
 #[test]
 fn worker_is_a_silent_noop_without_a_model() {
-    // No model connected. Tier-0 capture still works; the worker is a silent no-op.
+    // No model connected. model-free capture still works; the worker is a silent no-op.
     let harness = CliHarness::new();
     let record = harness.run_with_stdin(
         &["record", "--no-kick", "--context", "loop"],
@@ -181,7 +181,7 @@ fn worker_is_a_silent_noop_without_a_model() {
     assert_eq!(
         record.code,
         0,
-        "tier-0 record failed: {}",
+        "model-free record failed: {}",
         combined(&record)
     );
     let worker = harness.run(&["understand", "--worker"]);
@@ -342,14 +342,14 @@ fn skills_add_rejects_an_unknown_strategy() {
 const EQUIVALENCE_TRANSCRIPT: &str = "Acme needs password-less login to ship. We found the auth module file at src/auth.py and decided the auth module stays at src/auth.py. Use JWT with 15-min access tokens for the login flow.";
 
 /// The convergence contract: understanding reaches the store through ONE implementation. Capturing
-/// input X with `--understand-now` (tier-0 capture + a FOREGROUND drain of the just-captured
-/// digests) produces the SAME structured graph as tier-0-capturing X and then running
+/// input X with `--understand-now` (model-free capture + a FOREGROUND drain of the just-captured
+/// digests) produces the SAME structured graph as model-free-capturing X and then running
 /// `cg understand` (the background/foreground drainer over the backlog) — same intentions,
 /// decisions, and observations, modulo row ids. If the two paths ever diverged, one of them would
 /// be a second, duplicate understanding pipeline.
 #[test]
 fn understand_now_and_tier0_then_understand_produce_the_same_graph() {
-    // Path A: `--understand-now` (tier-0 capture, then a blocking foreground drain).
+    // Path A: `--understand-now` (model-free capture, then a blocking foreground drain).
     let eager = connected_harness();
     let eager_capture = eager.run_with_stdin(
         &["record", "--understand-now", "--context", "loop"],
@@ -362,7 +362,7 @@ fn understand_now_and_tier0_then_understand_produce_the_same_graph() {
         combined(&eager_capture)
     );
 
-    // Path B: default tier-0 capture, then the `cg understand` drainer.
+    // Path B: default model-free capture, then the `cg understand` drainer.
     let deferred = connected_harness();
     let deferred_capture = deferred.run_with_stdin(
         &["record", "--no-kick", "--context", "loop"],
@@ -371,7 +371,7 @@ fn understand_now_and_tier0_then_understand_produce_the_same_graph() {
     assert_eq!(
         deferred_capture.code,
         0,
-        "tier-0 record failed: {}",
+        "model-free record failed: {}",
         combined(&deferred_capture)
     );
     let understand = deferred.run(&["understand", "--context", "loop"]);
@@ -390,7 +390,7 @@ fn understand_now_and_tier0_then_understand_produce_the_same_graph() {
     );
     assert_eq!(
         eager_graph, deferred_graph,
-        "--understand-now and tier-0 + cg understand must produce the SAME structured graph \
+        "--understand-now and model-free + cg understand must produce the SAME structured graph \
          (one understanding path), modulo ids"
     );
 }

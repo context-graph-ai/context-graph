@@ -128,10 +128,6 @@ fn write_agent_config(path: &Path, agent: &str, cg_hook_count: usize) {
         .expect("agent config written");
 }
 
-fn claude_config(home: &Path) -> PathBuf {
-    home.join("agent-config/claude-code/settings.json")
-}
-
 fn cursor_config(home: &Path) -> PathBuf {
     home.join(".cursor/hooks.json")
 }
@@ -140,10 +136,37 @@ fn gemini_config(home: &Path) -> PathBuf {
     home.join(".gemini/settings.json")
 }
 
-/// The REAL Claude Code settings path the `cg` binary installs injection hooks into (structured
-/// JSON), replacing the old placeholder `agent-config/claude-code/settings.json`.
+/// Claude Code injection hooks use structured JSON at the standard settings path.
 fn real_claude_settings(home: &Path) -> PathBuf {
     home.join(".claude/settings.json")
+}
+
+fn write_claude_settings(home: &Path) {
+    let path = real_claude_settings(home);
+    fs::create_dir_all(path.parent().unwrap()).expect("Claude settings directory");
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "theme": "dark",
+            "hooks": {"SessionStart": [{"matcher": "", "hooks": [{
+                "type": "command", "command": "echo user-custom-hook:claude-code:echo hello"
+            }]}]}
+        }))
+        .unwrap(),
+    )
+    .expect("user settings written");
+}
+
+fn claude_hook_commands(settings: &str) -> Vec<String> {
+    let settings: serde_json::Value = serde_json::from_str(settings).expect("structured settings");
+    settings["hooks"]
+        .as_object()
+        .expect("hook events")
+        .values()
+        .flat_map(|groups| groups.as_array().expect("hook groups"))
+        .flat_map(|group| group["hooks"].as_array().expect("group hooks"))
+        .map(|hook| hook["command"].as_str().expect("hook command").to_string())
+        .collect()
 }
 
 fn create_dot_cg_projects(home: &Path) -> Vec<PathBuf> {
@@ -176,24 +199,29 @@ fn is_executable(path: &Path) -> bool {
     path.exists()
 }
 
+/// Repeated installation keeps one structured cg hook per event and preserves user hooks.
 #[test]
 fn install_script_idempotent_re_running_does_not_duplicate_hook_injections() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let prefix = temp.path().join("prefix");
     fs::create_dir_all(&home).expect("home created");
-    write_agent_config(&claude_config(&home), CLAUDE_AGENT, 0);
+    write_claude_settings(&home);
 
     let first = run_install(&home, &prefix, &[]);
     assert_success(&first, "first install");
     let second = run_install(&home, &prefix, &[]);
     assert_success(&second, "second install");
 
-    let settings = fs::read_to_string(claude_config(&home)).expect("claude settings readable");
+    let settings =
+        fs::read_to_string(real_claude_settings(&home)).expect("claude settings readable");
     assert_eq!(
-        count_occurrences(&settings, CG_HOOK_MARKER),
-        1,
-        "install should inject exactly one cg hook marker across repeated runs"
+        claude_hook_commands(&settings)
+            .iter()
+            .filter(|command| command.starts_with("cg hook claude-code "))
+            .count(),
+        2,
+        "install should inject exactly two structured cg hooks across repeated runs"
     );
     assert_eq!(
         count_occurrences(&settings, "user-custom-hook:claude-code:echo hello"),
@@ -202,6 +230,7 @@ fn install_script_idempotent_re_running_does_not_duplicate_hook_injections() {
     );
 }
 
+/// Uninstall removes cg artifacts and structured hooks while preserving user settings.
 #[test]
 fn uninstall_script_default_removes_binary_cache_user_config_and_surgically_removes_agent_config_hooks()
  {
@@ -211,14 +240,20 @@ fn uninstall_script_default_removes_binary_cache_user_config_and_surgically_remo
     let cache_root = home.join(".cache/cg/models");
     fs::create_dir_all(&home).expect("home created");
     fs::create_dir_all(&cache_root).expect("cache root created");
-    write_agent_config(&claude_config(&home), CLAUDE_AGENT, 1);
+    write_claude_settings(&home);
 
     let install = run_install(&home, &prefix, &[]);
     assert_success(&install, "install");
     fs::write(home.join(".config/cg/config.toml"), "installed = true\n")
         .expect("cg user config written");
-    let before = fs::read_to_string(claude_config(&home)).expect("claude settings readable");
-    assert!(before.contains(CG_HOOK_MARKER));
+    let before = fs::read_to_string(real_claude_settings(&home)).expect("claude settings readable");
+    assert_eq!(
+        claude_hook_commands(&before)
+            .iter()
+            .filter(|command| command.starts_with("cg hook claude-code "))
+            .count(),
+        2
+    );
 
     let uninstall = run_uninstall(&home, &prefix, &[]);
     assert_success(&uninstall, "uninstall");
@@ -235,16 +270,21 @@ fn uninstall_script_default_removes_binary_cache_user_config_and_surgically_remo
         !home.join(".config/cg").exists(),
         "default uninstall should remove cg user config"
     );
-    let after = fs::read_to_string(claude_config(&home)).expect("claude settings remains");
+    let after = fs::read_to_string(real_claude_settings(&home)).expect("claude settings remains");
     assert!(
-        !after.contains(CG_HOOK_MARKER),
+        claude_hook_commands(&after)
+            .iter()
+            .all(|command| !command.starts_with("cg hook claude-code ")),
         "default uninstall should remove only cg-injected hook blocks"
     );
     assert!(
         after.contains("user-custom-hook:claude-code:echo hello"),
         "default uninstall must preserve unrelated user hook bytes"
     );
-    serde_json::from_str::<serde_json::Value>(&after).expect("agent config remains valid JSON");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after).unwrap()["theme"],
+        "dark"
+    );
 }
 
 #[test]
@@ -314,13 +354,14 @@ fn uninstall_script_purge_flag_prompts_for_confirmation_and_removes_dot_cg_only_
     }
 }
 
+/// Disconnect removes Claude Code cg hooks while preserving user hooks and other agents.
 #[test]
 fn disconnect_command_removes_single_agent_hook_other_connections_untouched() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let prefix = temp.path().join("prefix");
     fs::create_dir_all(&home).expect("home created");
-    write_agent_config(&claude_config(&home), CLAUDE_AGENT, 1);
+    write_claude_settings(&home);
     write_agent_config(&cursor_config(&home), CURSOR_AGENT, 1);
     write_agent_config(&gemini_config(&home), GEMINI_AGENT, 1);
     let install = run_install(&home, &prefix, &[]);
@@ -328,12 +369,23 @@ fn disconnect_command_removes_single_agent_hook_other_connections_untouched() {
 
     let cursor_before = fs::read(cursor_config(&home)).expect("cursor config readable");
     let gemini_before = fs::read(gemini_config(&home)).expect("gemini config readable");
+    let installed = fs::read_to_string(real_claude_settings(&home)).expect("installed hooks");
+    assert_eq!(
+        claude_hook_commands(&installed)
+            .iter()
+            .filter(|command| command.starts_with("cg hook claude-code "))
+            .count(),
+        2
+    );
     let disconnect = run_cg(&home, &prefix, &["disconnect", CLAUDE_AGENT]);
     assert_success(&disconnect, "cg disconnect claude-code");
 
-    let claude_after = fs::read_to_string(claude_config(&home)).expect("claude config readable");
+    let claude_after =
+        fs::read_to_string(real_claude_settings(&home)).expect("claude config readable");
     assert!(
-        !claude_after.contains("cg observe --agent claude-code"),
+        claude_hook_commands(&claude_after)
+            .iter()
+            .all(|command| !command.starts_with("cg hook claude-code ")),
         "disconnect claude-code should remove only claude-code cg hook lines"
     );
     assert!(
@@ -467,7 +519,7 @@ fn install_script_runs_on_linux_and_macos_and_emits_correct_cache_root_per_platf
 /// `$HOME/.cache` instead downloads 547 MB into a directory nothing reads, and then reports it
 /// removed the model cache while leaving the one in use on disk. The expectation here is the
 /// resolver's own answer under the same environment, never a literal, so the script and the
-/// library rule cannot drift apart again.
+/// library rule cannot drift apart.
 #[test]
 fn the_installer_seeds_the_model_cache_root_the_library_reads_when_the_cache_home_is_relocated() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -574,5 +626,59 @@ fn install_script_writes_uninstall_with_executable_permission_and_shebang() {
     assert!(
         stdout.contains("--purge") && stdout.contains("preserve"),
         "uninstall help should document purge and default .cg preservation"
+    );
+}
+
+/// Uninstall cleans its real Claude Code settings and preserves unrelated settings under HOME.
+#[test]
+fn uninstall_touches_only_the_claude_code_settings_it_installed_into() {
+    let fixture = tempfile::tempdir().expect("isolated installation");
+    let home = fixture.path().join("home");
+    let prefix = fixture.path().join("prefix");
+    let real = real_claude_settings(&home);
+    fs::create_dir_all(real.parent().unwrap()).expect("real settings directory");
+    let original = serde_json::json!({
+        "custom": "keep-me",
+        "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo user-kept"}]}]}
+    });
+    fs::write(&real, serde_json::to_vec_pretty(&original).unwrap()).expect("real user settings");
+    let install = run_install(&home, &prefix, &[]);
+    assert_success(&install, "install into real Claude Code settings");
+    let installed = fs::read_to_string(&real).expect("installed settings");
+
+    // Plant a similarly named file outside the installation target after installation.
+    let decoy = home.join("unrelated-project/agent-config/claude-code/settings.json");
+    write_agent_config(&decoy, CLAUDE_AGENT, 1);
+    let decoy_before = fs::read(&decoy).expect("decoy bytes");
+    let uninstall = run_uninstall(&home, &prefix, &[]);
+    assert_success(&uninstall, "generated uninstall");
+    assert_eq!(
+        fs::read(&decoy).expect("decoy remains"),
+        decoy_before,
+        "uninstall must not glob another project's agent-config settings"
+    );
+    assert!(
+        installed.contains("cg hook claude-code SessionStart"),
+        "the installer writes the real SessionStart hook: {installed}"
+    );
+    assert!(
+        installed.contains("cg hook claude-code UserPromptSubmit"),
+        "the installer writes the real UserPromptSubmit hook: {installed}"
+    );
+    let cleaned_text = fs::read_to_string(&real).expect("real settings remain");
+    assert!(
+        !cleaned_text.contains("cg hook claude-code"),
+        "uninstall removes every hook installed in the real settings: {cleaned_text}"
+    );
+    let cleaned: serde_json::Value =
+        serde_json::from_str(&cleaned_text).expect("valid cleaned JSON");
+    assert_eq!(
+        cleaned["custom"], original["custom"],
+        "unrelated settings survive"
+    );
+    assert_eq!(
+        cleaned.pointer("/hooks/SessionStart/0"),
+        original.pointer("/hooks/SessionStart/0"),
+        "the user's original SessionStart hook survives exactly"
     );
 }

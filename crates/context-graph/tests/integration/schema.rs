@@ -548,7 +548,7 @@ fn insert_signature(db: &Database, id: Uuid, status: &str) {
             ("signature_type", Value::Text("frequency_anomaly".into())),
             ("description", Value::Text("Same person at multiple locations".into())),
             ("match_criteria", Value::Json(json!({"observation_types": ["person_detected"]}))),
-            ("scope_labels", Value::Json(json!({"org": "bank-x"}))),
+            ("scope_labels", Value::Json(json!({"org": "example-org"}))),
             ("confidence", Value::Float64(0.75)),
             ("origin_context_ids", Value::Json(json!([uuid(1)]))),
             ("status", Value::Text(status.to_string())),
@@ -660,6 +660,7 @@ fn insert_approval(db: &Database, id: Uuid, context_id: Uuid, decision_id: Uuid)
 // contexts table round-trip: id, name, labels JSON, properties JSON, and created_at survive insert + select byte-exact.
 #[test]
 fn test_contexts_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let _ = now_ts();
     let id = Uuid::from_u128(1);
@@ -703,6 +704,7 @@ fn test_contexts_table_insert() {
 // intentions table round-trip: every schema column (origin, origin_ref, blueprint_id, bindings, blueprint_proposal, tags) persists as declared.
 #[test]
 fn test_intentions_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let id = Uuid::from_u128(2);
     let context_id = Uuid::from_u128(20);
@@ -782,6 +784,7 @@ fn test_intentions_table_insert() {
 // decisions table round-trip: decision_type, reasoning JSON, confidence, status, agent_id, tags, and context_id FK all persist.
 #[test]
 fn test_decisions_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let id = Uuid::from_u128(3);
     let context_id = Uuid::from_u128(30);
@@ -849,6 +852,7 @@ fn test_decisions_table_insert() {
 // entities table round-trip: entity_type, name, context_id, properties JSON, and created_at survive insert + select.
 #[test]
 fn test_entities_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let id = Uuid::from_u128(4);
     let context_id = Uuid::from_u128(40);
@@ -887,6 +891,7 @@ fn test_entities_table_insert() {
 // observations table round-trip: observation_type, property JSON, source, entity_id and context_id FKs, and timestamp persist.
 #[test]
 fn test_observations_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(50);
     let entity_id = Uuid::from_u128(51);
@@ -932,6 +937,7 @@ fn test_observations_table_insert() {
 // outcomes table round-trip: decision_id FK, success bool, notes, and recorded_at persist.
 #[test]
 fn test_outcomes_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(60);
     insert_context(&db, context_id, "ctx");
@@ -965,6 +971,7 @@ fn test_outcomes_table_insert() {
 // invalidations table round-trip: status, affected_decision_id, trigger_observation_id, basis_diff JSON, severity, and resolution columns persist.
 #[test]
 fn test_invalidations_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(70);
     insert_context(&db, context_id, "ctx");
@@ -1027,6 +1034,7 @@ fn test_invalidations_table_insert() {
 
 #[test]
 fn combination_invalidations_unique_per_context_affected_decision_refuses_raw_duplicate() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_060);
     let entity_id = Uuid::from_u128(20_061);
@@ -1079,6 +1087,7 @@ fn combination_invalidations_unique_per_context_affected_decision_refuses_raw_du
 // signatures table round-trip: signature_type, match_criteria JSON, scope_labels, origin_context_ids, confidence, and status persist.
 #[test]
 fn test_signatures_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let id = Uuid::from_u128(8);
     insert_signature(&db, id, "active");
@@ -1104,7 +1113,7 @@ fn test_signatures_table_insert() {
     );
     assert_eq!(
         row_value(&result, 0, "scope_labels"),
-        &Value::Json(json!({"org": "bank-x"}))
+        &Value::Json(json!({"org": "example-org"}))
     );
     assert_eq!(row_value(&result, 0, "confidence"), &Value::Float64(0.75));
     assert_eq!(
@@ -1128,6 +1137,7 @@ fn test_signatures_table_insert() {
 // digests table round-trip: source, session_ref, summary, text vector, context_id FK, properties, and created_at persist.
 #[test]
 fn test_digests_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let id = Uuid::from_u128(9);
     let context_id = Uuid::from_u128(90);
@@ -1179,6 +1189,7 @@ fn test_digests_table_insert() {
 // blueprints table round-trip: canonical_description, category, slots JSON, default_config_shape, version, and status persist.
 #[test]
 fn test_blueprints_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let id = Uuid::from_u128(10);
     insert_blueprint(&db, id);
@@ -1223,6 +1234,7 @@ fn test_blueprints_table_insert() {
 // edges table accepts every relationship label (SERVES, BASED_ON, ABOUT, CITES, SUPERSEDES, RELATES_TO, OBSERVED_ON, HAS_OUTCOME, INVALIDATES, TRIGGERED_BY, MATCHED_BY, GENERATED, EXTRACTED_FROM, INSTANTIATES, REFINES); removing a label at the schema layer silently drops a relationship kind.
 #[test]
 fn test_edges_table_all_relationship_types() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(99);
     insert_context(&db, context_id, "ctx");
@@ -1286,6 +1298,7 @@ fn test_edges_table_all_relationship_types() {
 // entity_snapshots table round-trip: entity_id, data JSON, and valid_from/valid_to txid integers persist as declared.
 #[test]
 fn test_entity_snapshots_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(299);
     let entity_id = Uuid::from_u128(300);
@@ -1311,6 +1324,7 @@ fn test_entity_snapshots_table_insert() {
 
 #[test]
 fn entity_snapshot_rows_reject_raw_update_and_delete_as_engine_immutable() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_060);
     let entity_id = Uuid::from_u128(20_061);
@@ -1342,6 +1356,7 @@ fn entity_snapshot_rows_reject_raw_update_and_delete_as_engine_immutable() {
 
 #[test]
 fn entity_snapshot_link_rows_reject_raw_update_and_delete_as_engine_immutable() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_063);
     let entity_id = Uuid::from_u128(20_064);
@@ -1388,6 +1403,7 @@ fn entity_snapshot_link_rows_reject_raw_update_and_delete_as_engine_immutable() 
 
 #[test]
 fn combination_entity_snapshot_links_reject_cross_entity_successor_by_composite_fk() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_070);
     let entity_a = Uuid::from_u128(20_071);
@@ -1416,6 +1432,7 @@ fn combination_entity_snapshot_links_reject_cross_entity_successor_by_composite_
 
 #[test]
 fn combination_entity_current_snapshots_reject_cross_entity_snapshot_by_composite_fk() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_076);
     let entity_a = Uuid::from_u128(20_077);
@@ -1441,6 +1458,7 @@ fn combination_entity_current_snapshots_reject_cross_entity_snapshot_by_composit
 // intention_snapshots round-trip: intention_id FK, description, status, origin, properties JSON, tags JSON, valid_from and valid_to TXIDs survive insert + select.
 #[test]
 fn test_intention_snapshots_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(310);
     let intention_id = Uuid::from_u128(311);
@@ -1505,6 +1523,7 @@ fn test_intention_snapshots_table_insert() {
 // intention_snapshots.intention_id FK into intentions.id must hold; a row pointing at a non-existent intention must fail with ForeignKeyViolation.
 #[test]
 fn test_fk_intention_snapshot_invalid_intention_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_error_is_fk(db.execute(
         "INSERT INTO intention_snapshots (id, context_id, intention_id, description, status, origin, properties, tags, valid_from, valid_to) VALUES ($id, $context_id, $intention_id, $description, $status, $origin, $properties, $tags, $valid_from, $valid_to)",
@@ -1526,6 +1545,7 @@ fn test_fk_intention_snapshot_invalid_intention_id_rejected() {
 // approvals table round-trip: decision_id FK, approver_id, level, rationale, and created_at persist.
 #[test]
 fn test_approvals_table_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(400);
     insert_context(&db, context_id, "ctx");
@@ -1563,6 +1583,7 @@ fn test_approvals_table_insert() {
 // observations carries TableMeta.immutable=true at the engine layer; a raw UPDATE must fail with Error::ImmutableTable, not merely be blocked higher up.
 #[test]
 fn test_observation_immutable_rejects_update() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(500);
     let entity_id = Uuid::from_u128(501);
@@ -1584,6 +1605,7 @@ fn test_observation_immutable_rejects_update() {
 // observations rows cannot be physically removed; a raw DELETE must return Error::ImmutableTable from the engine.
 #[test]
 fn test_observation_immutable_rejects_delete() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(503);
     let entity_id = Uuid::from_u128(504);
@@ -1602,6 +1624,7 @@ fn test_observation_immutable_rejects_delete() {
 // digests table is immutable at the schema layer; a raw UPDATE of summary must fail with Error::ImmutableTable.
 #[test]
 fn test_digest_immutable_rejects_update() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(506);
     let id = Uuid::from_u128(507);
@@ -1621,6 +1644,7 @@ fn test_digest_immutable_rejects_update() {
 // digests rows cannot be deleted because downstream extractions hold EXTRACTED_FROM edges back to them; the engine must refuse raw DELETE with Error::ImmutableTable.
 #[test]
 fn test_digest_immutable_rejects_delete() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(508);
     let id = Uuid::from_u128(509);
@@ -1638,6 +1662,7 @@ macro_rules! allowed_status_test {
     ($name:ident, $insert_fn:ident, $table:literal, $start:literal, $next:literal) => {
         #[test]
         fn $name() {
+            let _alongside = crate::runs_alone::alongside_siblings();
             let db = fresh_db();
             assert!(
                 db.table_meta($table).unwrap().state_machine.is_some(),
@@ -1672,6 +1697,7 @@ macro_rules! rejected_status_test {
     ($name:ident, $insert_fn:ident, $table:literal, $start:literal, $next:literal) => {
         #[test]
         fn $name() {
+            let _alongside = crate::runs_alone::alongside_siblings();
             let db = fresh_db();
             let context_id = Uuid::from_u128(602);
             let id = Uuid::from_u128(603);
@@ -1819,7 +1845,7 @@ rejected_status_test!(
     "archived"
 );
 
-// invalidations state machine permits Pending -> Acknowledged so a reviewer can stage a response without resolving it yet.
+// invalidations state machine permits Pending -> Acknowledged so a reader can stage a response without resolving it yet.
 allowed_status_test!(
     test_invalidation_status_pending_to_acknowledged,
     insert_invalidation_status,
@@ -1827,7 +1853,7 @@ allowed_status_test!(
     "pending",
     "acknowledged"
 );
-// invalidations state machine permits Acknowledged -> Resolved so a reviewer closes the invalidation by linking a new Decision.
+// invalidations state machine permits Acknowledged -> Resolved so a reader closes the invalidation by linking a new Decision.
 allowed_status_test!(
     test_invalidation_status_acknowledged_to_resolved,
     insert_invalidation_status,
@@ -1835,7 +1861,7 @@ allowed_status_test!(
     "acknowledged",
     "resolved"
 );
-// invalidations state machine permits Acknowledged -> Dismissed so a reviewer can judge an invalidation irrelevant after inspection.
+// invalidations state machine permits Acknowledged -> Dismissed so a reader can judge an invalidation irrelevant after inspection.
 allowed_status_test!(
     test_invalidation_status_acknowledged_to_dismissed,
     insert_invalidation_status,
@@ -1887,6 +1913,7 @@ rejected_status_test!(
 // edges of type CITES must form a DAG; a direct back-edge that would close a 2-node cycle must be rejected at insert.
 #[test]
 fn test_cites_dag_rejects_cycle() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(699);
     insert_context(&db, context_id, "ctx");
@@ -1919,6 +1946,7 @@ fn test_cites_dag_rejects_cycle() {
 // a CITES edge from a node to itself is a degenerate cycle and must be refused at insert so precedent_chain cannot spin forever.
 #[test]
 fn test_cites_dag_rejects_self_cycle() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(7030);
     insert_context(&db, context_id, "ctx");
@@ -1942,6 +1970,7 @@ fn test_cites_dag_rejects_self_cycle() {
 // the CITES DAG guard must detect transitive cycles (A->B->C->A), not merely direct back-edges, so reachability cannot create a loop.
 #[test]
 fn test_cites_dag_rejects_transitive_cycle() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(7050);
     insert_context(&db, context_id, "ctx");
@@ -1969,6 +1998,7 @@ fn test_cites_dag_rejects_transitive_cycle() {
 // the DAG guard is scoped to CITES only; typed edges such as RELATES_TO must accept both directions between the same pair without being misclassified as cycles.
 #[test]
 fn test_non_cites_edge_allows_bidirectional() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(7110);
     insert_context(&db, context_id, "ctx");
@@ -1989,6 +2019,7 @@ fn test_non_cites_edge_allows_bidirectional() {
 // edges carry a UNIQUE constraint on (source_id, target_id, edge_type); a duplicate raw insert is refused loudly, and add_relationship absorbs that refusal to stay idempotent.
 #[test]
 fn test_edge_duplicate_insert_refused() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(7150);
     insert_context(&db, context_id, "ctx");
@@ -2031,6 +2062,7 @@ fn test_edge_duplicate_insert_refused() {
 // entities.context_id column supports engine-side equality filtering so list_entities scoped to one context cannot bleed rows from another.
 #[test]
 fn test_entities_filter_by_context_id() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(800);
     let ctx_b = Uuid::from_u128(801);
@@ -2052,6 +2084,7 @@ fn test_entities_filter_by_context_id() {
 // edges.context_id column supports engine-side equality filtering so traverse and impact-analysis scopes never see edges authored under a sibling context.
 #[test]
 fn test_edges_filter_by_context_id() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(804);
     let ctx_b = Uuid::from_u128(805);
@@ -2103,6 +2136,7 @@ fn test_edges_filter_by_context_id() {
 // entity_snapshots rows whose valid_to equals the next row's valid_from are contiguous and permitted; the engine must not mistake them for overlaps.
 #[test]
 fn test_entity_snapshots_adjacent_rows_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(899);
     let entity_id = Uuid::from_u128(900);
@@ -2130,6 +2164,7 @@ fn test_entity_snapshots_adjacent_rows_insert() {
 // the engine itself does not reject overlapping entity_snapshots rows; overlap prevention is the update_entity operation's contract, not a schema-level constraint, and this test pins that division.
 #[test]
 fn test_entity_snapshots_engine_permits_overlapping_rows() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(9030);
     let entity_id = Uuid::from_u128(904);
@@ -2153,6 +2188,7 @@ fn test_entity_snapshots_engine_permits_overlapping_rows() {
 // outcomes.decision_id is a declared FK into decisions.id; an insert naming a non-existent decision must fail with ForeignKeyViolation so no HAS_OUTCOME edge can dangle.
 #[test]
 fn test_fk_outcome_invalid_decision_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_error_is_fk(db.execute(
         "INSERT INTO outcomes (id, context_id, decision_id, success, notes, recorded_at) VALUES ($id, $context_id, $decision_id, $success, $notes, $recorded_at)",
@@ -2170,6 +2206,7 @@ fn test_fk_outcome_invalid_decision_id_rejected() {
 // observations.entity_id is a declared FK into entities.id; observations pointing at a non-existent entity must be refused at the engine, not silently accepted.
 #[test]
 fn test_fk_observation_invalid_entity_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx = Uuid::from_u128(1002);
     insert_context(&db, ctx, "ctx");
@@ -2193,6 +2230,7 @@ fn test_fk_observation_invalid_entity_id_rejected() {
 // invalidations.affected_decision_id FK must resolve to a real decisions row; a phantom target is rejected so INVALIDATES edges cannot dangle.
 #[test]
 fn test_fk_invalidation_invalid_decision_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(1004);
     let entity_id = Uuid::from_u128(1005);
@@ -2221,6 +2259,7 @@ fn test_fk_invalidation_invalid_decision_id_rejected() {
 // approvals.decision_id FK must resolve; an approval pointing at no Decision would leave the governance record untethered.
 #[test]
 fn test_fk_approval_invalid_decision_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_error_is_fk(db.execute(
         "INSERT INTO approvals (id, context_id, decision_id, approver_id, level, rationale, created_at) VALUES ($id, $context_id, $decision_id, $approver_id, $level, $rationale, $created_at)",
@@ -2239,6 +2278,7 @@ fn test_fk_approval_invalid_decision_id_rejected() {
 // intentions.context_id FK into contexts.id must hold; an intention with a non-existent context would break the isolation boundary.
 #[test]
 fn test_fk_intention_invalid_context_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_error_is_fk(db.execute(
         "INSERT INTO intentions (id, description, status, context_id, origin, origin_ref, blueprint_id, bindings, blueprint_proposal, properties, tags, created_at) VALUES ($id, $description, $status, $context_id, $origin, $origin_ref, $blueprint_id, $bindings, $blueprint_proposal, $properties, $tags, $created_at)",
@@ -2262,6 +2302,7 @@ fn test_fk_intention_invalid_context_id_rejected() {
 // decisions.context_id FK into contexts.id must hold; a decision outside any context would escape the per-tenant isolation surface.
 #[test]
 fn test_fk_decision_invalid_context_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_error_is_fk(db.execute(
         "INSERT INTO decisions (id, decision_type, description, reasoning, confidence, status, agent_id, context_id, properties, tags, created_at) VALUES ($id, $decision_type, $description, $reasoning, $confidence, $status, $agent_id, $context_id, $properties, $tags, $created_at)",
@@ -2284,6 +2325,7 @@ fn test_fk_decision_invalid_context_id_rejected() {
 // entities.context_id FK into contexts.id must hold; an entity with a dangling context would be invisible to every scoped list_entities call.
 #[test]
 fn test_fk_entity_invalid_context_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_error_is_fk(db.execute(
         "INSERT INTO entities (id, entity_type, name, status, context_id, properties, tags, created_at) VALUES ($id, $entity_type, $name, $status, $context_id, $properties, $tags, $created_at)",
@@ -2303,6 +2345,7 @@ fn test_fk_entity_invalid_context_id_rejected() {
 // digests.context_id FK into contexts.id must hold; a digest attached to no context would make its provenance edges leak across tenancy.
 #[test]
 fn test_fk_digest_invalid_context_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_error_is_fk(db.execute(
         "INSERT INTO digests (id, source, session_ref, summary, kind, vector_text, dimension, context_id, properties, created_at) VALUES ($id, $source, $session_ref, $summary, $kind, $vector_text, $dimension, $context_id, $properties, $created_at)",
@@ -2327,6 +2370,7 @@ fn test_fk_digest_invalid_context_id_rejected() {
 // invalidations.trigger_observation_id FK into observations.id must hold; without it, TRIGGERED_BY provenance would point at nothing.
 #[test]
 fn test_fk_invalidation_invalid_observation_id_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(1018);
     let decision_id = Uuid::from_u128(1019);
@@ -2353,6 +2397,7 @@ fn test_fk_invalidation_invalid_observation_id_rejected() {
 // intentions.description is NOT NULL at the schema layer; a null description would make the Intention semantically empty and is refused at insert.
 #[test]
 fn test_not_null_intention_description_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx = Uuid::from_u128(1030);
     insert_context(&db, ctx, "ctx");
@@ -2382,6 +2427,7 @@ fn test_not_null_intention_description_rejected() {
 // decisions.decision_type is NOT NULL; Discovery and audit queries key off this column, so a null value must be rejected at insert.
 #[test]
 fn test_not_null_decision_decision_type_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx = Uuid::from_u128(1130);
     insert_context(&db, ctx, "ctx");
@@ -2410,6 +2456,7 @@ fn test_not_null_decision_decision_type_rejected() {
 // entities.name is NOT NULL so list_entities name_contains filters always have a string to match on; null names are refused at insert.
 #[test]
 fn test_not_null_entity_name_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx = Uuid::from_u128(1230);
     insert_context(&db, ctx, "ctx");
@@ -2430,6 +2477,7 @@ fn test_not_null_entity_name_rejected() {
 // observations.source is NOT NULL so every captured fact carries a traceable origin; null source is refused at insert.
 #[test]
 fn test_not_null_observation_source_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx = Uuid::from_u128(1330);
     insert_context(&db, ctx, "ctx");
@@ -2459,6 +2507,7 @@ fn test_not_null_observation_source_rejected() {
 // contexts.name is NOT NULL because the unique-name contract underpins tenant isolation; null name is refused at insert.
 #[test]
 fn test_not_null_context_name_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let result = db.execute(
         "INSERT INTO contexts (id, name, labels, properties, created_at) VALUES ($id, $name, $labels, $properties, $created_at)",
@@ -2476,6 +2525,7 @@ fn test_not_null_context_name_rejected() {
 // contexts.name carries a UNIQUE constraint; a duplicate insert succeeds as a no-op at the engine, so the application layer (Store) detects the collision and surfaces CgError::UniqueViolation.
 #[test]
 fn test_unique_context_name_noop() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let id1 = Uuid::from_u128(1040);
     let id2 = Uuid::from_u128(1041);
@@ -2506,6 +2556,7 @@ fn test_unique_context_name_noop() {
 // digests.vector_text is a fixed-dimension vector column (DIGEST_VECTOR_DIMENSION); the engine must round-trip a full-dimension embedding without truncation or dimension drift.
 #[test]
 fn test_digest_vector_column_accepts_embedding() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(1050);
     insert_context(&db, context_id, "ctx");
@@ -2529,6 +2580,7 @@ fn test_digest_vector_column_accepts_embedding() {
 // the cosine-distance operator on digests.vector_text must honor context_id scoping during ANN ordering so semantic search never surfaces a closer digest from a sibling context.
 #[test]
 fn test_digest_vector_cosine_distance_query() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(1060);
     let ctx_b = Uuid::from_u128(1061);
@@ -2568,6 +2620,7 @@ fn test_digest_vector_cosine_distance_query() {
 // schema initialization is idempotent: calling it twice must neither duplicate tables nor error, so Store::open on an already-initialized database stays safe.
 #[test]
 fn test_initialize_schema_idempotent() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = Database::open_memory();
     initialize_schema(&db);
     initialize_schema(&db);
@@ -2591,6 +2644,7 @@ fn assert_table_present(db: &Database, table: &str) {
 
 #[test]
 fn combination_record_observation_observation_evidence_snapshot_embedding_atomic_one_tx() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let _dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: _dir.path().join("cg.db"),
@@ -2722,6 +2776,7 @@ fn combination_record_observation_observation_evidence_snapshot_embedding_atomic
 
 #[test]
 fn combination_record_observation_rollback_on_validation_error_after_tx_open_leaves_zero_rows() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -2748,7 +2803,7 @@ fn combination_record_observation_rollback_on_validation_error_after_tx_open_lea
         observation_id,
         context_id,
         kind: context_graph::EvidenceKind::ImageFrame,
-        source_ref: "vigil-edge://camera-1/frame/invalid".to_string(),
+        source_ref: "s3://camera-1/frame/invalid".to_string(),
         mime_type: Some("image/jpeg".to_string()),
         region: Some(json!({"x": 1.4, "y": 0.0, "w": 0.2, "h": 0.2})),
         retention_status: context_graph::RetentionStatus::RetainedExternal,
@@ -2812,6 +2867,7 @@ fn combination_record_observation_rollback_on_validation_error_after_tx_open_lea
 
 #[test]
 fn combination_evidence_table_immutable_rejects_update_and_delete() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_table_present(&db, "evidence");
     let update = db.execute(
@@ -2837,6 +2893,7 @@ fn combination_evidence_table_immutable_rejects_update_and_delete() {
 
 #[test]
 fn combination_evidence_availability_log_immutable_rejects_update_and_delete() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_table_present(&db, "evidence_availability_log");
     let update = db.execute(
@@ -2863,6 +2920,7 @@ fn combination_evidence_availability_log_immutable_rejects_update_and_delete() {
 #[test]
 fn combination_evidence_availability_log_concurrent_appends_persist_distinct_rows_last_writer_wins_by_txid()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = Arc::new(fresh_db());
     let context_id = Uuid::from_u128(20_105);
     let entity_id = Uuid::from_u128(20_205);
@@ -2932,6 +2990,7 @@ fn combination_evidence_availability_log_concurrent_appends_persist_distinct_row
 
 #[test]
 fn combination_decision_status_state_machine_active_to_invalidated_accepted() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_006);
     insert_context(&db, context_id, "ctx");
@@ -2952,16 +3011,19 @@ fn combination_decision_status_state_machine_active_to_invalidated_accepted() {
 
 #[test]
 fn combination_decision_status_state_machine_invalidated_to_active_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     assert_invalidated_terminal_transition_rejected("active");
 }
 
 #[test]
 fn combination_decision_status_state_machine_invalidated_to_archived_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     assert_invalidated_terminal_transition_rejected("archived");
 }
 
 #[test]
 fn combination_decision_status_state_machine_invalidated_to_superseded_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     assert_invalidated_terminal_transition_rejected("superseded");
 }
 
@@ -2986,6 +3048,7 @@ fn assert_invalidated_terminal_transition_rejected(to: &str) {
 
 #[test]
 fn combination_invalidate_decision_with_invalidation_row_atomic_or_neither_visible() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -3028,6 +3091,7 @@ fn combination_invalidate_decision_with_invalidation_row_atomic_or_neither_visib
 
 #[test]
 fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidations_equals_one() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -3134,6 +3198,7 @@ fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidati
 
 #[test]
 fn combination_decision_basis_snapshots_reject_wrong_context_and_wrong_entity_by_composite_fk() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(20_011);
     let ctx_b = Uuid::from_u128(20_012);
@@ -3182,6 +3247,7 @@ fn combination_decision_basis_snapshots_reject_wrong_context_and_wrong_entity_by
 #[test]
 fn combination_entity_snapshot_observations_reject_wrong_context_and_wrong_entity_by_composite_fk()
 {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(20_020);
     let ctx_b = Uuid::from_u128(20_021);
@@ -3249,6 +3315,7 @@ fn combination_entity_snapshot_observations_reject_wrong_context_and_wrong_entit
 
 #[test]
 fn combination_embedding_spaces_table_unique_on_embedding_space_id_concurrent_seed_collapses() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -3286,6 +3353,7 @@ fn combination_embedding_spaces_table_unique_on_embedding_space_id_concurrent_se
 
 #[test]
 fn combination_embedding_space_bindings_composite_primary_key_identity() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_table_present(&db, "embedding_space_bindings");
     assert_eq!(
@@ -3397,6 +3465,7 @@ fn combination_embedding_space_bindings_composite_primary_key_identity() {
 
 #[test]
 fn combination_evidence_multi_vector_columns_per_row_text_and_vision_independently_indexed() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let context_id = Uuid::from_u128(20_050);
     let entity_id = Uuid::from_u128(20_051);
@@ -3422,7 +3491,7 @@ fn combination_evidence_multi_vector_columns_per_row_text_and_vision_independent
                 ("observation_id", Value::Uuid(observation_id)),
                 ("context_id", Value::Uuid(context_id)),
                 ("kind", Value::Text("image_frame".into())),
-                ("source_ref", Value::Text(format!("vigil-edge://camera-1/frame/{supply_order}"))),
+                ("source_ref", Value::Text(format!("s3://camera-1/frame/{supply_order}"))),
                 ("retention_status", Value::Text("retained_external".into())),
                 ("supply_order", Value::Int64(supply_order)),
                 ("vector_text", Value::Vector(vector_text)),
@@ -3479,6 +3548,7 @@ fn combination_evidence_multi_vector_columns_per_row_text_and_vision_independent
 #[test]
 fn combination_cg_schema_version_table_single_row_invariant_multiple_rows_returns_legacy_schema_detected()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     context_graph::Store::admin_raw_install_legacy_schema_for_tests(
         dir.path().join("cg.db"),
@@ -3497,6 +3567,7 @@ fn combination_cg_schema_version_table_single_row_invariant_multiple_rows_return
 
 #[test]
 fn combination_observation_with_evidence_atomic_insert_under_fk_violation_rolls_back_at_commit() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_table_present(&db, "evidence");
     let evidence_id = Uuid::from_u128(20_016);
@@ -3586,6 +3657,7 @@ fn combination_observation_with_evidence_atomic_insert_under_fk_violation_rolls_
 
 #[test]
 fn combination_evidence_self_fk_derived_from_validated_at_commit_against_committed_snapshot() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = Arc::new(fresh_db());
     db.execute(
         "CREATE TABLE evidence_delete_race (id UUID PRIMARY KEY, derived_from UUID REFERENCES evidence_delete_race(id))",
@@ -3660,6 +3732,7 @@ fn combination_evidence_self_fk_derived_from_validated_at_commit_against_committ
 
 #[test]
 fn combination_observation_entity_cross_context_raw_insert_rejected_by_schema() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(20_022);
     let ctx_b = Uuid::from_u128(20_023);
@@ -3698,6 +3771,7 @@ fn combination_observation_entity_cross_context_raw_insert_rejected_by_schema() 
 
 #[test]
 fn combination_evidence_observation_cross_context_raw_insert_rejected_by_schema() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(20_026);
     let ctx_b = Uuid::from_u128(20_027);
@@ -3738,6 +3812,7 @@ fn combination_evidence_observation_cross_context_raw_insert_rejected_by_schema(
 
 #[test]
 fn combination_evidence_derived_from_cross_context_raw_insert_rejected_by_schema() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(20_031);
     let ctx_b = Uuid::from_u128(20_032);
@@ -3785,6 +3860,7 @@ fn combination_evidence_derived_from_cross_context_raw_insert_rejected_by_schema
 
 #[test]
 fn combination_invalidation_cross_context_raw_insert_rejected_by_schema() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     let ctx_a = Uuid::from_u128(20_039);
     let ctx_b = Uuid::from_u128(20_040);
@@ -3874,6 +3950,7 @@ fn combination_invalidation_cross_context_raw_insert_rejected_by_schema() {
 
 #[test]
 fn combination_record_observation_concurrent_appends_immutable_snapshot_chain() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -3930,6 +4007,7 @@ fn combination_record_observation_concurrent_appends_immutable_snapshot_chain() 
 
 #[test]
 fn combination_invalidate_decision_observation_atomic_visibility_no_torn_reader() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let config = context_graph::StoreConfig {
         db_path: dir.path().join("cg.db"),
@@ -3958,6 +4036,7 @@ fn combination_invalidate_decision_observation_atomic_visibility_no_torn_reader(
 #[test]
 fn combination_record_observation_text_evidence_vector_text_hnsw_atomic_with_row_insert_rollback_reverts_index()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db = fresh_db();
     assert_table_present(&db, "evidence");
     let context_id = Uuid::from_u128(20_032);

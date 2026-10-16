@@ -25,17 +25,22 @@ uses one directory. This crate does not open a ContextDB read session; core cons
 
 ## Invariants and guards
 
+Ownership boundaries above are review-only architectural constraints unless a guard below covers them.
+
 - Caller owns data-root resolution:
   `tests/production_guards.rs::the_catalog_never_resolves_the_data_root_for_itself`.
 - Explicit fetch adopts a complete artifact-only cache only after pinned identity validation:
   `tests/acceptance/air_gap.rs::explicit_fetch_makes_a_complete_artifact_only_cache_usable`.
 - A partial/corrupt cache is refused, never silently fetched:
   `tests/acceptance/air_gap.rs::air_gap_with_partial_cache_and_no_network_returns_typed_artifact_missing_error_does_not_silently_attempt_fetch`
-  and `air_gap_manifest_matching_corrupt_bytes_does_not_override_catalog_artifact_identity_validation`.
+  and `tests/acceptance/air_gap.rs::air_gap_manifest_matching_corrupt_bytes_does_not_override_catalog_artifact_identity_validation`.
 - License acceptance is local and required:
   `tests/acceptance/license_gate.rs::license_gate_acceptance_on_host_a_does_not_propagate_to_host_b_via_sync`.
-- Credentials stay off model entries and output:
-  `tests/acceptance/generic_llm_credential_integrity.rs::list_show_status_emit_no_secret_in_json_or_text_output`.
+- A supplied API key is stored behind a credential reference and never written in plain or base64
+  form to any file under the data root, nor printed: guard (through the CLI, repository-root path)
+  `crates/cg-cli/tests/cli_model_byok.rs::cli_connect_then_status_then_selftest_success_state_exit_zero_and_json_stable`.
+  `tests/acceptance/generic_llm_credential_integrity.rs::list_show_status_emit_no_secret_in_json_or_text_output`
+  only covers an environment-variable credential that the catalog never receives.
 - Hosted requests follow the attached provider contract:
   `tests/acceptance/generic_llm_endpoint.rs::wire_schema_tracks_the_attached_contract_not_a_constant`.
 

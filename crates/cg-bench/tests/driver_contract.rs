@@ -1,9 +1,5 @@
-//! RED contract tests for the bench runner: the bench drives the
-//! PRODUCTION capture path (the same library entry the drain calls — never a side harness; the
-//! prior side path is the documented false-green history), reads extraction back from the
-//! store, and its report carries the per-category numbers vs the frozen bars, the hosted-ceiling
-//! row, and the per-lever history. Authored and committed BEFORE implementation; implementation
-//! commits may not touch this file.
+//! The bench drives the production capture path, reads persisted extraction, and reports
+//! category scores, ceiling measurements and extraction settings.
 
 use cg_bench::driver::{collect_extracted_session, run_transcript_through_capture};
 use cg_bench::gold::load_gold_str;
@@ -120,7 +116,7 @@ fn bench_driver_exercises_production_capture_path() {
     );
     assert_eq!(extracted.entities.len(), 1);
 
-    // The full bench pipeline: captured store state scores against gold with the frozen method.
+    // The full bench pipeline: captured store state scores against gold with the scoring method.
     let gold = load_gold_str(GOLD).expect("gold parses");
     let score = score_session(&gold, &extracted, &EqualitySim);
     assert!(score.intention_captured);

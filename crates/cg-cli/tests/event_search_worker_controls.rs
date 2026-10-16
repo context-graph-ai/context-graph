@@ -781,8 +781,8 @@ fn sigint_foreground_hands_the_queued_request_to_one_background_worker() {
     );
 }
 
-// This reaches the Nomic prepared-document forward-call boundary, rather than the older
-// post-catch-up worker boundary. The foreground process must exit promptly while that call is
+// This reaches the Nomic prepared-document forward-call boundary. The foreground process
+// must exit promptly while that call is
 // still held. Its queued child inherits the private test environment, so the fixture releases it
 // only after the foreground exit and then proves the queued project becomes ready.
 #[test]

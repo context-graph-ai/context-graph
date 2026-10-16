@@ -51,7 +51,7 @@ pub struct ExtractedSession {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractedDecision {
     pub statement: String,
-    /// The goal this decision claims to serve (the extracted trunk attachment), if any.
+    /// The goal this decision claims to serve (the extracted goal linkage attachment), if any.
     pub goal: Option<String>,
 }
 
@@ -89,7 +89,7 @@ pub struct SessionScore {
     pub gray_zone: Vec<(String, String)>,
 }
 
-/// Score one session's extraction against its gold, per the frozen method.
+/// Score one session's extraction against its gold, per the scoring method.
 pub fn score_session(
     gold: &GoldSession,
     extracted: &ExtractedSession,

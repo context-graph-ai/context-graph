@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Validate bidirectional docs <-> tests coverage for the context-graph repo, and — the
-docs-workflow claim-binding extension — that every behavior claim in a file the current
-change touched carries an enforcing test.
+Validate bidirectional docs <-> tests coverage for the context-graph repo and require an
+enforcing test for every behavior claim in a file the current change touched.
 
 A documented claim is bound to a test with an HTML comment placed at (or immediately after)
 the end of the claim's paragraph:
@@ -78,17 +77,14 @@ a long descriptive aside as a claim, or miss a short one. It only runs against f
 `--changed-files` (or derived from `git diff --name-only <base>..HEAD` with `--base`), so it
 never penalizes a doc page nothing in this change touched. It is deliberately file-scoped, not
 line-scoped: touching any part of a doc file surfaces every unbound claim in that file, not
-only the lines the change added or altered. A run that finds pre-existing unbound claims in a
-file it otherwise only lightly touched binds what its own change added or altered and leaves
-the rest as the chartered docs run's backfill (`docs-workflow.md`, "Published claims bind to
-the test that enforces them") — this script cannot itself tell "added" from "pre-existing", so
-that triage stays a human/reviewer judgment call, not a mechanical one.
+only the lines the change added or altered. The script reports every unbound claim in a
+touched file; determining which claims the change introduced requires human review.
 
 Usage:
-  python3 scripts/validate-doc-coverage.py
+  python3 scripts/validate-doc-coverage.py --all
   python3 scripts/validate-doc-coverage.py --repo /path/to/context-graph
   python3 scripts/validate-doc-coverage.py --changed-files README.md,crates/context-graph/README.md
-  python3 scripts/validate-doc-coverage.py --base 20a4842e36f03e4a43144fd0f642b0d5ee8ee318
+  python3 scripts/validate-doc-coverage.py --base HEAD~1
   python3 scripts/validate-doc-coverage.py --repo /tmp/copy --list-unreferenced
 """
 
@@ -455,6 +451,15 @@ class ChangedFilesUnavailable(Exception):
 
 
 def resolve_changed_files(args, repo: Path) -> set[str]:
+    if args.all:
+        try:
+            out = subprocess.run(
+                ["git", "ls-files", "-z"], cwd=repo, capture_output=True, check=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            raise ChangedFilesUnavailable(f"could not enumerate tracked files: {exc}") from exc
+        tracked = {path for path in out.stdout.decode().split("\0") if path}
+        return tracked | {path.relative_to(repo).as_posix() for path in all_doc_paths(repo)}
     if args.changed_files:
         return {f.strip() for f in args.changed_files.split(",") if f.strip()}
     if args.base:
@@ -484,6 +489,7 @@ def main() -> int:
     ap.add_argument("--base", type=str, default=None,
                     help="git ref to diff HEAD against for the changed-file list, when "
                          "--changed-files is not given directly")
+    ap.add_argument("--all", action="store_true", help="audit every documentation page without a base ref")
     ap.add_argument("--list-unreferenced", action="store_true",
                     help="list every unreferenced test-tree test, not just counts")
     args = ap.parse_args()

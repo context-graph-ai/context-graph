@@ -217,7 +217,7 @@ fn run(args: Vec<String>) -> i32 {
 
 fn print_help() {
     println!(
-        "Usage: cg <command>\n\nModels and fabric:\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  model status                  Show the model connection and the memory store it serves\n  sync <status|push|pull>       Sync this machine's memory store against a remote hub\n                                (--remote-server <hub-ticket-or-endpoint> --tenant-id TENANT_ID)\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n  disconnect <agent>            Remove cg hooks for one agent config\n  connect <agent> --remove-all  Remove cg hooks for one agent across configs\n  worker [--poll-interval MS] [--budget N]\n                                Run this machine as a fabric understanding worker: dial the\n                                configured hub ticket, advertise capability, execute jobs other\n                                nodes submitted (needs cg/fabric.toml + a connected model)\n\nConversation history (Claude Code sessions, stored in this machine's Context Graph store):\n  import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer]\n                                Capture a project's Claude Code history, then make it searchable\n  find <question> [--context NAME[,NAME...] | --all-contexts]\n                                Search imported history; returns passages, never an answer\n  show <passage-id>             Show the exact stored events behind one `cg find` passage\n  status [--context NAME[,NAME...] | --all-contexts]\n                                Read this machine's Context Graph memory store without changing\n                                it: graph memory, captured history and search readiness (the\n                                model connection is `cg model status`)\n  forget --session <ref> | --context NAME\n                                Delete imported history and everything derived from it\n\nEvery command writes JSON by default; --format text selects the human rendering.\n\nEvery command also takes --write-memory-limit-bytes <BYTES>: the working memory one write may\nhold on this machine. Unset, cg derives it from the machine; [write] memory_limit_bytes in\ncg/fabric.toml sets it for every command, and `cg status` shows the value in force. A low\nderived writer limit blocks writable capture, not help or read-only inspection.\n\nReads use [read] memory_limit_bytes and active_time_ms in cg/fabric.toml; unset, the\nlimits are 1 GiB and 5000 ms of active time per statement.\n\nExamples:\n  cd ~/projects/my-app && cg import .\n  cg find \"why did we change the retry policy?\" --format text\n  cg show <passage-id> --format text\n  cg status --format text\n  cg forget --session <ref>\n  cg model auth login --connection claude --consent"
+        "Usage: cg <command>\n\nModels and diagnostics:\n  model connect <name>          Register a model endpoint with your API key\n  model fetch --defaults        Download the default search model\n  model auth login              Connect cg to an existing model host session\n  model list                    List registered models\n  model show <id>               Show model metadata\n  model status                  Show the model connection and the memory store it serves\n  selftest                      Spend one consented proof call\n  doctor                        Run free model-provider diagnostics\n\nConversation history (Claude Code sessions, stored in this machine's Context Graph store):\n  import <project-directory>|<session.jsonl> [--context NAME] [--search background|wait|defer]\n                                Capture a project's Claude Code history, then make it searchable\n  find <question> [--context NAME[,NAME...] | --all-contexts]\n                                Search imported history; returns passages, never an answer\n  show <passage-id>             Show the exact stored events behind one `cg find` passage\n  status [--context NAME[,NAME...] | --all-contexts]\n                                Read this machine's Context Graph memory store without changing\n                                it: graph memory, captured history and search readiness (the\n                                model connection is `cg model status`)\n  forget --session <ref> | --context NAME\n                                Delete imported history and everything derived from it\n\nEvery command writes JSON by default; --format text selects the human rendering.\n\nEvery command also takes --write-memory-limit-bytes <BYTES>: the working memory one write may\nhold on this machine. Unset, cg derives it from the machine; [write] memory_limit_bytes in\ncg/fabric.toml sets it for every command, and `cg status` shows the value in force. A low\nderived writer limit blocks writable capture, not help or read-only inspection.\n\nReads use [read] memory_limit_bytes and active_time_ms in cg/fabric.toml; unset, the\nlimits are 1 GiB and 5000 ms of active time per statement.\n\nExamples:\n  cd ~/projects/my-app && cg import .\n  cg find \"why did we change the retry policy?\" --format text\n  cg show <passage-id> --format text\n  cg status --format text\n  cg forget --session <ref>\n  cg model auth login --connection claude --consent"
     );
 }
 
@@ -227,7 +227,7 @@ fn usage_error(message: &str) -> i32 {
 }
 
 /// Load the node's fabric config once (an absent `cg/fabric.toml` = single-node, unchanged) and run a
-/// tier-0 capture through the fabric-aware submission path, honoring the global sharing switch, the
+/// model-free capture through the fabric-aware submission path, honoring the global sharing switch, the
 /// per-source opt-out list, and the per-invocation `--no-share` flag. The CLI stays a caller — the
 /// share/opt-out decision lives in `context_graph::fabric::capture`.
 fn run_fabric_capture(
@@ -296,7 +296,7 @@ fn handle_record(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsiz
         Err(err) => return cg_failure(err, &db_path, &context_label),
     };
     // Eager opt-in (`--understand-now`): the SAME two-step understanding path the background worker
-    // runs, but in the foreground. First deterministic tier-0 capture (verbatim digest + kept chunk
+    // runs, but in the foreground. First deterministic model-free capture (verbatim digest + kept chunk
     // + queue row per chunk), THEN a blocking drain of exactly those just-captured digests through
     // the queue drainer. There is ONE understanding implementation — no second, duplicate pipeline.
     if has_flag(args, "--understand-now") {
@@ -332,11 +332,11 @@ fn handle_record(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsiz
             mark_first_capture_loaded(&root);
         }
         if memory_capture_connection_name(&root).is_none() {
-            // No connected model: tier-0 kept the verbatim digest; there is nothing to understand.
+            // No connected model: model-free kept the verbatim digest; there is nothing to understand.
             print_understand_now_no_graph(
                 &store,
                 context.id,
-                "model-free capture: kept verbatim tier-0 digest, no derived graph",
+                "model-free capture: kept verbatim model-free digest, no derived graph",
                 None,
                 None,
                 None,
@@ -357,7 +357,7 @@ fn handle_record(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsiz
             &db_path,
         );
     }
-    // Tier-0 deterministic capture is the DEFAULT front door: a verbatim digest + local embedding +
+    // model-free deterministic capture is the DEFAULT front door: a verbatim digest + local embedding +
     // kept raw chunk + durable understanding-queue row per chunk, in one atomic transaction, with
     // ZERO model calls even when a model is connected. Understanding (structuring a chunk into the
     // ontology) is deferred to the background worker that drains the queue.
@@ -405,7 +405,7 @@ fn capture_session_ref(args: &[String], path: Option<&Path>) -> String {
     "cg-record".to_string()
 }
 
-/// Print the tier-0 capture receipt (the Capability-A cost/time lane): zero model calls, zero
+/// Print the model-free capture receipt (the usage accounting cost/time lane): zero model calls, zero
 /// dollars, wall-clock, digests written, raw chunks kept, and the pending understanding count.
 fn print_tier0_report(
     report: &Tier0CaptureReport,
@@ -436,7 +436,7 @@ fn print_tier0_report(
             },
             "captured": counts_json(&HarvestCounts::default()),
             "totals": counts_json(&HarvestCounts::default()),
-            "message": "deterministic tier-0 capture: verbatim digests queued for understanding, 0 model calls",
+            "message": "deterministic model-free capture: verbatim digests queued for understanding, 0 model calls",
             "rendered": rendered,
         }),
         db_path,
@@ -473,7 +473,7 @@ fn now_millis() -> i64 {
 
 const LAST_UNDERSTANDING_RUN_KEY: &str = "last_understanding_run";
 
-/// The understanding worker: drain the deferred tier-0 backlog through the connected model, turning
+/// The understanding worker: drain the deferred model-free backlog through the connected model, turning
 /// verbatim digests into structured Intention / Decision / Entity / Observation memory. This is the
 /// "overnight the queue structures what you touched" contract — capture stays free and instant; the
 /// cost (the connected model's tokens/time) is paid here, on the user's schedule, stopping at the
@@ -549,7 +549,7 @@ fn understand_worker(args: &[String], read_memory_limit_bytes: std::num::NonZero
         // Another worker already holds the drain lock; exactly one drains at a time.
         return 0;
     };
-    // No connected model: understanding is a silent no-op (tier-0 capture already succeeded).
+    // No connected model: understanding is a silent no-op (model-free capture already succeeded).
     if memory_capture_connection_name(&root).is_none() {
         return 0;
     }
@@ -767,7 +767,7 @@ fn handle_worker(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsiz
         let started = Instant::now();
         // The self-sufficient poll: pull the tenant's ledger from the hub, run the claim/execute/record
         // poll, then push the result back — so this remote node actually sees peers' jobs and delivers
-        // its outcomes, rather than scanning only its own local db (the two-root rehearsal defect).
+        // its outcomes, rather than scanning only its own local db.
         let outcome = run_worker_poll(&client, &store, &extractor, &worker_config, now_millis());
         match outcome {
             Ok(FabricPollOutcome::Executed { job_id }) => {
@@ -918,7 +918,7 @@ fn worker_failure(code: i32, condition: &str, message: &str) -> i32 {
     code
 }
 
-/// The token ceiling a drain stops at. Token-based today (the Capability-A receipt lane counts
+/// The token ceiling a drain stops at. Token-based today (the usage accounting receipt lane counts
 /// tokens on every path; dollars are only meaningful on a per-token-priced BYOK endpoint and are
 /// derived from the same lane). `None` drains the whole backlog.
 #[derive(Debug, Clone, Copy, Default)]
@@ -975,7 +975,7 @@ struct DrainCounts {
 /// The result of one drain pass: the per-context counts plus the per-digest capture reports the
 /// drain produced. The background worker and plain `cg understand` ignore the reports (they print a
 /// drain receipt); the foreground `--understand-now` path aggregates them into ONE capture receipt
-/// so its stdout matches the old synchronous capture shape.
+/// so stdout carries one receipt for the capture.
 struct DrainOutcome {
     counts: DrainCounts,
     reports: Vec<(CaptureReport, CaptureHarnessReport)>,
@@ -990,7 +990,7 @@ struct DrainSummary {
 
 /// Drain one context's pending understanding backlog in priority order. Each digest: claim it
 /// atomically (skip if another worker already took it), run the SAME `run_capture` terminal path
-/// capture uses over the stored raw chunk — anchoring the structured graph ONTO that tier-0 digest
+/// capture uses over the stored raw chunk — anchoring the structured graph ONTO that model-free digest
 /// (`run_capture_into_digest`, so understanding never mints a second digest) — then record the
 /// outcome (structured + completion on success, attempt-with-cap on model failure). Accumulates
 /// spend into `spent` so a caller draining several contexts shares one budget.
@@ -1028,7 +1028,7 @@ fn drain_context_queue(
     // Snapshot the pending set once; retries land on a later drain, never an in-run loop.
     let pending = list_pending_digests(store, context_id, None)?;
     // How many chunks this drain will understand — the denominator for the live progress line the
-    // foreground `--understand-now` path streams (the Capability-A wedged-vs-slow liveness signal).
+    // foreground `--understand-now` path streams (the usage accounting wedged-vs-slow liveness signal).
     let progress_total = only.map(|set| set.len()).unwrap_or(pending.len()).max(1);
     for pending_digest in pending {
         if let Some(only) = only
@@ -1046,7 +1046,7 @@ fn drain_context_queue(
         }
         // Apply layer 2: assemble the generation-time steering block for THIS chunk (matched guidance
         // rules + capped few-shot examples) and attach it to a fresh extractor. Re-processing here is
-        // cheap; this never runs on the tier-0 default path.
+        // cheap; this never runs on the model-free default path.
         let steering = context_graph::skill_store::assemble_pre_extraction_steering(
             store,
             &pending_digest.chunk_text,
@@ -1075,7 +1075,7 @@ fn drain_context_queue(
             transcript: pending_digest.chunk_text.clone(),
             model_available: true,
         };
-        // Understand INTO the tier-0 digest: the structured graph anchors onto the existing digest
+        // Understand INTO the model-free digest: the structured graph anchors onto the existing digest
         // instead of minting a second one, so a chunk stays exactly one digest (verbatim ->
         // structured).
         match run_capture_into_digest(
@@ -1147,7 +1147,7 @@ fn drain_context_queue(
             &extractor,
             &config,
         );
-        // Capability-A honesty: the reconciliation's judge calls ride THIS extractor — their
+        // usage accounting honesty: the reconciliation's judge calls ride THIS extractor — their
         // usage must join EVERY receipt lane like any other provider call (a receipt that
         // undercounts calls is a lying receipt; the capture receipt test enforces this).
         // Two lanes: `spent` feeds the understand-side receipts; the last capture report's
@@ -1174,11 +1174,11 @@ fn drain_context_queue(
     Ok(DrainOutcome { counts, reports })
 }
 
-/// The eager (`--understand-now`) foreground path, shared by `cg record` and `cg import`. Tier-0
+/// The eager (`--understand-now`) foreground path, shared by `cg record` and `cg import`. model-free
 /// deterministic capture has ALREADY written the digests + queue rows; this drains EXACTLY those
 /// just-captured digests through the SAME queue drainer the background worker uses — blocking until
 /// they are understood on the connected model — then prints ONE aggregated capture receipt with the
-/// Capability-A cost/time lane. This is the single understanding path: there is no second, duplicate
+/// usage accounting cost/time lane. This is the single understanding path: there is no second, duplicate
 /// CLI capture pipeline. Requires a connected model (the caller handles the model-free case).
 #[allow(clippy::too_many_arguments)]
 fn understand_now_foreground(
@@ -1238,7 +1238,7 @@ fn understand_now_foreground(
     }
     // No digest was understood. If the model was actually called and FAILED (a refused, truncated,
     // or floor-exhausted reply), surface it WITH the usage receipt (reliability + outcome) and a
-    // non-zero exit — never a silent empty success; the verbatim tier-0 digests are kept for a
+    // non-zero exit — never a silent empty success; the verbatim model-free digests are kept for a
     // later retry. If nothing was even attempted, print the honest no-derived-graph receipt.
     if !spent.is_empty() {
         return understand_now_failure_with_usage(
@@ -1265,9 +1265,9 @@ fn understand_now_foreground(
 }
 
 /// Surface a foreground `--understand-now` drain that spent model budget but understood nothing (a
-/// refused / truncated / floor-exhausted reply): a non-zero receipt carrying the Capability-A usage
+/// refused / truncated / floor-exhausted reply): a non-zero receipt carrying the usage accounting usage
 /// lane (per-call reliability level + outcome), so the failure is observable and never a silent
-/// empty success. The verbatim tier-0 digests remain queued for a later retry.
+/// empty success. The verbatim model-free digests remain queued for a later retry.
 #[allow(clippy::too_many_arguments)]
 fn understand_now_failure_with_usage(
     spent: Vec<ModelCallUsage>,
@@ -1285,7 +1285,7 @@ fn understand_now_failure_with_usage(
             "condition": "UnderstandingFailed",
             "bucket": "memory",
             "captured": counts_json(&HarvestCounts::default()),
-            "message": "understanding failed on the connected model; the verbatim tier-0 digests are kept for a later retry",
+            "message": "understanding failed on the connected model; the verbatim model-free digests are kept for a later retry",
             "usage": usage_receipt_json(&receipt),
             "import_chunks": import_chunks,
             "resolved_chunk_window": resolved_chunk_window,
@@ -1361,7 +1361,7 @@ fn aggregate_capture_reports(
     report.import_chunks = import_chunks.or(Some(chunk_count));
     report.resolved_chunk_window = resolved_chunk_window;
     report.model_context_tokens = model_context_tokens;
-    // Multi-chunk import is now N per-chunk tier-0 digests each understood in its own pass — no
+    // Multi-chunk import creates N per-chunk model-free digests, each understood in its own pass — no
     // rolling condensation, so both ends survive with no decay. (Single-chunk keeps the terminal
     // path's own "captured structured memory" message.)
     if report.import_chunks.is_some_and(|chunks| chunks > 1) {
@@ -1369,13 +1369,13 @@ fn aggregate_capture_reports(
         report.message = format!(
             "understood import in {chunks} chunks as {chunks} per-chunk memories (one digest per chunk, no condensation decay)"
         );
-        report.digest_summary = format!("tier-0 per-chunk import: {chunks} chunks");
+        report.digest_summary = format!("model-free per-chunk import: {chunks} chunks");
     }
     Some((report, harness))
 }
 
 /// Print an honest capture receipt for the `--understand-now` path when no structured graph was
-/// derived: the model-free case (tier-0 kept the verbatim digests, no model to understand them) or a
+/// derived: the model-free case (model-free kept the verbatim digests, no model to understand them) or a
 /// model run that harvested nothing. Carries the store totals, an empty captured/stable-id lane, and
 /// the import framing, so a caller reading `/totals` / locators still finds them.
 #[allow(clippy::too_many_arguments)]
@@ -2308,7 +2308,7 @@ fn handle_review(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsiz
 }
 
 /// `cg why @n` — explain a flagged item. Resolve the handle to a real item id the same way the other
-/// item-action verbs do, then route it through the corrected library seam
+/// item-action verbs do, then route it through the library seam
 /// (`legal_types_for_flagged_item`). Only a genuinely-flagged closed-vocab item gets its legal type
 /// list enumerated (a correction chosen from a named set); a non-flagged / unknown id renders a clear
 /// "not a flagged closed-vocab item" message with NO legal-type enumeration.
@@ -2607,8 +2607,7 @@ fn handle_sync(args: &[String], read_memory_limit_bytes: std::num::NonZeroUsize)
                     );
                     // Materialize every remote worker result that just arrived: a done job's structured
                     // payload becomes local memory here, model-free and idempotent under the write-once
-                    // completion marker. Without this a pulled result flipped `cg status` to done while
-                    // the submitter's graph stayed empty (the two-root rehearsal defect).
+                    // completion marker. Job completion and the submitter's graph reflect the same result.
                     if let Err(err) = context_graph::fabric::apply_pulled_results(&stores.admin) {
                         eprintln!(
                             "cg sync pull: applied synced rows, but materializing arrived worker \
@@ -3216,8 +3215,8 @@ struct FabricJobLine {
 /// The one post-open status read a test has asked to refuse.
 ///
 /// `cg status` opening the store and THEN failing one of its metric reads is not reachable from
-/// outside the process, so what the CLI does with such a failure could not be pinned at all. This
-/// makes exactly the named read refuse and leaves the open itself untouched. It is compiled only
+/// outside the process. This seam makes exactly the named read refuse and leaves the open itself
+/// untouched. It is compiled only
 /// under the `status-fault-injection` feature, which nothing but this package's dev-dependency on
 /// itself turns on — so a `cargo build` binary, debug or release, neither reads the variable nor
 /// contains its name.
@@ -4634,8 +4633,7 @@ fn memory_error(err: MemoryCliError, db_path: &Path, context_label: &str) -> i32
         MemoryCliError::StoreHeldByReaders(condition) => {
             // Handed on verbatim: the condition writes the whole sentence an operator acts on, so
             // re-wording it here could only lose something. The exit code is the one this boundary
-            // already gives a refused command — a reader-held code of its own is a parked owner
-            // proposal, and inventing one here would settle it by accident.
+            // gives a refused command; reader-held refusals have no dedicated numeric contract.
             memory_failure(
                 1,
                 "StoreHeldByReaders",
@@ -5084,7 +5082,7 @@ A staged copy next to the cache is seeded without re-downloading."
     let defaults = has_flag(args, "--defaults") || target.is_none();
 
     if defaults {
-        // Disclose what will be fetched, with its size, before downloading. `--defaults` fetches
+        // Disclose the selected download and its size before downloading. `--defaults` fetches
         // the default embedder.
         if format == OutputFormat::Text {
             println!("fetching defaults:");
@@ -5531,7 +5529,7 @@ fn handle_status(
 ) -> i32 {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         println!(
-            "Usage: cg status [CONNECTION] [--connection NAME] [--format json|text]\n\nReports two things in one command:\n  - whether cg is connected to a model, and\n  - the state of this machine's Context Graph memory store: context totals, the\n    understanding queue, the raw footprint and the fabric posture.\n\n`no model connection is active` is an answer about the model; the store beside it may\nbe perfectly healthy. An answer about the store carries \"bucket\": \"memory\" and the\nstore path it is about.\n\nWhen the store cannot be read, status says so and never prints `goals: 0 decisions: 0\nobservations: 0` — those totals mean the store WAS read and is empty. A store another\nprocess is writing is refused as `store busy / already in use` under condition\nStoreBusy with exit 4, naming the holder and the store. A store direct readers are\nstill holding is refused under condition StoreHeldByReaders. It names each\nverified reader by process id and name, and discloses any holder the store\nobserved and could not identify. Its numeric exit code is deliberately unsettled,\nso branch on the failure and the condition name rather than on a number.\n\nExamples:\n  cg status\n  cg model status byok-openai --format text"
+            "Usage: cg model status [CONNECTION] [--connection NAME] [--format json|text]\n\nReports two things in one command:\n  - whether cg is connected to a model, and\n  - the state of this machine's Context Graph memory store: context totals, the\n    understanding queue, the raw footprint and the fabric posture.\n\n`no model connection is active` is an answer about the model; the store beside it may\nbe perfectly healthy. An answer about the store carries \"bucket\": \"memory\" and the\nstore path it is about.\n\nWhen the store cannot be read, status says so and never prints `goals: 0 decisions: 0\nobservations: 0` — those totals mean the store WAS read and is empty. A store another\nprocess is writing is refused as `store busy / already in use` under condition\nStoreBusy with exit 4, naming the holder and the store. A store direct readers are\nstill holding is refused under condition StoreHeldByReaders. It names each\nverified reader by process id and name, and discloses any holder the store\nobserved and could not identify. Its numeric exit code is deliberately unsettled,\nso branch on the failure and the condition name rather than on a number.\n\nExamples:\n  cg model status\n  cg model status byok-openai --format text"
         );
         return 0;
     }
@@ -6353,9 +6351,8 @@ fn print_doctor_text(report: &cg_cli::DoctorReport) {
     }
 }
 
-/// The Claude Code hook events cg installs. INJECTION ONLY — cg installs no capture hook (the
-/// auto-capture connector is cut from this slice); these two hooks only read memory back into the
-/// working session and bump retrieval-touch counts.
+/// The Claude Code hook events cg installs. These hooks read memory into the working session
+/// and bump retrieval-touch counts. No capture hook is installed.
 const CLAUDE_CODE_HOOK_EVENTS: [&str; 2] = ["SessionStart", "UserPromptSubmit"];
 /// The stable identifier that marks a hook command as cg's, for idempotent install and clean
 /// uninstall. A user's own hooks (any command not containing this) are always preserved.
@@ -6459,7 +6456,7 @@ fn handle_disconnect(args: &[String]) -> i32 {
 }
 
 /// Install cg's injection hooks into the REAL Claude Code settings file (`~/.claude/settings.json`),
-/// which is structured JSON — not a comment-marker block and not the old placeholder path. Idempotent:
+/// which is structured JSON. Idempotent:
 /// re-running adds no duplicate entries. Any hooks the user already configured are preserved.
 fn connect_claude_code() -> i32 {
     let path = claude_code_settings_path();
@@ -7035,9 +7032,8 @@ fn output_format(args: &[String]) -> OutputFormat {
 /// `--format` is a request about the whole command line, not about one code path: an operator who
 /// asked for text asked for every answer in text, refusals included. The refusal renderers sit far
 /// below the argument parsing that reads the flag — `memory_failure` alone is reached from every
-/// command that opens the store — and threading the flag down each of those paths is what left the
-/// refusals rendering JSON at a text caller. The request is recorded once, where the command line
-/// is first seen, and read where an answer is written.
+/// command that opens the store. The request is recorded once, where the command line is first
+/// seen, and read where an answer is written.
 static TEXT_RENDERING_WAS_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn record_requested_format(args: &[String]) {

@@ -26,9 +26,8 @@ fn enforced_output_cannot_become_decision_basis_barrier_holds() {
 
 #[test]
 fn extracted_field_is_not_a_basis() {
-    // The .stderr declares the compile error that the ModelExtractedField barrier will produce.
-    // Until the impl adds the barrier type to src/, the .rs file compiles (no error) and
-    // trybuild reports a mismatch.
+    // The .stderr declares the expected compile error for the ModelExtractedField barrier.
+    // The fixture must fail to compile with that diagnostic.
     let trybuild = trybuild::TestCases::new();
     trybuild.compile_fail("tests/ui/extracted_field_is_not_a_basis.rs");
 }
@@ -41,9 +40,6 @@ fn usage_is_not_a_basis_input_compile_fail() {
 
 #[test]
 fn fabric_receipt_cannot_become_decision_basis() {
-    // RED at scaffold: the receipt type still carries a `From<_> for serde_json::Value`, so the
-    // .rs COMPILES and trybuild reports the expected-compile-fail did not trigger. The impl removes
-    // that `From` (installing the operational barrier), flipping this case green.
     let trybuild = trybuild::TestCases::new();
     trybuild.compile_fail("tests/compile-fail/fabric_receipt_not_basis.rs");
 }

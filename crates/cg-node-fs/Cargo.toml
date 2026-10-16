@@ -1,4 +1,6 @@
 [package]
+keywords.workspace = true
+categories.workspace = true
 name = "cg-node-fs"
 version.workspace = true
 authors.workspace = true

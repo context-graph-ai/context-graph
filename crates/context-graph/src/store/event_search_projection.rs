@@ -8463,7 +8463,7 @@ mod bounded_preparation_tests {
         }
     }
 
-    // Independent pre-repair oracle: consider all endpoints in reverse order without pruning,
+    // Independent exhaustive oracle: consider all endpoints in reverse order without pruning,
     // then filter ALL original spans for overlap. No bound, index or optimized helper.
     fn exhaustive_ranges(
         embedder: &dyn Embedder,

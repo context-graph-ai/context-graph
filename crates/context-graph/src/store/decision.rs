@@ -691,8 +691,7 @@ impl Store {
 
     /// Additive SERVES routing (the reconciliation writer seam): attach an
     /// existing decision to an intention it serves. Idempotent; writes an edge, never edits or
-    /// deletes rows. The session-goal reconciliation pass writes through this; the future
-    /// a future server-side runner reuses the same seam.
+    /// deletes rows. The session-goal reconciliation pass writes through this.
     pub fn route_decision_to_intention(
         &self,
         decision_id: DecisionId,

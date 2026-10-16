@@ -2,19 +2,12 @@
 //!
 //! ## The promise
 //!
-//! `cg status --help` advertises `[--format json|text]` without qualification, so an operator who
-//! asks for text has asked for text. Today the flag is honored on the success path and dropped on
-//! every refusal path: `print_memory_json` (crates/cg-cli/src/main.rs:5212) is the only rendering
-//! `memory_failure` (:5279) has, and its two callers `memory_error` (:5303) and `cg_failure`
-//! (:5352) never see the requested format at all. So the ONE class of answer the README's "What
-//! `cg status` says when the store cannot be read" section exists for — the refusals — is the one
-//! class that ignores what the caller asked for.
+//! `cg status --help` advertises `[--format json|text]` without qualification. Both success and
+//! refusal paths honor the requested format.
 //!
-//! What that costs is not cosmetic. A refusal is the answer an operator reads at the moment their
-//! memory appears to be gone, and a person who asked for prose is instead handed a single JSON
-//! line whose whole payload is a Rust `Debug` dump escaped inside a string field — the store path,
-//! the condition and the remedy all buried behind `\"` sequences. A text rendering that is JSON
-//! wearing a text flag is not a rendering; it is the flag being ignored.
+//! A refusal is the answer an operator reads when their memory appears to be gone. A prose
+//! request must produce readable text carrying the store path, condition, and remedy directly,
+//! without burying them in an escaped JSON string or a Rust `Debug` dump.
 //!
 //! ## What this file pins
 //!
@@ -26,10 +19,10 @@
 //! - The prose still carries the three things the operator and their script act on: the store
 //!   path, the condition name (`cg status --help` tells them to branch on it rather than on the
 //!   exit code, so text must not be the one surface that withholds it), and what happened.
-//! - `--format json` is unchanged — the fix is a second rendering, never the loss of the first.
+//! - `--format json` renders the machine-readable refusal envelope.
 //! - The exit code is identical in both formats. Format is how an answer is written, never what
-//!   the answer is. No NUMBER is asserted for the reader-held shape, whose exit code is a parked
-//!   owner proposal; only that the two formats agree and that a refusal fails.
+//!   the answer is. No dedicated numeric code is contracted for the reader-held shape; the two
+//!   formats agree and a refusal fails.
 //! - A refusal rendered as text still never prints `goals: 0 decisions: 0 observations: 0`, which
 //!   would say the store was read and is empty.
 
@@ -123,8 +116,7 @@ fn assert_text_refusal_is_prose(run: &CgRun, expectation: &TextRefusalExpectatio
     );
 }
 
-/// The JSON rendering is the contract this file must not cost anybody: a fix that turns the text
-/// request into prose by turning the JSON request into prose too has broken every script.
+/// The JSON format renders a JSON document for scripts, independently of the prose rendering.
 fn assert_json_refusal_is_still_a_json_document(run: &CgRun, shape: &str) {
     let said = run.everything_said();
     let stdout = run.stdout.trim();

@@ -324,7 +324,7 @@ fn collect_new_decision() -> NewDecisionCollector {
     let (dir, path, store) = fixture();
     let ctx = context(&store, "new-decision").id;
     let intent = intention(&store, ctx, "reload gate policy immediately");
-    let ent = entity(&store, ctx, "school-gate", BTreeMap::new());
+    let ent = entity(&store, ctx, "entry", BTreeMap::new());
     let payloads = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&payloads);
     store
@@ -436,7 +436,7 @@ fn subscribe_new_decision_fires_post_commit_carries_served_intention_ids_and_des
     let created = decision(
         &store,
         ctx,
-        "alert when an unknown car waits at the school gate",
+        "alert when an unknown car waits at the entry",
         vec![intent_id],
         vec![entity_id],
         vec![],
@@ -485,9 +485,9 @@ fn subscribe_invalidation_detected_fires_carries_intention_anchor_and_render_str
     );
 }
 
-// Use case: a school-gate safety message preserves the parent's wording in the Intention.
+// Use case: a entry safety message preserves the parent's wording in the Intention.
 #[test]
-fn subscribe_invalidation_detected_renders_u1_kerala_school_gate_setup() {
+fn subscribe_invalidation_detected_renders_entry_alert_setup() {
     let (_dir, _path, store, ctx, ent, intent, _dec, payloads) = collect_invalidation();
     observe(
         &store,
@@ -2047,7 +2047,7 @@ fn subscription_resume_replays_queued_events_after_reopen_for_invalidation_confl
 
 // Use case: registering a subscriber does not mutate the Invalidation row shape.
 #[test]
-fn plan_7_invalidation_row_15_field_shape_unchanged_after_plan_10_subscriber_wraps_payload() {
+fn invalidation_row_field_shape_unchanged_when_subscriber_wraps_payload() {
     let (_dir, _path, store, ctx, ent, _intent, _dec, payloads) = collect_invalidation();
     observe(
         &store,
@@ -2151,8 +2151,7 @@ fn lifecycle_audit_chain(with_subscriber: bool) -> Vec<NormalizedAuditEntry> {
 
 // Use case: a no-op subscriber does not create lifecycle audit entries.
 #[test]
-fn plan_8_lifecycle_audit_chain_byte_identical_modulo_synthetic_ids_with_and_without_plan_10_subscriber()
- {
+fn lifecycle_audit_chain_identical_with_and_without_subscriber() {
     let without_subscriber = lifecycle_audit_chain(false);
     let with_subscriber = lifecycle_audit_chain(true);
     assert_eq!(without_subscriber, with_subscriber);

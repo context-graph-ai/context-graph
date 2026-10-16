@@ -506,6 +506,7 @@ fn observation_created_txids(db: &Database, evidence_ids: &[EvidenceId]) -> Vec<
 
 #[test]
 fn reindex_updates_vectors_and_preserves_searchability() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-searchability");
     let result = fixture
         .store
@@ -541,6 +542,7 @@ fn reindex_updates_vectors_and_preserves_searchability() {
 
 #[test]
 fn reindex_changes_stored_vectors() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-changes-vector");
     let result = fixture
         .store
@@ -600,6 +602,7 @@ fn reindex_changes_stored_vectors() {
 
 #[test]
 fn reindex_scoped_by_embedding_space() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-scope");
     let result = fixture
         .store
@@ -635,6 +638,7 @@ fn reindex_scoped_by_embedding_space() {
 
 #[test]
 fn reindex_does_not_trigger_impact_analysis_invalidation_cascade() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-no-invalidation");
     let result = fixture
         .store
@@ -660,6 +664,7 @@ fn reindex_does_not_trigger_impact_analysis_invalidation_cascade() {
 
 #[test]
 fn reindex_preserves_pre_reindex_producer_lineage_via_original_write_txid() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-provenance");
     let result = fixture
         .store
@@ -700,6 +705,7 @@ fn reindex_preserves_pre_reindex_producer_lineage_via_original_write_txid() {
 
 #[test]
 fn reindex_resumable_after_interruption_picks_up_at_last_committed_cursor() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-resume");
     let interrupted = fixture.store.reindex_space(
         TEXT_SPACE,
@@ -734,6 +740,7 @@ fn reindex_resumable_after_interruption_picks_up_at_last_committed_cursor() {
 
 #[test]
 fn reindex_concurrent_writes_during_reindex_window_land_in_target_space_deterministically() {
+    let _runs_alone = crate::runs_alone::alone();
     let fixture = fixture("reindex-concurrent-write");
     let expected_scan_rows = fixture.evidence_ids.len() + 96;
     for idx in 0..96 {

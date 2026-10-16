@@ -388,7 +388,7 @@ pub const TABLES: &[TableSpec] = &[
         name: "cg_pending_review_items",
         ddl: "CREATE TABLE cg_pending_review_items (id TEXT PRIMARY KEY, acted_on BOOLEAN NOT NULL DEFAULT false, content TEXT, legal_vocab TEXT, created_at TXID NOT NULL) SYNC OFF",
     },
-    // Tier-0 deterministic-capture tables (schema v10). Raw source chunks are the local
+    // model-free deterministic-capture tables (schema v10). Raw source chunks are the local
     // understanding substrate and NEVER sync (`SYNC OFF`) — the graph is the durable synced
     // asset. Retrieval touches + local settings are per-device runtime state. The private
     // understanding queue is retired: the shipped work ledger's computed job state

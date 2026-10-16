@@ -1,15 +1,8 @@
-//! Fabric first-light — the remote-worker self-sufficiency regression, pinning the live two-root
-//! defect: a real remote worker must PULL the tenant's ledger before it polls (so it sees a job
-//! another node submitted) and PUSH its result afterwards (so the outcome reaches the submitter
-//! without waiting for the next claim's piggyback).
+//! A remote worker pulls the tenant ledger before polling and pushes its result afterwards,
+//! so it discovers peer jobs and delivers results without relying on a later claim.
 //!
-//! Every other fabric worker test pre-pulls onto the worker edge in the fixture (`push_then_pull`
-//! before invoking the worker), which masked BOTH halves of this defect: the inner
-//! `run_worker_once` scans only rows already in its own local db, so a worker that never pulled saw
-//! no job (real rehearsal: a worker polled for minutes while the job stayed `pending`), and it never
-//! pushed its recorded result, so the submitter never saw `done`. These tests invoke ONLY the
-//! self-sufficient `run_worker_poll` on the worker edge, with NO fixture pre-pull on that edge, and
-//! assert the round-trip closes.
+//! These tests invoke `run_worker_poll` with no fixture pull on the worker edge. The worker
+//! must perform both round trips itself.
 
 use context_graph::fabric::{
     self, FabricCapture, FabricPollOutcome, FabricWorkerConfig, run_worker_poll,
@@ -64,24 +57,24 @@ async fn pull_only(client: &contextdb_server::SyncClient) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_worker_pulls_the_job_then_pushes_the_result_without_a_fixture_prepull() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture: FabricFixture = fabric_fixture("remote_worker_self_sufficient").await;
 
     // Edge1 is the SUBMITTER + digest owner: capture the session, then push its job to the hub. No
-    // pull onto edge2 (the worker) — that is exactly what the frozen fixtures did and what masked the
-    // defect. Edge2 must discover the job on its OWN pull inside run_worker_poll.
+    // pull onto edge2 (the worker). Edge2 must discover the job on its own pull inside run_worker_poll.
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on edge1");
     push_only(&fixture.edge1_client).await;
 
     // The worker edge has never seen this job: nothing has been pulled onto it. The inner
-    // `run_worker_once` alone would scan an empty local ledger and report NoWork — the masked defect.
+    // `run_worker_once` alone would scan an empty local ledger and report NoWork.
     assert_eq!(
         work_row_count(&fixture.edge2.store, "work_jobs"),
         0,
-        "the worker edge has NOT pre-pulled the job — this is the unmasked starting state"
+        "the worker edge starts without a local copy of the job"
     );
 
     // Invoke ONLY the self-sufficient poll on the worker edge. It must pull the job from the hub,
@@ -111,7 +104,7 @@ async fn remote_worker_pulls_the_job_then_pushes_the_result_without_a_fixture_pr
     // result-push were fixture-masked, edge1 would see no `work_results` row here.
     pull_only(&fixture.edge1_client).await;
 
-    let ctx = context_id(&fixture.edge1.store, "daily-loop").expect("context on submitter");
+    let ctx = context_id(&fixture.edge1.store, "capture").expect("context on submitter");
     let statuses = fabric::job_statuses(&fixture.edge1.store, ctx, 2_000).expect("statuses");
     assert!(
         statuses
@@ -129,13 +122,14 @@ async fn remote_worker_pulls_the_job_then_pushes_the_result_without_a_fixture_pr
 
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_poll_with_unreachable_hub_degrades_quietly_offline() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     // A genuinely hub-less persisted-identity node uses a valid authenticated ticket whose endpoint
     // has gone away. The self-sufficient poll must treat both round trips as best-effort and still
     // execute the locally present job through the offline claim convention.
     let node = FabricNode::open("offline_worker");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on the offline node");
 

@@ -1,0 +1,15 @@
+name: Feature request
+description: Describe a use case and its constraints.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what currently prevents it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include compatibility and data-movement considerations.

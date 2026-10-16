@@ -1,4 +1,4 @@
-//! Acceptance tests for WP2 apply layer 2 — the generation-time steering seam.
+//! Acceptance tests for  apply layer 2 — the generation-time steering seam.
 //!
 //! The contract: at the queue-drain call site, matched `PreExtractionGuidance` rules plus retrieved
 //! few-shot correction examples are assembled into a steering block appended to the extraction

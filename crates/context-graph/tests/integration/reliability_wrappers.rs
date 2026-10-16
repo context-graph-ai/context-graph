@@ -1,9 +1,5 @@
-//! RED contract tests for the reliability re-ask wrapper: grammar
-//! guarantees shape, not effort — the observed lazy-empty failures are intermittent effort
-//! failures. The deterministic wrapper converts intermittent into rare at $0: ONE re-ask when a
-//! result is suspiciously empty (zero entities on a big chunk), never a loop; every wrapper
-//! action is visible on the harness report. Authored and committed BEFORE implementation;
-//! implementation commits may not touch this file.
+//! The reliability wrapper re-asks once when a large chunk produces no entities.
+//! Every wrapper action appears in the capture report.
 
 use std::cell::RefCell;
 
@@ -43,8 +39,8 @@ fn big_transcript() -> String {
     text
 }
 
-/// Lazy-then-diligent double: the first entities-bearing ask returns EMPTY entities (the
-/// intermittent effort failure, exactly as observed live); the re-ask returns the entities that
+/// Lazy-then-diligent double: the first entities-bearing ask returns empty entities; the
+/// re-ask returns the entities that
 /// were genuinely in the transcript. Counts every pass invocation.
 struct LazyOnceExtractor {
     full_calls: RefCell<usize>,
@@ -153,6 +149,7 @@ impl ConversationExtractor for AlwaysLazyExtractor {
 
 #[test]
 fn suspicious_empty_result_triggers_exactly_one_reask() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let extractor = LazyOnceExtractor::new();
     let (_report, harness_report) = run_capture(
@@ -193,6 +190,7 @@ fn suspicious_empty_result_triggers_exactly_one_reask() {
 
 #[test]
 fn reask_happens_once_even_when_still_empty() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let extractor = AlwaysLazyExtractor {
         entity_reasks: RefCell::new(0),
@@ -224,6 +222,7 @@ fn reask_happens_once_even_when_still_empty() {
 
 #[test]
 fn small_or_populated_chunks_do_not_reask() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     // Small chunk (< 8KB) with empty entities: plausibly nothing there — no re-ask.
     let extractor = LazyOnceExtractor::new();

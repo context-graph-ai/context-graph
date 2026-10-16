@@ -111,8 +111,7 @@ fn a_crash_dirty_store_answer_never_says_a_live_owner_turned_the_caller_down() {
 
     let refusal =
         request_owner(&db_path, "status\n").expect_err("nobody holds the crash-dirty store");
-    // This is the arm the misattribution actually reached an operator through: a file condition
-    // dressed up as a live owner's refusal, on the very store they most need a plain answer about.
+    // A crash-dirty file has no live owner; its file condition must not be attributed to one.
     assert_names_no_live_owner(&refusal, "a store whose file needs a writable repair");
 }
 

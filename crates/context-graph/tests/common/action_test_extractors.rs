@@ -1,10 +1,9 @@
-//! Test-support extractors for the cg-llm-client-refactor test suite.
+//! Test-support extractors for the understanding actions test suite.
 //! These are deterministic doubles — they return controlled model output shapes.
 //! Each extractor returns what a real model *would* emit on that kind of input.
 //! None of these are answer-keys; they are faithful simulations of model outputs.
 
-// Many extractors and helpers in this file are used by test files not yet written.
-// They are defined here so they compile cleanly as test support doubles.
+// Extractors and helpers compile together as test support doubles.
 #![allow(dead_code)]
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::clone_on_copy)]
@@ -165,12 +164,6 @@ fn parse_extracted_entity_type(s: &str) -> ExtractedEntityType {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AllThirteenTypesExtractor
-// ---------------------------------------------------------------------------
-/// Returns one entity for each of the 13 EntityType variants using the full
-/// ExtractedEntityType vocabulary. The placeholder From<ExtractedEntityType>
-/// maps several variants to the wrong EntityType, so per-seed identity assertions fail.
 #[derive(Debug, Default)]
 pub struct AllThirteenTypesExtractor;
 
@@ -233,11 +226,6 @@ fn entity(key: &str, name: &str, entity_type: ExtractedEntityType) -> EntitySeed
     }
 }
 
-// ---------------------------------------------------------------------------
-// RepositoryModuleExtractor
-// ---------------------------------------------------------------------------
-/// Returns two entities typed Repository and Module. The placeholder From impl
-/// maps both to File, so assertions on EntityType::Repository/Module fail.
 #[derive(Debug, Default)]
 pub struct RepositoryModuleExtractor;
 
@@ -262,7 +250,7 @@ impl ConversationExtractor for RepositoryModuleExtractor {
 // DecisionTypeExtractor
 // ---------------------------------------------------------------------------
 /// Returns a decision with decision_type "technology_choice".
-/// The wrong harness stub ignores this and stores "code_reference".
+/// Capture must preserve the emitted decision type.
 #[derive(Debug, Default)]
 pub struct DecisionTypeExtractor;
 
@@ -297,7 +285,7 @@ impl ConversationExtractor for DecisionTypeExtractor {
 // ---------------------------------------------------------------------------
 // AgentIdExtractor
 // ---------------------------------------------------------------------------
-/// Returns a decision attributed to a named agent. Wrong harness stores "cg-ingest".
+/// Returns a decision attributed to a named agent; capture must preserve that attribution.
 #[derive(Debug, Default)]
 pub struct AgentIdExtractor;
 
@@ -326,7 +314,7 @@ impl ConversationExtractor for AgentIdExtractor {
 // ---------------------------------------------------------------------------
 // NullConfidenceExtractor
 // ---------------------------------------------------------------------------
-/// Decisions always emit confidence: null. Wrong harness fabricates 0.9.
+/// Decisions emit confidence: null, which capture must preserve.
 #[derive(Debug, Default)]
 pub struct NullConfidenceExtractor;
 
@@ -385,7 +373,7 @@ impl ConversationExtractor for WithConfidenceExtractor {
 // ---------------------------------------------------------------------------
 // OutcomeExtractor
 // ---------------------------------------------------------------------------
-/// Emits one outcome linked to a decision. Wrong harness drops the outcomes field.
+/// Emits one outcome linked to a decision; capture must persist that outcome.
 #[derive(Debug, Default)]
 pub struct OutcomeExtractor;
 
@@ -420,7 +408,7 @@ impl ConversationExtractor for OutcomeExtractor {
 // ---------------------------------------------------------------------------
 // ObservationLanesExtractor
 // ---------------------------------------------------------------------------
-/// Returns an observation with all lanes populated. Wrong harness drops them.
+/// Returns an observation with all lanes populated for persistence checks.
 #[derive(Debug, Default)]
 pub struct ObservationLanesExtractor;
 
@@ -458,7 +446,7 @@ impl ConversationExtractor for ObservationLanesExtractor {
 // ---------------------------------------------------------------------------
 // DecisionWithMetadataExtractor
 // ---------------------------------------------------------------------------
-/// Returns a decision with reasoning, tags, properties. Wrong harness drops them.
+/// Returns a decision with reasoning, tags, and properties for persistence checks.
 #[derive(Debug, Default)]
 pub struct DecisionWithMetadataExtractor;
 
@@ -493,8 +481,7 @@ impl ConversationExtractor for DecisionWithMetadataExtractor {
 // HighConfidenceFabricatedSpanExtractor
 // ---------------------------------------------------------------------------
 /// Emits a confident, in-vocab value whose cited_span text is NOT in the chunk.
-/// The wrong grounding stub flags on low confidence → passes this through.
-/// The correct impl: flags because span is absent regardless of confidence.
+/// Grounding flags the absent span regardless of confidence.
 #[derive(Debug, Default)]
 pub struct HighConfidenceFabricatedSpanExtractor;
 
@@ -759,11 +746,11 @@ impl ConversationExtractor for AmbiguousSpanExtractor {
 // ---------------------------------------------------------------------------
 // Capture-path closed-vocab DECISION_TYPE grounding doubles
 // ---------------------------------------------------------------------------
-// HEAD's capture grounding inspects entity name/type ONLY — it never grounds a decision's closed
+// an incorrect implementation's capture grounding inspects entity name/type ONLY — it never grounds a decision's closed
 // `decision_type` value. These doubles emit a decision whose decision_type is mislabeled / out of
 // vocabulary / ambiguous (span present in the transcript, so the flag is driven by the label/vocab/
 // ambiguity check, not a missing span). A capture that grounds decision_type would flag them with
-// the specific reason; HEAD lets them through, so the capture-path arm fails (honest RED).
+// the specific reason; an implementation that lets them through, so the capture-path arm fails (honest regression).
 
 /// Emits a decision whose `decision_type` span is present but does NOT support the chosen label.
 #[derive(Debug, Default)]
@@ -906,16 +893,15 @@ impl ConversationExtractor for MixedModelConfidenceSpanFaithfulExtractor {
 // OtherTenantContextExtractor
 // ---------------------------------------------------------------------------
 /// Emits a real, valid OTHER-tenant context_id on seeds.
-/// The wrong harness trusts the model-emitted context_id and stores rows under that
-/// foreign context (cross-tenant leak). The correct harness ignores it and always uses
-/// the capture context.
+/// Capture ignores the model-emitted context_id and uses the capture context, preventing
+/// model output from selecting another tenant.
 ///
 /// The other-tenant context_id must be pre-created in the store before capture and
 /// stored here, because the `extract` method has no store access.
 #[derive(Debug)]
 pub struct OtherTenantContextExtractor {
     /// A real, valid context_id belonging to a different tenant — pre-created in the
-    /// store before capture so the wrong harness can actually route rows there.
+    /// store before capture so a cross-tenant routing defect would reach a real context.
     pub other_context_id: String,
 }
 
@@ -925,7 +911,7 @@ impl ConversationExtractor for OtherTenantContextExtractor {
         harvest.goals.push(GoalSeed {
             key: "G1".to_string(),
             text: "cross-tenant isolation test".to_string(),
-            // Emit the real other-tenant context_id so the wrong harness leaks into it.
+            // Emit the real other-tenant context_id to exercise the capture-context boundary.
             context_id: Some(self.other_context_id.clone()),
         });
         harvest.decisions.push(DecisionSeed {
@@ -954,7 +940,7 @@ pub struct CountingExtractor {
     /// Counts calls to `classify_decision_relation()` (Stage-3 decision-relation judge calls).
     judge_call_count: Mutex<usize>,
     /// Counts calls to the DEDICATED entity-identity judge seam (`classify_entity_identity`),
-    /// which is a distinct question from the decision-relation classifier. The strengthened
+    /// which is a distinct question from the decision-relation classifier. The
     /// relevance-retrieval test asserts the entity-identity judge — NOT
     /// `classify_decision_relation` — is the one consulted for a resolved entity, so this
     /// counter must move while `judge_call_count` (decision-relation) stays 0.
@@ -1002,7 +988,7 @@ impl CountingExtractor {
     /// the inner Vec contains the `text` of each `ExtractionPriorDecision` in that call's
     /// `prior_decisions` slice.
     ///
-    /// Used by Surface-E tests to assert that the judge receives a narrowed candidate set
+    /// Used by relevance tests to assert that the judge receives a narrowed candidate set
     /// rather than the full store contents.
     pub fn received_candidate_sets(&self) -> Vec<Vec<String>> {
         self.received_candidate_sets.lock().unwrap().clone()

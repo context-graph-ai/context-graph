@@ -215,7 +215,7 @@ fn entity_neighborhood_returns_everything_connected() {
     assert_eq!(intention_ids, expected_intentions);
 }
 
-// Use case: An audit reviewer asks for the Decisions attached to a hub within one hop. The engine includes Decisions on the hub and its direct neighbours but excludes Decisions on entities at depth > 1.
+// Use case: An audit reader asks for the Decisions attached to a hub within one hop. The engine includes Decisions on the hub and its direct neighbours but excludes Decisions on entities at depth > 1.
 #[test]
 fn subgraph_decisions_by_depth() {
     let (_tempdir, db_path, store) = fixture();

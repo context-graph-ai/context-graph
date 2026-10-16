@@ -1,10 +1,8 @@
-//! Fabric first-light final mile — the executor's receipt carries the model's REAL spend.
+//! The executor's receipt carries the model's real spend.
 //!
-//! The live two-root rehearsal defect: the worker's stderr line printed the true tokens/elapsed, but
-//! the `work_results` receipt stored `total_tokens` = the INPUT BYTE COUNT and `wall_clock_ms` = 0 —
-//! a fabricated receipt that then flowed to `cg status`. This test drives the real executor with a
-//! content-faithful double that reports a KNOWN provider usage and asserts the recorded receipt
-//! carries THOSE token numbers and a nonzero wall-clock, never the input byte length.
+//! This test drives the real executor with a content-faithful double reporting known provider
+//! usage. The recorded receipt carries those token numbers and measured wall-clock, never the
+//! input byte length or a fabricated zero duration.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -22,7 +20,7 @@ use crate::fake_extractor::LabeledTranscriptExtractor;
 const SESSION: &str = "User: Goal G1: resume across machines. Assistant: Decision D1: keep the auth module at src/auth.py.";
 
 // A KNOWN provider usage the double reports — deliberately unlike the input byte length so an honest
-// receipt (real tokens) is distinguishable from the old fabricated one (byte count).
+// receipt (real tokens) is distinguishable from a fabricated byte count.
 const KNOWN_PROMPT_TOKENS: u64 = 1_300;
 const KNOWN_COMPLETION_TOKENS: u64 = 144;
 const KNOWN_TOTAL_TOKENS: u64 = 1_444;
@@ -72,12 +70,13 @@ impl ConversationExtractor for KnownUsageExtractor {
 }
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn executor_receipt_carries_real_tokens_and_elapsed_not_input_byte_length() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("receipt_honesty").await;
     let digests = fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on submitter")
     .digest_ids;
@@ -108,7 +107,7 @@ async fn executor_receipt_carries_real_tokens_and_elapsed_not_input_byte_length(
     assert_ne!(
         receipt.total_tokens,
         SESSION.len() as u64,
-        "the receipt is NOT the input byte count (the old fabricated value)"
+        "the receipt is NOT the input byte count"
     );
     assert_eq!(
         receipt.wall_clock_ms, KNOWN_ELAPSED_MS,
