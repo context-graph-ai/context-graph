@@ -3,7 +3,7 @@
 //! Ten integration tests verifying that the capture harness respects the three distinct
 //! sources of field data (model extraction, structural fill, harness-enforced) and that
 //! Stage-3 identity resolution (entity reuse, intention grouping, decision relation) behaves
-//! correctly. Every assertion fails on a placeholder value.
+//! correctly.
 
 use context_graph::harness::{
     CaptureHarnessConfig, ContextIdSource, DecisionRelation, ResolutionKind, VerdictValue,
@@ -15,11 +15,11 @@ use context_graph::{
     StoreConfig,
 };
 
-use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::{
+use super::action_test_extractors::{
     CountingExtractor, DecisionRelationExtractor, NullConfidenceExtractor,
     OtherTenantContextExtractor, SpanFaithfulExtractor, SpyExtractor,
 };
+use super::fake_extractor::open_store_with_lexical_embedder;
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -56,20 +56,12 @@ fn context_id_by_name(store: &Store, name: &str) -> Option<ContextId> {
         .map(|c| c.id)
 }
 
-// ---------------------------------------------------------------------------
-// Test 1: Stage-1 extraction must NOT receive prior store memory. The placeholder
-// `record_conversation_with_extractor` passes all active decisions in the context
-// to the extractor as `prior_decisions`. The new harness must not forward them.
-//
-// Load-bearing assertions:
-//   1. The spy extractor observed zero prior decisions (placeholder path: non-zero)
-//   2. `harness_report.stage1_received_prior_store_memory == false` (placeholder: true)
-// ---------------------------------------------------------------------------
 #[test]
 fn stage1_extraction_receives_chunk_summary_and_applied_skills_but_not_prior_store_memory() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
-    // Seed a prior decision so the old RAG-style path would pass it to Stage-1.
+    // Seed a prior decision to verify that Stage-1 receives no stored memory.
     let _ = run_capture(
         &store,
         request(
@@ -91,8 +83,6 @@ fn stage1_extraction_receives_chunk_summary_and_applied_skills_but_not_prior_sto
     )
     .expect("spy capture");
 
-    // Primary: the spy must have observed zero prior decisions in the ExtractionRequest.
-    // Placeholder path forwards store contents; correct path passes an empty slice.
     let observed_count = spy.received_prior_decision_count();
     assert_eq!(
         observed_count,
@@ -106,17 +96,18 @@ fn stage1_extraction_receives_chunk_summary_and_applied_skills_but_not_prior_sto
     assert!(
         !harness_report.stage1_received_prior_store_memory,
         "stage1 must not receive prior store memory (not a RAG pipeline); \
-         wrong stub always returns stage1_received_prior_store_memory=true"
+         prior store memory is forbidden in Stage-1"
     );
 }
 
 // ---------------------------------------------------------------------------
 // Test 2: Stage-2 structural fill (minting id, status, created_at, embedding) must use
 // zero model calls. The only model calls are Stage-1 extraction and any Stage-3 judge.
-// Placeholder always returns `stage2_model_calls = 1`.
+// `stage2_model_calls` is zero for structural fill.
 // ---------------------------------------------------------------------------
 #[test]
 fn stage2_structural_fill_uses_no_model_and_mints_id_status_created_at_embedding() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     let counter = CountingExtractor::new(SpanFaithfulExtractor);
@@ -131,11 +122,10 @@ fn stage2_structural_fill_uses_no_model_and_mints_id_status_created_at_embedding
     )
     .expect("stage2 capture");
 
-    // Primary: Stage-2 structural fill uses zero model calls — placeholder returns 1.
     assert_eq!(
         harness_report.stage2_model_calls, 0,
         "Stage-2 structural fill must use zero model calls; \
-         wrong stub always returns stage2_model_calls=1"
+         structural fill must remain model-free"
     );
 
     // CROSS-CHECK the self-reported field against the ACTUAL spy counters (an impl that calls the
@@ -195,21 +185,12 @@ fn stage2_structural_fill_uses_no_model_and_mints_id_status_created_at_embedding
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test 3: `context_id` on every captured row must be the capture context's id, never a
-// model-emitted value. Even when the extractor emits a real, valid OTHER-tenant
-// context_id on its seeds, the placeholder harness trusts it (cross-tenant leak) while
-// the correct harness ignores it.
-//
-// This test establishes tenant B first, then captures under tenant A using an
-// extractor that emits tenant B's context_id on every seed. On the placeholder
-// harness, seeds land in tenant B (leak). Asserted on the STORE.
-// ---------------------------------------------------------------------------
 #[test]
 fn context_id_is_set_from_capture_context_never_the_model() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
-    // Establish tenant B so its context_id is valid and the wrong harness can route there.
+    // Establish tenant B so a cross-tenant routing defect would reach a valid context.
     let _ = run_capture(
         &store,
         request("tenant-b-seed", "Goal G_seed: establish tenant b"),
@@ -232,8 +213,6 @@ fn context_id_is_set_from_capture_context_never_the_model() {
     )
     .expect("capture for context_id source test");
 
-    // Store assertion: intentions captured under tenant A must NOT appear in tenant B.
-    // On the placeholder harness, the GoalSeed's emitted context_id routes the intention to tenant B.
     let b_intentions = store
         .list_intentions_in_context(tenant_b_ctx)
         .expect("list intentions in tenant B");
@@ -260,7 +239,7 @@ fn context_id_is_set_from_capture_context_never_the_model() {
     for intention in &a_intentions {
         assert_eq!(
             intention.context_id, a_id,
-            "intention '{}' must be in tenant-a; wrong harness leaked it to another context",
+            "intention '{}' must be in tenant-a",
             intention.description
         );
     }
@@ -270,20 +249,16 @@ fn context_id_is_set_from_capture_context_never_the_model() {
         harness_report.context_id_source,
         ContextIdSource::CaptureContext,
         "context_id_source must be CaptureContext (never ModelEmitted); \
-         wrong stub always returns ContextIdSource::ModelEmitted"
+         model output cannot select the context"
     );
 }
 
 // ---------------------------------------------------------------------------
 // Test 4: Even when the model emits a REAL, valid OTHER-tenant context_id, every captured
 // row must land under the capture context — no cross-tenant leak.
-//
-// Two contexts are created: A (the capture context) and B (a pre-existing context).
-// The `OtherTenantContextExtractor` simulates a model that would try to write rows under B.
-// Placeholder harness: trusts the model-emitted id and leaks into B.
-// ---------------------------------------------------------------------------
 #[test]
 fn context_id_ignores_a_valid_other_tenant_id_emitted_by_the_model() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     // Establish context B by capturing something under it first.
@@ -296,7 +271,7 @@ fn context_id_ignores_a_valid_other_tenant_id_emitted_by_the_model() {
     .expect("establish tenant B context");
 
     // Look up tenant B's real context_id — the extractor will emit it on seeds so the
-    // wrong harness leaks rows into tenant B's context.
+    // capture-context boundary is tested against a real other-tenant context.
     let tenant_b_ctx = context_id_by_name(&store, "tenant-b")
         .expect("tenant-b context must exist after establishing capture");
 
@@ -315,9 +290,6 @@ fn context_id_ignores_a_valid_other_tenant_id_emitted_by_the_model() {
     let a_id =
         context_id_by_name(&store, "tenant-a").expect("capture context 'tenant-a' must exist");
 
-    // Store assertion FIRST (primary): intentions from tenant A's capture must be in tenant A.
-    // Placeholder harness: GoalSeed with context_id=tenant-b gets routed to tenant B, so
-    // tenant A is empty → assertion fails before reaching the harness_report check.
     let a_intentions = store
         .list_intentions_in_context(a_id)
         .expect("list intentions in tenant A");
@@ -325,7 +297,7 @@ fn context_id_ignores_a_valid_other_tenant_id_emitted_by_the_model() {
     assert!(
         !a_intentions.is_empty(),
         "at least one intention must land in tenant A after capture under tenant A; \
-         wrong harness leaked it to tenant B"
+         the capture must stay within tenant A"
     );
     for intention in &a_intentions {
         assert_eq!(
@@ -371,23 +343,17 @@ fn context_id_ignores_a_valid_other_tenant_id_emitted_by_the_model() {
         leaked_entity.map(|e| &e.name)
     );
 
-    // Secondary (harness report): the placeholder returns ModelEmitted — but the store assertion
-    // above already fails first.
     assert_eq!(
         harness_report.context_id_source,
         ContextIdSource::CaptureContext,
         "context_id must come from capture context even when model emits another tenant's id; \
-         wrong stub returns ContextIdSource::ModelEmitted"
+         model output cannot select the context"
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test 5: The same named entity captured in two sessions resolves to ONE Entity id (reuse),
-// not two. Placeholder: mints a fresh entity row per capture, so two sessions yield
-// two rows. Asserted directly on the store: entities.len() == 1.
-// ---------------------------------------------------------------------------
 #[test]
 fn stage3_entity_reuse_resolves_one_entity_across_two_sessions() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     // Session 1: capture "context-graph" as a Repository.
@@ -402,8 +368,6 @@ fn stage3_entity_reuse_resolves_one_entity_across_two_sessions() {
     )
     .expect("session 1");
 
-    // Session 2: capture the same "context-graph" entity again.
-    // Placeholder harness: always mints a fresh entity row — two rows in the store.
     let (_report2, harness_report2) = run_capture(
         &store,
         request(
@@ -415,8 +379,6 @@ fn stage3_entity_reuse_resolves_one_entity_across_two_sessions() {
     )
     .expect("session 2");
 
-    // Primary store assertion: only ONE entity with this name must exist.
-    // Placeholder: always mints fresh → entities.len() == 2, assertion fails.
     let context_id = context_id_by_name(&store, "reuse-context");
     let entities = store
         .list_entities(ListEntityFilter {
@@ -430,16 +392,14 @@ fn stage3_entity_reuse_resolves_one_entity_across_two_sessions() {
         entities.len(),
         1,
         "the same named entity across two sessions must resolve to ONE Entity id; \
-         wrong stub always mints a fresh row per capture; got {} entities in the store",
+         got {} entities in the store",
         entities.len()
     );
 
-    // Secondary: the harness report must reflect the reuse via a resolution verdict.
-    // Placeholder: stage3_resolution_verdicts is always empty.
     assert!(
         !harness_report2.stage3_resolution_verdicts.is_empty(),
         "stage3_resolution_verdicts must be non-empty for the second session (entity reuse); \
-         wrong stub always returns empty"
+         observed no resolution verdicts"
     );
     let same_entity_verdict = harness_report2
         .stage3_resolution_verdicts
@@ -459,13 +419,10 @@ fn stage3_entity_reuse_resolves_one_entity_across_two_sessions() {
 
 // ---------------------------------------------------------------------------
 // Test 6: An Intention is linked into a blueprint_catalog entry (get-or-create) via Stage-3.
-// `blueprint_catalog_id` must be Some(_) after capture; placeholder never sets it.
-//
-// Store assertion: every captured intention has blueprint_catalog_id = Some(_).
-// Placeholder: all intentions have blueprint_catalog_id = None.
-// ---------------------------------------------------------------------------
+// `blueprint_catalog_id` must be Some(_) after capture.
 #[test]
 fn stage3_intention_grouping_get_or_create_into_edge_local_catalog() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     let (_report, harness_report) = run_capture(
@@ -479,8 +436,6 @@ fn stage3_intention_grouping_get_or_create_into_edge_local_catalog() {
     )
     .expect("grouping capture");
 
-    // Store assertion: the captured intention must have blueprint_catalog_id = Some(_).
-    // Placeholder: create_intention always passes blueprint_catalog_id: None → stored as None.
     let context_id = context_id_by_name(&store, "grouping-context")
         .expect("grouping-context must exist after capture");
     let intentions = store
@@ -495,7 +450,7 @@ fn stage3_intention_grouping_get_or_create_into_edge_local_catalog() {
         assert!(
             intention.blueprint_catalog_id.is_some(),
             "captured intention '{}' must have blueprint_catalog_id = Some(_) after Stage-3 grouping; \
-             wrong stub never sets it (always None)",
+             observed no catalog id",
             intention.description
         );
     }
@@ -504,7 +459,7 @@ fn stage3_intention_grouping_get_or_create_into_edge_local_catalog() {
     assert!(
         !harness_report.stage3_resolution_verdicts.is_empty(),
         "stage3_resolution_verdicts must be non-empty when an Intention was captured; \
-         placeholder always returns an empty list"
+         observed an empty verdict list"
     );
     let intention_verdicts: Vec<_> = harness_report
         .stage3_resolution_verdicts
@@ -527,12 +482,9 @@ fn stage3_intention_grouping_get_or_create_into_edge_local_catalog() {
 // Test 7: A judge `unsure` verdict mints a new catalog entry — never merges.
 // Two distinct intentions captured in separate sessions must each have a
 // `blueprint_catalog_id` AND they must be DISTINCT from each other.
-//
-// Store assertion: both intentions have Some(catalog_id), and the two catalog ids differ.
-// Placeholder: both have None, assertion fails on the first `.is_some()` check.
-// ---------------------------------------------------------------------------
 #[test]
 fn stage3_intention_verdict_unsure_keeps_them_separate() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     // Capture two distinct intentions so both go through Stage-3.
@@ -552,8 +504,6 @@ fn stage3_intention_verdict_unsure_keeps_them_separate() {
     )
     .expect("second intention");
 
-    // Store assertion: each intention must have a catalog id.
-    // Placeholder: all are None — fails on first assertion.
     let context_id = context_id_by_name(&store, "unsure-context")
         .expect("unsure-context must exist after captures");
     let intentions = store
@@ -568,13 +518,11 @@ fn stage3_intention_verdict_unsure_keeps_them_separate() {
         assert!(
             intention.blueprint_catalog_id.is_some(),
             "intention '{}' must have blueprint_catalog_id = Some(_) after Stage-3 grouping; \
-             wrong stub always stores None",
+             observed no catalog id",
             intention.description
         );
     }
 
-    // The two catalog ids must be distinct (unsure → separate entries, not merged).
-    // Placeholder: both are None so distinctness can't even be checked.
     let catalog_ids: Vec<&str> = intentions
         .iter()
         .filter_map(|i| i.blueprint_catalog_id.as_deref())
@@ -600,7 +548,7 @@ fn stage3_intention_verdict_unsure_keeps_them_separate() {
     assert!(
         !intention_verdicts.is_empty(),
         "stage3 must emit at least one Intention verdict for the second capture; \
-         placeholder returns empty list"
+         observed an empty verdict list"
     );
     let any_same = intention_verdicts
         .iter()
@@ -608,20 +556,16 @@ fn stage3_intention_verdict_unsure_keeps_them_separate() {
     assert!(
         !any_same,
         "unsure judge result must NOT produce VerdictValue::Same — that would indicate \
-         a silent merge; placeholder returns VerdictValue::New for all"
+         a silent merge"
     );
 }
 
 // ---------------------------------------------------------------------------
 // Test 8: When grouping is `unsure` BUT candidates existed, the system mints a NEW catalog
 // entry whose id differs from every candidate AND surfaces a grouping proposal.
-//
-// Store assertion: the second intention has blueprint_catalog_id = Some(_) AND it
-// differs from the first intention's catalog id (a new entry was minted, not merged).
-// Placeholder: both are None — fails on first `.is_some()` check.
-// ---------------------------------------------------------------------------
 #[test]
 fn grouping_unsure_with_candidates_mints_new_and_surfaces_a_proposal() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     // Seed a candidate catalog entry first.
@@ -645,8 +589,6 @@ fn grouping_unsure_with_candidates_mints_new_and_surfaces_a_proposal() {
     )
     .expect("unsure-with-candidates capture");
 
-    // Store assertion: both intentions must have a catalog id, and the ids must differ.
-    // Placeholder: neither has a catalog id (both None) — fails immediately.
     let context_id =
         context_id_by_name(&store, "proposal-context").expect("proposal-context must exist");
     let intentions = store
@@ -661,7 +603,7 @@ fn grouping_unsure_with_candidates_mints_new_and_surfaces_a_proposal() {
         assert!(
             intention.blueprint_catalog_id.is_some(),
             "intention '{}' must have blueprint_catalog_id = Some(_); \
-             wrong stub never sets it",
+             observed no catalog id",
             intention.description
         );
     }
@@ -677,14 +619,14 @@ fn grouping_unsure_with_candidates_mints_new_and_surfaces_a_proposal() {
         distinct,
         intentions.len(),
         "each intention must have its own distinct catalog id (unsure with candidates mints new); \
-         wrong stub: all None, so distinctness cannot hold"
+         catalog identity must be present before comparing distinctness"
     );
 
     // Secondary: report must not show a silent merge (Same verdict for the new intention).
     assert!(
         !harness_report.stage3_resolution_verdicts.is_empty(),
         "stage3_resolution_verdicts must be non-empty when an unsure grouping produces a proposal; \
-         placeholder always returns empty"
+         observed an empty verdict list"
     );
     let silently_merged = harness_report
         .stage3_resolution_verdicts
@@ -703,12 +645,9 @@ fn grouping_unsure_with_candidates_mints_new_and_surfaces_a_proposal() {
 // All captured intentions must get a blueprint_catalog_id. Two pre-existing Intentions
 // that the judge reads as one must NOT auto-merge — a proposal is emitted but their
 // catalog ids stay distinct.
-//
-// Store assertion: every intention has Some(catalog_id); all catalog ids are distinct.
-// Placeholder: all are None — fails on first `.is_some()` check.
-// ---------------------------------------------------------------------------
 #[test]
 fn stage3_new_intention_may_autolink_on_strong_evidence_existing_intentions_only_proposed() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     // Establish two existing intentions.
@@ -737,8 +676,6 @@ fn stage3_new_intention_may_autolink_on_strong_evidence_existing_intentions_only
     )
     .expect("third intention capture");
 
-    // Store assertion: every intention must have a catalog id.
-    // Placeholder: all are None — fails immediately.
     let context_id =
         context_id_by_name(&store, "autolink-context").expect("autolink-context must exist");
     let intentions = store
@@ -753,7 +690,7 @@ fn stage3_new_intention_may_autolink_on_strong_evidence_existing_intentions_only
         assert!(
             intention.blueprint_catalog_id.is_some(),
             "intention '{}' must have blueprint_catalog_id = Some(_); \
-             wrong stub never sets it",
+             observed no catalog id",
             intention.description
         );
     }
@@ -788,7 +725,7 @@ fn stage3_new_intention_may_autolink_on_strong_evidence_existing_intentions_only
     assert!(
         !harness_report.stage3_resolution_verdicts.is_empty(),
         "stage3 must emit at least one resolution verdict for the third capture; \
-         placeholder returns empty"
+         observed an empty verdict list"
     );
 
     // No more than one Same verdict (only the newly captured intention can auto-link).
@@ -812,9 +749,6 @@ fn stage3_new_intention_may_autolink_on_strong_evidence_existing_intentions_only
 // Test 10: A decision resolved against priors landing in each of the five relations has its
 // own edge/status side-effect, asserted directly on the STORE.
 //
-// Placeholder: stores decisions with no relation edges and no status flips.
-// Five sub-scenarios, parametrized by relation class:
-//
 //   New:        first capture, no prior — no edges; decision is Active.
 //   Supersedes: second capture supersedes prior → prior becomes Superseded + SUPERSEDES edge.
 //   Refines:    refines prior → REFINES edge; prior stays Active.
@@ -823,6 +757,7 @@ fn stage3_new_intention_may_autolink_on_strong_evidence_existing_intentions_only
 // ---------------------------------------------------------------------------
 #[test]
 fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersedes() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
 
     // Capture first decision (New relation — no prior to relate to).
@@ -861,9 +796,6 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
     );
     let d1_id = decisions_after_first[0].id;
 
-    // --- Supersedes: second capture supersedes prior → prior becomes Superseded. ---
-    // PRIMARY store assertion: prior decision status must flip to Superseded.
-    // Placeholder: no status flip — prior stays Active.
     let ext_supersedes = DecisionRelationExtractor {
         relation: DecisionRelationClassification::SupersedesExisting,
         ..Default::default()
@@ -879,8 +811,6 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
     )
     .expect("supersedes capture");
 
-    // Store: prior decision must now be Superseded.
-    // Placeholder: no status flip — prior stays Active.
     let d1_after = store
         .get_decision(d1_id)
         .expect("get prior decision")
@@ -889,11 +819,9 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
         d1_after.status,
         DecisionStatus::Superseded,
         "prior decision must be Superseded after a superseding capture; \
-         wrong stub: no status flip, prior stays Active"
+         observed no supersession transition"
     );
 
-    // Store: SUPERSEDES edge must exist from new decision to prior.
-    // Placeholder: stores no relation edges.
     let all_decisions = store
         .by_intention(
             intention_id,
@@ -913,15 +841,13 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
     assert!(
         supersedes_edge,
         "a SUPERSEDES edge from the new decision to the prior must exist in the store; \
-         wrong stub creates no relation edges"
+         the relation edge must be persisted"
     );
 
-    // Secondary: harness report must carry a Decision verdict for the superseding capture.
-    // Placeholder: stage3_resolution_verdicts is always empty.
     assert!(
         !harness_rep.stage3_resolution_verdicts.is_empty(),
         "stage3_resolution_verdicts must be non-empty after a supersedes relation; \
-         wrong stub always returns empty (reaches here only after store assertions above pass)"
+         observed no resolution verdicts (reaches here only after store assertions above pass)"
     );
     let decision_verdicts: Vec<_> = harness_rep
         .stage3_resolution_verdicts
@@ -937,7 +863,7 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
         supersedes_verdict,
         Some(DecisionRelation::Supersedes),
         "supersedes capture must report DecisionRelation::Supersedes; \
-         wrong stub returns None or wrong variant"
+         the reported relation must match the stored transition"
     );
 
     // --- Refines: a new decision refines a prior → REFINES edge, prior stays Active. ---
@@ -980,7 +906,7 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
     assert!(
         refines_edge,
         "a REFINES edge from the new decision to the prior must exist; \
-         wrong stub creates no relation edges"
+         the relation edge must be persisted"
     );
     // Prior (d2) must still be Active (refining doesn't supersede).
     let d2_after_refines = store
@@ -991,7 +917,7 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
         d2_after_refines.status,
         DecisionStatus::Active,
         "prior decision must remain Active when a new decision refines it; \
-         wrong stub: no relation processing"
+         the relation must preserve the prior active decision"
     );
 
     // --- Conflicts: a new decision conflicts a prior → CITES/CONFLICTS edge, no auto-supersede. ---
@@ -1034,7 +960,7 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
         d3_after_conflicts.status,
         DecisionStatus::Active,
         "existing decision must remain Active when a new decision conflicts it (no auto-supersede); \
-         wrong stub: no relation processing"
+         the relation must preserve the prior active decision"
     );
     // d4 must also be stored (it's a new conflicting decision, not a duplicate).
     let d4_stored = store
@@ -1044,7 +970,7 @@ fn stage3_decision_relation_classified_new_duplicate_refines_conflicts_supersede
     assert_eq!(
         d4_stored.status,
         DecisionStatus::Active,
-        "conflicting decision must be Active (no auto-resolution); wrong stub"
+        "conflicting decision must be Active (no auto-resolution)"
     );
 
     // --- Duplicate: an exact-duplicate decision reuses/links the prior — NO second decision row. ---

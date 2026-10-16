@@ -1,4 +1,4 @@
-//! Fabric first-light — the global sharing switch, proven at the REAL push level.
+//! Fabric  — the global sharing switch, proven at the REAL push level.
 //!
 //! Non-frozen companion to the privacy contract (`fabric_privacy`). Sharing OFF keeps the ephemeral
 //! understanding input off the wire because the copy is NEVER WRITTEN — submission uses an
@@ -37,9 +37,10 @@ fn tenant_config(sharing: bool) -> FabricConfig {
 
 #[tokio::test]
 async fn sharing_off_push_carries_no_input_rows_or_bytes() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("sharing_off_push").await;
     let config = tenant_config(false);
-    let mut capture = FabricCapture::new(tier0_request("daily-loop", "s1", SESSION));
+    let mut capture = FabricCapture::new(tier0_request("capture", "s1", SESSION));
     capture.config = Some(&config);
     fabric::capture(&fixture.edge1.store, capture).expect("capture with sharing off");
 
@@ -76,9 +77,10 @@ async fn sharing_off_push_carries_no_input_rows_or_bytes() {
 
 #[tokio::test]
 async fn sharing_on_push_carries_the_input() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("sharing_on_push").await;
     let config = tenant_config(true);
-    let mut capture = FabricCapture::new(tier0_request("daily-loop", "s1", SESSION));
+    let mut capture = FabricCapture::new(tier0_request("capture", "s1", SESSION));
     capture.config = Some(&config);
     fabric::capture(&fixture.edge1.store, capture).expect("capture with sharing on");
 

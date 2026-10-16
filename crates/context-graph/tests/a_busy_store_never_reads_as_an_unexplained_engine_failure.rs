@@ -1,15 +1,12 @@
 //! A store that is merely BUSY must never read to an operator as a store that is BROKEN.
 //!
-//! "unexpected engine error: ..." is what a consumer sees today when direct readers are still
-//! hydrating a store a writer wants. That sentence tells an operator that something went wrong
-//! inside the engine, on a machine where nothing has gone wrong at all: a reader is reading, and
-//! the writer's own next attempt will succeed. The cost is real — a runtime that stops on it never
-//! comes up, and an operator who reads it goes looking for damage to repair.
+//! Direct readers hydrating a store temporarily hold off a writer. The condition must describe
+//! that contention without suggesting engine damage; the writer can retry after the readers finish.
 //!
 //! ## Public contract this file proves
 //!
 //! - The condition renders as what it is: readers are holding the store. The word "unexpected"
-//!   never appears, and neither does the generic engine-error wrapper it falls into today.
+//!   never appears, and neither does the generic engine-error wrapper.
 //! - What contextdb verified about the readers survives into what the operator reads: a process a
 //!   reader was named by is in the rendered condition, so the operator can go and find it instead
 //!   of only being told to wait.
@@ -39,11 +36,11 @@ use context_graph::{CgError, ReaderIdentity};
 /// Wording that tells an operator the engine failed. None of it belongs on a store that is simply
 /// being read by somebody else.
 const READS_AS_A_BROKEN_ENGINE: [&str; 3] = [
-    // The exact sentence a busy store produces today.
+    // The generic engine-error wording excluded from a busy-store refusal.
     "unexpected engine error",
     // Anything the engine calls unexpected: a reader reading is expected.
     "unexpected",
-    // The generic catch-all this condition must stop falling into.
+    // The generic catch-all excluded from this condition.
     "engine(",
 ];
 

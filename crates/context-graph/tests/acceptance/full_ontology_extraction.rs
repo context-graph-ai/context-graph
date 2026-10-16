@@ -9,12 +9,12 @@ use context_graph::{
     RetentionStatus, Store, StoreConfig,
 };
 
-use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::{
+use super::action_test_extractors::{
     AgentIdExtractor, AllThirteenTypesExtractor, DecisionTypeExtractor,
     DecisionWithMetadataExtractor, NullConfidenceExtractor, ObservationLanesExtractor,
     OutcomeExtractor, RawEntityTypeStringExtractor, RepositoryModuleExtractor,
 };
+use super::fake_extractor::open_store_with_lexical_embedder;
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -64,8 +64,6 @@ fn decision_id_from_stable(
         .map(DecisionId::from)
 }
 
-// The placeholder From<ExtractedEntityType> maps Repository and Module to File.
-// Assert stored entities carry Repository and Module, not File.
 #[test]
 fn repository_and_module_transcript_resolve_to_repository_and_module_not_file() {
     let (_dir, store) = fresh_store();
@@ -87,7 +85,6 @@ fn repository_and_module_transcript_resolve_to_repository_and_module_not_file() 
     let repo_entity = entities.iter().find(|e| e.name.contains("context-graph"));
     let module_entity = entities.iter().find(|e| e.name.contains("ingest"));
 
-    // Placeholder: From<ExtractedEntityType> maps Repository→File, Module→File.
     assert_eq!(
         repo_entity.map(|e| e.entity_type),
         Some(EntityType::Repository),
@@ -114,9 +111,6 @@ fn repository_and_module_transcript_resolve_to_repository_and_module_not_file() 
 // that bypasses string resolution stores the wrong variant. An unrecognized string must be
 // flagged out-of-vocab, never silently coerced.
 //
-// SCAFFOLD STUB the test fails on: the current capture path ignores entity_type_raw and uses the
-// typed enum default (File), so "module"/"repository" land as File (variant assertion fails) and
-// "wormhole" is silently dropped rather than flagged (out-of-vocab assertion fails).
 #[test]
 fn model_emitted_string_entity_type_resolves_to_variant_via_from_str_through_capture() {
     let (_dir, store) = fresh_store();
@@ -137,9 +131,7 @@ fn model_emitted_string_entity_type_resolves_to_variant_via_from_str_through_cap
         })
         .expect("list entities");
 
-    // The module entity, whose type arrived as the raw string "module", must resolve to Module via
-    // entity_type_from_str on the live capture path. The wrong stub (ignores entity_type_raw) stores
-    // the default File → assertion fails.
+    // Capture resolves the raw string "module" to Module through entity_type_from_str.
     let module_entity = entities
         .iter()
         .find(|e| e.name.contains(RawEntityTypeStringExtractor::MODULE_NAME));
@@ -147,7 +139,7 @@ fn model_emitted_string_entity_type_resolves_to_variant_via_from_str_through_cap
         module_entity.map(|e| e.entity_type),
         Some(EntityType::Module),
         "raw model string \"module\" must resolve to EntityType::Module via entity_type_from_str; \
-         wrong stub ignores entity_type_raw and stores the default File"
+         entity_type_raw must override the default File"
     );
 
     // The repository entity, raw string "repository", must resolve to Repository.
@@ -159,12 +151,10 @@ fn model_emitted_string_entity_type_resolves_to_variant_via_from_str_through_cap
         repo_entity.map(|e| e.entity_type),
         Some(EntityType::Repository),
         "raw model string \"repository\" must resolve to EntityType::Repository via entity_type_from_str; \
-         wrong stub stores the default File"
+         the default File must not override the raw type"
     );
 
-    // A raw string the conversion does not recognize ("wormhole") must be FLAGGED out-of-vocab,
-    // never silently coerced to a default variant. The wrong stub drops the raw string and stores
-    // File without flagging → the flagged_items assertion fails.
+    // Capture flags the unrecognized raw type "wormhole" as out-of-vocabulary.
     assert!(
         report.flagged_items.iter().any(|f| {
             f.reason
@@ -178,8 +168,6 @@ fn model_emitted_string_entity_type_resolves_to_variant_via_from_str_through_cap
     );
 }
 
-// Assert each of the 13 entity types maps to its own variant per named seed.
-// The placeholder implementation misroutes several to wrong variants.
 #[test]
 fn all_thirteen_entity_types_are_reachable_through_capture() {
     let (_dir, store) = fresh_store();
@@ -235,9 +223,6 @@ fn all_thirteen_entity_types_are_reachable_through_capture() {
     }
 }
 
-// The placeholder harness stores decision_type="code_reference" unconditionally.
-// Assert the stored decision carries the model-emitted "technology_choice".
-// Look up by stable_id to avoid depending on the placeholder captured_decisions list.
 #[test]
 fn decision_type_comes_from_model_not_hardcoded_code_reference() {
     let (_dir, store) = fresh_store();
@@ -256,7 +241,6 @@ fn decision_type_comes_from_model_not_hardcoded_code_reference() {
         .expect("get decision")
         .expect("decision exists");
 
-    // Placeholder: stores "code_reference". Assert the model-emitted value is stored.
     assert_eq!(
         decision.decision_type, "technology_choice",
         "decision_type must be 'technology_choice' from model, not the hardcoded 'code_reference'"
@@ -267,8 +251,6 @@ fn decision_type_comes_from_model_not_hardcoded_code_reference() {
     );
 }
 
-// The placeholder harness stores agent_id="cg-ingest" unconditionally.
-// Assert the stored decision carries the model-emitted "senior-eng-alice".
 #[test]
 fn agent_id_comes_from_model_not_hardcoded_cg_ingest() {
     let (_dir, store) = fresh_store();
@@ -286,7 +268,6 @@ fn agent_id_comes_from_model_not_hardcoded_cg_ingest() {
         .expect("get decision")
         .expect("decision exists");
 
-    // Placeholder: stores "cg-ingest". Assert the model-emitted value is stored.
     assert_eq!(
         decision.agent_id.as_deref(),
         Some("senior-eng-alice"),
@@ -299,8 +280,6 @@ fn agent_id_comes_from_model_not_hardcoded_cg_ingest() {
     );
 }
 
-// The placeholder harness fabricates confidence=0.9 at capture time.
-// Assert confidence is None in the stored decision immediately after capture.
 #[test]
 fn decision_confidence_is_null_at_capture_never_fabricated_point_nine() {
     let (_dir, store) = fresh_store();
@@ -318,7 +297,6 @@ fn decision_confidence_is_null_at_capture_never_fabricated_point_nine() {
         .expect("get decision")
         .expect("decision exists");
 
-    // Placeholder: fabricates Some(0.9). Assert it must be None.
     assert!(
         decision.confidence.is_none(),
         "confidence must be None at capture (evidence-derived), got Some({:?})",
@@ -345,8 +323,7 @@ fn decision_confidence_is_null_at_capture_never_fabricated_point_nine() {
 //     non-invalidating Observations (it survived scrutiny);
 //   - Y is cited by decisions whose Outcomes are FAILURE, and its basis entity carries FEWER
 //     non-invalidating Observations.
-// A correct broad-record derivation yields X.confidence > Y.confidence; the current single-outcome
-// stub yields X == Y (both 1.0) → the `X > Y` assertion fails on an assert! (honest RED at HEAD).
+// Broad-record derivation yields X.confidence > Y.confidence.
 //
 // X and Y are built directly with `create_decision` (confidence: None) so the test controls their
 // basis entities and CITES precedents — the capture path cannot attach those. The test never
@@ -427,11 +404,8 @@ fn decision_confidence_becomes_evidence_derived_after_outcomes_accrue() {
     );
 }
 
-// NEW (Surface A): confidence must be derived ON THE PRODUCTION FLOW. After recording a decision's
-// Outcomes + citing/observation track record through the LIVE path, reading the decision back shows
-// confidence is evidence-derived (Some, moving with the record) WITHOUT the test ever calling
-// `derive_decision_confidence` itself. HEAD has `derive_decision_confidence` but the production
-// capture/outcome/read flow never invokes it → confidence stays None → RED.
+// The production capture/outcome/read flow derives confidence from the stored track record
+// without an explicit derivation call from the test.
 #[test]
 fn decision_confidence_is_derived_on_the_production_flow() {
     let (_dir, store) = fresh_store();
@@ -481,15 +455,15 @@ fn decision_confidence_is_derived_on_the_production_flow() {
         .expect("y exists");
 
     // Confidence must be evidence-derived BY the production flow (Some), and move with the record.
-    // HEAD never invokes derivation on the production flow → both are None → RED here.
+    // an implementation that never invokes derivation on the production flow → both are None → regression here.
     assert!(
         persisted_x.confidence.is_some(),
         "X confidence must be Some — derived BY the production capture/outcome/read flow without the \
-         test calling derive_decision_confidence; HEAD leaves it None (derivation never invoked)"
+         test calling derive_decision_confidence; an implementation that leaves it None (derivation never invoked)"
     );
     assert!(
         persisted_y.confidence.is_some(),
-        "Y confidence must be Some — derived BY the production flow; HEAD leaves it None"
+        "Y confidence must be Some — derived BY the production flow; an implementation that leaves it None"
     );
     assert!(
         persisted_x.confidence.unwrap() > persisted_y.confidence.unwrap(),
@@ -630,9 +604,6 @@ fn record_non_invalidating_observation(
         .expect("record non-invalidating observation");
 }
 
-// The placeholder harness drops the outcomes key; captured_outcomes is always empty.
-// Assert: one Outcome linked to the decision; recording a second REPLACES the first
-// (at most one active outcome per decision).
 #[test]
 fn outcome_is_extracted_and_attached_single_active() {
     let (_dir, store) = fresh_store();
@@ -646,9 +617,6 @@ fn outcome_is_extracted_and_attached_single_active() {
     let decision_id = decision_id_from_stable(&report, "D1")
         .expect("D1 must be in stable_ids from OutcomeExtractor");
 
-    // Read back from store: the extractor emitted an outcome, so the store must hold exactly
-    // one outcome for this decision. The placeholder drops the outcome at capture, so the
-    // store has none and this deep read fails.
     let first_outcomes = store
         .admin_raw_outcomes_for_decision(decision_id)
         .expect("list outcomes for decision");
@@ -690,8 +658,6 @@ fn outcome_is_extracted_and_attached_single_active() {
     );
 }
 
-// The placeholder harness drops observation lanes (observation_type, source, observed_properties, state_delta).
-// Assert all four lanes are stored with the emitted values.
 #[test]
 fn observation_lanes_observed_properties_state_delta_source_type_all_captured() {
     let (_dir, store) = fresh_store();
@@ -702,10 +668,6 @@ fn observation_lanes_observed_properties_state_delta_source_type_all_captured() 
         &ObservationLanesExtractor,
     );
 
-    // Read back from the STORE by context — the product contract is that the captured
-    // observation is queryable from the store.
-    // The placeholder drops the observation at capture, so the store holds none and this
-    // deep read fails.
     let context_id = context_id_by_name(&store, "observation-lanes-context");
     let observations = store
         .list_observations(context_id)
@@ -738,8 +700,6 @@ fn observation_lanes_observed_properties_state_delta_source_type_all_captured() 
     );
 }
 
-// The placeholder harness drops reasoning, tags, and properties on Decision.
-// Assert all three are populated from the model extraction.
 #[test]
 fn decision_reasoning_tags_properties_are_captured() {
     let (_dir, store) = fresh_store();
@@ -750,8 +710,6 @@ fn decision_reasoning_tags_properties_are_captured() {
         &DecisionWithMetadataExtractor,
     );
 
-    // Read the decision from the STORE via stable_id. The placeholder drops reasoning, tags, and
-    // properties at capture, so the stored decision has them empty/default and these deep reads fail.
     let decision_id = decision_id_from_stable(&report, "D1")
         .expect("D1 must be in stable_ids from DecisionWithMetadataExtractor");
     let decision = store
@@ -759,7 +717,6 @@ fn decision_reasoning_tags_properties_are_captured() {
         .expect("get decision")
         .expect("decision exists");
 
-    // Placeholder: drops reasoning, tags, properties — they are empty/default.
     assert_eq!(
         decision.reasoning.len(),
         2,

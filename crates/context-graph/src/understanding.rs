@@ -1,7 +1,7 @@
-//! Understanding drain accessors: the store-level seam a worker uses to turn the durable tier-0
+//! Understanding drain accessors: the store-level seam a worker uses to turn the durable model-free
 //! backlog into structured memory.
 //!
-//! Tier-0 capture is deterministic and free; it submits one understanding job onto the shipped work
+//! model-free capture is deterministic and free; it submits one understanding job onto the shipped work
 //! ledger per digest (state `pending`) plus the raw source chunk in `cg_source_chunks`. A worker
 //! later drains that backlog through a real model: it lists the pending digests by PRIORITY
 //! (most-retrieved first, oldest first within equal touch), CLAIMS each one atomically (a ledger
@@ -10,10 +10,9 @@
 //! success (the ledger job's computed state reads `structured`), or a recorded failure that re-queues
 //! below the attempt cap and turns the job terminally `failed` at the cap.
 //!
-//! The private `cg_understanding_queue` table is retired: the ledger's computed job state
-//! (`work_jobs`/`work_claims`/`work_failures`/`work_cancellations`, plus the retained write-once
-//! `cg_understanding_completions` marker) subsumes the queue's pending/in_flight/attempts/status role,
-//! so there is no second source of truth to rot. These are pure store accessors: no model, no
+//! Job state derives from `work_jobs`, `work_claims`, `work_failures`, `work_cancellations`, and
+//! the retained write-once `cg_understanding_completions` marker. These are pure store accessors:
+//! no model, no
 //! filesystem, no process control. The worker loop, the lockfile, and the connected-model extractor
 //! live in the CLI (the surface caller); vigil, which embeds cg as a library, can drive the same
 //! drain in-process by calling these directly.
@@ -124,7 +123,7 @@ pub fn claim_digest(store: &Store, digest_id: DigestId) -> Result<bool> {
     }
     let attempt = next_attempt(db, &job_id).map_err(map_engine)?;
     // The local claim takes an unexpiring lease: the single-node claim is sticky until the worker
-    // records success or failure (the fabric worker slice injects a real lease clock for expiry).
+    // records success or failure.
     match insert_claim(
         db,
         &job_id,
@@ -258,8 +257,7 @@ fn highest_claim_attempt(store: &Store, job_id: &str) -> Result<i64> {
         .unwrap_or(1))
 }
 
-/// How many failures have been recorded for a job — the attempt count the retired queue tracked in
-/// its `attempts` column.
+/// How many failures have been recorded for a job.
 fn failure_count(store: &Store, job_id: &str) -> Result<u32> {
     let result = store.read_query(
         "SELECT attempt FROM work_failures WHERE job_id = $job_id",

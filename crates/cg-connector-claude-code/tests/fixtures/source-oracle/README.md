@@ -4,7 +4,7 @@ These files are independently authored synthetic inputs for source and adapter f
 not copy, transform, name, or locate any private transcript. `expected-occurrences.json` is a
 source-fact oracle, not a serialized public event schema: it states every accepted occurrence's
 source fields, ordered semantic mapping, exact retained text or structured source value, and
-coverage expectation. A later RED author binds those facts to the released connector contract.
+coverage expectation. A later regression author binds those facts to the released connector contract.
 
 `compact-rich.jsonl` is the primary valid stream. It deliberately includes accounts, a legal matter,
 literal embedding-prefix-looking text, Unicode, a fence, a tab, multipart messages, linked and

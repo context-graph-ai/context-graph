@@ -1122,7 +1122,7 @@ fn find_via_digests_enriches_only_limited_candidates() {
     assert!(
         !sql.iter()
             .any(|statement| statement.contains("LIMIT 10000")),
-        "digest vector search must not keep the old 10000 over-fetch cap; sql={sql:?}"
+        "digest vector search must not impose a fixed 10000 over-fetch cap; sql={sql:?}"
     );
 }
 

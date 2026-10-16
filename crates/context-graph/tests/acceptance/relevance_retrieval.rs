@@ -1,15 +1,11 @@
 //! Relevance retrieval acceptance tests.
 //!
 //! Four acceptance tests verifying that Stage-3 retrieval makes the right number of
-//! judge calls with the right narrowed candidate set. Every assertion fails on a placeholder
-//! value, never on a compile error or panic.
+//! judge calls with the right narrowed candidate set.
 //!
 //! Primary observables: the `CountingExtractor` spy records `judge_call_count()` and
 //! `received_candidate_sets()` — these are process-observable doubles, not report fields.
-//! Placeholder values (from `CaptureHarnessReport` defaults are secondary confirmations):
-//!   - `judge_call_count: 0` (stays 0 even when candidates exist)
-//!   - `judge_candidate_set: []` (always empty)
-//!   - `stage2_model_calls: 1` (placeholder; correct is 0)
+//! Report fields provide secondary confirmation of candidate selection and model calls.
 
 use std::collections::HashMap;
 
@@ -18,10 +14,10 @@ use context_graph::ingest::{CaptureRequest, DecisionRelationClassification};
 use context_graph::{ListEntityFilter, Store, StoreConfig, TxId};
 use contextdb_core::Value as DbValue;
 
-use super::fake_extractor::open_store_with_lexical_embedder;
-use super::refactor_extractor::{
+use super::action_test_extractors::{
     CountingExtractor, DecisionRelationExtractor, SpanFaithfulExtractor,
 };
+use super::fake_extractor::open_store_with_lexical_embedder;
 
 /// Insert a learned skill row directly into `cg_learned_skills` (test seeding). The rule text is a
 /// non-retype placeholder — fine here because these rows are only used as description-match
@@ -101,22 +97,10 @@ fn request(label: &str, transcript: &str) -> CaptureRequest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test 1 (retrieval): In a fresh store (no prior neighbors), Stage-3 must issue zero
-// judge calls — cost floor. The placeholder run_capture calls the judge for every
-// harvested decision even when the store has zero prior candidates.
-//
-// Primary load-bearing observable: `counter.judge_call_count() == 0` fails because the
-// placeholder calls the judge once per decision in the harvest, even with zero store candidates.
-// The transcript includes a decision so the placeholder pipeline has a decision to iterate over.
-// ---------------------------------------------------------------------------
 #[test]
 fn zero_candidates_makes_no_judge_call() {
     let (_dir, store) = fresh_store();
 
-    // Transcript includes a decision so the placeholder pipeline's per-decision judge loop fires.
-    // Correct impl: zero prior candidates → zero judge calls.
-    // Placeholder: calls judge once per harvested decision even with zero candidates.
     let counter = CountingExtractor::new(SpanFaithfulExtractor);
     let (_report, harness_report) = run_capture(
         &store,
@@ -129,14 +113,12 @@ fn zero_candidates_makes_no_judge_call() {
     )
     .expect("fresh-store capture");
 
-    // Primary load-bearing spy assertion: fresh store has no prior candidates —
-    // the judge must not be called. Placeholder calls it once per decision
-    // even with zero candidates → spy observes 1 call → assertion fails.
+    // A fresh store has no prior candidates, so the judge must not be called.
     assert_eq!(
         counter.judge_call_count(),
         0,
         "fresh store has no prior candidates — judge must not be called; \
-         wrong run_capture called the judge {} time(s) even with zero candidates",
+         observed {} judge calls with zero candidates",
         counter.judge_call_count()
     );
 
@@ -176,12 +158,6 @@ fn zero_candidates_makes_no_judge_call() {
 // ---------------------------------------------------------------------------
 // Test 2 (retrieval): When candidates exist, the judge is called once per resolved item
 // with a NARROWED candidate set — not the whole store.
-//
-// Primary observable: `counter.received_candidate_sets()` — the spy records what the
-// judge actually received. The set contents must be the near few, not all 20.
-// Placeholder: judge is never called via classify_decision_relation → received_candidate_sets
-// is empty → assertion on received.len() fails.
-// ---------------------------------------------------------------------------
 #[test]
 fn candidates_present_makes_exactly_one_small_judge_call_per_item() {
     let (_dir, store) = fresh_store();
@@ -309,25 +285,10 @@ fn candidates_present_makes_exactly_one_small_judge_call_per_item() {
 // Test 3 (retrieval): The retrieval+judge `unsure` outcome keeps items separate
 // (false-merge-worse-than-miss). The contract: when the judge returns unsure
 // (None from classify_decision_relation), the harness must NOT silently merge two distinct items.
-//
-// Primary load-bearing spy assertion: the judge must have been consulted (called at least once)
-// to decide separateness — `counter.judge_call_count() >= 1`.
-// Placeholder run_capture: the entity-identity judge seam does not exist (only
-// `classify_decision_relation` exists, which is per-decision, not per-entity).
-// With entity-only transcripts (no decisions), placeholder behavior 2 never calls the judge →
-// `counter.judge_call_count() == 0` → assertion `>= 1` FAILS.
-//
-// NOTE for impl: the correct impl needs a dedicated entity-identity judge seam invoked
-// during Stage-3 entity resolution; `classify_decision_relation` is the only available
-// judge hook and is not called for entity-only harvests in the placeholder pipeline.
-// ---------------------------------------------------------------------------
 #[test]
 fn relevance_retrieval_unsure_keeps_separate() {
     let (_dir, store) = fresh_store();
 
-    // Capture a first entity to populate the neighbor space.
-    // Entity-only transcript: no decisions, so the placeholder's per-decision judge loop
-    // never fires, leaving judge_call_count at 0.
     let _ = run_capture(
         &store,
         request(
@@ -392,7 +353,7 @@ fn relevance_retrieval_unsure_keeps_separate() {
         relation: DecisionRelationClassification::RefinesExisting,
         ..Default::default()
     };
-    let (_r3, hr3) = run_capture(
+    let (_third_report, hr3) = run_capture(
         &store,
         request(
             "unsure-retrieval-context",
@@ -431,7 +392,7 @@ fn relevance_retrieval_unsure_keeps_separate() {
         "at least one entity must be in the store after two captures"
     );
 
-    // Secondary: structural fill uses zero model calls (now correct in run_capture).
+    // Structural fill makes no model calls.
     assert_eq!(
         harness_report.stage2_model_calls, 0,
         "Stage-2 structural fill must be model-free"
@@ -443,9 +404,9 @@ fn relevance_retrieval_unsure_keeps_separate() {
 // the captured chunk — exactly the matching few by identity, not every active skill and not a
 // different set.
 //
-// Seed ~20 learned skills with varying descriptions, only 2 of which match the chunk; run a REAL
-// capture on that chunk; assert EXACTLY those 2 skills (by id) are in applied_skill_ids. HEAD's
-// run_capture never selects/applies skills (applied_skill_ids stays empty) → RED.
+// Seed ~20 learned skills with varying descriptions, only 2 of which match the chunk. A real
+// capture must record firings for exactly those 2 skills by id. Application reporting additionally
+// requires a persisted effect.
 // ---------------------------------------------------------------------------
 #[test]
 fn skill_selection_retrieves_the_relevant_few_not_the_whole_corpus() {

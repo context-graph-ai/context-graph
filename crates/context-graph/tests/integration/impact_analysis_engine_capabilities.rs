@@ -165,6 +165,7 @@ fn observe(
 // Concurrent observation writers should serialize or surface the engine's typed refusal without torn derived rows.
 #[test]
 fn engine_serializes_concurrent_record_observation_with_typed_error_on_refusal() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, store) = fresh_store();
     let ctx = context(&store, "concurrent-impact");
     let ent = entity(&store, ctx.id, "service");
@@ -223,6 +224,7 @@ fn engine_serializes_concurrent_record_observation_with_typed_error_on_refusal()
 // The cascade cap should be the product's ten-hop boundary, not the engine ceiling.
 #[test]
 fn cg_cascade_depth_cap_below_engine_cap() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let ctx = context(&store, "depth-cap");
     let ent = entity(&store, ctx.id, "root-service");
@@ -271,6 +273,7 @@ fn cg_cascade_depth_cap_below_engine_cap() {
 // A callback write failure should roll back the firing observation rather than leave partial state.
 #[test]
 fn trigger_callback_failure_rolls_back_observation() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (dir, store) = fresh_store();
     let ctx = context(&store, "rollback");
     let ent = entity(&store, ctx.id, "rollback-service");

@@ -926,6 +926,7 @@ fn seed_hnsw_padding(
 
 #[test]
 fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_serialize_per_index() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("distinct-indexes");
     let text_evidence = EvidenceId::new_v7();
     let vision_evidence = EvidenceId::new_v7();
@@ -1066,6 +1067,7 @@ fn engine_probe_named_vector_index_concurrent_writes_distinct_index_refs_seriali
 
 #[test]
 fn engine_probe_named_vector_index_concurrent_writes_same_index_ref_serialize_no_torn_index() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("same-index");
     let first_evidence = EvidenceId::new_v7();
     let second_evidence = EvidenceId::new_v7();
@@ -1145,6 +1147,7 @@ fn engine_probe_named_vector_index_concurrent_writes_same_index_ref_serialize_no
 
 #[test]
 fn engine_probe_immutable_embedding_handle_id_rejects_update_under_contention() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("immutable-handle");
     let evidence_id = EvidenceId::new_v7();
     let handle_id = EmbeddingId::new_v7();
@@ -1227,6 +1230,7 @@ fn engine_probe_immutable_embedding_handle_id_rejects_update_under_contention() 
 
 #[test]
 fn engine_probe_composite_fk_same_context_rejects_cross_context_embedding_handle_write() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("cross-context");
     let target_evidence = EvidenceId::new_v7();
     let target_embedding = EmbeddingId::new_v7();
@@ -1314,6 +1318,7 @@ fn engine_probe_composite_fk_same_context_rejects_cross_context_embedding_handle
 #[test]
 fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_rolls_back_on_partial_failure_under_contention()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let staging_probe = Arc::new(StagedDuplicateHandleProbe::default());
     let plugin: Arc<dyn DatabasePlugin> = staging_probe.clone();
     let fixture = fixture_with_plugin("atomic-rollback", Some(plugin));
@@ -1617,6 +1622,7 @@ fn engine_probe_atomic_multi_row_write_observation_evidence_snapshot_handle_roll
 
 #[test]
 fn engine_probe_evidence_unique_context_id_id_constraint_rejects_duplicate_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("duplicate-evidence");
     let evidence_id = EvidenceId::new_v7();
     let seed = record_text_embedding(
@@ -1711,6 +1717,7 @@ fn engine_probe_evidence_unique_context_id_id_constraint_rejects_duplicate_inser
 
 #[test]
 fn reindex_space_via_database_insert_vector_does_not_fire_observation_trigger() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-trigger");
     let evidence_id = EvidenceId::new_v7();
     let seed = record_text_embedding(

@@ -1,4 +1,4 @@
-//! RED proofs for incremental event-search edges that are not covered by the ordinary tail case.
+//! Behavior proofs for incremental event-search edges that are not covered by the ordinary tail case.
 
 #![cfg(context_graph_internal_test_support)]
 
@@ -166,7 +166,7 @@ fn draft(key: &str, ordinal: u64, role: EventRenderRole, text: &str) -> EventDra
 
 fn profile() -> EventSearchProfile {
     EventSearchProfile {
-        // The ordinary incremental-tail RED fixture declares these binding renderer limits.
+        // The ordinary incremental-tail regression fixture declares these binding renderer limits.
         target_passage_tokens: NonZeroU32::new(177).expect("nonzero target"),
         hard_passage_tokens: NonZeroU32::new(256).expect("nonzero hard limit"),
         ordinary_overlap_events: NonZeroU32::new(1).expect("nonzero overlap"),

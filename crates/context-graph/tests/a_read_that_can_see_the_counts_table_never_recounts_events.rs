@@ -9,13 +9,7 @@
 //! selection -- measured at roughly 128 ms PER CONTEXT -- and an operator asking what their memory
 //! holds is entitled to a lookup.
 //!
-//! ## The silent path this closes
-//!
-//! A read-only consumer whose declaration leaves the counts table out used to fall through to that
-//! recount without saying so: the same command, the same answer, a hundredfold the cost, and
-//! nothing in the output to tell anyone. It is now refused by the table's own name, which is what
-//! every other undeclared read in this crate does, so a consumer fixes its declaration instead of
-//! silently paying.
+//! A consumer that omits the counts table is refused by table name before any recount.
 //!
 //! ## What is measured
 //!

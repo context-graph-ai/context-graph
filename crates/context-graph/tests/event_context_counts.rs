@@ -707,8 +707,8 @@ fn show_reads_its_source_links_once_through_the_passage_first_index() {
 #[derive(Default)]
 struct InterleaveOnPurge {
     armed: AtomicBool,
-    /// Also release at the DELETE that retired the count row outside the purge, for the race that
-    /// only exists while such a DELETE is issued at all.
+    /// Also release at a standalone count-row DELETE, so moving retirement outside the purge
+    /// cannot evade the interleaving.
     release_at_count_row_delete: AtomicBool,
     release: Mutex<Option<Sender<()>>>,
     committed: Mutex<Option<Receiver<()>>>,
@@ -719,8 +719,7 @@ struct InterleaveOnPurge {
 
 impl DatabasePlugin for InterleaveOnPurge {
     fn on_query(&self, sql: &str) -> contextdb_core::Result<()> {
-        // Whichever the forget reaches first: its purge, or — while the count row was still
-        // retired outside the purge — the DELETE that retired it, right after it was read.
+        // Whichever the forget reaches first: its purge or a standalone count-row DELETE.
         let at_release_point = sql.trim_start().starts_with("PURGE FROM")
             || (self.release_at_count_row_delete.load(Ordering::SeqCst)
                 && sql.contains("DELETE FROM")

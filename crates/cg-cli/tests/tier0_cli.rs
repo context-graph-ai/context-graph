@@ -1,4 +1,4 @@
-//! CLI acceptance tests for WP1 tier-0 deterministic capture.
+//! CLI acceptance tests for  model-free deterministic capture.
 //!
 //! `cg record` / `cg import` are the deterministic, free front door: zero model calls even when a
 //! model is connected, an honest zero-cost estimate, a purge command (`cg forget`), and `cg status`
@@ -39,7 +39,7 @@ fn record_default_is_tier0_zero_model_calls() {
         json.pointer("/receipt/model_calls")
             .and_then(JsonValue::as_u64),
         Some(0),
-        "tier-0 record makes zero model calls"
+        "model-free record makes zero model calls"
     );
     assert_eq!(
         json.pointer("/receipt/cost_usd")

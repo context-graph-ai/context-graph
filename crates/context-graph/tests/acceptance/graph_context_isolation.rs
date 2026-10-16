@@ -306,10 +306,8 @@ fn graph_operations_respect_context_isolation() {
         );
     }
 
-    // Strength gate: the stub returns empty collections. To guarantee a real
-    // implementation surfaces *something* for the A side (not just any empty
-    // vec that trivially passes the disjoint check), bind known-A content
-    // to a lower-bound assertion here.
+    // The A side must return known content, so empty collections cannot satisfy the disjointness
+    // check without exercising traversal.
     let a_surfaced = !trav.nodes.is_empty() && !chain.is_empty() && !nb.entities.is_empty();
     assert!(
         a_surfaced,

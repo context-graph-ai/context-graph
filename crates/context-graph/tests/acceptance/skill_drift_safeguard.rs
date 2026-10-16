@@ -2,13 +2,8 @@
 //
 // All four tests are store-state tests: they read persisted rows from
 // cg_skill_firing_trace / cg_learned_skills and assert the right-vs-wrong
-// DISTINCTION. Placeholders use bare integer counters (fire_right/fire_wrong)
-// and check_drift always returns None, list_drift_alerts returns empty.
-//
-// Placeholder behaviors:
-//   - record_firing_label: does nothing (no row update)
-//   - check_drift: always returns None
-//   - list_drift_alerts: always returns empty
+// distinction. Firing labels persist per trace, and drift detection exposes
+// alerts for deteriorating skill records.
 
 use std::collections::HashMap;
 
@@ -165,8 +160,8 @@ fn load_traces_for_skill(store: &Store, skill_id: &str) -> Vec<FiringTrace> {
         .collect()
 }
 
-// Test 1 (store-state): placeholder record_firing does not persist a row;
-// record_firing_label does nothing; check_drift returns None even when wrong fires accumulate.
+// Firing traces and their correctness labels persist per skill; accumulated
+// wrong firings produce a drift alert.
 #[test]
 fn per_skill_right_vs_wrong_record_exists_not_a_bare_fire_count() {
     let (_dir, store) = fresh_store();
@@ -226,7 +221,6 @@ fn per_skill_right_vs_wrong_record_exists_not_a_bare_fire_count() {
         "five wrong traces must be in the wrong-only set"
     );
 
-    // Wrong traces should trigger a drift alert — placeholder returns None.
     let alert_wrong = check_drift(&bad_skill, &wrong_traces);
     assert!(
         alert_wrong.is_some(),
@@ -234,11 +228,6 @@ fn per_skill_right_vs_wrong_record_exists_not_a_bare_fire_count() {
     );
 }
 
-// Test 2 (store-state): placeholder record_firing_label does nothing (no row update).
-// A placeholder that tallies a bare counter without per-firing attribution fails when we
-// swap which capture is wrong. After calling record_firing_label, the persisted trace rows
-// must reflect the labels; the placeholder leaves them all NULL → right_count=0,
-// wrong_count=0 → assertion fails.
 #[test]
 fn skill_fires_on_two_captures_with_opposite_correct_labels_attributes_one_right_one_wrong() {
     let (_dir, store) = fresh_store();
@@ -250,22 +239,19 @@ fn skill_fires_on_two_captures_with_opposite_correct_labels_attributes_one_right
     insert_firing_trace(&store, firing_p_id, "sk-attr", "cap-p", None);
     insert_firing_trace(&store, firing_q_id, "sk-attr", "cap-q", None);
 
-    // Label P as correct, Q as wrong via the API (placeholder: does nothing).
     record_firing_label(&store, firing_p_id, true);
     record_firing_label(&store, firing_q_id, false);
 
     let right_count = count_trace_with_correct(&store, "sk-attr", Some(true));
     let wrong_count = count_trace_with_correct(&store, "sk-attr", Some(false));
 
-    // Placeholder: record_firing_label does nothing → both rows stay NULL-correct
-    // → right_count=0, wrong_count=0 → assertion fails.
     assert_eq!(
         right_count, 1,
-        "exactly one trace must be attributed as correct (P) after record_firing_label; wrong stub does nothing → got {right_count}"
+        "exactly one trace must be attributed as correct (P) after record_firing_label; got {right_count}"
     );
     assert_eq!(
         wrong_count, 1,
-        "exactly one trace must be attributed as wrong (Q) after record_firing_label; wrong stub does nothing → got {wrong_count}"
+        "exactly one trace must be attributed as wrong (Q) after record_firing_label; got {wrong_count}"
     );
 
     // Swap: re-label P as wrong and Q as correct.
@@ -338,8 +324,8 @@ fn count_trace_correct_value(store: &Store, firing_id: &str) -> Option<bool> {
     })
 }
 
-// Test 3 (store-state): placeholder check_drift returns None, list_drift_alerts returns
-// empty, alert re-fires every call, healthy co-resident skill is spuriously alerted.
+// A deteriorating skill record produces one persisted alert for either provenance;
+// repeated checks do not re-emit it or alert on a healthy co-resident skill.
 #[test]
 fn skill_whose_record_turns_bad_is_flagged_once_for_any_provenance() {
     for provenance_str in &["human-authored", "llm-authored"] {
@@ -393,7 +379,6 @@ fn skill_whose_record_turns_bad_is_flagged_once_for_any_provenance() {
 
         // check_drift for the target must return Some(DriftAlert).
         let target_alert = check_drift(&bad_skill, &bad_traces);
-        // Placeholder returns None → assertion fails.
         assert!(
             target_alert.is_some(),
             "bad-record skill must trigger a drift alert (provenance={provenance_str}); check_drift returned None"
@@ -432,8 +417,6 @@ fn skill_whose_record_turns_bad_is_flagged_once_for_any_provenance() {
             );
         }
 
-        // list_drift_alerts must surface exactly one alert for sk-target (deduped).
-        // Placeholder returns empty → assertion fails.
         let all_alerts = list_drift_alerts(&store).expect("read succeeds");
         let target_alerts: Vec<_> = all_alerts
             .iter()
@@ -456,9 +439,7 @@ fn skill_whose_record_turns_bad_is_flagged_once_for_any_provenance() {
     }
 }
 
-// Test 4 (store-state): placeholder check_drift returns None → no alert is raised, so
-// the assertion that the skill remains active (not auto-disabled) cannot be reached.
-// Load-bearing: AFTER a drift alert, the skill is still active (an alert only informs).
+// A drift alert informs the caller while the skill remains active.
 #[test]
 fn drift_alert_never_auto_disables_the_skill() {
     let (_dir, store) = fresh_store();
@@ -480,7 +461,6 @@ fn drift_alert_never_auto_disables_the_skill() {
 
     // Trigger the drift alert.
     let alert = check_drift(&bad_skill, &traces);
-    // Placeholder returns None → this assertion fails.
     assert!(
         alert.is_some(),
         "bad-record skill must produce a drift alert before testing no-auto-disable"
@@ -529,7 +509,7 @@ fn drift_alert_never_auto_disables_the_skill() {
 /// Insert a skill whose description matches the drift tests' capture chunk AND whose rule carries
 /// a real, derivable retype effect (the fold-seam withhold contract excludes an effect-less row
 /// from applying/firing regardless of matching strategy — a placeholder non-retype rule string
-/// would now be withheld, not fired, defeating these firing/drift tests' whole point).
+/// is withheld, not fired, defeating these firing/drift tests' whole point).
 fn insert_matching_skill(store: &Store, id: &str, description: &str) {
     let db = store.sync_database();
     db.execute(
@@ -554,11 +534,11 @@ fn insert_matching_skill(store: &Store, id: &str, description: &str) {
     .expect("insert matching skill");
 }
 
-// NEW (Surface H): drift's real input is capture-recorded firings. When a promoted skill applies
+// Capture-recorded drift input: drift's real input is capture-recorded firings. When a promoted skill applies
 // during a REAL capture, a `cg_skill_firing_trace` row must be recorded for that skill+capture (on
 // the capture path, not hand-inserted); a later wrong-label correction then makes `list_drift_alerts`
-// — reading the CAPTURE-produced traces — surface it. HEAD's run_capture applies no skills and
-// records no firing → both arms fail (honest RED).
+// — reading the CAPTURE-produced traces — surface it. an incorrect implementation's run_capture applies no skills and
+// records no firing → both arms fail (honest regression).
 #[test]
 fn skill_application_records_a_firing_trace_on_the_capture_path() {
     use context_graph::harness::{CaptureHarnessConfig, run_capture};
@@ -584,7 +564,7 @@ fn skill_application_records_a_firing_trace_on_the_capture_path() {
                     .to_string(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("capture where the skill applies");
@@ -595,14 +575,14 @@ fn skill_application_records_a_firing_trace_on_the_capture_path() {
             .applied_skill_ids
             .iter()
             .any(|id| id == "sk-fires"),
-        "the matching skill must apply on the live capture; HEAD applies no skills (applied={:?})",
+        "the matching skill must apply on the live capture; an implementation that applies no skills (applied={:?})",
         harness_report.applied_skill_ids
     );
     let traces = load_traces_for_skill(&store, "sk-fires");
     assert!(
         !traces.is_empty(),
         "a cg_skill_firing_trace row must be recorded on the capture path for the applied skill; \
-         HEAD's run_capture records none (it sets applied_skill_ids but never records a firing)"
+         an incorrect implementation's run_capture records none (it sets applied_skill_ids but never records a firing)"
     );
 
     // A wrong-label correction against that capture-produced firing must let drift surface it.

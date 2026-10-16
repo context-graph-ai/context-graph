@@ -1,4 +1,4 @@
-//! RED proof that an ordinary append extends the ready generation by replacing only its open tail.
+//! Behavior proofs that an ordinary append extends the ready generation by replacing only its open tail.
 
 #![cfg(context_graph_internal_test_support)]
 
@@ -25,7 +25,7 @@ const SOURCE: &str = "event-search-incremental-tail-source";
 const SESSION: &str = "event-search-incremental-tail-session";
 const SPACE: &str = "event-search-incremental-tail-768";
 
-/// This is the adopted renderer's non-scalar prepared-token shape: five model tokens plus two
+/// The fixture renderer has a non-scalar prepared-token shape: five model tokens plus two
 /// prepared tokens per Unicode scalar. The profile below is the valid ordinary grouping profile.
 struct TailEmbedder {
     embedded_documents: Mutex<Vec<String>>,
@@ -315,7 +315,7 @@ fn ready_generation_reuses_closed_passage_and_replaces_only_the_open_tail() {
     assert_eq!(
         initial.len(),
         2,
-        "the adopted grouping has one closed passage and one open tail"
+        "the fixture grouping has one closed passage and one open tail"
     );
     let closed = initial[0].clone();
     let tail = initial[1].clone();

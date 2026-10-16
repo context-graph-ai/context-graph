@@ -13,19 +13,17 @@ members = [
 ]
 
 [workspace.package]
+keywords = ["agent-memory", "knowledge-graph", "embeddings", "claude-code", "local-first"]
+categories = ["database", "command-line-utilities"]
 version = "0.1.0"
 authors = ["John Cyriac <lucidprogrammer@hotmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/context-graph-ai/context-graph"
 description = "Agentic memory graph — Intention-centric ontology, contextdb-backed"
 
-# CI's dev/test builds link a single huge dependency graph (contextdb-engine,
-# iroh, candle, tokenizers) into each test/bench binary; full debug info on
-# every crate in that graph (the cargo default) has been observed to exhaust
-# ubuntu-latest GitHub Actions runner disk mid-link, crashing the linker with
-# SIGBUS ("ld terminated with signal 7"). line-tables-only keeps file:line
-# backtraces while dropping the bulky per-generic-instantiation type debug
-# info that dominates the size of this workspace's debug builds.
+# Dev/test builds link contextdb-engine, iroh, candle and tokenizers into each
+# test/bench binary. line-tables-only keeps file:line backtraces while limiting
+# per-generic-instantiation debug info to fit CI runner disk capacity.
 [profile.dev]
 debug = "line-tables-only"
 

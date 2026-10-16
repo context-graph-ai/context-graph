@@ -34,12 +34,9 @@
 //!
 //! ## Why a projection rather than the substrate's own value
 //!
-//! An earlier draft of this file argued the opposite — that carrying contextdb's `ReaderBreadcrumb`
-//! straight through was what made "nothing is dropped" provable. Review overturned it, and rightly:
-//! this crate's adapter projects Context Graph results, and putting a substrate struct in a public
-//! `CgError` variant makes every consumer's build depend on the vocabulary this crate exists to
-//! absorb — the same reason `StoreLocked` carries a plain pid and path rather than contextdb's
-//! detail struct. Nothing is dropped for a structural reason instead: the conversion destructures
+//! This crate's adapter projects Context Graph results. A public `CgError` variant carries this
+//! crate's own reader identity, so consumers build against its vocabulary, just as `StoreLocked`
+//! carries a plain pid and path. The conversion preserves every field structurally: it destructures
 //! `ReaderBreadcrumb` EXHAUSTIVELY, so a field added upstream breaks the build rather than going
 //! quietly missing. What this file pins is the other half of that guarantee — that every field
 //! which exists today arrives with its value intact.
@@ -67,7 +64,7 @@ const BUSY_STORE_PATH: &str = "/data/cg/memory.db";
 const OBSERVED_READERS: u64 = 2;
 
 /// The reader contextdb could verify, in the substrate's own vocabulary. This is the value the
-/// projection is measured against.
+/// projection is measured with.
 fn verified_breadcrumb() -> ReaderBreadcrumb {
     ReaderBreadcrumb {
         process_id: 4242,

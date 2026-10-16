@@ -1,4 +1,4 @@
-//! Fabric first-light — duplicate delivery, claim races, and exactly-once guarantees.
+//! Fabric  — duplicate delivery, claim races, and exactly-once guarantees.
 //!
 //! Result exactly-once lives in `work_results` (worker side); apply exactly-once lives in the
 //! retained write-once completion marker (owner side). Keeping them separate is what lets execution
@@ -17,13 +17,14 @@ const SESSION: &str = "User: Goal G1: resume across machines. Assistant: Decisio
 
 #[test]
 fn applying_same_result_twice_is_a_noop() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("apply_twice");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
-    let ctx = context_id(&node.store, "daily-loop").expect("context");
+    let ctx = context_id(&node.store, "capture").expect("context");
 
     let extractor = CountingExtractor::new();
     let first = fabric::apply_result(&node.store, "job-1", &extractor).expect("apply once");
@@ -48,15 +49,16 @@ fn applying_same_result_twice_is_a_noop() {
 
 #[test]
 fn recapturing_identical_content_creates_no_duplicate_job() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("recapture_dedup");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("first capture");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("identical recapture");
 
@@ -69,13 +71,14 @@ fn recapturing_identical_content_creates_no_duplicate_job() {
 
 #[tokio::test]
 async fn result_arriving_after_local_execution_does_not_duplicate() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("late_result");
     fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture");
-    let ctx = context_id(&node.store, "daily-loop").expect("context");
+    let ctx = context_id(&node.store, "capture").expect("context");
 
     let extractor = CountingExtractor::new();
     let drained = fabric::drain_local_worker(&node.store, &extractor, "local-node", None)
@@ -99,10 +102,11 @@ async fn result_arriving_after_local_execution_does_not_duplicate() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_workers_racing_one_claim_each() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("two_workers_race").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on edge1");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -145,12 +149,13 @@ async fn two_workers_racing_one_claim_each() {
 }
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn worker_crash_mid_job_lease_expires_then_second_attempt_succeeds() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("crash_lease").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on edge1");
     push_then_pull(&fixture.edge1_client, &fixture.edge2_client).await;
@@ -184,7 +189,7 @@ async fn worker_crash_mid_job_lease_expires_then_second_attempt_succeeds() {
     );
 
     push_then_pull(&fixture.edge2_client, &fixture.edge1_client).await;
-    let ctx = context_id(&fixture.edge1.store, "daily-loop").expect("context");
+    let ctx = context_id(&fixture.edge1.store, "capture").expect("context");
     let statuses =
         fabric::job_statuses(&fixture.edge1.store, ctx, after_lease + 10).expect("statuses");
     assert!(
@@ -197,11 +202,12 @@ async fn worker_crash_mid_job_lease_expires_then_second_attempt_succeeds() {
 
 #[tokio::test]
 async fn offline_drained_job_not_reclaimed_remotely_after_reconnect() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("offline_reconnect").await;
     // Edge1 captures and drains its own job while offline (no sync yet).
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on edge1");
     let ext1 = CountingExtractor::new();
@@ -237,12 +243,13 @@ async fn offline_drained_job_not_reclaimed_remotely_after_reconnect() {
 }
 
 #[tokio::test]
-#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; quarantined under DL-CG-17"]
+#[ignore = "hangs rather than fails: the test never returns, so the runner stops it at its terminate-after; tracked in the project issue list"]
 async fn work_tables_are_append_only_no_update() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture("append_only").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on edge1");
     assert_eq!(

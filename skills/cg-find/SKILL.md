@@ -1,49 +1,61 @@
 ---
 name: cg-find
-description: Search imported Claude Code history for stored passages behind a question or decision.
+description: Find stored conversation passages.
 ---
-<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
 
 # Find conversation passages
 
-## Prerequisites
+## Prerequisite
 
-Install `cg` from the repository README and capture history using [cg-import](../cg-import/SKILL.md).
-Install the search model with `cg model fetch --defaults`, then run the original import with
-`--search wait`; find itself never indexes.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `missing_nomic_artifact_blocks_background_and_wait_without_download_while_defer_skips_preflight` -->
+Install `cg`.
+
+Import history with `cg import <project-directory> --context <name> --search wait`.
 
 ## Recipe
 
-1. Run `cg find "your question"` in the bound project, or pass `--context NAME` explicitly.
-2. To search a wider authorized scope, use `--context app,infra` or `--all-contexts`.
-3. Read `hits[].text` as source passages, then cite `context_name` and `passage_id`.
-4. Expand a hit with `cg show <passage-id>` using the same Context selection.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
+1. Run `cg find "<query>" --context <name>`.
 
-Find ranks across the selected Context set. It reports omitted unready Contexts rather than treating
-their missing coverage as a complete search. Its shared coverage reads do not multiply with the
-number of selected Contexts.<!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `a_find_over_ready_contexts_issues_the_same_statements_at_one_eight_and_sixty_four` -->
+2. Use `cg find "<query>" --context app,infra` for multiple Contexts.
 
-## Reproducible missing-store example
+3. Pass a result to `cg show <passage-id> --context <name>`.
 
-This POSIX-shell/Python 3 example opens a fresh data root with no store. The command exits 1;
-its JSON says `store_not_found` instead of inventing results. The final command prints that asserted
-state. Use the numbered recipe above for an existing imported store.<!-- enforced by: `cg_status_is_read_only_uses_project_binding_or_explicit_context_set_and_returns_store_not_found_without_creating_either` -->
+## Installed-binary example
 
+Install `cg` and Python 3; use a POSIX shell.
+
+Use the synthetic session below in a disposable data root.
+
+Set `CG_MODEL_CACHE_ROOT` before changing `HOME`.
+
+<!-- smoke: skill -->
 ```sh
-cg_read_example=$(mktemp -d)
-CG_DATA_ROOT="$cg_read_example/data" cg find anything --format json > "$cg_read_example/read.json" || test "$?" -eq 1
-python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$cg_read_example/read.json"
+export CG_MODEL_CACHE_ROOT="${CG_MODEL_CACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/cg/models}"
+cg_example=$(mktemp -d)
+export HOME="$cg_example/home"
+mkdir -p "$HOME"
+export CG_DATA_ROOT="$cg_example/data"
+cat > "$cg_example/session.jsonl" <<'JSONL'
+{"type":"user","uuid":"00000000-0000-4000-8000-000000000001","sessionId":"example-auth","timestamp":"2026-09-01T09:00:00Z","message":{"role":"user","content":"Where is the authentication module?"}}
+{"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","sessionId":"example-auth","timestamp":"2026-09-01T09:01:00Z","message":{"role":"assistant","content":"The authentication module moved from src/auth.py to src/authentication.py."}}
+JSONL
+cg import "$cg_example/session.jsonl" --context example-auth --search wait > "$cg_example/import.json"
+cg find "where did authentication move?" --context example-auth --format json > "$cg_example/find.json"
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hits"][0]["text"])' "$cg_example/find.json"
 ```
 
-Exact final stdout:
+### Example output
 
 ```text
-store_not_found
+User [author="user"]: Where is the authentication module?
+Assistant [author="assistant"]: The authentication module moved from src/auth.py to src/authentication.py.
 ```
 
 ## Failure to handle
 
-`history_search_not_ready` (exit 1) means captured history needs search work; follow its retry or
-inspect status. `no_matching_history` (exit 0) is a successful empty result. An unknown explicit
-Context refuses the selection instead of silently dropping it. Reads use `ConsumerReader` and leave
-the store untouched even while another process writes it.<!-- enforced by: `find_in_a_context_with_no_imported_history_answers_no_matching_history`, `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets`, `the_read_only_commands_answer_an_idle_store_and_a_held_one_without_changing_a_byte` -->
+Find on pending search returns `history_search_not_ready`. <!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
+
+Find leaves pending search pending. <!-- enforced by: `event_history_journey_with_real_nomic_imports_finds_shows_and_forgets` -->
+
+Retry import with `--search wait`, then repeat find.
+
+See [CLI reference](../../docs/cli.md) and [configuration](../../docs/configuration.md).

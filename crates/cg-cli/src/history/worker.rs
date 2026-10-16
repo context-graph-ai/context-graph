@@ -311,8 +311,7 @@ fn publish_embedding_worker_policy(
                 request.refusal_superseded = true;
             }
         }
-        // The new accepted token supplies the wake previously carried by completed ordinary
-        // requests. Keep every unfinished request and every unretired saved ceiling.
+        // The accepted token supplies the wake for completed ordinary selections.
         write_requests.retain(|request| {
             !request.completed
                 || !request.selection_retired

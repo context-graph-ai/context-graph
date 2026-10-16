@@ -1,5 +1,5 @@
-//! Projection correctness under interruption and concurrent readers (intent "Projection
-//! recovery" and the incremental-tail snapshot contract).
+//! Projection preserves committed work and incremental-tail snapshots across interruption
+//! and concurrent reads.
 //!
 //! The standalone runner releases its Store around rendering and embedding, so the embedder hooks
 //! below act at real claim boundaries: one simulates a worker killed after a committed passage

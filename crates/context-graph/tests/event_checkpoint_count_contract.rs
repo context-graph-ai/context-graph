@@ -1,4 +1,4 @@
-//! Reproduction of source-checkpoint watermarks diverging from unique event rows.
+//! Source checkpoints track progress independently of unique event counts.
 //!
 //! The fixture uses only the public append and import APIs. SQL opens the database only after the
 //! Store is dropped, to inspect the persisted rows that those APIs produced.

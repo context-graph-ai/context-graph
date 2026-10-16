@@ -7,12 +7,7 @@
 //! provider (the on-PATH fake `claude`) for BOTH the binary run and the library run — no Rust double
 //! for one side and a fake provider for the other.
 //!
-//! These assert the intended end state, so they fail against the current binary: today `cg
-//! record`/`import` run the CLI's own extractor pipeline instead of routing through the library
-//! capture entry point, and the item-action verbs (`fix`/`drop`/`group`/`undo`/`skills`) and the
-//! review render of the five message kinds do not exist on the binary yet. Every test fails on an
-//! `assert!`/`assert_eq!`, never on a spawn-panic or a compile error: each binary invocation is
-//! allowed to return a non-zero exit, and the library entry points exist today.
+//! CLI actions use the library capture, review, grouping and correction contracts.
 
 mod support;
 
@@ -229,9 +224,7 @@ fn extraction_harness() -> CliHarness {
 // `run_capture` fed the identical model output — proving the CLI is a thin caller of the library
 // harness, not a parallel pipeline.
 //
-// RED against HEAD 7925b6d: `cg record` runs its own ConnectedModelExtractor pipeline (main.rs),
-// NOT `run_capture`, so the CLI-produced graph differs from the library-produced graph fed the same
-// fake-provider output → the equality assertion fails.
+// `cg record` delegates to `run_capture`; identical provider output produces identical stored graphs.
 // ---------------------------------------------------------------------------
 #[test]
 fn cli_capture_is_a_thin_caller_of_the_library_harness() {
@@ -278,11 +271,7 @@ fn cli_capture_is_a_thin_caller_of_the_library_harness() {
          (the CLI is a thin caller); CLI={cli_graph:?} library={lib_graph:?}"
     );
 
-    // LOAD-BEARING discriminator: a CLI that is a thin caller of `run_capture` surfaces the
-    // library `CaptureHarnessReport` on its receipt (it has one to surface). The current binary runs
-    // its OWN ConnectedModelExtractor pipeline (main.rs:208) and never produces a CaptureHarnessReport,
-    // so its receipt carries none of the harness-report fields → RED. We require at least one
-    // harness-report marker that only the run_capture path produces.
+    // The CLI receipt includes a report marker produced by the library capture path.
     let receipt: serde_json::Value =
         serde_json::from_str(&record.stdout).expect("cg record must emit a JSON receipt");
     let has_harness_marker = ["context_id_source", "harness", "stage3_resolution_verdicts"]
@@ -296,17 +285,11 @@ fn cli_capture_is_a_thin_caller_of_the_library_harness() {
         has_harness_marker,
         "the CLI capture receipt must surface a run_capture CaptureHarnessReport marker (e.g. \
          context_id_source / stage3_resolution_verdicts), proving the CLI routes through the library \
-         harness; the current binary runs its own ConnectedModelExtractor and emits none. \
-         receipt keys: {:?}",
+         harness; receipt keys: {:?}",
         receipt.as_object().map(|o| o.keys().collect::<Vec<_>>())
     );
 
-    // SINGLE-SOURCE PROMPT: the prompt the CLI actually sent the model must DERIVE FROM the library
-    // single-source schema descriptor, not a hand-written one. Capture the outgoing prompt via the
-    // fake-provider seam and assert it contains the descriptor's rendered schema block (and the
-    // descriptor-only tokens the hand-written CLI prompt omits: the full entity-vocab line and the
-    // `outcomes` field). The CLI's `ConnectedModelExtractor` builds a hand-written
-    // `structured_capture_prompt` (no `outcomes` key, a 5-value entity subset) → RED.
+    // The outgoing prompt includes the library descriptor schema, entity vocabulary and outcomes.
     let sent_prompt = harness
         .providers
         .last_completion_prompt()
@@ -318,26 +301,22 @@ fn cli_capture_is_a_thin_caller_of_the_library_harness() {
     assert!(
         sent_prompt.contains(&rendered_block),
         "the CLI `record` prompt must DERIVE FROM the library single-source descriptor — it must \
-         contain the descriptor's rendered schema block; the CLI sent a hand-written prompt instead.\n\
+         contain the descriptor's rendered schema block.\n\
          --- descriptor rendered block ---\n{rendered_block}\n--- CLI sent prompt ---\n{sent_prompt}"
     );
     assert!(
         sent_prompt.contains("named things referenced, each typed as one of:"),
         "the CLI prompt must carry the descriptor's full entity-vocab line (from allowed_entity_types), \
-         not a hand-written entity-type subset; CLI sent: {sent_prompt}"
+         with every allowed entity type; CLI sent: {sent_prompt}"
     );
     assert!(
         sent_prompt.contains("results recorded for a decision"),
-        "the CLI prompt must carry the descriptor's `outcomes` field description; the hand-written CLI \
-         prompt has no outcomes key; CLI sent: {sent_prompt}"
+        "the CLI prompt must carry the descriptor's `outcomes` field description; CLI sent: {sent_prompt}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// the five message kinds are produced by the library seam, and the ACTUAL `cg`
-// binary renders exactly those five (no sixth, none the library did not emit). The library half is
-// reachable today; the CLI render of the review/skill/grouping/drift kinds is NOT (those surfaces
-// have no binary verbs yet), so the CLI-render assertion is honest-RED.
+// The binary renders exactly the five message kinds emitted by the library seam.
 // ---------------------------------------------------------------------------
 #[test]
 fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
@@ -361,17 +340,14 @@ fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
         );
     }
 
-    // CLI render of SPECIFIC seeded content (not static category labels): produce a real capture
-    // receipt and SEED each of the 4 non-receipt conditions into the STORE with KNOWN content — a
-    // review item, a grouping proposal, a skill card, a drift alert. Then `cg review` must render the
-    // SPECIFIC seeded content for each. HEAD has no `cg review` content surface → RED.
+    // Review renders the seeded receipt, review item, grouping proposal, skill card and drift alert.
     let harness = extraction_harness();
     let record = harness.run_with_stdin(&["record", "--understand-now"], PARITY_TRANSCRIPT);
     let (store, _ctx) = open_recorded_store(&record.stdout);
 
     // KNOWN, unique content strings the CLI must echo back for each kind. The grouping name is a
-    // distinctive STORE-DERIVED value — deliberately NOT the impl's hardcoded UX sample — so a render
-    // that fabricates a fixed sample name instead of echoing the store fails.
+    // distinctive STORE-DERIVED value, so a render that fabricates a fixed sample name instead of
+    // echoing the store fails.
     const REVIEW_ITEM_CONTENT: &str = "uncertain-marker-zorptangle";
     const GROUPING_CONTENT: &str = "grouping-store-derived-thunderquill";
     const SKILL_CONTENT: &str = "skillcard-marker-quibblenacht";
@@ -387,7 +363,7 @@ fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
     );
 
     // Seed a skill card plus a drifting skill. Drift must come from a real firing-trace row, not
-    // the legacy aggregate counters on the skill row.
+    // the aggregate counters on the skill row.
     let db = store.sync_database();
     db.execute(
         "INSERT INTO cg_learned_skills (id, description, rule, provenance, active, held_for_review, fire_right, fire_wrong, created_at) VALUES ($id, $description, $rule, $provenance, $active, $held_for_review, $fire_right, $fire_wrong, $created_at)",
@@ -484,10 +460,7 @@ fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
          '{GROUPING_CONTENT}'; got: {rendered}"
     );
 
-    // ...AND every grouping name the CLI renders must be backed by a real store row — the render must
-    // not fabricate a fixed UX sample. Gather the store-derived grouping names (grouping-link overlay
-    // values + per-intention catalog ids) and assert every rendered `grouping proposed:` line is one
-    // of them. The impl appends a hardcoded sample with no store backing → RED.
+    // Every rendered grouping name is backed by a grouping link or intention catalog id.
     let store2 = open_recorded_store(&record.stdout).0;
     let store_grouping_names: Vec<String> = {
         let db2 = store2.sync_database();
@@ -549,10 +522,8 @@ fn five_message_kinds_emitted_at_one_library_seam_cli_only_renders() {
 // verb rejected, while existing retrieval/capture commands stay valid (additive, not a closed
 // namespace).
 //
-// RED against HEAD 7925b6d: `cg fix/drop/group/undo/skills` do not exist as binary verbs, so each
-// invocation returns a non-zero "unknown command" exit → the per-verb "honored" assertions fail.
-// (The library `parse_verb` half is asserted too, and an unknown verb / existing `cg query` are
-// checked so the action verbs are shown additive.)
+// The binary honors each action with a stored effect, rejects an unknown verb, and keeps
+// `cg query` available. The library action parser recognizes the same action vocabulary.
 // ---------------------------------------------------------------------------
 #[test]
 fn six_verbs_are_the_whole_action_surface() {
@@ -575,26 +546,25 @@ fn six_verbs_are_the_whole_action_surface() {
 
     // REAL store-effect assertions (a verb that exits 0 but no-ops fails too).
 
-    // drop: after `cg drop @1`, `cg query` must EXCLUDE the dropped item. HEAD has no `drop` verb, so
+    // drop: after `cg drop @1`, `cg query` must EXCLUDE the dropped item. an implementation without `drop` verb, so
     // the drop has no effect and the dropped content still appears in query → the exclusion fails.
     let _drop = harness.run(&["drop", "@1"]);
     let query_after_drop = harness.run(&["query", "ingest"]);
     let q = format!("{}\n{}", query_after_drop.stdout, query_after_drop.stderr).to_lowercase();
     assert!(
         !q.contains("ingest"),
-        "after `cg drop @1`, `cg query` must EXCLUDE the dropped item; HEAD has no drop verb so it \
+        "after `cg drop @1`, `cg query` must EXCLUDE the dropped item; an implementation without drop verb so it \
          still appears: {q}"
     );
 
-    // fix: after `cg fix @1 <val>`, the read view must show the changed value. HEAD has no `fix` verb,
-    // so the read view is unchanged → the changed-value assertion fails.
+    // After `cg fix @1 <val>`, the read view shows the corrected value.
     let _fix = harness.run(&["fix", "@1", "renamed-ingest-path"]);
     let query_after_fix = harness.run(&["query", "ingest"]);
     let qf = format!("{}\n{}", query_after_fix.stdout, query_after_fix.stderr).to_lowercase();
     assert!(
         qf.contains("renamed-ingest-path"),
-        "after `cg fix @1 renamed-ingest-path`, the read view must show the corrected value; HEAD has \
-         no fix verb so the read view is unchanged: {qf}"
+        "after `cg fix @1 renamed-ingest-path`, the read view must show renamed-ingest-path; \
+         observed read view: {qf}"
     );
 
     // group confirm LINKS intentions under the named canonical entry (the three-distinct-effects
@@ -619,8 +589,7 @@ fn six_verbs_are_the_whole_action_surface() {
     let status = harness.run(&["status"]);
     assert_eq!(
         status.code, 0,
-        "an existing command (`cg status`) must still be accepted — the action verbs did not close \
-         the CLI namespace; stderr: {}",
+        "an existing command (`cg status`) must be accepted alongside the action verbs; stderr: {}",
         status.stderr
     );
 }
@@ -641,12 +610,10 @@ fn rendered_grouping_names(harness: &CliHarness) -> Vec<String> {
 //   - `cg group ok <name1>`   LINKS the intentions under name1.
 //   - `cg group rename <name2>` RETITLES: intentions grouped under name2, and name1 is GONE.
 //   - `cg group no`           leaves the intentions UNGROUPED (neither name linked).
-// RED today: `parse_group_action` returns Confirm for every arg, so `rename` re-links (name1 stays
-// alongside name2 → not a retitle) and `no` links under a default catalog (→ not ungrouped). Each
-// sub-action runs on its own fresh capture so state does not accumulate across them.
+// Each sub-action runs on a fresh capture so state cannot accumulate between actions.
 #[test]
 fn group_sub_actions_have_three_distinct_store_effects() {
-    // The marker the impl always appends as a UX sample — not a real store grouping; filter it out.
+    // Exclude the fixed sample marker when comparing store-derived grouping names.
     fn store_derived(names: &[String], marker: &str) -> Vec<String> {
         names
             .iter()
@@ -680,7 +647,7 @@ fn group_sub_actions_have_three_distinct_store_effects() {
     assert!(
         rn_names.iter().all(|n| !n.contains("beta-old-uniquename")),
         "group rename must RETITLE — the old name 'beta-old-uniquename' must be GONE, not kept \
-         alongside the new one. HEAD routes rename through Confirm (re-links, never retitles), so the \
+         alongside the new one. an implementation that routes rename through Confirm (re-links, never retitles), so the \
          old name survives. rendered: {rn_names:?}"
     );
 
@@ -694,7 +661,7 @@ fn group_sub_actions_have_three_distinct_store_effects() {
             && store_derived(&no_names, "gamma").is_empty()
             && store_derived(&no_names, "grouped-canonical").is_empty(),
         "group no (reject) must leave the intentions UNGROUPED — no store-derived grouping link must \
-         exist. HEAD routes reject through Confirm (links under a default catalog), so a grouping \
+         exist. an implementation that routes reject through Confirm (links under a default catalog), so a grouping \
          persists. rendered: {no_names:?}"
     );
 }
@@ -750,10 +717,7 @@ fn recorded_context_name(record_stdout: &str) -> String {
         .to_string()
 }
 
-// NEW (Surface L): through the real `cg` binary, `cg record` with only `--tenant-id` (no `--context`)
-// run from two DIFFERENT working directories must land both captures in the SAME tenant context —
-// the CLI default is the tenant, never a cwd-hash. HEAD hashes cwd into the default context
-// (`memory_context_label`), so the two cwds produce two different contexts → RED.
+// With only --tenant-id, captures from two working directories share the same tenant context.
 #[test]
 fn cg_record_default_context_is_tenant_not_cwd_hash() {
     let harness = extraction_harness();
@@ -788,9 +752,7 @@ fn cg_record_default_context_is_tenant_not_cwd_hash() {
         rec_b.stderr
     );
 
-    // Both captures must land in the SAME context, and that context must be the TENANT ("founder"),
-    // never a cwd-hash and never the generic "default". HEAD does not thread --tenant-id into the
-    // record capture context (it falls back to "default"), so the tenant-context assertion fails (RED).
+    // Both captures use the tenant ("founder") as their context, independent of working directory.
     let ctx_a = recorded_context_name(&rec_a.stdout);
     let ctx_b = recorded_context_name(&rec_b.stdout);
     assert_eq!(
@@ -801,15 +763,11 @@ fn cg_record_default_context_is_tenant_not_cwd_hash() {
     assert_eq!(
         ctx_a, "founder",
         "the default capture context for `cg record --tenant-id founder` must be the TENANT \
-         ('founder'), never the generic 'default' and never a cwd-hash; HEAD falls back to {ctx_a:?}"
+         ('founder'), never the generic 'default' and never a cwd-hash; an implementation that falls back to {ctx_a:?}"
     );
 }
 
-// `cg why @<item>` must resolve the item through the corrected library seam
-// (`legal_types_for_flagged_item` → `legal_vocab_for_pending_item`): it enumerates the legal type
-// list ONLY for a genuinely-flagged closed-vocab item, and returns nothing-of-the-sort for a
-// non-flagged / unknown item. RED today: `handle_why` is a stub that returns the full 13-type list
-// for ANY handle, ignoring the item and bypassing the library seam — so the non-flagged arm fails.
+// `cg why` resolves the flagged item and returns its legal vocabulary only for a closed field.
 #[test]
 fn cg_why_resolves_the_flagged_item_through_the_library_seam() {
     let harness = extraction_harness();
@@ -873,16 +831,13 @@ fn cg_why_resolves_the_flagged_item_through_the_library_seam() {
         why_flagged.stderr
     );
 
-    // NON-FLAGGED arm (the discriminator): `cg why <unknown id>` resolves to no flagged closed-vocab
-    // item (the library seam returns None), so the CLI must NOT enumerate the legal type list — it
-    // renders free text / an empty result / a clear "not a flagged closed-vocab item" message. The
-    // stub returns the constant 13-type list regardless of the item → it enumerates the full list → RED.
+    // An unknown id has no flagged closed field, so it must not enumerate the legal type list.
     let why_unknown = harness.run(&["why", "no-such-pending-item-zorptangle"]);
     let unknown_hits = legal_name_hits(&why_unknown, &legal_names);
     assert!(
         unknown_hits < 3,
         "cg why on a NON-flagged / unknown item must NOT enumerate the legal type list (the library \
-         seam returns None for it); the stub returns the constant 13-type list regardless of the item \
+         seam returns None for it); an item-independent constant list is invalid \
          — saw {unknown_hits} legal type names in the output:\n{}\n{}",
         why_unknown.stdout,
         why_unknown.stderr

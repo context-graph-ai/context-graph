@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Gray-zone adjudication (frozen method, criteria 99d99ee): each 0.55-0.75 cosine pair goes to
-the FIXED judge prompt below (temperature 0, hosted). Output: input tsv + verdict column, for
-counting AND for the owner's >=20% spot-check sample. The prompt is frozen for the run: editing
-it invalidates prior adjudications."""
+"""Adjudicate gray-zone cosine pairs (0.55-0.75) with a fixed hosted judge prompt.
+Write the input TSV with a verdict column and a deterministic 20% sample for inspection.
+Changing the prompt invalidates prior adjudications."""
 import json, os, sys, urllib.request, random
 
 JUDGE_MODEL = "anthropic/claude-haiku-4.5"

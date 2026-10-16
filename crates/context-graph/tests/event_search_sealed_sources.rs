@@ -1,4 +1,4 @@
-//! RED proof that an event-search generation consumes only its sealed source membership.
+//! Behavior proofs that an event-search generation consumes only its sealed source membership.
 
 #![cfg(context_graph_internal_test_support)]
 

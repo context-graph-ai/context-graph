@@ -1,4 +1,4 @@
-//! Independent RED contracts for released event interpretation.
+//! Independent regression contracts for released event interpretation.
 //!
 //! Fixture values are authored directly in JSON.  The mapper, preservation validator, and every
 //! expected assertion below deliberately avoid production mapping and hash helpers.

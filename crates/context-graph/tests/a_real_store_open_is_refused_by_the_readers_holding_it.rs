@@ -1,14 +1,8 @@
 //! A REAL `Store::open` refused by live direct readers must come back as the busy condition,
 //! carrying the readers it was actually refused by.
 //!
-//! ## Why this file exists at all
-//!
-//! The busy condition already has two companion files: one pins what the value IS
-//! (`a_writer_held_off_by_hydrating_readers_is_told_so_by_type.rs`) and one pins what an operator
-//! READS (`a_busy_store_never_reads_as_an_unexplained_engine_failure.rs`). Both build the value
-//! themselves. Nothing anywhere drove a real `Store::open` into it, so every one of those
-//! assertions would keep passing on a build where the conversion never fires and a busy store still
-//! comes back as an unexplained engine failure — the exact defect the variant was added to end.
+//! Companion tests cover the typed condition and its operator rendering. This file exercises
+//! the conversion through a real `Store::open` refused by live readers.
 //!
 //! ## The contract this file proves
 //!
@@ -31,10 +25,9 @@
 //!
 //! Direct-reader contention exists only WHILE a committed image is being loaded: a read session
 //! that has finished hydrating holds nothing a writer must wait for. So an in-process read session
-//! cannot produce it, and an earlier attempt to build this coverage that way proved exactly that —
-//! the writer open succeeded. contextdb reproduces the condition the only way it can be
-//! reproduced: a second PROCESS caught inside hydration. This file drives that same production
-//! path through contextdb's shipped hydration checkpoint (`test-seams`), which parks the reader
+//! cannot produce it. A second process is parked inside hydration through the shipped
+//! hydration checkpoint (`test-seams`), after its breadcrumb is published and its read lock is held.
+//! The reader prints the identity it
 //! after its breadcrumb is published and its read lock is held, and prints the identity it
 //! published. The refusing writer is a third process, so it observes the readers exactly as a
 //! separate context-graph client does.

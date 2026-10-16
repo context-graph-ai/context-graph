@@ -285,7 +285,7 @@ pub(super) fn validate_present_consumer_tables(
 /// or `Ok(())` when they agree.
 ///
 /// The declaration is read with contextdb's own parser — the same parse the
-/// engine runs on it — and compared against the table's persisted `TableMeta`.
+/// engine runs on it — and compared with the table's persisted `TableMeta`.
 ///
 /// **Compared:** the column list, in order, by name, type, nullability (a primary
 /// key is `NOT NULL` whether or not the declaration repeats it, as the engine
@@ -921,9 +921,8 @@ mod the_event_tables_declare_the_counts_their_reads_ask_for {
     };
     use contextdb_engine::Database;
 
-    /// The events declaration with its maintained-count clause taken off — what a store built
-    /// before this schema declared one holds. Greenfield: such a store is moved aside and
-    /// recreated, and this is the comparison that has to say so rather than run on it silently.
+    /// The events declaration without its required maintained-count clause. Such a store must be
+    /// moved aside and recreated; this comparison refuses to use the incomplete declaration silently.
     pub(super) fn without_the_clause(ddl: &str) -> String {
         let (head, clause) = ddl
             .split_once(" MAINTAIN COUNT ")

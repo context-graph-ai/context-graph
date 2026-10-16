@@ -859,10 +859,8 @@ impl Embedder for NomicTextEmbedder {
 /// silently embedded as a stored passage is exactly the encoding defect this space exists to
 /// avoid, and a caller who meant one of the two roles is told to say which.
 ///
-/// The space is declared with no table binding yet — its physical passage target
-/// (`event_search_passages.vector_text`) lands in the same change as that table — so registering
-/// it never contends with the text-default space for `evidence.vector_text` or
-/// `digests.vector_text`.
+/// The space binds only `event_search_passages.vector_text`, so registering it never contends
+/// with the text-default space for `evidence.vector_text` or `digests.vector_text`.
 pub struct EventHistoryTextEmbedder {
     model: Arc<NomicTextEmbedder>,
 }

@@ -1,4 +1,4 @@
-//! Fabric first-light — the privacy contract: the sharing switch, per-source opt-out, fail-closed
+//! Fabric  — the privacy contract: the sharing switch, per-source opt-out, fail-closed
 //! unknown ref kinds, cross-tenant isolation, and the never-sync permanent raw store.
 
 use context_graph::fabric::{
@@ -22,9 +22,10 @@ fn sharing_off_config() -> FabricConfig {
 
 #[tokio::test]
 async fn sharing_off_no_input_material_leaves_machine() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("sharing_off_none");
     let config = sharing_off_config();
-    let mut capture = FabricCapture::new(tier0_request("daily-loop", "s1", SESSION));
+    let mut capture = FabricCapture::new(tier0_request("capture", "s1", SESSION));
     capture.config = Some(&config);
     fabric::capture(&node.store, capture).expect("capture");
 
@@ -44,6 +45,7 @@ async fn sharing_off_no_input_material_leaves_machine() {
 
 #[test]
 fn sharing_off_with_stale_ticket_still_never_emits_input() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("sharing_off_ticket");
     let config = FabricConfig {
         hub_endpoint: Some("stale-unreachable-ticket".to_string()),
@@ -51,7 +53,7 @@ fn sharing_off_with_stale_ticket_still_never_emits_input() {
         sharing: false,
         ..Default::default()
     };
-    let mut capture = FabricCapture::new(tier0_request("daily-loop", "s1", SESSION));
+    let mut capture = FabricCapture::new(tier0_request("capture", "s1", SESSION));
     capture.config = Some(&config);
     fabric::capture(&node.store, capture).expect("capture");
 
@@ -69,6 +71,7 @@ fn sharing_off_with_stale_ticket_still_never_emits_input() {
 
 #[test]
 fn no_fabric_toml_is_exactly_single_node_behavior() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("no_fabric_toml");
     assert_eq!(
         FabricConfig::load(&node.data_root()).expect("load fabric config"),
@@ -77,7 +80,7 @@ fn no_fabric_toml_is_exactly_single_node_behavior() {
     );
     let report = fabric::capture(
         &node.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("single-node capture");
     assert!(
@@ -93,6 +96,7 @@ fn no_fabric_toml_is_exactly_single_node_behavior() {
 
 #[test]
 fn per_source_opt_out_keeps_that_sources_input_local_under_sharing_on() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     // Sharing on: a default source's input may move; an opted-out source's input stays local.
     assert_eq!(
         fabric::movement_decision("ledger_input", true, false),
@@ -108,10 +112,11 @@ fn per_source_opt_out_keeps_that_sources_input_local_under_sharing_on() {
 
 #[test]
 fn capture_flag_opt_out_matches_config_opt_out() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     // Flag opt-out on one node; config opt-out on another. Both yield the identical local-only
     // outcome: a submitted job whose input never enters the push set.
     let flag_node = FabricNode::open("optout_flag");
-    let mut flag_capture = FabricCapture::new(tier0_request("daily-loop", "s1", SESSION));
+    let mut flag_capture = FabricCapture::new(tier0_request("capture", "s1", SESSION));
     flag_capture.source_opt_out = true;
     fabric::capture(&flag_node.store, flag_capture).expect("flag capture");
 
@@ -121,7 +126,7 @@ fn capture_flag_opt_out_matches_config_opt_out() {
         ..Default::default()
     };
     let cfg_node = FabricNode::open("optout_config");
-    let mut cfg_capture = FabricCapture::new(tier0_request("daily-loop", "s1", SESSION));
+    let mut cfg_capture = FabricCapture::new(tier0_request("capture", "s1", SESSION));
     cfg_capture.config = Some(&config);
     fabric::capture(&cfg_node.store, cfg_capture).expect("config capture");
 
@@ -140,6 +145,7 @@ fn capture_flag_opt_out_matches_config_opt_out() {
 
 #[test]
 fn unknown_input_reference_kind_fails_closed() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     assert_eq!(
         fabric::movement_decision("some_future_kind", true, false),
         MovementDecision::Refused,
@@ -149,10 +155,11 @@ fn unknown_input_reference_kind_fails_closed() {
 
 #[tokio::test]
 async fn input_copy_scoped_to_tenant_a_rejected_at_apply_on_tenant_b_handle() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture_with_tenants("cross_tenant_reject", "tenant-a", "tenant-b").await;
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on tenant-a edge");
 
@@ -183,7 +190,7 @@ async fn input_copy_scoped_to_tenant_a_rejected_at_apply_on_tenant_b_handle() {
         &config_b,
         1_000,
     );
-    if let Some(ctx_b) = context_id(&fixture.edge2.store, "daily-loop") {
+    if let Some(ctx_b) = context_id(&fixture.edge2.store, "capture") {
         assert_eq!(
             memory_total(&fixture.edge2.store, ctx_b),
             0,
@@ -194,12 +201,13 @@ async fn input_copy_scoped_to_tenant_a_rejected_at_apply_on_tenant_b_handle() {
 
 #[tokio::test]
 async fn default_on_sharing_is_same_tenant_scoped() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fabric_fixture_with_tenants("default_on_tenant", "tenant-a", "tenant-b").await;
     let config = FabricConfig {
         tenant: Some("tenant-a".to_string()),
         ..Default::default()
     };
-    let mut capture = FabricCapture::new(tier0_request("daily-loop", "s1", SESSION));
+    let mut capture = FabricCapture::new(tier0_request("capture", "s1", SESSION));
     capture.config = Some(&config);
     fabric::capture(&fixture.edge1.store, capture).expect("capture on tenant-a edge");
 
@@ -228,6 +236,7 @@ async fn default_on_sharing_is_same_tenant_scoped() {
 
 #[test]
 fn permanent_raw_store_never_syncs() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("permanent_raw_store_never_syncs");
     let raw = node
         .store

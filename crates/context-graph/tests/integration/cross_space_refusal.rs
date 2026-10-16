@@ -127,6 +127,7 @@ fn close_enough(left: f32, right: f32) -> bool {
 /// @invariant 15a
 #[test]
 fn cross_space_cosine_refused_at_query_surface_when_dimensions_match() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store();
     let candidate = seed_evidence(&store, IMAGE_SPACE, EvidenceKind::ImageFrame, axis(512, 0));
     let result = compare_embedding_targets_across_spaces(
@@ -155,6 +156,7 @@ fn cross_space_cosine_refused_at_query_surface_when_dimensions_match() {
 /// @invariant 15a
 #[test]
 fn cross_space_cosine_refused_at_query_surface_when_dimensions_differ() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store();
     let text_candidate = seed_evidence(&store, TEXT_SPACE, EvidenceKind::Text, axis(768, 0));
     let _image_candidate =
@@ -184,12 +186,14 @@ fn cross_space_cosine_refused_at_query_surface_when_dimensions_differ() {
 
 #[test]
 fn composite_vector_search_requires_explicit_fusion_policy_no_default() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui/composite_query_without_fusion_policy.rs");
 }
 
 #[test]
 fn composite_vector_search_keeps_per_clause_scores_when_fusion_policy_provided() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let store = store();
     let text_id = seed_evidence(&store, TEXT_SPACE, EvidenceKind::Text, axis(768, 0));
     let image_id = seed_evidence(&store, IMAGE_SPACE, EvidenceKind::ImageFrame, axis(512, 1));

@@ -17,8 +17,8 @@
 //! every refusal leaves the store, its companion and the directory holding them byte-for-byte as
 //! they were found.
 //!
-//! The door is ADDITIVE: it takes the same consumer declaration and scope labels the other openers
-//! take, and every existing opener keeps creating an absent store exactly as it always has.
+//! The door takes the same consumer declaration and scope labels as create-capable openers,
+//! which create an absent store.
 //!
 //! Every assertion below is about a typed value, a row, or a pathname. Nothing sleeps.
 
@@ -290,8 +290,7 @@ fn a_store_this_process_cannot_look_at_is_refused_as_unreadable_by_the_edit_door
     );
 }
 
-// The door is additive: it refuses the absent store the ordinary opener still creates, so nothing
-// about the openers a consumer already ships changes.
+// The edit door refuses the absent store that the ordinary opener creates.
 #[test]
 fn the_edit_door_refuses_the_absent_store_the_ordinary_opener_still_creates() {
     let directory = tempfile::tempdir().expect("scratch directory");
@@ -309,7 +308,7 @@ fn the_edit_door_refuses_the_absent_store_the_ordinary_opener_still_creates() {
     assert!(!path.exists(), "the refused door created nothing");
 
     let store = Store::open_with_consumer_schema(config(&path), Vec::new(), declared_schema())
-        .expect("the ordinary opener still creates an absent store, exactly as it always has");
+        .expect("the ordinary opener creates an absent store");
     write_setting(&store, "detector_sample_frames", "edge").expect("the first run owns the write");
     assert_eq!(
         vec!["detector_sample_frames".to_string()],

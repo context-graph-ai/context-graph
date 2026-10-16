@@ -73,7 +73,7 @@ fn open_and_drop(path: &Path) {
 }
 
 #[test]
-#[ignore = "contextdb a5f5b3a: owner-read accept thread outlives Store close; upstream gap 8"]
+#[ignore = "contextdb a5f5b3a: owner-read accept thread outlives Store close; the accept thread remains live after close"]
 fn reopening_a_writable_store_keeps_no_threads_or_memory_from_closed_stores() {
     owner_runtime_dir();
     let dir = tempfile::tempdir().expect("store dir");

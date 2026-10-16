@@ -1,6 +1,6 @@
-//! Acceptance tests for WP2 understanding-queue drain accessors.
+//! Acceptance tests for  understanding-queue drain accessors.
 //!
-//! The contract under test: tier-0 capture leaves a durable `pending` understanding-queue row per
+//! The contract under test: model-free capture leaves a durable `pending` understanding-queue row per
 //! digest; a worker drains those rows by PRIORITY (most-touched first, oldest first within equal
 //! touch), claims each atomically so two workers never double-understand the same digest, records a
 //! write-once completion on success, and increments attempts with a terminal cap on model failure.
@@ -16,7 +16,7 @@ use context_graph::{ContextId, DigestId, Store, StoreConfig};
 
 use super::fake_extractor::open_store_with_lexical_embedder;
 
-const CONTEXT: &str = "daily-loop";
+const CONTEXT: &str = "capture";
 
 fn fresh_store(dir: &std::path::Path) -> Store {
     open_store_with_lexical_embedder(StoreConfig {
@@ -36,7 +36,7 @@ fn context_id(store: &Store) -> ContextId {
         .id
 }
 
-/// Capture one short transcript as one tier-0 digest and return its id.
+/// Capture one short transcript as one model-free digest and return its id.
 fn capture_one(store: &Store, session: &str, text: &str) -> DigestId {
     let report = capture_tier0(
         store,
@@ -48,7 +48,7 @@ fn capture_one(store: &Store, session: &str, text: &str) -> DigestId {
             chunk_window: 0,
         },
     )
-    .expect("tier-0 capture");
+    .expect("model-free capture");
     assert_eq!(
         report.digest_ids.len(),
         1,

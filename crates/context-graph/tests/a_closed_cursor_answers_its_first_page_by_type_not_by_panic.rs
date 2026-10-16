@@ -9,16 +9,12 @@
 //!
 //! Closing it and then asking it something is an ordinary mistake — an early return, a retry, a
 //! caller that closed on the way out of one branch and read on the way out of another. Every other
-//! way of asking a closed [`ConsumerCursor`] anything already answers that mistake the same way:
-//! `fetch` after close and `close` after close both come back as a typed [`context_graph::CgError`]
-//! the consumer can match on. `first_page` is the one that unwinds the caller instead.
-//!
-//! That asymmetry is the defect this file pins. A consumer whose whole reason for being on the
-//! read-only door is that it must not damage anything gets its process taken down by a read. The
-//! promise: `first_page` after close answers the SAME typed refusal `fetch` after close answers —
+//! way of asking a closed [`ConsumerCursor`] anything answers that mistake with a typed
+//! [`context_graph::CgError`] the consumer can match on. `first_page` after close answers the
+//! SAME typed refusal `fetch` after close answers —
 //! not a different error, not a panic, and not an empty page that looks like a store with no rows.
 //!
-//! The refusal is compared against `fetch`'s own rather than restated here, so the two cannot
+//! The refusal is compared with `fetch`'s own rather than restated here, so the two cannot
 //! drift into telling a consumer two different things about one closed cursor.
 //!
 //! Every assertion below is about a typed value. Nothing waits on elapsed time and nothing sleeps.
@@ -132,7 +128,7 @@ fn seeded_store(directory: &Path) -> PathBuf {
                 observed_at: Utc::now(),
                 evidence: vec![text_evidence(
                     detection_id,
-                    &format!("vigil-edge://front-door/{index:06}"),
+                    &format!("s3://front-door/{index:06}"),
                 )],
                 observed_properties: BTreeMap::from([("frame_index".to_string(), json!(index))]),
                 state_delta: BTreeMap::new(),

@@ -242,6 +242,7 @@ fn decision_context(store: &Store, decision: DecisionId) -> ContextId {
 
 #[test]
 fn probe_record_observation_observation_and_evidence_visible_atomically() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (context, entity) = seed_context_entity(&seed);
@@ -313,6 +314,7 @@ fn probe_record_observation_observation_and_evidence_visible_atomically() {
 
 #[test]
 fn probe_invalidate_decision_conditional_where_exactly_one_winner_under_4_writer_barrier() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (decision_id, trigger_id) = seed_decision(&seed);
@@ -350,6 +352,7 @@ fn probe_invalidate_decision_conditional_where_exactly_one_winner_under_4_writer
 
 #[test]
 fn probe_evidence_availability_log_concurrent_inserts_get_distinct_monotonic_txids() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (context, entity) = seed_context_entity(&seed);
@@ -409,6 +412,7 @@ fn probe_evidence_availability_log_concurrent_inserts_get_distinct_monotonic_txi
 
 #[test]
 fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (context, entity) = seed_context_entity(&seed);
@@ -521,6 +525,7 @@ fn probe_record_observation_vector_write_atomic_rolls_back_on_validation_error()
 
 #[test]
 fn probe_evidence_derived_from_fk_delete_race_rejects_child_insert() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     drop(Store::open(config.clone()).expect("open"));
     let db = Arc::new(Database::open(&config.db_path).expect("open raw contextdb"));
@@ -593,6 +598,7 @@ fn probe_evidence_derived_from_fk_delete_race_rejects_child_insert() {
 
 #[test]
 fn probe_record_observation_concurrent_same_entity_appends_immutable_chain() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (context, entity) = seed_context_entity(&seed);
@@ -638,6 +644,7 @@ fn probe_record_observation_concurrent_same_entity_appends_immutable_chain() {
 
 #[test]
 fn probe_basis_diff_under_concurrent_writer_returns_mvcc_consistent_horizon() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (decision_id, observation_id) = seed_decision(&seed);
@@ -735,6 +742,7 @@ fn probe_basis_diff_under_concurrent_writer_returns_mvcc_consistent_horizon() {
 
 #[test]
 fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurrent_writers() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (context, entity) = seed_context_entity(&seed);
@@ -828,6 +836,7 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
 
 #[test]
 fn probe_extra_embedding_space_concurrent_idempotent_seed_collapses_to_one_row() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let barrier = Arc::new(Barrier::new(4));
     let handles: Vec<_> = (0..4)
@@ -858,6 +867,7 @@ fn probe_extra_embedding_space_concurrent_idempotent_seed_collapses_to_one_row()
 
 #[test]
 fn probe_decisions_pk_update_concurrent_writers_collapse_to_one_visible_row() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (_dir, config) = shared_config();
     let seed = Store::open(config.clone()).expect("open");
     let (decision_id, _) = seed_decision(&seed);

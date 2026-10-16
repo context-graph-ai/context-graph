@@ -65,7 +65,7 @@ fn image_evidence_ref(observation_id: ObservationId, evidence_id: EvidenceId) ->
         observation_id,
         context_id: ContextId::default(),
         kind: EvidenceKind::ImageFrame,
-        source_ref: "vigil-edge://camera-7/frame/42".to_string(),
+        source_ref: "s3://camera-7/frame/42".to_string(),
         mime_type: Some("image/jpeg".to_string()),
         content_hash: Some(
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
@@ -76,7 +76,7 @@ fn image_evidence_ref(observation_id: ObservationId, evidence_id: EvidenceId) ->
         frame_index: Some(42),
         region: Some(serde_json::json!({"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4})),
         producer: EvidenceProducer {
-            system: "vigil-edge".to_string(),
+            system: "s3".to_string(),
             model_name: "yolov8s".to_string(),
             model_version: "0.42.1".to_string(),
             pipeline_version: "1.7".to_string(),
@@ -1114,7 +1114,7 @@ fn record_observation_image_evidence_lands_in_vector_vision_hnsw_index_queryable
 }
 
 #[test]
-fn record_observation_vigil_edge_camera_frame_atomic_observation_evidence_snapshot_embedding_one_tx()
+fn record_observation_camera_source_camera_frame_atomic_observation_evidence_snapshot_embedding_one_tx()
  {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StoreConfig {
@@ -5024,7 +5024,7 @@ fn store_open_file_uri_accepted_only_when_file_uri_allowed_true() {
 }
 
 #[test]
-fn store_open_vigil_edge_s3_gs_azure_cas_webhook_schemes_accepted_unconditionally() {
+fn store_open_camera_source_s3_gs_azure_cas_webhook_schemes_accepted_unconditionally() {
     let schemes = [
         "vigil-edge://camera/1",
         "s3://bucket/key",
@@ -5409,7 +5409,7 @@ fn create_digest_with_dimension_mismatch_rejected_with_embedding_space_mismatch_
 }
 
 #[test]
-fn record_observation_vigil_edge_multi_camera_evidence_each_carries_distinct_region_and_frame_index_routes_to_vision_index()
+fn record_observation_camera_source_multi_camera_evidence_each_carries_distinct_region_and_frame_index_routes_to_vision_index()
  {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = StoreConfig {
@@ -5421,15 +5421,15 @@ fn record_observation_vigil_edge_multi_camera_evidence_each_carries_distinct_reg
     let first = EvidenceId::new_v7();
     let second = EvidenceId::new_v7();
     let mut cam_1 = image_evidence_ref(observation_id, first);
-    cam_1.source_ref = "vigil-edge://camera-1/frame/17".to_string();
+    cam_1.source_ref = "s3://camera-1/frame/17".to_string();
     cam_1.frame_index = Some(17);
     cam_1.region = Some(serde_json::json!({"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}));
-    cam_1.producer.system = "vigil-edge-cam-1".to_string();
+    cam_1.producer.system = "s3-cam-1".to_string();
     let mut cam_3 = image_evidence_ref(observation_id, second);
-    cam_3.source_ref = "vigil-edge://camera-3/frame/42".to_string();
+    cam_3.source_ref = "s3://camera-3/frame/42".to_string();
     cam_3.frame_index = Some(42);
     cam_3.region = Some(serde_json::json!({"x": 0.5, "y": 0.6, "w": 0.2, "h": 0.2}));
-    cam_3.producer.system = "vigil-edge-cam-3".to_string();
+    cam_3.producer.system = "s3-cam-3".to_string();
     let context_id = ContextId::new_v7();
     set_evidence_context(std::slice::from_mut(&mut cam_1), context_id);
     set_evidence_context(std::slice::from_mut(&mut cam_3), context_id);
@@ -5486,12 +5486,12 @@ fn record_observation_vigil_edge_multi_camera_evidence_each_carries_distinct_reg
         vec![first, second]
     );
     assert_eq!(returned[0], cam_1);
-    assert_eq!(returned[0].source_ref, "vigil-edge://camera-1/frame/17");
+    assert_eq!(returned[0].source_ref, "s3://camera-1/frame/17");
     assert_eq!(returned[0].region, cam_1.region);
     assert_eq!(returned[0].frame_index, Some(17));
     assert_eq!(returned[0].producer, cam_1.producer);
     assert_eq!(returned[1], cam_3);
-    assert_eq!(returned[1].source_ref, "vigil-edge://camera-3/frame/42");
+    assert_eq!(returned[1].source_ref, "s3://camera-3/frame/42");
     assert_eq!(returned[1].region, cam_3.region);
     assert_eq!(returned[1].frame_index, Some(42));
     assert_eq!(returned[1].producer, cam_3.producer);

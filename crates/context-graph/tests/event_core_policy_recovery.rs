@@ -1,4 +1,4 @@
-//! RED contracts for restoring an adapter, ordering opaque source positions,
+//! regression contracts for restoring an adapter, ordering opaque source positions,
 //! and publishing the authenticated tenant schema.
 //!
 //! Each fixture drives the public Store and ContextDB enrollment doors. The

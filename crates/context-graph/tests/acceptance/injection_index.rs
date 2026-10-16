@@ -1,4 +1,4 @@
-//! Acceptance tests for the invalidation-aware injection index (the daily-loop injection surface's
+//! Acceptance tests for the invalidation-aware injection index (the capture injection surface's
 //! library half) and the retrieval-touch counter it drives.
 //!
 //! The index is a pure function over `DigestSearchHit`s: it must keep structured (graph-anchored)
@@ -115,7 +115,7 @@ fn verbatim_lines_are_marked_and_carry_query_pointers_not_transcripts() {
     let rendered = index.render();
     assert!(
         rendered.to_lowercase().contains("verbatim"),
-        "the render marks the verbatim tier honestly: {rendered}"
+        "the render marks the verbatim results honestly: {rendered}"
     );
     assert!(
         rendered.contains(&query_pointer(verbatim.digest_id)),
@@ -277,7 +277,7 @@ fn observation_only_hits_count_as_structured() {
         0.10,
         "webhook worker observed at src/webhook.rs",
     );
-    // Similarity is far below the verbatim threshold, yet the structured tier ignores that gate.
+    // Similarity is far below the verbatim threshold, yet the structured results ignores that gate.
     let index = build_injection_index(&[hit], INJECTION_TOKEN_BUDGET);
     assert_eq!(index.structured_count, 1);
     assert_eq!(index.verbatim_count, 0);

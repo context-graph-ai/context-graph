@@ -50,7 +50,7 @@ fn run_repository_capture_with_skills(
             transcript: repository_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig {
             skills_enabled,
             ..CaptureHarnessConfig::default()
@@ -129,7 +129,7 @@ struct GenericSummaryRollingExtractor;
 
 impl ConversationExtractor for GenericSummaryRollingExtractor {
     fn extract(&self, request: ExtractionRequest<'_>) -> context_graph::Result<StructuredHarvest> {
-        let mut harvest = super::refactor_extractor::span_faithful_harvest(request.transcript);
+        let mut harvest = super::action_test_extractors::span_faithful_harvest(request.transcript);
         if !harvest.goals.is_empty()
             || !harvest.entities.is_empty()
             || !harvest.decisions.is_empty()
@@ -300,7 +300,7 @@ fn record_conversation_with_extractor_applies_earned_skill_and_records_firing() 
             transcript: repository_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
     )
     .expect("library import capture must succeed");
 
@@ -384,7 +384,7 @@ fn llm_authored_skill_stays_in_learned_scope_and_drift_alert_does_not_disable() 
             .join("\n"),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("out-of-scope capture must succeed");
@@ -410,7 +410,7 @@ fn llm_authored_skill_stays_in_learned_scope_and_drift_alert_does_not_disable() 
             transcript: repository_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("in-scope capture must succeed");

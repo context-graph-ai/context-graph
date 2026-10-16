@@ -1,9 +1,5 @@
 // Learned-skill store and SKILL.md parser tests.
 //
-// Store-state tests: fail under a HashMap because assertions read persisted rows
-// from the real cg_learned_skills / cg_teaching_events tables. The placeholder
-// implementations in skill_store.rs return empty lists, None, or wrong provenance.
-//
 // Pure-logic tests: assert the SKILL.md parse/export contract — no store.
 
 use std::collections::HashMap;
@@ -93,7 +89,6 @@ fn retype_effect(entity_name: &str, from_type: &str, to_type: &str) -> SkillEffe
     }
 }
 
-// Test 1 (store-state): reads persisted rows; the placeholder returns an empty list.
 #[test]
 fn learned_skill_is_inspectable_skill_md_shaped_row_with_provenance() {
     let (_dir, store) = fresh_store();
@@ -115,7 +110,6 @@ fn learned_skill_is_inspectable_skill_md_shaped_row_with_provenance() {
         );
     }
 
-    // The placeholder returns empty — this assertion fails.
     let skills = list_skills_in_store(&store).expect("read succeeds");
     assert_eq!(
         skills.len(),
@@ -225,7 +219,7 @@ fn pre_extraction_strategy_is_not_silently_applied_by_post_harvest_retype() {
             transcript: transcript.to_string(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("capture with pre-extraction skill must still succeed");
@@ -240,7 +234,7 @@ fn pre_extraction_strategy_is_not_silently_applied_by_post_harvest_retype() {
     );
 }
 
-// RED (fold-seam withhold contract): a stored row whose apply_strategy is a string this build does
+// regression (fold-seam withhold contract): a stored row whose apply_strategy is a string this build does
 // not implement (as an older edge would see after syncing a newer edge's rule) must never be
 // coerced to an implemented strategy, must never apply, must never be counted in
 // `applied_skill_ids`, and must surface as a named diagnostic on the capture harness report so
@@ -285,7 +279,7 @@ fn unknown_apply_strategy_is_withheld_not_applied_and_surfaces_diagnostic() {
             transcript: transcript.to_string(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("capture must succeed even though the matching rule carries an unsupported strategy");
@@ -318,7 +312,6 @@ fn unknown_apply_strategy_is_withheld_not_applied_and_surfaces_diagnostic() {
     );
 }
 
-// Test 2 (store-state): the placeholder apply_correction returns teaching_event = None.
 #[test]
 fn a_correction_is_a_label_not_a_skill() {
     let (_dir, store) = fresh_store();
@@ -330,7 +323,6 @@ fn a_correction_is_a_label_not_a_skill() {
     // The correction should report as applied.
     assert!(result.applied, "correction must report as applied");
 
-    // A teaching event must have been logged — the placeholder returns None.
     assert!(
         result.teaching_event.is_some(),
         "a correction must log a teaching event; teaching_event was None"
@@ -362,7 +354,6 @@ fn a_correction_is_a_label_not_a_skill() {
     );
 }
 
-// Test 5 (pure-logic): the placeholder parse_human_authored_skill accepts any non-empty content.
 #[test]
 fn human_authored_skill_bypasses_promotion_gate_parses_only() {
     // A well-formed SKILL.md shaped file.
@@ -386,7 +377,6 @@ fn human_authored_skill_bypasses_promotion_gate_parses_only() {
     // A malformed file (missing required sections).
     let malformed = "not a skill file at all @@@";
     let bad = parse_human_authored_skill(malformed);
-    // The placeholder accepts any non-empty content.
     assert!(
         !bad.accepted,
         "a malformed skill file must be rejected with a parse error"
@@ -406,9 +396,6 @@ fn human_authored_skill_bypasses_promotion_gate_parses_only() {
     );
 }
 
-// Test 6 (pure-logic): the placeholder parse_human_authored_skill uses the raw first line
-// (including the `#` prefix) as the description. The real implementation strips the
-// `# description:` header to extract a clean description.
 #[test]
 fn human_authored_skill_whose_rule_would_fail_heldout_is_still_accepted() {
     let would_fail_gate = "# description: always classify as code_reference\n## rule\nwhen true → classify as code_reference\n";
@@ -426,9 +413,6 @@ fn human_authored_skill_whose_rule_would_fail_heldout_is_still_accepted() {
         "human-authored provenance must be set without running the promotion gate"
     );
 
-    // The SKILL.md parser must extract the clean description (without the `# description:` header).
-    // The placeholder uses `content.lines().next()` → description starts with `#`.
-    // This assertion fails because the placeholder does not strip the header.
     assert!(
         !skill.description.starts_with('#'),
         "description must be extracted cleanly from the `# description:` header, not include the `#`; got: {:?}",
@@ -445,9 +429,6 @@ fn human_authored_skill_whose_rule_would_fail_heldout_is_still_accepted() {
     );
 }
 
-// Test 7 (pure-logic): the placeholder export_skill returns "# Skill: {desc}\n## Rule\n..."
-// which is not SKILL.md-shaped. The correct export uses "# description: {desc}" as the first
-// header and omits the "## Provenance" section (provenance is reconstructed on re-add).
 #[test]
 fn exported_edited_skill_pushed_back_becomes_human_authored() {
     let original = llm_authored_skill("sk-export", "detect technology_choice decisions");
@@ -458,16 +439,12 @@ fn exported_edited_skill_pushed_back_becomes_human_authored() {
         "exported skill must produce non-empty text"
     );
 
-    // The exported SKILL.md must start with the `# description:` header (not `# Skill:`).
-    // The placeholder emits "# Skill: ...".
     assert!(
         exported.starts_with("# description:"),
-        "exported skill must start with `# description:` header; placeholder uses `# Skill:`; got: {:?}",
+        "exported skill must start with `# description:` header; got: {:?}",
         exported.lines().next().unwrap_or("")
     );
 
-    // A real SKILL.md does not embed a `## Provenance` section.
-    // The placeholder emits `## Provenance\n{prov:?}`.
     assert!(
         !exported.contains("## Provenance"),
         "exported skill must not embed a `## Provenance` section; provenance is reconstructed on re-add"
@@ -487,12 +464,8 @@ fn exported_edited_skill_pushed_back_becomes_human_authored() {
     );
 }
 
-// RED (receipt honesty): "applied" must mean
-// an actual persisted effect. A promoted skill that MATCHES the chunk but whose harvest contains
-// nothing its retype can touch (extraction yielded no such entity) must NOT be reported in
-// applied_skill_ids — the receipt was claiming an effect that never landed, so the follow-up
-// "is the entity now a Repository?" check found no entity at all. The firing trace may keep the
-// fired-without-effect record; the RECEIPT must tell the truth.
+// A receipt lists a skill as applied only when its retype effect touches a harvested entity.
+// Firing without an effect may remain in the trace but is excluded from applied_skill_ids.
 #[test]
 fn matched_but_effectless_skill_is_not_reported_applied() {
     use context_graph::harness::{CaptureHarnessConfig, run_capture};
@@ -519,7 +492,7 @@ fn matched_but_effectless_skill_is_not_reported_applied() {
             transcript: transcript.to_string(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("capture with a matched-but-effectless skill must still succeed");
@@ -535,9 +508,6 @@ fn matched_but_effectless_skill_is_not_reported_applied() {
 // captured result, with no approval step. The proof is a DIFF against a no-skill baseline capture
 // of the same transcript: the two results must differ exactly by the skill's effect.
 //
-// SCAFFOLD STUB the test fails on: run_capture does not read skills at all (applied_skill_ids is
-// hardcoded empty and no skill ever changes a captured value), so the with-skill and no-skill
-// captures are identical and applied_skill_ids stays empty → both assertions fail (RED).
 #[test]
 fn promoted_skill_auto_applies_when_description_matches_no_approval_click() {
     use context_graph::harness::{CaptureHarnessConfig, run_capture};
@@ -556,7 +526,7 @@ fn promoted_skill_auto_applies_when_description_matches_no_approval_click() {
     let (_br, baseline_hr) = run_capture(
         &baseline_store,
         req("baseline-ctx"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("baseline capture");
@@ -577,7 +547,7 @@ fn promoted_skill_auto_applies_when_description_matches_no_approval_click() {
     let (_sr, skill_hr) = run_capture(
         &skill_store,
         req("skill-ctx"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("with-skill capture");
@@ -587,14 +557,13 @@ fn promoted_skill_auto_applies_when_description_matches_no_approval_click() {
     assert!(
         skill_hr.applied_skill_ids.iter().any(|id| id == "sk-auto"),
         "the promoted matching skill must auto-apply (appear in applied_skill_ids) with no approval \
-         step; wrong stub leaves applied_skill_ids empty, got {:?}",
+         step; got {:?}",
         skill_hr.applied_skill_ids
     );
     // The captured RESULT must differ from the no-skill baseline by exactly the skill's effect.
     assert_ne!(
         with_skill_type, baseline_type,
-        "a promoted matching skill must change the captured result vs a no-skill baseline; \
-         wrong stub ignores skills on the capture path so both captures are identical \
+        "a promoted matching skill must change the captured result vs a no-skill baseline \
          (baseline={baseline_type:?}, with_skill={with_skill_type:?})"
     );
     // The no-skill baseline must NOT have applied any skill.
@@ -614,7 +583,6 @@ fn entity_type_named(store: &Store, name_fragment: &str) -> Option<context_graph
         .map(|e| e.entity_type)
 }
 
-// Test 9 (store-state): the placeholder list_skills_in_store returns empty.
 #[test]
 fn learned_skill_is_visible_via_skills_listing() {
     let (_dir, store) = fresh_store();
@@ -632,7 +600,6 @@ fn learned_skill_is_visible_via_skills_listing() {
     }
 
     let skills = list_skills_in_store(&store).expect("read succeeds");
-    // The placeholder returns empty.
     assert_eq!(
         skills.len(),
         3,
@@ -653,8 +620,6 @@ fn learned_skill_is_visible_via_skills_listing() {
 // skills ON the skill's effect must be present; with skills OFF the same matching capture must NOT
 // show the effect; ON again restores it.
 //
-// SCAFFOLD STUB the test fails on: run_capture never applies skills (no skill-application seam), so
-// the effect is absent even with skills ON → the "effect present with skills ON" assertion fails.
 #[test]
 fn skills_off_master_switch_stops_application_capture_still_works() {
     use context_graph::harness::{CaptureHarnessConfig, run_capture};
@@ -684,7 +649,7 @@ fn skills_off_master_switch_stops_application_capture_still_works() {
     run_capture(
         &baseline_store,
         req("switch-baseline"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("baseline capture");
@@ -695,7 +660,7 @@ fn skills_off_master_switch_stops_application_capture_still_works() {
     let (_on_r, on_hr) = run_capture(
         &store,
         req("switch-on-ctx"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig {
             skills_enabled: true,
             ..Default::default()
@@ -705,8 +670,8 @@ fn skills_off_master_switch_stops_application_capture_still_works() {
     let on_type = entity_type_named(&store, "context-graph");
     assert_ne!(
         on_type, baseline_type,
-        "with skills ON, the matching skill must apply and change the captured result vs baseline; \
-         wrong stub never applies skills (on={on_type:?}, baseline={baseline_type:?})"
+        "with skills ON, the matching skill must apply and change the captured result vs baseline \
+         (on={on_type:?}, baseline={baseline_type:?})"
     );
     assert!(
         on_hr.applied_skill_ids.iter().any(|id| id == "sk-switch"),
@@ -718,7 +683,7 @@ fn skills_off_master_switch_stops_application_capture_still_works() {
     let (off_report, off_hr) = run_capture(
         &store,
         req("switch-off-ctx"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig {
             skills_enabled: false,
             ..Default::default()
@@ -745,7 +710,7 @@ fn skills_off_master_switch_stops_application_capture_still_works() {
     let (_on2_r, on2_hr) = run_capture(
         &store,
         req("switch-on-again-ctx"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig {
             skills_enabled: true,
             ..Default::default()
@@ -784,8 +749,8 @@ fn entity_type_named_in(
 // LIVE PATH: the review-hold gate must gate the actual capture path. With `cg skills review` OFF
 // (default), a freshly promoted matching skill auto-applies on a REAL capture; with it ON, a newly
 // promoted skill is HELD (does NOT apply on the live capture) until acknowledged, while the
-// promotion is still recorded. HEAD's run_capture applies no skills at all → the baseline and
-// post-acknowledge "effect present" arms fail (honest RED).
+// promotion is still recorded. an incorrect implementation's run_capture applies no skills at all → the baseline and
+// post-acknowledge "effect present" arms fail (honest regression).
 #[test]
 fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
     use context_graph::harness::{CaptureHarnessConfig, run_capture};
@@ -804,7 +769,7 @@ fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
     run_capture(
         &baseline_store,
         req("review-baseline"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("baseline capture");
@@ -825,7 +790,7 @@ fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
     let (_ro, off_hr) = run_capture(
         &store_off,
         req("review-off-ctx"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig {
             review_mode: false,
             ..Default::default()
@@ -836,7 +801,7 @@ fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
     assert_ne!(
         off_type, baseline_type,
         "with `cg skills review` OFF, a promoted matching skill must auto-apply on the live capture \
-         (effect differs from the no-skill baseline); HEAD applies no skills (off={off_type:?}, \
+         (effect differs from the no-skill baseline); an implementation that applies no skills (off={off_type:?}, \
          baseline={baseline_type:?})"
     );
     assert!(
@@ -871,7 +836,7 @@ fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
     let (_rh, held_hr) = run_capture(
         &store_on,
         req("review-held-ctx"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig {
             review_mode: true,
             ..Default::default()
@@ -894,7 +859,7 @@ fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
     let (_ra, ack_hr) = run_capture(
         &store_on,
         req("review-ack-ctx"),
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig {
             review_mode: true,
             ..Default::default()
@@ -905,7 +870,7 @@ fn cg_skills_review_on_holds_a_freshly_promoted_skill_until_acknowledged() {
     assert_ne!(
         ack_type, baseline_type,
         "after acknowledgement, the skill must apply on a subsequent live capture (effect differs \
-         from baseline); HEAD applies no skills (ack={ack_type:?}, baseline={baseline_type:?})"
+         from baseline); an implementation that applies no skills (ack={ack_type:?}, baseline={baseline_type:?})"
     );
     assert!(
         ack_hr

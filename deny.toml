@@ -36,8 +36,8 @@ allow = [
     "MIT",
     "Unicode-3.0",
     "Zlib",
-    # Public-domain-equivalent; entered the graph via the dial-by-key sync
-    # transport's wasm-target deps (ws_stream_wasm family) — never compiled
+    # Public-domain-equivalent; the dial-by-key sync transport's wasm-target
+    # dependencies (ws_stream_wasm family) require it — never compiled
     # for shipped targets.
     "Unlicense",
 ]

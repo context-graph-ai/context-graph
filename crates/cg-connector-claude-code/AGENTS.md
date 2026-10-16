@@ -24,6 +24,8 @@ consumer read route directly, and no embedding trait.
 
 ## Invariants and guarding tests
 
+Ownership boundaries above are review-only architectural constraints unless a guard below covers them.
+
 Test paths below are relative to this crate.
 
 | Invariant | Guard (file and test) |
@@ -39,7 +41,7 @@ Test paths below are relative to this crate.
 
 These architectural constraints require code review; the tests above do not mechanically enforce
 them. When changing a mapping, advance the adapter or anchor declaration version and leave stored
-events unchanged. Author synthetic fixtures; do not copy owner transcripts, machine paths or private
+events unchanged. Author synthetic fixtures; do not copy personal transcripts, machine paths or private
 labels into fixtures, defaults or constants. Treat retained `source_remainder` as data; do not derive
 new mapping vocabulary, event kinds or repair rules from it.
 

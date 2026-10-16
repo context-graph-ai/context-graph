@@ -274,6 +274,7 @@ fn cross_context_handle_insert_rejected(
 
 #[test]
 fn precomputed_embedding_zero_length_vector_rejected_with_typed_empty_vector_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("zero-vector");
     let result = record(
         &fixture,
@@ -287,6 +288,7 @@ fn precomputed_embedding_zero_length_vector_rejected_with_typed_empty_vector_err
 
 #[test]
 fn precomputed_embedding_with_nan_or_inf_floats_rejected_at_record_observation() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     for (case, actual, value) in [
         ("nan", "NaN", f32::NAN),
         ("inf", "inf", f32::INFINITY),
@@ -323,6 +325,7 @@ fn precomputed_embedding_with_nan_or_inf_floats_rejected_at_record_observation()
 
 #[test]
 fn precomputed_embedding_target_evidence_in_different_context_rejected_at_record_observation() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("cross-context-source");
     let target_evidence_id = EvidenceId::new_v7();
     let inserted = record(
@@ -395,6 +398,7 @@ fn precomputed_embedding_target_evidence_in_different_context_rejected_at_record
 
 #[test]
 fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reserved-producer");
     let evidence_id = EvidenceId::new_v7();
     let mut input = embedding(text_vector(0), EmbeddingTarget::Evidence(evidence_id));
@@ -573,6 +577,7 @@ fn precomputed_embedding_caller_supplied_reserved_producer_system_tag_rejected()
 
 #[test]
 fn embedding_handle_id_update_attempt_rejected_with_typed_immutable_error_single_thread() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("immutable-handle");
     let evidence_id = EvidenceId::new_v7();
     let evidence_embedding_id = EmbeddingId::new_v7();
@@ -690,6 +695,7 @@ fn embedding_handle_id_update_attempt_rejected_with_typed_immutable_error_single
 #[test]
 fn embedding_target_routing_evidence_variant_writes_to_evidence_vector_column_digest_variant_writes_to_digest_vector_column()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("target-routing");
     let evidence_id = EvidenceId::new_v7();
     let evidence_embedding_id = EmbeddingId::new_v7();
@@ -814,6 +820,7 @@ fn embedding_target_routing_evidence_variant_writes_to_evidence_vector_column_di
 
 #[test]
 fn producer_metadata_model_name_persists_full_string_up_to_documented_max() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("producer-long-name");
     let long_name = "encoder-".repeat(31);
     let embedding_id = EmbeddingId::new_v7();
@@ -848,6 +855,7 @@ fn producer_metadata_model_name_persists_full_string_up_to_documented_max() {
 
 #[test]
 fn producer_metadata_field_exceeding_max_rejected_at_record_observation() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     for field in ["model_name", "model_version", "pipeline_version"] {
         let fixture = fixture(&format!("producer-too-long-{field}"));
         let evidence_id = EvidenceId::new_v7();

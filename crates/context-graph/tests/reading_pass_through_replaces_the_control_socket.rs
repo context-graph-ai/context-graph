@@ -1,5 +1,5 @@
 //! Asking the process that owns a store an administrative question goes through contextdb's
-//! reading surface, and context-graph no longer carries a transport of its own.
+//! reading surface; context-graph delegates transport to the substrate.
 //!
 //! The contract: a live owner registers its `ControlHandler` on the writable open, and a client
 //! names only the STORE PATH — `context_graph::owner_control::request_owner(store_path, frame)`
@@ -18,8 +18,8 @@
 //!   -> context_graph::Result<Store>` — the production writable open that installs the handler
 //!   through `Database::open_with_options`, so a cg store IS the owner clients ask.
 //!
-//! That the retired names are gone is proved by a scan of the crate's shipped source rather than by
-//! a `trybuild` case. A compile-fail case proves two names no longer resolve; the contract here is
+//! The transport boundary is checked by scanning shipped source. A compile-fail case can establish
+//! that two names are unavailable; the contract here is
 //! wider — nothing anywhere in this crate binds, dials, or takes a socket path — and only reading
 //! the source proves that. It also cannot rot against compiler-message wording.
 
@@ -212,7 +212,7 @@ fn the_crate_carries_no_socket_transport_and_no_path_taking_control_api() {
 
     assert!(
         !src.join("control_transport.rs").exists(),
-        "the socket control transport module must be gone from {}",
+        "the crate must contain no socket control transport module in {}",
         src.display()
     );
 
@@ -229,7 +229,7 @@ fn the_crate_carries_no_socket_transport_and_no_path_taking_control_api() {
     }
     assert!(
         lib.contains("owner_control"),
-        "the database-backed owner plane replaces it and must be a public module"
+        "the database-backed owner plane must be a public module"
     );
 
     let mut offenders: Vec<String> = Vec::new();

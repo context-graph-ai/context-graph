@@ -108,6 +108,7 @@ fn hit_score(
 /// @invariant 15b
 #[test]
 fn evidence_kind_rename_inside_one_embedding_space_does_not_change_vector_search_results() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let db_path =
         std::env::temp_dir().join(format!("intra-space-modality-{}.db", uuid::Uuid::now_v7()));
     let store = Store::open(StoreConfig {

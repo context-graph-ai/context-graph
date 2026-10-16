@@ -262,7 +262,7 @@ pub struct EventSearchBuildRequest {
 #[derive(Debug, Clone)]
 pub struct EventSearchRebuildRequest {
     pub context_id: ContextId,
-    /// An explicit staged interpretation target. Its connector lookup is pending implementation.
+    /// An explicit staged interpretation target. Connector lookup is unsupported.
     pub interpretation_generation_id: Option<InterpretationGenerationId>,
     pub embedder: EmbedderRegistration,
     pub profile: EventSearchProfile,
@@ -826,7 +826,7 @@ impl ConsumerReader {
         crate::store::event_search_projection::event_search_work(self, selector, spec, policy)
     }
 
-    /// Future read-only find callers open the reader first, then attach the exact event-history
+    /// Read-only find callers open the reader first, then attach the exact event-history
     /// registration without writing the Store.
     pub fn attach_event_search_embedder_registrations(
         &mut self,

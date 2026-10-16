@@ -1047,7 +1047,7 @@ fn consultant_same_principal_multi_context_handle_full_lifecycle_aggregates_on_p
 fn webhook_bot_principal_records_bot_identity_not_human_operator() {
     let fixture = seed_pending_fixture();
     let store = reopen(&fixture.config);
-    let principal = agent("whatsapp-bot");
+    let principal = agent("notification-bot");
 
     let acknowledged = store
         .with_principal(principal.clone())
@@ -1088,16 +1088,16 @@ fn audit_log_replay_reconstructs_six_month_narrative_chain() {
 }
 
 #[test]
-fn lifecycle_ops_identical_on_mode_one_and_mode_two_invalidations() {
-    let mode_one = seed_pending_fixture();
-    let mode_two = seed_fixture_with_options(
-        "mode-two",
+fn lifecycle_ops_identical_on_human_and_system_invalidations() {
+    let human_authored = seed_pending_fixture();
+    let system_authored = seed_fixture_with_options(
+        "system-authored",
         DirectSeedOptions {
-            mode_two_decision: true,
+            system_decision: true,
             ..Default::default()
         },
     );
-    for fixture in [&mode_one, &mode_two] {
+    for fixture in [&human_authored, &system_authored] {
         set_invalidation_status(
             &fixture.config,
             fixture.invalidation.id,
@@ -1118,11 +1118,11 @@ fn lifecycle_ops_identical_on_mode_one_and_mode_two_invalidations() {
             .expect("resolve");
         assert_eq!(resolved.status, InvalidationStatus::Resolved);
     }
-    let mode_two_decision = reopen(&mode_two.config)
-        .get_decision(mode_two.decision_id)
-        .expect("get mode-two decision")
-        .expect("mode-two decision");
-    assert_eq!(mode_two_decision.agent_id.as_deref(), Some("system"));
+    let system_decision = reopen(&system_authored.config)
+        .get_decision(system_authored.decision_id)
+        .expect("get system-authored decision")
+        .expect("system-authored decision");
+    assert_eq!(system_decision.agent_id.as_deref(), Some("system"));
 }
 
 #[test]
@@ -1236,7 +1236,7 @@ fn regression_archive_intention_refuses_with_active_decisions_reference_post_hel
 }
 
 #[test]
-fn regression_store_open_admin_path_continues_to_work_post_plan_8() {
+fn store_open_admin_path_supports_invalidation_lifecycle() {
     let fixture = seed_pending_fixture();
     let admin = reopen(&fixture.config);
     let other = create_context(&admin, "client-b");
@@ -1401,7 +1401,7 @@ fn regression_invalidation_status_cannot_go_backward_full_sweep() {
 }
 
 #[test]
-fn resolution_action_column_carries_three_canonical_strings_set_by_plan_8_ops() {
+fn resolution_action_column_carries_three_canonical_lifecycle_strings() {
     let new_decision_fixture = seed_acknowledged_fixture();
     let store = reopen(&new_decision_fixture.config);
     let new_decision = create_serving_decision(

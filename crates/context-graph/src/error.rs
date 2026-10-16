@@ -295,8 +295,8 @@ pub enum CgError {
         expected_profile: String,
         actual_profile: String,
     },
-    /// Interpretation search is exposed before its persistence and execution exist. A scaffold
-    /// call always refuses explicitly; it never reports a successful no-op.
+    /// Interpretation search persistence and execution are unavailable. Calls refuse
+    /// explicitly; they never report a successful no-op.
     InterpretationSearchScaffoldOnly {
         operation: &'static str,
     },
@@ -777,7 +777,7 @@ impl fmt::Display for CgError {
             ),
             CgError::InterpretationSearchScaffoldOnly { operation } => write!(
                 f,
-                "`{operation}` is a public step-5/6 scaffold; its persistence and execution are not implemented yet"
+                "`{operation}` is unavailable; interpretation search persistence and execution are not implemented"
             ),
             CgError::InterpretationAdmissionRefused {
                 context_id,

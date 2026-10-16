@@ -1204,6 +1204,7 @@ fn run_two_reindexes(
 
 #[test]
 fn reindex_concurrent_invocations_on_same_space_serialize_or_reject_typed() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-same-space");
     let seeded = seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 3);
     let db_path = fixture.db_path.clone();
@@ -1272,6 +1273,7 @@ fn reindex_concurrent_invocations_on_same_space_serialize_or_reject_typed() {
 
 #[test]
 fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let row_count = 20;
     let serial_fixture = fixture("reindex-distinct-serial");
     let serial_text_seeded = seed_rows(
@@ -1383,6 +1385,7 @@ fn reindex_concurrent_invocations_on_distinct_spaces_proceed_in_parallel() {
 
 #[test]
 fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-empty");
     let context = fixture
         .store
@@ -1508,6 +1511,7 @@ fn reindex_on_empty_space_completes_immediately_with_zero_rows_processed() {
 
 #[test]
 fn reindex_on_single_row_space_processes_exactly_one_row() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-one-row");
     seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 1);
     let result = fixture
@@ -1524,6 +1528,7 @@ fn reindex_on_single_row_space_processes_exactly_one_row() {
 
 #[test]
 fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     if std::env::var_os("CG_REINDEX_CURSOR_CHILD").is_some() {
         let db_path = PathBuf::from(std::env::var("CG_REINDEX_CURSOR_DB").expect("db env"));
         let seeded = reindex_cursor_seeded_from_env(&db_path);
@@ -1799,6 +1804,7 @@ fn reindex_resumable_after_process_restart_persists_cursor_to_disk() {
 #[test]
 fn reindex_emits_observable_pause_signal_when_underlying_io_unavailable_and_resume_signal_when_restored()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-pause-resume");
     let seeded = seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 3);
     let result = fixture.store.reindex_space(
@@ -1865,6 +1871,7 @@ fn reindex_emits_observable_pause_signal_when_underlying_io_unavailable_and_resu
 
 #[test]
 fn reindex_zero_invalidation_cascades_under_fleet_load_n_decisions_n_entities() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-fleet");
     let decisions = seed_active_basis_decisions(&fixture.store, 50);
     seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 50);
@@ -1944,6 +1951,7 @@ fn reindex_zero_invalidation_cascades_under_fleet_load_n_decisions_n_entities() 
 
 #[test]
 fn reindex_on_registered_space_with_no_bindings_returns_typed_no_op_or_error() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-no-binding");
     let before_events = fixture.store.drain_reindex_events();
     let result = fixture
@@ -1973,6 +1981,7 @@ fn reindex_on_registered_space_with_no_bindings_returns_typed_no_op_or_error() {
 
 #[test]
 fn reindex_emits_typed_completion_event_distinct_from_invalidation_callbacks() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture = fixture("reindex-completion");
     let seeded = seed_rows(&fixture.store, TEXT_SPACE, EvidenceKind::Text, 768, 2);
     let before_events = fixture.store.drain_reindex_events();

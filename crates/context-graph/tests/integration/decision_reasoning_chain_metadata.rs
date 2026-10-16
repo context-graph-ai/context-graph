@@ -245,6 +245,7 @@ fn persisted_handle_rows_for_version(db_path: &Path, version: &str) -> i64 {
 
 #[test]
 fn embedder_metadata_stored_on_decision() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (db_path, decision_id) = {
         let store = store();
         let fixture = create_decision_with_seeded_embedding(&store, "1");
@@ -274,6 +275,7 @@ fn embedder_metadata_stored_on_decision() {
 
 #[test]
 fn embedding_metadata_stored_on_decision_reasoning_chain_at_write_time_not_derived_at_read() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (db_path, decision_id) = {
         let store = store();
         let fixture = create_decision_with_seeded_embedding(&store, "1");
@@ -301,6 +303,7 @@ fn embedding_metadata_stored_on_decision_reasoning_chain_at_write_time_not_deriv
 
 #[test]
 fn decision_reasoning_chain_producer_remains_queryable_after_subsequent_reindex() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let (db_path, decision_id) = {
         let store = store();
         let fixture = create_decision_with_seeded_embedding(&store, "1");

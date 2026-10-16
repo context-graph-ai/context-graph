@@ -448,7 +448,7 @@ fn intention_update_and_archive_append_immutable_history_and_move_current_pointe
 // Decision fired, not today's value after a later calibration?" Delivers "what was true" on
 // Entity snapshot history across three updates; state_at returns a distinct snapshot for each
 // historical TxId.
-// Regression guard on cg-crud's shipped state_at surface.
+// Regression guard on the Store's state_at surface.
 #[test]
 fn state_at_returns_historical_snapshot_for_each_moment() -> Result<(), CgError> {
     let (_tempdir, db_path, store) = fixture();
@@ -520,7 +520,7 @@ fn state_at_returns_historical_snapshot_for_each_moment() -> Result<(), CgError>
 
 // Use case: audit script treats earliest-Ok(Some) as creation time. state_at at a TxId strictly
 // before an Entity existed returns Ok(None), not Err — the caller need not special-case pre-creation.
-// Regression guard on cg-crud's shipped state_at return shape (Ok(None) for no covering row).
+// Regression guard on the Store's state_at return shape (Ok(None) for no covering row).
 #[test]
 fn state_at_before_entity_existed() -> Result<(), CgError> {
     let (_tempdir, db_path, store) = fixture();
@@ -565,7 +565,7 @@ fn state_at_before_entity_existed() -> Result<(), CgError> {
 
 // Use case: builder-as-substrate dashboard rendering "missing" cells — state_at on a never-stored
 // EntityId returns Ok(None), same as pre-creation; the caller does not distinguish.
-// Regression guard on cg-crud's shipped state_at.
+// Regression guard on the Store's state_at.
 #[test]
 fn state_at_nonexistent_entity() -> Result<(), CgError> {
     let (_tempdir, db_path, store) = fixture();
@@ -597,7 +597,7 @@ fn state_at_nonexistent_entity() -> Result<(), CgError> {
 // Use case: a library consumer renders an Entity's timeline in a dashboard — no phantom gaps,
 // content matches what was committed at each TxId. entity_history returns immutable oldest-first
 // EntitySnapshots; every snapshot remains open and ancestry links identify successors.
-// Regression guard on cg-crud's shipped entity_history.
+// Regression guard on the Store's entity_history.
 #[test]
 fn history_oldest_first_immutable_and_linked() -> Result<(), CgError> {
     let (_tempdir, db_path, store) = fixture();

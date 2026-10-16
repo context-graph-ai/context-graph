@@ -1,4 +1,4 @@
-//! RED proof for public event-history retrieval.  The Store API is the only writable read path;
+//! Behavior proofs for public event-history retrieval.  The Store API is the only writable read path;
 //! the database plugin observes its SQL after the public call.
 
 #![cfg(context_graph_internal_test_support)]

@@ -27,7 +27,7 @@ fn install_genuine_schema_ten(db: &Database) {
         if SCHEMA_ELEVEN_ONLY_TABLES.contains(&table.name) {
             continue;
         }
-        // Schema 10 had the snapshot rows, but had not yet made that table append-only.
+        // The schema-10 fixture declares mutable snapshot rows.
         let ddl = if table.name == "intention_snapshots" {
             table.ddl.replace(") IMMUTABLE SYNC", ") SYNC")
         } else {
@@ -151,6 +151,7 @@ fn table_topology(db: &Database) -> Vec<String> {
 
 #[test]
 fn fresh_schema_eleven_root_carries_intention_history_tables() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let node = FabricNode::open("fresh_schema_eleven");
     let tables = node.store.sync_database().table_names();
     assert!(
@@ -163,6 +164,7 @@ fn fresh_schema_eleven_root_carries_intention_history_tables() {
 
 #[test]
 fn old_schema_ten_root_is_refused_without_data_loss() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("cg.db");
 
@@ -185,8 +187,7 @@ fn old_schema_ten_root_is_refused_without_data_loss() {
         db_path: path.clone(),
         ..Default::default()
     });
-    // The binary's own schema version moved past 11 when event capture reserved the next one
-    // (cg-event-backed-import intent §6); the refusal names whatever version this binary expects.
+    // The refusal names the schema version this binary expects.
     assert!(
         matches!(
             result,

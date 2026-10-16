@@ -1,10 +1,7 @@
 use context_graph::CgError;
 use context_graph::ingest::{ClaudeJsonlParser, ImportParser, parser_for_format};
 
-// EXPECTATION CHANGE (2026-07-03, tool-output preservation):
-// the original "clean conversation" contract asserted tool blocks vanish WITHOUT TRACE — the
-// exact behavior that deleted decision-bearing tool output at import. The current contract:
-// every tool event keeps a one-line prose header; result content survives only where the
+// Every tool event keeps a one-line prose header. Result content survives only where the
 // following assistant dialogue engages with it (here: nothing follows, so header only).
 const CLAUDE_JSONL: &str = r#"{"type":"system","content":"noise"}
 {"type":"user","message":{"content":[{"type":"text","text":"Where is auth?"}]}}
@@ -75,7 +72,7 @@ fn claude_jsonl_strips_local_command_blocks_without_dropping_surrounding_text() 
 #[test]
 fn claude_jsonl_strips_teammate_message_instruction_blocks() {
     let parser = ClaudeJsonlParser;
-    let raw = r#"{"type":"user","message":{"content":[{"type":"text","text":"Before <teammate-message teammate_id=\"lead\">You are the reviewer. Decision: ship the decoy.</teammate-message> after"}]}}
+    let raw = r#"{"type":"user","message":{"content":[{"type":"text","text":"Before <teammate-message teammate_id=\"lead\">You are the reader. Decision: ship the decoy.</teammate-message> after"}]}}
 {"type":"assistant","message":{"content":[{"type":"text","text":"Decision: keep the actual billing rollout capped"}]}}
 "#;
     let clean = parser.parse(raw.as_bytes()).expect("parser seam returns");

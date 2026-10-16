@@ -4,12 +4,9 @@
 //! past what the model window can hold. Only embedding a still-oversized prepared value is
 //! refused, by exact count against the embedder's own declared event-search ceiling.
 //!
-//! The document role has this proof; the query role did not, and the gap is not cosmetic. A
-//! preparer that clamped its encoding to the ceiling before sealing would leave every other check
-//! green — the sealed count would still equal its payload length, the vector would still be a real
-//! vector, and the short fixtures every other query test uses never reach the ceiling — while the
-//! caller silently got a truncated query vector stamped with the canonical event-history identity
-//! and a token count reporting the truncated number.
+//! Clamping the encoding before sealing can produce a vector with the canonical event-history
+//! identity and an internally consistent token count while silently truncating the query. Oversized
+//! fixtures and an independent tokenizer expose that loss of content.
 //!
 //! The oracle is the cached tokenizer loaded directly, independently of the embedder, and the
 //! ceiling is read from the embedder's own declared capability, never a hardcoded constant. The

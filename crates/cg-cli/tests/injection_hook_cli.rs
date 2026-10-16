@@ -1,6 +1,6 @@
-//! Injection-surface CLI acceptance tests (daily-loop WP5): the `cg connect claude-code` /
+//! Injection-surface CLI acceptance tests (capture ): the `cg connect claude-code` /
 //! `cg disconnect claude-code` / `cg connect list` install commands operate on the REAL
-//! `~/.claude/settings.json` as structured JSON (not comment markers, not the old placeholder path),
+//! `~/.claude/settings.json` as structured JSON,
 //! and `cg hook claude-code <event>` reads a Claude Code hook event on stdin and prints a budgeted,
 //! staleness-honest `hookSpecificOutput.additionalContext` block — degrading silently when there is
 //! nothing to inject.
@@ -58,7 +58,7 @@ fn connect_claude_code_writes_real_structured_settings_not_markers_or_placeholde
     );
     assert!(
         !raw.contains("agent-config"),
-        "cg must not use the old placeholder path: {raw}"
+        "cg must use the structured settings path: {raw}"
     );
 
     let value = read_json(&path);

@@ -1,4 +1,4 @@
-//! Acceptance tests for WP1 tier-0 deterministic capture + retention.
+//! Acceptance tests for  model-free deterministic capture + retention.
 //!
 //! The contract under test: `cg record` / `cg import` capture is deterministic and free — a
 //! verbatim digest + local embedding + kept raw chunk + durable understanding-queue row per chunk,
@@ -22,7 +22,7 @@ use context_graph::{
 
 use super::fake_extractor::open_store_with_lexical_embedder;
 
-const CONTEXT: &str = "daily-loop";
+const CONTEXT: &str = "capture";
 
 fn fresh_store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -113,7 +113,7 @@ fn tier0_capture_writes_digest_chunk_queue_atomically() {
 
     assert_eq!(report.digests_written, 1, "one verbatim digest written");
     assert_eq!(report.chunks_kept, 1, "one raw chunk kept");
-    assert_eq!(report.model_calls, 0, "tier-0 makes zero model calls");
+    assert_eq!(report.model_calls, 0, "model-free makes zero model calls");
     assert_eq!(report.digest_ids.len(), 1);
 
     let digest = store
@@ -189,7 +189,7 @@ fn tier0_default_writes_no_graph_rows_only_digest_chunk_queue() {
     .expect("capture");
     let ctx = context_id(&store);
 
-    // The default tier-0 path writes ONLY a digest + raw chunk + queue row — never structured graph.
+    // The default model-free path writes ONLY a digest + raw chunk + queue row — never structured graph.
     assert!(report.digests_written >= 1, "a verbatim digest is written");
     assert_eq!(
         raw_footprint(&store, ctx).expect("footprint").chunk_count,
@@ -206,7 +206,7 @@ fn tier0_default_writes_no_graph_rows_only_digest_chunk_queue() {
     assert_eq!(
         (counts.goals, counts.decisions, counts.observations),
         (0, 0, 0),
-        "tier-0 default extracts NO intentions/decisions/observations — understanding is deferred"
+        "model-free default extracts NO intentions/decisions/observations — understanding is deferred"
     );
     assert!(
         store
@@ -216,7 +216,7 @@ fn tier0_default_writes_no_graph_rows_only_digest_chunk_queue() {
             })
             .expect("entities")
             .is_empty(),
-        "tier-0 default extracts no entities"
+        "model-free default extracts no entities"
     );
 }
 
@@ -265,7 +265,7 @@ fn tier0_digest_immediately_queryable_marked_verbatim() {
             .expect("kind")
             .as_deref(),
         Some("verbatim"),
-        "tier-0 digests are marked verbatim"
+        "model-free digests are marked verbatim"
     );
 
     let hits = store
@@ -421,8 +421,8 @@ fn queue_rows_survive_reopen() {
 #[test]
 fn sync_contract_registers_new_tables() {
     let (_dir, store) = fresh_store();
-    // Raw and per-device runtime state never leave the machine. The private understanding queue is
-    // retired at schema v10 (the work ledger's computed job state subsumes it).
+    // Raw and per-device runtime state never leave the machine. Understanding state is computed
+    // from the work ledger.
     for table in [
         "cg_source_chunks",
         "cg_retrieval_touches",
@@ -502,6 +502,6 @@ fn salience_clean_strips_tool_noise_keeps_dialogue() {
     );
 
     // Already-clean prose is unchanged (idempotent salience cut).
-    let plain = "User: what is the plan\nAssistant: ship tier-0 capture";
+    let plain = "User: what is the plan\nAssistant: ship model-free capture";
     assert_eq!(salience_clean(plain), plain);
 }

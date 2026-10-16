@@ -136,10 +136,6 @@ fn skill_row_by_id(store: &Store, skill_id: &str) -> Option<HashMap<String, DbVa
     .map(|row| row.values)
 }
 
-// Test 1: a skill promoted on edge1 must be visible on edge2
-// (both in the raw row AND via list_skills_in_store) after a push/pull. The placeholder
-// list_skills_in_store returns empty, so the listing assertion fails even though the sync
-// engine propagates the row correctly.
 #[tokio::test(flavor = "multi_thread")]
 async fn skills_sync_tenant_wide_hub_arbitrated() {
     let fixture = real_sync_fixture("skills_sync_tenant_wide_hub_arbitrated").await;
@@ -214,15 +210,12 @@ async fn skills_sync_tenant_wide_hub_arbitrated() {
         "synced skill provenance must be identical to edge1"
     );
 
-    // The synced skill must also appear via list_skills_in_store (the public surface).
-    // Placeholder returns empty → this assertion fails, proving the listing reads from
-    // the real table, not a HashMap.
     let listed = context_graph::skill_store::list_skills_in_store(&fixture.edge2.store)
         .expect("read succeeds");
     assert_eq!(
         listed.len(),
         1,
-        "list_skills_in_store must surface the synced skill; wrong stub returns empty; got {}",
+        "list_skills_in_store must surface the synced skill; got {}",
         listed.len()
     );
     let listed_skill = &listed[0];
@@ -246,10 +239,6 @@ async fn skills_sync_tenant_wide_hub_arbitrated() {
     );
 }
 
-// Test 2: teaching events from both edges must converge to the
-// full union and be visible via list_teaching_events_in_store (which reads the persisted
-// table, not a HashMap). Placeholder: list_teaching_events_in_store always returns empty →
-// the listing count assertion fails even after the sync propagates all 4 rows into both tables.
 #[tokio::test(flavor = "multi_thread")]
 async fn teaching_events_sync_tenant_wide_order_free_set_union() {
     let fixture = real_sync_fixture("teaching_events_sync_tenant_wide_order_free_set_union").await;
@@ -301,14 +290,12 @@ async fn teaching_events_sync_tenant_wide_order_free_set_union() {
         "edge2 must hold all 4 teaching events in the table after bidirectional sync; got {edge2_raw}"
     );
 
-    // list_teaching_events_in_store must surface all 4 events from the persisted table.
-    // Placeholder returns empty → this assertion fails.
     let listed = context_graph::skill_store::list_teaching_events_in_store(&fixture.edge2.store)
         .expect("read succeeds");
     assert_eq!(
         listed.len(),
         4,
-        "list_teaching_events_in_store must return all 4 synced teaching events; wrong stub returns empty; got {}",
+        "list_teaching_events_in_store must return all 4 synced teaching events; got {}",
         listed.len()
     );
 }
@@ -338,7 +325,7 @@ async fn firing_trace_stays_local_per_device_not_synced() {
     let edge2_count = count_table_rows(&fixture.edge2.store, "cg_skill_firing_trace");
     assert_eq!(
         edge2_count, 0,
-        "firing-trace rows must NOT sync to edge2; edge2 has {edge2_count} rows (wrong stub syncs them)"
+        "firing-trace rows must NOT sync to edge2; edge2 has {edge2_count} rows"
     );
 
     let edge1_count = count_table_rows(&fixture.edge1.store, "cg_skill_firing_trace");

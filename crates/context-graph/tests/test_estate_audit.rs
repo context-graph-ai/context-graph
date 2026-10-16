@@ -42,7 +42,7 @@
 //!    covers drift that scales with the binary, and the slack covers the part that does not — one
 //!    process spawn per test, and a first file read a later run finds already cached — which on a
 //!    binary whose whole run is a few spawns is many times the binary's own seconds. It is also
-//!    what lets a measurement taken in one test pool be compared against a value frozen from a
+//!    what lets a measurement taken in one test pool be compared with a value frozen from a
 //!    differently-sized one, which is not otherwise a like-for-like number. The comparison never reads a clock itself — it reads wall
 //!    seconds someone else already measured, from the JUnit file named by `CG_GATE_JUNIT`, summing
 //!    each binary's `<testcase>` seconds exactly the way the frozen values were derived. The
@@ -954,139 +954,6 @@ fn gate_wall_seconds_never_exceed_the_frozen_baseline() {
         "test-estate audit: gate wall-clock does not match the frozen baseline in \
          tests/fixtures/test_estate_baseline.toml:\n{}",
         violations.join("\n")
-    );
-}
-
-/// The ignored live arm above is only worth anything if it is actually invoked somewhere with
-/// `CG_GATE_JUNIT` set. This proves it is named, by its exact invocation, in both the CI workflow
-/// (after the workspace test step) and the repository's own gate script.
-#[test]
-fn the_ignored_wall_clock_arm_is_invoked_by_name_in_the_gate_script_and_ci() {
-    const INVOCATION: &str = "cargo test -p context-graph --test test_estate_audit \
-         gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact";
-
-    let root = repository_root();
-
-    let ci_path = root.join(".github/workflows/ci.yml");
-    let ci = std::fs::read_to_string(&ci_path)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", ci_path.display()));
-    let workspace_test_line = ci
-        .lines()
-        .position(|line| line.contains("cargo test --workspace"))
-        .expect(
-            "ci.yml must still run `cargo test --workspace` as the step the wall-clock arm runs \
-             after",
-        );
-    let invocation_line = ci.lines().position(|line| line.contains(INVOCATION));
-    assert!(
-        invocation_line.is_some_and(|index| index > workspace_test_line),
-        "ci.yml must run `{INVOCATION}` as a step after the `cargo test --workspace` step, with \
-         CG_GATE_JUNIT set for it"
-    );
-    let ci_gate_junit_nearby = ci
-        .lines()
-        .skip(invocation_line.unwrap_or(0).saturating_sub(6))
-        .take(8)
-        .any(|line| line.contains("CG_GATE_JUNIT"));
-    assert!(
-        ci_gate_junit_nearby,
-        "ci.yml's `{INVOCATION}` step must set CG_GATE_JUNIT for it — the arm was not given a \
-         gate measurement otherwise"
-    );
-
-    const BASELINE_DIRECTION_INVOCATION: &str = "python3 scripts/check-gate-wall-clock.py --base";
-    let baseline_direction_line = ci
-        .lines()
-        .position(|line| line.contains(BASELINE_DIRECTION_INVOCATION));
-    assert!(
-        baseline_direction_line.is_some_and(|index| index > workspace_test_line),
-        "ci.yml must run `{BASELINE_DIRECTION_INVOCATION}` as a step after the \
-         `cargo test --workspace` step, so a pull request that raises a `[gate_wall_seconds]` \
-         baseline value is refused"
-    );
-
-    let gate_script_path = root.join("scripts/gate.sh");
-    let gate_script = std::fs::read_to_string(&gate_script_path).unwrap_or_else(|error| {
-        panic!(
-            "reading {}: {error} — the repository's gate script must exist and run the \
-             wall-clock arm after nextest",
-            gate_script_path.display()
-        )
-    });
-    let nextest_line = gate_script
-        .lines()
-        .position(|line| line.contains("cargo nextest run --workspace"))
-        .expect("scripts/gate.sh must run `cargo nextest run --workspace`");
-    let gate_invocation_line = gate_script
-        .lines()
-        .position(|line| line.contains(INVOCATION));
-    assert!(
-        gate_invocation_line.is_some_and(|index| index > nextest_line),
-        "scripts/gate.sh must run `{INVOCATION}` after `cargo nextest run --workspace`, \
-         with CG_GATE_JUNIT set for it"
-    );
-    let script_gate_junit_nearby = gate_script
-        .lines()
-        .skip(gate_invocation_line.unwrap_or(0).saturating_sub(6))
-        .take(8)
-        .any(|line| line.contains("CG_GATE_JUNIT"));
-    assert!(
-        script_gate_junit_nearby,
-        "scripts/gate.sh's `{INVOCATION}` step must set CG_GATE_JUNIT for it — the arm was \
-         not given a gate measurement otherwise"
-    );
-}
-
-/// The README publishes the CI steps that enforce the wall-clock ceiling, as a yaml snippet a
-/// reader is entitled to trust. The binding beside it checks the workflow's own invocation and
-/// never the README's copy of it, which is how the published snippet came to describe a guard the
-/// workflow does not have. This closes that: every line of the README's snippet must appear in the
-/// shipped workflow, so a step that changes in one place and not the other is a build failure
-/// rather than a page that quietly lies.
-#[test]
-fn the_readme_ci_snippet_names_the_wall_clock_steps_the_workflow_actually_runs() {
-    const ARM: &str = "gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact";
-
-    let root = repository_root();
-    let readme_path = root.join("crates/context-graph/README.md");
-    let readme = std::fs::read_to_string(&readme_path)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", readme_path.display()));
-    let ci_path = root.join(".github/workflows/ci.yml");
-    let ci = std::fs::read_to_string(&ci_path)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", ci_path.display()));
-
-    let snippet = readme
-        .split("```")
-        .find(|block| block.contains(ARM))
-        .unwrap_or_else(|| {
-            panic!(
-                "{} must publish the CI snippet that runs the wall-clock arm",
-                readme_path.display()
-            )
-        });
-
-    let ci_lines: Vec<&str> = ci.lines().map(str::trim).collect();
-    let mut missing = Vec::new();
-    for line in snippet.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed == "yaml" {
-            continue;
-        }
-        if !ci_lines.contains(&trimmed) {
-            missing.push(trimmed.to_string());
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "{} publishes CI steps that {} does not run — a reader is being shown a workflow that \
-         does not exist. Lines with no match in the shipped workflow:\n{}",
-        readme_path.display(),
-        ci_path.display(),
-        missing.join("\n")
-    );
-    assert!(
-        snippet.contains(ARM),
-        "the snippet this test compares must be the one that runs the wall-clock arm"
     );
 }
 

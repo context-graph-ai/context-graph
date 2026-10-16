@@ -29,7 +29,7 @@ pub enum MessageBody {
 }
 
 impl Store {
-    pub fn render_school_gate_message_body(
+    pub fn render_entity_alert_message_body(
         &self,
         invalidation_id: InvalidationId,
     ) -> Result<MessageBody> {

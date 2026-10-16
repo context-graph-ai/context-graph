@@ -83,6 +83,7 @@ fn read_settings(store: &Store) -> Vec<(String, String)> {
 
 #[test]
 fn consumer_declares_a_namespaced_keyed_table_at_store_open() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let store = open_with(config(&dir), settings_schema()).expect("declare the consumer table");
 
@@ -106,6 +107,7 @@ fn consumer_declares_a_namespaced_keyed_table_at_store_open() {
 
 #[test]
 fn declaring_the_same_consumer_schema_again_keeps_the_existing_rows() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let store = open_with(config(&dir), settings_schema()).expect("first declaration");
     write_setting(&store, "detector_confidence_threshold", "0.55");
@@ -124,6 +126,7 @@ fn declaring_the_same_consumer_schema_again_keeps_the_existing_rows() {
 
 #[test]
 fn context_graph_refuses_its_own_table_names() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let reserved = ConsumerSchema {
         namespace: "cg".to_string(),
@@ -178,6 +181,7 @@ fn context_graph_refuses_its_own_table_names() {
 
 #[test]
 fn a_namespace_that_lands_inside_a_reserved_one_is_refused_too() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     // `cg_extra` is not `cg`, but everything it would own — `cg_extra_settings`
     // and the rest — sits inside context-graph's own `cg_` prefix, which is the
@@ -201,6 +205,7 @@ fn a_namespace_that_lands_inside_a_reserved_one_is_refused_too() {
 
 #[test]
 fn a_consumer_namespace_still_cannot_reach_a_table_context_graph_owns() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     // `audit` is nobody's reserved namespace and `audit_log` sits squarely inside
     // it — but `audit_log` is context-graph's own table, and a name check that
@@ -224,6 +229,7 @@ fn a_consumer_namespace_still_cannot_reach_a_table_context_graph_owns() {
 
 #[test]
 fn a_consumer_cannot_claim_a_table_name_context_graph_creates_at_runtime() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     // context-graph does not declare one entity-reference table per embedding
     // dimension up front; it creates the one a declared space needs, when that
@@ -250,6 +256,7 @@ fn a_consumer_cannot_claim_a_table_name_context_graph_creates_at_runtime() {
 
 #[test]
 fn a_declaration_whose_quoted_name_hides_an_escaped_quote_is_refused() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     // contextdb reads a doubled quote inside a quoted identifier as one literal
     // quote, so this declaration creates `vigil_settings"shadow` — not the
@@ -274,6 +281,7 @@ fn a_declaration_whose_quoted_name_hides_an_escaped_quote_is_refused() {
 
 #[test]
 fn a_consumer_declaration_must_create_the_table_it_names() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let mismatched = ConsumerSchema {
         namespace: "vigil".to_string(),
@@ -294,6 +302,7 @@ fn a_consumer_declaration_must_create_the_table_it_names() {
 
 #[test]
 fn a_consumer_cannot_declare_the_same_table_twice() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let duplicated = ConsumerSchema {
         namespace: "vigil".to_string(),
@@ -320,6 +329,7 @@ fn a_consumer_cannot_declare_the_same_table_twice() {
 
 #[test]
 fn a_lowercase_declaration_is_accepted_the_way_contextdb_accepts_it() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let lowercase = ConsumerSchema {
         namespace: "vigil".to_string(),
@@ -340,6 +350,7 @@ fn a_lowercase_declaration_is_accepted_the_way_contextdb_accepts_it() {
 
 #[test]
 fn the_schema_version_gate_reads_the_same_version_with_a_consumer_table_present() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let store = open_with(config(&dir), settings_schema()).expect("declare the consumer table");
     write_setting(&store, "motion_sensitivity", "7");
@@ -355,8 +366,7 @@ fn the_schema_version_gate_reads_the_same_version_with_a_consumer_table_present(
     );
     drop(store);
 
-    // And the version the gate reports is context-graph's own, not something the
-    // consumer table shifted: an older expectation still names the shipped version.
+    // The version the gate reports is context-graph's own, independent of consumer tables.
     let stale = StoreConfig {
         expected_schema_version: CG_SCHEMA_VERSION - 1,
         ..config(&dir)
@@ -374,6 +384,7 @@ fn the_schema_version_gate_reads_the_same_version_with_a_consumer_table_present(
 
 #[test]
 fn consumer_policy_declarations_reach_the_engine_unchanged() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let store = open_with(config(&dir), settings_schema()).expect("declare the consumer table");
     let db = store.sync_database();
@@ -405,6 +416,7 @@ fn consumer_policy_declarations_reach_the_engine_unchanged() {
 
 #[test]
 fn a_declaration_using_if_not_exists_is_accepted_the_way_contextdb_accepts_it() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let if_not_exists = ConsumerSchema {
         namespace: "vigil".to_string(),
@@ -426,6 +438,7 @@ fn a_declaration_using_if_not_exists_is_accepted_the_way_contextdb_accepts_it() 
 
 #[test]
 fn a_declaration_using_a_quoted_identifier_is_accepted_the_way_contextdb_accepts_it() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let quoted = ConsumerSchema {
         namespace: "vigil".to_string(),
@@ -465,6 +478,7 @@ fn engine_refusal_reason(ddl: &str) -> String {
 
 #[test]
 fn the_engine_refuses_a_consumer_declaration_that_reshapes_a_table_the_engine_owns() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
 
     // `peer_directory` is the engine's own fabric bookkeeping table, and a
@@ -500,6 +514,7 @@ fn the_engine_refuses_a_consumer_declaration_that_reshapes_a_table_the_engine_ow
 
 #[test]
 fn the_engine_still_refuses_sync_safe_on_a_keyless_consumer_table() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let ddl = "CREATE TABLE vigil_keyless (name TEXT, requested TEXT) RETAIN 1 HOURS SYNC SAFE";
     let keyless = ConsumerSchema {
@@ -568,6 +583,7 @@ fn hub_setting_names(store: &Store) -> Vec<String> {
 
 #[test]
 fn an_edge_scoped_consumer_handle_is_refused_a_row_its_declaration_reserves_for_the_hub() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let store = Store::open_with_consumer_schema_scoped(
         config(&dir),
@@ -603,6 +619,7 @@ fn an_edge_scoped_consumer_handle_is_refused_a_row_its_declaration_reserves_for_
 
 #[test]
 fn an_unrestricted_consumer_handle_writes_the_row_the_declaration_reserves_for_the_hub() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let store = open_with(config(&dir), hub_settings_schema())
         .expect("an unrestricted handle opens the declaration");
@@ -618,6 +635,7 @@ fn an_unrestricted_consumer_handle_writes_the_row_the_declaration_reserves_for_t
 
 #[test]
 fn a_hub_scoped_consumer_handle_writes_the_row_its_declaration_reserves_for_the_hub() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let store = Store::open_with_consumer_schema_scoped(
         config(&dir),
@@ -636,9 +654,8 @@ fn a_hub_scoped_consumer_handle_writes_the_row_its_declaration_reserves_for_the_
     );
 }
 
-/// The same table as `HUB_SETTINGS_DDL` as an earlier version of a consumer might
-/// have created it: same name, same columns, but without the `SCOPE_LABEL` the
-/// hub/edge refusal rests on.
+/// A table with the same name and columns as `HUB_SETTINGS_DDL`, but without
+/// the `SCOPE_LABEL` required by the hub/edge refusal.
 const HUB_SETTINGS_DDL_BEFORE_THE_LABEL: &str =
     "CREATE TABLE vigil_hub_settings (name TEXT PRIMARY KEY, requested TEXT, scope_label TEXT)";
 
@@ -675,6 +692,7 @@ fn drift_refusal(
 #[test]
 fn a_declaration_that_adds_the_scope_label_the_refusal_rests_on_is_refused_on_the_table_that_lacks_it()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let (table, mismatch) =
         drift_refusal(&dir, HUB_SETTINGS_DDL_BEFORE_THE_LABEL, HUB_SETTINGS_DDL);
@@ -692,6 +710,7 @@ fn a_declaration_that_adds_the_scope_label_the_refusal_rests_on_is_refused_on_th
 #[test]
 fn a_declaration_that_changes_where_a_consumer_table_travels_is_refused_on_the_table_that_still_travels_the_old_way()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let (table, mismatch) = drift_refusal(
         &dir,
@@ -708,6 +727,7 @@ fn a_declaration_that_changes_where_a_consumer_table_travels_is_refused_on_the_t
 
 #[test]
 fn a_declaration_that_adds_a_column_is_refused_on_the_table_that_does_not_have_it() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let (_, mismatch) = drift_refusal(
         &dir,
@@ -723,6 +743,7 @@ fn a_declaration_that_adds_a_column_is_refused_on_the_table_that_does_not_have_i
 
 #[test]
 fn the_declaration_that_created_the_table_still_opens_it() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let store = open_with(config(&dir), hub_settings_schema()).expect("first declaration");
     write_hub_setting(&store, "detector_sample_frames").expect("the row the declaration allows");
@@ -800,6 +821,7 @@ fn reopens_cleanly(schema: ConsumerSchema) {
 
 #[test]
 fn the_declarations_the_settings_consumer_ships_reopen_the_store_they_created() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     reopens_cleanly(ConsumerSchema {
         namespace: "vigil".to_string(),
         tables: CONSUMER_TABLES_AS_SHIPPED
@@ -814,11 +836,13 @@ fn the_declarations_the_settings_consumer_ships_reopen_the_store_they_created() 
 
 #[test]
 fn a_declaration_carrying_every_clause_the_check_compares_reopens_the_table_it_created() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     reopens_cleanly(schema_with("vigil_every_clause", EVERY_CLAUSE_DDL));
 }
 
 #[test]
 fn a_declaration_carrying_custody_policies_reopens_with_the_engine_metadata_it_declared() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let schema = schema_with("vigil_custody", CUSTODY_POLICY_DDL);
     let store = open_with(config(&dir), schema.clone()).expect("create the custody declaration");
@@ -846,6 +870,7 @@ fn a_declaration_carrying_custody_policies_reopens_with_the_engine_metadata_it_d
 #[test]
 fn a_declaration_that_changes_delivery_manifest_members_is_refused_on_the_existing_consumer_table()
 {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let changed = "CREATE TABLE vigil_custody (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER vigil_custody_parts, vigil_custody_attachments EDGE DISCARD AFTER OUTCOME";
     let (table, mismatch) = custody_drift_refusal(&dir, CUSTODY_POLICY_DDL, changed);
@@ -859,6 +884,7 @@ fn a_declaration_that_changes_delivery_manifest_members_is_refused_on_the_existi
 
 #[test]
 fn a_declaration_that_changes_edge_discard_policy_is_refused_on_the_existing_consumer_table() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let changed = "CREATE TABLE vigil_custody (id UUID PRIMARY KEY, body TEXT) SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE DELIVERY MANIFEST OVER vigil_custody_parts EDGE DISCARD NEVER";
     let (table, mismatch) = custody_drift_refusal(&dir, CUSTODY_POLICY_DDL, changed);
@@ -872,6 +898,7 @@ fn a_declaration_that_changes_edge_discard_policy_is_refused_on_the_existing_con
 
 #[test]
 fn a_declaration_carrying_a_maintain_count_clause_reopens_with_the_engine_metadata_it_declared() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let ddl = "CREATE TABLE vigil_index_counts (owner TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (owner, seq)) MAINTAIN COUNT (owner)";
     let schema = schema_with("vigil_index_counts", ddl);
@@ -898,6 +925,7 @@ fn a_declaration_carrying_a_maintain_count_clause_reopens_with_the_engine_metada
 #[test]
 fn a_declaration_that_changes_maintain_count_policy_is_refused_on_the_table_that_still_carries_the_old_one()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let created = "CREATE TABLE vigil_hub_settings (owner TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (owner, seq)) MAINTAIN COUNT (owner)";
     let changed = "CREATE TABLE vigil_hub_settings (owner TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (owner, seq)) MAINTAIN COUNT NONE";
@@ -911,6 +939,7 @@ fn a_declaration_that_changes_maintain_count_policy_is_refused_on_the_table_that
 
 #[test]
 fn a_declaration_that_adds_a_maintain_count_clause_is_refused_on_the_table_that_declared_none() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let created = "CREATE TABLE vigil_hub_settings (id UUID PRIMARY KEY, owner TEXT NOT NULL)";
     let changed = "CREATE TABLE vigil_hub_settings (id UUID PRIMARY KEY, owner TEXT NOT NULL) MAINTAIN COUNT ALL PREFIXES";
@@ -939,6 +968,7 @@ const GRAPH_SHAPED_TABLES: &[(&str, &str)] = &[
 
 #[test]
 fn a_declaration_carrying_the_graph_shaped_clauses_reopens_the_table_it_created() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     reopens_cleanly(ConsumerSchema {
         namespace: "vigil".to_string(),
         tables: GRAPH_SHAPED_TABLES
@@ -954,6 +984,7 @@ fn a_declaration_carrying_the_graph_shaped_clauses_reopens_the_table_it_created(
 #[test]
 fn a_declaration_that_changes_a_propagation_rule_is_refused_on_the_table_that_still_carries_the_old_one()
  {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let dir = tempfile::tempdir().expect("consumer tempdir");
     let created = "CREATE TABLE vigil_hub_settings (id UUID PRIMARY KEY, status TEXT NOT NULL) STATE MACHINE (status: open -> closed) PROPAGATE ON EDGE supersedes OUTGOING STATE closed SET status MAX DEPTH 3";
     let changed = "CREATE TABLE vigil_hub_settings (id UUID PRIMARY KEY, status TEXT NOT NULL) STATE MACHINE (status: open -> closed) PROPAGATE ON EDGE supersedes OUTGOING STATE closed SET status MAX DEPTH 5";
@@ -967,6 +998,7 @@ fn a_declaration_that_changes_a_propagation_rule_is_refused_on_the_table_that_st
 
 #[test]
 fn a_declaration_naming_dag_edge_types_reopens_the_table_it_created() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     reopens_cleanly(schema_with(
         "vigil_lineage",
         "CREATE TABLE vigil_lineage (id UUID PRIMARY KEY, name TEXT NOT NULL) DAG ('supersedes', 'refines')",

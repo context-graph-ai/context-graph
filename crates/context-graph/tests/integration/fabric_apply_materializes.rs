@@ -1,12 +1,7 @@
-//! Fabric first-light final mile — a PULLED worker result MATERIALIZES memory on the submitter.
+//! A pulled worker result materializes memory on the submitter without a model call.
 //!
-//! The live two-root rehearsal defect: a remote worker executed a job, its `work_results` row synced
-//! back, and `cg status` showed the job `done` — yet the submitter's graph stayed EMPTY. Two failures
-//! sat behind it: `fabric::apply_result` had zero CLI callers (a pulled result never got applied), and
-//! even when applied it RE-EXTRACTED the chunk through a model on the submitter instead of committing
-//! the worker's structured output. These tests pin the fix without editing any frozen suite: after a
-//! plain `cg sync pull`-equivalent, the library sweep the CLI now calls materializes the worker's
-//! structured output as memory, model-free, and a second sweep is a no-op.
+//! After a sync pull, the library sweep commits the worker's structured output as memory.
+//! Repeating the sweep leaves the stored result unchanged.
 
 use context_graph::fabric::{
     self, ApplyOutcome, FabricCapture, FabricPollOutcome, FabricWorkerConfig,
@@ -58,12 +53,13 @@ async fn pull_only(client: &contextdb_server::SyncClient) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pulled_worker_result_materializes_memory_on_submitter() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture: FabricFixture = fabric_fixture("apply_materializes").await;
 
     // Submitter (edge1) captures a session and pushes its understanding job to the hub.
     fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on submitter");
     push_only(&fixture.edge1_client).await;
@@ -89,9 +85,9 @@ async fn pulled_worker_result_materializes_memory_on_submitter() {
         "the model ran once, on the worker"
     );
 
-    // Before the submitter pulls, its graph carries NO structured memory — tier-0 capture wrote only
+    // Before the submitter pulls, its graph carries NO structured memory — model-free capture wrote only
     // the verbatim digest; understanding is still remote.
-    let ctx = context_id(&fixture.edge1.store, "daily-loop").expect("context on submitter");
+    let ctx = context_id(&fixture.edge1.store, "capture").expect("context on submitter");
     assert_eq!(
         memory_total(&fixture.edge1.store, ctx),
         0,
@@ -99,7 +95,7 @@ async fn pulled_worker_result_materializes_memory_on_submitter() {
     );
 
     // The submitter does ONLY a `cg sync pull` (no worker, no explicit apply call), then the sweep the
-    // CLI's pull path now runs. The test never calls `apply_result`.
+    // CLI's pull path runs. The test never calls `apply_result`.
     pull_only(&fixture.edge1_client).await;
     let applied = fabric::apply_pulled_results(&fixture.edge1.store).expect("apply sweep");
     assert_eq!(
@@ -131,11 +127,12 @@ async fn pulled_worker_result_materializes_memory_on_submitter() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_commits_the_worker_payload_and_never_re_extracts_on_the_submitter() {
+    let _alongside = crate::runs_alone::alongside_siblings();
     let fixture: FabricFixture = fabric_fixture("apply_payload_not_model").await;
 
     let digests = fabric::capture(
         &fixture.edge1.store,
-        FabricCapture::new(tier0_request("daily-loop", "s1", SESSION)),
+        FabricCapture::new(tier0_request("capture", "s1", SESSION)),
     )
     .expect("capture on submitter")
     .digest_ids;
@@ -153,9 +150,8 @@ async fn apply_commits_the_worker_payload_and_never_re_extracts_on_the_submitter
     .expect("worker poll");
     pull_only(&fixture.edge1_client).await;
 
-    // Apply on the submitter through a SPY extractor. Because the worker recorded a structured result,
-    // apply commits THAT payload and the submitter's model is never invoked — the fixed defect. If apply
-    // re-extracted (the old behavior), the spy would record a call.
+    // Applying a worker's structured result commits that payload without invoking the submitter's
+    // model. The spy records any unexpected extraction call.
     let submitter_spy = CountingExtractor::new();
     let job_id = fabric::job_id_for_digest(digest);
     let outcome = fabric::apply_result(&fixture.edge1.store, &job_id, &submitter_spy)
@@ -169,7 +165,7 @@ async fn apply_commits_the_worker_payload_and_never_re_extracts_on_the_submitter
         0,
         "apply committed the worker's structured output — the submitter's model was never invoked"
     );
-    let ctx = context_id(&fixture.edge1.store, "daily-loop").expect("context");
+    let ctx = context_id(&fixture.edge1.store, "capture").expect("context");
     assert!(
         memory_total(&fixture.edge1.store, ctx) > 0,
         "memory materialized from the worker payload, not from a submitter-side re-extraction"

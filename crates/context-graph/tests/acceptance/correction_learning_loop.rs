@@ -1,4 +1,4 @@
-// End-to-end learning-loop tests for the reopened cg-llm-client-refactor correction.
+// Repeated corrections teach skills that auto-apply and expose drift through persisted traces.
 //
 // These tests deliberately do not seed cg_learned_skills and do not call the pure promotion
 // helpers as proof. They drive the product path: real capture -> correction overlay +
@@ -64,7 +64,7 @@ fn run_repository_capture(store: &Store, context_label: &str) -> Entity {
             transcript: repository_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("repository capture must succeed");
@@ -319,7 +319,7 @@ fn repeated_real_corrections_promote_persisted_skill_then_run_capture_auto_appli
     assert!(
         !skills.is_empty(),
         "repeated real corrections through the correction entrypoint must promote and persist an \
-         auto-applying learned skill; current code logs lessons but leaves cg_learned_skills empty"
+         auto-applying learned skill in cg_learned_skills"
     );
 
     let skill = learned_repository_retype_skill(&skills).unwrap_or_else(|| {
@@ -340,7 +340,7 @@ fn repeated_real_corrections_promote_persisted_skill_then_run_capture_auto_appli
             transcript: repository_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("post-learning run_capture must succeed");
@@ -401,7 +401,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
             transcript: repository_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("co-fired no-op capture must succeed");
@@ -520,7 +520,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
                 // harvested type ("File") — same no-op-co-fire shape as `cofired_retype_skill_id`
                 // above: the skill is selected and fires (matches by description/scope) but never
                 // changes an entity, so it stays a real co-firing negative control. An
-                // effect-less rule would now be withheld under the fold-seam contract (an
+                // effect-less rule is withheld under the fold-seam contract (an
                 // apply-strategy row whose effect cannot be derived never fires), which would
                 // defeat this fixture's whole point.
                 rule: "when an entity named context-graph is typed Service → Module".to_string(),
@@ -545,7 +545,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
             transcript: repository_with_ingest_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("stale skill-fire capture must succeed");
@@ -566,7 +566,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
             transcript: repository_with_ingest_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("target skill-fire capture must succeed");
@@ -587,7 +587,7 @@ fn correction_after_capture_produced_skill_fire_labels_drift_without_direct_firi
             transcript: repository_with_ingest_transcript(),
             model_available: true,
         },
-        &super::refactor_extractor::SpanFaithfulExtractor,
+        &super::action_test_extractors::SpanFaithfulExtractor,
         &CaptureHarnessConfig::default(),
     )
     .expect("later skill-fire capture must succeed");
@@ -1124,7 +1124,7 @@ fn correction_after_chained_retype_labels_each_effect_that_changed_the_value() {
                 transcript: transcript.clone(),
                 model_available: true,
             },
-            &super::refactor_extractor::SpanFaithfulExtractor,
+            &super::action_test_extractors::SpanFaithfulExtractor,
             &CaptureHarnessConfig::default(),
         )
         .expect("chained retype capture must succeed");

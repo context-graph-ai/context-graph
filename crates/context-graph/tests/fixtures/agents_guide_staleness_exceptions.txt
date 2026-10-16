@@ -1,5 +1,5 @@
 # Crates exempt from "a change that edits crates/<crate>/src/ also updates
-# crates/<crate>/AGENTS.md", one crate name per line with the owner-approved reason after a `#`.
+# crates/<crate>/AGENTS.md", one crate name per line with the documented reason after a `#`.
 #
 # An exemption is a tracked line, never a silent skip: a reader can see which crate is exempt and
 # why, and deleting the line puts the crate back under the rule. Empty today on purpose.

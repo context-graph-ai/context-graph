@@ -1,4 +1,4 @@
-//! RED regressions for concurrent public interpretation runners.
+//! regression regressions for concurrent public interpretation runners.
 //!
 //! The mappers are the only barriers.  Each captures the durable claim made by a real runner;
 //! the control expires only that row through the existing test SQL seam.  No test invents a

@@ -70,7 +70,7 @@ fn insert_generation(store: &Store, context_id: uuid::Uuid, id: uuid::Uuid) {
                 ("started_at".into(), Value::TxId(TxId(1))),
             ]),
         )
-        .expect("seed derived generation through the declared test SQL seam");
+        .expect("seed derived generation through the declaBehavior tests SQL seam");
 }
 
 fn insert_passage(
@@ -100,7 +100,7 @@ fn insert_passage(
                 ("created_at".into(), Value::TxId(TxId(1))),
             ]),
         )
-        .expect("seed derived passage through the declared test SQL seam");
+        .expect("seed derived passage through the declaBehavior tests SQL seam");
 }
 
 fn receipt_rows(columns: &[String], rows: &[Vec<Value>]) -> Vec<(u64, String)> {

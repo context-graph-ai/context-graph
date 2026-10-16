@@ -1,58 +1,8 @@
-//! A bounded paged read that stops early must let go of its cursor.
+//! A bounded paged read releases its cursor when a fold refuses a page.
 //!
-//! ## The promise
-//!
-//! The bounded reading door exists so a status total on a huge store costs a page at a time and
-//! nothing more: "Only one page is ever held at a time: what a status total retains is its
-//! counters, not its input" (src/status_reads.rs:9). A caller is entitled to that on the paths
-//! where the read STOPS as much as on the paths where it finishes — a status that failed is exactly
-//! the moment a caller retries, and a retry that meets slots and snapshots left behind by the
-//! attempt before it is worse than the failure was.
-//!
-//! ## What is observed today
-//!
-//! `StatusReads::for_each_page` (src/status_reads.rs:130-148) closes its cursor on ONE path: the
-//! one where every page is folded successfully. `fold(&first.rows)?`, `cursor.fetch(None)?` and
-//! `fold(&page.rows)?` all return through `?` with the cursor still open, and contextdb's
-//! `ReadCursor` has no `Drop` — `close()` is a method a caller calls (read_session.rs:2795), which
-//! is why abandoning one is not a no-op. The cursor's slot and the snapshot it pins are held until
-//! the whole session goes away. `queue_counts_observed` reaches this on its ordinary error path:
-//! its fold runs two keyed reads and a work-ledger read, any of which can fail, and the digest
-//! scan's own cursor is abandoned when one does.
-//!
-//! ## What this file needs, and why it does not exist yet
-//!
-//! Nothing publicly reachable makes a status fold fail on demand, and nothing publicly reachable
-//! says what a reading session is still holding — `StatusReads` is `pub(crate)`. So this file is
-//! written against the seam that makes the promise checkable at all, and it does not compile until
-//! that seam exists. The shape asked for is the smallest one that puts no test logic in `src/`:
-//!
-//! ```text
-//! // crates/context-graph/src/status_reads.rs — the module is already `pub`
-//! pub struct StatusReads<'observer> { .. }          // was pub(crate)
-//! impl<'observer> StatusReads<'observer> {
-//!     pub fn open(store: &Store, observer: &'observer dyn StatusReadObserver) -> Result<Self>;
-//!     pub fn for_each_page(
-//!         &self,
-//!         statement: &str,
-//!         params: &HashMap<String, contextdb_core::Value>,
-//!         fold: impl FnMut(&[Vec<contextdb_core::Value>]) -> Result<()>,
-//!     ) -> Result<()>;
-//!
-//!     /// Cursors this session opened and has not closed.
-//!     ///
-//!     /// contextdb's `ReadCursor` has no `Drop`, so a cursor left behind on an error path holds
-//!     /// its slot and its snapshot until the session ends. This is the session's own count —
-//!     /// incremented where a cursor is opened, decremented where one is closed — so it needs no
-//!     /// engine test seam and stays true in an ordinary build.
-//!     pub fn open_cursors(&self) -> u64;
-//! }
-//! ```
-//!
-//! A narrower alternative, if the owner would rather not widen the reading door: keep
-//! `StatusReads` crate-private and add one `#[doc(hidden)]` helper that runs a paged read whose
-//! fold refuses a named page and reports the same count. This file pins the wider shape because it
-//! keeps the failing fold here, in the test, instead of in `src/`.
+//! `StatusReads::for_each_page` closes cursors on successful reads and on failures.
+//! The session's `open_cursors` count returns to zero after a refusal on the first page
+//! or a later page, allowing another bounded read through the same session.
 
 use std::collections::HashMap;
 
@@ -108,7 +58,7 @@ fn fixture() -> (tempfile::TempDir, Store, ContextId) {
             chunk_window: CHUNK_WINDOW,
         },
     )
-    .expect("tier-0 capture of the fixture");
+    .expect("model-free capture of the fixture");
 
     let context_id = store
         .list_contexts()
@@ -215,6 +165,6 @@ fn a_session_that_survived_a_failed_fold_can_still_read() {
     assert_eq!(
         reads.open_cursors(),
         0,
-        "a read that finished closes its cursor, which is the path that already works today"
+        "a successful read closes its cursor"
     );
 }

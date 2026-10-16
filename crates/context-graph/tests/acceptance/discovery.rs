@@ -1900,7 +1900,7 @@ fn by_intention_excludes_cross_context_decision_even_when_raw_edge_links_anchor(
     assert!(!rows.iter().any(|row| row.id == db.id));
 }
 
-// A reviewer asking what touches an Entity needs BASED_ON and ABOUT Decisions, with duplicates collapsed.
+// A reader asking what touches an Entity needs BASED_ON and ABOUT Decisions, with duplicates collapsed.
 #[test]
 fn by_entity_returns_connected_decisions_active_only() {
     let (_tempdir, db_path, store) = fixture();
@@ -2921,7 +2921,7 @@ fn by_entity_supersedes_chain_does_not_cross_anchor() {
 
 // A reader racing a supersede sees either the old active set or the new active set, never both.
 #[test]
-#[ignore = "contextdb a5f5b3a: four-subquery graph query overflows a 2 MiB thread; upstream gap 10"]
+#[ignore = "contextdb a5f5b3a: four-subquery graph query overflows a 2 MiB thread; the query exceeds the thread stack"]
 fn discovery_pull_side_returns_consistent_view_under_concurrent_writer() {
     assert_contextdb_pinned_discovery_graph_composition();
 
@@ -3203,7 +3203,7 @@ fn by_entity_intention_dedups_when_decision_has_multi_edges_to_same_entity() {
     assert_eq!(rows[0].id, i.id);
 }
 
-// A reviewer iterating changed Entities should see a multi-Entity Decision for each anchor.
+// A reader iterating changed Entities should see a multi-Entity Decision for each anchor.
 #[test]
 fn by_entity_decision_state_bleed_across_entity_queries() {
     let (_tempdir, db_path, store) = fixture();

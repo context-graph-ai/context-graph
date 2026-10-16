@@ -1,10 +1,9 @@
-//! Acceptance tests for WP2 apply layer 1 — the generalized post-generation repair effects.
+//! Acceptance tests for  apply layer 1 — the generalized post-generation repair effects.
 //!
 //! Beyond entity retype, a learned skill can recategorize a decision's `decision_type`, drop a
 //! wrongly-captured item, or add a tag — applied deterministically post-harvest on the same capture
 //! seam as retype. A skill this build cannot run (an unknown apply strategy) is withheld verbatim,
-//! never coerced, and capture proceeds unchanged. Matching is literal-text keyed (identity-based
-//! matching is a named deferred item).
+//! never coerced, and capture proceeds unchanged. Matching is literal-text keyed.
 
 use context_graph::ingest::{
     CaptureRequest, ConversationExtractor, DecisionSeed, ExtractionRequest, GoalSeed,

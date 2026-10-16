@@ -76,7 +76,7 @@ fn transcript() -> String {
     text
 }
 
-/// The work-ledger job id tier-0 capture submits for a digest.
+/// The work-ledger job id model-free capture submits for a digest.
 fn understanding_job_id(digest: DigestId) -> String {
     format!("cg.understanding.{}", digest.as_uuid())
 }
@@ -102,7 +102,7 @@ fn fill(store: &Store) -> MixedStore {
             chunk_window: CHUNK_WINDOW,
         },
     )
-    .expect("tier-0 capture of the queued digests");
+    .expect("model-free capture of the queued digests");
     assert_eq!(
         (
             report.chunks_kept,
@@ -116,7 +116,7 @@ fn fill(store: &Store) -> MixedStore {
     assert_eq!(
         queued.len(),
         CAPTURED_DIGESTS,
-        "tier-0 writes one digest per kept chunk"
+        "model-free writes one digest per kept chunk"
     );
 
     let context_id = store

@@ -1,10 +1,8 @@
 //! A caller choosing to store a passage for later retrieval and a caller searching for one must
 //! never be able to reach the wrong role by accident. `EventHistoryTextEmbedder` offers the
 //! explicit `prepare_document`/`embed_prepared_document` and `prepare_query`/`embed_prepared_query`
-//! entrypoints on `&dyn Embedder` for exactly that reason. Plain `Embedder::embed(Text)` on this
-//! wrapper names neither role, so it must refuse rather than silently pick one — an engineering
-//! decision that once silently defaulted to the document role was withdrawn as an unauthorized
-//! default (review finding, absorbed as a behavior-change reversion).
+//! entrypoints through `EventSearchEmbedder` for exactly that reason. Plain `Embedder::embed(Text)`
+//! on this wrapper names neither role, so it refuses rather than silently picking one.
 
 use std::sync::Arc;
 

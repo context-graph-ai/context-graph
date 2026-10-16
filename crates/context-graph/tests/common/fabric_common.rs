@@ -1,4 +1,4 @@
-//! Test-support harness for the fabric first-light acceptance tests.
+//! Test-support harness for the fabric  acceptance tests.
 //!
 //! Every fabric test runs against a real authenticated, ticketed Iroh hub and two production
 //! `SyncClient` edges with persisted identities. Claim exclusivity, conflict attribution, and
@@ -325,7 +325,7 @@ pub fn acquire_worker_lock_at(
     context_graph::fabric::acquire_worker_lock(data_root)
 }
 
-/// Build a tier-0 capture request for the fabric tests.
+/// Build a model-free capture request for the fabric tests.
 pub fn tier0_request(context: &str, session: &str, transcript: &str) -> Tier0CaptureRequest {
     Tier0CaptureRequest {
         context_label: context.to_string(),

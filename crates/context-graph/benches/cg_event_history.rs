@@ -10,7 +10,7 @@
 //!
 //! Events are appended through the public `Store::append_event_batch`. The derived projection rows
 //! (generation, passages with their 768-d vectors, embedding handles, source links, head) are
-//! written through the Store's declared test SQL seam `Store::execute_sql_for_test`, column for
+//! written through the Store's declaBehavior tests SQL seam `Store::execute_sql_for_test`, column for
 //! column as the projection commit writes them. By default the passage vectors are random unit
 //! directions, because 100,000 real passage inferences are not what the latency proofs measure;
 //! the search-quality proof stores each passage's real Nomic document embedding instead (same
@@ -720,9 +720,8 @@ mod fixture {
         pub sample_passages: Vec<(ContextId, EventSearchPassageId)>,
     }
 
-    /// Where a fixture's passage vectors come from. The original random and Nomic modes retain
-    /// their passage texts, Context distribution and seeds; representative has its own vector
-    /// layout and held-out query set.
+    /// Where a fixture's passage vectors come from. Random and Nomic modes share passage texts,
+    /// Context distribution and seeds; representative has its own vector layout and held-out queries.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum Embedding {
         /// Random unit 768-d directions (`random-unit-768`): cheap, and fine for timing, but its
@@ -770,8 +769,7 @@ mod fixture {
             }
         }
 
-        /// The fixture directory name: the synthetic name is unchanged, so fixtures already
-        /// sealed on disk keep being reused.
+        /// The fixture directory name identifies the vector source for reuse of sealed fixtures.
         fn dir_name(self, total_passages: usize, context_count: usize, epp: usize) -> String {
             match self {
                 Self::Synthetic => format!("P{total_passages}-K{context_count}-E{epp}"),
@@ -1049,7 +1047,7 @@ mod fixture {
             representative::verify_files(dir);
         }
         let manifest: serde_json::Value = serde_json::from_str(&raw).expect("fixture manifest");
-        // Manifests sealed before the embedding was recorded hold synthetic vectors.
+        // Manifests without an embedding field hold synthetic vectors.
         let sealed = manifest["embedding"].as_str().unwrap_or("synthetic");
         assert_eq!(
             sealed,
@@ -4498,7 +4496,7 @@ mod binding {
             declared_files("", table, &mut files);
             files
         } else {
-            // A directly installed Nomic artifact predates the optional catalog sidecar.
+            // A directly installed Nomic artifact need not have the optional catalog sidecar.
             [
                 "REVISION",
                 "config.json",
@@ -4763,7 +4761,7 @@ mod gate {
             // Every required scope and mode must have mean distance evaluations strictly below
             // EXACT over its fixed paired query set. The single-Context cell must also walk the
             // maintained graph on every query and be faster than EXACT at p95; a several-Context
-            // scope must be no slower than EXACT at p95 (the exact-route exception is withdrawn).
+            // scope must be no slower than EXACT at p95.
             if mode.queries.is_empty() {
                 failures.push(format!("{label} {name}: no paired distance-work samples"));
             } else if !mean_work_below_exact(&mode.queries) {

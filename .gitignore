@@ -1,1 +1,7 @@
 target/
+
+.claude
+*.fabric-identity.key
+*.ticket
+book/
+/llms-full.txt

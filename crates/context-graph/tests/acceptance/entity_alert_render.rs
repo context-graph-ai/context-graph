@@ -39,7 +39,7 @@ fn vector(axis: usize) -> Vec<f32> {
 fn scenario() -> Scenario {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::open(StoreConfig {
-        db_path: dir.path().join("school-gate.db"),
+        db_path: dir.path().join("entry.db"),
         extra_embedding_spaces: vec![EmbeddingSpaceDecl {
             embedding_space_id: FACE_REID_SPACE.to_string(),
             dimension: 512,
@@ -60,7 +60,7 @@ fn scenario() -> Scenario {
     .expect("store opens");
     let context = store
         .create_context(CreateContext {
-            name: "school-gate".to_string(),
+            name: "entry".to_string(),
             labels: Vec::new(),
             properties: BTreeMap::new(),
         })
@@ -68,7 +68,7 @@ fn scenario() -> Scenario {
     let intention = store
         .create_intention(CreateIntention {
             id: None,
-            description: "trust Kumar at 8 AM".to_string(),
+            description: "trust Alex at 8 AM".to_string(),
             status: IntentionStatus::Active,
             origin: IntentionOrigin::Human,
             context_id: context.id,
@@ -80,7 +80,7 @@ fn scenario() -> Scenario {
     let entity = store
         .create_entity(CreateEntity {
             entity_type: EntityType::Person,
-            name: "Kumar".to_string(),
+            name: "Alex".to_string(),
             properties: BTreeMap::new(),
             tags: vec!["student:primary-guardian-approved".to_string()],
             context_id: context.id,
@@ -89,16 +89,16 @@ fn scenario() -> Scenario {
     let detected_entity = store
         .create_entity(CreateEntity {
             entity_type: EntityType::Person,
-            name: "unidentified person at school gate".to_string(),
+            name: "unidentified person at entry".to_string(),
             properties: BTreeMap::from([("track".to_string(), serde_json::json!("gate-42"))]),
-            tags: vec!["school-gate-live-detection".to_string()],
+            tags: vec!["entry-live-detection".to_string()],
             context_id: context.id,
         })
         .expect("live detection track");
     let decision = store
         .create_decision(CreateDecision {
             decision_type: "access-control".to_string(),
-            description: "trust Kumar at 8 AM".to_string(),
+            description: "trust Alex at 8 AM".to_string(),
             confidence: Some(0.91),
             intention_ids: vec![intention.id],
             based_on_entity_ids: vec![entity.id],
@@ -122,13 +122,13 @@ fn live_face_observation(scenario: &Scenario, axis: usize) -> RecordObservation 
         id: context_graph::ObservationId::new_v7(),
         entity_id: scenario.detected_entity_id,
         context_id: scenario.context_id,
-        observation_type: "school-gate-camera".to_string(),
+        observation_type: "entry-camera".to_string(),
         source: "gate-camera".to_string(),
         observed_at: Utc::now(),
         evidence: vec![EvidenceRef {
             id: evidence_id,
             kind: EvidenceKind::ImageFrame,
-            source_ref: "vigil-edge://camera/gate/frame/42".to_string(),
+            source_ref: "s3://camera/gate/frame/42".to_string(),
             mime_type: Some("image/jpeg".to_string()),
             retention_status: RetentionStatus::RetainedExternal,
             producer: face_producer("detector-v1"),
@@ -166,7 +166,7 @@ fn invalidation_carries_entity_aware_no_match_payload(
         .iter()
         .flat_map(|divergence| &divergence.value_diffs)
     {
-        if diff.field == "entity_name" && diff.current_value == Some(serde_json::json!("Kumar")) {
+        if diff.field == "entity_name" && diff.current_value == Some(serde_json::json!("Alex")) {
             entity_name = true;
         }
         if diff.field == "entity_id"
@@ -185,7 +185,7 @@ fn invalidation_carries_entity_aware_no_match_payload(
 }
 
 #[test]
-fn whatsapp_message_body_distinguishes_known_entity_from_unknown_at_school_gate() {
+fn alert_message_body_distinguishes_known_entity_from_unknown_at_entry() {
     let scenario = scenario();
     let enrollment = scenario.store.enroll_entity_reference(
         scenario.entity_id,
@@ -206,7 +206,7 @@ fn whatsapp_message_body_distinguishes_known_entity_from_unknown_at_school_gate(
         .as_ref()
         .ok()
         .and_then(|rows| rows.first())
-        .map(|row| scenario.store.render_school_gate_message_body(row.id));
+        .map(|row| scenario.store.render_entity_alert_message_body(row.id));
 
     assert!(
         enrollment.is_ok()
@@ -228,11 +228,11 @@ fn whatsapp_message_body_distinguishes_known_entity_from_unknown_at_school_gate(
                             live_space
                         },
                 })) if *entity_id == scenario.entity_id
-                    && entity_name == "Kumar"
+                    && entity_name == "Alex"
                     && reference_space == FACE_REID_SPACE
                     && live_space == FACE_REID_SPACE
             )
             && !matches!(&message, Some(Ok(MessageBody::ClassOnlyDetection { .. }))),
-        "school-gate alert must come from the persisted no-match invalidation payload and be entity-aware, enrollment={enrollment:?}, observation={observation:?}, invalidations={invalidations:?}, message={message:?}"
+        "entry alert must come from the persisted no-match invalidation payload and be entity-aware, enrollment={enrollment:?}, observation={observation:?}, invalidations={invalidations:?}, message={message:?}"
     );
 }
