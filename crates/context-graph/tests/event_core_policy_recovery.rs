@@ -621,12 +621,16 @@ async fn unbound_store_exposes_only_bootstrap_and_binding_publishes_the_complete
         EventPlacementState::TenantHubUnbound
     );
     assert!(reopened.sync_database().table_meta("contexts").is_none());
-    assert!(matches!(
-        ConsumerReader::open(&db_path, ConsumerDeclaration::default()),
-        Err(CgError::TenantPolicyBindingRequired {
-            expected: EventPlacementPolicy::TenantHub,
-        })
-    ));
+    let result = ConsumerReader::open(&db_path, ConsumerDeclaration::default());
+    assert!(
+        matches!(
+            &result,
+            Err(CgError::TenantPolicyBindingRequired {
+                expected: EventPlacementPolicy::TenantHub,
+            })
+        ),
+        "ConsumerReader::open returned {result:?}"
+    );
 
     let hub = authenticated_hub("ready", "AFTER OUTCOME").await;
     let client = bind(&reopened, &hub, "AFTER OUTCOME").await;

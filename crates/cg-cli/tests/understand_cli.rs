@@ -25,7 +25,7 @@ fn graph_snapshot(harness: &CliHarness, context: &str) -> (Vec<String>, Vec<Stri
         .or_else(|| json.pointer("/store_path"))
         .or_else(|| json.pointer("/db_path"))
         .and_then(JsonValue::as_str)
-        .expect("db path");
+        .unwrap_or_else(|| panic!("db path absent from status JSON: {json}"));
     let db = Database::open(db_path).expect("open store");
     let snapshot = db.snapshot();
     let column = |table: &str, column: &str| -> Vec<String> {

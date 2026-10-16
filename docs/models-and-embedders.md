@@ -71,7 +71,7 @@ Event-history queries refuse text-default candidates even when both dimensions a
 
 Text-default queries also refuse event-history candidates. <!-- enforced by: `dedicated_event_search_space_refuses_old_unlabelled_space_comparison` -->
 
-The ordinary Nomic embedding path retains its artifact-bound golden vectors. <!-- enforced by: `event_search_uses_role_preparation_while_digest_record_and_evidence_paths_remain_byte_for_byte_unchanged` -->
+The ordinary Nomic embedding path retains exact model, tokenizer and fixture bindings; real vectors are compared within an explicit roundoff envelope across hosts, and same-host role-path vectors remain exactly equal. <!-- enforced by: `event_search_uses_role_preparation_while_digest_record_and_evidence_paths_remain_byte_for_byte_unchanged` -->
 
 An embedder that declares event-search capability but does not implement preparation returns `EventSearchPreparationUnsupported` for document preparation. <!-- enforced by: `an_embedder_that_declares_the_capability_without_implementing_preparation_answers_unsupported_and_never_delegates_to_plain_embed` -->
 

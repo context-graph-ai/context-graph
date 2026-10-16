@@ -195,7 +195,10 @@ fn apply(command: &mut Command, location: RuntimeLocation<'_>) {
             command.env(RUNTIME_DIR_ENV, root);
         }
         RuntimeLocation::PlatformLocator(root) => {
+            #[cfg(not(target_os = "macos"))]
             command.env("XDG_RUNTIME_DIR", root);
+            #[cfg(target_os = "macos")]
+            let _ = root;
         }
     }
 }

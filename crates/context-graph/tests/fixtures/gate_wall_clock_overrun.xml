@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" failures="0" errors="0">
+    <testsuite name="context-graph::test_estate_audit" tests="2" failures="0" errors="0">
+        <testcase name="one" classname="context-graph::test_estate_audit" time="119.5">
+        </testcase>
+        <testcase name="two" classname="context-graph::test_estate_audit" time="0.5">
+        </testcase>
+    </testsuite>
+</testsuites>

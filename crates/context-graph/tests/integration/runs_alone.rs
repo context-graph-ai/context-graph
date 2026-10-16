@@ -3,7 +3,8 @@
 //! The reindex test that bounds how many rows the scan reads while 24 writers race it
 //! (`reindex::reindex_concurrent_writes_during_reindex_window_land_in_target_space_deterministically`)
 //! fails its read budget when other tests in this process run alongside it. nextest already
-//! runs it alone through the `runs-alone` test group in `.config/nextest.toml`; plain
+//! reserves its entire actual test pool with `threads-required = "num-test-threads"`
+//! in `.config/nextest.toml`; plain
 //! `cargo test` has no test groups, so this binary carries its own process-wide lock instead.
 //! That test holds the lock exclusively; every other test in this binary holds it shared for its
 //! whole body, so the exclusive holder never overlaps any of them at any `--test-threads` count.

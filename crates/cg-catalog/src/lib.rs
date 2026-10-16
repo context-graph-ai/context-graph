@@ -733,6 +733,7 @@ impl Catalog {
                 | FetchResult::AlreadyCached
                 | FetchResult::AlreadyCachedByConcurrentWinner,
             ) => {
+                let _lock = self.lock_model(NOMIC_ID)?;
                 let artifact_sha =
                     sha256_file(&self.model_dir(NOMIC_ID).join("model.safetensors"))?;
                 summary.fetched.push(FetchedEntry {
@@ -787,7 +788,7 @@ impl Catalog {
                 missing_files: missing,
             });
         }
-        validate_artifact_identity(id, &self.model_dir(id))?;
+        validate_artifact_identity_locked(id, &self.model_dir(id))?;
         let actual = sha256_file(&self.model_dir(id).join("model.safetensors"))?;
         let source = self.source_override(id)?;
         let expected = expected_model_shas(
@@ -865,8 +866,26 @@ impl Catalog {
             return Err(CgCatalogError::NotFound);
         };
 
-        let complete_before = self.cache_complete(id)?;
-        if spec.requires_manual_acceptance && !self.acceptance_recorded_for_scope(id)? {
+        // Preflight is a complete snapshot too: it must not inspect a live partial replacement
+        // or admit an abandoned writer before the later fetch lock is taken.
+        let lock_existed_before = self.model_dir(id).join(".lock").exists();
+        let (complete_before, accepted, waited) = {
+            let (_lock, waited) = lock_artifact_dir_with_wait(id, &self.model_dir(id), || {
+                // Keep first-touch progress visible while an Apache-model fetch waits for
+                // the cache lock. License-gated fetches must first inspect acceptance.
+                if !spec.requires_manual_acceptance {
+                    self.emit_progress(&spec, &output_mode)?;
+                }
+                Ok(())
+            })?;
+            let complete = self.cache_complete(id)?;
+            let accepted = self.acceptance_recorded_for_scope(id)?;
+            if !complete && (!spec.requires_manual_acceptance || accepted) {
+                self.validate_existing_cache_before_fetch(id)?;
+            }
+            (complete, accepted, waited)
+        };
+        if spec.requires_manual_acceptance && !accepted {
             if sync_arrival {
                 let canonical_message = canonical_install_message(&self.entry_for_spec(spec)?);
                 if let Some(store) = store {
@@ -883,10 +902,7 @@ impl Catalog {
             });
         }
         if complete_before {
-            if sync_arrival
-                && !spec.requires_manual_acceptance
-                && self.model_dir(id).join(".lock").exists()
-            {
+            if waited || (sync_arrival && !spec.requires_manual_acceptance && lock_existed_before) {
                 return Ok(FetchResult::AlreadyCachedByConcurrentWinner);
             }
             return Ok(if spec.requires_manual_acceptance {
@@ -896,9 +912,9 @@ impl Catalog {
             });
         }
 
-        self.validate_existing_cache_before_fetch(id)?;
-
-        self.emit_progress(&spec, &output_mode)?;
+        if !waited || spec.requires_manual_acceptance {
+            self.emit_progress(&spec, &output_mode)?;
+        }
         let lock = self.lock_model(id)?;
         if self.cache_complete(id)? {
             drop(lock);
@@ -933,6 +949,7 @@ impl Catalog {
             if spec.requires_manual_acceptance && self.source_override(spec.id)?.is_none() {
                 continue;
             }
+            let lock = self.lock_model(spec.id)?;
             let current_revision = self
                 .revision_on_disk(spec.id)
                 .or_else(|| self.existing_catalog_entity_revision(store, spec.id))
@@ -942,6 +959,7 @@ impl Catalog {
                 continue;
             }
             if spec.requires_manual_acceptance {
+                drop(lock);
                 if matches!(policy, UpdatePolicy::Auto) {
                     observations.push(self.record_update_observation(
                         store,
@@ -960,10 +978,9 @@ impl Catalog {
             }
             let applied = matches!(policy, UpdatePolicy::Auto);
             if applied {
-                let lock = self.lock_model(spec.id)?;
                 self.fetch_to_temp_and_publish_with_revision(spec.clone(), &upstream_revision)?;
-                drop(lock);
             }
+            drop(lock);
             let revision_coupled_fixtures = revision_coupled_fixtures(spec.id);
             let release_notes_url = spec
                 .source_repo
@@ -1429,13 +1446,13 @@ impl Catalog {
             return Ok(());
         }
         if !has_manifest && self.artifact_files_present(id) {
-            return validate_artifact_identity(id, &model_dir);
+            return validate_artifact_identity_locked(id, &model_dir);
         }
         let missing_files = self.missing_files(id);
         if !missing_files.is_empty() {
             return Err(CgCatalogError::CacheIncomplete { missing_files });
         }
-        validate_artifact_identity(id, &model_dir)
+        validate_artifact_identity_locked(id, &model_dir)
     }
 
     /// An explicit fetch may adopt a complete, identity-valid local cache into catalog metadata.
@@ -1445,7 +1462,7 @@ impl Catalog {
         if self.manifest_path(spec.id).is_file() || !self.artifact_files_present(spec.id) {
             return Ok(false);
         }
-        validate_artifact_identity(spec.id, &model_dir)?;
+        validate_artifact_identity_locked(spec.id, &model_dir)?;
         let revision = self
             .source_override(spec.id)?
             .map(|source| source.revision)
@@ -1514,16 +1531,29 @@ impl Catalog {
         let model_dir = self.model_dir(spec.id);
         let shas = shas_from_artifact_dir(temp_dir)?;
         fs::create_dir_all(&model_dir).map_err(|err| io_error(&model_dir, err))?;
-        for file in [
-            "model.safetensors",
-            "tokenizer.json",
-            "config.json",
-            "REVISION",
-        ] {
+        // The caller holds .lock. Both catalog and direct Nomic admission reject either
+        // publisher's pending marker. Never clear somebody else's abandoned publication.
+        refuse_unfinished_publication(spec.id, &model_dir)?;
+        let pending = model_dir.join(".catalog-publication");
+        let marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)
+            .map_err(|err| io_error(&pending, err))?;
+        drop(marker);
+        for (index, file) in ARTIFACT_FILES.into_iter().enumerate() {
             replace_file(&temp_dir.join(file), &model_dir.join(file))?;
+            #[cfg(test)]
+            shared_publication_tests::after_replace(index)?;
+            #[cfg(not(test))]
+            let _ = index;
         }
         self.write_manifest(spec, revision, source, &shas)?;
-        clean_dir(temp_dir)?;
+        // Removing this marker commits the complete artifacts AND their catalog metadata.
+        // Errors or process termination before here deliberately leave admission closed.
+        fs::remove_file(&pending).map_err(|err| io_error(&pending, err))?;
+        // Cleanup after commit must not report a failed publication.
+        let _ = clean_dir(temp_dir);
         Ok(())
     }
 
@@ -1927,6 +1957,7 @@ impl Catalog {
         entity_key: &str,
     ) -> Result<()> {
         let (name, properties, tags) = if let Some(spec) = spec_by_id(entity_key) {
+            let _lock = self.lock_model(spec.id)?;
             let properties = BTreeMap::from([
                 ("model_id".to_string(), json!(spec.id)),
                 ("kind".to_string(), json!(format!("{:?}", spec.kind))),
@@ -2246,19 +2277,7 @@ impl Catalog {
     }
 
     fn lock_model(&self, id: &str) -> Result<File> {
-        let lock_path = self.model_dir(id).join(".lock");
-        fs::create_dir_all(lock_path.parent().expect("lock path has parent"))
-            .map_err(|err| io_error(&lock_path, err))?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|err| io_error(&lock_path, err))?;
-        file.lock_exclusive()
-            .map_err(|err| io_error(&lock_path, err))?;
-        Ok(file)
+        lock_artifact_dir(id, &self.model_dir(id))
     }
 
     fn cache_dirs(&self) -> Result<Vec<PathBuf>> {
@@ -2291,6 +2310,7 @@ impl Catalog {
     }
 
     fn model_revision_for_runtime(&self, id: &str) -> Result<String> {
+        let _lock = self.lock_model(id)?;
         Ok(self
             .revision_on_disk(id)
             .or(self.source_override(id)?.map(|source| source.revision))
@@ -2461,6 +2481,21 @@ fn canonical_license_gate_message(entry: &CatalogEntry) -> String {
 }
 
 pub fn validate_artifact_identity(model_id: &str, cache_dir: &Path) -> Result<()> {
+    spec_by_id(model_id).ok_or(CgCatalogError::NotFound)?;
+    if !cache_dir
+        .try_exists()
+        .map_err(|err| io_error(cache_dir, err))?
+    {
+        return Err(CgCatalogError::CacheIncomplete {
+            missing_files: vec![ARTIFACT_FILES[0].to_string()],
+        });
+    }
+    let _lock = lock_artifact_dir(model_id, cache_dir)?;
+    validate_artifact_identity_locked(model_id, cache_dir)
+}
+
+// Caller holds the persistent .lock through every artifact and manifest read.
+fn validate_artifact_identity_locked(model_id: &str, cache_dir: &Path) -> Result<()> {
     let spec = spec_by_id(model_id).ok_or(CgCatalogError::NotFound)?;
     let revision = fs::read_to_string(cache_dir.join("REVISION"))
         .ok()
@@ -3364,3 +3399,61 @@ fn store_error(path: &Path, err: CgError) -> CgCatalogError {
 pub fn default_cache_root() -> PathBuf {
     context_graph::embedder::nomic::default_cache_root()
 }
+
+// These on-disk names are shared with the bundled Nomic loader. A killed catalog writer
+// has no rollback guarantee; a killed Nomic writer retains its existing rollback journal.
+// Neither owner replays or discards abandoned state over a potentially newer installation.
+fn refuse_unfinished_publication(model_id: &str, model_dir: &Path) -> Result<()> {
+    for name in [".catalog-publication", ".nomic-rollback/READY"] {
+        let pending = model_dir.join(name);
+        if pending
+            .try_exists()
+            .map_err(|err| io_error(&pending, err))?
+        {
+            return Err(CgCatalogError::SourceUnavailable {
+                model_id: model_id.to_string(),
+                message: format!(
+                    "cache has an unfinished publication at {}",
+                    pending.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn lock_artifact_dir(model_id: &str, model_dir: &Path) -> Result<File> {
+    lock_artifact_dir_with_wait(model_id, model_dir, || Ok(())).map(|(file, _)| file)
+}
+
+fn lock_artifact_dir_with_wait(
+    model_id: &str,
+    model_dir: &Path,
+    on_wait: impl FnOnce() -> Result<()>,
+) -> Result<(File, bool)> {
+    let lock_path = model_dir.join(".lock");
+    fs::create_dir_all(model_dir).map_err(|err| io_error(&lock_path, err))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|err| io_error(&lock_path, err))?;
+    let waited = match FileExt::try_lock_exclusive(&file) {
+        Ok(true) => false,
+        Ok(false) => {
+            on_wait()?;
+            file.lock_exclusive()
+                .map_err(|err| io_error(&lock_path, err))?;
+            true
+        }
+        Err(err) => return Err(io_error(&lock_path, err)),
+    };
+    refuse_unfinished_publication(model_id, model_dir)?;
+    Ok((file, waited))
+}
+
+#[cfg(test)]
+#[path = "../tests/support/shared_publication.rs"]
+mod shared_publication_tests;

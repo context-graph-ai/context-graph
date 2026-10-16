@@ -46,3 +46,10 @@
 - [cg-selftest](../skills/cg-selftest/SKILL.md)
 - [cg-show](../skills/cg-show/SKILL.md)
 - [cg-status](../skills/cg-status/SKILL.md)
+
+## Contributing
+
+<!-- concept -->
+- [Continuous integration](../.github/CI.md)
+- [CI rules for agents](../.github/AGENTS.md)
+- [Performance measurement](performance/README.md)

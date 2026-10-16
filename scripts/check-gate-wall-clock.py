@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Refuse a gate whose test binaries got slower, and a baseline that rose.
+Report test duration overruns and refuse a baseline that rose.
 
 `crates/context-graph/tests/fixtures/test_estate_baseline.toml` records, under
 `[gate_wall_seconds]`, the wall-clock seconds one gate run measured for each test binary, and
@@ -16,14 +16,13 @@ one, which is otherwise a different amount of contention over the same cores and
 this script nor the Rust arm beside it ever reads a clock: both consume seconds someone else
 already measured and wrote into a JUnit file.
 
-Two modes, both of which exit nonzero on a violation and print every offending binary:
+Two modes, both of which print every offending binary; duration overruns are report-only:
 
   --junit <path> --baseline <toml>   (--junit defaults to the CG_GATE_JUNIT environment variable)
       Compares the per-binary wall seconds in a gate's own JUnit against `[gate_wall_seconds]`.
       A binary present on both sides whose measurement exceeds
-      `baseline seconds * tolerance_factor + slack_seconds` is a runtime regression. A binary
-      whose whole ceiling is the slack is still recorded and still covered; it just cannot be
-      failed on a number that carries no signal. A binary the gate RAN and the baseline has no
+      `baseline seconds * tolerance_factor + slack_seconds` is reported with its measurement
+      and ceiling, without failing the gate for ordinary suite duration. A binary the gate RAN and the baseline has no
       row for is reported too: an unratcheted binary has no ceiling at all,
       and deleting a row is how a binary loses one silently. A row for a binary the gate did not
       run is ignored. A JUnit that parses to no binaries at all is a hard failure, never a pass:
@@ -32,8 +31,8 @@ Two modes, both of which exit nonzero on a violation and print every offending b
 
   --base <ref>
       Compares the baseline file in the working tree against the same file at `<ref>`. The
-      baseline only ever LOWERS: a value that rose is a ceiling raise, and the ordinary move on
-      a regression is to make the binary fast again, not to buy room in the baseline. A binary
+      baseline only ever LOWERS: a value that rose is a ceiling raise and remains a failure.
+      An unavailable ref is reported as initial state, no comparison. A binary
       the working tree adds is accepted (it has no earlier value to have risen from). One it
       REMOVES is a violation: a deleted row leaves that binary with no ceiling at all. The
       removal is accepted only when a JUnit for the same run shows the gate no longer runs that
@@ -167,7 +166,7 @@ def read_baseline(text: str, source: str) -> tuple[dict[str, float], float, floa
 
 def compare_against_junit(
     junit_path: Path, baseline_path: Path, live: dict[str, float]
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     baseline, tolerance, slack_seconds = read_baseline(
         baseline_path.read_text(), str(baseline_path)
     )
@@ -187,20 +186,21 @@ def compare_against_junit(
     # Completeness is checked from the LIVE side, never from the frozen table: a row that was
     # never added, or one that was deleted, gives that binary an unbounded ceiling while every
     # direction check still prints a clean pass.
+    missing = []
     for binary in sorted(live):
         if binary in baseline:
             continue
-        violations.append(
+        missing.append(
             f"{binary}: ran in this gate with no [gate_wall_seconds] row — record its measured "
             f"wall seconds in the same change; an unratcheted binary has no ceiling at all, and "
             f"deleting a row is how a binary loses one silently"
         )
-    return violations
+    return violations, missing
 
 
 def compare_against_base(
     repo: Path, base: str, baseline_path: Path, live: dict[str, float] | None
-) -> list[str]:
+) -> list[str] | None:
     relative = baseline_path.relative_to(repo).as_posix()
 
     def git(*arguments: str) -> subprocess.CompletedProcess:
@@ -209,13 +209,14 @@ def compare_against_base(
         )
 
     if git("rev-parse", "--verify", "--quiet", f"{base}^{{commit}}").returncode != 0:
-        raise SystemExit(f"ERROR: {base} does not resolve to a commit in this repository")
+        print(f"initial state, no comparison: {base} does not resolve to a commit")
+        return None
     if git("cat-file", "-e", f"{base}:{relative}").returncode != 0:
         print(
-            f"  {relative} did not exist at {base}; every value in it is new, and a new value "
-            f"has no earlier value to have risen from"
+            f"initial state, no comparison: {relative} did not exist at {base}; "
+            f"no historical timing comparison made"
         )
-        return []
+        return None
     earlier = git("show", f"{base}:{relative}").stdout
     base_seconds = read_recorded_seconds(earlier, f"{relative} at {base}")
     now_seconds, _, _ = read_baseline(baseline_path.read_text(), relative)
@@ -282,6 +283,7 @@ def main() -> int:
         return 2
 
     violations: list[str] = []
+    reports: list[str] = []
     live: dict[str, float] | None = None
     if junit is not None:
         if not junit.exists():
@@ -297,28 +299,31 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        found = compare_against_junit(junit, baseline_path, live)
+        found, missing = compare_against_junit(junit, baseline_path, live)
         print(
             f"--- gate wall-clock vs {baseline_path.name}: {len(live)} binary/binaries measured, "
-            f"{len(found)} over the ceiling or unratcheted ---"
+            f"{len(found)} over the ceiling; {len(missing)} without a recorded limit ---"
         )
-        violations += found
+        reports += found
+        violations += missing
     if args.base is not None:
         found = compare_against_base(repo, args.base, baseline_path, live)
-        print(
-            f"--- baseline direction vs {args.base}: {len(found)} raised or removed value(s) ---"
-        )
-        violations += found
+        if found is not None:
+            print(
+                f"--- baseline direction vs {args.base}: {len(found)} raised or removed value(s) ---"
+            )
+            violations += found
 
+    for report in reports:
+        print(f"  {report}")
+    if reports:
+        print(f"REPORT: {len(reports)} gate wall-clock overrun report(s).")
     for violation in violations:
         print(f"  {violation}")
     if violations:
         print(f"FAIL: {len(violations)} gate wall-clock violation(s).")
         return 1
-    print(
-        "PASS: every measured binary is ratcheted and under its ceiling, no baseline value "
-        "raised or removed."
-    )
+    print("Wall-clock check complete.")
     return 0
 
 

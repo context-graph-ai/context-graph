@@ -54,7 +54,12 @@ Hosted understanding uses user-chosen provider credentials; read [privacy](docs/
 
 Preserve public behavior and compatibility in the linked docs. [CONTRIBUTING.md](CONTRIBUTING.md)
 describes the full `scripts/gate.sh` gate, claim bindings, deterministic test-estate checks,
-recorded test-duration limits, and live smokes. A crate guide adds to this file.
+report-only test durations, and live smokes. A crate guide adds to this file.
+
+CI is described in [`.github/CI.md`](.github/CI.md); before changing anything under
+`.github/` or the scripts the workflows call, follow [`.github/AGENTS.md`](.github/AGENTS.md).
+Performance measurement is manual and lives only in
+[`docs/performance/README.md`](docs/performance/README.md).
 
 ### Crate map
 

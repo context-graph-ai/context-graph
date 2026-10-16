@@ -8,8 +8,8 @@ the end of the claim's paragraph:
 
     ... prepared value carrying the exact final token count.<!-- enforced by: `oversized_event_split_uses_selected_tokenizer_and_has_utf8_safe_exact_bidirectional_source_offsets` -->
 
-This script reads those comments out of README.md, crates/*/README.md, docs/*.md (if the
-directory exists) and skills/**/SKILL.md (if the directory exists); reads live default-tier test
+This script reads those comments out of README.md, crates/*/README.md, docs/*.md and
+docs/performance/**/*.md (if the directory exists) and skills/**/SKILL.md (if the directory exists); reads live default-tier test
 function names out of the Rust test tree (`crates/*/tests/**/*.rs` and `crates/*/src/**/*.rs`
 for `#[test]`/`#[tokio::test]` functions, including parameterized Tokio attributes); and reports:
 
@@ -102,7 +102,7 @@ TEST_GLOBS = [
 
 # Doc roots, relative to the repo root. docs/ and skills/ are scanned only when present.
 DOC_FILES = ["README.md"]
-DOC_GLOBS = ["crates/*/README.md", "docs/*.md", "skills/**/SKILL.md"]
+DOC_GLOBS = ["crates/*/README.md", "docs/*.md", "docs/performance/**/*.md", "skills/**/SKILL.md"]
 
 # A test line carries one of these attributes on the line immediately (or a few
 # attribute-lines) above its `fn`. Tokio accepts parameters such as

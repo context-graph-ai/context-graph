@@ -14,14 +14,10 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [profile.gate.junit]
 path = "junit.xml"
 
-# One test bounds how many rows a reindex scan reads while 24 writers race it, and that read budget
-# fails when sibling tests run alongside it. The group never runs two of its tests at once (max-threads 1); nothing else belongs in it, and
-# every other test keeps the runner's full parallelism. Plain `cargo test` has no test groups, so
-# the same binary also serialises it with its own lock (crates/context-graph/tests/integration/runs_alone.rs).
-# Overrides in the default profile apply to every profile, the gate profile included.
-[test-groups]
-runs-alone = { max-threads = 1 }
-
+# Reserve the entire actual nextest pool for this case: its read budget requires no sibling
+# tests to overlap its 24 writers within this invocation. Unrelated processes are not excluded.
+# Other cases retain normal parallelism. Plain cargo test uses the integration binary's
+# process-local lock instead. Default overrides also apply to gate.
 [[profile.default.overrides]]
 filter = 'binary_id(context-graph::integration) & test(=reindex::reindex_concurrent_writes_during_reindex_window_land_in_target_space_deterministically)'
-test-group = 'runs-alone'
+threads-required = "num-test-threads"
