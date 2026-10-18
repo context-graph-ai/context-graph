@@ -99,6 +99,57 @@ fn assert_condition(output: &CommandOutput, expected: &str) {
     );
 }
 
+// Only these public fixture arguments are safe to include in invocation diagnostics.
+fn provider_diagnostic_arg(arg: &str) -> &str {
+    match arg {
+        "--version" | "--help" | "exec" | "auth" | "status" | "--json" => arg,
+        _ => "<redacted>",
+    }
+}
+
+// Used only by tests whose command output is public fixture status, never a live reply.
+fn print_provider_diagnostics(harness: &CliHarness, outputs: &[(&str, &CommandOutput)]) {
+    for (command, output) in outputs {
+        eprintln!(
+            "{command}: status={} stdout={:?} stderr={:?}",
+            output.code, output.stdout, output.stderr
+        );
+    }
+    // Keep log order; never print the fixture's env, prompt, or arbitrary argument values.
+    match fs::read_to_string(&harness.providers.log_path) {
+        Ok(log) => {
+            for line in log.lines() {
+                match serde_json::from_str::<Value>(line) {
+                    Ok(record) => {
+                        let provider = match record.get("provider").and_then(Value::as_str) {
+                            Some("claude") => "claude",
+                            Some("codex") => "codex",
+                            Some("agy") => "agy",
+                            _ => "<redacted>",
+                        };
+                        let mode = match record.get("mode").and_then(Value::as_str) {
+                            Some("probe") => "probe",
+                            Some("auth-status-probe") => "auth-status-probe",
+                            Some("completion") => "completion",
+                            _ => "<redacted>",
+                        };
+                        let argv = record.get("argv").and_then(Value::as_array).map(|args| {
+                            args.iter()
+                                .map(|arg| provider_diagnostic_arg(arg.as_str().unwrap_or("")))
+                                .collect::<Vec<_>>()
+                        });
+                        eprintln!(
+                            "fixture invocation: provider={provider} mode={mode} argv={argv:?}"
+                        );
+                    }
+                    Err(_) => eprintln!("fixture invocation: unreadable JSON record"),
+                }
+            }
+        }
+        Err(err) => eprintln!("fixture invocation log unavailable: {:?}", err.kind()),
+    }
+}
+
 fn completion_count(output_harness: &CliHarness) -> usize {
     output_harness.providers.completion_count()
 }
@@ -1872,7 +1923,7 @@ fn selftest_bounds_a_hung_provider_cli_with_typed_failure() {
 timeout_ms = 700
 "#,
     );
-    let _ = harness.run(&[
+    let login = harness.run(&[
         "model",
         "auth",
         "login",
@@ -1881,6 +1932,13 @@ timeout_ms = 700
         "--consent",
     ]);
     let output = harness.run(&["selftest"]);
+    print_provider_diagnostics(
+        &harness,
+        &[
+            ("cg model auth login --connection claude --consent", &login),
+            ("cg selftest", &output),
+        ],
+    );
     assert_eq!(output.code, 6);
     assert_condition(&output, "live_call_failed");
     assert_bucket(&output, "timeout");
@@ -2248,8 +2306,10 @@ timeout_ms = 700
     );
     let started = std::time::Instant::now();
     let output = harness.run(&["doctor"]);
+    let elapsed = started.elapsed();
+    print_provider_diagnostics(&harness, &[("cg doctor", &output)]);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
+        elapsed < std::time::Duration::from_secs(5),
         "doctor help drift checks must be bounded by the provider metadata timeout"
     );
     assert_eq!(output.code, 1);
@@ -2276,6 +2336,7 @@ fn cg_doctor_empty_required_help_flags_still_checks_binary_and_version() {
     write_agy_provider_override(harness.data_root.path(), &[]);
 
     let output = harness.run(&["doctor"]);
+    print_provider_diagnostics(&harness, &[("cg doctor", &output)]);
 
     assert!(
         output.stdout.contains("OK: model/agy/flags-in-help"),
@@ -2310,6 +2371,7 @@ fn cg_doctor_empty_required_help_flags_still_checks_binary_and_version() {
     let missing = CliHarness::new();
     write_agy_provider_override(missing.data_root.path(), &[]);
     let output = missing.run(&["doctor"]);
+    print_provider_diagnostics(&missing, &[("cg doctor", &output)]);
     assert!(
         output
             .stdout
@@ -2333,6 +2395,7 @@ fn cg_doctor_empty_required_help_flags_still_checks_binary_and_version() {
         .set_version_probe_fails(Provider::Agy);
     write_agy_provider_override(failed_version.data_root.path(), &[]);
     let output = failed_version.run(&["doctor"]);
+    print_provider_diagnostics(&failed_version, &[("cg doctor", &output)]);
     assert_eq!(output.code, 1);
     assert!(
         output
@@ -2690,25 +2753,19 @@ fn reply_extraction_engine_matches_recorded_envelopes() {
     let claude = extract_reply("claude", "json", CLAUDE_SUCCESS, None);
     assert_eq!(
         claude.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through the logged-in Claude CLI; turn capture should stay off until ingestion ships."
-        ),
+        Ok("The logged-in Claude CLI returned this completion."),
         "claude JSON framing must extract /result"
     );
     let codex = extract_reply("codex", "file", "", Some(&codex_file));
     assert_eq!(
         codex.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through this logged-in Codex CLI; no turn capture should begin until ingestion ships.\n"
-        ),
+        Ok("The logged-in Codex CLI returned this completion.\n"),
         "codex file framing must read --output-last-message"
     );
     let agy = extract_reply("agy", "text", AGY_PLAIN, None);
     assert_eq!(
         agy.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through the local Agy CLI; capture remains disabled until ingestion ships.\n"
-        ),
+        Ok("The local Agy CLI returned this completion.\n"),
         "text framing returns the whole stdout"
     );
     let missing = extract_reply("claude", "json", "{\"type\":\"result\"}", None);

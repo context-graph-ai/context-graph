@@ -468,8 +468,8 @@ class ShardInventory(unittest.TestCase):
                     else: step['env']['GATE_CI_MODEL_MODE'] = "${{ matrix.bundle == '" + shard + "' && 'catalog-narrow' || 'catalog-features' }}"
                 def load(text):
                     parsed = parser(text)
-                    if isinstance(parsed, dict) and parsed.get('name') == 'ci': return changed['ci.yml']
-                    if isinstance(parsed, dict) and parsed.get('name') == 'macOS advisory': return changed['macos-advisory.yml']
+                    if isinstance(parsed, dict) and parsed.get('name') == 'Linux CI': return changed['ci.yml']
+                    if isinstance(parsed, dict) and parsed.get('name') == 'macOS CI (advisory)': return changed['macos-advisory.yml']
                     return parsed
                 with mock.patch.object(yaml, 'safe_load', side_effect=load), self.assertRaises(AssertionError):
                     self.test_catalog_seed_source_and_workflow_bindings()
@@ -542,7 +542,7 @@ class ShardInventory(unittest.TestCase):
         lock_digest = 'e6a98ee802ad0f1e9e3696f87daa40c6b7a78c6bb9424f6472f1afd4a798a55f'
         def valid(body, lock_bytes, root_manifest):
             return (body == expected and hashlib.sha256(lock_bytes).hexdigest() == lock_digest
-                    and hashlib.sha256(root_manifest).hexdigest() == 'ab995589c0159a218d0fd370a539c2994b6008e7e64b0d3e171062e6e0b11e85')
+                    and hashlib.sha256(root_manifest).hexdigest() == 'e596546905960311e0ffa8c45678175278e4a9fe05554851480f762eb82e5f86')
         self.assertTrue(valid(expected, lock.read_bytes(), (ROOT / 'Cargo.toml').read_bytes()))
         for key, value in [('edition', '2021'), ('autotests', True), ('publish', True)]:
             changed = copy.deepcopy(expected); changed['package'][key] = value

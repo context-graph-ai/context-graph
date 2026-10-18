@@ -18,6 +18,25 @@ fn active_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
+// Diagnostic execution has its own closure; the seven model sources remain unchanged.
+#[allow(dead_code)]
+pub fn diagnostic_contract_matches(
+    dispatcher: &[u8],
+    helper: &[u8],
+    entrypoint: &[u8],
+    controls: &[u8],
+) -> bool {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(dispatcher))
+        == "b0c93ee465b079d599946913e381c7ff245942066d6e2512a13d5b42595a91da"
+        && format!("{:x}", Sha256::digest(helper))
+            == "eda85e5d2d63efe2a9aa1e0f44951978b75bb2fd371d38a1d9946e8fd92f9473"
+        && format!("{:x}", Sha256::digest(entrypoint))
+            == "61befd76524f2d3e500f52219990f16d025e6864c3a09f91cc2fb1164748cdcd"
+        && format!("{:x}", Sha256::digest(controls))
+            == "9d856e438cfa59e5dfbf3499a8186cab5aeabd4927b04f009ea1055a7990a439"
+}
+
 pub fn routes_are_executable(script: &str) -> bool {
     let lines = active_lines(script);
     let required = [
@@ -262,7 +281,7 @@ fn model_contract_matches(
         && format!("{:x}", Sha256::digest(core.0))
             == "9feafef445a5364998c90178048e781f08b9840595a311f9f7bf620b2c0798d9"
         && format!("{:x}", Sha256::digest(core.1))
-            == "125356acd39f98d17aa3806ea4e94d3ae7ad7ba4d00e9399e6a184cf8cd70867"
+            == "4eab97ef9a49735936fcf87149b3dafff8bfdfa3907199105580990c5b1572f6"
 }
 
 fn shard_contract_is_frozen(script: &str) -> bool {
@@ -339,14 +358,15 @@ fn shard_contract_is_frozen(script: &str) -> bool {
     ];
     functions.iter().all(|(name, digest)| {
         format!("{:x}", Sha256::digest(body(script, name).as_bytes())) == *digest
-    }) && format!(
+    }) && diagnostic_contract_matches(
+        include_bytes!("../../../../scripts/ci-test-shards.py"),
+        include_bytes!("../../../../scripts/ci-trybuild-cargo.py"),
+        include_bytes!("../../../../scripts/tests/test_ci_qualification.py"),
+        include_bytes!("../../../../scripts/tests/test_ci_trybuild_cargo.py"),
+    ) && format!(
         "{:x}",
-        Sha256::digest(include_bytes!("../../../../scripts/ci-test-shards.py"))
-    ) == "fb4a3b06a7ec775b9d5b7d7b333920e7dad25859a9f35ca192ca2cffe7276bec"
-        && format!(
-            "{:x}",
-            Sha256::digest(include_bytes!("../../../../scripts/ci-test-shards.json"))
-        ) == "2a21c8fa764e57e3f1b26b0011555415e469ebc3e16c6c3ea5d0a6f0208c03d5"
+        Sha256::digest(include_bytes!("../../../../scripts/ci-test-shards.json"))
+    ) == "2a21c8fa764e57e3f1b26b0011555415e469ebc3e16c6c3ea5d0a6f0208c03d5"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!(
@@ -362,11 +382,11 @@ fn shard_contract_is_frozen(script: &str) -> bool {
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!("../../../../Cargo.toml"))
-        ) == "ab995589c0159a218d0fd370a539c2994b6008e7e64b0d3e171062e6e0b11e85"
+        ) == "e596546905960311e0ffa8c45678175278e4a9fe05554851480f762eb82e5f86"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!("../../../../Cargo.lock"))
-        ) == "3d835eba6e63d7839a0eb78ca6715fb805a95509a8dcaf0df7fdc699907a9b84"
+        ) == "c46663aa1c25e26515b98d391f463632fec54ba281511128590a910bf36fa59c"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!(
@@ -702,6 +722,28 @@ pub fn assert_exact_shared_commands(workflow: &Value, masks: impl Fn(&Value) -> 
         receipt,
         (wrapper, core_manifest)
     ));
+    let diagnostic_sources: [&[u8]; 4] = [
+        include_bytes!("../../../../scripts/ci-test-shards.py"),
+        include_bytes!("../../../../scripts/ci-trybuild-cargo.py"),
+        include_bytes!("../../../../scripts/tests/test_ci_qualification.py"),
+        include_bytes!("../../../../scripts/tests/test_ci_trybuild_cargo.py"),
+    ];
+    assert!(diagnostic_contract_matches(
+        diagnostic_sources[0],
+        diagnostic_sources[1],
+        diagnostic_sources[2],
+        diagnostic_sources[3]
+    ));
+    for index in 0..4 {
+        let mut sources = diagnostic_sources.map(<[u8]>::to_vec);
+        sources[index].extend_from_slice(b" ");
+        assert!(!diagnostic_contract_matches(
+            &sources[0],
+            &sources[1],
+            &sources[2],
+            &sources[3]
+        ));
+    }
     for index in 0..7 {
         let mut sources = [
             roots.to_vec(),
@@ -866,7 +908,7 @@ pub fn platform_coverage(mut required: Value, advisory: Value) -> Value {
                 "../../../../.github/workflows/macos-advisory.yml"
             ))
         ),
-        "4ee054c66a544643b33e1285e5524c624c368c452d3ea88407c6b99a1ca726b4"
+        "c465bd1a0a7ae76323b6d915a549fee3cdce8824ba8815ff0512757a674216ce"
     );
     let frozen_mac: Value = serde_yaml_ng::from_str(include_str!(
         "../../../../.github/workflows/macos-advisory.yml"
@@ -876,8 +918,8 @@ pub fn platform_coverage(mut required: Value, advisory: Value) -> Value {
         advisory, frozen_mac,
         "whole advisory mapping must remain unchanged"
     );
-    assert_eq!(required["name"].as_str(), Some("ci"));
-    assert_eq!(advisory["name"].as_str(), Some("macOS advisory"));
+    assert_eq!(required["name"].as_str(), Some("Linux CI"));
+    assert_eq!(advisory["name"].as_str(), Some("macOS CI (advisory)"));
     for key in ["on", "permissions", "env", "defaults"] {
         assert_eq!(required[key], advisory[key], "platform workflow context");
     }

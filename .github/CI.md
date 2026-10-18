@@ -22,12 +22,18 @@ contributor runs the same commands locally.
 
 | Path | Workflow | Trigger | What a result means |
 |---|---|---|---|
-| PR checks | [`ci.yml`](workflows/ci.yml) (`ci`) | every push and every pull request; manual dispatch with exact `cg_sha` and `contextdb_sha` | Correctness of this exact commit. The aggregate job **`PR checks`** passes only if every required Linux, source and documentation job succeeded. |
-| macOS advisory | [`macos-advisory.yml`](workflows/macos-advisory.yml) (`macOS advisory`) | same push, pull request and exact-SHA dispatch triggers | Full macOS coverage with a failing aggregate on failure; nonblocking for Linux and delivery. |
+| PR checks | [`ci.yml`](workflows/ci.yml) (`Linux CI`) | pushes to `dev` and every pull request; manual dispatch with exact `cg_sha` and `contextdb_sha` | Correctness of this exact commit. The aggregate job **`PR checks`** passes only if every required Linux, source and documentation job succeeded. |
+| macOS advisory | [`macos-advisory.yml`](workflows/macos-advisory.yml) (`macOS CI (advisory)`) | pushes to `dev`, every pull request and exact-SHA dispatch | Full macOS coverage with a failing aggregate on failure; nonblocking for Linux and delivery. |
 | Extended integration | [`extended-integration.yml`](workflows/extended-integration.yml) (`extended integration`) | callable; Mondays 03:23 UTC; manual dispatch with exact SHAs | Public Nomic model and event-search discovery on Linux and macOS (aggregate `extended-required`). A manual dispatch with `trusted: true` additionally runs the protected trusted jobs (aggregate `trusted-qualification`). |
 | Performance measurement | [`performance.yml`](workflows/performance.yml) (`Performance measurement (manual guide)`) | Never — dormant placeholder | **Manual today.** The workflow cannot start: its only trigger is a push filter that ignores every branch and every tag, and manual dispatch is commented out. It checks out nothing, runs no benchmark and never reports a status. The manual journey is [`docs/performance/README.md`](../docs/performance/README.md). |
 | Development downloads | [`build.yml`](workflows/build.yml) (`Build development binaries`) | called after PR checks for each push to dev; maintainer dispatch on dev | Packages and smokes exact-source binaries, then publishes the rolling development prerelease. |
 | Publication preparation | [`publication.yml`](workflows/publication.yml) (`publication preparation`) | manual dispatch with exact SHAs | Locked optimized CLI build and local package inspection (aggregate `publication-receipt`). It publishes nothing, creates no tag and performs no crates.io action. |
+
+Automatic pushes run only on `dev`, preserving development publication. Candidate
+branches receive both platform workflows through pull requests or exact-SHA manual
+dispatch, without duplicate push runs. Display-name changes apply to future runs;
+existing runs retain their recorded names. Job names, `PR checks`, and
+`macOS advisory results` are unchanged.
 
 ## PR checks (`ci.yml`)
 
@@ -80,6 +86,29 @@ debug assertions and overflow checks enabled. Local Cargo profile defaults stay 
 specified in `Cargo.toml`. Linux jobs reclaim preinstalled SDKs with sudo and print
 root disk headroom before and after linking. Disposable `target/tests` trybuild output
 is removed before compiler cache post hooks, including on failure.
+
+The macOS default acceptance bundle temporarily records the digest immutability
+compile proof's inner Cargo boundaries under its existing receipt artifact's
+`trybuild-diagnostics/` directory. A native nextest runner sets `CARGO` only for
+`crud::digest_immutable_no_update_symbol`; other cases execute with their original
+Cargo environment. The wrapper forwards to the pinned toolchain's Cargo without
+changing arguments, compiler flags, output streams, test selection or timeout.
+Generated manifests and locks, selected compiler fingerprint fields and original
+fingerprint hashes are saved before inner cleanup and after execution. Fingerprint
+environment entries are excluded. A start without an end records interrupted work;
+it is never a successful command receipt. Scratch cleanup still runs afterward.
+The complete Python controls entrypoint also runs the wrapper and diagnostic admission
+controls. The diagnostic source closure binds the dispatcher, executable helper,
+controls entrypoint and wrapper controls separately from the seven model sources.
+`trybuild-diagnostics/completeness.json` records `accepted`, `incomplete` or `fail`
+without replacing the original nextest exit status or JUnit. Admission requires matching
+Cargo, rustc, nextest, Python, helper and test executable hashes; consecutive writer receipts;
+actual arguments, flag/cfg state and input snapshots; matched start/spawn/end boundaries;
+and a successful final capture. Check commands require generated manifest, lock and
+compiler fingerprints. Earlier metadata commands record absent generated inputs explicitly.
+A single interrupted inner command requires a matching digest-case JUnit timeout to
+identify the last active command; it remains an incomplete trace with causal admission
+refused. Missing writes, identities, snapshots or helper byte changes fail admission.
 These changes require hosted evidence to establish end-to-end completion under
 30 minutes; queue time, cold model downloads, repeated workspace compilation and the
 aggregate audit build remain part of that measurement.
@@ -296,7 +325,7 @@ unit-reuse evidence and complete cold/warm hosted measurements.
 
 ## macOS qualification follow-up
 
-Linux is the current required qualification platform. The separate `macOS advisory`
+Linux is the current required qualification platform. The separate `macOS CI (advisory)`
 workflow preserves macOS lint, default tests, feature tests and complete Python controls:
 five physical jobs (two default, one feature, lint and controls) produce six logical
 Rust receipts. Its `macOS advisory results` aggregate fails on failed, cancelled,
@@ -306,12 +335,17 @@ The legacy local `shard-union` stage still requires twelve receipts; explicit Li
 and macOS stages each require exactly six, with no fallback to available platforms.
 
 Qualification remains pending: seven macOS test failures remain unresolved.
-The default owner-service locator also remains broken: the native user temporary
-root plus the full socket key can exceed macOS's 103-byte socket pathname limit.
-A writable database open can succeed while the separate owner service fails to start.
-A repair and independent native owner/reader proof are still pending; prior reader
-authentication results do not prove the default locator. These are open follow-up
-items, not passing evidence. Completion requires identifying and fixing each failure in source, verifying
+The pinned ContextDB macOS default locator now canonicalizes the fixed system
+temporary root `/tmp` and uses a private per-effective-UID directory with the full
+socket key. Focused upstream engine coverage consists of five integration cases
+actually run on the pinned revision and three unchanged library cases carried
+from an older revision, not eight newly executed cases. The only reader
+authentication proof is from a separate earlier ContextDB candidate, not the
+pinned revision; prior reader authentication results do not prove the pinned
+default locator or full Context Graph qualification. Full Context Graph macOS
+consumer qualification, including the integrated default owner/reader locator,
+remains pending. These are open follow-up items, not passing evidence.
+Completion requires identifying and fixing each failure in source, verifying
 locator behavior, running all five macOS jobs with all six valid receipts on the exact
 integrated source, and reviewing the resulting evidence before changing qualification.
 No issue number or hosted green result is claimed.
