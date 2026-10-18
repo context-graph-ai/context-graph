@@ -17,6 +17,7 @@ from test_build_workflow import BuildWorkflow
 from test_workflow_contexts import WorkflowContexts
 from test_ci_shards import ShardInventory
 from test_ci_model_seed import SeedArtifact
+from test_ci_trybuild_cargo import Contract, DiagnosticCompleteness
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -838,7 +839,7 @@ else: print('public default dependency')
         if job in ('test', 'features'):
             variant = 'default' if job == 'test' else 'features'
             command = 'python3 scripts/ci-test-shards.py bundle ' + variant
-            if job == 'features' and workflow['name'] == 'ci': command += ' --tests-only'
+            if job == 'features' and workflow['name'] == 'Linux CI': command += ' --tests-only'
             step = next(s for s in workflow['jobs'][job]['steps'] if s.get('run') == command)
             self.assertNotIn('if', step)
             self.assertNotIn('continue-on-error', step)

@@ -1,8 +1,9 @@
-name: ci
+name: Linux CI
 
 on:
   pull_request:
   push:
+    branches: [dev]
   workflow_dispatch:
     inputs:
       cg_sha:

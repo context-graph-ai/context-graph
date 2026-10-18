@@ -426,6 +426,7 @@ impl CompletionBehavior {
 
 pub struct FakeProviderRig {
     _root: TempDir,
+    driver_interpreter: PathBuf,
     pub root_path: PathBuf,
     pub bin_dir: PathBuf,
     pub fixture_dir: PathBuf,
@@ -434,6 +435,8 @@ pub struct FakeProviderRig {
 
 impl FakeProviderRig {
     pub fn new() -> Self {
+        // Bind the harness dependency before cg receives its restricted provider PATH.
+        let driver_interpreter = fixture_driver_interpreter();
         let root = TempDir::new().expect("fake provider root");
         let root_path = root.path().to_path_buf();
         let bin_dir = root_path.join("bin");
@@ -442,6 +445,7 @@ impl FakeProviderRig {
         fs::create_dir_all(&fixture_dir).expect("fake fixture dir");
         let rig = Self {
             _root: root,
+            driver_interpreter,
             root_path,
             bin_dir,
             fixture_dir,
@@ -693,7 +697,8 @@ impl FakeProviderRig {
 
     fn write_wrapper(&self, provider: Provider) {
         let script = format!(
-            "#!/bin/sh\npython3 {} {} {} \"$@\"\n",
+            "#!/bin/sh\nexec {} {} {} {} \"$@\"\n",
+            shell_quote(&self.driver_interpreter),
             shell_quote(self.fixture_dir.join("fake_provider.py")),
             shell_quote(provider.binary_name()),
             shell_quote(&self.fixture_dir),
@@ -1473,6 +1478,32 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+fn fixture_driver_interpreter() -> PathBuf {
+    let runner_path = std::env::var_os("PATH")
+        .expect("fake provider fixture requires python3 on the test runner PATH (PATH is unset)");
+    for directory in std::env::split_paths(&runner_path) {
+        // Canonicalization binds relative PATH entries and follows interpreter symlinks.
+        let Ok(candidate) = fs::canonicalize(directory.join("python3")) else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        return candidate;
+    }
+    panic!("fake provider fixture requires an executable python3 on the test runner PATH");
 }
 
 fn shell_quote(value: impl AsRef<Path>) -> String {

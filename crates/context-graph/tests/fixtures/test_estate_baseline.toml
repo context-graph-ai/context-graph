@@ -150,7 +150,7 @@
 "cg-vision-embedder" = 5
 # Tests in test_estate_audit.rs are excluded from the default-tier inventory.
 "context-graph" = 1338
-"context-graph-cli" = 279
+"context-graph-cli" = 280
 
 [gate_wall_seconds_policy]
 # A test binary's ceiling is `recorded seconds * tolerance_factor + slack_seconds`. Both terms are
