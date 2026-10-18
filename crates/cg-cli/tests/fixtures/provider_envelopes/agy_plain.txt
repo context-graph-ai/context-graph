@@ -1,1 +1,1 @@
-Host session proof received. I can answer through the local Agy CLI; capture remains disabled until ingestion ships.
+The local Agy CLI returned this completion.

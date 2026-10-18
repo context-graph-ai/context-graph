@@ -306,12 +306,17 @@ The legacy local `shard-union` stage still requires twelve receipts; explicit Li
 and macOS stages each require exactly six, with no fallback to available platforms.
 
 Qualification remains pending: seven macOS test failures remain unresolved.
-The default owner-service locator also remains broken: the native user temporary
-root plus the full socket key can exceed macOS's 103-byte socket pathname limit.
-A writable database open can succeed while the separate owner service fails to start.
-A repair and independent native owner/reader proof are still pending; prior reader
-authentication results do not prove the default locator. These are open follow-up
-items, not passing evidence. Completion requires identifying and fixing each failure in source, verifying
+The pinned ContextDB macOS default locator now canonicalizes the fixed system
+temporary root `/tmp` and uses a private per-effective-UID directory with the full
+socket key. Focused upstream engine coverage consists of five integration cases
+actually run on the pinned revision and three unchanged library cases carried
+from an older revision, not eight newly executed cases. The only reader
+authentication proof is from a separate earlier ContextDB candidate, not the
+pinned revision; prior reader authentication results do not prove the pinned
+default locator or full Context Graph qualification. Full Context Graph macOS
+consumer qualification, including the integrated default owner/reader locator,
+remains pending. These are open follow-up items, not passing evidence.
+Completion requires identifying and fixing each failure in source, verifying
 locator behavior, running all five macOS jobs with all six valid receipts on the exact
 integrated source, and reviewing the resulting evidence before changing qualification.
 No issue number or hosted green result is claimed.

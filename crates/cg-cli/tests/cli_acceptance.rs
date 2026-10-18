@@ -2690,25 +2690,19 @@ fn reply_extraction_engine_matches_recorded_envelopes() {
     let claude = extract_reply("claude", "json", CLAUDE_SUCCESS, None);
     assert_eq!(
         claude.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through the logged-in Claude CLI; turn capture should stay off until ingestion ships."
-        ),
+        Ok("The logged-in Claude CLI returned this completion."),
         "claude JSON framing must extract /result"
     );
     let codex = extract_reply("codex", "file", "", Some(&codex_file));
     assert_eq!(
         codex.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through this logged-in Codex CLI; no turn capture should begin until ingestion ships.\n"
-        ),
+        Ok("The logged-in Codex CLI returned this completion.\n"),
         "codex file framing must read --output-last-message"
     );
     let agy = extract_reply("agy", "text", AGY_PLAIN, None);
     assert_eq!(
         agy.as_deref(),
-        Ok(
-            "Host session proof received. I can answer through the local Agy CLI; capture remains disabled until ingestion ships.\n"
-        ),
+        Ok("The local Agy CLI returned this completion.\n"),
         "text framing returns the whole stdout"
     );
     let missing = extract_reply("claude", "json", "{\"type\":\"result\"}", None);

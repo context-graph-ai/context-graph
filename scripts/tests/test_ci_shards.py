@@ -542,7 +542,7 @@ class ShardInventory(unittest.TestCase):
         lock_digest = 'e6a98ee802ad0f1e9e3696f87daa40c6b7a78c6bb9424f6472f1afd4a798a55f'
         def valid(body, lock_bytes, root_manifest):
             return (body == expected and hashlib.sha256(lock_bytes).hexdigest() == lock_digest
-                    and hashlib.sha256(root_manifest).hexdigest() == 'ab995589c0159a218d0fd370a539c2994b6008e7e64b0d3e171062e6e0b11e85')
+                    and hashlib.sha256(root_manifest).hexdigest() == '120776aefc6ae100986f4b51e837a64012df52604c3a2b59b14d3d0021a01520')
         self.assertTrue(valid(expected, lock.read_bytes(), (ROOT / 'Cargo.toml').read_bytes()))
         for key, value in [('edition', '2021'), ('autotests', True), ('publish', True)]:
             changed = copy.deepcopy(expected); changed['package'][key] = value

@@ -43,7 +43,7 @@ cg-cli-conventions.workspace = true
 context-graph = { path = "../context-graph", features = ["fabric-sync"] }
 contextdb-core.workspace = true
 contextdb-engine.workspace = true
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905", features = ["iroh"] }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "db9d067f291c0add0922713936a63f51f24e9f1c", features = ["iroh"] }
 fs4.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -63,6 +63,6 @@ context-graph-cli = { path = ".", features = ["status-fault-injection"] }
 # compiled behind contextdb-engine's `test-seams` feature. This is a test-only activation — the
 # `cg` binary's own dependency edge on contextdb-engine does not enable it.
 contextdb-engine = { workspace = true, features = ["test-seams"] }
-contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "bc9cce955eb85fb1488f5304426eedeb6d97e905", features = ["iroh", "test-seams"] }
+contextdb-server = { git = "https://github.com/context-graph-ai/contextdb", rev = "db9d067f291c0add0922713936a63f51f24e9f1c", features = ["iroh", "test-seams"] }
 libc = "0.2"
 tempfile.workspace = true

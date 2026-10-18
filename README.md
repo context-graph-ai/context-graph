@@ -57,7 +57,7 @@ Use the [download guide](docs/download.md) for wget, receipts and provenance ver
 
 The pinned toolchain in `rust-toolchain.toml` is Rust **1.94.1**. <!-- enforced by: `readme_states_the_rust_version_rust_toolchain_toml_pins` -->
 
-ContextDB is pinned to `bc9cce955eb85fb1488f5304426eedeb6d97e905` in the manifests and lockfile. <!-- enforced by: `manifests_lockfile_and_readme_name_the_same_exact_contextdb_revision` -->
+ContextDB is pinned to `db9d067f291c0add0922713936a63f51f24e9f1c` in the manifests and lockfile. <!-- enforced by: `manifests_lockfile_and_readme_name_the_same_exact_contextdb_revision` -->
 
 Linux is required by `PR checks`; macOS runs in the separate, nonblocking `macOS advisory` workflow. See the [macOS qualification follow-up](.github/CI.md#macos-qualification-follow-up). <!-- enforced by: `cg_github_actions_workflow_runs_on_matrix_of_macos_latest_ubuntu_latest_and_documents_the_deliberate_windows_exclusion` -->
 
