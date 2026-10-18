@@ -1,8 +1,9 @@
-name: macOS advisory
+name: macOS CI (advisory)
 
 on:
   pull_request:
   push:
+    branches: [dev]
   workflow_dispatch:
     inputs:
       cg_sha:

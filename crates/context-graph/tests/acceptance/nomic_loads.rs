@@ -1330,7 +1330,7 @@ fn cg_readme_ci_section_documents_two_runner_matrix_and_shared_model_cache_root_
     assert!(lower.contains("continuous integration") || lower.contains("## ci"));
     assert!(readme.contains("Required PR test and feature jobs run on `ubuntu-latest`"));
     assert!(readme.contains(
-        "separate `macOS advisory` workflow retains the same coverage on `macos-latest`"
+        "separate `macOS CI (advisory)` workflow retains the same coverage on `macos-latest`"
     ));
     assert!(readme.contains("`windows-latest` is excluded deliberately"));
     assert!(readme.contains("CG_MODEL_CACHE_ROOT` at runner temporary space"));
