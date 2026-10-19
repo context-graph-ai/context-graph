@@ -500,3 +500,6 @@ mod mapping;
 mod opaque_media;
 #[path = "source_fidelity/timestamp_boundary.rs"]
 mod timestamp_boundary;
+
+#[path = "source_fidelity/session_alias_contract.rs"]
+mod session_alias_contract;

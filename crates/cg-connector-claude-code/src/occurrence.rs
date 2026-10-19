@@ -329,8 +329,14 @@ pub fn decode_jsonl_record(raw_record: &[u8]) -> Result<ClaudeOccurrence, Claude
 }
 
 fn decode_object(object: &Map<String, Value>) -> Result<ClaudeOccurrence, ClaudeConnectorError> {
-    let session_id =
-        aliased_optional_string(object, "sessionId", "session_id")?.unwrap_or_default();
+    // Validate both aliases even when the primary already identifies this record.
+    let primary_session_id = optional_string(object, "sessionId")?;
+    let legacy_session_id = optional_string(object, "session_id")?;
+    let preserve_legacy_session_id = matches!(
+        (primary_session_id.as_deref(), object.get("session_id").and_then(Value::as_str)),
+        (Some(primary), Some(legacy)) if primary != legacy
+    );
+    let session_id = primary_session_id.or(legacy_session_id).unwrap_or_default();
     let uuid = optional_string(object, "uuid")?;
     if let Some(uuid) = &uuid {
         uuid::Uuid::parse_str(uuid).map_err(|error| ClaudeConnectorError::MalformedRecord {
@@ -357,17 +363,18 @@ fn decode_object(object: &Map<String, Value>) -> Result<ClaudeOccurrence, Claude
         && let Some(message) = decode_message(object.get("message"))?
     {
         let (extras, refused) = provider_object_from_entries(object.iter().filter(|(key, _)| {
-            !matches!(
-                key.as_str(),
-                "type"
-                    | "uuid"
-                    | "sessionId"
-                    | "session_id"
-                    | "timestamp"
-                    | "cwd"
-                    | "subagent"
-                    | "message"
-            )
+            (preserve_legacy_session_id && key.as_str() == "session_id")
+                || !matches!(
+                    key.as_str(),
+                    "type"
+                        | "uuid"
+                        | "sessionId"
+                        | "session_id"
+                        | "timestamp"
+                        | "cwd"
+                        | "subagent"
+                        | "message"
+                )
         }));
         meta.envelope_extras = extras;
         meta.envelope_payload_refused = refused;
@@ -385,10 +392,12 @@ fn decode_object(object: &Map<String, Value>) -> Result<ClaudeOccurrence, Claude
     retain_unparsed_known_meta(object, &mut meta);
 
     let (facts, facts_refused) = provider_object_from_entries(object.iter().filter(|(key, _)| {
-        !matches!(
-            key.as_str(),
-            "type" | "uuid" | "sessionId" | "session_id" | "timestamp" | "cwd" | "subagent"
-        ) && !key.starts_with("envelope_")
+        ((preserve_legacy_session_id && key.as_str() == "session_id")
+            || !matches!(
+                key.as_str(),
+                "type" | "uuid" | "sessionId" | "session_id" | "timestamp" | "cwd" | "subagent"
+            ))
+            && !key.starts_with("envelope_")
     }));
     Ok(ClaudeOccurrence::opaque(
         meta,
@@ -430,23 +439,6 @@ fn optional_string(
             reason: format!("top-level {key} must be a string when present"),
         }),
     }
-}
-
-fn aliased_optional_string(
-    object: &Map<String, Value>,
-    first: &str,
-    second: &str,
-) -> Result<Option<String>, ClaudeConnectorError> {
-    let first_value = optional_string(object, first)?;
-    let second_value = optional_string(object, second)?;
-    if let (Some(first_value), Some(second_value)) = (&first_value, &second_value)
-        && first_value != second_value
-    {
-        return Err(ClaudeConnectorError::MalformedRecord {
-            reason: format!("top-level {first} and {second} disagree"),
-        });
-    }
-    Ok(first_value.or(second_value))
 }
 
 fn decode_subagent(value: Option<&Value>) -> Option<ClaudeSubagent> {

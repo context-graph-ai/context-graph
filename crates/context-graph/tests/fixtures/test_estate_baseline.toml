@@ -145,7 +145,7 @@
 "cg-bench" = 10
 "cg-catalog" = 118
 "cg-cli-conventions" = 0
-"cg-connector-claude-code" = 23
+"cg-connector-claude-code" = 30
 "cg-node-fs" = 3
 "cg-vision-embedder" = 5
 # Tests in test_estate_audit.rs are excluded from the default-tier inventory.
