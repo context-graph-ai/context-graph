@@ -197,15 +197,15 @@ fn decision_projection(
         "SELECT id, context_id, decision_type, status, created_at FROM decisions WHERE id = $id",
         &HashMap::from([("id".to_string(), Value::Uuid(decision_id))]),
     )?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
     Ok(Some(DecisionProjection {
-        id: row_uuid(row, &result.columns, "id")?,
-        context_id: row_uuid(row, &result.columns, "context_id")?,
-        decision_type: row_text(row, &result.columns, "decision_type")?,
-        status: row_text(row, &result.columns, "status")?,
-        created_at: row_txid(row, &result.columns, "created_at")?,
+        id: row_uuid(row, result.columns(), "id")?,
+        context_id: row_uuid(row, result.columns(), "context_id")?,
+        decision_type: row_text(row, result.columns(), "decision_type")?,
+        status: row_text(row, result.columns(), "status")?,
+        created_at: row_txid(row, result.columns(), "created_at")?,
     }))
 }
 
@@ -224,9 +224,9 @@ fn outcome_success(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .first()
-        .map(|row| row_bool(row, &result.columns, "success"))
+        .map(|row| row_bool(row, result.columns(), "success"))
         .transpose()
 }
 
@@ -246,9 +246,9 @@ fn based_on_entities(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| row_uuid(row, &result.columns, "target_id"))
+        .map(|row| row_uuid(row, result.columns(), "target_id"))
         .collect()
 }
 
@@ -273,12 +273,12 @@ fn active_candidates_on_entity(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             Ok(Candidate {
-                id: row_uuid(row, &result.columns, "id")?,
-                created_at: row_txid(row, &result.columns, "created_at")?,
+                id: row_uuid(row, result.columns(), "id")?,
+                created_at: row_txid(row, result.columns(), "created_at")?,
             })
         })
         .collect()
@@ -316,9 +316,9 @@ fn served_intentions(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| row_uuid(row, &result.columns, "target_id"))
+        .map(|row| row_uuid(row, result.columns(), "target_id"))
         .collect()
 }
 

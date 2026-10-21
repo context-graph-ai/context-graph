@@ -94,7 +94,7 @@ impl Store {
             ),
         };
         let result = self.read_query(&sql, &params)?;
-        let column = |name: &str| result.columns.iter().position(|c| c == name);
+        let column = |name: &str| result.columns().iter().position(|c| c == name);
         let (Some(entity_column), Some(label_column), Some(score_column)) =
             (column("entity_id"), column("label"), column("score"))
         else {
@@ -103,7 +103,7 @@ impl Store {
             ));
         };
         let mut scored: Vec<EntityMatch> = Vec::new();
-        for row in &result.rows {
+        for row in result.rows() {
             let Some(Value::Uuid(entity_id)) = row.get(entity_column) else {
                 continue;
             };
@@ -409,7 +409,7 @@ impl Store {
                 &std::collections::HashMap::new(),
             )
             .map_err(map_engine_err)?;
-        Ok(result.rows.first().and_then(|row| match row.first() {
+        Ok(result.rows().first().and_then(|row| match row.first() {
             Some(Value::Uuid(id)) => Some(ContextId::from(*id)),
             _ => None,
         }))

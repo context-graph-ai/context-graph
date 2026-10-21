@@ -85,8 +85,8 @@ fn cites_chain(
                     ("edge_type".to_string(), Value::Text("CITES".to_string())),
                 ]),
             )?;
-            for row in &result.rows {
-                let target_id = row_uuid(row, &result.columns, "target_id")?;
+            for row in result.rows() {
+                let target_id = row_uuid(row, result.columns(), "target_id")?;
                 candidates.push(CitedCandidate {
                     id: target_id,
                     created_at: decision_created_at(db, tx, context_id, target_id)?,
@@ -126,8 +126,8 @@ fn decision_created_at(
             ("context_id".to_string(), Value::Uuid(context_id)),
         ]),
     )?;
-    match result.rows.first() {
-        Some(row) => row_txid(row, &result.columns, "created_at"),
+    match result.rows().first() {
+        Some(row) => row_txid(row, result.columns(), "created_at"),
         None => Err(EngineError::Other(format!(
             "cited decision {decision_id} missing in context {context_id}"
         ))),
@@ -189,9 +189,9 @@ fn outcome_success(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .first()
-        .map(|row| row_bool(row, &result.columns, "success"))
+        .map(|row| row_bool(row, result.columns(), "success"))
         .transpose()
 }
 
@@ -211,9 +211,9 @@ fn served_intentions(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| row_uuid(row, &result.columns, "target_id"))
+        .map(|row| row_uuid(row, result.columns(), "target_id"))
         .collect()
 }
 

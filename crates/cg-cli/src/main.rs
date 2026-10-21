@@ -3613,10 +3613,10 @@ fn existing_schema_version(
     let result = session
         .execute("SELECT version FROM cg_schema_version", &Default::default())
         .map_err(|err| MemoryCliError::Store(err.to_string()))?;
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Ok(None);
     }
-    Ok(match result.rows[0].first() {
+    Ok(match result.rows()[0].first() {
         Some(DbValue::Int64(version)) => u32::try_from(*version).ok(),
         _ => None,
     })

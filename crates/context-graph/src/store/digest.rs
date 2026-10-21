@@ -185,10 +185,10 @@ impl Store {
                 "SELECT id, source, session_ref, summary, vector_text, dimension, context_id, properties, created_at FROM digests WHERE id = $id",
                 &params,
             )?;
-        if result.rows.is_empty() {
+        if result.rows().is_empty() {
             return Ok(None);
         }
-        Ok(Some(decode_digest(&result.columns, &result.rows[0])?))
+        Ok(Some(decode_digest(result.columns(), &result.rows()[0])?))
     }
 
     pub(crate) fn digest_source_ids_for_context(
@@ -200,8 +200,8 @@ impl Store {
             &HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
         )?;
         let mut source_ids = Vec::new();
-        for row in &result.rows {
-            let digest_id = DigestId::from(get_uuid(row, &result.columns, "id")?);
+        for row in result.rows() {
+            let digest_id = DigestId::from(get_uuid(row, result.columns(), "id")?);
             source_ids.extend(self.extracted_from_source_ids(context_id, digest_id)?.0);
         }
         source_ids.sort();
@@ -265,12 +265,12 @@ impl Store {
             " ORDER BY vector_text <=> $query LIMIT {candidate_limit}"
         ));
         let result = self.read_query(&sql, &params)?;
-        let vector_trace = format!("{:?}", result.trace);
+        let vector_trace = format!("{:?}", result.trace());
         let mut candidates = Vec::new();
-        for row in result.rows {
-            let digest_id = DigestId::from(value_uuid(&row, &result.columns, "id")?);
-            let context_id = ContextId::from(value_uuid(&row, &result.columns, "context_id")?);
-            let similarity = value_score(&row, &result.columns, "score")?;
+        for row in result.rows() {
+            let digest_id = DigestId::from(value_uuid(&row, result.columns(), "id")?);
+            let context_id = ContextId::from(value_uuid(&row, result.columns(), "context_id")?);
+            let similarity = value_score(&row, result.columns(), "score")?;
             if similarity <= 0.0 {
                 continue;
             }
@@ -280,8 +280,8 @@ impl Store {
             {
                 continue;
             }
-            let summary = value_text(&row, &result.columns, "summary")?;
-            let created_at = value_txid(&row, &result.columns, "created_at")?;
+            let summary = value_text(&row, result.columns(), "summary")?;
+            let created_at = value_txid(&row, result.columns(), "created_at")?;
             candidates.push(DigestCandidate {
                 digest_id,
                 context_id,
@@ -503,9 +503,9 @@ impl Store {
                 WHERE source_id IN (SELECT source_id FROM edges WHERE context_id = $context_id)",
             &params,
         )?;
-        let graph_trace = format!("{:?}", result.trace);
+        let graph_trace = format!("{:?}", result.trace());
         let mut graph_ids = result
-            .rows
+            .rows()
             .iter()
             .filter_map(|row| match row.first() {
                 Some(Value::Uuid(id)) => Some(*id),
@@ -531,8 +531,8 @@ impl Store {
             &format!("SELECT id, description FROM intentions WHERE id IN ({id_list})"),
             &params,
         )?;
-        for row in &intentions.rows {
-            let raw_id = value_uuid(row, &intentions.columns, "id")?;
+        for row in intentions.rows() {
+            let raw_id = value_uuid(row, intentions.columns(), "id")?;
             let overlay = crate::overlay::overlay_read_decision_for_item(self, &raw_id.to_string());
             if overlay.dropped {
                 continue;
@@ -540,7 +540,7 @@ impl Store {
             let text = overlay
                 .corrected_value
                 .map(Ok)
-                .unwrap_or_else(|| value_text(row, &intentions.columns, "description"))?;
+                .unwrap_or_else(|| value_text(row, intentions.columns(), "description"))?;
             out.insert(
                 raw_id,
                 DigestSourceDetail::Intention {
@@ -556,20 +556,20 @@ impl Store {
             &format!("SELECT id, description, status FROM decisions WHERE id IN ({id_list})"),
             &params,
         )?;
-        for row in &decisions.rows {
-            let raw_id = value_uuid(row, &decisions.columns, "id")?;
+        for row in decisions.rows() {
+            let raw_id = value_uuid(row, decisions.columns(), "id")?;
             let overlay = crate::overlay::overlay_read_decision_for_item(self, &raw_id.to_string());
             if overlay.dropped {
                 continue;
             }
-            let status = decision_status_from_text(&value_text(row, &decisions.columns, "status")?)
+            let status = decision_status_from_text(&value_text(row, decisions.columns(), "status")?)
                 .ok_or_else(|| {
                     CgError::Engine("decision source returned invalid status".to_string())
                 })?;
             let text = overlay
                 .corrected_value
                 .map(Ok)
-                .unwrap_or_else(|| value_text(row, &decisions.columns, "description"))?;
+                .unwrap_or_else(|| value_text(row, decisions.columns(), "description"))?;
             out.insert(
                 raw_id,
                 DigestSourceDetail::Decision {
@@ -590,14 +590,14 @@ impl Store {
             )?;
         let mut observation_rows = Vec::new();
         let mut entity_ids = source_ids.clone();
-        for row in &observations.rows {
-            let raw_id = value_uuid(row, &observations.columns, "id")?;
-            let entity_id = value_uuid(row, &observations.columns, "entity_id")?;
+        for row in observations.rows() {
+            let raw_id = value_uuid(row, observations.columns(), "id")?;
+            let entity_id = value_uuid(row, observations.columns(), "entity_id")?;
             entity_ids.insert(entity_id);
             observation_rows.push((
                 raw_id,
-                value_text(row, &observations.columns, "observation_type")?,
-                get_json(row, &observations.columns, "state_delta")?,
+                value_text(row, observations.columns(), "observation_type")?,
+                get_json(row, observations.columns(), "state_delta")?,
                 entity_id,
             ));
         }
@@ -650,10 +650,10 @@ impl Store {
             &params,
         )?;
         let mut out = HashMap::new();
-        for row in &result.rows {
+        for row in result.rows() {
             out.insert(
-                value_uuid(row, &result.columns, "id")?,
-                value_text(row, &result.columns, "name")?,
+                value_uuid(row, result.columns(), "id")?,
+                value_text(row, result.columns(), "name")?,
             );
         }
         Ok(out)
@@ -751,5 +751,5 @@ fn digest_context_id_exists(store: &Store, context_id: ContextId) -> Result<bool
             &HashMap::from([("id".to_string(), Value::Uuid(context_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    Ok(!result.rows.is_empty())
+    Ok(!result.rows().is_empty())
 }

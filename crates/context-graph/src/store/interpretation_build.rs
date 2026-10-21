@@ -419,14 +419,14 @@ fn scan_source(
     content.update(b"context-graph/interpretation-source-content/v1");
     let captured = (|| -> Result<()> {
         let first = cursor.first_page();
-        let mut has_more = first.has_more;
+        let mut has_more = first.has_more();
         capture_page(
             store,
             request,
             bounds,
             generation_id,
-            &first.columns,
-            &first.rows,
+            first.columns(),
+            first.rows(),
             &mut count,
             &mut ordered,
             &mut content,
@@ -435,14 +435,14 @@ fn scan_source(
             let next = cursor
                 .fetch(NonZeroUsize::new(bounds.events))
                 .map_err(map_engine_err)?;
-            has_more = next.has_more;
+            has_more = next.has_more();
             capture_page(
                 store,
                 request,
                 bounds,
                 generation_id,
-                &next.columns,
-                &next.rows,
+                next.columns(),
+                next.rows(),
                 &mut count,
                 &mut ordered,
                 &mut content,
@@ -495,37 +495,37 @@ fn find_sealed_generation(
             ),
         ]),
     )?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
-    if result.rows.len() != 1 {
+    if result.rows().len() != 1 {
         return Err(CgError::Engine(
             "interpretation watermark selected multiple generations".into(),
         ));
     }
-    let state = get_text(row, &result.columns, "state")?;
+    let state = get_text(row, result.columns(), "state")?;
     if state == "capturing" {
         return Ok(None);
     }
     generation_state(&state)?;
-    let id = InterpretationGenerationId::from(get_uuid(row, &result.columns, "id")?);
+    let id = InterpretationGenerationId::from(get_uuid(row, result.columns(), "id")?);
     let declaration = request.mapper.declaration();
     let accepted = serde_json::to_value(&declaration.accepted_source_declarations)
         .expect("release declarations always serialize");
-    if get_json(row, &result.columns, "accepted_source_declarations")? != accepted
-        || get_text(row, &result.columns, "target_adapter_version")?
+    if get_json(row, result.columns(), "accepted_source_declarations")? != accepted
+        || get_text(row, result.columns(), "target_adapter_version")?
             != declaration.target_adapter_version
-        || get_text(row, &result.columns, "target_anchor_declaration_version")?
+        || get_text(row, result.columns(), "target_anchor_declaration_version")?
             != declaration.target_anchor_declaration_version
-        || get_text(row, &result.columns, "mapping_contract_id")? != declaration.mapping_contract_id
-        || get_text(row, &result.columns, "mapping_contract_sha256")?
+        || get_text(row, result.columns(), "mapping_contract_id")? != declaration.mapping_contract_id
+        || get_text(row, result.columns(), "mapping_contract_sha256")?
             != declaration.mapping_contract_sha256
-        || nonnegative(row, &result.columns, "event_count")? != snapshot.event_count
-        || get_text(row, &result.columns, "ordered_source_set_sha256")?
+        || nonnegative(row, result.columns(), "event_count")? != snapshot.event_count
+        || get_text(row, result.columns(), "ordered_source_set_sha256")?
             != snapshot.ordered_source_set_sha256
-        || get_text(row, &result.columns, "source_content_sha256")?
+        || get_text(row, result.columns(), "source_content_sha256")?
             != snapshot.source_content_sha256
-        || nonnegative(row, &result.columns, "capture_ordinal")? != snapshot.event_count
+        || nonnegative(row, result.columns(), "capture_ordinal")? != snapshot.event_count
     {
         return Err(lease_refusal(
             request,
@@ -649,7 +649,7 @@ fn capture_page(
         }
         let anchors = read_anchors(store, bounds, request.context_id, event.id)?;
         let source_row_sha256 =
-            captured_source_sha256(columns, row, &anchors.columns, &anchors.rows);
+            captured_source_sha256(columns, row, anchors.columns(), anchors.rows());
         if let Some(generation_id) = generation_id {
             persist_membership(
                 store,
@@ -833,34 +833,34 @@ fn claim_batch(
                 ]),
             )
             .map_err(map_engine_err)?;
-        let checked_row = checked.rows.first().ok_or_else(|| {
+        let checked_row = checked.rows().first().ok_or_else(|| {
             lease_refusal(
                 request,
                 seal.id,
                 InterpretationLeaseRefusalReason::MembershipChanged,
             )
         })?;
-        if checked.rows.len() != 1
-            || nonnegative(checked_row, &checked.columns, "event_count")? != event_count
-            || get_text(checked_row, &checked.columns, "ordered_source_set_sha256")?
+        if checked.rows().len() != 1
+            || nonnegative(checked_row, checked.columns(), "event_count")? != event_count
+            || get_text(checked_row, checked.columns(), "ordered_source_set_sha256")?
                 != seal.ordered_source_set_sha256
-            || get_text(checked_row, &checked.columns, "source_content_sha256")?
+            || get_text(checked_row, checked.columns(), "source_content_sha256")?
                 != seal.source_content_sha256
-            || nonnegative(checked_row, &checked.columns, "build_ordinal")? != build_ordinal
-            || optional_nonnegative(checked_row, &checked.columns, "claim_end_ordinal")?
+            || nonnegative(checked_row, checked.columns(), "build_ordinal")? != build_ordinal
+            || optional_nonnegative(checked_row, checked.columns(), "claim_end_ordinal")?
                 != persisted_end
-            || get_optional_text(checked_row, &checked.columns, "claim_membership_sha256")?
+            || get_optional_text(checked_row, checked.columns(), "claim_membership_sha256")?
                 != persisted_digest
-            || signed_integer(checked_row, &checked.columns, "lease_epoch")? != old_epoch
-            || get_optional_text(checked_row, &checked.columns, "lease_token")? != current_token
-            || optional_timestamp(checked_row, &checked.columns, "lease_expires_at")?
+            || signed_integer(checked_row, checked.columns(), "lease_epoch")? != old_epoch
+            || get_optional_text(checked_row, checked.columns(), "lease_token")? != current_token
+            || optional_timestamp(checked_row, checked.columns(), "lease_expires_at")?
                 != current_expiry
-            || nonnegative(checked_row, &checked.columns, "interpreted_event_count")?
+            || nonnegative(checked_row, checked.columns(), "interpreted_event_count")?
                 != interpreted_event_count
-            || get_optional_text(checked_row, &checked.columns, "effective_content_sha256")?
+            || get_optional_text(checked_row, checked.columns(), "effective_content_sha256")?
                 .unwrap_or_else(empty_effective_hash)
                 != effective_content_sha256
-            || get_text(checked_row, &checked.columns, "state")? != state
+            || get_text(checked_row, checked.columns(), "state")? != state
         {
             return Err(lease_refusal(
                 request,
@@ -870,7 +870,7 @@ fn claim_batch(
         }
         let conditions = exact_row_conditions(
             checked_row,
-            &checked.columns,
+            checked.columns(),
             &[
                 "context_id",
                 "event_count",
@@ -984,7 +984,7 @@ fn create_bounded_claim(
     )?;
     let mut events = Vec::new();
     let mut used_bytes = 0_usize;
-    for row in &candidates.rows {
+    for row in candidates.rows() {
         let expected = build_ordinal
             .checked_add(
                 u64::try_from(events.len()).map_err(|_| {
@@ -992,7 +992,7 @@ fn create_bounded_claim(
                 })?,
             )
             .ok_or_else(|| CgError::Engine("interpretation claim ordinal exhausted u64".into()))?;
-        if nonnegative(row, &candidates.columns, "ordinal")? != expected {
+        if nonnegative(row, candidates.columns(), "ordinal")? != expected {
             return Err(lease_refusal(
                 request,
                 seal.id,
@@ -1000,7 +1000,7 @@ fn create_bounded_claim(
             ));
         }
         let (event, event_bytes) =
-            decode_claimed_event(store, request, seal.id, bounds, &candidates.columns, row)?;
+            decode_claimed_event(store, request, seal.id, bounds, candidates.columns(), row)?;
         if event_bytes > bounds.bytes {
             return Err(CgError::Engine(format!(
                 "captured event {} exceeds max_bytes_per_batch {}",
@@ -1072,8 +1072,8 @@ fn load_persisted_claim(
                 ),
             ]),
         )?;
-        if membership.rows.len() != 1
-            || nonnegative(&membership.rows[0], &membership.columns, "ordinal")? != ordinal
+        if membership.rows().len() != 1
+            || nonnegative(&membership.rows()[0], membership.columns(), "ordinal")? != ordinal
         {
             return Err(lease_refusal(
                 request,
@@ -1086,8 +1086,8 @@ fn load_persisted_claim(
             request,
             seal.id,
             bounds,
-            &membership.columns,
-            &membership.rows[0],
+            membership.columns(),
+            &membership.rows()[0],
         )?;
         used_bytes = used_bytes.saturating_add(event_bytes);
         if used_bytes > bounds.bytes {
@@ -1281,23 +1281,23 @@ fn commit_batch_in_tx(
             ]),
         )
         .map_err(map_engine_err)?;
-    let row = generation.rows.first().ok_or_else(|| {
+    let row = generation.rows().first().ok_or_else(|| {
         lease_refusal(
             request,
             claim.generation.id,
             InterpretationLeaseRefusalReason::MembershipChanged,
         )
     })?;
-    if generation.rows.len() != 1 {
+    if generation.rows().len() != 1 {
         return Err(lease_refusal(
             request,
             claim.generation.id,
             InterpretationLeaseRefusalReason::MembershipChanged,
         ));
     }
-    if get_optional_text(row, &generation.columns, "lease_token")?.as_deref()
+    if get_optional_text(row, generation.columns(), "lease_token")?.as_deref()
         != Some(claim.lease_token.as_str())
-        || signed_integer(row, &generation.columns, "lease_epoch")? != claim.lease_epoch
+        || signed_integer(row, generation.columns(), "lease_epoch")? != claim.lease_epoch
     {
         return Err(lease_refusal(
             request,
@@ -1305,22 +1305,22 @@ fn commit_batch_in_tx(
             InterpretationLeaseRefusalReason::StaleClaim,
         ));
     }
-    if nonnegative(row, &generation.columns, "event_count")? != claim.generation.event_count
-        || get_text(row, &generation.columns, "ordered_source_set_sha256")?
+    if nonnegative(row, generation.columns(), "event_count")? != claim.generation.event_count
+        || get_text(row, generation.columns(), "ordered_source_set_sha256")?
             != claim.generation.ordered_source_set_sha256
-        || get_text(row, &generation.columns, "source_content_sha256")?
+        || get_text(row, generation.columns(), "source_content_sha256")?
             != claim.generation.source_content_sha256
-        || nonnegative(row, &generation.columns, "build_ordinal")? != claim.build_ordinal
-        || optional_nonnegative(row, &generation.columns, "claim_end_ordinal")?
+        || nonnegative(row, generation.columns(), "build_ordinal")? != claim.build_ordinal
+        || optional_nonnegative(row, generation.columns(), "claim_end_ordinal")?
             != Some(claim.claim_end_ordinal)
-        || get_optional_text(row, &generation.columns, "claim_membership_sha256")?.as_deref()
+        || get_optional_text(row, generation.columns(), "claim_membership_sha256")?.as_deref()
             != Some(claim.claim_membership_sha256.as_str())
-        || nonnegative(row, &generation.columns, "interpreted_event_count")?
+        || nonnegative(row, generation.columns(), "interpreted_event_count")?
             != claim.interpreted_event_count
-        || get_optional_text(row, &generation.columns, "effective_content_sha256")?
+        || get_optional_text(row, generation.columns(), "effective_content_sha256")?
             .unwrap_or_else(empty_effective_hash)
             != claim.effective_content_sha256
-        || get_text(row, &generation.columns, "state")? != "building"
+        || get_text(row, generation.columns(), "state")? != "building"
     {
         return Err(lease_refusal(
             request,
@@ -1328,7 +1328,7 @@ fn commit_batch_in_tx(
             InterpretationLeaseRefusalReason::MembershipChanged,
         ));
     }
-    let persisted_expiry = optional_timestamp(row, &generation.columns, "lease_expires_at")?;
+    let persisted_expiry = optional_timestamp(row, generation.columns(), "lease_expires_at")?;
 
     let mut claim_digest = claim_membership_hasher();
     for (offset, event) in built.iter().enumerate() {
@@ -1362,22 +1362,22 @@ fn commit_batch_in_tx(
                 ]),
             )
             .map_err(map_engine_err)?;
-        if membership.rows.len() != 1 {
+        if membership.rows().len() != 1 {
             return Err(lease_refusal(
                 request,
                 claim.generation.id,
                 InterpretationLeaseRefusalReason::MembershipChanged,
             ));
         }
-        let row = &membership.rows[0];
-        if nonnegative(row, &membership.columns, "ordinal")? != event.claimed.ordinal
-            || EventId::from(get_uuid(row, &membership.columns, "event_id")?)
+        let row = &membership.rows()[0];
+        if nonnegative(row, membership.columns(), "ordinal")? != event.claimed.ordinal
+            || EventId::from(get_uuid(row, membership.columns(), "event_id")?)
                 != event.claimed.captured.event.id
-            || get_text(row, &membership.columns, "source_instance_ref")?
+            || get_text(row, membership.columns(), "source_instance_ref")?
                 != event.claimed.source_instance_ref
-            || nonnegative(row, &membership.columns, "source_sequence")?
+            || nonnegative(row, membership.columns(), "source_sequence")?
                 != event.claimed.source_sequence
-            || get_text(row, &membership.columns, "source_row_sha256")?
+            || get_text(row, membership.columns(), "source_row_sha256")?
                 != event.claimed.source_row_sha256
         {
             return Err(lease_refusal(
@@ -1417,7 +1417,7 @@ fn commit_batch_in_tx(
     }
     let conditions = exact_row_conditions(
         row,
-        &generation.columns,
+        generation.columns(),
         &[
             "context_id",
             "event_count",
@@ -1517,14 +1517,14 @@ fn verify_source_in_tx(
             ]),
         )
         .map_err(map_engine_err)?;
-    let Some(event_row) = event.rows.first() else {
+    let Some(event_row) = event.rows().first() else {
         return Err(lease_refusal(
             request,
             generation_id,
             InterpretationLeaseRefusalReason::SourceChanged,
         ));
     };
-    if event.rows.len() != 1 {
+    if event.rows().len() != 1 {
         return Err(lease_refusal(
             request,
             generation_id,
@@ -1545,7 +1545,7 @@ fn verify_source_in_tx(
             ]),
         )
         .map_err(map_engine_err)?;
-    if anchors.rows.len() != built.claimed.captured.anchors.len() {
+    if anchors.rows().len() != built.claimed.captured.anchors.len() {
         return Err(lease_refusal(
             request,
             generation_id,
@@ -1553,13 +1553,13 @@ fn verify_source_in_tx(
         ));
     }
     let mut sorted_anchors = anchors
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             Ok((
-                get_text(row, &anchors.columns, "declaration_version")?,
-                get_text(row, &anchors.columns, "key")?,
-                get_text(row, &anchors.columns, "identity_value")?,
+                get_text(row, anchors.columns(), "declaration_version")?,
+                get_text(row, anchors.columns(), "key")?,
+                get_text(row, anchors.columns(), "identity_value")?,
                 row.clone(),
             ))
         })
@@ -1574,7 +1574,7 @@ fn verify_source_in_tx(
         .into_iter()
         .map(|(_, _, _, row)| row)
         .collect::<Vec<_>>();
-    let hash = captured_source_sha256(&event.columns, event_row, &anchors.columns, &sorted_rows);
+    let hash = captured_source_sha256(event.columns(), event_row, anchors.columns(), &sorted_rows);
     if hash != built.claimed.source_row_sha256 {
         return Err(lease_refusal(
             request,
@@ -1712,13 +1712,13 @@ fn load_receipt(
                 ("id".into(), Value::Uuid(generation_id.as_uuid())),
             ]),
         )?;
-    let row = result.rows.first().ok_or_else(|| CgError::NotFound {
+    let row = result.rows().first().ok_or_else(|| CgError::NotFound {
         id: Some(generation_id.to_string()),
         missing: Some("interpretation generation"),
     })?;
     let accepted_source_declarations = serde_json::from_value(get_json(
         row,
-        &result.columns,
+        result.columns(),
         "accepted_source_declarations",
     )?)
     .map_err(|error| {
@@ -1733,34 +1733,34 @@ fn load_receipt(
         accepted_source_declarations,
         target_interpretation_version: get_text(
             row,
-            &result.columns,
+            result.columns(),
             "target_interpretation_version",
         )?,
-        target_adapter_version: get_text(row, &result.columns, "target_adapter_version")?,
+        target_adapter_version: get_text(row, result.columns(), "target_adapter_version")?,
         target_anchor_declaration_version: get_text(
             row,
-            &result.columns,
+            result.columns(),
             "target_anchor_declaration_version",
         )?,
-        mapping_contract_id: get_text(row, &result.columns, "mapping_contract_id")?,
-        mapping_contract_sha256: get_text(row, &result.columns, "mapping_contract_sha256")?,
+        mapping_contract_id: get_text(row, result.columns(), "mapping_contract_id")?,
+        mapping_contract_sha256: get_text(row, result.columns(), "mapping_contract_sha256")?,
         source_watermark: EventWatermark {
-            event_count: nonnegative(row, &result.columns, "event_count")?,
-            ordered_source_set_sha256: get_text(row, &result.columns, "ordered_source_set_sha256")?,
+            event_count: nonnegative(row, result.columns(), "event_count")?,
+            ordered_source_set_sha256: get_text(row, result.columns(), "ordered_source_set_sha256")?,
         },
-        source_content_sha256: get_text(row, &result.columns, "source_content_sha256")?,
+        source_content_sha256: get_text(row, result.columns(), "source_content_sha256")?,
         effective_content_sha256: get_optional_text(
             row,
-            &result.columns,
+            result.columns(),
             "effective_content_sha256",
         )?
         .unwrap_or_else(empty_effective_hash),
-        eligible_event_count: nonnegative(row, &result.columns, "eligible_event_count")?,
-        interpreted_event_count: nonnegative(row, &result.columns, "interpreted_event_count")?,
-        failed_event_count: nonnegative(row, &result.columns, "failed_event_count")?,
-        state: generation_state(&get_text(row, &result.columns, "state")?)?,
-        completed_at: get_optional_txid(row, &result.columns, "completed_at")?,
-        sanitized_failure: get_optional_text(row, &result.columns, "sanitized_failure")?,
+        eligible_event_count: nonnegative(row, result.columns(), "eligible_event_count")?,
+        interpreted_event_count: nonnegative(row, result.columns(), "interpreted_event_count")?,
+        failed_event_count: nonnegative(row, result.columns(), "failed_event_count")?,
+        state: generation_state(&get_text(row, result.columns(), "state")?)?,
+        completed_at: get_optional_txid(row, result.columns(), "completed_at")?,
+        sanitized_failure: get_optional_text(row, result.columns(), "sanitized_failure")?,
     };
     drop(store);
     Ok(receipt)
@@ -1854,13 +1854,13 @@ fn load_captured(
             ("event_id".into(), Value::Uuid(event_id.as_uuid())),
         ]),
     )?;
-    let row = result.rows.first().ok_or_else(|| CgError::NotFound {
+    let row = result.rows().first().ok_or_else(|| CgError::NotFound {
         id: Some(event_id.to_string()),
         missing: Some("captured event"),
     })?;
-    let event = decode_event(&result.columns, row)?;
+    let event = decode_event(result.columns(), row)?;
     let anchors = read_anchors(store, bounds, context_id, event_id)?;
-    let hash = captured_source_sha256(&result.columns, row, &anchors.columns, &anchors.rows);
+    let hash = captured_source_sha256(result.columns(), row, anchors.columns(), anchors.rows());
     Ok((
         CapturedEventAndAnchors {
             event,
@@ -1897,12 +1897,12 @@ fn read_anchors(
     let mut used = 0_usize;
     let read = (|| -> Result<()> {
         let first = cursor.first_page();
-        columns = first.columns.clone();
-        let mut has_more = first.has_more;
+        columns = first.columns().to_vec();
+        let mut has_more = first.has_more();
         append_anchor_page(
             bounds,
-            &first.columns,
-            &first.rows,
+            first.columns(),
+            first.rows(),
             &mut used,
             &mut decoded,
             &mut raw,
@@ -1911,11 +1911,11 @@ fn read_anchors(
             let next = cursor
                 .fetch(NonZeroUsize::new(bounds.events))
                 .map_err(map_engine_err)?;
-            has_more = next.has_more;
+            has_more = next.has_more();
             append_anchor_page(
                 bounds,
-                &next.columns,
-                &next.rows,
+                next.columns(),
+                next.rows(),
                 &mut used,
                 &mut decoded,
                 &mut raw,
@@ -1968,11 +1968,11 @@ fn query_one(
     params: &HashMap<String, Value>,
 ) -> Result<(Vec<Value>, Vec<String>)> {
     let result = query_rows(store, bounds, sql, params)?;
-    let row = result.rows.into_iter().next().ok_or(CgError::NotFound {
+    let row = result.rows().first().cloned().ok_or(CgError::NotFound {
         id: None,
         missing: Some("interpretation generation"),
     })?;
-    Ok((row, result.columns))
+    Ok((row, result.columns().to_vec()))
 }
 
 fn query_rows(

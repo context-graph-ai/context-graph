@@ -915,7 +915,6 @@ dependencies = [
 [[package]]
 name = "contextdb-core"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "bincode 2.0.1",
  "rand 0.9.4",
@@ -929,7 +928,6 @@ dependencies = [
 [[package]]
 name = "contextdb-engine"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "bao-tree",
  "bincode 2.0.1",
@@ -974,7 +972,6 @@ dependencies = [
 [[package]]
 name = "contextdb-graph"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -985,7 +982,6 @@ dependencies = [
 [[package]]
 name = "contextdb-hnsw"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "anndists",
  "anyhow",
@@ -1009,7 +1005,6 @@ dependencies = [
 [[package]]
 name = "contextdb-parser"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "contextdb-core",
  "pest",
@@ -1019,7 +1014,6 @@ dependencies = [
 [[package]]
 name = "contextdb-planner"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "contextdb-core",
  "contextdb-parser",
@@ -1028,15 +1022,16 @@ dependencies = [
 [[package]]
 name = "contextdb-redb"
 version = "4.1.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
+ "allocator-api2",
+ "hashbrown 0.16.1",
  "libc",
+ "tempfile",
 ]
 
 [[package]]
 name = "contextdb-relational"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -1047,7 +1042,6 @@ dependencies = [
 [[package]]
 name = "contextdb-server"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "blake3",
  "clap",
@@ -1075,16 +1069,15 @@ dependencies = [
 [[package]]
 name = "contextdb-tx"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "contextdb-core",
  "parking_lot",
+ "serde",
 ]
 
 [[package]]
 name = "contextdb-vector"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9#5ecedbeb785800fcea8dd4ddc96b263ca8ba29e9"
 dependencies = [
  "anndists",
  "contextdb-core",

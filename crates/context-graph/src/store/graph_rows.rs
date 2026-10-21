@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use contextdb_core::Value;
-use contextdb_engine::QueryResult;
+use crate::consumer_read::ConsumerQueryResult;
 
 use crate::Result;
 
@@ -25,7 +25,7 @@ pub(crate) trait GraphRows {
     /// declaration, so a read reaching an undeclared table is refused by name before the engine is
     /// asked — which is why every typed read below runs its statements through this one call
     /// rather than reaching for a handle of its own.
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult>;
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult>;
 }
 
 impl crate::Store {
@@ -34,7 +34,7 @@ impl crate::Store {
         &self,
         sql: &str,
         params: &HashMap<String, Value>,
-    ) -> Result<QueryResult> {
+    ) -> Result<ConsumerQueryResult> {
         let session = self
             .internal_db()
             .read_session(self.read_limits())
@@ -42,21 +42,21 @@ impl crate::Store {
         let mut cursor = session
             .open_cursor(sql, params)
             .map_err(super::convert::map_engine_err)?;
-        let paged = (|| -> Result<QueryResult> {
+        let paged = (|| -> Result<ConsumerQueryResult> {
             let first = cursor.first_page();
-            let mut answer = QueryResult {
-                columns: first.columns.clone(),
-                rows: first.rows.clone(),
-                ..QueryResult::empty()
+            let mut answer = ConsumerQueryResult {
+                columns: first.columns().to_vec(),
+                rows: first.rows().to_vec(),
+                ..ConsumerQueryResult::empty()
             };
-            let mut has_more = first.has_more;
+            let mut has_more = first.has_more();
             while has_more {
                 let page = cursor.fetch(None).map_err(super::convert::map_engine_err)?;
                 if answer.columns.is_empty() {
-                    answer.columns = page.columns;
+                    answer.columns = page.columns().to_vec();
                 }
-                answer.rows.extend(page.rows);
-                has_more = page.has_more;
+                answer.rows.extend_from_slice(page.rows());
+                has_more = page.has_more();
             }
             Ok(answer)
         })();

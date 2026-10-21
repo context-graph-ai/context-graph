@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use contextdb_core::Value;
-use contextdb_engine::QueryResult;
+use crate::consumer_read::ConsumerQueryResult;
 
 use crate::embedder::{Embedder, EventSearchEmbedder};
 use crate::{
@@ -21,7 +21,7 @@ use super::convert::map_engine_err;
 type EventSearchRowVisitor<'a> = dyn FnMut(&[String], &[Value]) -> Result<()> + 'a;
 
 pub(crate) trait EventSearchRows {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult>;
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult>;
     fn stream_rows(
         &self,
         sql: &str,
@@ -193,15 +193,15 @@ fn record_statement(sql: &str) {
 fn record_statement(_sql: &str) {}
 
 impl EventSearchRows for Store {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult> {
         record_statement(sql);
         self.require_application_ready()?;
         let answer = self
             .internal_db()
             .execute(sql, params)
             .map_err(map_engine_err)?;
-        record_cursor_trace(|| Ok(&answer.trace))?;
-        Ok(answer)
+        record_cursor_trace(|| Ok(answer.trace()))?;
+        Ok(ConsumerQueryResult::copy_from(&answer))
     }
 
     fn stream_rows(
@@ -220,16 +220,16 @@ impl EventSearchRows for Store {
         let read = (|| -> Result<()> {
             let first = cursor.first_page();
             record_page_charge(|| session.charged_bytes().map_err(map_engine_err))?;
-            let mut has_more = first.has_more;
-            for row in &first.rows {
-                visit(&first.columns, row)?;
+            let mut has_more = first.has_more();
+            for row in first.rows() {
+                visit(first.columns(), row)?;
             }
             while has_more {
                 let page = cursor.fetch(None).map_err(map_engine_err)?;
                 record_page_charge(|| session.charged_bytes().map_err(map_engine_err))?;
-                has_more = page.has_more;
-                for row in &page.rows {
-                    visit(&page.columns, row)?;
+                has_more = page.has_more();
+                for row in page.rows() {
+                    visit(page.columns(), row)?;
                 }
             }
             Ok(())
@@ -251,23 +251,23 @@ impl EventSearchRows for Store {
 }
 
 impl EventSearchRows for ConsumerReader {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult> {
         record_statement(sql);
         let mut cursor = self.open_cursor(sql, params)?;
         let paged = (|| -> Result<(Vec<String>, Vec<Vec<Value>>)> {
             let first = cursor.first_page()?;
             record_page_charge(|| self.charged_bytes())?;
-            let mut columns = first.columns.clone();
-            let mut rows = first.rows.clone();
-            let mut has_more = first.has_more;
+            let mut columns = first.columns().to_vec();
+            let mut rows = first.rows().to_vec();
+            let mut has_more = first.has_more();
             while has_more {
                 let page = cursor.fetch(None)?;
                 record_page_charge(|| self.charged_bytes())?;
                 if columns.is_empty() {
-                    columns = page.columns;
+                    columns = page.columns().to_vec();
                 }
-                rows.extend(page.rows);
-                has_more = page.has_more;
+                rows.extend_from_slice(page.rows());
+                has_more = page.has_more();
             }
             Ok((columns, rows))
         })();
@@ -276,10 +276,10 @@ impl EventSearchRows for ConsumerReader {
         let (columns, rows) = paged?;
         traced?;
         closed?;
-        Ok(QueryResult {
+        Ok(ConsumerQueryResult {
             columns,
             rows,
-            ..QueryResult::empty()
+            ..ConsumerQueryResult::empty()
         })
     }
 
@@ -294,16 +294,16 @@ impl EventSearchRows for ConsumerReader {
         let read = (|| -> Result<()> {
             let first = cursor.first_page()?;
             record_page_charge(|| self.charged_bytes())?;
-            let mut has_more = first.has_more;
-            for row in &first.rows {
-                visit(&first.columns, row)?;
+            let mut has_more = first.has_more();
+            for row in first.rows() {
+                visit(first.columns(), row)?;
             }
             while has_more {
                 let page = cursor.fetch(None)?;
                 record_page_charge(|| self.charged_bytes())?;
-                has_more = page.has_more;
-                for row in &page.rows {
-                    visit(&page.columns, row)?;
+                has_more = page.has_more();
+                for row in page.rows() {
+                    visit(page.columns(), row)?;
                 }
             }
             Ok(())
@@ -395,18 +395,18 @@ pub(crate) fn stored_event_context_counts<R: EventSearchRows + ?Sized>(
         ),
         &params,
     )?;
-    for row in &answer.rows {
+    for row in answer.rows() {
         stored.insert(
-            ContextId::from(get_uuid(row, &answer.columns, "context_id")?),
+            ContextId::from(get_uuid(row, answer.columns(), "context_id")?),
             CapturedEventCounts {
-                captured: get_u64(row, &answer.columns, "captured_events")?,
+                captured: get_u64(row, answer.columns(), "captured_events")?,
                 coverage: EventCoverageCounts {
-                    complete: get_u64(row, &answer.columns, "complete_events")?,
-                    opaque: get_u64(row, &answer.columns, "opaque_events")?,
-                    payload_refused: get_u64(row, &answer.columns, "payload_refused_events")?,
+                    complete: get_u64(row, answer.columns(), "complete_events")?,
+                    opaque: get_u64(row, answer.columns(), "opaque_events")?,
+                    payload_refused: get_u64(row, answer.columns(), "payload_refused_events")?,
                     source_declared_missing: get_u64(
                         row,
-                        &answer.columns,
+                        answer.columns(),
                         "source_declared_missing_events",
                     )?,
                 },
@@ -426,10 +426,10 @@ pub(crate) fn count_captured_events<R: EventSearchRows + ?Sized>(
     let count = |sql: &str, params: &HashMap<String, Value>| -> Result<u64> {
         let answer = rows.query_rows(sql, params)?;
         let row = answer
-            .rows
+            .rows()
             .first()
             .ok_or_else(|| CgError::Engine("an event count returned no aggregate row".into()))?;
-        get_u64(row, &answer.columns, "n")
+        get_u64(row, answer.columns(), "n")
     };
     let params = HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]);
     let by_coverage = |coverage: &str| -> Result<u64> {
@@ -662,17 +662,17 @@ pub(crate) fn find_event_history(
             )
         })
         .collect::<HashMap<_, _>>();
-    let mut hits = Vec::with_capacity(ranked.rows.len());
-    for row in &ranked.rows {
-        let context_id = ContextId::from(get_uuid(row, &ranked.columns, "context_id")?);
+    let mut hits = Vec::with_capacity(ranked.rows().len());
+    for row in ranked.rows() {
+        let context_id = ContextId::from(get_uuid(row, ranked.columns(), "context_id")?);
         let generation_id =
-            EventSearchGenerationId::from(get_uuid(row, &ranked.columns, "generation_id")?);
+            EventSearchGenerationId::from(get_uuid(row, ranked.columns(), "generation_id")?);
         let Some(space_id) = active_pairs.get(&(context_id, generation_id)) else {
             return Err(CgError::Engine(
                 "event-history ranking returned a passage outside the active selected heads".into(),
             ));
         };
-        let dimension = get_u32(row, &ranked.columns, "dimension")?;
+        let dimension = get_u32(row, ranked.columns(), "dimension")?;
         if dimension as usize != output.dimension {
             return Err(CgError::EmbeddingDimensionMismatch {
                 space_id: space_id.clone(),
@@ -680,23 +680,23 @@ pub(crate) fn find_event_history(
                 found: dimension,
             });
         }
-        let score = get_f32(row, &ranked.columns, "score")?;
+        let score = get_f32(row, ranked.columns(), "score")?;
         if !score.is_finite() {
             return Err(CgError::Engine(
                 "event-history ranking returned a non-finite cosine similarity".into(),
             ));
         }
         hits.push(EventSearchHit {
-            passage_id: EventSearchPassageId::from(get_uuid(row, &ranked.columns, "id")?),
+            passage_id: EventSearchPassageId::from(get_uuid(row, ranked.columns(), "id")?),
             context_id,
-            connector_id: get_text(row, &ranked.columns, "connector_id")?,
-            session_ref: get_text(row, &ranked.columns, "session_ref")?,
-            source_instance_ref: get_text(row, &ranked.columns, "source_instance_ref")?,
-            first_event_seq: get_u64(row, &ranked.columns, "first_event_sequence")?,
-            last_event_seq: get_u64(row, &ranked.columns, "last_event_sequence")?,
+            connector_id: get_text(row, ranked.columns(), "connector_id")?,
+            session_ref: get_text(row, ranked.columns(), "session_ref")?,
+            source_instance_ref: get_text(row, ranked.columns(), "source_instance_ref")?,
+            first_event_seq: get_u64(row, ranked.columns(), "first_event_sequence")?,
+            last_event_seq: get_u64(row, ranked.columns(), "last_event_sequence")?,
             first_occurred_at: None,
             last_occurred_at: None,
-            text: get_text(row, &ranked.columns, "rendered_text")?,
+            text: get_text(row, ranked.columns(), "rendered_text")?,
             cosine_similarity: score,
             applied_filter: filter.clone(),
             embedding_space_id: space_id.clone(),
@@ -757,12 +757,12 @@ pub(crate) fn get_event_search_passage(
             params
         },
     )?;
-    let Some(row) = passage.rows.first() else {
+    let Some(row) = passage.rows().first() else {
         return Ok(None);
     };
-    let context_id = ContextId::from(get_uuid(row, &passage.columns, "context_id")?);
+    let context_id = ContextId::from(get_uuid(row, passage.columns(), "context_id")?);
     let generation_id =
-        EventSearchGenerationId::from(get_uuid(row, &passage.columns, "generation_id")?);
+        EventSearchGenerationId::from(get_uuid(row, passage.columns(), "generation_id")?);
 
     let generation = rows.query_rows(
         "SELECT embedding_space_id FROM event_search_generations \
@@ -772,12 +772,12 @@ pub(crate) fn get_event_search_passage(
             ("context_id".into(), Value::Uuid(context_id.as_uuid())),
         ]),
     )?;
-    let generation_row = generation.rows.first().ok_or_else(|| {
+    let generation_row = generation.rows().first().ok_or_else(|| {
         CgError::Engine(format!(
             "event-search passage {passage_id} names a missing generation"
         ))
     })?;
-    let embedding_space_id = get_text(generation_row, &generation.columns, "embedding_space_id")?;
+    let embedding_space_id = get_text(generation_row, generation.columns(), "embedding_space_id")?;
     let handle = rows.query_rows(
         "SELECT id, embedding_space_id FROM event_search_embedding_handles \
          WHERE passage_id = $passage_id AND context_id = $context_id \
@@ -792,7 +792,7 @@ pub(crate) fn get_event_search_passage(
             ),
         ]),
     )?;
-    let handle_row = handle.rows.first().ok_or_else(|| {
+    let handle_row = handle.rows().first().ok_or_else(|| {
         CgError::Engine(format!(
             "event-search passage {passage_id} has no matching embedding handle"
         ))
@@ -813,21 +813,21 @@ pub(crate) fn get_event_search_passage(
         id: passage_id,
         context_id,
         generation_id,
-        connector_id: get_text(row, &passage.columns, "connector_id")?,
-        session_ref: get_text(row, &passage.columns, "session_ref")?,
-        source_instance_ref: get_text(row, &passage.columns, "source_instance_ref")?,
-        ordinal: get_u64(row, &passage.columns, "passage_ordinal")?,
-        first_event_seq: get_u64(row, &passage.columns, "first_event_sequence")?,
-        last_event_seq: get_u64(row, &passage.columns, "last_event_sequence")?,
+        connector_id: get_text(row, passage.columns(), "connector_id")?,
+        session_ref: get_text(row, passage.columns(), "session_ref")?,
+        source_instance_ref: get_text(row, passage.columns(), "source_instance_ref")?,
+        ordinal: get_u64(row, passage.columns(), "passage_ordinal")?,
+        first_event_seq: get_u64(row, passage.columns(), "first_event_sequence")?,
+        last_event_seq: get_u64(row, passage.columns(), "last_event_sequence")?,
         first_occurred_at,
         last_occurred_at,
-        text: get_text(row, &passage.columns, "rendered_text")?,
-        content_sha256: get_text(row, &passage.columns, "content_sha256")?,
-        embedding_id: EmbeddingId::from(get_uuid(handle_row, &handle.columns, "id")?),
+        text: get_text(row, passage.columns(), "rendered_text")?,
+        content_sha256: get_text(row, passage.columns(), "content_sha256")?,
+        embedding_id: EmbeddingId::from(get_uuid(handle_row, handle.columns(), "id")?),
         embedding_space_id,
-        dimension: get_u32(row, &passage.columns, "dimension")?,
-        is_current: get_bool(row, &passage.columns, "is_current")?,
-        created_at: get_txid(row, &passage.columns, "created_at")?,
+        dimension: get_u32(row, passage.columns(), "dimension")?,
+        is_current: get_bool(row, passage.columns(), "is_current")?,
+        created_at: get_txid(row, passage.columns(), "created_at")?,
         sources,
     }))
 }
@@ -869,10 +869,10 @@ fn classify_contexts(
         &head_params,
     )?;
     let mut generation_for_context = HashMap::new();
-    for row in &heads.rows {
+    for row in heads.rows() {
         generation_for_context.insert(
-            ContextId::from(get_uuid(row, &heads.columns, "context_id")?),
-            EventSearchGenerationId::from(get_uuid(row, &heads.columns, "generation_id")?),
+            ContextId::from(get_uuid(row, heads.columns(), "context_id")?),
+            EventSearchGenerationId::from(get_uuid(row, heads.columns(), "generation_id")?),
         );
     }
 
@@ -895,14 +895,14 @@ fn classify_contexts(
             ),
             &generation_params,
         )?;
-        for row in &generations.rows {
-            let state = get_text(row, &generations.columns, "state")?;
+        for row in generations.rows() {
+            let state = get_text(row, generations.columns(), "state")?;
             if state != "ready" && state != "building" {
                 continue;
             }
-            let context_id = ContextId::from(get_uuid(row, &generations.columns, "context_id")?);
+            let context_id = ContextId::from(get_uuid(row, generations.columns(), "context_id")?);
             let generation_id =
-                EventSearchGenerationId::from(get_uuid(row, &generations.columns, "id")?);
+                EventSearchGenerationId::from(get_uuid(row, generations.columns(), "id")?);
             if generation_for_context.get(&context_id) != Some(&generation_id) {
                 return Err(CgError::Engine(
                     "event-search head and ready generation disagree on Context".into(),
@@ -915,11 +915,11 @@ fn classify_contexts(
                     generation_id,
                     source_sha256: get_text(
                         row,
-                        &generations.columns,
+                        generations.columns(),
                         "ordered_source_set_sha256",
                     )?,
-                    embedding_space_id: get_text(row, &generations.columns, "embedding_space_id")?,
-                    encoding_profile: get_text(row, &generations.columns, "encoding_profile")?,
+                    embedding_space_id: get_text(row, generations.columns(), "embedding_space_id")?,
+                    encoding_profile: get_text(row, generations.columns(), "encoding_profile")?,
                 },
             );
         }
@@ -1074,9 +1074,9 @@ fn verify_contexts(rows: &dyn EventSearchRows, selected: &[ContextId]) -> Result
         &params,
     )?;
     let ordered = answer
-        .rows
+        .rows()
         .iter()
-        .map(|row| get_uuid(row, &answer.columns, "id").map(ContextId::from))
+        .map(|row| get_uuid(row, answer.columns(), "id").map(ContextId::from))
         .collect::<Result<Vec<_>>>()?;
     let found = ordered.iter().copied().collect::<HashSet<_>>();
     if let Some(missing) = selected
@@ -1114,10 +1114,10 @@ fn load_sources(
                 ("passage_id".into(), Value::Uuid(passage_id.as_uuid())),
             ]),
         )?;
-        for row in &answer.rows {
-            let row_context = ContextId::from(get_uuid(row, &answer.columns, "context_id")?);
+        for row in answer.rows() {
+            let row_context = ContextId::from(get_uuid(row, answer.columns(), "context_id")?);
             let row_passage =
-                EventSearchPassageId::from(get_uuid(row, &answer.columns, "passage_id")?);
+                EventSearchPassageId::from(get_uuid(row, answer.columns(), "passage_id")?);
             if (row_context, row_passage) != (*context_id, *passage_id) {
                 return Err(CgError::Engine(
                     "event-search source expansion returned an unrequested passage".into(),
@@ -1129,15 +1129,15 @@ fn load_sources(
                 .push(PassageEventSource {
                     context_id: row_context,
                     passage_id: row_passage,
-                    event_id: EventId::from(get_uuid(row, &answer.columns, "event_id")?),
-                    connector_id: get_text(row, &answer.columns, "connector_id")?,
-                    session_ref: get_text(row, &answer.columns, "session_ref")?,
-                    source_instance_ref: get_text(row, &answer.columns, "source_instance_ref")?,
-                    source_order: get_u64(row, &answer.columns, "source_order")?,
-                    event_start_byte: get_optional_u64(row, &answer.columns, "event_start_byte")?,
-                    event_end_byte: get_optional_u64(row, &answer.columns, "event_end_byte")?,
-                    passage_start_byte: get_u64(row, &answer.columns, "passage_start_byte")?,
-                    passage_end_byte: get_u64(row, &answer.columns, "passage_end_byte")?,
+                    event_id: EventId::from(get_uuid(row, answer.columns(), "event_id")?),
+                    connector_id: get_text(row, answer.columns(), "connector_id")?,
+                    session_ref: get_text(row, answer.columns(), "session_ref")?,
+                    source_instance_ref: get_text(row, answer.columns(), "source_instance_ref")?,
+                    source_order: get_u64(row, answer.columns(), "source_order")?,
+                    event_start_byte: get_optional_u64(row, answer.columns(), "event_start_byte")?,
+                    event_end_byte: get_optional_u64(row, answer.columns(), "event_end_byte")?,
+                    passage_start_byte: get_u64(row, answer.columns(), "passage_start_byte")?,
+                    passage_end_byte: get_u64(row, answer.columns(), "passage_end_byte")?,
                 });
         }
     }
@@ -1171,10 +1171,10 @@ fn load_event_times<'a>(
         &params,
     )?;
     let mut times = HashMap::new();
-    for row in &answer.rows {
+    for row in answer.rows() {
         times.insert(
-            EventId::from(get_uuid(row, &answer.columns, "id")?),
-            get_optional_timestamp(row, &answer.columns, "occurred_at")?,
+            EventId::from(get_uuid(row, answer.columns(), "id")?),
+            get_optional_timestamp(row, answer.columns(), "occurred_at")?,
         );
     }
     if let Some(missing) = sources

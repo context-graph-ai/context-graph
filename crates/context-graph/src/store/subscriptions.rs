@@ -672,8 +672,8 @@ fn based_on_entity_ids(
             ]),
         )
         .map_err(subscription_engine_err)?;
-    let mut ids = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+    let mut ids = Vec::with_capacity(result.rows().len());
+    for row in result.rows() {
         match row.first() {
             Some(Value::Uuid(value)) => ids.push(EntityId::from(*value)),
             other => {
@@ -697,7 +697,7 @@ fn observation_entity_id(
             &HashMap::from([("id".to_string(), Value::Uuid(observation_id.as_uuid()))]),
         )
         .map_err(subscription_engine_err)?;
-    let row = result.rows.first().ok_or_else(|| {
+    let row = result.rows().first().ok_or_else(|| {
         SubscriptionError::Engine(format!("observation not found: {observation_id}"))
     })?;
     match row.first() {
@@ -776,7 +776,7 @@ fn has_subscription_receipt(
         "SELECT action_id FROM cg_subscription_receipts WHERE sink_name = $sink_name AND action_id = $action_id",
         &receipt_params(sink_name, action_id),
     )
-    .map(|result| !result.rows.is_empty())
+    .map(|result| !result.rows().is_empty())
     .map_err(|error| SinkError::Transient(error.to_string()))
 }
 

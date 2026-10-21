@@ -60,7 +60,7 @@
 use std::collections::HashMap;
 
 use contextdb_core::Value;
-use contextdb_engine::QueryResult;
+use crate::consumer_read::ConsumerQueryResult;
 
 use crate::Result;
 use crate::store::graph_rows::GraphRows;
@@ -196,7 +196,7 @@ impl<'reader> ConsumerGraphView<'reader> {
 /// observations never said how many there would be and a bounded single answer would refuse the
 /// large ones the writable path answers.
 impl GraphRows for ConsumerGraphView<'_> {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult> {
         let mut cursor = self.reader.open_cursor(sql, params)?;
         // A read that STOPS is exactly where a cursor gets abandoned, and the consumer that only
         // wanted to look is the one left holding the snapshot. So every way out of the paging loop
@@ -204,18 +204,18 @@ impl GraphRows for ConsumerGraphView<'_> {
         // close.
         let paged = (|| -> Result<(Vec<String>, Vec<Vec<Value>>)> {
             let first = cursor.first_page()?;
-            let mut columns = first.columns.clone();
-            let mut rows = first.rows.clone();
-            let mut has_more = first.has_more;
+            let mut columns = first.columns().to_vec();
+            let mut rows = first.rows().to_vec();
+            let mut has_more = first.has_more();
             while has_more {
                 let page = cursor.fetch(None)?;
                 // A page that carries no rows names no columns either; the decoder needs the
                 // projection, so the first page that states one is the one believed.
                 if columns.is_empty() {
-                    columns = page.columns;
+                    columns = page.columns().to_vec();
                 }
-                rows.extend(page.rows);
-                has_more = page.has_more;
+                rows.extend_from_slice(page.rows());
+                has_more = page.has_more();
             }
             Ok((columns, rows))
         })();
@@ -224,10 +224,10 @@ impl GraphRows for ConsumerGraphView<'_> {
         // displace the refusal that stopped the read.
         let (columns, rows) = paged?;
         closed?;
-        Ok(QueryResult {
+        Ok(ConsumerQueryResult {
             columns,
             rows,
-            ..QueryResult::empty()
+            ..ConsumerQueryResult::empty()
         })
     }
 }

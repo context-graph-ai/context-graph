@@ -41,7 +41,7 @@ use contextdb_core::{
     ColumnType, EdgeDiscardMode, Error as EngineError, ScopeLabel, SyncDirection, TxId, Value,
 };
 use contextdb_engine::{
-    Database, DatabaseOpenOptions, OpenDisposition, QueryResult, plugin::DatabasePlugin,
+    Database, DatabaseOpenOptions, OpenDisposition, plugin::DatabasePlugin,
     work_ledger::WORK_LEDGER_TABLES,
 };
 
@@ -891,7 +891,7 @@ impl Store {
             .db
             .execute("SELECT id FROM contexts WHERE id = $id", &params)
             .map_err(map_engine_err)?;
-        if existing.rows.is_empty() {
+        if existing.rows().is_empty() {
             return Err(CgError::NotFound {
                 id: Some(ctx.as_uuid().to_string()),
                 missing: Some("context"),
@@ -947,7 +947,7 @@ fn maybe_register_default_text_embedder(
 }
 
 impl graph_rows::GraphRows for Store {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<crate::consumer_read::ConsumerQueryResult> {
         self.require_application_ready()?;
         self.read_query(sql, params)
     }
@@ -1255,18 +1255,18 @@ fn schema_version_is_published(db: &Database, expected: u32) -> Result<bool> {
     let result = db
         .execute("SELECT version FROM cg_schema_version", &HashMap::new())
         .map_err(map_engine_err)?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Ok(false);
     }
-    let found = if result.rows.len() == 1 {
-        match result.rows[0].first() {
+    let found = if result.rows().len() == 1 {
+        match result.rows()[0].first() {
             Some(Value::Int64(version)) => u32::try_from(*version).unwrap_or(0),
             _ => 0,
         }
     } else {
         0
     };
-    if result.rows.len() != 1 || found != expected {
+    if result.rows().len() != 1 || found != expected {
         return Err(CgError::LegacySchemaDetected {
             found_version: found,
             expected_version: expected,
@@ -1364,7 +1364,7 @@ fn installation_table_baseline(db: &Database) -> Result<Option<HashSet<String>>>
             &HashMap::from([("id".to_string(), Value::Int64(1))]),
         )
         .map_err(map_engine_err)?;
-    let Some(value) = result.rows.first().and_then(|row| row.first()) else {
+    let Some(value) = result.rows().first().and_then(|row| row.first()) else {
         return Ok(None);
     };
     let Value::Json(serde_json::Value::Array(names)) = value else {
@@ -1419,7 +1419,7 @@ fn begin_installation_table_baseline(db: &Database) -> Result<HashSet<String>> {
             return Err(map_engine_err(error));
         }
     };
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         let _ = db.rollback(tx);
         return Err(CgError::Engine(
             "the tenant bootstrap changed while recording its installation table baseline".into(),
@@ -1456,7 +1456,7 @@ fn clear_installation_table_baseline_in_tx(db: &Database, tx: TxId) -> Result<()
             ]),
         )
         .map_err(map_engine_err)?;
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         return Err(CgError::Engine(
             "the tenant bootstrap row disappeared while clearing its installation table baseline"
                 .into(),
@@ -1780,7 +1780,7 @@ fn persisted_event_policy_value(db: &Database) -> Result<Option<String>> {
             &HashMap::from([("id".to_string(), Value::Int64(1))]),
         )
         .map_err(map_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
     match row.first() {
@@ -1866,7 +1866,7 @@ fn event_capture_has_started(db: &Database) -> Result<bool> {
             &HashMap::from([("id".to_string(), Value::Int64(1))]),
         )
         .map_err(map_engine_err)?;
-    match captured.rows.first().and_then(|row| row.first()) {
+    match captured.rows().first().and_then(|row| row.first()) {
         Some(Value::TxId(_)) => Ok(true),
         Some(Value::Null) => Ok(false),
         other => Err(CgError::Engine(format!(
@@ -1896,7 +1896,7 @@ fn begin_event_placement_transition(db: &Database) -> Result<bool> {
             return Err(map_engine_err(error));
         }
     };
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         let _ = db.rollback(tx);
         return Ok(false);
     }
@@ -1928,7 +1928,7 @@ fn replace_event_policy_value(db: &Database, expected: &str, replacement: &str) 
             return Err(map_engine_err(error));
         }
     };
-    if updated.rows_affected != 1 {
+    if updated.rows_affected() != 1 {
         let _ = db.rollback(tx);
         return Err(CgError::Engine(
             "the persisted event placement changed during transition".into(),
@@ -2172,7 +2172,7 @@ fn verify_complete_schema(
             &HashMap::from([("embedding_space_id".into(), Value::Text(default_space))]),
         )
         .map_err(map_engine_err)?;
-    if seeded.rows.len() != 1 {
+    if seeded.rows().len() != 1 {
         return Err(CgError::Engine(
             "schema installation is incomplete; the default embedding space is not seeded".into(),
         ));
@@ -2216,13 +2216,13 @@ fn validate_schema_version(db: &Database, expected: u32) -> Result<()> {
     let rows = db
         .execute("SELECT version FROM cg_schema_version", &HashMap::new())
         .map_err(map_engine_err)?;
-    if rows.rows.len() != 1 {
+    if rows.rows().len() != 1 {
         return Err(CgError::LegacySchemaDetected {
             found_version: 0,
             expected_version: expected,
         });
     }
-    let found = match rows.rows[0].first() {
+    let found = match rows.rows()[0].first() {
         Some(Value::Int64(version)) => *version as u32,
         _ => 0,
     };
@@ -2253,7 +2253,7 @@ fn schema_version_table_is_empty(db: &Database) -> bool {
         return false;
     }
     db.execute("SELECT version FROM cg_schema_version", &HashMap::new())
-        .map(|rows| rows.rows.is_empty())
+        .map(|rows| rows.rows().is_empty())
         .unwrap_or(false)
 }
 
@@ -2297,7 +2297,7 @@ fn seed_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) -> Result<()>
             )]),
         )
         .map_err(map_engine_err)?;
-    if existing.rows.is_empty() {
+    if existing.rows().is_empty() {
         let params = HashMap::from([
             (
                 "embedding_space_id".to_string(),
@@ -2410,7 +2410,7 @@ fn validate_existing_embedding_space(db: &Database, space: &EmbeddingSpaceDecl) 
             &params,
         )
         .map_err(map_engine_err)?;
-    let Some(row) = rows.rows.first() else {
+    let Some(row) = rows.rows().first() else {
         return Ok(());
     };
     if !matches!(row.first(), Some(Value::Int64(n)) if *n as usize == space.dimension) {
@@ -2808,7 +2808,7 @@ fn validate_binding_owner(
             &params,
         )
         .map_err(map_engine_err)?;
-    if let Some(row) = rows.rows.first()
+    if let Some(row) = rows.rows().first()
         && !matches!(row.first(), Some(Value::Text(owner)) if owner == &space.embedding_space_id)
     {
         if shared_digest_vector_binding_allowed(binding) {
@@ -2880,8 +2880,8 @@ fn publish_schema_readiness(db: &Database) -> Result<()> {
     let version = db
         .execute("SELECT id, version FROM cg_schema_version", &HashMap::new())
         .map_err(map_engine_err)?;
-    if let Some(row) = version.rows.first() {
-        if version.rows.len() == 1
+    if let Some(row) = version.rows().first() {
+        if version.rows().len() == 1
             && row.first() == Some(&Value::Int64(1))
             && row.get(1) == Some(&Value::Int64(CG_SCHEMA_VERSION as i64))
         {

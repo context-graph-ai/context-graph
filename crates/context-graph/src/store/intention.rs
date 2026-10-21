@@ -211,8 +211,8 @@ impl Store {
                 "SELECT source_id FROM edges WHERE target_id = $target_id AND context_id = $context_id AND edge_type = $edge_type",
                 &params,
             )?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             if let Some(Value::Uuid(u)) = row.first() {
                 let id = DecisionId::from(*u);
                 if let Some(decision) = self.get_decision(id)?
@@ -288,9 +288,9 @@ impl Store {
             "SELECT id, decision_id, success, notes, recorded_at FROM outcomes WHERE {clause}"
         );
         let result = self.read_query(&sql, &params)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            out.push(decode_outcome(&result.columns, row)?);
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            out.push(decode_outcome(result.columns(), row)?);
         }
         Ok(out)
     }
@@ -312,9 +312,9 @@ impl Store {
             "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE status = $status AND ({clause})"
         );
         let result = self.read_query(&sql, &params)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            out.push(decode_invalidation(&result.columns, row)?);
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            out.push(decode_invalidation(result.columns(), row)?);
         }
         Ok(out)
     }
@@ -724,7 +724,7 @@ impl Store {
             }
         };
         let active_serving: Vec<DecisionId> = active_serving_result
-            .rows
+            .rows()
             .iter()
             .filter_map(|row| match row.first() {
                 Some(Value::Uuid(source)) => Some(DecisionId::from(*source)),
@@ -849,9 +849,9 @@ impl Store {
                 "SELECT id, intention_id, description, status, origin, properties, tags, valid_from, valid_to FROM intention_snapshots WHERE intention_id = $intention_id",
                 &params,
             )?;
-        let mut snaps: Vec<IntentionSnapshot> = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            snaps.push(decode_intention_snapshot(&result.columns, row)?);
+        let mut snaps: Vec<IntentionSnapshot> = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            snaps.push(decode_intention_snapshot(result.columns(), row)?);
         }
         snaps.sort_by_key(|s| (s.valid_from.0, s.id.as_uuid()));
         Ok(snaps)
@@ -958,7 +958,7 @@ impl Store {
             .db
             .execute("SELECT id FROM intentions WHERE id = $id", &existing)
             .map_err(map_engine_err)?;
-        if !result.rows.is_empty() {
+        if !result.rows().is_empty() {
             return Err(CgError::UniqueViolation {
                 entity: "intention",
                 id: Some(input.id.as_uuid().to_string()),
@@ -1034,9 +1034,9 @@ impl Store {
                 "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE context_id = $context_id ORDER BY created_at ASC",
                 &params,
             )?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            let mut intention = decode_intention(&result.columns, row)?;
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            let mut intention = decode_intention(result.columns(), row)?;
             // Two-layer read merge: a confirmed grouping links the intention to a canonical catalog
             // entry as an additive overlay. Override the read-view `blueprint_catalog_id` with the
             // grouped catalog while leaving the raw `intentions` row untouched;
@@ -1069,9 +1069,9 @@ impl Store {
                 &params,
             )
             .map_err(map_engine_err)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            out.push(decode_intention(&result.columns, row)?);
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            out.push(decode_intention(result.columns(), row)?);
         }
         Ok(out)
     }
@@ -1157,7 +1157,7 @@ impl Store {
                 &params,
             )
             .map_err(map_engine_err)?
-            .rows_affected;
+            .rows_affected();
         if updated == 1 {
             return Ok(());
         }
@@ -1186,9 +1186,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| get_uuid(row, &result.columns, "snapshot_id").map(IntentionSnapshotId::from))
+            .map(|row| get_uuid(row, result.columns(), "snapshot_id").map(IntentionSnapshotId::from))
             .transpose()
     }
 
@@ -1202,9 +1202,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_intention(&result.columns, row))
+            .map(|row| decode_intention(result.columns(), row))
             .transpose()
     }
 
@@ -1228,9 +1228,9 @@ impl Store {
             )
             .map_err(map_engine_err)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_intention_snapshot(&result.columns, row))
+            .map(|row| decode_intention_snapshot(result.columns(), row))
             .transpose()
     }
 
@@ -1285,22 +1285,22 @@ impl Store {
                     Value::Uuid(intention_id.as_uuid()),
                 )]),
             )?;
-        let mut links = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut links = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             links.push(IntentionSnapshotLink {
-                id: IntentionSnapshotLinkId::from(get_uuid(row, &result.columns, "id")?),
-                intention_id: IntentionId::from(get_uuid(row, &result.columns, "intention_id")?),
+                id: IntentionSnapshotLinkId::from(get_uuid(row, result.columns(), "id")?),
+                intention_id: IntentionId::from(get_uuid(row, result.columns(), "intention_id")?),
                 predecessor_snapshot_id: IntentionSnapshotId::from(get_uuid(
                     row,
-                    &result.columns,
+                    result.columns(),
                     "predecessor_snapshot_id",
                 )?),
                 successor_snapshot_id: IntentionSnapshotId::from(get_uuid(
                     row,
-                    &result.columns,
+                    result.columns(),
                     "successor_snapshot_id",
                 )?),
-                created_at: get_txid(row, &result.columns, "created_at")?,
+                created_at: get_txid(row, result.columns(), "created_at")?,
             });
         }
         links.sort_by_key(|link| (link.created_at.0, link.id.as_uuid()));
@@ -1316,18 +1316,18 @@ impl Store {
             &HashMap::from([("intention_id".to_string(), Value::Uuid(intention_id.as_uuid()))]),
         )?;
         result
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 Ok((
                     IntentionSnapshotId::from(get_uuid(
                         row,
-                        &result.columns,
+                        result.columns(),
                         "predecessor_snapshot_id",
                     )?),
                     IntentionSnapshotId::from(get_uuid(
                         row,
-                        &result.columns,
+                        result.columns(),
                         "successor_snapshot_id",
                     )?),
                 ))
@@ -1353,10 +1353,10 @@ pub(crate) fn get_intention(rows: &dyn GraphRows, id: IntentionId) -> Result<Opt
         "SELECT id, description, status, origin, context_id, blueprint_catalog_id, properties, tags, created_at FROM intentions WHERE id = $id",
         &params,
     )?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Ok(None);
     }
-    Ok(Some(decode_intention(&result.columns, &result.rows[0])?))
+    Ok(Some(decode_intention(result.columns(), &result.rows()[0])?))
 }
 
 pub(super) fn decode_intention(columns: &[String], row: &[Value]) -> Result<Intention> {

@@ -289,7 +289,7 @@ impl Store {
                 return Err(map_engine_err(err));
             }
         };
-        if result.rows_affected != 1 {
+        if result.rows_affected() != 1 {
             let _ = self.db.rollback(tx);
             return Err(CgError::ReindexAlreadyInProgress {
                 embedding_space_id: embedding_space_id.to_string(),
@@ -820,16 +820,16 @@ fn value_txid(row: &[Value], columns: &[String], name: &str) -> Result<TxId> {
 }
 
 fn decode_reindex_cursor(result: &QueryResult) -> Result<Option<ReindexCursor>> {
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
     Ok(Some(ReindexCursor {
-        status: value_text(row, &result.columns, "status")?,
-        lease_epoch: value_i64(row, &result.columns, "lease_epoch")? as usize,
-        last_committed_cursor: value_i64(row, &result.columns, "last_committed_cursor")? as usize,
-        from_producer: value_producer(row, &result.columns, "from_producer")?,
-        to_producer: value_producer(row, &result.columns, "to_producer")?,
-        started_at: value_txid(row, &result.columns, "started_at")?,
+        status: value_text(row, result.columns(), "status")?,
+        lease_epoch: value_i64(row, result.columns(), "lease_epoch")? as usize,
+        last_committed_cursor: value_i64(row, result.columns(), "last_committed_cursor")? as usize,
+        from_producer: value_producer(row, result.columns(), "from_producer")?,
+        to_producer: value_producer(row, result.columns(), "to_producer")?,
+        started_at: value_txid(row, result.columns(), "started_at")?,
     }))
 }
 

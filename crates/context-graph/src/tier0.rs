@@ -641,7 +641,7 @@ pub(crate) fn context_digests(
         )]),
     )?;
     Ok(result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(DbValue::Uuid(id)) => {
@@ -657,7 +657,7 @@ pub(crate) fn job_exists(store: &Store, job_id: &str) -> Result<bool> {
         "SELECT job_id FROM work_jobs WHERE job_id = $job_id",
         &HashMap::from([("job_id".to_string(), DbValue::Text(job_id.to_string()))]),
     )?;
-    Ok(!result.rows.is_empty())
+    Ok(!result.rows().is_empty())
 }
 
 pub(crate) fn completion_exists_local(store: &Store, digest_text: &str) -> Result<bool> {
@@ -665,7 +665,7 @@ pub(crate) fn completion_exists_local(store: &Store, digest_text: &str) -> Resul
         "SELECT id FROM cg_understanding_completions WHERE id = $id",
         &HashMap::from([("id".to_string(), DbValue::Text(digest_text.to_string()))]),
     )?;
-    Ok(!result.rows.is_empty())
+    Ok(!result.rows().is_empty())
 }
 
 /// Bump the retrieval-touch counter for one digest: increment `touch_count` and stamp
@@ -702,7 +702,7 @@ pub fn bump_touch(store: &Store, context_id: ContextId, digest_id: DigestId) -> 
                 ]),
             )
             .map_err(map_engine)?;
-        if updated.rows_affected == 0 {
+        if updated.rows_affected() == 0 {
             db.execute_in_tx(
                 tx,
                 "INSERT INTO cg_retrieval_touches (digest_id, context_id, touch_count, last_touched_at) VALUES ($digest_id, $context_id, $touch_count, $last_touched_at)",
@@ -746,7 +746,7 @@ fn retrieval_touch_count_in(store: &Store, digest_id: DigestId) -> Result<u64> {
             DbValue::Text(digest_id.to_string()),
         )]),
     )?;
-    let count = result.rows.first().and_then(|row| match row.first() {
+    let count = result.rows().first().and_then(|row| match row.first() {
         Some(DbValue::Int64(count)) => Some((*count).max(0) as u64),
         _ => None,
     });
@@ -759,7 +759,7 @@ pub fn digest_kind(store: &Store, digest_id: DigestId) -> Result<Option<String>>
         "SELECT kind FROM digests WHERE id = $id",
         &HashMap::from([("id".to_string(), DbValue::Uuid(digest_id.as_uuid()))]),
     )?;
-    Ok(result.rows.first().and_then(|row| match row.first() {
+    Ok(result.rows().first().and_then(|row| match row.first() {
         Some(DbValue::Text(kind)) => Some(kind.clone()),
         _ => None,
     }))
@@ -937,7 +937,7 @@ fn query_chunk_targets(
     };
     let result = store.read_query(&sql, &params)?;
     Ok(result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.as_slice() {
             [
@@ -986,7 +986,7 @@ fn digest_ids_for_session(
     let sql = format!("SELECT id FROM digests WHERE {clause}");
     let result = store.read_query(&sql, &params)?;
     Ok(result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(DbValue::Uuid(id)) => Some(id.to_string()),
@@ -1022,7 +1022,7 @@ fn local_setting(
         "SELECT value FROM cg_local_settings WHERE key = $key",
         &HashMap::from([("key".to_string(), DbValue::Text(key.to_string()))]),
     )?;
-    Ok(result.rows.first().and_then(|row| match row.first() {
+    Ok(result.rows().first().and_then(|row| match row.first() {
         Some(DbValue::Text(value)) => Some(value.clone()),
         _ => None,
     }))
@@ -1044,7 +1044,7 @@ pub fn set_local_setting(store: &Store, key: &str, value: &str) -> Result<()> {
                 ]),
             )
             .map_err(map_engine)?;
-        if updated.rows_affected == 0 {
+        if updated.rows_affected() == 0 {
             db.execute_in_tx(
                 tx,
                 "INSERT INTO cg_local_settings (key, value, updated_at) VALUES ($key, $value, $updated_at)",
@@ -1109,7 +1109,7 @@ fn digest_exists(store: &Store, context_id: ContextId, digest_uuid: uuid::Uuid) 
             ),
         ]),
     )?;
-    Ok(!result.rows.is_empty())
+    Ok(!result.rows().is_empty())
 }
 
 fn parse_digest_uuid(digest_text: &str) -> Option<uuid::Uuid> {

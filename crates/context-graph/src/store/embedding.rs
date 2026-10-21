@@ -605,11 +605,11 @@ pub fn dedup_compare_digest_spaces(
             &params,
         )
         .map_err(dedup_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(vec![]);
     };
-    let score_index = column_index(&result.columns, "score")?;
-    let context_index = column_index(&result.columns, "context_id")?;
+    let score_index = column_index(result.columns(), "score")?;
+    let context_index = column_index(result.columns(), "context_id")?;
     let score = match row.get(score_index) {
         Some(Value::Float64(score)) => *score as f32,
         _ => 0.0,
@@ -625,7 +625,7 @@ pub fn dedup_compare_digest_spaces(
         score,
         per_clause_scores: vec![],
         index_ref: "digests.vector_text".to_string(),
-        planner_trace: format!("{:?}", result.trace),
+        planner_trace: format!("{:?}", result.trace()),
         projected_context_labels: vec![],
         candidate_count_before_filter: 1,
         candidate_count_after_filter: 1,
@@ -671,10 +671,10 @@ fn latest_digest_embedding_space(store: &Store, digest_id: DigestId) -> Result<O
             )]),
         )
         .map_err(dedup_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
-    let space_index = column_index(&result.columns, "embedding_space_id")?;
+    let space_index = column_index(result.columns(), "embedding_space_id")?;
     Ok(match row.get(space_index) {
         Some(Value::Text(space)) => Some(space.clone()),
         _ => None,
@@ -692,10 +692,10 @@ fn dedup_digest_space_has_vector_binding(store: &Store, id: &str) -> Result<bool
             )]),
         )
         .map_err(dedup_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(false);
     };
-    let bindings_index = column_index(&result.columns, "bindings")?;
+    let bindings_index = column_index(result.columns(), "bindings")?;
     let Some(Value::Json(serde_json::Value::Array(bindings))) = row.get(bindings_index) else {
         return Ok(false);
     };
@@ -722,10 +722,10 @@ fn dedup_embedding_space_dimension(store: &Store, id: &str) -> Result<Option<usi
             )]),
         )
         .map_err(dedup_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(None);
     };
-    let dimension_index = column_index(&result.columns, "dimension")?;
+    let dimension_index = column_index(result.columns(), "dimension")?;
     Ok(match row.get(dimension_index) {
         Some(Value::Int64(value)) => Some(*value as usize),
         _ => Some(0),
@@ -759,9 +759,9 @@ fn context_label_map(store: &Store) -> Result<HashMap<ContextId, Vec<String>>> {
         .execute("SELECT id, labels FROM contexts", &HashMap::new())
         .map_err(map_engine_err)?;
     let mut out = HashMap::new();
-    for row in &result.rows {
-        let id = ContextId::from(get_uuid(row, &result.columns, "id")?);
-        let labels = tags_from_json(&get_json(row, &result.columns, "labels")?);
+    for row in result.rows() {
+        let id = ContextId::from(get_uuid(row, result.columns(), "id")?);
+        let labels = tags_from_json(&get_json(row, result.columns(), "labels")?);
         out.insert(id, labels);
     }
     Ok(out)
@@ -851,7 +851,7 @@ fn evidence_has_persisted_vector(
             ]),
         )
         .map_err(map_engine_err)?;
-    Ok(!result.rows.is_empty())
+    Ok(!result.rows().is_empty())
 }
 
 fn row_vector_search_from_evidence(
@@ -1030,10 +1030,10 @@ fn count_rankable_rows(
     };
     let sql = format!("SELECT COUNT(*) AS n FROM {table}{where_clause}");
     let result = store.db.execute(&sql, &params).map_err(map_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok(0);
     };
-    let count_index = column_index(&result.columns, "n")?;
+    let count_index = column_index(result.columns(), "n")?;
     Ok(match row.get(count_index) {
         Some(Value::Int64(value)) => *value as usize,
         _ => 0,
@@ -1196,17 +1196,17 @@ fn execute_ranked_vector_queries(
         };
         let result = store.db.execute(&sql, &params).map_err(map_engine_err)?;
         let trace = if query.include_planner_trace {
-            format!("{:?}", result.trace)
+            format!("{:?}", result.trace())
         } else {
             String::new()
         };
         let id_column = result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "id")
             .ok_or_else(|| CgError::Engine("vector search row lookup missing id".to_string()))?;
-        let score_column = result.columns.iter().position(|column| column == "score");
-        for row in result.rows {
+        let score_column = result.columns().iter().position(|column| column == "score");
+        for row in result.rows() {
             let id = match row.get(id_column) {
                 Some(Value::Uuid(id)) => *id,
                 Some(_) => uuid::Uuid::nil(),
@@ -1215,7 +1215,7 @@ fn execute_ranked_vector_queries(
             if id.is_nil() {
                 continue;
             }
-            let values = row_values_by_column(&result.columns, &row);
+            let values = row_values_by_column(result.columns(), row);
             let score = score_column
                 .and_then(|column| row.get(column))
                 .and_then(|value| match value {
@@ -1332,19 +1332,19 @@ fn execute_ranked_row_vector_queries(
         };
         let result = store.db.execute(&sql, &params).map_err(map_engine_err)?;
         let trace = if query.include_planner_trace {
-            format!("{:?}", result.trace)
+            format!("{:?}", result.trace())
         } else {
             String::new()
         };
         let id_column = result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "id")
             .ok_or_else(|| {
                 CgError::Engine("row vector search row lookup missing id".to_string())
             })?;
-        let score_column = result.columns.iter().position(|column| column == "score");
-        for row in result.rows {
+        let score_column = result.columns().iter().position(|column| column == "score");
+        for row in result.rows() {
             let id = match row.get(id_column) {
                 Some(Value::Uuid(id)) => *id,
                 Some(_) => uuid::Uuid::nil(),
@@ -1353,7 +1353,7 @@ fn execute_ranked_row_vector_queries(
             if id.is_nil() {
                 continue;
             }
-            let values = row_values_by_column(&result.columns, &row);
+            let values = row_values_by_column(result.columns(), row);
             let score = score_column
                 .and_then(|column| row.get(column))
                 .and_then(|value| match value {
@@ -1430,10 +1430,10 @@ fn active_target_ids_for_vector_binding(
         )
         .map_err(map_engine_err)?;
     let mut latest_by_target = HashMap::<uuid::Uuid, (TxId, String)>::new();
-    let space_column = column_index(&result.columns, "embedding_space_id")?;
-    for row in &result.rows {
-        let target_id = get_uuid(row, &result.columns, "target_id")?;
-        let created_at = get_txid(row, &result.columns, "created_at")?;
+    let space_column = column_index(result.columns(), "embedding_space_id")?;
+    for row in result.rows() {
+        let target_id = get_uuid(row, result.columns(), "target_id")?;
+        let created_at = get_txid(row, result.columns(), "created_at")?;
         let space_id = match row.get(space_column) {
             Some(Value::Text(space_id)) => space_id.clone(),
             other => {
@@ -1476,9 +1476,9 @@ fn binding_space_ids_for_vector_column(
             ]),
         )
         .map_err(map_engine_err)?;
-    let space_column = column_index(&result.columns, "embedding_space_id")?;
+    let space_column = column_index(result.columns(), "embedding_space_id")?;
     let mut space_ids = result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.get(space_column) {
             Some(Value::Text(space_id)) => Some(space_id.clone()),

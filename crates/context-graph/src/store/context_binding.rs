@@ -130,7 +130,7 @@ fn binding_context_in(
         None => store.db.execute(sql, &params),
     }
     .map_err(map_engine_err)?;
-    match result.rows.first().and_then(|row| row.first()) {
+    match result.rows().first().and_then(|row| row.first()) {
         Some(Value::Uuid(id)) => Ok(Some(ContextId::from(*id))),
         None => Ok(None),
         other => Err(CgError::Engine(format!(
@@ -148,7 +148,7 @@ fn require_context_in_tx(store: &Store, tx: TxId, context_id: ContextId) -> Resu
             &HashMap::from([("id".to_string(), Value::Uuid(context_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Err(CgError::NotFound {
             id: Some(context_id.to_string()),
             missing: Some("context"),
@@ -166,7 +166,7 @@ fn context_id_for_name_in_tx(store: &Store, tx: TxId, name: &str) -> Result<Opti
             &HashMap::from([("name".to_string(), Value::Text(name.to_string()))]),
         )
         .map_err(map_engine_err)?;
-    match result.rows.first().and_then(|row| row.first()) {
+    match result.rows().first().and_then(|row| row.first()) {
         Some(Value::Uuid(id)) => Ok(Some(ContextId::from(*id))),
         None => Ok(None),
         other => Err(CgError::Engine(format!(

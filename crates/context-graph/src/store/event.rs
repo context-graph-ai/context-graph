@@ -685,7 +685,7 @@ fn update_event_context_sessions_in_tx(
                 &params,
             )
             .map_err(AppendAttemptError::Engine)?;
-        match existing.rows.as_slice() {
+        match existing.rows() {
             [] => {
                 params.insert("event_count".into(), u64_db_value(added, "session count")?);
                 params.insert(
@@ -703,7 +703,7 @@ fn update_event_context_sessions_in_tx(
             }
             [row] => {
                 let count_index = existing
-                    .columns
+                    .columns()
                     .iter()
                     .position(|column| column == "event_count")
                     .ok_or_else(|| {
@@ -712,7 +712,7 @@ fn update_event_context_sessions_in_tx(
                         ))
                     })?;
                 let latest_index = existing
-                    .columns
+                    .columns()
                     .iter()
                     .position(|column| column == "latest_occurred_at")
                     .ok_or_else(|| {
@@ -813,7 +813,7 @@ fn bump_event_context_revision_in_tx(
             &params,
         )
         .map_err(AppendAttemptError::Engine)?;
-    match updated.rows_affected {
+    match updated.rows_affected() {
         0 => {
             store
                 .db
@@ -930,10 +930,10 @@ fn write_event_context_counts_in_tx(
         .db
         .execute_in_tx(tx, &sql, &params)
         .map_err(AppendAttemptError::Engine)?;
-    if written.rows_affected != 1 {
+    if written.rows_affected() != 1 {
         return Err(AppendAttemptError::Domain(CgError::Engine(format!(
             "the event count row for Context {context_id} wrote {} rows",
-            written.rows_affected
+            written.rows_affected()
         ))));
     }
     Ok(())
@@ -984,7 +984,7 @@ fn mark_event_capture_started_in_tx(store: &Store, tx: crate::TxId) -> Result<()
             ]),
         )
         .map_err(map_engine_err)?;
-    if updated.rows_affected > 1 {
+    if updated.rows_affected() > 1 {
         return Err(CgError::Engine(
             "the event placement latch updated more than one row".into(),
         ));
@@ -1033,14 +1033,14 @@ pub(crate) fn load_source_state(
             &params,
         )
         .map_err(map_engine_err)?;
-    let Some(row) = locator.rows.first() else {
+    let Some(row) = locator.rows().first() else {
         return Ok(None);
     };
-    let source_instance_ref = get_text(row, &locator.columns, "source_instance_ref")?;
-    let session_ref = get_text(row, &locator.columns, "session_ref")?;
-    let provisional_empty = get_bool_value(row, &locator.columns, "provisional_empty")?;
-    let adapter_version = get_text(row, &locator.columns, "adapter_version")?;
-    let anchor_declaration_version = get_text(row, &locator.columns, "anchor_declaration_version")?;
+    let source_instance_ref = get_text(row, locator.columns(), "source_instance_ref")?;
+    let session_ref = get_text(row, locator.columns(), "session_ref")?;
+    let provisional_empty = get_bool_value(row, locator.columns(), "provisional_empty")?;
+    let adapter_version = get_text(row, locator.columns(), "adapter_version")?;
+    let anchor_declaration_version = get_text(row, locator.columns(), "anchor_declaration_version")?;
     if adapter_version != declaration.adapter_version
         || anchor_declaration_version != declaration.anchor_declaration_version
     {
@@ -1096,9 +1096,9 @@ fn load_source_checkpoint(
         )
         .map_err(map_engine_err)?;
     let state = checkpoint
-        .rows
+        .rows()
         .first()
-        .map(|row| decode_source_checkpoint(&checkpoint.columns, row, declaration, identity))
+        .map(|row| decode_source_checkpoint(checkpoint.columns(), row, declaration, identity))
         .transpose()?;
     if let Some(state) = state.as_ref() {
         verify_persisted_source_position_order(
@@ -1124,7 +1124,7 @@ fn verify_persisted_source_position_order(
             params,
         )
         .map_err(map_engine_err)?;
-    let Some(row) = persisted.rows.first() else {
+    let Some(row) = persisted.rows().first() else {
         return Err(CgError::SourceHistoryDiverged {
             source_instance_ref: source_instance_ref.to_string(),
             cause: SourceHistoryDivergence::SourcePositionOrderMismatch {
@@ -1133,7 +1133,7 @@ fn verify_persisted_source_position_order(
             },
         });
     };
-    verify_source_position_order_row(&persisted.columns, row, declaration, source_instance_ref)
+    verify_source_position_order_row(persisted.columns(), row, declaration, source_instance_ref)
 }
 
 fn verify_source_position_order_row(
@@ -1199,9 +1199,9 @@ pub(crate) fn attach_source_locator(
                 &locator_params,
             )
             .map_err(map_engine_err)?;
-        let locator_already_attached = if let Some(row) = locator.rows.first() {
+        let locator_already_attached = if let Some(row) = locator.rows().first() {
             verify_attached_locator(
-                &locator.columns,
+                locator.columns(),
                 row,
                 declaration,
                 source_locator_ref,
@@ -1225,11 +1225,11 @@ pub(crate) fn attach_source_locator(
             )
             .map_err(map_engine_err)?;
         let current_state = checkpoint
-            .rows
+            .rows()
             .first()
             .map(|row| {
                 decode_source_checkpoint(
-                    &checkpoint.columns,
+                    checkpoint.columns(),
                     row,
                     declaration,
                     expected_state.identity.clone(),
@@ -1433,9 +1433,9 @@ pub(crate) fn get_event(
         ]),
     )?;
     result
-        .rows
+        .rows()
         .first()
-        .map(|row| decode_event(&result.columns, row))
+        .map(|row| decode_event(result.columns(), row))
         .transpose()
 }
 
@@ -1518,9 +1518,9 @@ pub(crate) fn list_stream_events(
     );
     let result = rows.query_rows(&sql, &params)?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| decode_event(&result.columns, row))
+        .map(|row| decode_event(result.columns(), row))
         .collect()
 }
 
@@ -1547,10 +1547,10 @@ pub(crate) fn list_events_by_anchor(
         &HashMap::from([("context_id".to_string(), context.clone())]),
     )?;
     let mut head_for_connector = BTreeMap::new();
-    for row in &heads.rows {
+    for row in heads.rows() {
         head_for_connector.insert(
-            get_text(row, &heads.columns, "connector_id")?,
-            get_uuid(row, &heads.columns, "generation_id")?,
+            get_text(row, heads.columns(), "connector_id")?,
+            get_uuid(row, heads.columns(), "generation_id")?,
         );
     }
     let match_params = |extra: Option<(&str, Value)>| {
@@ -1570,10 +1570,10 @@ pub(crate) fn list_events_by_anchor(
         "SELECT event_id, connector_id FROM event_anchors WHERE context_id = $context_id AND key = $key AND identity_value = $identity_value",
         &match_params(None),
     )?;
-    for row in &captured.rows {
-        let event_id = get_uuid(row, &captured.columns, "event_id")?;
+    for row in captured.rows() {
+        let event_id = get_uuid(row, captured.columns(), "event_id")?;
         if let Some(generation_id) =
-            head_for_connector.get(&get_text(row, &captured.columns, "connector_id")?)
+            head_for_connector.get(&get_text(row, captured.columns(), "connector_id")?)
         {
             let covered = rows.query_rows(
                 "SELECT event_id FROM event_interpretation_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND event_id = $event_id",
@@ -1583,7 +1583,7 @@ pub(crate) fn list_events_by_anchor(
                     ("event_id".to_string(), Value::Uuid(event_id)),
                 ]),
             )?;
-            if !covered.rows.is_empty() {
+            if !covered.rows().is_empty() {
                 continue;
             }
         }
@@ -1594,8 +1594,8 @@ pub(crate) fn list_events_by_anchor(
             "SELECT event_id FROM event_interpretation_anchors WHERE context_id = $context_id AND generation_id = $generation_id AND key = $key AND identity_value = $identity_value",
             &match_params(Some(("generation_id", Value::Uuid(*generation_id)))),
         )?;
-        for row in &interpreted.rows {
-            matched.insert(get_uuid(row, &interpreted.columns, "event_id")?);
+        for row in interpreted.rows() {
+            matched.insert(get_uuid(row, interpreted.columns(), "event_id")?);
         }
     }
 
@@ -2119,7 +2119,7 @@ fn ensure_context_exists(store: &Store, context_id: ContextId) -> Result<()> {
             &HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    if result.rows.is_empty() {
+    if result.rows().is_empty() {
         return Err(CgError::NotFound {
             id: Some(context_id.to_string()),
             missing: Some("context"),
@@ -2141,12 +2141,12 @@ fn stream_append_state_in_tx(
             &source_stream_params(input),
         )
         .map_err(AppendAttemptError::Engine)?;
-    let stream_exists = !result.rows.is_empty();
+    let stream_exists = !result.rows().is_empty();
     let order_persisted = source_position_order_persisted_in_tx(store, tx, input, stream_exists)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Ok((1, None, order_persisted));
     };
-    let stored_adapter_version = get_text(row, &result.columns, "adapter_version")?;
+    let stored_adapter_version = get_text(row, result.columns(), "adapter_version")?;
     if stored_adapter_version != input.declaration.adapter_version {
         return Err(CgError::SourceHistoryDiverged {
             source_instance_ref: input.source_instance_ref.clone(),
@@ -2157,14 +2157,14 @@ fn stream_append_state_in_tx(
         }
         .into());
     }
-    let next_seq = get_u64_value(row, &result.columns, "seq")?
+    let next_seq = get_u64_value(row, result.columns(), "seq")?
         .checked_add(1)
         .ok_or_else(|| CgError::InvalidSourceCommitBoundary {
             reason: "event source sequence exhausted u64".into(),
         })?;
     let watermark = source_position_tuple(
         &input.declaration,
-        &get_json(row, &result.columns, "source_position")?,
+        &get_json(row, result.columns(), "source_position")?,
         "",
     )?;
     Ok((next_seq, Some(watermark), order_persisted))
@@ -2184,9 +2184,9 @@ fn source_position_order_persisted_in_tx(
             &source_stream_params(input),
         )
         .map_err(AppendAttemptError::Engine)?;
-    if let Some(row) = persisted.rows.first() {
+    if let Some(row) = persisted.rows().first() {
         verify_source_position_order_row(
-            &persisted.columns,
+            persisted.columns(),
             row,
             &input.declaration,
             &input.source_instance_ref,
@@ -2314,9 +2314,9 @@ fn event_by_natural_key_in_tx(
         )
         .map_err(AppendAttemptError::Engine)?;
     Ok(result
-        .rows
+        .rows()
         .first()
-        .map(|row| decode_event(&result.columns, row))
+        .map(|row| decode_event(result.columns(), row))
         .transpose()?)
 }
 
@@ -2529,10 +2529,10 @@ fn persist_source_progress_in_tx(
         )
         .map_err(AppendAttemptError::Engine)?;
     let mut changed = false;
-    if let Some(row) = locator.rows.first() {
-        let existing_source = get_text(row, &locator.columns, "source_instance_ref")?;
-        let existing_session = get_text(row, &locator.columns, "session_ref")?;
-        let existing_provisional = get_bool_value(row, &locator.columns, "provisional_empty")?;
+    if let Some(row) = locator.rows().first() {
+        let existing_source = get_text(row, locator.columns(), "source_instance_ref")?;
+        let existing_session = get_text(row, locator.columns(), "session_ref")?;
+        let existing_provisional = get_bool_value(row, locator.columns(), "provisional_empty")?;
         let exact = existing_source == boundary.source_identity().source_instance_ref
             && existing_session == boundary.source_identity().session_ref;
         if !exact && !existing_provisional {
@@ -2572,7 +2572,7 @@ fn persist_source_progress_in_tx(
                         ]),
                     )
                     .map_err(AppendAttemptError::Engine)?;
-                if !events.rows.is_empty() {
+                if !events.rows().is_empty() {
                     return Err(CgError::SourceHistoryDiverged {
                         source_instance_ref: existing_source.clone(),
                         cause: SourceHistoryDivergence::LocatorIdentityMismatch {
@@ -2671,17 +2671,17 @@ fn persist_source_progress_in_tx(
         )
         .map_err(AppendAttemptError::Engine)?;
     let existing_latest_event_seq = existing
-        .rows
+        .rows()
         .first()
-        .map(|row| get_optional_u64_value(row, &existing.columns, "latest_event_seq"))
+        .map(|row| get_optional_u64_value(row, existing.columns(), "latest_event_seq"))
         .transpose()?
         .flatten();
     let latest_event_seq = match (latest_batch_seq, existing_latest_event_seq) {
         (Some(batch), Some(existing)) => Some(batch.max(existing)),
         (batch, existing) => batch.or(existing),
     };
-    if let Some(row) = existing.rows.first() {
-        let old_offset = get_u64_value(row, &existing.columns, "committed_byte_offset")?;
+    if let Some(row) = existing.rows().first() {
+        let old_offset = get_u64_value(row, existing.columns(), "committed_byte_offset")?;
         let new_offset = boundary.source_position_after_record().byte_offset;
         if new_offset < old_offset {
             return Err(CgError::SourceHistoryDiverged {
@@ -2693,8 +2693,8 @@ fn persist_source_progress_in_tx(
             }
             .into());
         }
-        let old_hash = get_text(row, &existing.columns, "prefix_sha256")?;
-        let old_checkpoint = get_json(row, &existing.columns, "checkpoint")?;
+        let old_hash = get_text(row, existing.columns(), "prefix_sha256")?;
+        let old_checkpoint = get_json(row, existing.columns(), "checkpoint")?;
         if new_offset == old_offset {
             if old_hash != boundary.prefix_sha256() {
                 return Err(CgError::SourceHistoryDiverged {
@@ -3029,12 +3029,12 @@ fn validate_authenticated_binding(
     let shown = db
         .execute("SHOW SYNC BINDINGS", &HashMap::new())
         .map_err(map_engine_err)?;
-    let table_index = column_index(&shown.columns, "table")?;
-    let tenant_index = column_index(&shown.columns, "tenant_id")?;
-    let hub_index = column_index(&shown.columns, "hub_node_id")?;
-    let edge_index = column_index(&shown.columns, "edge_node_id")?;
+    let table_index = column_index(shown.columns(), "table")?;
+    let tenant_index = column_index(shown.columns(), "tenant_id")?;
+    let hub_index = column_index(shown.columns(), "hub_node_id")?;
+    let edge_index = column_index(shown.columns(), "edge_node_id")?;
     for table in ["events", "event_anchors"] {
-        let installed = shown.rows.iter().any(|row| {
+        let installed = shown.rows().iter().any(|row| {
             row.get(table_index) == Some(&Value::Text(table.into()))
                 && row.get(tenant_index) == Some(&Value::Text(binding.tenant_id().as_str().into()))
                 && row.get(hub_index) == Some(&Value::Text(binding.hub_node_id().into()))
@@ -3057,9 +3057,9 @@ fn installed_hub_id(db: &contextdb_engine::Database) -> Result<Option<String>> {
     let shown = db
         .execute("SHOW SYNC BINDINGS", &HashMap::new())
         .map_err(map_engine_err)?;
-    let table_index = column_index(&shown.columns, "table")?;
-    let hub_index = column_index(&shown.columns, "hub_node_id")?;
-    let event_hub = shown.rows.iter().find_map(|row| {
+    let table_index = column_index(shown.columns(), "table")?;
+    let hub_index = column_index(shown.columns(), "hub_node_id")?;
+    let event_hub = shown.rows().iter().find_map(|row| {
         (row.get(table_index) == Some(&Value::Text("events".into())))
             .then(|| row.get(hub_index))
             .flatten()
@@ -3068,7 +3068,7 @@ fn installed_hub_id(db: &contextdb_engine::Database) -> Result<Option<String>> {
                 _ => None,
             })
     });
-    let anchor_hub = shown.rows.iter().find_map(|row| {
+    let anchor_hub = shown.rows().iter().find_map(|row| {
         (row.get(table_index) == Some(&Value::Text("event_anchors".into())))
             .then(|| row.get(hub_index))
             .flatten()

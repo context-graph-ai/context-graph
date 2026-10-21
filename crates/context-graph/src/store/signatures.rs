@@ -167,9 +167,9 @@ pub fn signature_match_full_chain_producers(
         )
         .map_err(map_engine_err)?;
     result
-        .rows
+        .rows()
         .iter()
-        .map(|row| decode_signature_lineage_row(&result.columns, row))
+        .map(|row| decode_signature_lineage_row(result.columns(), row))
         .collect()
 }
 
@@ -185,13 +185,13 @@ pub fn get_signature_aggregate(store: &Store, signature_id: &str) -> Result<Sign
             &params,
         )
         .map_err(map_engine_err)?;
-    let Some(row) = result.rows.first() else {
+    let Some(row) = result.rows().first() else {
         return Err(CgError::NotFound {
             id: Some(signature_id.to_string()),
             missing: Some("signature_aggregate"),
         });
     };
-    decode_signature_aggregate(&result.columns, row)
+    decode_signature_aggregate(result.columns(), row)
 }
 
 pub fn verify_inherited_signature_spaces(

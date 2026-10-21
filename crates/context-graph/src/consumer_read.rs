@@ -47,6 +47,9 @@
 //! configured carries no table dimension and answers unmodified.
 
 pub mod graph;
+mod result;
+
+pub use result::{ConsumerPage, ConsumerQueryResult};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroUsize;
@@ -54,7 +57,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use contextdb_core::read_contract::CursorPage;
 use contextdb_core::{ScopeLabel, ScopeLabelKind, Value};
 use contextdb_engine::{
     DirectScopeLabelKind, MetadataAnswer, MetadataBody, MetadataRequest, QueryResult, ReadCursor,
@@ -463,9 +465,10 @@ impl ConsumerReader {
     /// before the answer was built. What is narrowed HERE is only an answer keyed by table that
     /// carries no rows of the store's data at all: a `SHOW` about tables comes back intersected
     /// with the declaration.
-    pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+    pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult> {
         let shape = admit(&self.gate, sql, params)?;
-        let mut answered = self.raw_execute(sql, params)?;
+        let answer = self.raw_execute(sql, params)?;
+        let mut answered = ConsumerQueryResult::copy_from(&answer);
         if let AnswerShape::TableKeyed(key) = shape {
             answered.rows = declared_rows(key, &self.gate.declared, answered.rows);
         }
@@ -606,21 +609,21 @@ fn verify_context_graph_readiness(reader: &ConsumerReader) -> Result<()> {
     if tables.contains("cg_schema_version") {
         let versions =
             reader.raw_execute("SELECT version FROM cg_schema_version", &HashMap::new())?;
-        let found = if versions.rows.len() == 1 {
-            match versions.rows[0].first() {
+        let found = if versions.rows().len() == 1 {
+            match versions.rows()[0].first() {
                 Some(Value::Int64(version)) => u32::try_from(*version).unwrap_or(0),
                 _ => 0,
             }
         } else {
             0
         };
-        if versions.rows.len() == 1
+        if versions.rows().len() == 1
             && found == CG_SCHEMA_VERSION
             && reserved_reader_manifest_is_present(&tables)
         {
             return Ok(());
         }
-        if !versions.rows.is_empty() && found != CG_SCHEMA_VERSION {
+        if !versions.rows().is_empty() && found != CG_SCHEMA_VERSION {
             return Err(CgError::LegacySchemaDetected {
                 found_version: found,
                 expected_version: CG_SCHEMA_VERSION,
@@ -640,7 +643,7 @@ fn verify_context_graph_readiness(reader: &ConsumerReader) -> Result<()> {
             &HashMap::from([("id".to_string(), Value::Int64(1))]),
         )?;
         let expected = placement
-            .rows
+            .rows()
             .first()
             .and_then(|row| row.first())
             .and_then(|value| match value {
@@ -650,7 +653,7 @@ fn verify_context_graph_readiness(reader: &ConsumerReader) -> Result<()> {
         if matches!(expected, Some("tenant_hub" | "transition_to_tenant_hub")) && tables.len() == 1
         {
             let bindings = reader.raw_execute("SHOW SYNC BINDINGS", &HashMap::new())?;
-            if !bindings.rows.is_empty() {
+            if !bindings.rows().is_empty() {
                 return Err(CgError::StoreNeedsWritableRecovery {
                     path: path.to_path_buf(),
                     reason: "the authenticated tenant binding is durable but its application schema is not ready"
@@ -712,22 +715,20 @@ fn reserved_reader_manifest_is_present(tables: &BTreeSet<String>) -> bool {
 
 /// One bounded cursor a [`ConsumerReader`] opened.
 ///
-/// The substrate's paging vocabulary is CONSUMED rather than shadowed: pages come back as
-/// contextdb's own [`CursorPage`], and this handle carries contextdb's own [`ReadCursor`]. What it
+/// Ordinary pages retain contextdb's immutable engine handle; table-keyed answers use an
+/// application-owned filtered page. This handle carries contextdb's own [`ReadCursor`]. What it
 /// adds is that closing the cursor goes through the handle rather than consuming it, so a cursor
 /// closed twice is told so instead of failing to compile at the second call — and every refusal a
 /// cursor can produce reaches the consumer as a [`CgError`], which is the whole point of the
 /// adapter.
 ///
-/// [`CursorPage`]: contextdb_core::read_contract::CursorPage
 pub struct ConsumerCursor {
     cursor: Option<ReadCursor>,
     /// How a table-keyed answer is narrowed, and the declaration to narrow it against. `None` for
     /// every read of the store's own rows, which the engine's row gate has already narrowed.
     narrowing: Option<(ShowRowKey, BTreeSet<String>)>,
-    /// The first page with the narrowing applied, held only when there is narrowing to apply so
-    /// an ordinary read hands back the engine's own page without copying it.
-    narrowed_first_page: Option<CursorPage>,
+    /// Ordinary first pages share the engine payload; only declaration filtering copies rows.
+    first_page: Option<ConsumerPage>,
 }
 
 impl std::fmt::Debug for ConsumerCursor {
@@ -744,18 +745,18 @@ impl ConsumerCursor {
             AnswerShape::AsAnswered => None,
             AnswerShape::TableKeyed(key) => Some((key, gate.declared.clone())),
         };
-        let narrowed_first_page = narrowing.as_ref().map(|(key, declared)| {
-            let page = cursor.first_page();
-            CursorPage {
-                columns: page.columns.clone(),
-                rows: declared_rows(*key, declared, page.rows.clone()),
-                has_more: page.has_more,
-            }
+        let page = cursor.first_page();
+        let first_page = Some(match narrowing.as_ref() {
+            Some((key, declared)) => ConsumerPage::declared(
+                page,
+                declared_rows(*key, declared, page.rows().to_vec()),
+            ),
+            None => ConsumerPage::engine(page.clone()),
         });
         Self {
             cursor: Some(cursor),
             narrowing,
-            narrowed_first_page,
+            first_page,
         }
     }
 
@@ -766,12 +767,8 @@ impl ConsumerCursor {
     /// and then reading is an ordinary caller mistake — an early return, a retry, a branch that
     /// closed on the way out — and a consumer that came to the read-only door precisely because it
     /// must not damage anything is owed a refusal it can match on, not an unwound process.
-    pub fn first_page(&self) -> Result<&CursorPage> {
-        let cursor = self.cursor.as_ref().ok_or_else(already_closed)?;
-        Ok(self
-            .narrowed_first_page
-            .as_ref()
-            .unwrap_or_else(|| cursor.first_page()))
+    pub fn first_page(&self) -> Result<&ConsumerPage> {
+        self.first_page.as_ref().ok_or_else(already_closed)
     }
 
     /// The substrate's cumulative cursor trace, while the actual cursor remains open.
@@ -785,15 +782,18 @@ impl ConsumerCursor {
     }
 
     /// Fetch the next page.
-    pub fn fetch(&mut self, rows: Option<NonZeroUsize>) -> Result<CursorPage> {
+    pub fn fetch(&mut self, rows: Option<NonZeroUsize>) -> Result<ConsumerPage> {
         let Some(cursor) = self.cursor.as_mut() else {
             return Err(already_closed());
         };
-        let mut page = cursor.fetch(rows).map_err(map_engine_err)?;
-        if let Some((key, declared)) = self.narrowing.as_ref() {
-            page.rows = declared_rows(*key, declared, page.rows);
-        }
-        Ok(page)
+        let page = cursor.fetch(rows).map_err(map_engine_err)?;
+        Ok(match self.narrowing.as_ref() {
+            Some((key, declared)) => ConsumerPage::declared(
+                &page,
+                declared_rows(*key, declared, page.rows().to_vec()),
+            ),
+            None => ConsumerPage::engine(page),
+        })
     }
 
     /// Release the cursor's snapshot and route resources.
@@ -801,7 +801,7 @@ impl ConsumerCursor {
         let Some(cursor) = self.cursor.take() else {
             return Err(already_closed());
         };
-        self.narrowed_first_page = None;
+        self.first_page = None;
         match cursor.close() {
             // The owner that held this cursor's snapshot let the store go, and its snapshot with
             // it: there is nothing left for this close to release.

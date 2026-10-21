@@ -3750,12 +3750,12 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
-        let mut candidates = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut candidates = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             let decision_id =
-                DecisionId::from(required_uuid_column(row, &result.columns, "decision_id")?);
+                DecisionId::from(required_uuid_column(row, result.columns(), "decision_id")?);
             let snapshot_id =
-                EntitySnapshotId::from(required_uuid_column(row, &result.columns, "snapshot_id")?);
+                EntitySnapshotId::from(required_uuid_column(row, result.columns(), "snapshot_id")?);
             candidates.push((decision_id, snapshot_id));
         }
         let decision_ids = candidates
@@ -3899,7 +3899,7 @@ impl<'a> CaptureTxn<'a> {
             .internal_db()
             .execute_in_tx(self.tx, &sql, &params)
             .map_err(map_engine)?;
-        decode_invalidation_rows(&result.columns, &result.rows)
+        decode_invalidation_rows(result.columns(), result.rows())
     }
 
     fn list_invalidations_for_observation(
@@ -3922,7 +3922,7 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
-        decode_invalidation_rows(&result.columns, &result.rows)
+        decode_invalidation_rows(result.columns(), result.rows())
     }
 
     fn supersede_decision(&mut self, old: DecisionId, mut new: CreateDecision) -> Result<Decision> {
@@ -3978,11 +3978,11 @@ impl<'a> CaptureTxn<'a> {
                 )]),
             )
             .map_err(map_engine)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            let intention_id = IntentionId::from(required_uuid_column(row, &result.columns, "id")?);
-            let description = required_text_column(row, &result.columns, "description")?;
-            let catalog_id = required_text_column(row, &result.columns, "blueprint_catalog_id")?;
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
+            let intention_id = IntentionId::from(required_uuid_column(row, result.columns(), "id")?);
+            let description = required_text_column(row, result.columns(), "description")?;
+            let catalog_id = required_text_column(row, result.columns(), "blueprint_catalog_id")?;
             out.push(IntentionCatalogEntry {
                 intention_id,
                 normalized_description: normalize_intention_description(&description),
@@ -4034,7 +4034,7 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
-        if existing.rows.is_empty() {
+        if existing.rows().is_empty() {
             self.insert_edge(from.as_uuid(), to.as_uuid(), edge_type, context_id, None)?;
         }
         Ok(())
@@ -4051,7 +4051,7 @@ impl<'a> CaptureTxn<'a> {
             )
             .map_err(map_engine)?;
         result
-            .rows
+            .rows()
             .first()
             .map(|row| match row.first() {
                 Some(DbValue::Text(status)) => decision_status_from_label(status).map(Some),
@@ -4087,10 +4087,10 @@ impl<'a> CaptureTxn<'a> {
             )
             .map_err(map_engine)?;
         let mut out = HashMap::new();
-        for row in &result.rows {
+        for row in result.rows() {
             out.insert(
-                DecisionId::from(required_uuid_column(row, &result.columns, "id")?),
-                decision_status_from_label(&required_text_column(row, &result.columns, "status")?)?,
+                DecisionId::from(required_uuid_column(row, result.columns(), "id")?),
+                decision_status_from_label(&required_text_column(row, result.columns(), "status")?)?,
             );
         }
         Ok(out)
@@ -4121,10 +4121,10 @@ impl<'a> CaptureTxn<'a> {
             )
             .map_err(map_engine)?;
         let mut out = HashMap::new();
-        for row in &result.rows {
+        for row in result.rows() {
             out.insert(
-                EntitySnapshotId::from(required_uuid_column(row, &result.columns, "id")?),
-                required_json_column(row, &result.columns, "data")?,
+                EntitySnapshotId::from(required_uuid_column(row, result.columns(), "id")?),
+                required_json_column(row, result.columns(), "data")?,
             );
         }
         Ok(out)
@@ -4163,13 +4163,13 @@ impl<'a> CaptureTxn<'a> {
             )
             .map_err(map_engine)?;
         let mut out = HashMap::new();
-        for row in &result.rows {
+        for row in result.rows() {
             out.entry(DecisionId::from(required_uuid_column(
                 row,
-                &result.columns,
+                result.columns(),
                 "source_id",
             )?))
-            .or_insert(required_json_column(row, &result.columns, "properties")?);
+            .or_insert(required_json_column(row, result.columns(), "properties")?);
         }
         Ok(out)
     }
@@ -4188,7 +4188,7 @@ impl<'a> CaptureTxn<'a> {
                     )]),
                 )
                 .map_err(map_engine)?;
-            count_from_result(&result.columns, &result.rows)
+            count_from_result(result.columns(), result.rows())
         };
         Ok(HarvestCounts {
             goals: count_table("intentions")?,
@@ -4672,7 +4672,7 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
-        Ok(result.rows.first().and_then(|row| match row.first() {
+        Ok(result.rows().first().and_then(|row| match row.first() {
             Some(DbValue::Uuid(id)) => Some(EntitySnapshotId::from(*id)),
             _ => None,
         }))
@@ -4695,7 +4695,7 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
-        Ok(result.rows.first().and_then(|row| match row.first() {
+        Ok(result.rows().first().and_then(|row| match row.first() {
             Some(DbValue::Uuid(id)) => Some(IntentionSnapshotId::from(*id)),
             _ => None,
         }))
@@ -4742,9 +4742,9 @@ impl<'a> CaptureTxn<'a> {
             )
             .map_err(map_engine)?;
         result
-            .rows
+            .rows()
             .first()
-            .map(|row| decode_tx_entity_snapshot(&result.columns, row))
+            .map(|row| decode_tx_entity_snapshot(result.columns(), row))
             .transpose()
     }
 
@@ -4769,7 +4769,7 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
-        let row = result.rows.first().ok_or(CgError::NotFound {
+        let row = result.rows().first().ok_or(CgError::NotFound {
             id: Some(entity_id.as_uuid().to_string()),
             missing: Some("entity"),
         })?;
@@ -4848,7 +4848,7 @@ impl<'a> CaptureTxn<'a> {
                 &HashMap::from([("id".to_string(), DbValue::Uuid(decision_id.as_uuid()))]),
             )
             .map_err(map_engine)?;
-        Ok(result.rows.first().and_then(|row| match row.first() {
+        Ok(result.rows().first().and_then(|row| match row.first() {
             Some(DbValue::Uuid(id)) => Some(ContextId::from(*id)),
             _ => None,
         }))
@@ -4873,7 +4873,7 @@ impl<'a> CaptureTxn<'a> {
             )
             .map_err(map_engine)?;
         Ok(result
-            .rows
+            .rows()
             .iter()
             .filter_map(|row| match row.first() {
                 Some(DbValue::Uuid(id)) => Some(IntentionId::from(*id)),
@@ -4904,7 +4904,7 @@ impl<'a> CaptureTxn<'a> {
                 ]),
             )
             .map_err(map_engine)?;
-        Ok(result.rows.first().and_then(|row| match row.first() {
+        Ok(result.rows().first().and_then(|row| match row.first() {
             Some(DbValue::Text(text)) => Some(text.clone()),
             _ => None,
         }))
@@ -4940,7 +4940,7 @@ impl<'a> CaptureTxn<'a> {
             .internal_db()
             .execute_in_tx(self.tx, sql, &params)
             .map_err(map_engine)?
-            .rows_affected)
+            .rows_affected())
     }
 
     fn insert_edge(
@@ -5731,7 +5731,7 @@ pub(crate) fn extraction_prior_decisions(
         )
         .map_err(map_engine)?;
     let mut rows = result
-        .rows
+        .rows()
         .iter()
         .map(|row| {
             let id = match row.first() {
@@ -5804,10 +5804,10 @@ fn prior_decision_goals_batch(
         .iter()
         .map(|id| (*id, Vec::new()))
         .collect::<HashMap<_, _>>();
-    for row in &result.rows {
+    for row in result.rows() {
         let decision_id =
-            DecisionId::from(required_uuid_column(row, &result.columns, "source_id")?);
-        let text = required_text_column(row, &result.columns, "description")?;
+            DecisionId::from(required_uuid_column(row, result.columns(), "source_id")?);
+        let text = required_text_column(row, result.columns(), "description")?;
         out.entry(decision_id).or_default().push(text);
     }
     Ok(out)
@@ -5852,11 +5852,11 @@ fn prior_decision_entities_batch(
         .iter()
         .map(|id| (*id, Vec::new()))
         .collect::<HashMap<_, _>>();
-    for row in &result.rows {
+    for row in result.rows() {
         let decision_id =
-            DecisionId::from(required_uuid_column(row, &result.columns, "source_id")?);
-        let entity_id = EntityId::from(required_uuid_column(row, &result.columns, "id")?);
-        let name = required_text_column(row, &result.columns, "name")?;
+            DecisionId::from(required_uuid_column(row, result.columns(), "source_id")?);
+        let entity_id = EntityId::from(required_uuid_column(row, result.columns(), "id")?);
+        let name = required_text_column(row, result.columns(), "name")?;
         out.entry(decision_id)
             .or_default()
             .push(ExtractionPriorEntity {
@@ -5946,7 +5946,7 @@ fn find_intention_by_normalized_description(
             )]),
         )
         .map_err(map_engine)?;
-    Ok(result.rows.iter().find_map(|row| match row.as_slice() {
+    Ok(result.rows().iter().find_map(|row| match row.as_slice() {
         [DbValue::Uuid(id), DbValue::Text(existing)]
             if normalize_intention_description(existing) == target =>
         {
@@ -6214,7 +6214,7 @@ fn find_id_by_text(
             ]),
         )
         .map_err(map_engine)?;
-    Ok(result.rows.first().and_then(|row| match row.first() {
+    Ok(result.rows().first().and_then(|row| match row.first() {
         Some(DbValue::Uuid(id)) => Some(*id),
         _ => None,
     }))
@@ -6258,7 +6258,7 @@ fn total_counts(store: &Store, context_id: ContextId) -> Result<HarvestCounts> {
                 )]),
             )
             .map_err(map_engine)?;
-        count_from_result(&result.columns, &result.rows)
+        count_from_result(result.columns(), result.rows())
     };
     Ok(HarvestCounts {
         goals: count_table("intentions")?,
@@ -6386,7 +6386,7 @@ fn read_changed_cursor_row(store: &Store, context_id: ContextId) -> Result<Optio
             DbValue::Uuid(context_id.as_uuid()),
         )]),
     )?;
-    Ok(result.rows.first().and_then(|row| match row.first() {
+    Ok(result.rows().first().and_then(|row| match row.first() {
         Some(DbValue::TxId(tx)) => Some(*tx),
         _ => None,
     }))
@@ -6445,7 +6445,7 @@ fn runtime_model_context(
     sql.push_str(" ORDER BY created_at DESC LIMIT 1");
     let result = store.read_query(&sql, &params)?;
     Ok(result
-        .rows
+        .rows()
         .first()
         .and_then(|row| match row.first() {
             Some(DbValue::Int64(tokens)) => Some(*tokens as usize),

@@ -90,7 +90,7 @@ impl Store {
                 "SELECT id FROM edges WHERE source_id = $source_id AND target_id = $target_id AND edge_type = $edge_type",
                 &params,
             )?;
-        Ok(!result.rows.is_empty())
+        Ok(!result.rows().is_empty())
     }
 
     pub fn traverse(&self, start: EntityId, filter: TraverseFilter) -> Result<TraversalResult> {
@@ -149,7 +149,7 @@ impl Store {
                 &params,
             )
             .map_err(map_engine_err)?;
-        Ok(result.rows.len() as u64)
+        Ok(result.rows().len() as u64)
     }
 
     pub fn admin_raw_edge_scan(&self, rel: String) -> Result<Vec<RawEdge>> {
@@ -163,8 +163,8 @@ impl Store {
                 &params,
             )
             .map_err(map_engine_err)?;
-        let mut out = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        let mut out = Vec::with_capacity(result.rows().len());
+        for row in result.rows() {
             let source = match row.first() {
                 Some(Value::Uuid(u)) => *u,
                 _ => continue,
@@ -200,12 +200,12 @@ impl Store {
                         &params,
                     )
                     .map_err(map_engine_err)?;
-                if result.rows.is_empty() {
+                if result.rows().is_empty() {
                     return Ok(None);
                 }
                 Ok(Some(RawRow {
                     tombstone: false,
-                    data: format!("{:?}", result.rows[0]),
+                    data: format!("{:?}", result.rows()[0]),
                 }))
             }
             StorageKey::EdgeTable { from, rel } => {
@@ -222,12 +222,12 @@ impl Store {
                         &params,
                     )
                     .map_err(map_engine_err)?;
-                if result.rows.is_empty() {
+                if result.rows().is_empty() {
                     return Ok(None);
                 }
                 Ok(Some(RawRow {
                     tombstone: false,
-                    data: format!("{:?}", result.rows[0]),
+                    data: format!("{:?}", result.rows()[0]),
                 }))
             }
         }
@@ -316,8 +316,8 @@ pub(super) fn edges_from_sources(
         );
     }
     let result = rows.query_rows(&sql, &params)?;
-    let mut out = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+    let mut out = Vec::with_capacity(result.rows().len());
+    for row in result.rows() {
         let source = match row.first() {
             Some(Value::Uuid(u)) => *u,
             _ => continue,
