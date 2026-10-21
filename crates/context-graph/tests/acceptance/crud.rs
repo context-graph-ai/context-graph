@@ -2119,7 +2119,7 @@ fn schema_v10_open_refuses_without_mutating_outcomes() {
         )
         .expect("read preserved version");
     assert_eq!(
-        version.rows,
+        version.rows(),
         vec![vec![contextdb_core::Value::Int64(
             (context_graph::CG_SCHEMA_VERSION - 1) as i64
         )]],

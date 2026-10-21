@@ -864,6 +864,6 @@ mod tests {
                 )]),
             )
             .expect("read receipts");
-        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows().len(), 1);
     }
 }

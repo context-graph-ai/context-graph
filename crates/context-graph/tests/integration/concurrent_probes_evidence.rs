@@ -45,8 +45,8 @@ fn table_count(db: &Database, table: &str) -> i64 {
             &HashMap::new(),
         )
         .expect("count table");
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1);
+    match result.rows()[0][0] {
         Value::Int64(n) => n,
         ref other => panic!("expected count integer, got {other:?}"),
     }
@@ -59,8 +59,8 @@ fn count_where_uuid(db: &Database, table: &str, column: &str, id: uuid::Uuid) ->
             &raw_params(vec![("id", Value::Uuid(id))]),
         )
         .expect("count row");
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1);
+    match result.rows()[0][0] {
         Value::Int64(n) => n,
         ref other => panic!("expected count integer, got {other:?}"),
     }
@@ -781,9 +781,9 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
                 &raw_params(vec![("query", Value::Vector(text_vector(writer_idx)))]),
             )
             .expect("text query");
-        assert_eq!(text_hits.rows.len(), 1);
+        assert_eq!(text_hits.rows().len(), 1);
         assert_eq!(
-            text_hits.rows[0][0],
+            text_hits.rows()[0][0],
             Value::Uuid(expected_id.as_uuid()),
             "text query must return the row whose text vector was written to vector_text"
         );
@@ -794,9 +794,9 @@ fn probe_evidence_two_vectors_text_and_vision_isolated_per_column_under_concurre
                 &raw_params(vec![("query", Value::Vector(vision_vector(writer_idx)))]),
             )
             .expect("vision query");
-        assert_eq!(vision_hits.rows.len(), 1);
+        assert_eq!(vision_hits.rows().len(), 1);
         assert_eq!(
-            vision_hits.rows[0][0],
+            vision_hits.rows()[0][0],
             Value::Uuid(expected_id.as_uuid()),
             "vision query must return the row whose vision vector was written to vector_vision"
         );

@@ -699,7 +699,7 @@ async fn unbound_store_exposes_only_bootstrap_and_binding_publishes_the_complete
             .sync_database()
             .execute("SELECT version FROM cg_schema_version", &HashMap::new())
             .expect("ready schema version is readable")
-            .rows
+            .rows()
             == vec![vec![DbValue::Int64(CG_SCHEMA_VERSION.into())]],
         "Ready publishes the reserved schema version, not an arbitrary version row"
     );
@@ -764,7 +764,7 @@ async fn authenticated_discard_modes_are_enforced_from_the_bound_engine_policy()
                             &params,
                         )
                         .expect("inspect rows preserved while outcome is pending")
-                        .rows
+                        .rows()
                         .len(),
                     1,
                     "AFTER OUTCOME preserves its {table} row while the authenticated delivery remains pending"
@@ -813,7 +813,7 @@ async fn authenticated_discard_modes_are_enforced_from_the_bound_engine_policy()
                         &params,
                     )
                     .expect("inspect selected rows after discard")
-                    .rows
+                    .rows()
                     .len(),
                 usize::from(rows_remain),
                 "{name} follows the authenticated policy for its {table} row"

@@ -224,7 +224,7 @@ fn rewrite_skill_rule(store: &Store, skill_id: &str, rule: &str) {
         )
         .expect("rewrite skill rule");
     assert_eq!(
-        result.rows_affected, 1,
+        result.rows_affected(), 1,
         "the skill rule rewrite must update exactly one row for {skill_id}"
     );
 }

@@ -199,7 +199,7 @@ fn raw_decision_producer_display(
             ]),
         )
         .expect("raw decision producer query");
-    let row = result.rows.first()?;
+    let row = result.rows().first()?;
     let space = match row.first() {
         Some(Value::Text(space)) => space,
         _ => return None,

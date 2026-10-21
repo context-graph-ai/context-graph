@@ -72,7 +72,7 @@ fn read_settings(store: &Store) -> Vec<(String, String)> {
             &no_params(),
         )
         .expect("read the consumer table back");
-    rows.rows
+    rows.rows()
         .iter()
         .map(|row| match (&row[0], &row[1]) {
             (Value::Text(name), Value::Text(requested)) => (name.clone(), requested.clone()),
@@ -557,7 +557,7 @@ fn hub_setting_names(store: &Store) -> Vec<String> {
             &no_params(),
         )
         .expect("read the consumer table back");
-    rows.rows
+    rows.rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(name) => name.clone(),

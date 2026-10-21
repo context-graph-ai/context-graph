@@ -208,7 +208,7 @@ fn vector_index_tables_in_the_whole_store(path: &Path) -> BTreeSet<String> {
         .sync_database()
         .execute("SHOW VECTOR_INDEXES", &no_params())
         .expect("an unrestricted handle is answered about every vector index in the store");
-    let tables = text_column(&answered.rows).into_iter().collect();
+    let tables = text_column(&answered.rows()).into_iter().collect();
     drop(store);
     tables
 }
@@ -447,7 +447,7 @@ fn a_declared_reader_journeys_from_open_through_sql_metadata_and_cursor_to_close
             &cursor
                 .first_page()
                 .expect("the cursor was just opened")
-                .rows
+                .rows()
         ),
         "the page produced at open carries the declared table's row",
     );
@@ -455,7 +455,7 @@ fn a_declared_reader_journeys_from_open_through_sql_metadata_and_cursor_to_close
         !cursor
             .first_page()
             .expect("the cursor was just opened")
-            .has_more,
+            .has_more(),
         "one row is the whole answer, so nothing remains after the first page",
     );
     cursor.close().expect("the reader closes its own cursor");
@@ -734,7 +734,7 @@ fn every_query_shape_that_re_widens_a_narrowed_predicate_answers_only_in_scope_r
             &cursor
                 .first_page()
                 .expect("the cursor was just opened")
-                .rows
+                .rows()
         ),
         "the page produced at open must carry only the row the declaration admits",
     );

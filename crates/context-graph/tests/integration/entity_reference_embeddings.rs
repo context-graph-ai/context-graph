@@ -82,13 +82,13 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 
 fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
     let result = db.execute(sql, params).expect("count query");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0].first(), Some(Value::Int64(_))),
+        matches!(result.rows()[0].first(), Some(Value::Int64(_))),
         "expected count integer, got {:?}",
-        result.rows[0].first()
+        result.rows()[0].first()
     );
-    match result.rows[0][0] {
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         _ => 0,
     }
@@ -290,7 +290,7 @@ fn entity_reference_embedding_writes_to_dedicated_child_table_not_entities_table
             ]),
         )
         .expect("reference vector projection");
-    let persisted_vector_matches = vector_result.rows.first().is_some_and(
+    let persisted_vector_matches = vector_result.rows().first().is_some_and(
         |row| matches!(row.first(), Some(Value::Vector(vector)) if vector == &front_vector),
     );
     let entity_rows_with_vector_shadow = db
@@ -316,7 +316,7 @@ fn entity_reference_embedding_writes_to_dedicated_child_table_not_entities_table
             )]),
         )
         .expect("snapshot payloads");
-    let snapshot_has_embedding_shadow = snapshot_data.rows.iter().any(
+    let snapshot_has_embedding_shadow = snapshot_data.rows().iter().any(
         |row| matches!(row.first(), Some(Value::Json(value)) if has_embedding_shadow_key(value)),
     );
 
@@ -328,7 +328,7 @@ fn entity_reference_embedding_writes_to_dedicated_child_table_not_entities_table
             && snapshot_vector_columns == 0
             && !snapshot_has_embedding_shadow,
         "expected dedicated reference table row with the exact vector and no vector/embedding shadow on entities or snapshots, id={id:?}, reference_rows={reference_rows}, persisted_vector_matches={persisted_vector_matches}, entity_vector_columns={entity_rows_with_vector_shadow}, snapshot_vector_columns={snapshot_vector_columns}, snapshot_has_embedding_shadow={snapshot_has_embedding_shadow}, vector_rows={:?}",
-        vector_result.rows
+        vector_result.rows()
     );
 }
 

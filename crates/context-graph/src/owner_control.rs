@@ -580,7 +580,7 @@ mod tests {
     fn owner_route_unsupported_classifies_to_a_typed_variant_naming_the_inspection() {
         let store_path = PathBuf::from("/tmp/some-store");
         let failure = contextdb_core::read_contract::ReadFailure::owner_route_unsupported(
-            "custom_namespace".to_string(),
+            "custom_namespace".to_string().into(),
         );
 
         let classified = classify(&store_path, DbError::from(failure));
@@ -611,7 +611,7 @@ mod tests {
         .expect("owner-not-serving pairs with no specialized detail");
         let route_unsupported_failure =
             contextdb_core::read_contract::ReadFailure::owner_route_unsupported(
-                "custom_namespace".to_string(),
+                "custom_namespace".to_string().into(),
             );
 
         let not_serving = classify(&store_path, DbError::from(not_serving_failure));

@@ -154,8 +154,8 @@ fn import_options(
 
 fn scalar_count(db: &Database, sql: &str, params: HashMap<String, Value>) -> i64 {
     let result = db.execute(sql, &params).expect("count query");
-    assert_eq!(result.rows.len(), 1, "one aggregate row");
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1, "one aggregate row");
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         ref value => panic!("expected integer count, got {value:?}"),
     }
@@ -172,7 +172,7 @@ fn checkpoint_latest_sequences(db: &Database, context_id: context_graph::Context
         )
         .expect("read source checkpoint rows");
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row[0] {
             Value::Int64(value) => value,

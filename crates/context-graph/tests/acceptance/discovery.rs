@@ -357,17 +357,17 @@ fn engine_contexts(contexts: &[uuid::Uuid]) -> BTreeSet<contextdb_core::ContextI
 
 fn engine_uuid_set(result: &contextdb_engine::QueryResult, column: &str) -> BTreeSet<uuid::Uuid> {
     let idx = result
-        .columns
+        .columns()
         .iter()
         .position(|candidate| candidate == column || candidate.rsplit('.').next() == Some(column));
     assert!(
         idx.is_some(),
         "column {column} not found in {:?}",
-        result.columns
+        result.columns()
     );
     let idx = idx.unwrap();
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[idx] {
             Value::Uuid(id) => *id,

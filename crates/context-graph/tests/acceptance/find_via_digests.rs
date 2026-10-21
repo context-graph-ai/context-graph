@@ -368,7 +368,7 @@ fn raw_digest_vector_query(
         )
         .expect("raw digest vector query");
     let ids = result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Uuid(id)) => Some(DigestId::from(*id)),
@@ -378,13 +378,13 @@ fn raw_digest_vector_query(
     // The vectors admitted to the indexed AUTO plan, as the engine's query disclosure reports
     // them. An AUTO leaf may still use bounded exact work when the maintained graph is unavailable.
     let indexed_vectors = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .filter(|search| search.resolved_mode == VectorSearchMode::Indexed)
         .and_then(|search| search.aggregate_allowed_vectors)
         .unwrap_or_default();
-    (ids, format!("{:?}", result.trace), indexed_vectors)
+    (ids, format!("{:?}", result.trace()), indexed_vectors)
 }
 
 fn raw_extracted_from_graph_walk(
@@ -408,7 +408,7 @@ fn raw_extracted_from_graph_walk(
         )
         .expect("raw extracted-from graph walk");
     let mut ids = result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Uuid(id)) => Some(*id),
@@ -416,7 +416,7 @@ fn raw_extracted_from_graph_walk(
         })
         .collect::<Vec<_>>();
     ids.sort();
-    (ids, format!("{:?}", result.trace))
+    (ids, format!("{:?}", result.trace()))
 }
 
 fn seeded_fixture() -> DigestFixture {

@@ -165,12 +165,12 @@ fn observe(
 
 fn uuid_column_set(result: &QueryResult, column: &str) -> BTreeSet<Uuid> {
     let index = result
-        .columns
+        .columns()
         .iter()
         .position(|name| name == column)
         .unwrap_or_else(|| panic!("missing column {column}"));
     result
-        .rows
+        .rows()
         .iter()
         .map(|row| match row.get(index) {
             Some(Value::Uuid(id)) => *id,

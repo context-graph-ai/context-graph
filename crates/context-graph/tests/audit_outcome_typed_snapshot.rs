@@ -138,7 +138,7 @@ fn commit_between_staged_and_outcome_commit(
             &HashMap::from([("id".to_string(), Value::Uuid(id))]),
         )
         .expect("read intervening audit row");
-    match committed.rows.as_slice() {
+    match committed.rows().as_slice() {
         [row] => match row.as_slice() {
             [Value::TxId(tx)] => *tx,
             other => panic!("intervening audit row must expose its committed TXID: {other:?}"),
@@ -210,9 +210,9 @@ fn outcome_audit_snapshot_keeps_typed_committed_time_across_store_reopen_and_rea
             ]),
     )
     .expect("raw Outcome audit storage");
-    assert_eq!(raw.rows.len(), 3);
-    let mut raw_times = Vec::with_capacity(raw.rows.len());
-    for row in &raw.rows {
+    assert_eq!(raw.rows().len(), 3);
+    let mut raw_times = Vec::with_capacity(raw.rows().len());
+    for row in &raw.rows() {
         let Some(Value::TxId(recorded_at)) = row.first() else {
             panic!("Outcome audit row must store its timestamp as TXID: {row:?}");
         };

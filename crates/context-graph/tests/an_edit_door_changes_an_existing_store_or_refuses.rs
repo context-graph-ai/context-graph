@@ -125,7 +125,7 @@ fn setting_names(store: &Store) -> Vec<String> {
             &HashMap::new(),
         )
         .expect("read the consumer table back")
-        .rows
+        .rows()
         .iter()
         .map(|row| match &row[0] {
             Value::Text(name) => name.clone(),

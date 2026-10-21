@@ -800,13 +800,13 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 
 fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
     let result = db.execute(sql, params).expect("count query");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0].first(), Some(Value::Int64(_))),
+        matches!(result.rows()[0].first(), Some(Value::Int64(_))),
         "expected count integer, got {:?}",
-        result.rows[0].first()
+        result.rows()[0].first()
     );
-    match result.rows[0][0] {
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         _ => 0,
     }
@@ -843,7 +843,7 @@ fn handle_producer_row(db: &Database, embedding_id: EmbeddingId) -> Option<Handl
             &params(vec![("id", Value::Uuid(embedding_id.as_uuid()))]),
         )
         .expect("producer row");
-    let row = result.rows.first()?;
+    let row = result.rows().first()?;
     let space = match row.first() {
         Some(Value::Text(space)) => space.clone(),
         _ => return None,
@@ -875,7 +875,7 @@ fn handle_producer_row_by_target(
             &params(vec![("target_id", Value::Uuid(evidence_id.as_uuid()))]),
         )
         .expect("producer row by target");
-    let row = result.rows.first()?;
+    let row = result.rows().first()?;
     let space = match row.first() {
         Some(Value::Text(space)) => space.clone(),
         _ => return None,
@@ -1061,14 +1061,14 @@ fn producer_metadata_query_explain_uses_indexed_projection_on_system_field() {
         )
         .expect("producer projection query");
     let matching_ids = result
-        .rows
+        .rows()
         .iter()
         .filter_map(|row| match row.first() {
             Some(Value::Uuid(id)) => Some(EmbeddingId::from(*id)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    let trace = result.trace;
+    let trace = result.trace();
     let pushed = trace
         .predicates_pushed
         .iter()
@@ -1274,9 +1274,9 @@ fn decision_reasoning_chain_producer_system_predicate_query_returns_complete_ans
             ]),
         );
     let row_matches = result.as_ref().is_ok_and(|result| {
-        result.rows.len() == 1
+        result.rows().len() == 1
             && matches!(
-                result.rows.first(),
+                result.rows().first(),
                 Some(row)
                     if matches!(row.first(), Some(Value::Uuid(id)) if *id == embedding_id.as_uuid())
                         && matches!(row.get(1), Some(Value::Uuid(id)) if *id == evidence_id.as_uuid())

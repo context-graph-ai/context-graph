@@ -55,8 +55,8 @@ fn producer() -> EvidenceProducer {
 
 fn count(db: &Database, sql: &str, params: HashMap<String, Value>) -> i64 {
     let result = db.execute(sql, &params).expect("count query");
-    assert_eq!(result.rows.len(), 1);
-    let scalar = result.rows[0].first();
+    assert_eq!(result.rows().len(), 1);
+    let scalar = result.rows()[0].first();
     assert!(
         matches!(scalar, Some(Value::Int64(_))),
         "expected integer count, got {scalar:?}"

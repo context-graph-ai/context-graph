@@ -237,7 +237,7 @@ fn persisted_handle_rows_for_version(db_path: &Path, version: &str) -> i64 {
             )]),
         )
         .expect("producer count");
-    match result.rows.first().and_then(|row| row.first()) {
+    match result.rows().first().and_then(|row| row.first()) {
         Some(Value::Int64(n)) => *n,
         other => panic!("unexpected producer count cell: {other:?}"),
     }

@@ -6687,7 +6687,7 @@ mod request_write_ceilings {
         let prefix = passages
             .first_page()
             .expect("published prefix page")
-            .rows
+            .rows()
             .clone();
         passages.close().expect("close prefix cursor");
         assert_eq!(prefix.len(), 1, "one published prefix passage");
@@ -6856,7 +6856,7 @@ mod request_write_ceilings {
             let passages = cursor
                 .first_page()
                 .expect("widened passage page")
-                .rows
+                .rows()
                 .clone();
             cursor.close().expect("close widened passage cursor");
             assert_eq!(
@@ -7369,7 +7369,7 @@ mod request_write_ceilings {
                     )]),
                 )
                 .expect("expire the orphan claim deterministically");
-            assert_eq!(changed.rows_affected, 1);
+            assert_eq!(changed.rows_affected(), 1);
         }
         std::fs::write(lease_wait.join("release"), b"resume expired claim")
             .expect("release replacement");

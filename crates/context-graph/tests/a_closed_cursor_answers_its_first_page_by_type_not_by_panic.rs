@@ -162,7 +162,7 @@ fn a_closed_cursor_refuses_its_first_page_exactly_as_it_refuses_a_fetch() {
         .fetch(None)
         .expect("the cursor pages the site's observations while it is open");
     assert!(
-        !page.rows.is_empty(),
+        !page.rows().is_empty(),
         "the cursor must have rows to page, or closing it proves nothing",
     );
 
@@ -199,7 +199,7 @@ fn dropping_an_unfinished_cursor_releases_the_session_cursor_slot() {
         let cursor = reader
             .open_cursor("SELECT id FROM observations", &HashMap::new())
             .expect("open the first cursor");
-        assert!(cursor.first_page().expect("first page").has_more);
+        assert!(cursor.first_page().expect("first page").has_more());
     }
     let mut next = reader
         .open_cursor("SELECT id FROM observations", &HashMap::new())

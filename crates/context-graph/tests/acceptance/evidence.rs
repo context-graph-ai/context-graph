@@ -538,8 +538,8 @@ fn table_count(db: &Database, table: &str) -> i64 {
             &HashMap::new(),
         )
         .expect("count table");
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1);
+    match result.rows()[0][0] {
         Value::Int64(n) => n,
         ref other => panic!("expected count integer, got {other:?}"),
     }
@@ -578,8 +578,8 @@ fn count_where(
             &params,
         )
         .expect("count table");
-    assert_eq!(result.rows.len(), 1);
-    match result.rows[0][0] {
+    assert_eq!(result.rows().len(), 1);
+    match result.rows()[0][0] {
         Value::Int64(n) => n,
         ref other => panic!("expected count integer, got {other:?}"),
     }
@@ -599,9 +599,9 @@ fn raw_evidence_rows_for_observation(
         )
         .expect("raw evidence rows");
     result
-        .rows
+        .rows()
         .into_iter()
-        .map(|row| result.columns.iter().cloned().zip(row).collect())
+        .map(|row| result.columns().iter().cloned().zip(row).collect())
         .collect()
 }
 
@@ -6289,8 +6289,8 @@ fn record_observation_state_delta_some_null_sets_json_null_distinct_from_none_wh
             &db_params(vec![("id", Value::Uuid(observation_id.as_uuid()))]),
         )
         .expect("raw state_delta");
-    assert_eq!(row.rows.len(), 1);
-    let Value::Json(raw) = &row.rows[0][0] else {
+    assert_eq!(row.rows().len(), 1);
+    let Value::Json(raw) = &row.rows()[0][0] else {
         panic!("state_delta must be JSON");
     };
     assert_eq!(raw["format"], serde_json::json!("cg_state_delta_v1"));

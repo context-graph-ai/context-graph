@@ -6716,7 +6716,7 @@ mod tests {
                 )]),
             )
             .expect("count query")
-            .rows
+            .rows()
             .len()
     }
 }

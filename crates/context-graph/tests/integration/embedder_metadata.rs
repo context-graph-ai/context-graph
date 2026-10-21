@@ -514,7 +514,7 @@ fn producer_projection_by_target(
             &params(vec![("target_id", Value::Uuid(evidence_id.as_uuid()))]),
         )
         .expect("producer projection");
-    let row = result.rows.first()?;
+    let row = result.rows().first()?;
     let space = match row.first() {
         Some(Value::Text(space)) => space.clone(),
         _ => return None,
@@ -648,13 +648,13 @@ fn params(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
 
 fn count(db: &Database, sql: &str, params: &HashMap<String, Value>) -> i64 {
     let result = db.execute(sql, params).expect("count query");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows().len(), 1);
     assert!(
-        matches!(result.rows[0].first(), Some(Value::Int64(_))),
+        matches!(result.rows()[0].first(), Some(Value::Int64(_))),
         "expected count integer, got {:?}",
-        result.rows[0].first()
+        result.rows()[0].first()
     );
-    match result.rows[0][0] {
+    match result.rows()[0][0] {
         Value::Int64(value) => value,
         _ => 0,
     }
