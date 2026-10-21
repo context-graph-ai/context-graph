@@ -50,12 +50,12 @@ impl ConsumerQueryResult {
 }
 
 /// One consumer page: an engine handle, or an application-owned filtered copy.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ConsumerPage {
     inner: ConsumerPageData,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum ConsumerPageData {
     Engine(CursorPage),
     Declared {
@@ -101,6 +101,14 @@ impl ConsumerPage {
             ConsumerPageData::Engine(page) => page.has_more(),
             ConsumerPageData::Declared { has_more, .. } => *has_more,
         }
+    }
+}
+
+impl PartialEq for ConsumerPage {
+    fn eq(&self, other: &Self) -> bool {
+        self.columns() == other.columns()
+            && self.rows() == other.rows()
+            && self.has_more() == other.has_more()
     }
 }
 
