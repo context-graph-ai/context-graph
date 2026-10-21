@@ -24,6 +24,10 @@ reader declaration. ContextDB selects the idle-file/live-owner read route. Statu
 open a writable Store. Capture uses `Store`; the connector implements `EventImportAdapter`;
 search uses the core's `Embedder`/sealed `EventSearchEmbedder`, never a CLI abstraction.
 
+The schema-version probe in `src/main.rs` borrows the engine answer through `rows()`. Shared
+read decoders consume the core library’s application aggregate and page accessors; the CLI does
+not construct or mutate engine result storage.
+
 ## Invariants and guards
 
 - Session-import and search worker operations rely on `event_search_passages` declaring `HISTORY CURRENT ONLY`, allowing repeated tail replacements and session publications to reclaim superseded versions while preserving immutable captured events and their session identities:

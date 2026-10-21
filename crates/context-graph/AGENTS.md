@@ -15,6 +15,7 @@ runtime, a second embedding trait or a second transport to the running owner.
 | Passage rendering, durable request selections, work policy, embedding cap and batch writer admission | `src/event_search.rs`, `src/store/event_search_projection.rs` |
 | Find/status/forget | `src/store/event_search_read.rs`, `src/store/event_history_status.rs`, `src/store/event_forget.rs` |
 | One SQL/decoder across read and write | `src/store/graph_rows.rs` (`GraphRows`); `src/consumer_read/graph.rs` |
+| Application aggregates and declaration-filtered pages | `src/consumer_read/result.rs`; `ConsumerQueryResult`, `ConsumerPage` |
 | Read session admission, memory and active time | `src/consumer_read.rs`, `src/owner_control.rs`, `src/status_reads.rs` |
 | Writer budget / node probe | `src/write_budget.rs`; facts from `cg-node-fs` |
 | Atomic startup schema and writable open | `src/store/mod.rs`, `src/schema.rs` |
@@ -24,6 +25,10 @@ runtime, a second embedding trait or a second transport to the running owner.
 CLI and library hosts consume typed answers. ContextDB supplies `ReadSession`, owner transport,
 cursors, snapshot/row visibility and typed refusals. `ConsumerReader::open_with_read_limits`
 uses the declaration and engine gate; `Store` and `ConsumerGraphView` share `GraphRows` reads.
+Query results expose borrowed engine data. `ConsumerQueryResult` owns the copies combined by
+`GraphRows` and narrowed by the declaration gate. `ConsumerPage` retains an ordinary engine page
+handle or owns a declaration-filtered copy; its equality and canonical row serialization use the
+visible columns, rows and `has_more`. Those application copies do not become engine charges.
 `request_owner_with_budgets` addresses administrative frames by store path; only typed owner
 absence permits file fallback. In-process totals use the existing live database. The one writable
 open carrying both capabilities is `Store::open_with_control_handler_and_embedder_registrations`.
