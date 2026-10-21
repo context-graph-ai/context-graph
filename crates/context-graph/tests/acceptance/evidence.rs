@@ -601,7 +601,7 @@ fn raw_evidence_rows_for_observation(
     result
         .rows()
         .into_iter()
-        .map(|row| result.columns().iter().cloned().zip(row).collect())
+        .map(|row| result.columns().iter().cloned().zip(row.iter().cloned()).collect())
         .collect()
 }
 

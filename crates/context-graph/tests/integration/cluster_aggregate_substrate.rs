@@ -379,7 +379,7 @@ fn hidden_member_vector_payloads_reachable_from_signatures(
         let columns = if result.columns().is_empty() {
             fallback_columns.as_slice()
         } else {
-            result.columns().as_slice()
+            result.columns()
         };
 
         for row in result.rows() {

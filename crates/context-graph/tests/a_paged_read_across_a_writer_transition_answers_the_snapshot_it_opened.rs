@@ -340,7 +340,7 @@ fn a_cursor_opened_before_the_handover_finishes_the_read_it_opened() {
         first.rows().len()
     );
     let mut seen = Vec::new();
-    for row in &first.rows() {
+    for row in first.rows() {
         seen.push(seq_of(row, &first.columns()));
     }
 
@@ -362,7 +362,7 @@ fn a_cursor_opened_before_the_handover_finishes_the_read_it_opened() {
         match cursor.fetch(None) {
             Ok(page) => {
                 has_more = page.has_more();
-                for row in &page.rows() {
+                for row in page.rows() {
                     seen.push(seq_of(row, &page.columns()));
                 }
                 fetches.push(Ok(page.rows().len()));

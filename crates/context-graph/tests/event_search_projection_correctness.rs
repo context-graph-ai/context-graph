@@ -223,7 +223,7 @@ fn a_typed_active_time_refusal_retains_committed_passages_and_resumes() {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("read published passages")
-        .rows();
+        .rows().to_vec();
     let ids = rows
         .iter()
         .map(|row| format!("{:?}", row[0]))
@@ -595,7 +595,7 @@ fn commit_later_begun_audit_transaction(
             &HashMap::from([("id".into(), Value::Uuid(id))]),
         )
         .expect("read intervening transaction");
-    match committed.rows().as_slice() {
+    match committed.rows() {
         [row] => match row.as_slice() {
             [Value::TxId(committed)] => *committed,
             other => panic!("intervening row has no committed TXID: {other:?}"),
@@ -611,7 +611,7 @@ fn attempt_owner_row(config: &StoreConfig, context_id: ContextId) -> Vec<Value> 
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("read the competing owner's committed identity")
-        .rows();
+        .rows().to_vec();
     assert_eq!(rows.len(), 1, "one generation owns this fixture Context");
     rows.remove(0)
 }
@@ -1014,7 +1014,7 @@ fn committed_projection(store: &Store, context_id: ContextId) -> CommittedProjec
             ]),
         )
         .expect("inspect committed passage order, content, and vectors")
-        .rows();
+        .rows().to_vec();
     let status = store
         .event_history_status(ContextSelector::one(context_id))
         .expect("inspect committed coverage")
@@ -1030,7 +1030,7 @@ fn committed_projection(store: &Store, context_id: ContextId) -> CommittedProjec
             "SELECT event_id, source_order, event_start_byte, event_end_byte, passage_start_byte, passage_end_byte FROM event_search_passage_sources WHERE passage_id = $passage_id ORDER BY source_order ASC",
             &HashMap::from([("passage_id".into(), passage[0].clone())]),
         ).unwrap();
-        for mut link in links.rows() {
+        for mut link in links.rows().iter().cloned() {
             let event = store
                 .execute_sql_for_test(
                     "SELECT seq FROM events WHERE id = $event_id",
@@ -2060,7 +2060,7 @@ fn invalid_profile_preserves_an_in_progress_build() {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("snapshot building generation rows")
-        .rows();
+        .rows().to_vec();
     let failure_reason = store
         .event_history_status(ContextSelector::one(context_id))
         .expect("status after deterministic failure")
@@ -2074,7 +2074,7 @@ fn invalid_profile_preserves_an_in_progress_build() {
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .expect("snapshot committed cursor rows")
-        .rows();
+        .rows().to_vec();
     let passages = current_passages(&store, context_id);
     let passage_count = all_passage_count(&store, context_id);
     assert_eq!(generation_rows.len(), 1, "one generation remains building");
@@ -3796,7 +3796,7 @@ fn attempt_rows(config: &StoreConfig, context_id: ContextId) -> Vec<Vec<Value>> 
     open(config).execute_sql_for_test(
         "SELECT id, started_at, last_attempt_at, sanitized_failure FROM event_search_generations WHERE context_id = $context_id ORDER BY started_at ASC",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-    ).unwrap().rows()
+    ).unwrap().rows().to_vec()
 }
 
 fn consumer_search(
@@ -3918,7 +3918,7 @@ fn attempt_chronology_follows_resumption_and_activation_instead_of_generation_cr
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
         )
         .unwrap()
-        .rows();
+        .rows().to_vec();
     let (Value::TxId(activated), Value::TxId(attempt)) = (&head[0][0], &after[0][2]) else {
         panic!("activation and attempt TXIDs")
     };

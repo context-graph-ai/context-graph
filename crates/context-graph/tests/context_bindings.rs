@@ -60,7 +60,7 @@ fn binding_rows(store: &Store) -> Vec<Vec<Value>> {
             &HashMap::new(),
         )
         .expect("read local binding rows")
-        .rows()
+        .rows().to_vec()
 }
 
 fn durable_rows(store: &Store, table: &str) -> Vec<VersionedRow> {
@@ -566,17 +566,17 @@ fn placement_change_is_allowed_before_capture_or_after_failure_but_not_after_era
         .sync_database()
         .execute("SELECT * FROM events", &HashMap::new())
         .expect("read captured rows")
-        .rows();
+        .rows().to_vec();
     let anchor_rows_before_erasure = captured
         .sync_database()
         .execute("SELECT * FROM event_anchors", &HashMap::new())
         .expect("read captured anchor rows")
-        .rows();
+        .rows().to_vec();
     let local_commit_rows_before_erasure = captured
         .sync_database()
         .execute("SELECT * FROM event_local_commits", &HashMap::new())
         .expect("read captured local commit rows")
-        .rows();
+        .rows().to_vec();
     assert_eq!(event_rows_before_erasure.len(), 1);
     assert_eq!(anchor_rows_before_erasure.len(), 1);
     assert_eq!(local_commit_rows_before_erasure.len(), 1);
@@ -604,7 +604,7 @@ fn placement_change_is_allowed_before_capture_or_after_failure_but_not_after_era
         .sync_database()
         .execute("SELECT * FROM event_placement", &HashMap::new())
         .expect("read persisted local placement")
-        .rows();
+        .rows().to_vec();
 
     let event_params = HashMap::from([("event_id".to_string(), Value::Uuid(event_id))]);
     captured

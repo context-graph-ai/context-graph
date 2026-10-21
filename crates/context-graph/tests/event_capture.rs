@@ -484,7 +484,7 @@ fn capture_stream_summary(
         &params,
     ).expect("read fixture events for test-only session breakdown");
     let mut sessions = std::collections::BTreeMap::new();
-    for row in &rows.rows() {
+    for row in rows.rows() {
         let [
             DbValue::Text(connector),
             DbValue::Text(session),
@@ -500,7 +500,7 @@ fn capture_stream_summary(
         entry.0 += 1;
         entry.1 = entry.1.max(*seq);
     }
-    for group in &groups.rows() {
+    for group in groups.rows() {
         let [connector, source, count] = group.as_slice() else {
             panic!("unexpected maintained group: {group:?}");
         };
@@ -998,12 +998,12 @@ async fn authenticated_custody_counts_equivalent_full_units_and_refuses_changed_
         .sync_database()
         .execute("SELECT * FROM events", &HashMap::new())
         .expect("read first shared row")
-        .rows();
+        .rows().to_vec();
     let second_event_rows = second
         .sync_database()
         .execute("SELECT * FROM events", &HashMap::new())
         .expect("read second shared row")
-        .rows();
+        .rows().to_vec();
     assert_eq!(
         first_event_rows, second_event_rows,
         "identical accepted events retain byte-for-byte equal shared rows"
@@ -1012,12 +1012,12 @@ async fn authenticated_custody_counts_equivalent_full_units_and_refuses_changed_
         .sync_database()
         .execute("SELECT * FROM event_anchors", &HashMap::new())
         .expect("read first complete anchor rows")
-        .rows();
+        .rows().to_vec();
     let second_anchor_rows = second
         .sync_database()
         .execute("SELECT * FROM event_anchors", &HashMap::new())
         .expect("read second complete anchor rows")
-        .rows();
+        .rows().to_vec();
     assert_eq!(
         first_anchor_rows.len(),
         1,

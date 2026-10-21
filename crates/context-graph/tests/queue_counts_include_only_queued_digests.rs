@@ -188,7 +188,7 @@ fn captured_kind(store: &Store, digest: DigestId) -> String {
             &HashMap::from([("id".to_string(), DbValue::Uuid(digest.as_uuid()))]),
         )
         .expect("read a captured digest's kind")
-        .rows();
+        .rows().to_vec();
     match rows.first().and_then(|row| row.first()) {
         Some(DbValue::Text(kind)) => kind.clone(),
         other => panic!("a captured digest carries a text kind, not {other:?}"),

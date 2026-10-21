@@ -6688,7 +6688,7 @@ mod request_write_ceilings {
             .first_page()
             .expect("published prefix page")
             .rows()
-            .clone();
+            .to_vec();
         passages.close().expect("close prefix cursor");
         assert_eq!(prefix.len(), 1, "one published prefix passage");
         assert_eq!(prefix[0][0], contextdb_core::Value::Int64(2));
@@ -6857,7 +6857,7 @@ mod request_write_ceilings {
                 .first_page()
                 .expect("widened passage page")
                 .rows()
-                .clone();
+                .to_vec();
             cursor.close().expect("close widened passage cursor");
             assert_eq!(
                 passages.len(),
