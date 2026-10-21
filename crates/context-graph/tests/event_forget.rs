@@ -223,6 +223,42 @@ fn count(reader: &ConsumerReader, sql: &str, context_id: ContextId) -> u64 {
     }
 }
 
+/// One context's pending-work markers as (generation, connector, source, session, pending),
+/// sorted, so a before/after pair compares as a relational control.
+fn pending_streams(
+    reader: &ConsumerReader,
+    context_id: ContextId,
+) -> Vec<(String, String, String, String, bool)> {
+    let answer = reader
+        .execute(
+            "SELECT generation_id, connector_id, source_instance_ref, session_ref, pending FROM event_search_pending_streams WHERE context_id = $context_id",
+            &HashMap::from([("context_id".to_string(), Value::Uuid(context_id.as_uuid()))]),
+        )
+        .expect("read pending-stream markers");
+    let mut rows = answer
+        .rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                Value::Uuid(generation),
+                Value::Text(connector),
+                Value::Text(source),
+                Value::Text(session),
+                Value::Bool(pending),
+            ] => (
+                generation.to_string(),
+                connector.clone(),
+                source.clone(),
+                session.clone(),
+                *pending,
+            ),
+            other => panic!("pending-stream marker row {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
+}
+
 fn reader(path: &Path) -> ConsumerReader {
     ConsumerReader::open(path, event_history_reader_declaration()).expect("open reader")
 }
@@ -291,6 +327,29 @@ fn forgetting_a_session_erases_its_events_and_everything_derived_while_keeping_t
         !forgotten_passages.is_empty(),
         "the forgotten session was searchable"
     );
+    // Projection clears every marker, so one more capture to the session being forgotten leaves
+    // it pending work: the erasure is then proven on a live marker, not a cleared one.
+    let pending_anchors = append(
+        &store,
+        context_id,
+        "session-gone",
+        "source-gone",
+        "gone-3",
+        3,
+    );
+    let markers_before = pending_streams(&reader(&database), context_id);
+    assert!(
+        markers_before
+            .iter()
+            .any(|(_, _, _, session, pending)| session == "session-gone" && *pending),
+        "the fixture leaves a pending marker for the session to forget: {markers_before:?}"
+    );
+    assert!(
+        markers_before
+            .iter()
+            .any(|(_, _, _, session, _)| session == "session-kept"),
+        "the fixture leaves a marker for the retained session: {markers_before:?}"
+    );
 
     let receipt = store
         .forget_event_history(ForgetSelection::Session {
@@ -301,8 +360,8 @@ fn forgetting_a_session_erases_its_events_and_everything_derived_while_keeping_t
         .expect("forget one session");
     assert!(receipt.changed);
     assert_eq!(receipt.sessions, 1);
-    assert_eq!(receipt.events, 2);
-    assert_eq!(receipt.anchors, forgotten_anchors);
+    assert_eq!(receipt.events, 3);
+    assert_eq!(receipt.anchors, forgotten_anchors + pending_anchors);
     assert!(receipt.passages > 0, "search passages were erased");
     assert_eq!(
         receipt.vectors, receipt.passages,
@@ -329,6 +388,14 @@ fn forgetting_a_session_erases_its_events_and_everything_derived_while_keeping_t
         "the forgotten stream's checkpoint is gone"
     );
     assert_eq!(
+        status.contexts[0].source_streams[0].event_count, 1,
+        "the surviving capture stream summary remains exact"
+    );
+    assert_eq!(
+        status.contexts[0].source_streams[0].latest_event_seq,
+        Some(1)
+    );
+    assert_eq!(
         status.contexts[0].search.state,
         EventHistorySearchState::Pending,
         "the remaining history reads as pending re-indexing, never as an error or as ready"
@@ -343,6 +410,22 @@ fn forgetting_a_session_erases_its_events_and_everything_derived_while_keeping_t
     );
 
     let derived_reader = reader(&database);
+    let markers_after = pending_streams(&derived_reader, context_id);
+    assert!(
+        markers_after
+            .iter()
+            .all(|(_, _, _, session, _)| session != "session-gone"),
+        "no pending-work marker of the forgotten session survives, in any generation: {markers_after:?}"
+    );
+    assert_eq!(
+        markers_after,
+        markers_before
+            .iter()
+            .filter(|(_, _, _, session, _)| session == "session-kept")
+            .cloned()
+            .collect::<Vec<_>>(),
+        "the retained session's markers are exactly what they were before the forget"
+    );
     assert_eq!(
         count(
             &derived_reader,
@@ -595,10 +678,20 @@ fn a_context_can_be_forgotten_after_a_session_forget_and_rebuild() {
         })
         .expect("forget one session");
     project(&store, context_id);
+    let markers_before = pending_streams(&reader(&database), context_id);
+    assert!(
+        !markers_before.is_empty(),
+        "the rebuilt Context carries pending-work markers before its forget"
+    );
     let receipt = store
         .forget_event_history(ForgetSelection::Context { context_id })
         .expect("forget the Context after its search index was rebuilt");
     assert_eq!(receipt.events, 1);
+    assert_eq!(
+        pending_streams(&reader(&database), context_id),
+        Vec::new(),
+        "forgetting the Context erases every one of its pending-work markers"
+    );
 }
 
 #[test]

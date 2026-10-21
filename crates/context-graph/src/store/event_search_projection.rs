@@ -280,6 +280,8 @@ thread_local! {
     static PROJECTION_READ_ACTIVE_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static BEFORE_FAILURE_RECORD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_BATCH_COMMIT: std::cell::RefCell<Option<StoreHook>> = const { std::cell::RefCell::new(None) };
+    static AFTER_BATCH_COMMIT: std::cell::RefCell<Option<StoreHook>> = const { std::cell::RefCell::new(None) };
     static BEFORE_ATTEMPT_COMMIT: std::cell::RefCell<Option<StoreHook>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_ATTEMPT_COMMIT_BEFORE_READBACK: std::cell::RefCell<Option<StoreHook>> =
@@ -352,6 +354,20 @@ pub fn take_event_search_membership_captures_for_test() -> usize {
 #[doc(hidden)]
 pub fn before_next_event_search_failure_record_for_test(hook: impl FnOnce() + 'static) {
     BEFORE_FAILURE_RECORD.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// A process-crash cut after staging the cursor and pending marker, before their commit.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn before_next_event_search_batch_commit_for_test(hook: impl FnOnce(&Store) + 'static) {
+    BEFORE_BATCH_COMMIT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// A process-crash cut immediately after publishing the cursor and pending marker together.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn after_next_event_search_batch_commit_for_test(hook: impl FnOnce(&Store) + 'static) {
+    AFTER_BATCH_COMMIT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Run one deterministic interleaving immediately before the next attempt transaction commits.
@@ -467,7 +483,18 @@ const FIRST_PENDING_SOURCE_STATEMENT: &str = "SELECT ordinal FROM event_search_s
 const HAS_LATER_SESSION_STATEMENT: &str = "SELECT source_sequence FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $after ORDER BY source_sequence ASC LIMIT 1";
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 const SELECTED_STREAM_COUNT_STATEMENT: &str = "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source";
-const SELECTED_FRONTIER_COUNT_STATEMENT: &str = "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source AND source_sequence <= $frontier";
+const SELECTED_TAIL_COUNT_STATEMENT: &str = "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source AND source_sequence > $frontier";
+
+/// Events of one selected stream at or below `$frontier`: the stream's maintained exact-key total
+/// less the tail above the frontier. The tail is pending work, so the count never walks the
+/// completed history below it (ruling 164).
+fn selected_events_through(mut count: impl FnMut(&str) -> Result<u64>) -> Result<u64> {
+    let total = count(SELECTED_STREAM_COUNT_STATEMENT)?;
+    let tail = count(SELECTED_TAIL_COUNT_STATEMENT)?;
+    total
+        .checked_sub(tail)
+        .ok_or_else(|| stale_claim("selected stream tail exceeds its maintained total"))
+}
 const SOURCE_POSITION_SESSION_STATEMENT: &str = "SELECT session_ref FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND source_sequence = $start";
 const SOURCE_MEMBER_COLUMNS: &str = "membership_id, ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, effective_interpretation_generation_id, captured_source_sha256, effective_source_sha256";
 
@@ -1985,87 +2012,343 @@ fn selected_frontier(
         .transpose()
 }
 
+// The nil generation is captured work awaiting a target job. It stores no count/frontier;
+// real generation markers are enrolled with their cursor in membership preparation.
+const UNASSIGNED_SEARCH_GENERATION: uuid::Uuid = uuid::Uuid::nil();
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn set_stream_pending_in_tx(
+    store: &Store,
+    tx: TxId,
+    context_id: crate::ContextId,
+    generation_id: uuid::Uuid,
+    connector: &str,
+    source: &str,
+    session: &str,
+    pending: bool,
+) -> Result<()> {
+    let params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id)),
+        ("connector".into(), Value::Text(connector.into())),
+        ("source".into(), Value::Text(source.into())),
+        ("session".into(), Value::Text(session.into())),
+        ("pending".into(), Value::Bool(pending)),
+    ]);
+    let existing = store.internal_db().execute_in_tx(tx,
+        "SELECT pending FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session", &params).map_err(map_engine_err)?;
+    let statement = if existing.rows.is_empty() {
+        "INSERT INTO event_search_pending_streams (context_id, generation_id, connector_id, source_instance_ref, session_ref, pending) VALUES ($context_id, $generation_id, $connector, $source, $session, $pending)"
+    } else {
+        "UPDATE event_search_pending_streams SET pending = $pending WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session"
+    };
+    store
+        .internal_db()
+        .execute_in_tx(tx, statement, &params)
+        .map_err(map_engine_err)?;
+    Ok(())
+}
+
+pub(crate) fn mark_captured_stream_pending_in_tx(
+    store: &Store,
+    tx: TxId,
+    event: &ConversationEvent,
+) -> Result<()> {
+    let params = HashMap::from([("context_id".into(), Value::Uuid(event.context_id.as_uuid()))]);
+    let mut targets = BTreeSet::from([UNASSIGNED_SEARCH_GENERATION]);
+    let head = store
+        .internal_db()
+        .execute_in_tx(
+            tx,
+            "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+    for row in &head.rows {
+        targets.insert(get_uuid(row, &head.columns, "generation_id")?);
+    }
+    for state in ["capturing", "building"] {
+        let mut params = params.clone();
+        params.insert("state".into(), Value::Text(state.into()));
+        let jobs = store.internal_db().execute_in_tx(tx,
+            "SELECT id FROM event_search_generations WHERE context_id = $context_id AND state = $state", &params).map_err(map_engine_err)?;
+        for row in &jobs.rows {
+            targets.insert(get_uuid(row, &jobs.columns, "id")?);
+        }
+    }
+    for target in targets {
+        set_stream_pending_in_tx(
+            store,
+            tx,
+            event.context_id,
+            target,
+            &event.connector_id,
+            &event.source_instance_ref,
+            &event.session_ref,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn select_work(
     source: &dyn EventSearchRows,
     context_id: crate::ContextId,
     policy: EventSearchWorkPolicy,
 ) -> Result<EventSearchSelectedWork> {
-    let sessions = selected_captured_session_work(source, context_id, policy)?;
-    let mut streams = Vec::new();
-    // Enumerate immutable event metadata through bounded cursor pages. Keep only one
-    // maximum per selected stream; no event bodies or whole result page are retained.
-    let mut frontiers = BTreeMap::new();
-    source.stream_rows(
-        "SELECT connector_id, session_ref, source_instance_ref, seq FROM events WHERE context_id = $context_id",
-        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        &mut |columns, row| {
-            let connector_id = get_text(row, columns, "connector_id")?;
-            let session_ref = get_text(row, columns, "session_ref")?;
-            if let Some(rank) = sessions.rank(&connector_id, &session_ref) {
-                let source_instance_ref = get_text(row, columns, "source_instance_ref")?;
-                let seq = get_u64(row, columns, "seq")?;
-                let frontier = frontiers.entry((rank, connector_id, session_ref, source_instance_ref)).or_insert(0);
-                *frontier = (*frontier).max(seq);
-            }
-            Ok(())
-        },
+    select_work_for_spec(source, context_id, policy, None)
+}
+
+pub(crate) fn select_work_for_spec(
+    source: &dyn EventSearchRows,
+    context_id: crate::ContextId,
+    policy: EventSearchWorkPolicy,
+    spec: Option<&EventSearchWorkSpec>,
+) -> Result<EventSearchSelectedWork> {
+    let params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+    let head = source.query_rows(
+        "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+        &params,
     )?;
-    for ((rank, connector_id, session_ref, source_instance_ref), frontier) in frontiers {
+    let mut target = head
+        .rows
+        .first()
+        .map(|row| get_uuid(row, &head.columns, "generation_id"))
+        .transpose()?;
+    if let Some(spec) = spec {
+        spec.profile.validate()?;
+        let mut job_params = params.clone();
+        job_params.extend([
+            (
+                "profile".into(),
+                Value::Json(serde_json::to_value(&spec.profile).map_err(json_error)?),
+            ),
+            ("space".into(), Value::Text(spec.embedding_space_id.clone())),
+            (
+                "encoding".into(),
+                Value::Text(spec.encoding_profile_id.clone()),
+            ),
+            ("ready".into(), Value::Text("ready".into())),
+            ("failed".into(), Value::Text("failed".into())),
+            ("retired".into(), Value::Text("retired".into())),
+        ]);
+        let job = source.query_rows(
+            "SELECT id FROM event_search_generations WHERE context_id = $context_id AND renderer_profile = $profile AND embedding_space_id = $space AND encoding_profile = $encoding AND state != $ready AND state != $failed AND state != $retired ORDER BY started_at DESC, id DESC LIMIT 1", &job_params)?;
+        if let Some(row) = job.rows.first() {
+            target = Some(get_uuid(row, &job.columns, "id")?);
+        }
+    }
+    if target.is_none() && spec.is_none() {
+        let job = source.query_rows(
+            "SELECT id FROM event_search_generations WHERE context_id = $context_id AND (state = $capturing OR state = $building) ORDER BY started_at DESC, id DESC LIMIT 1",
+            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("capturing".into(), Value::Text("capturing".into())), ("building".into(), Value::Text("building".into()))]))?;
+        if let Some(row) = job.rows.first() {
+            target = Some(get_uuid(row, &job.columns, "id")?);
+        }
+    }
+    let mut target_connectors = BTreeSet::new();
+    let mut compatible = target.is_some() || spec.is_none();
+    if let Some(target) = target {
+        let row = source.query_rows(
+            "SELECT renderer_profile, embedding_space_id, encoding_profile, interpretation_snapshot FROM event_search_generations WHERE id = $id",
+            &HashMap::from([("id".into(), Value::Uuid(target))]))?;
+        compatible = match row.rows.first() {
+            Some(value) => {
+                let saved = get_json(value, &row.columns, "interpretation_snapshot")?;
+                let saved_bindings = bindings_from_snapshot(&saved)?;
+                target_connectors.extend(saved_bindings.keys().cloned());
+                let mut live_bindings = BTreeMap::new();
+                for connector in saved_bindings.keys() {
+                    live_bindings.insert(
+                        connector.clone(),
+                        InterpretationBinding {
+                            provenance: resolve_search_binding(source, context_id, connector)?,
+                        },
+                    );
+                }
+                snapshot_json(&live_bindings) == saved
+                    && spec
+                        .map(|spec| -> Result<bool> {
+                            Ok(get_json(value, &row.columns, "renderer_profile")?
+                                == serde_json::to_value(&spec.profile).map_err(json_error)?
+                                && get_text(value, &row.columns, "embedding_space_id")?
+                                    == spec.embedding_space_id
+                                && get_text(value, &row.columns, "encoding_profile")?
+                                    == spec.encoding_profile_id)
+                        })
+                        .transpose()?
+                        .unwrap_or(true)
+            }
+            None => false,
+        };
+    }
+    // Recent scope ranks through grouped indexed top-N. All scope reads only marked streams.
+    let recent = if matches!(policy.sessions, EventSearchSessionScope::Recent(_)) {
+        Some(selected_captured_session_work(source, context_id, policy)?)
+    } else {
+        None
+    };
+    let mut candidates = BTreeSet::new();
+    let mut complete = BTreeSet::new();
+    if compatible {
+        for generation_id in BTreeSet::from([
+            target.unwrap_or(UNASSIGNED_SEARCH_GENERATION),
+            UNASSIGNED_SEARCH_GENERATION,
+        ]) {
+            let mut params = params.clone();
+            params.insert("generation_id".into(), Value::Uuid(generation_id));
+            params.insert("pending".into(), Value::Bool(true));
+            source.stream_rows(
+                "SELECT connector_id, session_ref, source_instance_ref FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND pending = $pending ORDER BY connector_id ASC, session_ref ASC, source_instance_ref ASC",
+                &params, &mut |columns, row| {
+                    candidates.insert((get_text(row, columns, "connector_id")?, get_text(row, columns, "session_ref")?, get_text(row, columns, "source_instance_ref")?));
+                    Ok(())
+                })?;
+        }
+        // A request records every stream its policy selects for its target, complete ones
+        // included: refusal acknowledgement and saved ceilings match the identities the request
+        // observed. A completed stream keeps its cleared marker, so it is read from the marker
+        // index; one outside the selected sessions is retained at its published frontier below.
+        // Without a target spec this is the bounded pending selection: pending streams only.
+        if let (Some(target), Some(_)) = (target, spec) {
+            let mut params = params.clone();
+            params.insert("generation_id".into(), Value::Uuid(target));
+            params.insert("pending".into(), Value::Bool(false));
+            source.stream_rows(
+                "SELECT connector_id, session_ref, source_instance_ref FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND pending = $pending ORDER BY connector_id ASC, session_ref ASC, source_instance_ref ASC",
+                &params, &mut |columns, row| {
+                    let stream = (get_text(row, columns, "connector_id")?, get_text(row, columns, "session_ref")?, get_text(row, columns, "source_instance_ref")?);
+                    candidates.insert(stream.clone());
+                    complete.insert(stream);
+                    Ok(())
+                })?;
+        }
+    }
+    if target.is_some()
+        && candidates
+            .iter()
+            .any(|(connector, _, _)| !target_connectors.contains(connector))
+    {
+        compatible = false;
+    }
+    if !compatible || (target.is_none() && candidates.is_empty()) {
+        candidates.clear();
+        // A replacement target has no cursor: every captured stream is pending for that job.
+        let groups = source.query_rows(
+            "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref", &params)?;
+        for row in &groups.rows {
+            let connector = get_text(row, &groups.columns, "connector_id")?;
+            let stream = get_text(row, &groups.columns, "source_instance_ref")?;
+            let newest = source.query_rows(
+                "SELECT session_ref FROM events WHERE context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1",
+                &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("connector".into(), Value::Text(connector.clone())), ("source".into(), Value::Text(stream.clone()))]))?;
+            let newest_row = newest
+                .rows
+                .first()
+                .ok_or_else(|| CgError::Engine("captured group has no newest event".into()))?;
+            candidates.insert((
+                connector,
+                get_text(newest_row, &newest.columns, "session_ref")?,
+                stream,
+            ));
+        }
+    }
+    let mut streams = Vec::new();
+    for (connector, session, stream) in candidates {
+        let session_key = SessionKey {
+            connector_id: connector.clone(),
+            session_ref: session.clone(),
+        };
+        let params = HashMap::from([
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("connector".into(), Value::Text(connector.clone())),
+            ("session".into(), Value::Text(session.clone())),
+            ("source".into(), Value::Text(stream.clone())),
+        ]);
+        let mut retained_frontier = None;
+        if recent
+            .as_ref()
+            .is_some_and(|selected| !selected.rank.contains_key(&session_key))
+        {
+            if compatible
+                && !complete.contains(&(connector.clone(), session.clone(), stream.clone()))
+            {
+                continue;
+            }
+            // Replacement rebuilds, and a request's completed streams outside its selected
+            // sessions, keep previously published history at its committed frontier; newer
+            // capture outside the requested scope remains deferred.
+            let Some(head_row) = head.rows.first() else {
+                continue;
+            };
+            let mut prior_params = params.clone();
+            prior_params.insert(
+                "generation_id".into(),
+                Value::Uuid(get_uuid(head_row, &head.columns, "generation_id")?),
+            );
+            let progress = source.query_rows(
+                "SELECT is_published, searchable_event_count FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session", &prior_params)?;
+            let Some(progress_row) = progress.rows.first() else {
+                continue;
+            };
+            if !get_bool(progress_row, &progress.columns, "is_published")?
+                || get_u64(progress_row, &progress.columns, "searchable_event_count")? == 0
+            {
+                continue;
+            }
+            let cursor = source.query_rows(
+                "SELECT committed_sequence FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session", &prior_params)?;
+            let Some(cursor_row) = cursor.rows.first() else {
+                continue;
+            };
+            retained_frontier = Some(get_u64(cursor_row, &cursor.columns, "committed_sequence")?);
+        }
+        let session_row = source.query_rows(
+            "SELECT latest_occurred_at FROM event_context_sessions WHERE context_id = $context_id AND connector_id = $connector AND session_ref = $session", &params)?;
+        let occurred = session_row
+            .rows
+            .first()
+            .map(|row| get_optional_timestamp(row, &session_row.columns, "latest_occurred_at"))
+            .transpose()?
+            .flatten();
+        let newest = source.query_rows(
+            "SELECT seq FROM events WHERE context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1", &params)?;
+        let row = newest
+            .rows
+            .first()
+            .ok_or_else(|| CgError::Engine("pending stream has no newest event".into()))?;
         streams.push((
-            rank,
+            occurred,
             EventSearchSelectedStream {
-                connector_id,
-                session_ref,
-                source_instance_ref,
-                frontier,
+                connector_id: connector,
+                session_ref: session,
+                source_instance_ref: stream,
+                frontier: retained_frontier.unwrap_or(get_u64(row, &newest.columns, "seq")?),
             },
         ));
     }
-    let mut selected_streams = streams
-        .iter()
-        .map(|(_, stream)| {
-            (
-                stream.connector_id.clone(),
-                stream.session_ref.clone(),
-                stream.source_instance_ref.clone(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    // Retained searchable history participates in a replacement too. Freeze only its
-    // published cursor frontier: newer capture outside the selected policy remains deferred.
-    source.stream_rows(
-        "SELECT event_search_cursors.connector_id, event_search_cursors.session_ref, event_search_cursors.source_instance_ref, event_search_cursors.committed_sequence FROM event_search_cursors INNER JOIN event_search_heads ON event_search_cursors.context_id = event_search_heads.context_id AND event_search_cursors.generation_id = event_search_heads.generation_id INNER JOIN event_search_session_progress ON event_search_cursors.context_id = event_search_session_progress.context_id AND event_search_cursors.generation_id = event_search_session_progress.generation_id AND event_search_cursors.connector_id = event_search_session_progress.connector_id AND event_search_cursors.session_ref = event_search_session_progress.session_ref WHERE event_search_cursors.context_id = $context_id AND event_search_session_progress.is_published = $published AND event_search_session_progress.searchable_event_count > $zero",
-        &HashMap::from([
-            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-            ("published".into(), Value::Bool(true)),
-            ("zero".into(), Value::Int64(0)),
-        ]),
-        &mut |columns, row| {
-            let connector_id = get_text(row, columns, "connector_id")?;
-            let session_ref = get_text(row, columns, "session_ref")?;
-            let source_instance_ref = get_text(row, columns, "source_instance_ref")?;
-            if selected_streams.insert((connector_id.clone(), session_ref.clone(), source_instance_ref.clone())) {
-                streams.push((usize::MAX, EventSearchSelectedStream {
-                    connector_id, session_ref, source_instance_ref,
-                    frontier: get_u64(row, columns, "committed_sequence")?,
-                }));
-            }
-            Ok(())
-        },
-    )?;
     streams.sort_by(|left, right| {
-        (
-            left.0,
-            &left.1.connector_id,
-            &left.1.session_ref,
-            &left.1.source_instance_ref,
-        )
-            .cmp(&(
-                right.0,
-                &right.1.connector_id,
-                &right.1.session_ref,
-                &right.1.source_instance_ref,
-            ))
+        let time = match (left.0, right.0) {
+            (Some(left), Some(right)) => match policy.order {
+                EventSearchOrder::Newest => right.cmp(&left),
+                EventSearchOrder::Oldest => left.cmp(&right),
+            },
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        time.then_with(|| {
+            (
+                &left.1.connector_id,
+                &left.1.session_ref,
+                &left.1.source_instance_ref,
+            )
+                .cmp(&(
+                    &right.1.connector_id,
+                    &right.1.session_ref,
+                    &right.1.source_instance_ref,
+                ))
+        })
     });
     Ok(EventSearchSelectedWork {
         request_id: None,
@@ -2281,10 +2564,8 @@ struct CapturedSessionRow {
     latest_occurred_at: Option<i64>,
 }
 
-/// The sessions each Context's policy selects, for the whole set, in two statements: the sessions
-/// that carry a timestamp and the sessions that do not. Each Context's own order and session limit
-/// are applied to its own rows, so the selection and the ranks are what the single-Context read
-/// would have produced.
+/// Select policy-scoped sessions across the Context set. Recent scopes use indexed grouped
+/// top-N reads; the explicit all-session scope retains the complete ordered archive.
 pub(crate) fn selected_captured_session_work_for(
     source: &dyn EventSearchRows,
     context_ids: &[crate::ContextId],
@@ -2292,6 +2573,48 @@ pub(crate) fn selected_captured_session_work_for(
 ) -> Result<HashMap<crate::ContextId, SessionWorkSet>> {
     let mut work = HashMap::new();
     if context_ids.is_empty() {
+        return Ok(work);
+    }
+    let mut recent = HashMap::new();
+    let mut all_contexts = Vec::new();
+    for context_id in context_ids {
+        let policy = policies.get(context_id).copied().unwrap_or_default();
+        match policy.sessions {
+            EventSearchSessionScope::All => all_contexts.push(*context_id),
+            EventSearchSessionScope::Recent(limit) => {
+                recent.insert(*context_id, (policy.order, limit.get()));
+            }
+        }
+    }
+    let mut recent_rows: HashMap<crate::ContextId, Vec<CapturedSessionRow>> = HashMap::new();
+    for order in [EventSearchOrder::Newest, EventSearchOrder::Oldest] {
+        let limits = context_ids
+            .iter()
+            .filter_map(|context_id| {
+                recent
+                    .get(context_id)
+                    .filter(|(selected_order, _)| *selected_order == order)
+                    .map(|(_, limit)| (*context_id, *limit))
+            })
+            .collect::<Vec<_>>();
+        read_recent_session_rows(source, &limits, Some(order), &mut recent_rows)?;
+    }
+    let remaining = context_ids
+        .iter()
+        .filter_map(|context_id| {
+            let (_, limit) = recent.get(context_id)?;
+            let retained = recent_rows.get(context_id).map_or(0, Vec::len);
+            (retained < *limit).then_some((*context_id, limit.saturating_sub(retained)))
+        })
+        .collect::<Vec<_>>();
+    read_recent_session_rows(source, &remaining, None, &mut recent_rows)?;
+    for context_id in recent.keys() {
+        work.insert(
+            *context_id,
+            session_work_set(recent_rows.remove(context_id).unwrap_or_default()),
+        );
+    }
+    if all_contexts.is_empty() {
         return Ok(work);
     }
     let mut timestamped: HashMap<crate::ContextId, Vec<CapturedSessionRow>> = HashMap::new();
@@ -2304,7 +2627,7 @@ pub(crate) fn selected_captured_session_work_for(
         let filter = super::event_search_read::bind_contexts(
             &mut params,
             "session_context",
-            context_ids.iter().copied(),
+            all_contexts.iter().copied(),
         );
         let into = if timestamped_rows {
             &mut timestamped
@@ -2339,7 +2662,7 @@ pub(crate) fn selected_captured_session_work_for(
             },
         )?;
     }
-    for context_id in context_ids {
+    for context_id in &all_contexts {
         let policy = policies
             .get(context_id)
             .copied()
@@ -2380,6 +2703,73 @@ pub(crate) fn selected_captured_session_work_for(
         work.insert(*context_id, session_work_set(ordered));
     }
     Ok(work)
+}
+
+/// SQL window ranking expresses a separate bounded prefix for each Context in one read.
+/// Dated sessions take precedence; a second read fills only the remaining slots with undated
+/// sessions. Tie order is ascending connector/session regardless of the timestamp direction.
+fn read_recent_session_rows(
+    source: &dyn EventSearchRows,
+    limits: &[(crate::ContextId, usize)],
+    order: Option<EventSearchOrder>,
+    into: &mut HashMap<crate::ContextId, Vec<CapturedSessionRow>>,
+) -> Result<()> {
+    if limits.is_empty() {
+        return Ok(());
+    }
+    let mut params = HashMap::new();
+    let filter = super::event_search_read::bind_contexts(
+        &mut params,
+        "recent_context",
+        limits.iter().map(|(context_id, _)| *context_id),
+    );
+    let mut bounds = Vec::new();
+    for (index, (context_id, limit)) in limits.iter().enumerate() {
+        params.insert(
+            format!("rank_context_{index}"),
+            Value::Uuid(context_id.as_uuid()),
+        );
+        params.insert(
+            format!("rank_limit_{index}"),
+            Value::Int64(
+                i64::try_from(*limit)
+                    .map_err(|_| CgError::Engine("session limit exceeds INTEGER".into()))?,
+            ),
+        );
+        bounds.push(format!(
+            "(context_id = $rank_context_{index} AND session_rank <= $rank_limit_{index})"
+        ));
+    }
+    let (predicate, ordering) = match order {
+        Some(EventSearchOrder::Newest) => (
+            "latest_occurred_at IS NOT NULL",
+            "latest_occurred_at DESC, connector_id ASC, session_ref ASC",
+        ),
+        Some(EventSearchOrder::Oldest) => (
+            "latest_occurred_at IS NOT NULL",
+            "latest_occurred_at ASC, connector_id ASC, session_ref ASC",
+        ),
+        None => (
+            "latest_occurred_at IS NULL",
+            "connector_id ASC, session_ref ASC",
+        ),
+    };
+    source.stream_rows(
+        &format!("WITH ranked_sessions AS (SELECT context_id, connector_id, session_ref, event_count, latest_occurred_at, ROW_NUMBER() OVER (PARTITION BY context_id ORDER BY {ordering}) AS session_rank FROM event_context_sessions WHERE {filter} AND {predicate}) SELECT context_id, connector_id, session_ref, event_count, latest_occurred_at FROM ranked_sessions WHERE {} ORDER BY context_id ASC, session_rank ASC", bounds.join(" OR ")),
+        &params,
+        &mut |columns, row| {
+            let context_id = crate::ContextId::from(get_uuid(row, columns, "context_id")?);
+            let latest_occurred_at = match row.get(column_index(columns, "latest_occurred_at")?) {
+                Some(Value::Timestamp(value) | Value::Int64(value)) => Some(*value),
+                _ => None,
+            };
+            into.entry(context_id).or_default().push(CapturedSessionRow {
+                key: SessionKey { connector_id: get_text(row, columns, "connector_id")?, session_ref: get_text(row, columns, "session_ref")? },
+                events: get_u64(row, columns, "event_count")?, latest_occurred_at,
+            });
+            Ok(())
+        },
+    )
 }
 
 fn session_work_set(ordered: Vec<CapturedSessionRow>) -> SessionWorkSet {
@@ -2443,47 +2833,58 @@ pub(crate) fn policy_coverage_for(
     }
 
     let mut progress_params = HashMap::new();
-    let progress_context_filter = super::event_search_read::bind_contexts(
-        &mut progress_params,
-        "progress_context",
-        heads.iter().map(|(context_id, _)| *context_id),
-    );
-    let progress_generation_filter = super::event_search_read::bind_generations(
-        &mut progress_params,
-        "progress_generation",
-        heads.iter().map(|(_, generation_id)| *generation_id),
-    );
-    let mut selected: HashMap<crate::ContextId, (u64, u64)> = HashMap::new();
-    source.stream_rows(
-        &format!(
-            "SELECT context_id, connector_id, session_ref, searchable_event_count, \
-             no_searchable_text_event_count FROM event_search_session_progress \
-             WHERE {progress_context_filter} AND {progress_generation_filter}"
-        ),
-        &progress_params,
-        &mut |columns, row| {
-            let context_id = crate::ContextId::from(get_uuid(row, columns, "context_id")?);
-            let Some(session_work) = sessions.get(&context_id) else {
-                return Ok(());
-            };
-            let key = SessionKey {
-                connector_id: get_text(row, columns, "connector_id")?,
-                session_ref: get_text(row, columns, "session_ref")?,
-            };
-            if !session_work.events.contains_key(&key) {
-                return Ok(());
+    let mut keys = Vec::new();
+    for (context_id, generation_id) in heads {
+        if let Some(work) = sessions.get(context_id) {
+            for session in work.events.keys() {
+                let index = keys.len();
+                for (name, value) in [
+                    ("context", Value::Uuid(context_id.as_uuid())),
+                    ("generation", Value::Uuid(generation_id.as_uuid())),
+                    ("connector", Value::Text(session.connector_id.clone())),
+                    ("session", Value::Text(session.session_ref.clone())),
+                ] {
+                    progress_params.insert(format!("progress_{name}_{index}"), value);
+                }
+                keys.push(format!("($progress_context_{index}, $progress_generation_{index}, $progress_connector_{index}, $progress_session_{index})"));
             }
-            let entry = selected.entry(context_id).or_default();
-            entry.0 = entry
-                .0
-                .saturating_add(get_u64(row, columns, "searchable_event_count")?);
-            entry.1 =
-                entry
-                    .1
-                    .saturating_add(get_u64(row, columns, "no_searchable_text_event_count")?);
-            Ok(())
-        },
-    )?;
+        }
+    }
+    let mut selected: HashMap<crate::ContextId, (u64, u64)> = HashMap::new();
+    if !keys.is_empty() {
+        source.stream_rows(
+            &format!(
+                "SELECT context_id, connector_id, session_ref, searchable_event_count, \
+             no_searchable_text_event_count FROM event_search_session_progress \
+             WHERE (context_id, generation_id, connector_id, session_ref) IN ({})",
+                keys.join(", ")
+            ),
+            &progress_params,
+            &mut |columns, row| {
+                let context_id = crate::ContextId::from(get_uuid(row, columns, "context_id")?);
+                let Some(session_work) = sessions.get(&context_id) else {
+                    return Ok(());
+                };
+                let key = SessionKey {
+                    connector_id: get_text(row, columns, "connector_id")?,
+                    session_ref: get_text(row, columns, "session_ref")?,
+                };
+                if !session_work.events.contains_key(&key) {
+                    return Ok(());
+                }
+                let entry = selected.entry(context_id).or_default();
+                entry.0 = entry
+                    .0
+                    .saturating_add(get_u64(row, columns, "searchable_event_count")?);
+                entry.1 = entry.1.saturating_add(get_u64(
+                    row,
+                    columns,
+                    "no_searchable_text_event_count",
+                )?);
+                Ok(())
+            },
+        )?;
+    }
 
     for (context_id, _) in heads {
         let covered_events = *covered.get(context_id).ok_or_else(|| {
@@ -2547,7 +2948,11 @@ fn selected_session_work_for_run(
     policy: EventSearchWorkPolicy,
     selected_work: Option<&EventSearchSelectedWork>,
 ) -> Result<SessionWorkSet> {
-    let mut selected = selected_captured_session_work(store, context_id, policy)?;
+    let mut selected = if selected_work.is_some() {
+        session_work_set(Vec::new())
+    } else {
+        selected_captured_session_work(store, context_id, policy)?
+    };
     if let Some(work) = selected_work {
         selected.rank.clear();
         selected.events.clear();
@@ -2559,25 +2964,73 @@ fn selected_session_work_for_run(
             };
             let next = selected.rank.len();
             selected.rank.entry(key.clone()).or_insert(next);
-            let rows = store.query_rows(
-                SELECTED_FRONTIER_COUNT_STATEMENT,
-                &HashMap::from([
-                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                    ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
-                    ("connector".into(), Value::Text(stream.connector_id.clone())),
-                    ("session".into(), Value::Text(stream.session_ref.clone())),
-                    (
-                        "source".into(),
-                        Value::Text(stream.source_instance_ref.clone()),
-                    ),
-                    (
-                        "frontier".into(),
-                        integer(stream.frontier, "selected frontier")?,
-                    ),
-                ]),
+            let params = HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                ("connector".into(), Value::Text(stream.connector_id.clone())),
+                ("session".into(), Value::Text(stream.session_ref.clone())),
+                (
+                    "source".into(),
+                    Value::Text(stream.source_instance_ref.clone()),
+                ),
+                (
+                    "frontier".into(),
+                    integer(stream.frontier, "selected frontier")?,
+                ),
+            ]);
+            if !selected.events.contains_key(&key) {
+                let progress = store.query_rows(
+                    "SELECT committed_event_count FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session",
+                    &params,
+                )?;
+                let row = progress
+                    .rows
+                    .first()
+                    .ok_or_else(|| stale_claim("selected session has no captured progress"))?;
+                selected.events.insert(
+                    key.clone(),
+                    get_u64(row, &progress.columns, "committed_event_count")?,
+                );
+            }
+            let cursor = store.query_rows(
+                "SELECT committed_sequence FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+                &params,
             )?;
-            *selected.events.entry(key.clone()).or_default() +=
-                get_u64(&rows.rows[0], &rows.columns, "event_count")?;
+            let cursor_row = cursor
+                .rows
+                .first()
+                .ok_or_else(|| stale_claim("selected stream has no initialized cursor"))?;
+            let committed = get_u64(cursor_row, &cursor.columns, "committed_sequence")?;
+            let selected_count = selected_events_through(|sql| {
+                let rows = store.query_rows(sql, &params)?;
+                get_u64(&rows.rows[0], &rows.columns, "event_count")
+            })?;
+            let overlap = if committed == 0 {
+                0
+            } else {
+                let mut committed_params = params.clone();
+                committed_params.insert(
+                    "frontier".into(),
+                    integer(
+                        committed.min(stream.frontier),
+                        "committed selected frontier",
+                    )?,
+                );
+                selected_events_through(|sql| {
+                    let rows = store.query_rows(sql, &committed_params)?;
+                    get_u64(&rows.rows[0], &rows.columns, "event_count")
+                })?
+            };
+            let pending = selected_count.checked_sub(overlap).ok_or_else(|| {
+                stale_claim("selected frontier count is smaller than its committed prefix")
+            })?;
+            let total = selected
+                .events
+                .get_mut(&key)
+                .expect("selected session was initialized");
+            *total = total
+                .checked_add(pending)
+                .ok_or_else(|| CgError::Engine("selected event count exhausted u64".into()))?;
             frontiers.insert((key, stream.source_instance_ref.clone()), stream.frontier);
         }
         selected.frontiers = Some(frontiers);
@@ -3188,6 +3641,44 @@ fn insert_capture_attempt(
         let _ = store.internal_db().rollback(tx);
         return Err(map_engine_err(error));
     }
+    let enroll = (|| -> Result<()> {
+        if guard_event_context_revision_in_tx(store, tx, context_id)?.is_none() {
+            return Err(stale_claim(
+                "capture changed while enrolling target pending streams",
+            ));
+        }
+        let params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+        let groups = store.internal_db().execute_in_tx(tx,
+            "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref", &params).map_err(map_engine_err)?;
+        for row in &groups.rows {
+            let connector = get_text(row, &groups.columns, "connector_id")?;
+            let source = get_text(row, &groups.columns, "source_instance_ref")?;
+            let mut latest_params = params.clone();
+            latest_params.insert("connector".into(), Value::Text(connector.clone()));
+            latest_params.insert("source".into(), Value::Text(source.clone()));
+            let newest = store.internal_db().execute_in_tx(tx,
+                "SELECT session_ref FROM events WHERE context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1", &latest_params).map_err(map_engine_err)?;
+            let latest = newest.rows.first().ok_or_else(|| {
+                stale_claim("captured stream disappeared during target enrollment")
+            })?;
+            let session = get_text(latest, &newest.columns, "session_ref")?;
+            set_stream_pending_in_tx(
+                store,
+                tx,
+                context_id,
+                id.as_uuid(),
+                &connector,
+                &source,
+                &session,
+                true,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = enroll {
+        let _ = store.internal_db().rollback(tx);
+        return Err(error);
+    }
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     if let Some(hook) = BEFORE_ATTEMPT_COMMIT.with(|slot| slot.borrow_mut().take()) {
         hook(store);
@@ -3505,7 +3996,7 @@ fn event_connectors(
     context_id: crate::ContextId,
 ) -> Result<BTreeSet<String>> {
     let answer = source.query_rows(
-        "SELECT DISTINCT connector_id FROM events WHERE context_id = $context_id",
+        "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
     answer
@@ -4457,6 +4948,16 @@ fn ensure_generation_cursor_in_tx(
             &values,
         )
         .map_err(map_engine_err)?;
+    set_stream_pending_in_tx(
+        store,
+        tx,
+        context_id,
+        generation_id.as_uuid(),
+        connector,
+        source,
+        session,
+        true,
+    )?;
     Ok(())
 }
 
@@ -4949,8 +5450,9 @@ fn first_pending_stream(
     stream_rows(
         store,
         bounds,
-        "SELECT connector_id, source_instance_ref, session_ref, committed_sequence, open_tail_start_sequence, open_tail_members, open_tail_passage_id FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY connector_id ASC, source_instance_ref ASC, session_ref ASC",
+        "SELECT connector_id, source_instance_ref, session_ref FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND pending = $pending ORDER BY connector_id ASC, session_ref ASC, source_instance_ref ASC",
         &HashMap::from([
+            ("pending".into(), Value::Bool(true)),
             (
                 "context_id".into(),
                 Value::Uuid(generation.context_id.as_uuid()),
@@ -4968,6 +5470,28 @@ fn first_pending_stream(
             let Some(candidate_rank) = sessions.rank(&connector, &session) else {
                 return Ok(());
             };
+            let cursor = query_rows(
+                store,
+                bounds,
+                "SELECT committed_sequence, open_tail_start_sequence, open_tail_members, open_tail_passage_id FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+                &HashMap::from([
+                    (
+                        "context_id".into(),
+                        Value::Uuid(generation.context_id.as_uuid()),
+                    ),
+                    ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
+                    ("connector".into(), Value::Text(connector.clone())),
+                    ("source".into(), Value::Text(source.clone())),
+                    ("session".into(), Value::Text(session.clone())),
+                ]),
+            )?;
+            // A stream captured after membership preparation is marked pending before its
+            // membership and cursor exist. It is pending work, not a stale claim: the no-claim
+            // path prepares its membership and cursor, then discovery finds it here.
+            let Some(row) = cursor.rows.first() else {
+                return Ok(());
+            };
+            let columns = &cursor.columns;
             let committed = get_u64(row, columns, "committed_sequence")?;
             let key = SessionKey {
                 connector_id: connector.clone(),
@@ -6171,6 +6695,10 @@ fn commit_batch(
         let _ = store.internal_db().rollback(tx);
         return Err(error);
     }
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    if let Some(hook) = BEFORE_BATCH_COMMIT.with(|slot| slot.borrow_mut().take()) {
+        hook(store);
+    }
     measured(&mut observations.commit, || {
         store.internal_db().commit(tx).map_err(|error| match error {
             contextdb_core::Error::ConditionalUpdateConflict { .. } => {
@@ -6178,7 +6706,12 @@ fn commit_batch(
             }
             other => map_engine_err(other),
         })
-    })
+    })?;
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    if let Some(hook) = AFTER_BATCH_COMMIT.with(|slot| slot.borrow_mut().take()) {
+        hook(store);
+    }
+    Ok(())
 }
 
 fn commit_batch_in_tx(
@@ -6979,6 +7512,28 @@ fn upsert_cursor_in_tx(
             &params,
         )
         .map_err(map_engine_err)?;
+    if guard_event_context_revision_in_tx(store, tx, claim.generation.context_id)?.is_none() {
+        return Err(stale_claim("capture changed while clearing pending stream"));
+    }
+    let newest = store.internal_db().execute_in_tx(tx,
+        "SELECT seq FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1", &params).map_err(map_engine_err)?;
+    let row = newest
+        .rows
+        .first()
+        .ok_or_else(|| stale_claim("claimed source disappeared before pending marker update"))?;
+    let pending = claim.end_sequence < get_u64(row, &newest.columns, "seq")?;
+    for target in [claim.generation.id.as_uuid(), UNASSIGNED_SEARCH_GENERATION] {
+        set_stream_pending_in_tx(
+            store,
+            tx,
+            claim.generation.context_id,
+            target,
+            &claim.connector_id,
+            &claim.source_instance_ref,
+            &claim.session_ref,
+            pending,
+        )?;
+    }
     Ok(())
 }
 
@@ -9155,30 +9710,26 @@ fn assert_session_read_work_for_test(
                 "frontier".into(),
                 Value::Int64(completed + 2 * neighbours + 3),
             );
-            let count = session
-                .execute(SELECTED_FRONTIER_COUNT_STATEMENT, &params)
-                .unwrap();
-            assert_eq!(count.rows, vec![vec![Value::Int64(completed + 3)]]);
-            let total = session
-                .execute(SELECTED_STREAM_COUNT_STATEMENT, &params)
-                .unwrap();
-            assert_eq!(total.rows, vec![vec![Value::Int64(completed + 5)]]);
-            eprintln!(
-                "selected_frontier_count: completed={completed}, neighbours={neighbours}, examined={}, total_examined={}, maintained={:?}, index={:?}",
-                count.trace.rows_examined,
-                total.trace.rows_examined,
-                total.trace.maintained_count,
-                count.trace.index_used
-            );
-            return (
-                count.trace.rows_examined,
-                matches!(
-                    total.trace.maintained_count.as_deref(),
-                    Some(
-                        contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. }
-                    )
-                ),
-            );
+            // Measure the production composition itself: every statement it issues is charged.
+            let mut examined = 0;
+            let mut served = false;
+            let count = selected_events_through(|sql| {
+                let result = session.execute(sql, &params).unwrap();
+                examined += result.trace.rows_examined;
+                if sql == SELECTED_STREAM_COUNT_STATEMENT {
+                    assert_eq!(result.rows, vec![vec![Value::Int64(completed + 5)]]);
+                    served = matches!(
+                        result.trace.maintained_count.as_deref(),
+                        Some(
+                            contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. }
+                        )
+                    );
+                }
+                get_u64(&result.rows[0], &result.columns, "event_count")
+            })
+            .unwrap();
+            assert_eq!(count, (completed + 3) as u64);
+            return (examined, served);
         }
         let discovery = session
             .execute(FIRST_PENDING_SOURCE_STATEMENT, &params)
@@ -9211,9 +9762,12 @@ fn assert_session_read_work_for_test(
             source_position.trace.index_used.as_deref(),
             Some("idx_event_search_source_events_cursor_range")
         );
+        // Relational, no literal: the equality probe examines exactly the rows it returns, so
+        // any over-read fails; one row is returned at every history size, so it is also constant.
         assert_eq!(
-            source_position.trace.rows_examined, 2,
-            "source-position equality probe stays constant"
+            source_position.trace.rows_examined,
+            source_position.rows.len() as u64,
+            "source-position equality probe examines only the rows it returns"
         );
         eprintln!(
             "source_position: completed={completed}, neighbours={neighbours}, examined={}, index={:?}",

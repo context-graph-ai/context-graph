@@ -2932,9 +2932,13 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
     }
     // The source session and application-owned input vector collection are gone before timing.
     let index = VectorIndexRef::new("passages", "embedding");
+    let mut partition_observation_owner_1 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit partition observation reader"),
+    );
     let before = db
         .vector_store_for_test()
-        .partition_infos(&index)
+        .partition_infos(&index, &mut partition_observation_owner_1)
         .expect("fresh partition facts");
     assert_eq!(before.len(), 1);
     let partition = &before[0];
@@ -2976,9 +2980,13 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
     assert_eq!(report.vector.remaining_partitions, 0);
     assert!(report.vector.first_failure.is_none());
     assert!(report.vector.first_failure_details.is_none());
+    let mut partition_observation_owner_2 = contextdb_engine::vector_read_memory::admission(
+        db.declared_reader_memory()
+            .expect("admit partition observation reader"),
+    );
     let after = db
         .vector_store_for_test()
-        .partition_infos(&index)
+        .partition_infos(&index, &mut partition_observation_owner_2)
         .expect("published graph facts");
     assert_eq!(after.len(), 1);
     assert!(after[0].graph_available);
@@ -2989,9 +2997,14 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
     db.close().expect("close published graph");
     let reopened = Database::open_with_options(&path, open_options())
         .expect("restart published graph at same ceiling");
+    let mut partition_observation_owner_3 = contextdb_engine::vector_read_memory::admission(
+        reopened
+            .declared_reader_memory()
+            .expect("admit partition observation reader"),
+    );
     let ready = reopened
         .vector_store_for_test()
-        .partition_infos(&index)
+        .partition_infos(&index, &mut partition_observation_owner_3)
         .expect("restart graph facts");
     assert_eq!(ready.len(), 1);
     assert!(ready[0].graph_available);
@@ -6299,6 +6312,15 @@ fn event_fixture_vector_geometry(_c: &mut Criterion) {
 }
 
 #[cfg(context_graph_internal_test_support)]
+#[path = "cg_event_history/schema_overlap.rs"]
+mod schema_overlap;
+
+#[cfg(context_graph_internal_test_support)]
+pub fn event_find_show_status_during_schema_replay_and_largest_migration(c: &mut Criterion) {
+    schema_overlap::run(c);
+}
+
+#[cfg(context_graph_internal_test_support)]
 criterion_group!(
     benches,
     event_fixture_build,
@@ -6311,7 +6333,8 @@ criterion_group!(
     event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_index_merge_or_oversampling,
     event_find_recall_at_10_against_exact_on_the_real_model_fixture,
     event_fixture_vector_geometry,
-    event_recall_gate_controls
+    event_recall_gate_controls,
+    event_find_show_status_during_schema_replay_and_largest_migration
 );
 #[cfg(not(context_graph_internal_test_support))]
 criterion_group!(

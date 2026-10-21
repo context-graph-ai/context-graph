@@ -1109,6 +1109,16 @@ fn reject_content_reads_in_expr(expr: &Expr) -> Result<(), String> {
             reject_content_reads_in_expr(expr)?;
             reject_content_reads_in_select_body(subquery)
         }
+        Expr::RowNumber(window) => {
+            for column in &window.partition_by {
+                reject_content_column(&column.column)?;
+            }
+            for order in &window.order_by {
+                reject_content_column(&order.column.column)?;
+            }
+            Ok(())
+        }
+        Expr::WindowRank(_) => Ok(()),
         Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
     }
 }

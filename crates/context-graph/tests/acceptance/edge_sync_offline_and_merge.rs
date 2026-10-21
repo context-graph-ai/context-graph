@@ -394,6 +394,7 @@ fn capture_hub_outbound_conflict(
     let outbound = store
         .sync_database()
         .changes_since(Lsn(0))
+        .expect("admit engine read memory")
         .rows
         .into_iter()
         .filter(|row| row.table == "conflicts" && row.values.get("id") == Some(&DbValue::Uuid(id)))

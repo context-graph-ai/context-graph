@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::{
     Arc, Mutex,
@@ -4396,7 +4397,6 @@ struct HeldWriter(std::process::Child);
 impl HeldWriter {
     fn start(path: &Path) -> Self {
         use std::io::BufRead;
-        use std::process::{Command, Stdio};
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "projection_writer_hold_child", "--nocapture"])
             .env("CG_CORE_WRITER_HOLD_PATH", path)
@@ -5351,4 +5351,608 @@ fn selected_frontier_count_does_not_examine_completed_history() {
         roots.push(root);
         db
     });
+}
+
+fn bounded_read_rows(
+    cost: &context_graph::test_support::EventHistoryReadCost,
+    table: &str,
+) -> (u64, u64) {
+    let reads = cost
+        .reads
+        .iter()
+        .filter(|read| read.sql.contains(table))
+        .collect::<Vec<_>>();
+    assert!(!reads.is_empty(), "the real cursor must read {table}");
+    (
+        reads
+            .iter()
+            .map(|read| {
+                read.rows_examined
+                    .expect("actual cursor examined-entry telemetry is required")
+            })
+            .sum(),
+        reads.iter().map(|read| read.charged_bytes).max().unwrap(),
+    )
+}
+
+#[test]
+fn recent_session_selection_retains_only_the_selected_sessions() {
+    use context_graph::test_support::{
+        record_event_history_read_cost_for_test, take_event_history_read_cost_for_test,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(root.path().join("recent-selection.db"));
+    let store = open(&cfg);
+    let context_id = create_context(&store);
+    append_timestamped_sessions(&store, context_id, 10);
+    drop(store);
+    let embedder = ControlledEmbedder::new();
+    scoped_run(
+        &cfg,
+        context_id,
+        &embedder,
+        EventSearchWorkPolicy::default(),
+    );
+    let read = || {
+        let mut reader =
+            ConsumerReader::open(&cfg.db_path, event_history_reader_declaration()).unwrap();
+        reader
+            .attach_event_search_embedder_registrations(vec![embedder.registration()])
+            .unwrap();
+        // Warm the maintained index before measuring its working set.
+        reader
+            .find_event_history(
+                ContextSelector::one(context_id),
+                "session marker",
+                EventSearchFilter::default(),
+            )
+            .unwrap();
+        record_event_history_read_cost_for_test();
+        let selection = reader
+            .select_event_search_work(context_id, EventSearchWorkPolicy::default())
+            .unwrap();
+        let selection_cost = take_event_history_read_cost_for_test();
+        record_event_history_read_cost_for_test();
+        let answer = reader
+            .find_event_history(
+                ContextSelector::one(context_id),
+                "session marker",
+                EventSearchFilter::default(),
+            )
+            .unwrap();
+        let find_cost = take_event_history_read_cost_for_test();
+        record_event_history_read_cost_for_test();
+        let status = reader
+            .event_history_status(ContextSelector::one(context_id))
+            .unwrap();
+        let status_cost = take_event_history_read_cost_for_test();
+        (
+            selection,
+            selection_cost,
+            answer,
+            find_cost,
+            status,
+            status_cost,
+        )
+    };
+    let before = read();
+    assert!(
+        before.0.streams.is_empty(),
+        "completed streams are not selected as pending work"
+    );
+    let store = open(&cfg);
+    for index in 0..1_000 {
+        for dated in [true, false] {
+            let session = format!(
+                "older-{}-{index:04}",
+                if dated { "dated" } else { "undated" }
+            );
+            let mut event = draft(&session, 1, EventRenderRole::HumanMessage, "older metadata");
+            event.session_ref = session.clone();
+            event.text = None;
+            event.occurred_at =
+                dated.then(|| chrono::DateTime::from_timestamp(1_700_000_000 + index, 0).unwrap());
+            store
+                .append_event_batch(AppendEventBatch::live(
+                    context_id,
+                    declaration(),
+                    session,
+                    vec![event],
+                ))
+                .unwrap();
+        }
+    }
+    drop(store);
+    let after = read();
+    assert_eq!(
+        after.0, before.0,
+        "the completed recent scope has no pending streams before or after older captures"
+    );
+    assert_eq!(
+        after.2.hits, before.2.hits,
+        "recent find keeps every original passage and source link"
+    );
+    for (old, new, operation) in [
+        (&before.1, &after.1, "selection"),
+        (&before.3, &after.3, "find"),
+        (&before.5, &after.5, "status"),
+    ] {
+        assert_eq!(
+            bounded_read_rows(new, "FROM event_context_sessions"),
+            bounded_read_rows(old, "FROM event_context_sessions"),
+            "{operation}: 1,000 older dated and 1,000 undated sessions cannot increase recent-selection work or charges"
+        );
+    }
+    for cost in [
+        &before.1, &after.1, &before.3, &after.3, &before.5, &after.5,
+    ] {
+        let reads = cost
+            .reads
+            .iter()
+            .filter(|read| read.sql.contains("FROM event_context_sessions"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reads.len(),
+            1,
+            "dated rows fill the scope, so undated history is never read"
+        );
+        assert!(reads[0].sql.contains("latest_occurred_at IS NOT NULL"));
+        assert_eq!(
+            reads[0].trace.as_ref().unwrap().index_used.as_deref(),
+            Some("idx_event_context_sessions_recency"),
+            "the actual grouped cursor uses the declared recency index"
+        );
+    }
+    assert_eq!(after.2.coverage[0].pending_event_count, 0);
+    assert_eq!(after.2.coverage[0].outside_scope_event_count, 2_000);
+    assert_eq!(
+        after.2.coverage[0].outside_scope_indexed_event_count,
+        before.2.coverage[0].outside_scope_indexed_event_count
+    );
+    assert_eq!(
+        after.4.contexts[0].search.pending_events,
+        before.4.contexts[0].search.pending_events
+    );
+    assert_eq!(
+        after.4.contexts[0].source_streams.len(),
+        before.4.contexts[0].source_streams.len() + 2_000,
+        "status still lists every captured stream"
+    );
+}
+
+#[test]
+fn select_work_examines_no_completed_events() {
+    use context_graph::test_support::{
+        record_event_history_read_cost_for_test, take_event_history_read_cost_for_test,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut event_growth = Vec::new();
+    let mut session_growth = Vec::new();
+    for (completed, completed_sessions) in [(8_u64, 2_usize), (80, 2), (8, 20)] {
+        let cfg = config(root.path().join(format!(
+            "completed-{completed}-sessions-{completed_sessions}.db"
+        )));
+        let store = open(&cfg);
+        let context_id = create_context(&store);
+        let sessions = std::iter::once("selected".to_owned())
+            .chain((1..completed_sessions).map(|index| format!("older-{index:04}")));
+        for session in sessions {
+            let events = (1..=completed)
+                .map(|ordinal| {
+                    let mut event = draft(
+                        &format!("{session}-{ordinal}"),
+                        ordinal,
+                        EventRenderRole::HumanMessage,
+                        "completed metadata",
+                    );
+                    event.session_ref = session.clone();
+                    event.text = None;
+                    event.occurred_at = chrono::DateTime::from_timestamp(
+                        if session == "selected" {
+                            1_800_000_000
+                        } else {
+                            1_700_000_000
+                        },
+                        0,
+                    );
+                    event
+                })
+                .collect();
+            store
+                .append_event_batch(AppendEventBatch::live(
+                    context_id,
+                    declaration(),
+                    format!("{session}-completed"),
+                    events,
+                ))
+                .unwrap();
+        }
+        drop(store);
+        let embedder = ControlledEmbedder::new();
+        EventSearchProjectionRunner::catch_up_observed_with_policy(
+            run_request(
+                &cfg,
+                context_id,
+                &embedder,
+                profile(),
+                128,
+                OBSERVED_LEASE_MS,
+            ),
+            EventSearchWorkPolicy {
+                order: EventSearchOrder::Newest,
+                sessions: EventSearchSessionScope::All,
+            },
+        )
+        .result
+        .expect("complete the fixture before measuring selection");
+        let store = open(&cfg);
+        let mut pending = draft(
+            "pending",
+            1,
+            EventRenderRole::HumanMessage,
+            "same pending tail",
+        );
+        pending.session_ref = "selected".into();
+        pending.occurred_at = chrono::DateTime::from_timestamp(1_800_000_001, 0);
+        store
+            .append_event_batch(AppendEventBatch::live(
+                context_id,
+                declaration(),
+                "pending-source",
+                vec![pending],
+            ))
+            .unwrap();
+        let policy = EventSearchWorkPolicy {
+            order: EventSearchOrder::Newest,
+            sessions: EventSearchSessionScope::All,
+        };
+        record_event_history_read_cost_for_test();
+        let selected = store.select_event_search_work(context_id, policy).unwrap();
+        let cost = take_event_history_read_cost_for_test();
+        assert!(
+            cost.reads
+                .iter()
+                .filter(|read| read.sql.contains(" FROM events "))
+                .all(|read| read.sql.contains("COUNT(*)")
+                    || read.sql.contains("ORDER BY seq DESC LIMIT 1")),
+            "selection reads only engine-maintained counts and indexed frontiers"
+        );
+        assert_eq!(
+            selected.streams.len(),
+            1,
+            "selection reaches only the identical pending stream, never completed streams"
+        );
+        assert_eq!(
+            selected
+                .streams
+                .iter()
+                .find(|stream| stream.source_instance_ref == "pending-source")
+                .unwrap()
+                .frontier,
+            1,
+            "identical pending frontier"
+        );
+        let stream_cost = bounded_read_rows(&cost, "FROM events");
+        let selection_cost = bounded_read_rows(&cost, "");
+        drop(store);
+        let request = run_request(&cfg, context_id, &embedder, profile(), 8, OBSERVED_LEASE_MS);
+        let resumed =
+            EventSearchProjectionRunner::catch_up_observed_with_selected_work_and_batch_limits(
+                request,
+                policy,
+                selected,
+                || NonZeroUsize::MIN,
+                |_| {
+                    Ok(context_graph::EventSearchBatchWriteLimit {
+                        memory_limit_bytes: cfg.write_memory_limit_bytes,
+                        through_sequence: None,
+                    })
+                },
+            )
+            .result
+            .unwrap();
+        assert_eq!(resumed.failed_event_count, 0);
+        let reader =
+            ConsumerReader::open(&cfg.db_path, event_history_reader_declaration()).unwrap();
+        reader
+            .event_history_status(ContextSelector::one(context_id))
+            .unwrap();
+        record_event_history_read_cost_for_test();
+        let status = reader
+            .event_history_status(ContextSelector::one(context_id))
+            .unwrap();
+        let status_reads = take_event_history_read_cost_for_test();
+        let status_cost = bounded_read_rows(&status_reads, "FROM events");
+        assert_eq!(
+            status.contexts[0].search.pending_events, 0,
+            "the selected pending tail is claimed and completed"
+        );
+        assert_eq!(
+            status.contexts[0].captured_events,
+            completed * completed_sessions as u64 + 1
+        );
+        assert_eq!(
+            status.contexts[0].source_streams.len(),
+            completed_sessions + 1
+        );
+        assert_eq!(
+            status.contexts[0]
+                .source_streams
+                .iter()
+                .map(|stream| stream.event_count)
+                .sum::<u64>(),
+            completed * completed_sessions as u64 + 1
+        );
+        if completed_sessions == 2 {
+            event_growth.push((stream_cost, status_cost));
+        }
+        if completed == 8 {
+            session_growth.push(selection_cost);
+        }
+    }
+    assert_eq!(
+        event_growth[0].0, event_growth[1].0,
+        "ten times the completed history examines the same newest entries at the same read charge"
+    );
+    assert_eq!(
+        session_growth[0], session_growth[1],
+        "growing completed sessions under the all-session scope must examine the same entries and charge the same bytes for an identical pending tail"
+    );
+    assert_eq!(
+        event_growth[0].1, event_growth[1].1,
+        "ten times the completed history keeps ConsumerReader status grouped counts and newest-entry reads at the same examined entries and read charge"
+    );
+}
+
+#[test]
+fn pending_marker_and_cursor_publish_together_across_process_crashes() {
+    const CHILD_PATH: &str = "CG_PENDING_MARKER_CRASH_PATH";
+    const CHILD_CONTEXT: &str = "CG_PENDING_MARKER_CRASH_CONTEXT";
+    const CHILD_CUT: &str = "CG_PENDING_MARKER_CRASH_CUT";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let cfg = config(std::path::PathBuf::from(path));
+        let context_id = context_graph::ContextId::from(
+            uuid::Uuid::parse_str(&std::env::var(CHILD_CONTEXT).unwrap()).unwrap(),
+        );
+        let cut = std::env::var(CHILD_CUT).unwrap();
+        if cut == "before" {
+            context_graph::test_support::before_next_event_search_batch_commit_for_test(|_| {
+                std::process::exit(72)
+            });
+        } else {
+            context_graph::test_support::after_next_event_search_batch_commit_for_test(|_| {
+                std::process::exit(73)
+            });
+        }
+        let embedder = ControlledEmbedder::new();
+        let _ = EventSearchProjectionRunner::catch_up_observed_with_policy(
+            run_request(&cfg, context_id, &embedder, profile(), 8, OBSERVED_LEASE_MS),
+            EventSearchWorkPolicy {
+                order: EventSearchOrder::Newest,
+                sessions: EventSearchSessionScope::All,
+            },
+        );
+        panic!("the production batch commit must reach its crash cut");
+    }
+    let root = tempfile::tempdir().unwrap();
+    for (cut, expected_code, expected_sequence, expected_pending) in
+        [("before", 72, 1_i64, true), ("after", 73, 2_i64, false)]
+    {
+        let cfg = config(root.path().join(format!("marker-crash-{cut}.db")));
+        let store = open(&cfg);
+        let context_id = create_context(&store);
+        let mut first = draft("initial", 1, EventRenderRole::HumanMessage, "metadata");
+        first.session_ref = "crash-session".into();
+        first.text = None;
+        store
+            .append_event_batch(AppendEventBatch::live(
+                context_id,
+                declaration(),
+                "crash-source",
+                vec![first],
+            ))
+            .unwrap();
+        drop(store);
+        let embedder = ControlledEmbedder::new();
+        EventSearchProjectionRunner::catch_up_observed_with_policy(
+            run_request(&cfg, context_id, &embedder, profile(), 8, OBSERVED_LEASE_MS),
+            EventSearchWorkPolicy {
+                order: EventSearchOrder::Newest,
+                sessions: EventSearchSessionScope::All,
+            },
+        )
+        .result
+        .unwrap();
+        let store = open(&cfg);
+        let mut second = draft("tail", 2, EventRenderRole::HumanMessage, "metadata");
+        second.session_ref = "crash-session".into();
+        second.text = None;
+        store
+            .append_event_batch(AppendEventBatch::live(
+                context_id,
+                declaration(),
+                "crash-source",
+                vec![second],
+            ))
+            .unwrap();
+        drop(store);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pending_marker_and_cursor_publish_together_across_process_crashes",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &cfg.db_path)
+            .env(CHILD_CONTEXT, context_id.as_uuid().to_string())
+            .env(CHILD_CUT, cut)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_code),
+            "actual production crash cut {cut}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recovered = open(&cfg);
+        let params = std::collections::HashMap::from([(
+            "context_id".into(),
+            contextdb_core::Value::Uuid(context_id.as_uuid()),
+        )]);
+        let answer = recovered.sync_database().execute(
+            "SELECT event_search_cursors.committed_sequence, event_search_pending_streams.pending FROM event_search_heads INNER JOIN event_search_cursors ON event_search_heads.context_id = event_search_cursors.context_id AND event_search_heads.generation_id = event_search_cursors.generation_id INNER JOIN event_search_pending_streams ON event_search_cursors.context_id = event_search_pending_streams.context_id AND event_search_cursors.generation_id = event_search_pending_streams.generation_id AND event_search_cursors.connector_id = event_search_pending_streams.connector_id AND event_search_cursors.source_instance_ref = event_search_pending_streams.source_instance_ref AND event_search_cursors.session_ref = event_search_pending_streams.session_ref WHERE event_search_heads.context_id = $context_id", &params).unwrap();
+        assert_eq!(
+            answer.rows,
+            vec![vec![
+                contextdb_core::Value::Int64(expected_sequence),
+                contextdb_core::Value::Bool(expected_pending)
+            ]],
+            "crash before commit keeps both old values; crash after commit keeps both new values"
+        );
+        let selected = recovered
+            .select_event_search_work(
+                context_id,
+                EventSearchWorkPolicy {
+                    order: EventSearchOrder::Newest,
+                    sessions: EventSearchSessionScope::All,
+                },
+            )
+            .unwrap();
+        assert_eq!(selected.streams.len(), usize::from(expected_pending));
+        drop(recovered);
+        EventSearchProjectionRunner::catch_up_observed_with_policy(
+            run_request(&cfg, context_id, &embedder, profile(), 8, OBSERVED_LEASE_MS),
+            EventSearchWorkPolicy {
+                order: EventSearchOrder::Newest,
+                sessions: EventSearchSessionScope::All,
+            },
+        )
+        .result
+        .unwrap();
+        let complete = open(&cfg);
+        assert!(
+            complete
+                .select_event_search_work(
+                    context_id,
+                    EventSearchWorkPolicy {
+                        order: EventSearchOrder::Newest,
+                        sessions: EventSearchSessionScope::All
+                    }
+                )
+                .unwrap()
+                .streams
+                .is_empty(),
+            "recovered pending work completes and becomes unreachable from the pending index"
+        );
+    }
+}
+
+#[test]
+fn recent_coverage_reads_only_selected_progress_keys() {
+    use context_graph::test_support::{
+        record_event_history_read_cost_for_test, take_event_history_read_cost_for_test,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let cfg = config(root.path().join("selected-progress.db"));
+    let store = open(&cfg);
+    let context_id = create_context(&store);
+    append_timestamped_sessions(&store, context_id, 10);
+    drop(store);
+    let embedder = ControlledEmbedder::new();
+    scoped_run(
+        &cfg,
+        context_id,
+        &embedder,
+        EventSearchWorkPolicy::default(),
+    );
+    let mut previous = 0;
+    let mut measured = Vec::new();
+    let mut original_hits = None;
+    for older_sessions in [30, 150] {
+        let store = open(&cfg);
+        for index in previous..older_sessions {
+            let session = format!("completed-older-{index:04}");
+            let mut event = draft(&session, 1, EventRenderRole::HumanMessage, "metadata");
+            event.session_ref = session.clone();
+            event.text = None;
+            event.occurred_at = chrono::DateTime::from_timestamp(1_700_000_000 + index, 0);
+            store
+                .append_event_batch(AppendEventBatch::live(
+                    context_id,
+                    declaration(),
+                    session,
+                    vec![event],
+                ))
+                .unwrap();
+        }
+        drop(store);
+        let request = run_request(
+            &cfg,
+            context_id,
+            &embedder,
+            profile(),
+            128,
+            OBSERVED_LEASE_MS,
+        );
+        EventSearchProjectionRunner::catch_up_observed_with_policy(
+            request,
+            EventSearchWorkPolicy {
+                order: EventSearchOrder::Newest,
+                sessions: EventSearchSessionScope::All,
+            },
+        )
+        .result
+        .unwrap();
+        let store = open(&cfg);
+        store
+            .persist_event_search_work_policy(context_id, EventSearchWorkPolicy::default())
+            .unwrap();
+        drop(store);
+        let mut reader =
+            ConsumerReader::open(&cfg.db_path, event_history_reader_declaration()).unwrap();
+        reader
+            .attach_event_search_embedder_registrations(vec![embedder.registration()])
+            .unwrap();
+        reader
+            .find_event_history(
+                ContextSelector::one(context_id),
+                "session marker",
+                EventSearchFilter::default(),
+            )
+            .unwrap();
+        record_event_history_read_cost_for_test();
+        let answer = reader
+            .find_event_history(
+                ContextSelector::one(context_id),
+                "session marker",
+                EventSearchFilter::default(),
+            )
+            .unwrap();
+        let cost = take_event_history_read_cost_for_test();
+        measured.push(bounded_read_rows(
+            &cost,
+            "FROM event_search_session_progress",
+        ));
+        assert_eq!(answer.coverage[0].pending_event_count, 0);
+        assert_eq!(
+            answer.coverage[0].outside_scope_event_count,
+            older_sessions as u64
+        );
+        assert_eq!(
+            answer.coverage[0].outside_scope_indexed_event_count, 0,
+            "metadata-only completed history has no indexed passages"
+        );
+        if let Some(hits) = &original_hits {
+            assert_eq!(
+                &answer.hits, hits,
+                "retained exact answers do not change when no-text history grows"
+            );
+        } else {
+            original_hits = Some(answer.hits);
+        }
+        previous = older_sessions;
+    }
+    assert_eq!(
+        measured[0], measured[1],
+        "forty then one hundred sixty total sessions keep the same ten keyed progress probes and charged bytes"
+    );
 }

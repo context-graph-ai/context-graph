@@ -579,6 +579,7 @@ fn session_plan(
     // The captured-session summary is erased with its immutable events. Other sessions survive the
     // same authoritative purge, so reads never need a post-forget archive recount.
     plan.select("event_context_sessions", session_predicate);
+    plan.select("event_search_pending_streams", session_predicate);
     plan.select("event_search_request_selections", session_predicate);
     plan.select("event_search_refusal_frontiers", session_predicate);
     let mut source_values = Vec::with_capacity(sources.len());
@@ -642,6 +643,7 @@ fn context_plan(store: &Store, context_id: ContextId) -> Result<Option<(PurgePla
     let mut plan = PurgePlan::new(context_id);
     for table in CONTEXT_DERIVED_TABLES.iter().chain(
         [
+            "event_search_pending_streams",
             "event_search_request_selections",
             "event_search_refusal_frontiers",
             "adapter_coverage_gap_events",

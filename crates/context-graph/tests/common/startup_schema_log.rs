@@ -40,7 +40,10 @@ pub struct SchemaLog {
 }
 
 pub fn schema_log(store: &Store) -> SchemaLog {
-    let changes = store.sync_database().changes_since(Lsn(0));
+    let changes = store
+        .sync_database()
+        .changes_since(Lsn(0))
+        .expect("admit engine read memory");
     assert_eq!(
         changes.ddl.len(),
         changes.ddl_lsn.len(),

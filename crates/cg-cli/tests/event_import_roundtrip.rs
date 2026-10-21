@@ -778,10 +778,21 @@ fn malformed_input_reports_source_partial_at_the_failed_position_without_silentl
     let source = workspace.path().join("malformed.jsonl");
     fs::copy(fixture("malformed-after-valid.jsonl"), &source).expect("stage malformed source");
 
+    let help = run_cg(&data_root, None, &["import".into(), "--help".into()]);
+    assert_eq!(help.code, 0);
+    assert!(
+        help.stdout.contains("5 source_partial"),
+        "partial-capture exit is documented in import help"
+    );
+    assert!(
+        help.stdout.contains("6 store_needs_recovery"),
+        "recovery-required exit is documented in import help"
+    );
     let imported = run_cg(&data_root, None, &import_args(&source, "defer"));
     assert_eq!(
-        imported.code, 1,
-        "source_partial is a failed import receipt"
+        imported.code, 5,
+        "source_partial is a failed import receipt: stdout={} stderr={}",
+        imported.stdout, imported.stderr
     );
     let receipt = json(&imported, "cg import malformed source");
     assert_eq!(

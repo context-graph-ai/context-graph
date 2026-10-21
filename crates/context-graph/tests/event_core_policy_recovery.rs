@@ -474,7 +474,8 @@ async fn authenticated_hub(name: &str, discard: &str) -> AuthenticatedHub {
             tenant.clone(),
             hub_node,
             identity,
-        ),
+        )
+        .expect("admit engine read memory"),
     );
     for (table, policy) in [
         ("events", event_policy(discard)),
@@ -521,7 +522,8 @@ async fn bind(store: &Store, hub: &AuthenticatedHub, discard: &str) -> SyncClien
         hub.broker.client_as(&node_id),
         hub.tenant.clone(),
         identity,
-    );
+    )
+    .expect("admit engine read memory");
     let connected_hub = client
         .connected_hub_node_id()
         .expect("authenticated fixture client has a connected hub");
@@ -596,7 +598,8 @@ async fn unbound_store_exposes_only_bootstrap_and_binding_publishes_the_complete
         rejected_hub.broker.client_as(&rejected_node),
         rejected_hub.tenant.clone(),
         rejected_identity,
-    );
+    )
+    .expect("admit engine read memory");
     assert!(
         rejected_client
             .bind_application_table_policy(policy_expectation("ALWAYS"))

@@ -117,7 +117,8 @@ pub async fn fabric_fixture_with_tenants(
         edge1.store.sync_database(),
         &edge1_dial_spec,
         TenantId::from(edge1_tenant),
-    );
+    )
+    .expect("admit engine read memory");
     let edge2_dial_spec = contextdb_server::peer_dial_spec(
         &edge2_ticket,
         &edge2.db_path.with_extension("fabric-identity.key"),
@@ -126,7 +127,8 @@ pub async fn fabric_fixture_with_tenants(
         edge2.store.sync_database(),
         &edge2_dial_spec,
         TenantId::from(edge2_tenant),
-    );
+    )
+    .expect("admit engine read memory");
 
     FabricFixture {
         _hubs: hubs,
@@ -156,11 +158,10 @@ async fn start_ticketed_hub(
     .expect("authenticated hub bind stays bounded")
     .expect("bind authenticated ticketed hub");
     let ticket = endpoint.ticket();
-    let server = Arc::new(SyncServer::new(
-        hub.store.sync_database(),
-        &endpoint,
-        TenantId::from(tenant),
-    ));
+    let server = Arc::new(
+        SyncServer::new(hub.store.sync_database(), &endpoint, TenantId::from(tenant))
+            .expect("admit engine read memory"),
+    );
     let task = tokio::spawn(async move { server.run_until(shutdown).await });
     (hub, ticket, task)
 }
@@ -231,7 +232,7 @@ pub async fn unavailable_authenticated_client(
         &ticket,
         &edge_db_path.with_extension("fabric-identity.key"),
     );
-    SyncClient::new(db, &dial_spec, TenantId::from(tenant))
+    SyncClient::new(db, &dial_spec, TenantId::from(tenant)).expect("admit engine read memory")
 }
 
 /// An extractor double that records how many times the model boundary was invoked, wrapping the

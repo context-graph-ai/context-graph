@@ -867,6 +867,7 @@ fn stored_text_vector(db_path: &Path, evidence_id: EvidenceId) -> Option<Vec<f32
             _ => None,
         })?;
     db.live_vector_entry(row_id, snapshot)
+        .expect("admit engine read memory")
         .filter(|entry| entry.index == VectorIndexRef::new("evidence", "vector_text"))
         .map(|entry| entry.vector)
 }
