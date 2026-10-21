@@ -268,9 +268,9 @@ impl Store {
         let vector_trace = format!("{:?}", result.trace());
         let mut candidates = Vec::new();
         for row in result.rows() {
-            let digest_id = DigestId::from(value_uuid(&row, result.columns(), "id")?);
-            let context_id = ContextId::from(value_uuid(&row, result.columns(), "context_id")?);
-            let similarity = value_score(&row, result.columns(), "score")?;
+            let digest_id = DigestId::from(value_uuid(row, result.columns(), "id")?);
+            let context_id = ContextId::from(value_uuid(row, result.columns(), "context_id")?);
+            let similarity = value_score(row, result.columns(), "score")?;
             if similarity <= 0.0 {
                 continue;
             }
@@ -280,8 +280,8 @@ impl Store {
             {
                 continue;
             }
-            let summary = value_text(&row, result.columns(), "summary")?;
-            let created_at = value_txid(&row, result.columns(), "created_at")?;
+            let summary = value_text(row, result.columns(), "summary")?;
+            let created_at = value_txid(row, result.columns(), "created_at")?;
             candidates.push(DigestCandidate {
                 digest_id,
                 context_id,
