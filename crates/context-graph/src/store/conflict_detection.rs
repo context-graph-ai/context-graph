@@ -83,9 +83,9 @@ fn run_conflict_detection(db: &Database, ctx: &TriggerContext) -> contextdb_core
         "decisions" => required_uuid(&ctx.row_values, "id")?,
         "outcomes" => required_uuid(&ctx.row_values, "decision_id")?,
         other => {
-            return Err(EngineError::Other(format!(
-                "conflict detection fired for unsupported table {other}"
-            )));
+            return Err(EngineError::Other(
+                format!("conflict detection fired for unsupported table {other}").into(),
+            ));
         }
     };
     detect_conflicts_for_decision(db, ctx.tx, decision_id)
@@ -142,8 +142,9 @@ fn insert_conflict_row(
         .copied()
         .map(IntentionId::from)
         .collect::<Vec<_>>();
-    let threatened_json = serde_json::to_value(threatened_ids)
-        .map_err(|err| EngineError::Other(format!("conflict intentions serialize: {err}")))?;
+    let threatened_json = serde_json::to_value(threatened_ids).map_err(|err| {
+        EngineError::Other(format!("conflict intentions serialize: {err}").into())
+    })?;
     let params = HashMap::from([
         (
             "id".to_string(),
@@ -325,9 +326,9 @@ fn served_intentions(
 fn required_uuid(values: &HashMap<String, Value>, column: &str) -> contextdb_core::Result<Uuid> {
     match values.get(column) {
         Some(Value::Uuid(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "conflict detection expected {column} uuid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("conflict detection expected {column} uuid, got {other:?}").into(),
+        )),
     }
 }
 
@@ -335,42 +336,42 @@ fn column_index(columns: &[String], column: &str) -> contextdb_core::Result<usiz
     columns
         .iter()
         .position(|name| name == column)
-        .ok_or_else(|| EngineError::Other(format!("missing column {column}")))
+        .ok_or_else(|| EngineError::Other(format!("missing column {column}").into()))
 }
 
 fn row_uuid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<Uuid> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Uuid(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} uuid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} uuid, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_text(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<String> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Text(value)) => Ok(value.clone()),
-        other => Err(EngineError::Other(format!(
-            "expected {column} text, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} text, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_bool(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<bool> {
     match row.get(column_index(columns, column)?) {
         Some(Value::Bool(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} bool, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} bool, got {other:?}").into(),
+        )),
     }
 }
 
 fn row_txid(row: &[Value], columns: &[String], column: &str) -> contextdb_core::Result<TxId> {
     match row.get(column_index(columns, column)?) {
         Some(Value::TxId(value)) => Ok(*value),
-        other => Err(EngineError::Other(format!(
-            "expected {column} txid, got {other:?}"
-        ))),
+        other => Err(EngineError::Other(
+            format!("expected {column} txid, got {other:?}").into(),
+        )),
     }
 }
 

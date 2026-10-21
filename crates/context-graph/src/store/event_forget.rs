@@ -16,8 +16,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use contextdb_core::Value;
 use crate::consumer_read::ConsumerPage;
+use contextdb_core::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::consumer_read::ConsumerCursor;

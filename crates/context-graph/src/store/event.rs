@@ -1040,7 +1040,8 @@ pub(crate) fn load_source_state(
     let session_ref = get_text(row, locator.columns(), "session_ref")?;
     let provisional_empty = get_bool_value(row, locator.columns(), "provisional_empty")?;
     let adapter_version = get_text(row, locator.columns(), "adapter_version")?;
-    let anchor_declaration_version = get_text(row, locator.columns(), "anchor_declaration_version")?;
+    let anchor_declaration_version =
+        get_text(row, locator.columns(), "anchor_declaration_version")?;
     if adapter_version != declaration.adapter_version
         || anchor_declaration_version != declaration.anchor_declaration_version
     {

@@ -481,7 +481,6 @@ pub fn take_claim_loads_for_test() -> Vec<(usize, usize, usize)> {
 
 const FIRST_PENDING_SOURCE_STATEMENT: &str = "SELECT ordinal FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $committed ORDER BY source_sequence ASC LIMIT 1";
 const HAS_LATER_SESSION_STATEMENT: &str = "SELECT source_sequence FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session AND source_sequence > $after ORDER BY source_sequence ASC LIMIT 1";
-#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 const SELECTED_STREAM_COUNT_STATEMENT: &str = "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source";
 const SELECTED_TAIL_COUNT_STATEMENT: &str = "SELECT COUNT(*) AS event_count FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source AND source_sequence > $frontier";
 
@@ -4235,7 +4234,9 @@ fn capture_source_membership(
                     hook();
                 }
             });
-            let Some(last) = page.rows().last() else { break };
+            let Some(last) = page.rows().last() else {
+                break;
+            };
             after = Some((
                 get_text(last, page.columns(), "connector_id")?,
                 get_text(last, page.columns(), "source_instance_ref")?,
@@ -5339,7 +5340,8 @@ fn guard_generation_for_claim_in_tx(
             )
             .map_err(map_engine_err)?;
         if head.rows().len() != 1
-            || get_uuid(&head.rows()[0], head.columns(), "generation_id")? != generation.id.as_uuid()
+            || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
+                != generation.id.as_uuid()
         {
             return Err(stale_claim(
                 "event-search ready generation stopped being the current head before claim",
@@ -6805,11 +6807,15 @@ fn commit_batch_in_tx(
             generation.columns(),
             "ordered_source_set_sha256",
         )? != claim.generation.ordered_source_set_sha256
-        || get_text(generation_row, generation.columns(), "source_content_sha256")?
-            != claim.generation.source_content_sha256
+        || get_text(
+            generation_row,
+            generation.columns(),
+            "source_content_sha256",
+        )? != claim.generation.source_content_sha256
         || get_u64(generation_row, generation.columns(), "capture_ordinal")?
             != claim.generation.target.event_count
-        || get_text(generation_row, generation.columns(), "renderer_id")? != EVENT_SEARCH_RENDERER_ID
+        || get_text(generation_row, generation.columns(), "renderer_id")?
+            != EVENT_SEARCH_RENDERER_ID
         || get_text(generation_row, generation.columns(), "renderer_version")?
             != EVENT_SEARCH_RENDERER_VERSION
         || get_json(generation_row, generation.columns(), "renderer_profile")?
@@ -7209,13 +7215,15 @@ fn reload_claimed_events_in_tx(
             .first()
             .ok_or_else(|| stale_claim("sealed event-search membership disappeared"))?;
         if membership.rows().len() != 1
-            || get_uuid(member_row, membership.columns(), "membership_id")? != expected.membership_id
+            || get_uuid(member_row, membership.columns(), "membership_id")?
+                != expected.membership_id
             || get_uuid(member_row, membership.columns(), "context_id")?
                 != claim.generation.context_id.as_uuid()
             || get_uuid(member_row, membership.columns(), "generation_id")?
                 != claim.generation.id.as_uuid()
             || get_u64(member_row, membership.columns(), "ordinal")? != expected.ordinal
-            || get_uuid(member_row, membership.columns(), "event_id")? != expected.event.id.as_uuid()
+            || get_uuid(member_row, membership.columns(), "event_id")?
+                != expected.event.id.as_uuid()
             || get_text(member_row, membership.columns(), "connector_id")?
                 != expected.event.connector_id
             || get_text(member_row, membership.columns(), "source_instance_ref")?
@@ -7371,7 +7379,8 @@ fn reload_claimed_member_input_in_tx(
             stale_claim("selected interpretation membership disappeared before commit")
         })?;
         if source_member.rows().len() != 1
-            || get_text(source_row, source_member.columns(), "source_row_sha256")? != captured_sha256
+            || get_text(source_row, source_member.columns(), "source_row_sha256")?
+                != captured_sha256
         {
             return Err(stale_claim(
                 "selected interpretation membership changed before commit",
@@ -7389,8 +7398,11 @@ fn reload_claimed_member_input_in_tx(
             stale_claim("selected interpretation value disappeared before commit")
         })?;
         if effective.rows().len() != 1
-            || get_text(effective_row, effective.columns(), "captured_content_sha256")?
-                != event.content_hash
+            || get_text(
+                effective_row,
+                effective.columns(),
+                "captured_content_sha256",
+            )? != event.content_hash
         {
             return Err(stale_claim(
                 "selected interpretation value changed before commit",
@@ -8314,7 +8326,8 @@ fn guard_final_interpretations_in_tx(
             )
             .map_err(map_engine_err)?;
         if head.rows().len() != 1
-            || get_uuid(&head.rows()[0], head.columns(), "generation_id")? != generation.id.as_uuid()
+            || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
+                != generation.id.as_uuid()
         {
             return Err(stale_claim(
                 "event-search ready generation stopped being the current head before completion",

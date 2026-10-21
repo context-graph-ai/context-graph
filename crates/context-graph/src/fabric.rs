@@ -468,7 +468,8 @@ fn digest_context(store: &Store, digest_id: DigestId) -> Result<Option<(ContextI
         "SELECT context_id FROM digests WHERE id = $id",
         &HashMap::from([("id".to_string(), DbValue::Uuid(digest_id.as_uuid()))]),
     )?;
-    let Some(DbValue::Uuid(context_uuid)) = result.rows().first().and_then(|row| row.first()) else {
+    let Some(DbValue::Uuid(context_uuid)) = result.rows().first().and_then(|row| row.first())
+    else {
         return Ok(None);
     };
     let context_id = ContextId::from(*context_uuid);

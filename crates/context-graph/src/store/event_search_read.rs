@@ -3,9 +3,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::consumer_read::ConsumerQueryResult;
 use chrono::{DateTime, Utc};
 use contextdb_core::Value;
-use crate::consumer_read::ConsumerQueryResult;
 
 use crate::embedder::{Embedder, EventSearchEmbedder};
 use crate::{
@@ -21,7 +21,8 @@ use super::convert::map_engine_err;
 type EventSearchRowVisitor<'a> = dyn FnMut(&[String], &[Value]) -> Result<()> + 'a;
 
 pub(crate) trait EventSearchRows {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult>;
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>)
+    -> Result<ConsumerQueryResult>;
     fn stream_rows(
         &self,
         sql: &str,
@@ -193,7 +194,11 @@ fn record_statement(sql: &str) {
 fn record_statement(_sql: &str) {}
 
 impl EventSearchRows for Store {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult> {
+    fn query_rows(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<ConsumerQueryResult> {
         record_statement(sql);
         self.require_application_ready()?;
         let answer = self
@@ -251,7 +256,11 @@ impl EventSearchRows for Store {
 }
 
 impl EventSearchRows for ConsumerReader {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult> {
+    fn query_rows(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<ConsumerQueryResult> {
         record_statement(sql);
         let mut cursor = self.open_cursor(sql, params)?;
         let paged = (|| -> Result<(Vec<String>, Vec<Vec<Value>>)> {

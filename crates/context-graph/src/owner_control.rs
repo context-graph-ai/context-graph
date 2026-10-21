@@ -496,14 +496,12 @@ impl OwnerRequestHandler for ControlNamespaceHandler {
         _cancel: &OwnerReadCancellation,
     ) -> contextdb_core::Result<Vec<u8>> {
         if namespace != CONTROL_NAMESPACE {
-            return Err(DbError::Other(format!(
-                "`{namespace}` is not a context-graph owner request namespace"
-            )));
+            return Err(DbError::Other(
+                format!("`{namespace}` is not a context-graph owner request namespace").into(),
+            ));
         }
         let frame = std::str::from_utf8(request).map_err(|error| {
-            DbError::Other(format!(
-                "a context-graph control frame must be text: {error}"
-            ))
+            DbError::Other(format!("a context-graph control frame must be text: {error}").into())
         })?;
         Ok((self.handler)(frame.to_string()).into_bytes())
     }
@@ -538,7 +536,9 @@ fn classify(store_path: &Path, error: DbError) -> OwnerControlError {
         // store nobody built by hand always carries the inspection name here.
         ReadFailureKind::OwnerRouteUnsupported => {
             let inspection = match failure.detail() {
-                ReadFailureDetail::OwnerRouteUnsupported(detail) => detail.inspection.clone(),
+                ReadFailureDetail::OwnerRouteUnsupported(detail) => {
+                    detail.inspection.clone().into_owned()
+                }
                 _ => String::new(),
             };
             OwnerControlError::OwnerRouteUnsupported {

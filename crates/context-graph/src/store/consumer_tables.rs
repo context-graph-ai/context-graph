@@ -595,6 +595,8 @@ fn column_mismatch(declared: &DeclaredColumn, stored: &StoredColumn, mismatches:
         max_partitions,
         search_mode,
         auto_index_at,
+        auto_expansion_ceiling,
+        flat_below,
         hnsw,
         consolidation,
         rank_policy,
@@ -713,6 +715,23 @@ fn column_mismatch(declared: &DeclaredColumn, stored: &StoredColumn, mismatches:
             "AUTO_INDEX_AT",
             format!("{auto_index_at:?}"),
             format!("{stored_auto_index_at:?}"),
+        );
+    }
+    let stored_auto_expansion_ceiling =
+        stored.auto_expansion_ceiling.map(|count| count.to_string());
+    if *auto_expansion_ceiling != stored_auto_expansion_ceiling {
+        differs(
+            "AUTO_EXPANSION_CEILING",
+            format!("{auto_expansion_ceiling:?}"),
+            format!("{stored_auto_expansion_ceiling:?}"),
+        );
+    }
+    let stored_flat_below = stored.flat_below.map(|count| count.to_string());
+    if *flat_below != stored_flat_below {
+        differs(
+            "FLAT_BELOW",
+            format!("{flat_below:?}"),
+            format!("{stored_flat_below:?}"),
         );
     }
     let declared_hnsw =

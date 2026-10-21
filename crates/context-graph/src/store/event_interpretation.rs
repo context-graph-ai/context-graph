@@ -467,7 +467,13 @@ fn materialize_coverage_gaps(
                     .fetch(NonZeroUsize::new(GAP_SCAN_PAGE_ROWS as usize))
                     .map_err(map_engine_err)?;
                 has_more = next.has_more();
-                persist_gap_page(store, *context_id, connector_id, next.columns(), next.rows())?;
+                persist_gap_page(
+                    store,
+                    *context_id,
+                    connector_id,
+                    next.columns(),
+                    next.rows(),
+                )?;
             }
             Ok(())
         })();
@@ -753,10 +759,9 @@ fn event_has_complete_active_value(
                 ("event_id".into(), Value::Uuid(event_id.as_uuid())),
             ]),
         )?;
-    Ok(result
-        .rows()
-        .first()
-        .is_some_and(|row| get_text(row, result.columns(), "coverage").as_deref() == Ok("complete")))
+    Ok(result.rows().first().is_some_and(|row| {
+        get_text(row, result.columns(), "coverage").as_deref() == Ok("complete")
+    }))
 }
 
 fn context_status(

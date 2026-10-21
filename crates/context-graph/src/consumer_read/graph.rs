@@ -59,8 +59,8 @@
 
 use std::collections::HashMap;
 
-use contextdb_core::Value;
 use crate::consumer_read::ConsumerQueryResult;
+use contextdb_core::Value;
 
 use crate::Result;
 use crate::store::graph_rows::GraphRows;
@@ -196,7 +196,11 @@ impl<'reader> ConsumerGraphView<'reader> {
 /// observations never said how many there would be and a bounded single answer would refuse the
 /// large ones the writable path answers.
 impl GraphRows for ConsumerGraphView<'_> {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult> {
+    fn query_rows(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<ConsumerQueryResult> {
         let mut cursor = self.reader.open_cursor(sql, params)?;
         // A read that STOPS is exactly where a cursor gets abandoned, and the consumer that only
         // wanted to look is the one left holding the snapshot. So every way out of the paging loop

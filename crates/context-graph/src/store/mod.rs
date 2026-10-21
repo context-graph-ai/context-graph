@@ -947,7 +947,11 @@ fn maybe_register_default_text_embedder(
 }
 
 impl graph_rows::GraphRows for Store {
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<crate::consumer_read::ConsumerQueryResult> {
+    fn query_rows(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<crate::consumer_read::ConsumerQueryResult> {
         self.require_application_ready()?;
         self.read_query(sql, params)
     }

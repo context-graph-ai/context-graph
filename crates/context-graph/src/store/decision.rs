@@ -436,7 +436,12 @@ impl Store {
             .db
             .execute_at_snapshot(sql, &params, snapshot)
             .map_err(map_engine_err)?;
-        ordered_snapshot_ids(result.columns(), result.rows(), "basis_order", "snapshot_id")
+        ordered_snapshot_ids(
+            result.columns(),
+            result.rows(),
+            "basis_order",
+            "snapshot_id",
+        )
     }
 
     pub(super) fn insert_decision_basis_snapshots_in_tx(
@@ -2237,7 +2242,12 @@ fn basis_snapshots_for_decision(
         "SELECT snapshot_id, basis_order FROM decision_basis_snapshots WHERE decision_id = $decision_id",
         &HashMap::from([("decision_id".to_string(), Value::Uuid(id.as_uuid()))]),
     )?;
-    ordered_snapshot_ids(result.columns(), result.rows(), "basis_order", "snapshot_id")
+    ordered_snapshot_ids(
+        result.columns(),
+        result.rows(),
+        "basis_order",
+        "snapshot_id",
+    )
 }
 
 /// One decision's outcome, or the answered absence when nobody has recorded one.

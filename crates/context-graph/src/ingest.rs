@@ -3980,7 +3980,8 @@ impl<'a> CaptureTxn<'a> {
             .map_err(map_engine)?;
         let mut out = Vec::with_capacity(result.rows().len());
         for row in result.rows() {
-            let intention_id = IntentionId::from(required_uuid_column(row, result.columns(), "id")?);
+            let intention_id =
+                IntentionId::from(required_uuid_column(row, result.columns(), "id")?);
             let description = required_text_column(row, result.columns(), "description")?;
             let catalog_id = required_text_column(row, result.columns(), "blueprint_catalog_id")?;
             out.push(IntentionCatalogEntry {
@@ -4090,7 +4091,11 @@ impl<'a> CaptureTxn<'a> {
         for row in result.rows() {
             out.insert(
                 DecisionId::from(required_uuid_column(row, result.columns(), "id")?),
-                decision_status_from_label(&required_text_column(row, result.columns(), "status")?)?,
+                decision_status_from_label(&required_text_column(
+                    row,
+                    result.columns(),
+                    "status",
+                )?)?,
             );
         }
         Ok(out)

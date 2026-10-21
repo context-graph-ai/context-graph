@@ -517,7 +517,8 @@ fn find_sealed_generation(
             != declaration.target_adapter_version
         || get_text(row, result.columns(), "target_anchor_declaration_version")?
             != declaration.target_anchor_declaration_version
-        || get_text(row, result.columns(), "mapping_contract_id")? != declaration.mapping_contract_id
+        || get_text(row, result.columns(), "mapping_contract_id")?
+            != declaration.mapping_contract_id
         || get_text(row, result.columns(), "mapping_contract_sha256")?
             != declaration.mapping_contract_sha256
         || nonnegative(row, result.columns(), "event_count")? != snapshot.event_count
@@ -649,7 +650,7 @@ fn capture_page(
         }
         let anchors = read_anchors(store, bounds, request.context_id, event.id)?;
         let source_row_sha256 =
-            captured_source_sha256(columns, row, anchors.columns(), anchors.rows());
+            captured_source_sha256(columns, row, &anchors.columns, &anchors.rows);
         if let Some(generation_id) = generation_id {
             persist_membership(
                 store,
@@ -1746,7 +1747,11 @@ fn load_receipt(
         mapping_contract_sha256: get_text(row, result.columns(), "mapping_contract_sha256")?,
         source_watermark: EventWatermark {
             event_count: nonnegative(row, result.columns(), "event_count")?,
-            ordered_source_set_sha256: get_text(row, result.columns(), "ordered_source_set_sha256")?,
+            ordered_source_set_sha256: get_text(
+                row,
+                result.columns(),
+                "ordered_source_set_sha256",
+            )?,
         },
         source_content_sha256: get_text(row, result.columns(), "source_content_sha256")?,
         effective_content_sha256: get_optional_text(
@@ -1860,7 +1865,7 @@ fn load_captured(
     })?;
     let event = decode_event(result.columns(), row)?;
     let anchors = read_anchors(store, bounds, context_id, event_id)?;
-    let hash = captured_source_sha256(result.columns(), row, anchors.columns(), anchors.rows());
+    let hash = captured_source_sha256(result.columns(), row, &anchors.columns, &anchors.rows);
     Ok((
         CapturedEventAndAnchors {
             event,

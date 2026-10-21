@@ -12,8 +12,8 @@
 
 use std::collections::HashMap;
 
-use contextdb_core::Value;
 use crate::consumer_read::ConsumerQueryResult;
+use contextdb_core::Value;
 
 use crate::Result;
 
@@ -25,7 +25,8 @@ pub(crate) trait GraphRows {
     /// declaration, so a read reaching an undeclared table is refused by name before the engine is
     /// asked — which is why every typed read below runs its statements through this one call
     /// rather than reaching for a handle of its own.
-    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult>;
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>)
+    -> Result<ConsumerQueryResult>;
 }
 
 impl crate::Store {

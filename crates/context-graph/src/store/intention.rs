@@ -1188,7 +1188,9 @@ impl Store {
         result
             .rows()
             .first()
-            .map(|row| get_uuid(row, result.columns(), "snapshot_id").map(IntentionSnapshotId::from))
+            .map(|row| {
+                get_uuid(row, result.columns(), "snapshot_id").map(IntentionSnapshotId::from)
+            })
             .transpose()
     }
 

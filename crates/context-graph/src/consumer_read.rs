@@ -465,7 +465,11 @@ impl ConsumerReader {
     /// before the answer was built. What is narrowed HERE is only an answer keyed by table that
     /// carries no rows of the store's data at all: a `SHOW` about tables comes back intersected
     /// with the declaration.
-    pub fn execute(&self, sql: &str, params: &HashMap<String, Value>) -> Result<ConsumerQueryResult> {
+    pub fn execute(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<ConsumerQueryResult> {
         let shape = admit(&self.gate, sql, params)?;
         let answer = self.raw_execute(sql, params)?;
         let mut answered = ConsumerQueryResult::copy_from(&answer);
@@ -516,7 +520,7 @@ impl ConsumerReader {
             // SHORT inventory, which `verify_declaration_against_the_store` reads as "the store
             // does not hold that table" and passes over — a drifted declaration would go
             // unverified on the strength of a page that told us it was incomplete.
-            let Some(next) = answer.continuation else {
+            let Some(next) = answer.continuation.clone() else {
                 return Err(CgError::Engine(
                     "the store's table inventory said more tables were waiting and named no way \
                      to ask for them; a partial inventory would read as tables the store does \
@@ -682,16 +686,16 @@ fn raw_table_inventory(reader: &ConsumerReader) -> Result<BTreeSet<String>> {
     let mut continuation = None;
     loop {
         let answer = reader.raw_metadata(MetadataRequest::Tables, continuation.as_deref())?;
-        let MetadataBody::Tables { items, has_more } = answer.body else {
+        let MetadataBody::Tables { items, has_more } = &answer.body else {
             return Err(CgError::Engine(
                 "the store's table inventory came back as another kind of answer".into(),
             ));
         };
-        tables.extend(items);
+        tables.extend(items.iter().cloned());
         if !has_more {
             return Ok(tables);
         }
-        continuation = Some(answer.continuation.ok_or_else(|| {
+        continuation = Some(answer.continuation.clone().ok_or_else(|| {
             CgError::Engine(
                 "the store's table inventory said more tables were waiting without a continuation"
                     .into(),
@@ -747,10 +751,9 @@ impl ConsumerCursor {
         };
         let page = cursor.first_page();
         let first_page = Some(match narrowing.as_ref() {
-            Some((key, declared)) => ConsumerPage::declared(
-                page,
-                declared_rows(*key, declared, page.rows().to_vec()),
-            ),
+            Some((key, declared)) => {
+                ConsumerPage::declared(page, declared_rows(*key, declared, page.rows().to_vec()))
+            }
             None => ConsumerPage::engine(page.clone()),
         });
         Self {
@@ -788,10 +791,9 @@ impl ConsumerCursor {
         };
         let page = cursor.fetch(rows).map_err(map_engine_err)?;
         Ok(match self.narrowing.as_ref() {
-            Some((key, declared)) => ConsumerPage::declared(
-                &page,
-                declared_rows(*key, declared, page.rows().to_vec()),
-            ),
+            Some((key, declared)) => {
+                ConsumerPage::declared(&page, declared_rows(*key, declared, page.rows().to_vec()))
+            }
             None => ConsumerPage::engine(page),
         })
     }

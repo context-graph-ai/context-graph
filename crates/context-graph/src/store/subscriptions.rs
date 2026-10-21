@@ -816,7 +816,7 @@ fn subscription_cg_err(err: CgError) -> SubscriptionError {
 fn subscription_engine_err(err: contextdb_core::Error) -> SubscriptionError {
     match err {
         contextdb_core::Error::Other(message) if message.starts_with("sink not found") => {
-            SubscriptionError::SinkDdlMissing(message)
+            SubscriptionError::SinkDdlMissing(message.to_string())
         }
         other => SubscriptionError::Engine(map_engine_err(other).to_string()),
     }

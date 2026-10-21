@@ -562,10 +562,11 @@ impl Store {
             if overlay.dropped {
                 continue;
             }
-            let status = decision_status_from_text(&value_text(row, decisions.columns(), "status")?)
-                .ok_or_else(|| {
-                    CgError::Engine("decision source returned invalid status".to_string())
-                })?;
+            let status =
+                decision_status_from_text(&value_text(row, decisions.columns(), "status")?)
+                    .ok_or_else(|| {
+                        CgError::Engine("decision source returned invalid status".to_string())
+                    })?;
             let text = overlay
                 .corrected_value
                 .map(Ok)
