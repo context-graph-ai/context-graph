@@ -5382,7 +5382,7 @@ fn load_claimed_member(
         )
         .map_err(map_engine_err)?;
     #[cfg(feature = "test-support")]
-    LOADED_EVENT_ROWS.with(|rows| rows.set(rows.get() + result.rows.len()));
+    LOADED_EVENT_ROWS.with(|rows| rows.set(rows.get() + result.rows().len()));
     let event_row = result
         .rows()
         .first()
@@ -9728,17 +9728,17 @@ fn assert_session_read_work_for_test(
             let mut served = false;
             let count = selected_events_through(|sql| {
                 let result = session.execute(sql, &params).unwrap();
-                examined += result.trace.rows_examined;
+                examined += result.trace().rows_examined;
                 if sql == SELECTED_STREAM_COUNT_STATEMENT {
-                    assert_eq!(result.rows, vec![vec![Value::Int64(completed + 5)]]);
+                    assert_eq!(result.rows(), vec![vec![Value::Int64(completed + 5)]]);
                     served = matches!(
-                        result.trace.maintained_count.as_deref(),
+                        result.trace().maintained_count.as_deref(),
                         Some(
                             contextdb_engine::maintained_counts::MaintainedCountDisclosure::Used { .. }
                         )
                     );
                 }
-                get_u64(&result.rows[0], &result.columns, "event_count")
+                get_u64(&result.rows()[0], result.columns(), "event_count")
             })
             .unwrap();
             assert_eq!(count, (completed + 3) as u64);
@@ -9749,18 +9749,18 @@ fn assert_session_read_work_for_test(
             .expect("discover the selected pending tail");
         eprintln!(
             "pending_discovery: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
-            discovery.trace.rows_examined, discovery.trace.index_used, discovery.trace.sort_elided
+            discovery.trace().rows_examined, discovery.trace().index_used, discovery.trace().sort_elided
         );
         assert_eq!(
-            discovery.trace.index_used.as_deref(),
+            discovery.trace().index_used.as_deref(),
             Some("idx_event_search_source_events_session_sequence"),
             "{:#?}",
-            discovery.trace
+            discovery.trace()
         );
-        assert!(discovery.trace.sort_elided, "{:#?}", discovery.trace);
-        assert_eq!(discovery.trace.rows_examined, 1, "{:#?}", discovery.trace);
+        assert!(discovery.trace().sort_elided, "{:#?}", discovery.trace());
+        assert_eq!(discovery.trace().rows_examined, 1, "{:#?}", discovery.trace());
         assert_eq!(
-            discovery.rows,
+            discovery.rows(),
             vec![vec![Value::Int64(completed + 4 * neighbours + 1)]]
         );
         params.insert("start".into(), Value::Int64(completed + 2 * neighbours + 1));
@@ -9768,23 +9768,23 @@ fn assert_session_read_work_for_test(
             .execute(SOURCE_POSITION_SESSION_STATEMENT, &params)
             .unwrap();
         assert_eq!(
-            source_position.rows,
+            source_position.rows(),
             vec![vec![Value::Text("selected-session".into())]]
         );
         assert_eq!(
-            source_position.trace.index_used.as_deref(),
+            source_position.trace().index_used.as_deref(),
             Some("idx_event_search_source_events_cursor_range")
         );
         // Relational, no literal: the equality probe examines exactly the rows it returns, so
         // any over-read fails; one row is returned at every history size, so it is also constant.
         assert_eq!(
-            source_position.trace.rows_examined,
-            source_position.rows.len() as u64,
+            source_position.trace().rows_examined,
+            source_position.rows().len() as u64,
             "source-position equality probe examines only the rows it returns"
         );
         eprintln!(
             "source_position: completed={completed}, neighbours={neighbours}, examined={}, index={:?}",
-            source_position.trace.rows_examined, source_position.trace.index_used
+            source_position.trace().rows_examined, source_position.trace().index_used
         );
         params.insert("after".into(), Value::Int64(completed));
         let later = session
@@ -9792,25 +9792,25 @@ fn assert_session_read_work_for_test(
             .unwrap();
         eprintln!(
             "has_later: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
-            later.trace.rows_examined, later.trace.index_used, later.trace.sort_elided
+            later.trace().rows_examined, later.trace().index_used, later.trace().sort_elided
         );
-        assert_eq!(later.trace.rows_examined, 1);
+        assert_eq!(later.trace().rows_examined, 1);
         assert_eq!(
-            later.trace.index_used.as_deref(),
+            later.trace().index_used.as_deref(),
             Some("idx_event_search_source_events_session_sequence")
         );
-        assert!(later.trace.sort_elided);
+        assert!(later.trace().sort_elided);
         assert_eq!(
-            later.rows,
+            later.rows(),
             vec![vec![Value::Int64(completed + 2 * neighbours + 1)]]
         );
-        params.insert("start_ordinal".into(), discovery.rows[0][0].clone());
+        params.insert("start_ordinal".into(), discovery.rows()[0][0].clone());
         let sql = claim_source_statement(3);
         let claim = session
             .execute(&sql, &params)
             .expect("claim three pending entries");
-        assert_eq!(claim.rows.len(), 3);
-        for (offset, row) in claim.rows.iter().enumerate() {
+        assert_eq!(claim.rows().len(), 3);
+        for (offset, row) in claim.rows().iter().enumerate() {
             assert_eq!(
                 row[1],
                 Value::Int64(completed + 4 * neighbours + 1 + offset as i64)
@@ -9825,15 +9825,15 @@ fn assert_session_read_work_for_test(
         }
         eprintln!(
             "claim_batch_examines_only_pending_tail: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
-            claim.trace.rows_examined, claim.trace.index_used, claim.trace.sort_elided
+            claim.trace().rows_examined, claim.trace().index_used, claim.trace().sort_elided
         );
         assert_eq!(
-            claim.trace.index_used.as_deref(),
+            claim.trace().index_used.as_deref(),
             Some("idx_event_search_source_events_session_claim"),
             "{:#?}",
-            claim.trace
+            claim.trace()
         );
-        assert!(claim.trace.sort_elided, "{:#?}", claim.trace);
+        assert!(claim.trace().sort_elided, "{:#?}", claim.trace());
         let explanation = contextdb_engine::cli_render::render_explain(&db, &sql, &params)
             .expect("explain the shipped claim statement");
         assert!(
@@ -9843,10 +9843,10 @@ fn assert_session_read_work_for_test(
         assert!(explanation.contains("sort_elided: true"), "{explanation}");
         eprintln!("claim EXPLAIN at completed={completed}:\n{explanation}");
         assert!(
-            claim.trace.rows_examined >= 3,
+            claim.trace().rows_examined >= 3,
             "account for returned entries"
         );
-        (claim.trace.rows_examined, true)
+        (claim.trace().rows_examined, true)
     }
     let receipts: Vec<_> = [(10, 16), (10, 1_016), (2_010, 16), (2_010, 1_016)]
         .into_iter()
