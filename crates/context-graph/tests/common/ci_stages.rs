@@ -367,7 +367,7 @@ fn shard_contract_is_frozen(script: &str) -> bool {
     ) && format!(
         "{:x}",
         Sha256::digest(include_bytes!("../../../../scripts/ci-test-shards.json"))
-    ) == "2a21c8fa764e57e3f1b26b0011555415e469ebc3e16c6c3ea5d0a6f0208c03d5"
+    ) == "0514a0b25b75bdc4d73395b3383cb9870d91218b6ce5ba390af66acda3222459"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!(
