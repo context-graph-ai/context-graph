@@ -898,7 +898,7 @@ pub fn platform_coverage(mut required: Value, advisory: Value) -> Value {
                 "../../../../.github/workflows/macos-advisory.yml"
             ))
         ),
-        "e29f934518503f1c3378f54b87d5f6bed7893d19f3e462a5dab7366e8c15a545"
+        "149deea4cf3b4ba109b8ee8afac99053d32ddd2a9f738f46d696c720fc170873"
     );
     let frozen_mac: Value = serde_yaml_ng::from_str(include_str!(
         "../../../../.github/workflows/macos-advisory.yml"
@@ -1042,6 +1042,9 @@ steps:
     CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
   with:
     cache-bin: false
+    prefix-key: v1-rust-1.94.1
+    add-rust-environment-hash-key: false
+    save-if: ${{ github.ref == 'refs/heads/dev' }}
     workspaces: workspace/context-graph -> target
     key: feature-qualification-core-v1
 - name: Run feature compatibility qualification
@@ -1122,6 +1125,9 @@ steps:
     CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
   with:
     cache-bin: false
+    prefix-key: v1-rust-1.94.1
+    add-rust-environment-hash-key: false
+    save-if: ${{ github.ref == 'refs/heads/dev' }}
     workspaces: workspace/context-graph -> target
     key: feature-qualification-core-v1
 - name: Run feature compatibility qualification

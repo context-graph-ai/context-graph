@@ -88,6 +88,9 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           cache-bin: false
+          prefix-key: v1-rust-1.94.1
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           workspaces: workspace/context-graph -> target
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
@@ -323,9 +326,13 @@ jobs:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
         with:
           cache-bin: false
+          prefix-key: v1-rust-1.94.1
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           workspaces: workspace/context-graph -> target
           cache-on-failure: true
           key: test-catalog-seed-v3-${{ matrix.bundle == 'acceptance' && 'narrow' || 'workspace' }}
+          add-job-id-key: false
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         env:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
@@ -464,9 +471,13 @@ jobs:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
         with:
           cache-bin: false
+          prefix-key: v1-rust-1.94.1
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           workspaces: workspace/context-graph -> target
           cache-on-failure: true
           key: features-catalog-seed-v3-workspace
+          add-job-id-key: false
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         env:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
@@ -581,6 +592,9 @@ jobs:
         CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
       with:
         cache-bin: false
+        prefix-key: v1-rust-1.94.1
+        add-rust-environment-hash-key: false
+        save-if: ${{ github.ref == 'refs/heads/dev' }}
         workspaces: workspace/context-graph -> target
         key: feature-qualification-core-v1
     - name: Run feature compatibility qualification
@@ -698,6 +712,9 @@ jobs:
         CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
       with:
         cache-bin: false
+        prefix-key: v1-rust-1.94.1
+        add-rust-environment-hash-key: false
+        save-if: ${{ github.ref == 'refs/heads/dev' }}
         workspaces: workspace/context-graph -> target
         key: feature-qualification-sync-v1
     - name: Run feature compatibility qualification

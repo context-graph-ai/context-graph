@@ -86,7 +86,11 @@ debug assertions and overflow checks enabled. Local Cargo profile defaults stay 
 specified in `Cargo.toml`. Linux jobs reclaim preinstalled SDKs with sudo and print
 root disk headroom before and after linking. Disposable `target/tests` scratch
 is removed before compiler cache post hooks, including on failure; `target/tests/trybuild`
-stays so the compile-fail dependency build is cached with the rest of `target`.
+stays so the compile-fail dependency build is cached with the rest of `target`. The nested
+Cargo runs that tests start keep their own build directories under `target`
+(`tests/trybuild`, `no-default-features-check` and `expand-check`), so they are cached
+with it and never rerun, under a test's Cargo environment, the build scripts the
+surrounding build reuses.
 
 The macOS default acceptance bundle temporarily records the digest immutability
 compile proof's inner Cargo boundaries under its existing receipt artifact's
@@ -300,10 +304,14 @@ acceptance, integration and remaining cases, and imports and CLI in three indepe
 jobs: six runtime jobs plus two independent compatibility build jobs, eight Rust jobs per
 platform and sixteen in total. Each runtime job seeds and proves the model once and keeps
 its own Cargo target. Jobs that compile the same selection share one compiler cache entry
-per platform (default acceptance compiles the narrow selection; the other default bundles
+per platform (their cache keys omit the job identity, `add-job-id-key: false`) (default acceptance compiles the narrow selection; the other default bundles
 compile the workspace; every feature bundle compiles the workspace with event-search test
-support), and a job that fails still saves its compiled dependencies, so a later run does
-not start cold because an earlier one failed. `python3 scripts/ci-test-shards.py bundle default` (or `features`) uses
+support). Only pushes to `dev` save compiler caches, and a `dev` job that fails still saves
+its compiled dependencies; pull requests restore the `dev` entries, which GitHub serves to
+every branch targeting `dev`, and save nothing, so pull-request entries cannot evict them.
+Compiler cache keys name the pinned toolchain in their prefix (`v1-rust-1.94.1`) instead of
+hashing every Rust release the runner image preinstalls, so a runner image update does not
+miss the `dev` cache. `python3 scripts/ci-test-shards.py bundle default` (or `features`) uses
 `GATE_PHYSICAL_BUNDLE` to select the displayed bundle. Each logical stage retains its
 own `GATE_SHARD`, receipt directory and existing artifact identity. A failed stage
 stops the bundle, preserves its exit status and uploads available evidence; later
