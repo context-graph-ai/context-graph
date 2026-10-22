@@ -227,13 +227,15 @@ feature_qualification() {
 }
 feature_qualification_sync() {
     feature_builds_sync
-    feature_docs
 }
 features_tests() {
     case "${GATE_SHARD:-}" in
         acceptance|integration-and-rest|import-and-cli) ;;
         *) pending 'feature tests stage requires an exact shard' ;;
     esac
+    if [[ "$GATE_SHARD" == acceptance ]]; then
+        feature_docs
+    fi
     python3 scripts/ci-test-shards.py run features "$GATE_SHARD"
 }
 

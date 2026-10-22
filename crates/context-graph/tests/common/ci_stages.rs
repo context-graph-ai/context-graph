@@ -32,7 +32,7 @@ pub fn diagnostic_contract_matches(
         && format!("{:x}", Sha256::digest(helper))
             == "eda85e5d2d63efe2a9aa1e0f44951978b75bb2fd371d38a1d9946e8fd92f9473"
         && format!("{:x}", Sha256::digest(entrypoint))
-            == "bb3d9bc7149d201fc7b1ce23e5b1079b9859a92ca44981f8143c49de964ebdd0"
+            == "29c3bb6f70093f6962a4fba66852774f7aa93c49b5f91a8a48b16f0dd7bdceee"
         && format!("{:x}", Sha256::digest(controls))
             == "e8ef2a01c7bd8aadc4fad08bf495bb1ddf9988e032dc772448a60fbc97338615"
 }
@@ -338,11 +338,11 @@ fn shard_contract_is_frozen(script: &str) -> bool {
         ),
         (
             "feature_qualification_sync",
-            "664a16d58c155042d7da1f5e2d36dd2fc885ad4fbd88c32a63a03f129fc1eec4",
+            "ca87a5fc7df6047eb0eb40d215da32e69c33fff1025546acb9fc59d82dcd2e2c",
         ),
         (
             "features_tests",
-            "34dbc761338cdedd97e451bab78afe520638c8a9b81309ea16527a9dacc0c218",
+            "121125852235a5d9c71f79edd0ec012d1dbc347b779de9f62b6a3fdaa9e077c9",
         ),
         (
             "default_wall_isolated",
@@ -898,7 +898,7 @@ pub fn platform_coverage(mut required: Value, advisory: Value) -> Value {
                 "../../../../.github/workflows/macos-advisory.yml"
             ))
         ),
-        "149deea4cf3b4ba109b8ee8afac99053d32ddd2a9f738f46d696c720fc170873"
+        "e036617f82581348085d77a879a9c5a1e7e87ee23902e10e4af35033062bd4c9"
     );
     let frozen_mac: Value = serde_yaml_ng::from_str(include_str!(
         "../../../../.github/workflows/macos-advisory.yml"
@@ -1156,7 +1156,7 @@ steps:
     path: ${{ runner.temp }}/job-receipt
     retention-days: 14
     if-no-files-found: error
-"###.replace("default and minimal libraries", "sync, CLI and doctests")
+"###.replace("default and minimal libraries", "sync and CLI")
         .replace("feature-qualification-core", "feature-qualification-sync")).unwrap();
     assert_eq!(required["jobs"]["feature-qualification-sync"], compile_sync);
     // macOS runs both compatibility build jobs unchanged; only the runner and its label differ.

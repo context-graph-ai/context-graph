@@ -49,9 +49,9 @@ runs are cancelled; push and dispatch runs are not.
 | `lint` | `ubuntu-latest` | `bash scripts/gate.sh lint` | `cargo deny`, the expanded-library and dependency-tree scans that keep EmbeddingGemma out of the default library, `cargo fmt --check` and `clippy -D warnings` for the workspace. |
 | `docs` | `ubuntu-latest` | `bash scripts/gate.sh docs` | Every behaviour sentence in the published pages names a live test ([`validate-doc-coverage.py`](../scripts/validate-doc-coverage.py)), and the validator still rejects a dead reference and an unbound claim ([`check-doc-validator-negative-control.sh`](../scripts/check-doc-validator-negative-control.sh)). |
 | `test` | `ubuntu-latest` | `bash scripts/gate.sh public-model`, then `bash scripts/gate.sh default` | Offline real Nomic model proofs, `cargo test --workspace --no-run`, explicit doctests, three disjoint nextest bundles, the deterministic test-estate audit and the combined JUnit duration report. |
-| `features` | `ubuntu-latest` | `python3 scripts/ci-test-shards.py bundle features --tests-only` | The complete `event-search-test-support` runtime suite, with all model proofs and disjoint receipt accounting. |
+| `features` | `ubuntu-latest` | `python3 scripts/ci-test-shards.py bundle features --tests-only` | The complete `event-search-test-support` runtime suite and, in the acceptance bundle, the complete feature doctests, with all model proofs and disjoint receipt accounting. |
 | `Feature compatibility — default and minimal libraries (ubuntu-latest)` | `ubuntu-latest` | `bash scripts/gate.sh feature-qualification-core` | Locked library builds with default features and no default features. |
-| `Feature compatibility — sync, CLI and doctests (ubuntu-latest)` | `ubuntu-latest` | `bash scripts/gate.sh feature-qualification-sync` | Locked `fabric-sync` library and CLI builds, followed by the complete feature doctests. |
+| `Feature compatibility — sync and CLI (ubuntu-latest)` | `ubuntu-latest` | `bash scripts/gate.sh feature-qualification-sync` | Locked `fabric-sync` library and CLI builds. |
 | `CI controls` | `ubuntu-latest` | `python3 scripts/tests/test_ci_qualification.py` | Complete CI qualification and release safety controls, once per platform. |
 | **`PR checks`** | `ubuntu-latest` | — | Stable aggregate. Fails unless exactly `source`, `lint`, `docs`, `test`, `features`, `controls`, `feature-qualification-core` and `feature-qualification-sync` report `success`; a failed, cancelled, skipped, missing or unexpected job fails it. The complete Linux default and feature inventories must also verify before this check succeeds. |
 
@@ -77,7 +77,7 @@ cases, and verifies exactly every nonignored test ran once per platform and feat
 variant. Ignored cases remain excluded; the existing ignored measurement audit runs
 explicitly against each merged default JUnit only after the complete union verifies.
 Default compile-only examples and default doctests run in the integration
-bundle. Feature compatibility builds and feature doctests run in the two independent required jobs. Default acceptance compiles only `context-graph --test acceptance`; the other
+bundle. Feature compatibility builds run in the two independent required jobs; feature doctests run in the event-search support acceptance bundle. Default acceptance compiles only `context-graph --test acceptance`; the other
 bundles still compile the workspace. Feature builds retain workspace-wide feature
 resolution, so filtering alone does not reduce their compilation closure.
 
@@ -376,7 +376,10 @@ checks from `ci.yml`; advisory runs cannot authorize delivery.
 The compatibility build jobs are unconditional and independent of the six runtime
 jobs on each platform. `feature-qualification-core` runs the original default and minimal library
 builds. `feature-qualification-sync` runs the original fabric-sync library and CLI
-builds, then feature doctests. `feature-qualification` reproduces both groups in order.
+builds. The feature doctests run in the event-search support acceptance job, before its
+tests, where they reuse the workspace libraries that job already compiles with
+event-search test support instead of compiling that closure a second time.
+`feature-qualification` reproduces both build groups and then the feature doctests.
 Each compile job records its selected source, actual commands, compiler identities and
 job result without a shard or nextest inventory. The existing local `features`, sharded
 `features`, `pr` and `extended-public` stages retain all builds, tests and doctests in

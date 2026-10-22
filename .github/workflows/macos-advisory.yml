@@ -664,7 +664,7 @@ jobs:
         retention-days: 14
         if-no-files-found: error
   feature-qualification-sync:
-    name: Feature compatibility — sync, CLI and doctests (macos-latest)
+    name: Feature compatibility — sync and CLI (macos-latest)
     runs-on: macos-latest
     timeout-minutes: 120
     steps:

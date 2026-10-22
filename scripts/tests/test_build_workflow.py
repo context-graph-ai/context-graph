@@ -888,7 +888,7 @@ def admission_run(workflow, event='push', ref='refs/heads/dev', repository=REPOS
         run.update(run_changes or {})
         job_rows = [dict(name=name, conclusion='success') for name in
                     ('source', 'lint (ubuntu-latest)', 'docs',
-                     'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync, CLI and doctests (ubuntu-latest)',
+                     'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync and CLI (ubuntu-latest)',
                      *[f'Default tests — {bundle} ({os})'
                        for bundle in ('acceptance', 'integration-and-rest', 'import-and-cli')
                        for os in ('ubuntu-latest',)],
@@ -941,7 +941,7 @@ def check_admission(workflow):
         require(any('actions/workflows/ci.yml/runs' in arg for call in calls for arg in call), 'manual selects ci.yml push runs')
         require(any('/jobs' in arg and 'filter=latest' in arg for call in calls for arg in call), 'manual verifies latest attempt')
     required_jobs = ('source', 'docs', 'PR checks', 'lint (ubuntu-latest)',
-                     'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync, CLI and doctests (ubuntu-latest)',
+                     'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync and CLI (ubuntu-latest)',
                      'Default tests — acceptance (ubuntu-latest)',
                      'Default tests — integration-and-rest (ubuntu-latest)',
                      'Default tests — import-and-cli (ubuntu-latest)',
@@ -1195,7 +1195,7 @@ while read -r id; do
  if python3 - <<'JOBS'
 import json, os, pathlib
 rows = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'],'jobs').read_text())['jobs']
-expected = {'source', 'docs', 'PR checks', 'lint (ubuntu-latest)', 'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync, CLI and doctests (ubuntu-latest)'}
+expected = {'source', 'docs', 'PR checks', 'lint (ubuntu-latest)', 'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync and CLI (ubuntu-latest)'}
 for bundle in ('acceptance', 'integration-and-rest', 'import-and-cli'):
     expected.add(f'Default tests — {bundle} (ubuntu-latest)')
     expected.add(f'Event-search support tests — {bundle} (ubuntu-latest)')
@@ -1460,7 +1460,7 @@ PUBLISH_WORKFLOW_SETTINGS_SHA256 = '8bc0589e150ba5a54e0506c0edf7390b95e75377cae3
 
 
 # Complete parsed mappings are pinned independently of workflow-supplied values.
-BUILD_WORKFLOW_SHA256 = '303d86fb46f0072d97b5d2be1485612d9e1c34df65aa8b391049685c4c9ec281'
+BUILD_WORKFLOW_SHA256 = '0f95429addfd4037db9754b92b339dceecfb0ce67054cf75590afdd9f0d3cbc4'
 DEVELOPMENT_BINARIES_JOB_SHA256 = 'c510129efa6b318d4c850a1697338dbf84faff73740c5ce67aa5166e2cedaa5c'
 
 

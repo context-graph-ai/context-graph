@@ -744,9 +744,9 @@ else: print('public default dependency')
         sync = [
             ['build', '--locked', '-p', 'context-graph', '--features', 'fabric-sync', '--lib'],
             ['build', '--locked', '-p', 'context-graph-cli'],
-            ['test', '--workspace', '--doc', '--no-fail-fast', '--features', 'context-graph-cli/event-search-test-support'],
         ]
-        for stage, expected in [('feature-qualification-core', core), ('feature-qualification-sync', sync), ('feature-qualification', core + sync)]:
+        docs = [['test', '--workspace', '--doc', '--no-fail-fast', '--features', 'context-graph-cli/event-search-test-support']]
+        for stage, expected in [('feature-qualification-core', core), ('feature-qualification-sync', sync), ('feature-qualification', core + sync + docs)]:
             result = self.run_stage(stage)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.commands(), expected)
@@ -754,10 +754,10 @@ else: print('public default dependency')
             self.assertEqual(receipt['stage'], stage)
             self.assertEqual(receipt['test_count'], 0)
             self.assertEqual(receipt['tools']['nextest'], 'not used')
-            self.assertEqual(receipt['cargo_test_inventory'], [] if stage == 'feature-qualification-core' else ['src/lib.rs - docs (line 12)'])
+            self.assertEqual(receipt['cargo_test_inventory'], ['src/lib.rs - docs (line 12)'] if stage == 'feature-qualification' else [])
             self.assertEqual(receipt['commands'][0], 'bash scripts/gate.sh ' + stage)
             self.trace.unlink()
-            for failed in ('build', 'test') if stage != 'feature-qualification-core' else ('build',):
+            for failed in ('build', 'test') if stage == 'feature-qualification' else ('build',):
                 result = self.run_stage(stage, FAIL_SUBCOMMAND=failed)
                 self.assertEqual(result.returncode, 23, result.stderr)
                 receipt = json.loads((self.root / 'job-receipt' / (stage + '.json')).read_text())
@@ -780,6 +780,15 @@ else: print('public default dependency')
         self.assertEqual(receipt['commands'][0], 'bash scripts/gate.sh features-tests')
         self.assertEqual(receipt['test_count'], 2)
         self.assertEqual(len(receipt['executed_feature_inventory']), 2)
+        # The acceptance bundle alone runs the complete feature doctests, before its tests.
+        doc = 'cargo test --workspace --doc --no-fail-fast --features context-graph-cli/event-search-test-support'
+        self.assertEqual(receipt['commands'][1], doc)
+        self.assertEqual(receipt['cargo_test_inventory'], ['src/lib.rs - docs (line 12)'])
+        other = self.run_stage('features-tests', **dict(env, GATE_SHARD='import-and-cli'))
+        self.assertEqual(other.returncode, 0, other.stderr)
+        other_receipt = json.loads((self.root / 'job-receipt/features-tests.json').read_text())
+        self.assertNotIn(doc, other_receipt['commands'])
+        self.assertEqual(other_receipt['cargo_test_inventory'], [])
         result = self.run_stage('features-tests', **dict(env, RUNNER_OS='macOS'))
         self.assertEqual(result.returncode, 0, result.stderr)
         for system, shard in [('macOS', ''), ('macOS', 'wrong'), ('Linux', ''), ('Linux', 'wrong')]:

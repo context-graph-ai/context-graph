@@ -510,7 +510,7 @@ class ShardInventory(unittest.TestCase):
     def test_compile_jobs_are_exact_required_source_bound_commands(self):
         """Both compatibility jobs retain their complete reviewed execution and admission mapping."""
         import hashlib
-        pins = {'feature-qualification-core': '14a7f84756b8f77e292d4db534418f58e954124e34e2180e659ca04ff6a6f665', 'feature-qualification-sync': '54f2bd8118d08f541e341876ae877edfcd477b46a5d0813d03d4bf5dc89cbb2b'}
+        pins = {'feature-qualification-core': '14a7f84756b8f77e292d4db534418f58e954124e34e2180e659ca04ff6a6f665', 'feature-qualification-sync': 'fc7523f5837733e7f82635d4921a6ad3ed682ef46d05461367245983f5adf280'}
         def valid(workflow):
             for name, digest in pins.items():
                 if hashlib.sha256(json.dumps(workflow['jobs'].get(name), sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest() != digest:

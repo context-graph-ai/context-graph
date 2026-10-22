@@ -193,7 +193,10 @@ Local model seeding retains `cg model fetch --defaults`. Ordinary CLI builds and
 The compatibility build jobs are unconditional and independent of the six runtime
 jobs on each platform. `feature-qualification-core` runs the original default and minimal library
 builds. `feature-qualification-sync` runs the original fabric-sync library and CLI
-builds, then feature doctests. `feature-qualification` reproduces both groups in order.
+builds. The feature doctests run in the event-search support acceptance job, before its
+tests, where they reuse the workspace libraries that job already compiles with
+event-search test support instead of compiling that closure a second time.
+`feature-qualification` reproduces both build groups and then the feature doctests.
 Each compile job records its selected source, actual commands, compiler identities and
 job result without a shard or nextest inventory. The existing local `features`, sharded
 `features`, `pr` and `extended-public` stages retain all builds, tests and doctests in

@@ -854,7 +854,7 @@ jobs:
         retention-days: 14
         if-no-files-found: error
   feature-qualification-sync:
-    name: Feature compatibility — sync, CLI and doctests (ubuntu-latest)
+    name: Feature compatibility — sync and CLI (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
