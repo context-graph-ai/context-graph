@@ -44,11 +44,11 @@ candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
 criterion = { version = "0.8", features = ["html_reports"] }
-contextdb-core = { path = "../contextdb/crates/contextdb-core" }
-contextdb-engine = { path = "../contextdb/crates/contextdb-engine" }
-contextdb-parser = { path = "../contextdb/crates/contextdb-parser" }
-contextdb-tx = { path = "../contextdb/crates/contextdb-tx" }
-contextdb-vector = { path = "../contextdb/crates/contextdb-vector" }
+contextdb-core = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
+contextdb-engine = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
+contextdb-parser = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
+contextdb-tx = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
+contextdb-vector = { git = "https://github.com/context-graph-ai/contextdb", rev = "6a0d4b42222f3f3063e74d16d780a3e94a87163e" }
 safetensors = "0.7.0"
 sha2 = "0.10.9"
 tempfile = "3.23.0"
@@ -65,16 +65,3 @@ tiny_http = "0.12.0"
 which = "8.0.0"
 pollster = "0.4.0"
 rayon = "1.12.0"
-
-[patch."https://github.com/context-graph-ai/contextdb"]
-contextdb-core = { path = "../contextdb/crates/contextdb-core" }
-contextdb-engine = { path = "../contextdb/crates/contextdb-engine" }
-contextdb-graph = { path = "../contextdb/crates/contextdb-graph" }
-contextdb-hnsw = { path = "../contextdb/crates/contextdb-hnsw" }
-contextdb-parser = { path = "../contextdb/crates/contextdb-parser" }
-contextdb-planner = { path = "../contextdb/crates/contextdb-planner" }
-contextdb-redb = { path = "../contextdb/crates/contextdb-redb" }
-contextdb-relational = { path = "../contextdb/crates/contextdb-relational" }
-contextdb-server = { path = "../contextdb/crates/contextdb-server" }
-contextdb-tx = { path = "../contextdb/crates/contextdb-tx" }
-contextdb-vector = { path = "../contextdb/crates/contextdb-vector" }
