@@ -32,7 +32,10 @@ contributor runs the same commands locally.
 Automatic pushes run only on `dev`, preserving development publication. Candidate
 branches receive both platform workflows through pull requests or exact-SHA manual
 dispatch, without duplicate push runs. Display-name changes apply to future runs;
-existing runs retain their recorded names. Job names, `PR checks`, and
+existing runs retain their recorded names. The sync compatibility job was renamed on
+both platforms from `Feature compatibility — sync, CLI and doctests` to
+`Feature compatibility — sync and CLI` (`ci.yml` and `macos-advisory.yml`) because its
+feature doctests moved to the event-search acceptance job. `PR checks` and
 `macOS advisory results` are unchanged.
 
 ## PR checks (`ci.yml`)
