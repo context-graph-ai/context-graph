@@ -524,11 +524,11 @@ def legacy_family(family, workflow, ci, download, readme, advisory=None):
         required = parse_workflow(ci)
         advisory = parse_workflow(advisory if advisory is not None else
                                   (ROOT/'.github/workflows/macos-advisory.yml').read_text())
-        require(required.get('name') == 'ci' and advisory.get('name') == 'macOS advisory',
+        require(required.get('name') == 'Linux CI' and advisory.get('name') == 'macOS CI (advisory)',
                 'independent required and advisory workflow roles')
         for lane, os_name, aggregate, dependencies in (
                 (required, 'ubuntu-latest', 'required', {'source', 'lint', 'docs', 'controls', 'test', 'features', 'feature-qualification-core', 'feature-qualification-sync'}),
-                (advisory, 'macos-latest', 'macos-advisory', {'lint', 'controls', 'test', 'features'})):
+                (advisory, 'macos-latest', 'macos-advisory', {'lint', 'controls', 'test', 'features', 'feature-qualification-core', 'feature-qualification-sync'})):
             require(set(lane['jobs'].get(aggregate, {}).get('needs', [])) == dependencies,
                     'exact independent platform aggregate dependencies')
             require(('required' in lane['jobs']) == (aggregate == 'required'),
@@ -537,11 +537,7 @@ def legacy_family(family, workflow, ci, download, readme, advisory=None):
                 job = lane['jobs'].get(name, {})
                 expected_matrix = {'os': [os_name]}
                 if name in ('test', 'features'):
-                    bundles = ('acceptance', 'integration-and-rest + import-and-cli')
-                    if os_name == 'ubuntu-latest':
-                        bundles = ('acceptance', 'integration-and-rest', 'import-and-cli')
-                    if name == 'features' and os_name == 'macos-latest':
-                        bundles = ('integration-and-rest + import-and-cli + acceptance',)
+                    bundles = ('acceptance', 'integration-and-rest', 'import-and-cli')
                     expected_matrix = {'include': [{'os': os_name, 'bundle': bundle} for bundle in bundles]}
                 require(job.get('runs-on') == '${{ matrix.os }}' and
                         job.get('strategy', {}).get('matrix') == expected_matrix,
@@ -672,13 +668,13 @@ def check_triggers(workflow):
 
 
 def check_ci_triggers(workflow):
-    """Correctness runs on every push, every pull request and manual dispatch."""
+    """Correctness runs on dev pushes, every pull request and manual dispatch."""
     events = triggers(workflow)
     require(isinstance(events, dict) and
             set(events) == {'push', 'pull_request', 'workflow_dispatch'},
             'CI retains push, pull request and manual dispatch triggers')
-    for event in ('push', 'pull_request'):
-        require(events[event] in (None, {}), event + ' must be unrestricted')
+    require(events['push'] == {'branches': ['dev']}, 'automatic pushes select only dev')
+    require(events['pull_request'] in (None, {}), 'pull requests must be unrestricted')
 
 
 def check_concurrency(workflow):
@@ -892,7 +888,7 @@ def admission_run(workflow, event='push', ref='refs/heads/dev', repository=REPOS
         run.update(run_changes or {})
         job_rows = [dict(name=name, conclusion='success') for name in
                     ('source', 'lint (ubuntu-latest)', 'docs',
-                     'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync, CLI and doctests (ubuntu-latest)',
+                     'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync and CLI (ubuntu-latest)',
                      *[f'Default tests — {bundle} ({os})'
                        for bundle in ('acceptance', 'integration-and-rest', 'import-and-cli')
                        for os in ('ubuntu-latest',)],
@@ -945,7 +941,7 @@ def check_admission(workflow):
         require(any('actions/workflows/ci.yml/runs' in arg for call in calls for arg in call), 'manual selects ci.yml push runs')
         require(any('/jobs' in arg and 'filter=latest' in arg for call in calls for arg in call), 'manual verifies latest attempt')
     required_jobs = ('source', 'docs', 'PR checks', 'lint (ubuntu-latest)',
-                     'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync, CLI and doctests (ubuntu-latest)',
+                     'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync and CLI (ubuntu-latest)',
                      'Default tests — acceptance (ubuntu-latest)',
                      'Default tests — integration-and-rest (ubuntu-latest)',
                      'Default tests — import-and-cli (ubuntu-latest)',
@@ -1199,7 +1195,7 @@ while read -r id; do
  if python3 - <<'JOBS'
 import json, os, pathlib
 rows = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'],'jobs').read_text())['jobs']
-expected = {'source', 'docs', 'PR checks', 'lint (ubuntu-latest)', 'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync, CLI and doctests (ubuntu-latest)'}
+expected = {'source', 'docs', 'PR checks', 'lint (ubuntu-latest)', 'CI controls (ubuntu-latest)', 'Feature compatibility — default and minimal libraries (ubuntu-latest)', 'Feature compatibility — sync and CLI (ubuntu-latest)'}
 for bundle in ('acceptance', 'integration-and-rest', 'import-and-cli'):
     expected.add(f'Default tests — {bundle} (ubuntu-latest)')
     expected.add(f'Event-search support tests — {bundle} (ubuntu-latest)')
@@ -1464,7 +1460,7 @@ PUBLISH_WORKFLOW_SETTINGS_SHA256 = '8bc0589e150ba5a54e0506c0edf7390b95e75377cae3
 
 
 # Complete parsed mappings are pinned independently of workflow-supplied values.
-BUILD_WORKFLOW_SHA256 = '303d86fb46f0072d97b5d2be1485612d9e1c34df65aa8b391049685c4c9ec281'
+BUILD_WORKFLOW_SHA256 = '0f95429addfd4037db9754b92b339dceecfb0ce67054cf75590afdd9f0d3cbc4'
 DEVELOPMENT_BINARIES_JOB_SHA256 = 'c510129efa6b318d4c850a1697338dbf84faff73740c5ce67aa5166e2cedaa5c'
 
 
@@ -1604,38 +1600,43 @@ class BuildWorkflow(unittest.TestCase):
                 check_admission(changed)
 
     def test_ci_trigger_set(self):
-        """Correctness runs on every push, every pull request and manual dispatch."""
-        check_ci_triggers(parse_workflow((ROOT/'.github/workflows/ci.yml').read_text()))
+        """Both platforms run on dev pushes, every pull request and exact-SHA dispatch."""
+        for filename in ('ci.yml', 'macos-advisory.yml'):
+            with self.subTest(workflow=filename):
+                check_ci_triggers(parse_workflow((ROOT/'.github/workflows'/filename).read_text()))
 
     def test_ci_trigger_controls(self):
-        """Branch, tag, path and activity filters cannot narrow correctness admission."""
+        """Both platforms reject duplicate candidate pushes and narrowed PR admission."""
         import copy
-        workflow = parse_workflow((ROOT/'.github/workflows/ci.yml').read_text())
-        events = triggers(workflow)
-        events['push'] = None
-        events['pull_request'] = None
-        check_ci_triggers(workflow)
-        check_caller(workflow)
-        for event in ('push', 'pull_request', 'workflow_dispatch'):
-            changed = copy.deepcopy(workflow)
-            del triggers(changed)[event]
-            with self.subTest(missing=event), self.assertRaises(AssertionError):
-                check_ci_triggers(changed)
-        for event in ('push', 'pull_request'):
-            for key, value in (('branches', ['dev']), ('branches-ignore', ['main']),
-                               ('tags', ['v*']), ('paths', ['src/**']),
-                               ('paths-ignore', ['docs/**']), ('types', ['opened'])):
+        for filename in ('ci.yml', 'macos-advisory.yml'):
+            workflow = parse_workflow((ROOT/'.github/workflows'/filename).read_text())
+            check_ci_triggers(workflow)
+            for event in ('push', 'pull_request', 'workflow_dispatch'):
                 changed = copy.deepcopy(workflow)
-                triggers(changed)[event] = {key: value}
-                with self.subTest(event=event, filter=key), self.assertRaises(AssertionError):
+                del triggers(changed)[event]
+                with self.subTest(workflow=filename, missing=event), self.assertRaises(AssertionError):
                     check_ci_triggers(changed)
+            for event, configs in (
+                    ('push', [None, {}, {'branches': ['dev', 'ci-macos-candidate']},
+                              {'branches': ['**']}, {'branches': ['ci-macos-candidate']},
+                              {'branches': ['dev'], 'tags': ['v*']},
+                              {'branches': ['dev'], 'paths-ignore': ['docs/**']}]),
+                    ('pull_request', [{'branches': ['dev']}, {'branches-ignore': ['main']},
+                                      {'paths': ['src/**']}, {'paths-ignore': ['docs/**']},
+                                      {'types': ['opened']}] )):
+                for config in configs:
+                    changed = copy.deepcopy(workflow)
+                    triggers(changed)[event] = config
+                    with self.subTest(workflow=filename, event=event, config=config), self.assertRaises(AssertionError):
+                        check_ci_triggers(changed)
 
     def test_ci_rejects_branch_filtered_push(self):
-        """A push trigger limited to a named branch is refused for correctness admission."""
-        workflow = parse_workflow((ROOT/'.github/workflows/ci.yml').read_text())
-        triggers(workflow)['push'] = {'branches': ['feature-integration']}
-        with self.assertRaises(AssertionError):
-            check_ci_triggers(workflow)
+        """Automatic correctness pushes select dev alone, never another named branch."""
+        for filename in ('ci.yml', 'macos-advisory.yml'):
+            workflow = parse_workflow((ROOT/'.github/workflows'/filename).read_text())
+            triggers(workflow)['push'] = {'branches': ['feature-integration']}
+            with self.subTest(workflow=filename), self.assertRaises(AssertionError):
+                check_ci_triggers(workflow)
 
     def test_publisher_execution_settings_controls(self):
         """Only pinned job fields and inherited workflow execution settings may publish."""
@@ -2307,6 +2308,12 @@ STALE_RECEIPTS
             legacy_family('platforms', yaml.safe_dump(build), yaml.safe_dump(required), '', '',
                           yaml.safe_dump(optional))
         check(workflow, ci, advisory)
+        for key, old_name in (('required', 'ci'), ('advisory', 'macOS advisory')):
+            required, optional = copy.deepcopy(ci), copy.deepcopy(advisory)
+            lane = required if key == 'required' else optional
+            lane['name'] = old_name
+            with self.subTest(lane=key, old_name=old_name), self.assertRaises(AssertionError):
+                check(workflow, required, optional)
         for filename in ('required', 'advisory'):
             for name in ('lint', 'controls', 'test', 'features'):
                 for systems in ([], ['ubuntu-latest', 'macos-latest'],

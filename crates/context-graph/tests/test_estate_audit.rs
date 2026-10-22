@@ -961,7 +961,7 @@ fn default_measurement_is_wired(ci: &str, dispatcher: &str, gate: &str, stage: &
     let union = body("shard_union");
     let verify = union.find("python3 scripts/ci-test-shards.py verify");
     let copy = union.find("cp \"$RUNNER_TEMP/shard-receipts/default-$system.xml\" \"$repository_root/target/nextest/gate/junit.xml\"");
-    let wall_name = if stage == "shard-union-linux-isolated" {
+    let wall_name = if stage.ends_with("-isolated") {
         "default_wall_isolated"
     } else {
         "default_wall"
@@ -979,7 +979,7 @@ fn default_measurement_is_wired(ci: &str, dispatcher: &str, gate: &str, stage: &
             .contains("python3 scripts/ci-test-shards.py run default \"$GATE_SHARD\"")
         && union.contains("for system in \"${systems[@]}\"; do")
         && union.contains("shard-union-linux|shard-union-linux-isolated) systems=(Linux) ;;")
-        && union.contains("shard-union-macos) systems=(macOS) ;;")
+        && union.contains("shard-union-macos|shard-union-macos-isolated) systems=(macOS) ;;")
         && union.contains("--system \"${systems[0]}\"")
         && matches!((verify, copy, wall), (Some(v), Some(c), Some(w)) if v < c && c < w)
         && body(wall_name)
@@ -988,7 +988,7 @@ fn default_measurement_is_wired(ci: &str, dispatcher: &str, gate: &str, stage: &
             .contains("gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact")
         && body(wall_name)
             .contains("python3 scripts/check-gate-wall-clock.py --junit \"$CG_GATE_JUNIT\"")
-        && (stage != "shard-union-linux-isolated" || body(wall_name).contains(
+        && (!stage.ends_with("-isolated") || body(wall_name).contains(
             "cargo test --locked --manifest-path scripts/gate-wall-audit/Cargo.toml --target-dir \"$RUNNER_TEMP/gate-wall-audit-target\" --test test_estate_audit"))
 }
 
@@ -1062,7 +1062,7 @@ fn the_ignored_wall_clock_arm_is_invoked_by_name_in_the_gate_script_and_ci() {
         (
             std::fs::read_to_string(root.join(".github/workflows/macos-advisory.yml"))
                 .expect("advisory workflow"),
-            "shard-union-macos",
+            "shard-union-macos-isolated",
         ),
     ] {
         assert!(default_measurement_is_wired(

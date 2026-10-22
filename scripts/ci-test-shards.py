@@ -3,12 +3,15 @@
 import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 import os
+import platform
 import re
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -173,15 +176,57 @@ def run(variant, shard):
                    contextdb_sha=re.search(r'contextdb[?]rev=([0-9a-f]{40})', (ROOT/'Cargo.lock').read_text())[1],
                    commands=[listing, execution],
                    profile=execution[execution.index('--profile') + 1], exit_code=1)
+    diagnostic_env = None
+    if variant == 'default' and shard == 'acceptance' and os.environ.get('RUNNER_OS') == 'macOS':
+        # Runtime runner injection avoids Cargo replacing CARGO when starting nextest.
+        # No test is selected/removed and no additional Cargo command is executed.
+        triple = {'arm64': 'AARCH64_APPLE_DARWIN', 'x86_64': 'X86_64_APPLE_DARWIN'}[platform.machine()]
+        runner_key = 'CARGO_TARGET_' + triple + '_RUNNER'
+        if any(key in os.environ for key in ('CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER',
+                                              'CARGO_TARGET_X86_64_APPLE_DARWIN_RUNNER')):
+            raise ValueError('diagnostics require the existing native runner shape')
+        wrapper = ROOT / 'scripts/ci-trybuild-cargo.py'
+        if any(char.isspace() for char in str(wrapper)):
+            raise ValueError('nextest runner path must contain no whitespace')
+        real_cargo = subprocess.check_output(
+            ['rustup', 'which', '--toolchain', '1.94.1', 'cargo'], text=True).strip()
+        diagnostics = destination / 'trybuild-diagnostics'
+        diagnostics.mkdir()
+        spec = importlib.util.spec_from_file_location('trybuild_diagnostics', wrapper)
+        diagnostic_helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(diagnostic_helper)
+        tools = dict(helper=diagnostic_helper.identity(wrapper),
+                     python=diagnostic_helper.identity(sys.executable),
+                     cargo=diagnostic_helper.identity(real_cargo),
+                     rustc=diagnostic_helper.identity(Path(real_cargo).parent / 'rustc'),
+                     nextest=diagnostic_helper.identity(shutil.which('cargo-nextest')))
+        (diagnostics / 'tool.json').write_text(json.dumps(dict(
+            tools=tools,
+            real_cargo=real_cargo, sha256=hashlib.sha256(Path(real_cargo).read_bytes()).hexdigest(),
+            toolchain='1.94.1', runner_key=runner_key), sort_keys=True) + '\n')
+        diagnostic_env = dict(os.environ, CG_TRYBUILD_REAL_CARGO=real_cargo,
+                              CG_TRYBUILD_DIAG=str(diagnostics.resolve()), CG_TRYBUILD_ROOT=str(ROOT))
+        diagnostic_env[runner_key] = str(wrapper) + ' --test-runner'
     try:
         listing_result = subprocess.run(listing, text=True, stdout=subprocess.PIPE, check=True)
         inventory(strict_json(listing_result.stdout))
         (destination / 'inventory.json').write_text(listing_result.stdout)
         (destination / 'owned-inventory.json').write_text(
             json.dumps(owned_inventory(listing_result.stdout, shard), sort_keys=True)+'\n')
-        receipt['exit_code'] = subprocess.run(execution, check=False).returncode
+        receipt['exit_code'] = subprocess.run(execution, env=diagnostic_env, check=False).returncode
     finally:
         junit = ROOT / 'target/nextest/gate/junit.xml'
+        if diagnostic_env is not None:
+            # Separate diagnostic admission; neither result rewrites test status or JUnit.
+            try:
+                captured = subprocess.run([str(wrapper), '--capture'], env=diagnostic_env, check=False).returncode
+                verified = subprocess.run([str(wrapper), '--verify', '--junit', str(junit),
+                                           '--test-status', str(receipt['exit_code']),
+                                           '--capture-status', str(captured)], env=diagnostic_env, check=False).returncode
+                completeness = strict_json((diagnostics / 'completeness.json').read_text())
+                receipt['diagnostics'] = dict(gate_exit_code=verified, **completeness)
+            except (OSError, ValueError) as error:
+                receipt['diagnostics'] = dict(status='fail', causal_admission=False, error=str(error))
         if junit.is_file():
             shutil.copy2(junit, destination / 'junit.xml')
         (destination / 'shard.json').write_text(json.dumps(receipt, sort_keys=True)+'\n')
@@ -239,8 +284,8 @@ def workflow_receipt(destination, variant, result):
 
 def bundle(variant, tests_only=False):
     selected = PHYSICAL_BUNDLES[os.environ['GATE_PHYSICAL_BUNDLE']]
-    if tests_only and (variant != 'features' or os.environ['RUNNER_OS'] != 'Linux' or len(selected) != 1):
-        raise ValueError('tests-only requires a Linux feature singleton')
+    if tests_only and (variant != 'features' or len(selected) != 1):
+        raise ValueError('tests-only requires a feature singleton')
     if selected == PHYSICAL_BUNDLES['integration-and-rest + import-and-cli + acceptance']:
         if (variant, os.environ['RUNNER_OS']) != ('features', 'macOS'):
             raise ValueError('three-stage bundle requires macOS feature execution')

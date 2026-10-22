@@ -53,8 +53,8 @@ contextdb, context-graph and Vigil.
 
 - Linux qualification is required: `source`, `lint`, `docs`, `test`, `features`,
   complete `controls` and the stable `PR checks` aggregate remain fail-closed.
-  macOS runs the same lint, default, feature and complete controls commands in
-  `macos-advisory.yml`, with all five physical jobs and six logical receipts.
+  macOS runs the same lint, default, feature, compatibility build and complete
+  controls jobs in `macos-advisory.yml`, ten physical jobs and six logical receipts.
   Its aggregate reports failures honestly and never blocks Linux or delivery.
   Preserve model proofs, test-estate accounting, documentation validation and
   every feature shape. See [macOS follow-up](CI.md#macos-qualification-follow-up).

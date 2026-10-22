@@ -143,11 +143,46 @@ fn seed_pending_invalidation_direct(
     .expect("seed invalidation");
 }
 
-fn wait_for_len<T>(items: &Arc<Mutex<Vec<T>>>, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline && items.lock().expect("collector").len() < expected {
+/// Polls `ready` every 20 ms until it holds or `bound` passes; returns whether it held.
+fn wait_until(bound: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn wait_for_len<T>(items: &Arc<Mutex<Vec<T>>>, expected: usize) {
+    wait_until(Duration::from_secs(3), || {
+        items.lock().expect("collector").len() >= expected
+    });
+}
+
+/// Waits until every counter holds at least `expected` entries, failing the test with
+/// `what` and the observed counts if the generous `bound` passes first.
+fn wait_until_each_reaches<T>(
+    counters: &[Arc<Mutex<Vec<T>>>],
+    expected: usize,
+    bound: Duration,
+    what: &str,
+) {
+    let counts = || -> Vec<usize> {
+        counters
+            .iter()
+            .map(|c| c.lock().expect("collector").len())
+            .collect()
+    };
+    let reached = wait_until(bound, || counts().iter().all(|n| *n >= expected));
+    assert!(
+        reached,
+        "{what}: per-subscriber delivery counts {:?} did not all reach {expected} within {bound:?}",
+        counts()
+    );
 }
 
 fn assert_no_more<T>(items: &Arc<Mutex<Vec<T>>>, expected: usize) {
@@ -1385,18 +1420,19 @@ fn subscribe_callback_panic_isolated_at_n_10_with_seven_panicking_and_three_coun
             })
             .expect("subscribe panicker");
     }
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    for _ in 0..3 {
-        let seen_clone = Arc::clone(&seen);
+    let counters: Vec<Arc<Mutex<Vec<DecisionId>>>> =
+        (0..3).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+    for counter in &counters {
+        let seen = Arc::clone(counter);
         store
             .with_system_principal()
             .subscribe_new_decision(SubscriptionFilter::default(), move |payload| {
-                seen_clone.lock().expect("collector").push(payload.clone());
+                seen.lock().expect("collector").push(payload.decision.id);
                 Ok(())
             })
             .expect("subscribe counter");
     }
-    decision(
+    let created = decision(
         &store,
         ctx,
         "panic-isolated-scale",
@@ -1404,8 +1440,22 @@ fn subscribe_callback_panic_isolated_at_n_10_with_seven_panicking_and_three_coun
         vec![ent],
         vec![],
     );
-    wait_for_len(&seen, 3);
-    assert_eq!(seen.lock().expect("collector").len(), 3);
+    // The seven panicking subscribers keep being retried with backoff for the whole test,
+    // so delivery to the counting ones can be slow on a loaded runner; wait on the actual
+    // condition with a generous bound and fail loudly if it is not met.
+    wait_until_each_reaches(
+        &counters,
+        1,
+        Duration::from_secs(60),
+        "every counting subscriber receives the decision despite seven panicking siblings",
+    );
+    for (index, counter) in counters.iter().enumerate() {
+        assert_eq!(
+            *counter.lock().expect("collector"),
+            vec![created.id],
+            "counting subscriber {index} must receive exactly the one decision"
+        );
+    }
 }
 
 // Use case: two separate Store instances cannot poison each other's dispatchers.

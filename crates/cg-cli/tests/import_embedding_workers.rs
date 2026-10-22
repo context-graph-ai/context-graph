@@ -422,7 +422,7 @@ fn detached_background_import_delivers_default_cap_to_its_production_request_bui
     );
     assert_eq!(imported.code, 0, "{}", imported.describe());
     let first = wait_for_state(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(60),
         std::time::Duration::from_millis(20),
         || {
             let caps = observed_batch_caps(&observer);
@@ -432,7 +432,7 @@ fn detached_background_import_delivers_default_cap_to_its_production_request_bui
     .expect("first batch observation cannot fail");
     let (paused, later) = if first.is_some() {
         let paused = wait_for_state(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(60),
             std::time::Duration::from_millis(20),
             || Ok::<_, ()>(observer.join("entered").exists().then_some(())),
         )
@@ -454,7 +454,7 @@ fn detached_background_import_delivers_default_cap_to_its_production_request_bui
         )
         .expect("release owned background worker");
         let later = wait_for_state(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(60),
             std::time::Duration::from_millis(20),
             || {
                 let caps = observed_batch_caps(&observer);

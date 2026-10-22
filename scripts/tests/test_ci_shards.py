@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import subprocess
 import os
@@ -251,12 +252,16 @@ class ShardInventory(unittest.TestCase):
         target = self.root / 'compiler-cache'
         (target / 'tests').mkdir(parents=True)
         (target / 'tests/case').write_text('scratch')
+        (target / 'tests/trybuild').mkdir()
+        (target / 'tests/trybuild/compiled').write_text('trybuild')
         (target / 'deps').mkdir()
         (target / 'deps/keep').write_text('dependency')
         command = ['python3', str(ROOT / 'scripts/ci-cache-post-cleanup.py')]
         subprocess.run(command, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True)
-        self.assertFalse((target / 'tests').exists())
+        self.assertFalse((target / 'tests/case').exists())
+        self.assertEqual((target / 'tests/trybuild/compiled').read_text(), 'trybuild')
         self.assertEqual((target / 'deps/keep').read_text(), 'dependency')
+        shutil.rmtree(target / 'tests')
         (target / 'tests').symlink_to(target / 'deps', target_is_directory=True)
         subprocess.run(command, env=dict(os.environ, CARGO_TARGET_DIR=str(target)), check=True)
         self.assertFalse((target / 'tests').is_symlink())
@@ -423,14 +428,18 @@ class ShardInventory(unittest.TestCase):
             self.assertNotIn(hashlib.sha256(changed.encode()).hexdigest(), shared)
         for filename in ('ci.yml', 'macos-advisory.yml'):
             workflow = yaml.safe_load((ROOT / '.github/workflows' / filename).read_text())
-            default_mode = ("${{ matrix.bundle == 'acceptance' && 'catalog-narrow' || 'catalog-workspace' }}" if filename == 'ci.yml' else
-                            "${{ contains(matrix.bundle, 'integration-and-rest') && 'catalog-workspace' || 'catalog-narrow' }}")
+            default_mode = "${{ matrix.bundle == 'acceptance' && 'catalog-narrow' || 'catalog-workspace' }}"
+            # Shards that compile the identical selection share one compiler cache per platform:
+            # default acceptance alone compiles the narrow selection.
+            keys = {'test': "test-catalog-seed-v3-${{ matrix.bundle == 'acceptance' && 'narrow' || 'workspace' }}",
+                    'features': 'features-catalog-seed-v3-workspace'}
             for job, expected in [('test', default_mode), ('features', 'catalog-features')]:
                 for stage in ('model-seed', 'public-model'):
                     step = next(step for step in workflow['jobs'][job]['steps'] if step.get('run', '').strip() == 'bash scripts/gate.sh ' + stage)
                     self.assertEqual(step['env']['GATE_CI_MODEL_MODE'], expected)
                 cache = next(step for step in workflow['jobs'][job]['steps'] if step.get('uses', '').startswith('Swatinem/rust-cache@'))
-                self.assertEqual(cache['with']['key'], job + '-catalog-seed-v2-${{ matrix.bundle }}')
+                self.assertEqual(cache['with']['key'], keys[job])
+                self.assertIs(cache['with']['cache-on-failure'], True)
 
     def test_singleton_routing_and_platform_mutations_are_rejected(self):
         """Every singleton retains its own setup evidence and full platform commands."""
@@ -468,38 +477,40 @@ class ShardInventory(unittest.TestCase):
                     else: step['env']['GATE_CI_MODEL_MODE'] = "${{ matrix.bundle == '" + shard + "' && 'catalog-narrow' || 'catalog-features' }}"
                 def load(text):
                     parsed = parser(text)
-                    if isinstance(parsed, dict) and parsed.get('name') == 'ci': return changed['ci.yml']
-                    if isinstance(parsed, dict) and parsed.get('name') == 'macOS advisory': return changed['macos-advisory.yml']
+                    if isinstance(parsed, dict) and parsed.get('name') == 'Linux CI': return changed['ci.yml']
+                    if isinstance(parsed, dict) and parsed.get('name') == 'macOS CI (advisory)': return changed['macos-advisory.yml']
                     return parsed
                 with mock.patch.object(yaml, 'safe_load', side_effect=load), self.assertRaises(AssertionError):
                     self.test_catalog_seed_source_and_workflow_bindings()
                     self.test_workflow_covers_both_variants_and_platforms_before_aggregate()
 
 
-    def test_tests_only_requires_linux_feature_singleton(self):
-        """Only explicit feature singleton jobs may select the tests-only stage."""
+    def test_tests_only_requires_feature_singleton(self):
+        """Only explicit feature singleton jobs may select the tests-only stage, on either platform."""
         for variant, system, bundle in [('default', 'Linux', 'acceptance'),
-                ('features', 'macOS', 'acceptance'),
+                ('default', 'macOS', 'acceptance'),
                 ('features', 'Linux', 'integration-and-rest + import-and-cli'),
+                ('features', 'macOS', 'integration-and-rest + import-and-cli'),
                 ('features', 'macOS', 'integration-and-rest + import-and-cli + acceptance')]:
             with self.subTest(variant=variant, system=system, bundle=bundle), mock.patch.dict(os.environ,
                     dict(RUNNER_OS=system, GATE_PHYSICAL_BUNDLE=bundle)), mock.patch.object(shards.subprocess, 'run') as runner:
                 with self.assertRaises(ValueError): shards.bundle(variant, tests_only=True)
                 runner.assert_not_called()
-        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ,
-                dict(RUNNER_OS='Linux', GATE_PHYSICAL_BUNDLE='acceptance', RUNNER_TEMP=temporary)), \
-                mock.patch.object(shards.subprocess, 'run', return_value=mock.Mock(returncode=0)) as runner, \
-                mock.patch.object(shards, 'workflow_receipt') as receipt:
-            shards.bundle('features', tests_only=True)
-            self.assertEqual(runner.call_args.args[0], ['bash', 'scripts/gate.sh', 'features-tests'])
-            self.assertEqual(runner.call_args.kwargs['env']['GATE_SHARD'], 'acceptance')
-            receipt.assert_called_once_with(Path(temporary) / 'job-receipt/acceptance', 'features', 0)
+        for system in ('Linux', 'macOS'):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ,
+                    dict(RUNNER_OS=system, GATE_PHYSICAL_BUNDLE='acceptance', RUNNER_TEMP=temporary)), \
+                    mock.patch.object(shards.subprocess, 'run', return_value=mock.Mock(returncode=0)) as runner, \
+                    mock.patch.object(shards, 'workflow_receipt') as receipt:
+                shards.bundle('features', tests_only=True)
+                self.assertEqual(runner.call_args.args[0], ['bash', 'scripts/gate.sh', 'features-tests'])
+                self.assertEqual(runner.call_args.kwargs['env']['GATE_SHARD'], 'acceptance')
+                receipt.assert_called_once_with(Path(temporary) / 'job-receipt/acceptance', 'features', 0)
 
 
     def test_compile_jobs_are_exact_required_source_bound_commands(self):
         """Both compatibility jobs retain their complete reviewed execution and admission mapping."""
         import hashlib
-        pins = {'feature-qualification-core': '1c9d7ae7fa1ff4bc553de26b01d99c976729e4cdaea18fda5da48ccc3967a06c', 'feature-qualification-sync': 'a483f8e5d5c5ae4bd1a1c9df60ef2111b693ba5272ba9b2f51f73417090b317f'}
+        pins = {'feature-qualification-core': '14a7f84756b8f77e292d4db534418f58e954124e34e2180e659ca04ff6a6f665', 'feature-qualification-sync': 'fc7523f5837733e7f82635d4921a6ad3ed682ef46d05461367245983f5adf280'}
         def valid(workflow):
             for name, digest in pins.items():
                 if hashlib.sha256(json.dumps(workflow['jobs'].get(name), sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest() != digest:
@@ -542,7 +553,7 @@ class ShardInventory(unittest.TestCase):
         lock_digest = 'e6a98ee802ad0f1e9e3696f87daa40c6b7a78c6bb9424f6472f1afd4a798a55f'
         def valid(body, lock_bytes, root_manifest):
             return (body == expected and hashlib.sha256(lock_bytes).hexdigest() == lock_digest
-                    and hashlib.sha256(root_manifest).hexdigest() == 'ab995589c0159a218d0fd370a539c2994b6008e7e64b0d3e171062e6e0b11e85')
+                    and hashlib.sha256(root_manifest).hexdigest() == '46e2f70944bba714d98aed214ff5f5a0186334036638aef582b78bdd79907ce3')
         self.assertTrue(valid(expected, lock.read_bytes(), (ROOT / 'Cargo.toml').read_bytes()))
         for key, value in [('edition', '2021'), ('autotests', True), ('publish', True)]:
             changed = copy.deepcopy(expected); changed['package'][key] = value
@@ -570,27 +581,69 @@ class ShardInventory(unittest.TestCase):
         for path in (manifest, lock, ROOT / 'Cargo.toml', ROOT / 'Cargo.lock', ROOT / 'crates/context-graph/tests/test_estate_audit.rs'):
             self.assertIn(hashlib.sha256(path.read_bytes()).hexdigest(), helper)
 
+    def test_macos_workflow_runs_the_linux_jobs_on_macos(self):
+        """macOS runs every Linux correctness job with identical steps; only the runner differs."""
+        import copy
+        def mirrored(linux, mac):
+            def as_mac(job):
+                text = json.dumps(job, sort_keys=True)
+                for old, new in (('"os": "ubuntu-latest"', '"os": "macos-latest"'), ('"os": ["ubuntu-latest"]', '"os": ["macos-latest"]'),
+                                 ('"runs-on": "ubuntu-latest"', '"runs-on": "macos-latest"'), ('(ubuntu-latest)', '(macos-latest)')):
+                    text = text.replace(old, new)
+                return json.loads(text)
+            jobs = ('lint', 'controls', 'test', 'features', 'feature-qualification-core', 'feature-qualification-sync')
+            if set(mac['jobs']) != set(jobs) | {'macos-advisory'}:
+                return False
+            if any('ubuntu-latest' in json.dumps(mac['jobs'][name]) or as_mac(linux['jobs'][name]) != mac['jobs'][name] for name in jobs):
+                return False
+            aggregate = copy.deepcopy(linux['jobs']['required'])
+            aggregate['name'] = 'macOS advisory results'
+            aggregate['needs'] = [name for name in aggregate['needs'] if name not in ('source', 'docs')]
+            check = aggregate['steps'][0]['run']
+            aggregate['steps'][0]['run'] = check.replace("{'docs', 'source', 'features',", "{'features',")
+            union = next(step for step in aggregate['steps'] if step.get('run') == 'bash scripts/gate.sh shard-union-linux-isolated')
+            union['run'] = 'bash scripts/gate.sh shard-union-macos-isolated'
+            return (aggregate['steps'][0]['run'] != check and aggregate == mac['jobs']['macos-advisory']
+                    and all(linux[key] == mac[key] for key in (True, 'permissions', 'env', 'defaults')))  # YAML reads `on` as True
+        linux = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
+        mac = yaml.safe_load((ROOT / '.github/workflows/macos-advisory.yml').read_text())
+        self.assertTrue(mirrored(linux, mac))
+        for name in ('lint', 'controls', 'test', 'features', 'feature-qualification-core', 'feature-qualification-sync'):
+            with self.subTest(job=name):
+                changed = copy.deepcopy(mac); del changed['jobs'][name]
+                self.assertFalse(mirrored(linux, changed))
+                changed = copy.deepcopy(mac); changed['jobs'][name]['steps'].pop()
+                self.assertFalse(mirrored(linux, changed))
+                changed = copy.deepcopy(mac); changed['jobs'][name]['timeout-minutes'] = 5
+                self.assertFalse(mirrored(linux, changed))
+        for mutation in ('ubuntu row', 'combined bundle', 'full features', 'union', 'needs'):
+            with self.subTest(mutation=mutation):
+                changed = copy.deepcopy(mac)
+                if mutation == 'ubuntu row': changed['jobs']['test']['strategy']['matrix']['include'][0]['os'] = 'ubuntu-latest'
+                elif mutation == 'combined bundle': changed['jobs']['test']['strategy']['matrix']['include'][1]['bundle'] = 'integration-and-rest + import-and-cli'
+                elif mutation == 'full features':
+                    step = next(step for step in changed['jobs']['features']['steps'] if step.get('run', '').startswith('python3 scripts/ci-test-shards.py'))
+                    step['run'] = 'python3 scripts/ci-test-shards.py bundle features'
+                elif mutation == 'union':
+                    step = next(step for step in changed['jobs']['macos-advisory']['steps'] if 'shard-union' in step.get('run', ''))
+                    step['run'] = 'bash scripts/gate.sh shard-union-linux-isolated'
+                else: changed['jobs']['macos-advisory']['needs'].remove('feature-qualification-sync')
+                self.assertFalse(mirrored(linux, changed))
+
     def test_workflow_covers_both_variants_and_platforms_before_aggregate(self):
         for filename, system in [('ci.yml', 'ubuntu-latest'), ('macos-advisory.yml', 'macos-latest')]:
             workflow = yaml.safe_load((ROOT / '.github/workflows' / filename).read_text())
             for job in ('test', 'features'):
                 body = workflow['jobs'][job]
                 rows = body['strategy']['matrix']['include']
-                expected = ([
-                    {'os': 'macos-latest', 'bundle': 'acceptance'},
-                    {'os': 'macos-latest', 'bundle': 'integration-and-rest + import-and-cli'},
-                ] if job == 'test' else [
-                    {'os': 'macos-latest', 'bundle': 'integration-and-rest + import-and-cli + acceptance'},
-                ]) + [
-                    {'os': 'ubuntu-latest', 'bundle': 'acceptance'},
-                    {'os': 'ubuntu-latest', 'bundle': 'integration-and-rest'},
-                    {'os': 'ubuntu-latest', 'bundle': 'import-and-cli'},
-                ]
-                self.assertEqual(rows, [row for row in expected if row['os'] == system])
+                # Each platform runs every logical shard as its own job.
+                expected = [{'os': system, 'bundle': bundle}
+                            for bundle in ('acceptance', 'integration-and-rest', 'import-and-cli')]
+                self.assertEqual(rows, expected)
                 self.assertEqual(body['env']['GATE_PHYSICAL_BUNDLE'], '${{ matrix.bundle }}')
                 self.assertFalse(body['strategy']['fail-fast'])
                 command = f'python3 scripts/ci-test-shards.py bundle {"default" if job == "test" else job}'
-                if job == 'features' and system == 'ubuntu-latest': command += ' --tests-only'
+                if job == 'features': command += ' --tests-only'
                 runs = [step for step in body['steps'] if step.get('run') == command]
                 self.assertEqual(len(runs), 1)
                 self.assertNotIn('if', runs[0])
@@ -598,9 +651,7 @@ class ShardInventory(unittest.TestCase):
                 for stage in ('source', 'model-seed', 'public-model'):
                     self.assertEqual(sum(step.get('run', '').strip() == f'bash scripts/gate.sh {stage}' for step in body['steps']), 1)
                     step = next(step for step in body['steps'] if step.get('run', '').strip() == f'bash scripts/gate.sh {stage}')
-                    self.assertEqual(step['env']['GATE_RECEIPT_DIR'],
-                                     '${{ runner.temp }}/job-receipt/${{ matrix.bundle }}' if system == 'ubuntu-latest' else
-                                     "${{ runner.temp }}/job-receipt/${{ contains(matrix.bundle, 'integration-and-rest') && 'integration-and-rest' || 'acceptance' }}")
+                    self.assertEqual(step['env']['GATE_RECEIPT_DIR'], '${{ runner.temp }}/job-receipt/${{ matrix.bundle }}')
                 uploads = [step for step in body['steps'] if step.get('uses', '').startswith('actions/upload-artifact@')]
                 self.assertEqual(len(uploads), 3)
                 for shard, upload in zip(('integration-and-rest', 'import-and-cli', 'acceptance'), uploads):

@@ -1946,8 +1946,16 @@ fn oss_purity_no_embeddinggemma_symbol_leakage_in_main_crate() {
         which::which("cargo-expand").is_ok(),
         "install cargo-expand so this guard can inspect the expanded context-graph library"
     );
+    // The nested expansion inherits this test's Cargo environment. A build directory of its own
+    // keeps it from rerunning, under that environment, the build scripts the surrounding build
+    // and its compiler cache reuse.
+    let expand_target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"))
+        .join("expand-check");
     let output = Command::new("cargo")
-        .args(["expand", "--lib", "-p", "context-graph"])
+        .args(["expand", "--lib", "-p", "context-graph", "--target-dir"])
+        .arg(&expand_target_dir)
         .current_dir(workspace_root())
         .output()
         .expect("cargo expand starts");
