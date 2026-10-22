@@ -425,12 +425,7 @@ fn probe_identity_record(raw_record: &[u8]) -> ProbedIdentityRecord {
         .and_then(|first| {
             probe_optional_string(&object, "session_id").map(|second| (first, second))
         })
-        .and_then(|(first, second)| match (first, second) {
-            (Some(first), Some(second)) if first != second => None,
-            (Some(first), _) => Some(first),
-            (_, Some(second)) => Some(second),
-            (None, None) => None,
-        });
+        .and_then(|(first, second)| first.or(second));
     ProbedIdentityRecord { uuid, session_id }
 }
 

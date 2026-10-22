@@ -2,7 +2,7 @@ use context_graph::EventAdapterDeclaration;
 use serde_json::json;
 
 pub const CONNECTOR_ID: &str = "claude-code";
-pub const ADAPTER_VERSION: &str = "1";
+pub const ADAPTER_VERSION: &str = "2";
 pub const ANCHOR_DECLARATION_VERSION: &str = "1";
 
 pub fn event_adapter_declaration() -> EventAdapterDeclaration {
