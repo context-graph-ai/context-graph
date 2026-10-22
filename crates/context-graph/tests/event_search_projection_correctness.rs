@@ -3306,20 +3306,28 @@ fn one_concurrent_failure_waits_for_its_held_sibling_commits_nothing_and_retries
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control") = Some('b');
     let (entered_tx, entered_rx) = channel();
+    let entered_order = Arc::new(Mutex::new(entered_tx));
     let (release_tx, release_rx) = channel();
     let release_rx = Arc::new(Mutex::new(release_rx));
     let call_index = Arc::new(AtomicUsize::new(0));
     let held_active = Arc::new(AtomicBool::new(false));
     {
+        let entered_order = Arc::clone(&entered_order);
         let release_rx = Arc::clone(&release_rx);
         let call_index = Arc::clone(&call_index);
         let held_active = Arc::clone(&held_active);
         *embedder.embed_observer.lock().expect("observer lock") = Some(Arc::new(move || {
-            let ordinal = call_index.fetch_add(1, Ordering::SeqCst);
-            if ordinal == 0 {
-                held_active.store(true, Ordering::SeqCst);
-            }
-            let _ = entered_tx.send(ordinal);
+            // Take the ordinal and announce it under one lock so the channel order is the
+            // ordinal order; two workers racing between the two steps made 1 arrive before 0.
+            let ordinal = {
+                let announce = entered_order.lock().expect("entry order lock");
+                let ordinal = call_index.fetch_add(1, Ordering::SeqCst);
+                if ordinal == 0 {
+                    held_active.store(true, Ordering::SeqCst);
+                }
+                let _ = announce.send(ordinal);
+                ordinal
+            };
             if ordinal == 0 {
                 let _ = release_rx.lock().ok().and_then(|receiver| {
                     receiver
