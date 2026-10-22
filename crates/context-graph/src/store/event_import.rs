@@ -1,8 +1,10 @@
 use std::cmp::min;
 use std::io::{self, BufRead, BufReader, Read, SeekFrom};
 
+use super::source_prefix::{
+    CommittedPrefix, PrefixMismatch, ResumedPrefix, hash_prefix_from_start, verify_committed_prefix,
+};
 use serde_json::Value as JsonValue;
-use sha2::{Digest, Sha256};
 
 use crate::Result;
 use crate::error::{CgError, SourceHistoryDivergence};
@@ -61,7 +63,7 @@ impl Store {
         let attach_identified_locator = stored.is_some() && identified_without_locator.is_some();
         let (
             mut identity,
-            mut hasher,
+            mut prefix,
             committed_offset,
             mut event_watermark,
             known_checkpoint,
@@ -76,23 +78,34 @@ impl Store {
                     },
                 });
             }
-            let mut prefix_hasher = Sha256::new();
-            hash_exact_prefix(
+            // Seek past the committed prefix: only its head window and the window before the
+            // checkpoint are read and checked, and the exact prefix hash resumes from its stored
+            // state, so an append never reads history back.
+            let resumed = match verify_committed_prefix(
                 reader,
-                state.source_position.byte_offset,
-                &mut prefix_hasher,
-            )?;
-            let actual = hasher_hex(&prefix_hasher);
-            if actual != state.prefix_sha256 {
-                return Err(CgError::SourceHistoryDiverged {
-                    source_instance_ref: state.identity.source_instance_ref,
-                    cause: SourceHistoryDivergence::PrefixHashMismatch {
-                        checkpoint_offset: state.source_position.byte_offset,
-                        expected_sha256: state.prefix_sha256,
-                        actual_sha256: actual,
-                    },
-                });
-            }
+                &CommittedPrefix {
+                    offset: state.source_position.byte_offset,
+                    prefix_sha256: &state.prefix_sha256,
+                    hash_state: &state.prefix_hash_state,
+                    head_window_sha256: &state.head_window_sha256,
+                    tail_window_sha256: &state.tail_window_sha256,
+                },
+            )? {
+                Ok(resumed) => resumed,
+                Err(
+                    PrefixMismatch::Window { actual_sha256 }
+                    | PrefixMismatch::Digest { actual_sha256 },
+                ) => {
+                    return Err(CgError::SourceHistoryDiverged {
+                        source_instance_ref: state.identity.source_instance_ref,
+                        cause: SourceHistoryDivergence::PrefixHashMismatch {
+                            checkpoint_offset: state.source_position.byte_offset,
+                            expected_sha256: state.prefix_sha256,
+                            actual_sha256,
+                        },
+                    });
+                }
+            };
             if attach_identified_locator {
                 attach_source_locator(
                     self,
@@ -109,7 +122,7 @@ impl Store {
             let _anchor_declaration_version = state.anchor_declaration_version;
             (
                 state.identity,
-                prefix_hasher,
+                resumed,
                 state.source_position.byte_offset,
                 state.latest_event_seq,
                 Some(state.checkpoint),
@@ -118,14 +131,20 @@ impl Store {
         } else {
             let identity = identified_without_locator
                 .expect("a source without locator state was identified above");
-            (identity, Sha256::new(), 0, None, None, None)
+            (
+                identity,
+                hash_prefix_from_start(reader, 0)?,
+                0,
+                None,
+                None,
+                None,
+            )
         };
 
         if identity.provisional_empty && observed_source_len > committed_offset {
             let identified = identify_source(adapter, reader, &options)?;
             identity = identified;
-            hasher = Sha256::new();
-            hash_exact_prefix(reader, committed_offset, &mut hasher)?;
+            prefix = hash_prefix_from_start(reader, committed_offset)?;
         }
         validate_identity(&declaration, &identity, options.session_override.as_deref())?;
         if known_checkpoint.is_some()
@@ -155,7 +174,7 @@ impl Store {
         reader
             .seek(SeekFrom::Start(committed_offset))
             .map_err(|error| CgError::Engine(error.to_string()))?;
-        let mut input = CheckpointingBufReader::new(reader, hasher, committed_offset);
+        let mut input = CheckpointingBufReader::new(reader, prefix, committed_offset);
         let mut receipt = ImportEventReceipt {
             source: identity.clone(),
             batch_count: 0,
@@ -237,7 +256,7 @@ impl Store {
                     pending_boundary = Some(SourceCommitBoundary::new(
                         record.checkpoint_after_record,
                         record.source_position_after_record,
-                        input.prefix_sha256(),
+                        input.prefix_evidence(),
                         observed_source_len,
                         options.source_locator_ref.clone(),
                         identity.clone(),
@@ -288,7 +307,7 @@ impl Store {
                                 byte_offset: consumed,
                                 coordinate: JsonValue::Null,
                             },
-                            input.prefix_sha256(),
+                            input.prefix_evidence(),
                             observed_source_len,
                             options.source_locator_ref.clone(),
                             identity.clone(),
@@ -432,54 +451,18 @@ fn flush_batch(
     Ok(())
 }
 
-pub(super) fn hash_exact_prefix(
-    reader: &mut dyn SeekableEventSource,
-    length: u64,
-    hasher: &mut Sha256,
-) -> Result<()> {
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| CgError::Engine(error.to_string()))?;
-    let mut remaining = length;
-    let mut buffer = [0_u8; 16 * 1024];
-    while remaining > 0 {
-        let wanted = min(remaining, buffer.len() as u64) as usize;
-        let read = reader
-            .read(&mut buffer[..wanted])
-            .map_err(|error| CgError::Engine(error.to_string()))?;
-        if read == 0 {
-            return Err(CgError::Engine(
-                "source ended while verifying its committed prefix".into(),
-            ));
-        }
-        hasher.update(&buffer[..read]);
-        remaining -= read as u64;
-    }
-    Ok(())
-}
-
-pub(super) fn hasher_hex(hasher: &Sha256) -> String {
-    let digest = hasher.clone().finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    out
-}
-
 /// Hash only bytes the adapter actually consumes; BufReader prefetch never advances a checkpoint.
 struct CheckpointingBufReader<R> {
     inner: BufReader<R>,
-    hasher: Sha256,
+    prefix: ResumedPrefix,
     consumed: u64,
 }
 
 impl<R: Read> CheckpointingBufReader<R> {
-    fn new(inner: R, hasher: Sha256, consumed: u64) -> Self {
+    fn new(inner: R, prefix: ResumedPrefix, consumed: u64) -> Self {
         Self {
             inner: BufReader::new(inner),
-            hasher,
+            prefix,
             consumed,
         }
     }
@@ -488,8 +471,13 @@ impl<R: Read> CheckpointingBufReader<R> {
         self.consumed
     }
 
-    fn prefix_sha256(&self) -> String {
-        hasher_hex(&self.hasher)
+    fn prefix_evidence(&self) -> PrefixEvidence {
+        PrefixEvidence {
+            prefix_sha256: self.prefix.hasher.digest_hex(),
+            hash_state: self.prefix.hasher.state_hex(),
+            head_window_sha256: self.prefix.windows.head_sha256(),
+            tail_window_sha256: self.prefix.windows.tail_sha256(),
+        }
     }
 }
 
@@ -513,7 +501,9 @@ impl<R: Read> BufRead for CheckpointingBufReader<R> {
 
     fn consume(&mut self, amount: usize) {
         let amount = min(amount, self.inner.buffer().len());
-        self.hasher.update(&self.inner.buffer()[..amount]);
+        let consumed = &self.inner.buffer()[..amount];
+        self.prefix.hasher.update(consumed);
+        self.prefix.windows.update(consumed);
         self.consumed = self.consumed.saturating_add(amount as u64);
         self.inner.consume(amount);
     }

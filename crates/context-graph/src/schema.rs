@@ -206,7 +206,7 @@ pub const TABLES: &[TableSpec] = &[
     },
     TableSpec {
         name: "event_source_checkpoints",
-        ddl: "CREATE TABLE event_source_checkpoints (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, adapter_version TEXT NOT NULL, anchor_declaration_version TEXT NOT NULL, checkpoint JSON NOT NULL, source_position JSON NOT NULL, committed_byte_offset INTEGER NOT NULL, prefix_sha256 TEXT NOT NULL, observed_source_len INTEGER NOT NULL, latest_event_seq INTEGER, last_successful_tx TXID NOT NULL, PRIMARY KEY (context_id, connector_id, source_instance_ref)) SYNC OFF",
+        ddl: "CREATE TABLE event_source_checkpoints (context_id UUID CONTEXT_ID NOT NULL REFERENCES contexts(id), connector_id TEXT NOT NULL, source_instance_ref TEXT NOT NULL, session_ref TEXT NOT NULL, adapter_version TEXT NOT NULL, anchor_declaration_version TEXT NOT NULL, checkpoint JSON NOT NULL, source_position JSON NOT NULL, committed_byte_offset INTEGER NOT NULL, prefix_sha256 TEXT NOT NULL, prefix_hash_state TEXT NOT NULL, head_window_sha256 TEXT NOT NULL, tail_window_sha256 TEXT NOT NULL, observed_source_len INTEGER NOT NULL, latest_event_seq INTEGER, last_successful_tx TXID NOT NULL, PRIMARY KEY (context_id, connector_id, source_instance_ref)) SYNC OFF",
     },
     TableSpec {
         name: "event_source_ordering",

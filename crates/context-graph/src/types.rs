@@ -1407,12 +1407,23 @@ pub trait EventSourceAdapter {
 pub trait SeekableEventSource: Read + Seek {}
 impl<T: Read + Seek + ?Sized> SeekableEventSource for T {}
 
+/// What a checkpoint records about its committed prefix: the exact SHA-256, the hash state at its
+/// last 64-byte boundary, and the digests of its head window and of the window before the
+/// checkpoint — enough to resume without reading the prefix back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrefixEvidence {
+    pub(crate) prefix_sha256: String,
+    pub(crate) hash_state: String,
+    pub(crate) head_window_sha256: String,
+    pub(crate) tail_window_sha256: String,
+}
+
 /// A source checkpoint sealed by the core after adapter and byte-count agreement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceCommitBoundary {
     checkpoint_after_record: Value,
     source_position_after_record: SourceRecordPosition,
-    prefix_sha256: String,
+    prefix: PrefixEvidence,
     observed_source_len: u64,
     source_locator_ref: String,
     source_identity: EventSourceIdentity,
@@ -1422,7 +1433,7 @@ impl SourceCommitBoundary {
     pub(crate) fn new(
         checkpoint_after_record: Value,
         source_position_after_record: SourceRecordPosition,
-        prefix_sha256: String,
+        prefix: PrefixEvidence,
         observed_source_len: u64,
         source_locator_ref: String,
         source_identity: EventSourceIdentity,
@@ -1430,7 +1441,7 @@ impl SourceCommitBoundary {
         Self {
             checkpoint_after_record,
             source_position_after_record,
-            prefix_sha256,
+            prefix,
             observed_source_len,
             source_locator_ref,
             source_identity,
@@ -1446,7 +1457,11 @@ impl SourceCommitBoundary {
     }
 
     pub fn prefix_sha256(&self) -> &str {
-        &self.prefix_sha256
+        &self.prefix.prefix_sha256
+    }
+
+    pub(crate) fn prefix_evidence(&self) -> &PrefixEvidence {
+        &self.prefix
     }
 
     pub fn observed_source_len(&self) -> u64 {

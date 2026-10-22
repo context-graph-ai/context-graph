@@ -31,6 +31,7 @@ mod precedent_match;
 mod reindex;
 pub(crate) mod relationship;
 pub mod signatures;
+pub(crate) mod source_prefix;
 mod subscriptions;
 
 use std::collections::{BTreeSet, HashMap, HashSet};

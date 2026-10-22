@@ -107,8 +107,15 @@ Schema 12 adds a provider-neutral immutable event journal. An adapter supplies a
 `EventAdapterDeclaration` and ordered `EventDraft` values; `Store::append_event_batch` derives the
 event IDs, source-stream sequence numbers and SHA-256 integrity fields. Repeating an identical
 source occurrence is a no-op, while changing one under the same source key refuses the whole batch.
-`Store::import_event_stream` adds bounded record streaming, raw-prefix verification and atomic source
-checkpoints without exposing its commit-boundary constructor to adapters.<!-- enforced by: `append_derives_occurrence_identity_and_source_order_without_caller_control`, `retries_are_noops_and_a_divergent_batch_leaves_events_and_checkpoint_unchanged`, `import_verifies_prefix_then_adds_only_tail_or_refuses_rewritten_history` -->
+`Store::import_event_stream` adds bounded record streaming, bounded prefix verification and atomic
+source checkpoints without exposing its commit-boundary constructor to adapters. Resuming a
+checkpointed source seeks past its committed prefix: the import reads only the first 64 KiB of the
+source and the 64 KiB before the checkpoint, checks them against digests stored with the
+checkpoint, and continues the exact SHA-256 of the prefix from its stored state, so an append reads
+the same amount of the source however long it has grown. A source that is shorter than its
+checkpoint, or rewritten at its head or near the checkpoint, is refused. A full re-hash of every
+committed byte is on demand: `Store::check_event_source_prefix_fully`, which `cg import --dry-run`
+uses.<!-- enforced by: `append_derives_occurrence_identity_and_source_order_without_caller_control`, `retries_are_noops_and_a_divergent_batch_leaves_events_and_checkpoint_unchanged`, `import_verifies_prefix_then_adds_only_tail_or_refuses_rewritten_history`, `appending_one_record_to_a_checkpointed_source_reads_the_same_bytes_at_any_source_length`, `an_append_refuses_a_rewritten_head_or_boundary_and_the_full_check_finds_a_mid_prefix_edit` -->
 
 The default `StoreConfig::event_placement` is `None`: a fresh Store resolves that to
 `EventPlacementPolicy::LocalOnly` and declares event and exact-anchor rows `SYNC OFF`. A fresh

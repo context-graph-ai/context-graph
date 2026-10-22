@@ -29,7 +29,7 @@ const EVENT_POLICY: &str =
 const ANCHOR_POLICY: &str = "SYNC PUSH ONLY SYNC CONFLICT KEEP FIRST IMMUTABLE";
 
 const EVENT_COLUMNS: &str = "id, context_id, connector_id, adapter_version, anchor_declaration_version, source_instance_ref, session_ref, source_event_key, source_position, seq, content_hash, anchor_count, anchor_set_hash, occurred_at, author, kind, render_role, interaction_ref, text, payload, anchors, source_remainder, coverage";
-const SOURCE_CHECKPOINT_COLUMNS: &str = "session_ref, adapter_version, anchor_declaration_version, checkpoint, source_position, committed_byte_offset, prefix_sha256, observed_source_len, latest_event_seq";
+const SOURCE_CHECKPOINT_COLUMNS: &str = "session_ref, adapter_version, anchor_declaration_version, checkpoint, source_position, committed_byte_offset, prefix_sha256, prefix_hash_state, head_window_sha256, tail_window_sha256, observed_source_len, latest_event_seq";
 const MAX_APPEND_ATTEMPTS: usize = 4;
 
 type AppendAttemptResult<T> = std::result::Result<T, AppendAttemptError>;
@@ -102,6 +102,9 @@ pub(crate) struct StoredSourceState {
     pub(crate) checkpoint: JsonValue,
     pub(crate) source_position: SourceRecordPosition,
     pub(crate) prefix_sha256: String,
+    pub(crate) prefix_hash_state: String,
+    pub(crate) head_window_sha256: String,
+    pub(crate) tail_window_sha256: String,
     pub(crate) observed_source_len: u64,
     pub(crate) latest_event_seq: Option<u64>,
 }
@@ -1369,6 +1372,9 @@ fn decode_source_checkpoint(
             coordinate: get_json(row, columns, "source_position")?,
         },
         prefix_sha256: get_text(row, columns, "prefix_sha256")?,
+        prefix_hash_state: get_text(row, columns, "prefix_hash_state")?,
+        head_window_sha256: get_text(row, columns, "head_window_sha256")?,
+        tail_window_sha256: get_text(row, columns, "tail_window_sha256")?,
         observed_source_len: get_u64_value(row, columns, "observed_source_len")?,
         latest_event_seq: get_optional_u64_value(row, columns, "latest_event_seq")?,
     })
@@ -2716,7 +2722,7 @@ fn persist_source_progress_in_tx(
             .db
             .execute_in_tx(
                 tx,
-                "UPDATE event_source_checkpoints SET session_ref = $session_ref, adapter_version = $adapter_version, anchor_declaration_version = $anchor_declaration_version, checkpoint = $checkpoint, source_position = $source_position, committed_byte_offset = $committed_byte_offset, prefix_sha256 = $prefix_sha256, observed_source_len = $observed_source_len, latest_event_seq = $latest_event_seq, last_successful_tx = $last_successful_tx WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source_instance_ref",
+                "UPDATE event_source_checkpoints SET session_ref = $session_ref, adapter_version = $adapter_version, anchor_declaration_version = $anchor_declaration_version, checkpoint = $checkpoint, source_position = $source_position, committed_byte_offset = $committed_byte_offset, prefix_sha256 = $prefix_sha256, prefix_hash_state = $prefix_hash_state, head_window_sha256 = $head_window_sha256, tail_window_sha256 = $tail_window_sha256, observed_source_len = $observed_source_len, latest_event_seq = $latest_event_seq, last_successful_tx = $last_successful_tx WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source_instance_ref",
                 &checkpoint_write_params(input, boundary, latest_event_seq, tx)?,
             )
             .map_err(AppendAttemptError::Engine)?;
@@ -2726,7 +2732,7 @@ fn persist_source_progress_in_tx(
             .db
             .execute_in_tx(
                 tx,
-                "INSERT INTO event_source_checkpoints (context_id, connector_id, source_instance_ref, session_ref, adapter_version, anchor_declaration_version, checkpoint, source_position, committed_byte_offset, prefix_sha256, observed_source_len, latest_event_seq, last_successful_tx) VALUES ($context_id, $connector_id, $source_instance_ref, $session_ref, $adapter_version, $anchor_declaration_version, $checkpoint, $source_position, $committed_byte_offset, $prefix_sha256, $observed_source_len, $latest_event_seq, $last_successful_tx)",
+                "INSERT INTO event_source_checkpoints (context_id, connector_id, source_instance_ref, session_ref, adapter_version, anchor_declaration_version, checkpoint, source_position, committed_byte_offset, prefix_sha256, prefix_hash_state, head_window_sha256, tail_window_sha256, observed_source_len, latest_event_seq, last_successful_tx) VALUES ($context_id, $connector_id, $source_instance_ref, $session_ref, $adapter_version, $anchor_declaration_version, $checkpoint, $source_position, $committed_byte_offset, $prefix_sha256, $prefix_hash_state, $head_window_sha256, $tail_window_sha256, $observed_source_len, $latest_event_seq, $last_successful_tx)",
                 &checkpoint_write_params(input, boundary, latest_event_seq, tx)?,
             )
             .map_err(AppendAttemptError::Engine)?;
@@ -2818,6 +2824,18 @@ fn checkpoint_write_params(
         (
             "prefix_sha256".into(),
             Value::Text(boundary.prefix_sha256().to_string()),
+        ),
+        (
+            "prefix_hash_state".into(),
+            Value::Text(boundary.prefix_evidence().hash_state.clone()),
+        ),
+        (
+            "head_window_sha256".into(),
+            Value::Text(boundary.prefix_evidence().head_window_sha256.clone()),
+        ),
+        (
+            "tail_window_sha256".into(),
+            Value::Text(boundary.prefix_evidence().tail_window_sha256.clone()),
         ),
         (
             "observed_source_len".into(),

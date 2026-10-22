@@ -696,8 +696,8 @@ pub(crate) fn handle_import(
     )
 }
 
-/// `--dry-run`: resolve the sources and the Context, verify every committed prefix through the
-/// read-only reader, and report what a real run would capture. Nothing is written.
+/// `--dry-run`: resolve the sources and the Context, re-hash every committed prefix in full through
+/// the read-only reader, and report what a real run would capture. Nothing is written.
 fn dry_run(
     format: OutputFormat,
     root: &Path,
@@ -748,7 +748,9 @@ fn dry_run(
             }
         };
         let check = match (reader.as_ref(), context_id) {
-            (Some(reader), Some(context_id)) => reader.check_event_source_prefix(
+            // The dry run is the on-demand full verification: every committed byte is re-hashed,
+            // where an import reads only the bounded windows it resumes from.
+            (Some(reader), Some(context_id)) => reader.check_event_source_prefix_fully(
                 context_id,
                 &declaration,
                 &source.source_locator_ref,
@@ -1488,7 +1490,8 @@ the first search build much longer.
 
 background and wait need the local Nomic model (`cg model fetch --defaults`); nothing is
 downloaded by import. JSON is the default output; --format text prints a human summary.
---dry-run resolves the sources and the Context and writes nothing.
+--dry-run resolves the sources and the Context, re-hashes every committed prefix in full, and
+writes nothing.
 
 Exit: 0 complete / scheduled / deferred; 1 captured_search_behind, schema_mismatch,
 tenant_policy_blocked, config_error and other failures; 2 project_history_not_found,

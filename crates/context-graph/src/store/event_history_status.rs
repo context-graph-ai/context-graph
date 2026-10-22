@@ -848,8 +848,18 @@ pub enum EventSourcePrefixCheck {
     },
 }
 
+/// How much of a committed prefix a check reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixCheckDepth {
+    /// The way import resumes: the head window and the window before the checkpoint.
+    Bounded,
+    /// Every committed byte, re-hashed: the explicit, on-demand verification.
+    Full,
+}
+
 impl Store {
-    /// Verify one source's committed prefix the way import does, writing nothing.
+    /// Verify one source's committed prefix the way import does, writing nothing: a bounded read
+    /// of its head window and the window before the checkpoint.
     pub fn check_event_source_prefix(
         &self,
         context_id: ContextId,
@@ -857,7 +867,32 @@ impl Store {
         source_locator_ref: &str,
         source: &mut dyn crate::SeekableEventSource,
     ) -> Result<EventSourcePrefixCheck> {
-        check_event_source_prefix(self, context_id, declaration, source_locator_ref, source)
+        check_event_source_prefix(
+            self,
+            context_id,
+            declaration,
+            source_locator_ref,
+            source,
+            PrefixCheckDepth::Bounded,
+        )
+    }
+
+    /// Verify one source's whole committed prefix by re-hashing every byte, writing nothing.
+    pub fn check_event_source_prefix_fully(
+        &self,
+        context_id: ContextId,
+        declaration: &crate::EventAdapterDeclaration,
+        source_locator_ref: &str,
+        source: &mut dyn crate::SeekableEventSource,
+    ) -> Result<EventSourcePrefixCheck> {
+        check_event_source_prefix(
+            self,
+            context_id,
+            declaration,
+            source_locator_ref,
+            source,
+            PrefixCheckDepth::Full,
+        )
     }
 }
 
@@ -870,7 +905,32 @@ impl ConsumerReader {
         source_locator_ref: &str,
         source: &mut dyn crate::SeekableEventSource,
     ) -> Result<EventSourcePrefixCheck> {
-        check_event_source_prefix(self, context_id, declaration, source_locator_ref, source)
+        check_event_source_prefix(
+            self,
+            context_id,
+            declaration,
+            source_locator_ref,
+            source,
+            PrefixCheckDepth::Bounded,
+        )
+    }
+
+    /// [`Store::check_event_source_prefix_fully`] through the read-only session.
+    pub fn check_event_source_prefix_fully(
+        &self,
+        context_id: ContextId,
+        declaration: &crate::EventAdapterDeclaration,
+        source_locator_ref: &str,
+        source: &mut dyn crate::SeekableEventSource,
+    ) -> Result<EventSourcePrefixCheck> {
+        check_event_source_prefix(
+            self,
+            context_id,
+            declaration,
+            source_locator_ref,
+            source,
+            PrefixCheckDepth::Full,
+        )
     }
 }
 
@@ -880,6 +940,7 @@ pub(crate) fn check_event_source_prefix(
     declaration: &crate::EventAdapterDeclaration,
     source_locator_ref: &str,
     source: &mut dyn crate::SeekableEventSource,
+    depth: PrefixCheckDepth,
 ) -> Result<EventSourcePrefixCheck> {
     use std::io::SeekFrom;
     let io = |error: std::io::Error| CgError::Engine(error.to_string());
@@ -912,7 +973,7 @@ pub(crate) fn check_event_source_prefix(
         Value::Text(source_instance_ref),
     );
     let checkpoint = rows.query_rows(
-        "SELECT committed_byte_offset, prefix_sha256 FROM event_source_checkpoints WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source_instance_ref",
+        "SELECT committed_byte_offset, prefix_sha256, prefix_hash_state, head_window_sha256, tail_window_sha256 FROM event_source_checkpoints WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source_instance_ref",
         &params,
     )?;
     let Some(row) = checkpoint.rows().first() else {
@@ -942,9 +1003,23 @@ pub(crate) fn check_event_source_prefix(
             ),
         });
     }
-    let mut digest = <sha2::Sha256 as sha2::Digest>::new();
-    super::event_import::hash_exact_prefix(source, committed_bytes, &mut digest)?;
-    if super::event_import::hasher_hex(&digest) != committed_sha256 {
+    let matches = match depth {
+        PrefixCheckDepth::Full => {
+            super::source_prefix::full_prefix_sha256(source, committed_bytes)? == committed_sha256
+        }
+        PrefixCheckDepth::Bounded => super::source_prefix::verify_committed_prefix(
+            source,
+            &super::source_prefix::CommittedPrefix {
+                offset: committed_bytes,
+                prefix_sha256: &committed_sha256,
+                hash_state: &text(row, checkpoint.columns(), "prefix_hash_state")?,
+                head_window_sha256: &text(row, checkpoint.columns(), "head_window_sha256")?,
+                tail_window_sha256: &text(row, checkpoint.columns(), "tail_window_sha256")?,
+            },
+        )?
+        .is_ok(),
+    };
+    if !matches {
         return Ok(EventSourcePrefixCheck::Diverged {
             committed_bytes,
             reason: "the committed prefix no longer matches its recorded hash".into(),

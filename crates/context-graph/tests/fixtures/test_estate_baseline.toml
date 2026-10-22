@@ -205,7 +205,7 @@
 # The consumer cursor continuation proof adds one default-tier test.
 # Typed active-time mapping and committed-prefix projection recovery add two proofs.
 # The session claim and strict upstream count work proofs join the default tier: 1320 + 2 = 1322.
-"context-graph" = 1326
+"context-graph" = 1330
 # 190 -> 184: the status tests for answers read-only status no longer gives were removed with that
 # change, and the retired chunked-import, estimate and raw-chunk forget routes took their tests.
 # 184 -> 187: coverage for the reader-wait allowance and the foreground import's unusable-lock
@@ -325,6 +325,8 @@ slack_seconds = 0.235
 "cg-vision-embedder::siglip" = 0.082
 "context-graph" = 36.976
 "context-graph::audit_outcome_typed_snapshot" = 1.755
+# Source-resume proof: measured from its two gate-profile test cases, 2026-10-22.
+"context-graph::event_import_resume_cost" = 65.110
 "context-graph::event_search_embedding_parallelism" = 19.067
 "context-graph::event_search_projection_correctness" = 139.337
 "context-graph::read_memory_policy" = 15.073
