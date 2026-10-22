@@ -1,7 +1,7 @@
 //! Appending to a checkpointed source reads a fixed amount of it, however long the source is.
 //!
 //! A source cg has already captured up to a checkpoint grows by one record; importing it again
-//! must seek past the completed prefix rather than read it back (bounded-storage intent, "Resuming
+//! must seek past the completed prefix rather than read it back (source-resume contract, "Resuming
 //! an interrupted import must seek past completed work without scanning it again"). The source is
 //! wrapped in a reader that counts every byte cg reads, so the proof is about the work the import
 //! does on the source, not about elapsed time.
