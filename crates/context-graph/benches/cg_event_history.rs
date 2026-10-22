@@ -660,7 +660,7 @@ fn stream_tail_trace(store: &Store, context_id: ContextId) {
         traces.push(json!({
             "source_instance_ref": source,
             "ms": ms(started.elapsed()),
-            "trace": format!("{:?}", result.trace),
+            "trace": format!("{:?}", result.trace()),
         }));
     }
     emit(json!({"bench": APPEND_NAME, "stream_tail_statement": TAIL, "traces": traces}));
@@ -979,7 +979,7 @@ mod fixture {
                 &HashMap::new(),
             )
             .expect("count current passage vectors")
-            .rows[0][0]
+            .rows()[0][0]
         {
             Value::Int64(n) => u64::try_from(n).expect("nonnegative vector count"),
             ref other => panic!("expected vector count, got {other:?}"),
@@ -1023,7 +1023,7 @@ mod fixture {
                 .execute(sql, &HashMap::new())
                 .expect("read fixture content");
             let mut rows = result
-                .rows
+                .rows()
                 .iter()
                 .map(|row| format!("{row:?}"))
                 .collect::<Vec<_>>();
@@ -1977,7 +1977,7 @@ mod fixture {
                 &HashMap::from([("current".into(), Value::Bool(true))]),
             )
             .expect("count active passages")
-            .rows
+            .rows()
             .len();
         assert_eq!(counted, total_passages, "every synthetic passage is active");
         let distinct = contexts.iter().copied().collect::<BTreeSet<_>>().len();
@@ -2014,10 +2014,10 @@ mod fixture {
             let generations = read(
                 "SELECT context_id, event_count, searchable_event_count FROM event_search_generations",
             );
-            let context_at = column(&generations.columns, "context_id");
-            let events_at = column(&generations.columns, "event_count");
-            let searchable_at = column(&generations.columns, "searchable_event_count");
-            for row in &generations.rows {
+            let context_at = column(&generations.columns(), "context_id");
+            let events_at = column(&generations.columns(), "event_count");
+            let searchable_at = column(&generations.columns(), "searchable_event_count");
+            for row in generations.rows() {
                 assert_eq!(
                     number(row, searchable_at),
                     number(row, events_at),
@@ -2029,13 +2029,13 @@ mod fixture {
             let progress = read(
                 "SELECT context_id, connector_id, session_ref, searchable_event_count, is_published FROM event_search_session_progress",
             );
-            let context_at = column(&progress.columns, "context_id");
-            let connector_at = column(&progress.columns, "connector_id");
-            let session_at = column(&progress.columns, "session_ref");
-            let searchable_at = column(&progress.columns, "searchable_event_count");
-            let published_at = column(&progress.columns, "is_published");
+            let context_at = column(&progress.columns(), "context_id");
+            let connector_at = column(&progress.columns(), "connector_id");
+            let session_at = column(&progress.columns(), "session_ref");
+            let searchable_at = column(&progress.columns(), "searchable_event_count");
+            let published_at = column(&progress.columns(), "is_published");
             let published = progress
-                .rows
+                .rows()
                 .iter()
                 .filter(|row| matches!(row[published_at], Value::Bool(true)))
                 .map(|row| {
@@ -2053,11 +2053,11 @@ mod fixture {
             let sessions = read(
                 "SELECT context_id, connector_id, session_ref, event_count FROM event_context_sessions",
             );
-            let context_at = column(&sessions.columns, "context_id");
-            let connector_at = column(&sessions.columns, "connector_id");
-            let session_at = column(&sessions.columns, "session_ref");
-            let events_at = column(&sessions.columns, "event_count");
-            for row in &sessions.rows {
+            let context_at = column(&sessions.columns(), "context_id");
+            let connector_at = column(&sessions.columns(), "connector_id");
+            let session_at = column(&sessions.columns(), "session_ref");
+            let events_at = column(&sessions.columns(), "event_count");
+            for row in sessions.rows() {
                 let key = (
                     id(row, context_at),
                     text(row, connector_at),
@@ -2325,7 +2325,7 @@ mod sessions {
                 ("current".into(), Value::Bool(true)),
             ]),
         )
-        .rows
+        .rows()
         .len()
     }
 
@@ -2351,7 +2351,7 @@ mod sessions {
             HashMap::from([("current".into(), Value::Bool(true))]),
         );
         let mut rows = result
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 let ordinal = match &row[1] {
@@ -2505,7 +2505,7 @@ mod sessions {
             HashMap::new(),
         );
         let generations = heads
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 (
@@ -2524,9 +2524,9 @@ mod sessions {
             "SELECT context_id, id FROM event_search_passages WHERE is_current = $current",
             HashMap::from([("current".into(), Value::Bool(true))]),
         );
-        let actual_passages = passages.rows.len();
+        let actual_passages = passages.rows().len();
         let sample_passages = passages
-            .rows
+            .rows()
             .iter()
             .step_by(97)
             .take(4_000)
@@ -2538,7 +2538,7 @@ mod sessions {
             })
             .collect::<Vec<_>>();
         let total_events =
-            match sql(&store, "SELECT COUNT(*) AS n FROM events", HashMap::new()).rows[0][0] {
+            match sql(&store, "SELECT COUNT(*) AS n FROM events", HashMap::new()).rows()[0][0] {
                 Value::Int64(n) => n as usize,
                 ref other => panic!("expected a count, got {other:?}"),
             };
@@ -2818,10 +2818,10 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
             "SELECT id, context_id, generation_id, content_sha256, vector_text, is_searchable FROM event_search_passages WHERE is_current = TRUE AND id > $after ORDER BY id ASC LIMIT 128",
             &HashMap::from([("after".into(), Value::Uuid(after))]),
         ).expect("read one bounded page of current source vectors");
-        if page.rows.is_empty() {
+        if page.rows().is_empty() {
             break;
         }
-        for row in page.rows {
+        for row in page.rows() {
             let Value::Uuid(id) = row[0] else {
                 panic!("source passage UUID")
             };
@@ -2868,13 +2868,13 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
             &HashMap::new(),
         )
         .expect("source search heads");
-    assert_eq!(heads.rows.len(), 1);
+    assert_eq!(heads.rows().len(), 1);
     assert_eq!(
         source_partition,
-        Some((heads.rows[0][0].clone(), heads.rows[0][1].clone()))
+        Some((heads.rows()[0][0].clone(), heads.rows()[0][1].clone()))
     );
     let mut heads = heads
-        .rows
+        .rows()
         .iter()
         .map(|row| format!("{row:?}"))
         .collect::<Vec<_>>();
@@ -3013,15 +3013,15 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
             &HashMap::from([("id".into(), Value::Uuid(Uuid::from_u128(100)))]),
         )
         .expect("read restart query vector")
-        .rows[0][0]
+        .rows()[0][0]
         .clone();
     let result = reopened.execute(
         "SELECT id FROM passages WHERE context_id = $context AND generation_id = $generation AND is_current = TRUE ORDER BY embedding <=> $query USE VECTOR INDEXED LIMIT 10",
         &HashMap::from([("context".into(), Value::Uuid(context)), ("generation".into(), Value::Uuid(generation)), ("query".into(), query)]),
     ).expect("indexed search reads durable graph after restart");
-    assert_eq!(result.rows.len(), 10);
+    assert_eq!(result.rows().len(), 10);
     let trace = result
-        .trace
+        .trace()
         .vector_search
         .as_ref()
         .expect("restart indexed trace");
@@ -3032,7 +3032,7 @@ pub fn event_fresh_graph_build(_c: &mut Criterion) {
                 .is_some_and(|route| route.as_str() != "exact")),
         "restart search must use the persisted index"
     );
-    let restart_route = route::disclosure(&result.trace);
+    let restart_route = route::disclosure(&result.trace());
     reopened.close().expect("close restarted graph");
     emit(json!({"bench": NAME, "fixture": {
         "fresh_graph_build_seconds": seconds, "contexts": 1, "current_passages": ROWS,
@@ -3661,7 +3661,7 @@ mod route {
                     let result = session.execute(&sql, &params);
                     let read = *totals.0.lock().expect("totals");
                     runs.push(serde_json::json!({
-                        "answered": result.as_ref().map(|r| r.rows.len()).map_err(|e| e.to_string()),
+                        "answered": result.as_ref().map(|r| r.rows().len()).map_err(|e| e.to_string()),
                         "work": read.map(|t| t.work),
                         "active_ms": read.map(|t| t.active_ms),
                     }));
@@ -3686,12 +3686,12 @@ mod route {
     /// The passage ids a vector statement returned, in rank order.
     pub fn ids(result: &contextdb_engine::QueryResult) -> Vec<uuid::Uuid> {
         let id = result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "id")
             .expect("id column");
         result
-            .rows
+            .rows()
             .iter()
             .map(|row| match &row[id] {
                 Value::Uuid(id) => *id,
@@ -3703,12 +3703,12 @@ mod route {
     /// Count the returned winners by stored Context, preserving the partition they came from.
     pub fn winners_by_context(result: &contextdb_engine::QueryResult) -> BTreeMap<String, usize> {
         let context = result
-            .columns
+            .columns()
             .iter()
             .position(|column| column == "context_id")
             .expect("context_id column");
         let mut counts = BTreeMap::new();
-        for row in &result.rows {
+        for row in result.rows() {
             let Value::Uuid(id) = &row[context] else {
                 panic!("context id is not a UUID: {:?}", row[context]);
             };
@@ -3865,7 +3865,7 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                     let planned = session.execute(&sql, &params);
                     // The partition route: the declared (context_id, generation_id) key, one
                     // partition for one Context and a finite selected set for several.
-                    let partition_route = planned.as_ref().map(|r| route::disclosure(&r.trace));
+                    let partition_route = planned.as_ref().map(|r| route::disclosure(&r.trace()));
                     let expected_shape = if scope.len() == 1 { "one" } else { "several" };
                     match &partition_route {
                         Ok(route)
@@ -3906,18 +3906,18 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                 );
                     per_scope.push(json!({
                     "source_links_first_context": {
-                        "trace": linked.as_ref().map(|r| format!("{:?}", r.trace)).map_err(|e| e.to_string()),
-                        "rows": linked.as_ref().map(|r| r.rows.len()).ok(),
+                        "trace": linked.as_ref().map(|r| format!("{:?}", r.trace())).map_err(|e| e.to_string()),
+                        "rows": linked.as_ref().map(|r| r.rows().len()).ok(),
                     },
                     "scope": scope_name,
                     "scope_contexts": scope.len(),
                     "vector_statement": sql,
                     "partition_route": partition_route.map_err(|e| e.to_string()),
-                    "trace": planned.as_ref().map(|r| format!("{:?}", r.trace)).map_err(|e| e.to_string()),
-                    "rows_returned": planned.as_ref().map(|r| r.rows.len()).ok(),
+                    "trace": planned.as_ref().map(|r| format!("{:?}", r.trace())).map_err(|e| e.to_string()),
+                    "rows_returned": planned.as_ref().map(|r| r.rows().len()).ok(),
                     "coverage_count_first_context": {
-                        "trace": counted.as_ref().map(|r| format!("{:?}", r.trace)).map_err(|e| e.to_string()),
-                        "value": counted.as_ref().ok().and_then(|r| r.rows.first().cloned()).map(|row| format!("{row:?}")),
+                        "trace": counted.as_ref().map(|r| format!("{:?}", r.trace())).map_err(|e| e.to_string()),
+                        "value": counted.as_ref().ok().and_then(|r| r.rows().first().cloned()).map(|row| format!("{row:?}")),
                     },
                 }));
                 }
@@ -4028,7 +4028,7 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                 // Isolation: the same vector statement alone, and the scope's per-Context
                 // captured-event counts alone, each through the Store's own engine handle, warm,
                 // against the whole find above. The vector statement's route is recorded here
-                // too, because the read-only session refuses it (see `scopes[].trace`).
+                // too, because the read-only session refuses it (see `scopes[].trace()`).
                 let mut vector_alone = Vec::new();
                 let mut counts_alone = Vec::new();
                 let mut writable_trace = None;
@@ -4044,11 +4044,11 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                         .expect("vector statement alone");
                     let elapsed = started.elapsed();
                     assert_eq!(
-                        result.rows.len(),
+                        result.rows().len(),
                         10,
                         "a full page from the vector statement"
                     );
-                    writable_trace.get_or_insert_with(|| format!("{:?}", result.trace));
+                    writable_trace.get_or_insert_with(|| format!("{:?}", result.trace()));
                     let started = Instant::now();
                     for context_id in &scope {
                         let counted = store
@@ -4125,23 +4125,23 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                         .execute_sql_for_test(&route::with_mode(&sql, "EXACT"), &params)
                         .expect("exact answer over the whole scope");
                     exact_ms.push(started.elapsed());
-                    route_facts.get_or_insert_with(|| route::disclosure(&selected.trace));
+                    route_facts.get_or_insert_with(|| route::disclosure(&selected.trace()));
                     let exact_ids = route::ids(&exact);
                     let selected_counts = route::winners_by_context(&selected);
                     let exact_counts = route::winners_by_context(&exact);
                     let exact_id_set = exact_ids.iter().copied().collect::<BTreeSet<_>>();
                     let context_column = selected
-                        .columns
+                        .columns()
                         .iter()
                         .position(|column| column == "context_id")
                         .expect("context_id column");
                     let id_column = selected
-                        .columns
+                        .columns()
                         .iter()
                         .position(|column| column == "id")
                         .expect("id column");
                     let mut hit_counts = BTreeMap::<String, usize>::new();
-                    for row in &selected.rows {
+                    for row in selected.rows() {
                         if let (Value::Uuid(context), Value::Uuid(id)) =
                             (&row[context_column], &row[id_column])
                             && exact_id_set.contains(id)
@@ -4310,7 +4310,7 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                                       elapsed: Duration| {
                         if let Ok(result) = &result
                             && mode == "INDEXED"
-                            && result.trace.physical_plan.starts_with("Scan")
+                            && result.trace().physical_plan.starts_with("Scan")
                         {
                             failures.push(format!(
                                 "removed {name}: INDEXED on the {path} scanned the table for {scope_name}"
@@ -4320,7 +4320,7 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                             "path": path,
                             "scope": scope_name,
                             "mode": mode,
-                            "route": result.map(|r| route::disclosure(&r.trace)),
+                            "route": result.map(|r| route::disclosure(&r.trace())),
                             "vector_statement_ms": ms(elapsed),
                         }));
                     };
@@ -4437,7 +4437,7 @@ mod binding {
             )
             .expect("read the stored corpus");
         let mut rows = passages
-            .rows
+            .rows()
             .iter()
             .map(|row| {
                 let mut bytes = Vec::new();
@@ -4463,7 +4463,7 @@ mod binding {
             )
             .expect("read search heads");
         let mut heads = heads
-            .rows
+            .rows()
             .iter()
             .map(|row| format!("{row:?}"))
             .collect::<Vec<_>>();
@@ -4990,7 +4990,7 @@ mod recall {
             let Ok(result) = &self.result else {
                 return false;
             };
-            let Some(vector) = result.trace.vector_search.as_ref() else {
+            let Some(vector) = result.trace().vector_search.as_ref() else {
                 return false;
             };
             vector.route.is_some_and(|route| route.as_str() != "exact")
@@ -5006,9 +5006,9 @@ mod recall {
             match &self.result {
                 Err(error) => serde_json::json!({"error": error}),
                 Ok(result) => {
-                    let vector = result.trace.vector_search.as_ref();
+                    let vector = result.trace().vector_search.as_ref();
                     serde_json::json!({
-                        "physical_plan": result.trace.physical_plan,
+                        "physical_plan": result.trace().physical_plan,
                         "route": vector.and_then(|v| v.route).map(|r| r.as_str()),
                         "resolved_mode": vector.map(|v| format!("{:?}", v.resolved_mode)),
                         "route_evidence": vector.map(|v| v.route_evidence.as_str()),
@@ -5071,11 +5071,11 @@ mod recall {
             )
             .expect("read stored passages");
         let contexts = result
-            .rows
+            .rows()
             .iter()
             .map(|row| format!("{:?}", row[0]))
             .collect::<HashSet<_>>();
-        (result.rows.len(), contexts.len())
+        (result.rows().len(), contexts.len())
     }
 
     /// Every stored passage text's digest, to prove each held-out query is not a corpus passage.
@@ -5087,7 +5087,7 @@ mod recall {
             )
             .expect("read passage digests");
         result
-            .rows
+            .rows()
             .into_iter()
             .map(|row| match &row[0] {
                 Value::Text(digest) => digest.clone(),
@@ -6031,7 +6031,7 @@ fn event_fixture_vector_geometry(_c: &mut Criterion) {
         &HashMap::new(),
     ).expect("read stored passage vectors");
     let corpus = rows
-        .rows
+        .rows()
         .into_iter()
         .map(|row| {
             let Value::Uuid(context) = row[1] else {

@@ -294,14 +294,14 @@ fn assert_chain_kept(db: &Database, calls: &AtomicU64) {
                 &HashMap::new()
             )
             .unwrap()
-            .rows,
+            .rows(),
             vec![vec![
                 Value::Int64(1),
                 Value::Text("kept".into()),
                 vector(ordinal)
             ]]
         );
-        assert_eq!(db.execute(&format!("SELECT id FROM schema_{ordinal:03} ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 1"), &HashMap::from([("q".into(), vector(ordinal))])).unwrap().rows,
+        assert_eq!(db.execute(&format!("SELECT id FROM schema_{ordinal:03} ORDER BY embedding <=> $q USE VECTOR EXACT LIMIT 1"), &HashMap::from([("q".into(), vector(ordinal))])).unwrap().rows(),
             vec![vec![Value::Int64(1)]]);
     }
     assert!(
@@ -398,7 +398,7 @@ fn scenario(
             assert_eq!(
                 db.execute("SELECT revised FROM schema_000", &HashMap::new())
                     .unwrap()
-                    .rows,
+                    .rows(),
                 vec![vec![Value::Null]]
             );
             assert_chain_kept(&db, calls.as_ref().unwrap());
