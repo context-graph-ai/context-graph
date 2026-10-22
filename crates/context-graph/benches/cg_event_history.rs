@@ -3831,7 +3831,7 @@ pub fn event_find_meets_scale_on_the_selected_contextdb_route_without_cg_side_in
                         None,
                     )
                     .expect("passage schema metadata");
-                let DirectMetadataBody::Schema { schema } = schema.body else {
+                let DirectMetadataBody::Schema { ref schema } = schema.body else {
                     panic!("schema metadata answered another kind");
                 };
                 let persisted = schema
