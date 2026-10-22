@@ -133,8 +133,14 @@ fn forget_keeps_the_reader_coordination_condition_when_erasure_is_refused() {
 
     let machine = Machine::without_model();
     let project = machine.project("coordination");
-    let runtime = machine.root.join("runtime");
-    fs::create_dir(&runtime).expect("create isolated coordination root");
+    // The owner channel binds a Unix socket below this directory, and a socket address holds only
+    // about a hundred bytes, so the directory sits under `/tmp` rather than below the long
+    // per-user temporary directory macOS hands out.
+    let runtime_root = tempfile::Builder::new()
+        .prefix("cgr")
+        .tempdir_in("/tmp")
+        .expect("a coordination root short enough for local channel addresses");
+    let runtime = runtime_root.path().to_path_buf();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
         .expect("make coordination root private");
     write_session(

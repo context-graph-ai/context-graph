@@ -268,7 +268,9 @@ jobs:
           - os: macos-latest
             bundle: acceptance
           - os: macos-latest
-            bundle: integration-and-rest + import-and-cli
+            bundle: integration-and-rest
+          - os: macos-latest
+            bundle: import-and-cli
     steps:
       - name: Validate exact ContextDB SHA
         if: github.event_name == 'workflow_dispatch'
@@ -293,7 +295,7 @@ jobs:
       - name: Print and verify checked revisions
         env:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
-          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ contains(matrix.bundle, 'integration-and-rest') && 'integration-and-rest' || 'acceptance' }}
+          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ matrix.bundle }}
           TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
@@ -322,7 +324,8 @@ jobs:
         with:
           cache-bin: false
           workspaces: workspace/context-graph -> target
-          key: test-catalog-seed-v2-${{ matrix.bundle }}
+          cache-on-failure: true
+          key: test-catalog-seed-v3-${{ matrix.bundle == 'acceptance' && 'narrow' || 'workspace' }}
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         env:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
@@ -340,16 +343,16 @@ jobs:
           key: cg-nomic-${{ runner.os }}-${{ hashFiles('workspace/context-graph/crates/context-graph/src/embedder/nomic.rs') }}
       - name: Seed Nomic model cache on cold miss
         env:
-          GATE_CI_MODEL_MODE: ${{ contains(matrix.bundle, 'integration-and-rest') && 'catalog-workspace' || 'catalog-narrow' }}
+          GATE_CI_MODEL_MODE: ${{ matrix.bundle == 'acceptance' && 'catalog-narrow' || 'catalog-workspace' }}
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
-          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ contains(matrix.bundle, 'integration-and-rest') && 'integration-and-rest' || 'acceptance' }}
+          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ matrix.bundle }}
         if: steps.nomic-model-cache.outputs.cache-hit != 'true'
         run: bash scripts/gate.sh model-seed
       - name: Run offline real Nomic model proofs
         env:
-          GATE_CI_MODEL_MODE: ${{ contains(matrix.bundle, 'integration-and-rest') && 'catalog-workspace' || 'catalog-narrow' }}
+          GATE_CI_MODEL_MODE: ${{ matrix.bundle == 'acceptance' && 'catalog-narrow' || 'catalog-workspace' }}
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
-          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ contains(matrix.bundle, 'integration-and-rest') && 'integration-and-rest' || 'acceptance' }}
+          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ matrix.bundle }}
           MODEL_CACHE_HIT: 'true'
         run: bash scripts/gate.sh public-model
       - name: Run default ${{ matrix.bundle }} tests
@@ -404,7 +407,11 @@ jobs:
         # windows-latest is intentionally excluded: descriptor-relative sync IO requires Unix.
         include:
           - os: macos-latest
-            bundle: integration-and-rest + import-and-cli + acceptance
+            bundle: acceptance
+          - os: macos-latest
+            bundle: integration-and-rest
+          - os: macos-latest
+            bundle: import-and-cli
     steps:
       - name: Validate exact ContextDB SHA
         if: github.event_name == 'workflow_dispatch'
@@ -429,7 +436,7 @@ jobs:
       - name: Print and verify checked revisions
         env:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
-          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ contains(matrix.bundle, 'integration-and-rest') && 'integration-and-rest' || 'acceptance' }}
+          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ matrix.bundle }}
           TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
@@ -458,7 +465,8 @@ jobs:
         with:
           cache-bin: false
           workspaces: workspace/context-graph -> target
-          key: features-catalog-seed-v2-${{ matrix.bundle }}
+          cache-on-failure: true
+          key: features-catalog-seed-v3-workspace
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         env:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
@@ -475,14 +483,14 @@ jobs:
         env:
           GATE_CI_MODEL_MODE: catalog-features
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
-          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ contains(matrix.bundle, 'integration-and-rest') && 'integration-and-rest' || 'acceptance' }}
+          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ matrix.bundle }}
         if: steps.nomic-model-cache.outputs.cache-hit != 'true'
         run: bash scripts/gate.sh model-seed
       - name: Run offline real Nomic model proofs
         env:
           GATE_CI_MODEL_MODE: catalog-features
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
-          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ contains(matrix.bundle, 'integration-and-rest') && 'integration-and-rest' || 'acceptance' }}
+          GATE_RECEIPT_DIR: ${{ runner.temp }}/job-receipt/${{ matrix.bundle }}
           MODEL_CACHE_HIT: 'true'
         run: bash scripts/gate.sh public-model
       - name: Run event-search support ${{ matrix.bundle }} tests
@@ -491,7 +499,7 @@ jobs:
           GATE_MODEL_READY: '1'
           TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
           MODEL_CACHE_HIT: 'true'
-        run: python3 scripts/ci-test-shards.py bundle features
+        run: python3 scripts/ci-test-shards.py bundle features --tests-only
       - name: Record disk headroom and remove disposable compiler scratch
         if: always()
         run: |
@@ -524,10 +532,244 @@ jobs:
           path: ${{ runner.temp }}/job-receipt/acceptance
           retention-days: 14
           if-no-files-found: error
+  feature-qualification-core:
+    name: Feature compatibility — default and minimal libraries (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+    - name: Validate exact ContextDB SHA
+      if: github.event_name == 'workflow_dispatch'
+      working-directory: .
+      env:
+        CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      run: |
+        if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+          exit 1
+        fi
+    - name: Check out Context Graph
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        path: workspace/context-graph
+        ref: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Print and verify checked revisions
+      env:
+        TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
+        EVENT_SHA: ${{ github.sha }}
+        REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      run: |
+        bash scripts/gate.sh source
+    - name: Free disk space
+      if: runner.os == 'Linux'
+      run: |
+        df -h /
+        sudo docker image prune -a -f || true
+        sudo docker system prune -a -f --volumes || true
+        sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/az /opt/ghc /usr/local/lib/android /usr/share/dotnet /usr/local/share/boost
+        df -h /
+    - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+      env:
+        CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+      with:
+        toolchain: 1.94.1
+    - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      env:
+        CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+      with:
+        cache-bin: false
+        workspaces: workspace/context-graph -> target
+        key: feature-qualification-core-v1
+    - name: Run feature compatibility qualification
+      run: bash scripts/gate.sh feature-qualification-core
+    - name: Record the exact job receipt
+      if: always()
+      env:
+        TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
+        RECEIPT_OS: ${{ runner.os }}
+        RECEIPT_JOB: ${{ github.job }}
+        RECEIPT_JOB_STATUS: ${{ job.status }}
+      run: |
+        python3 - <<'PY_RECEIPT'
+        import json, os, pathlib, subprocess, xml.etree.ElementTree as ET
+        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+        if head != os.environ['TESTED_SHA']:
+            raise SystemExit('receipt checkout mismatch')
+        lock = pathlib.Path('Cargo.lock').read_text()
+        import re
+        dependency = re.search(r'contextdb[?]rev=([0-9a-f]{40})', lock).group(1)
+        receipt = dict(cg_sha=head, contextdb_sha=dependency, os=os.environ['RECEIPT_OS'], job=os.environ['RECEIPT_JOB'], toolchain='1.94.1', profile='gate' if os.environ['RECEIPT_JOB'] == 'test' else 'default')
+        destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'job-receipt'
+        destination.mkdir(exist_ok=True)
+        receipt_path = destination / 'receipt.json'
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True) + '\n')
+        evidence_errors = []
+        if True:
+            for field, command in (
+                ('rustc_version', ['rustc', '+1.94.1', '--version']),
+                ('cargo_version', ['cargo', '+1.94.1', '--version']),
+            ):
+                try:
+                    version = subprocess.check_output(command, text=True).strip()
+                    if not version:
+                        raise ValueError('empty tool identity')
+                    receipt[field] = version
+                except (OSError, subprocess.CalledProcessError, ValueError):
+                    evidence_errors.append('missing required tool identity: ' + field)
+        junit = pathlib.Path('target/nextest/gate/junit.xml')
+        if os.environ['RECEIPT_JOB'] == 'test':
+            try:
+                cases = list(ET.parse(junit).getroot().iter('testcase'))
+                executed = [c for c in cases if c.find('skipped') is None]
+                receipt['test_count'] = len(executed)
+                receipt['failed_cases'] = [c.attrib for c in cases if c.find('failure') is not None or c.find('error') is not None]
+                if not executed:
+                    evidence_errors.append('empty measured test inventory')
+            except (OSError, ET.ParseError):
+                evidence_errors.append('missing or malformed measured test inventory')
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True) + '\n')
+        if junit.is_file() and os.environ['RECEIPT_JOB'] == 'test':
+            import shutil
+            shutil.copy2(junit, destination / 'junit.xml')
+        if evidence_errors and os.environ['RECEIPT_JOB_STATUS'] == 'success':
+            raise SystemExit('; '.join(evidence_errors))
+        PY_RECEIPT
+    - name: Record disk headroom and remove disposable compiler scratch
+      if: always()
+      run: |
+        df -h /
+        python3 scripts/ci-cache-post-cleanup.py
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      if: always()
+      with:
+        name: pr-${{ github.job }}-${{ runner.os }}
+        path: ${{ runner.temp }}/job-receipt
+        retention-days: 14
+        if-no-files-found: error
+  feature-qualification-sync:
+    name: Feature compatibility — sync, CLI and doctests (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+    - name: Validate exact ContextDB SHA
+      if: github.event_name == 'workflow_dispatch'
+      working-directory: .
+      env:
+        CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      run: |
+        if [[ ! "$CONTEXTDB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "contextdb_sha must be an exact 40-character lowercase hexadecimal commit SHA" >&2
+          exit 1
+        fi
+    - name: Check out Context Graph
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        path: workspace/context-graph
+        ref: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Print and verify checked revisions
+      env:
+        TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
+        EVENT_SHA: ${{ github.sha }}
+        REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
+      run: |
+        bash scripts/gate.sh source
+    - name: Free disk space
+      if: runner.os == 'Linux'
+      run: |
+        df -h /
+        sudo docker image prune -a -f || true
+        sudo docker system prune -a -f --volumes || true
+        sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/az /opt/ghc /usr/local/lib/android /usr/share/dotnet /usr/local/share/boost
+        df -h /
+    - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+      env:
+        CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+      with:
+        toolchain: 1.94.1
+    - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      env:
+        CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
+      with:
+        cache-bin: false
+        workspaces: workspace/context-graph -> target
+        key: feature-qualification-sync-v1
+    - name: Run feature compatibility qualification
+      run: bash scripts/gate.sh feature-qualification-sync
+    - name: Record the exact job receipt
+      if: always()
+      env:
+        TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
+        RECEIPT_OS: ${{ runner.os }}
+        RECEIPT_JOB: ${{ github.job }}
+        RECEIPT_JOB_STATUS: ${{ job.status }}
+      run: |
+        python3 - <<'PY_RECEIPT'
+        import json, os, pathlib, subprocess, xml.etree.ElementTree as ET
+        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+        if head != os.environ['TESTED_SHA']:
+            raise SystemExit('receipt checkout mismatch')
+        lock = pathlib.Path('Cargo.lock').read_text()
+        import re
+        dependency = re.search(r'contextdb[?]rev=([0-9a-f]{40})', lock).group(1)
+        receipt = dict(cg_sha=head, contextdb_sha=dependency, os=os.environ['RECEIPT_OS'], job=os.environ['RECEIPT_JOB'], toolchain='1.94.1', profile='gate' if os.environ['RECEIPT_JOB'] == 'test' else 'default')
+        destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'job-receipt'
+        destination.mkdir(exist_ok=True)
+        receipt_path = destination / 'receipt.json'
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True) + '\n')
+        evidence_errors = []
+        if True:
+            for field, command in (
+                ('rustc_version', ['rustc', '+1.94.1', '--version']),
+                ('cargo_version', ['cargo', '+1.94.1', '--version']),
+            ):
+                try:
+                    version = subprocess.check_output(command, text=True).strip()
+                    if not version:
+                        raise ValueError('empty tool identity')
+                    receipt[field] = version
+                except (OSError, subprocess.CalledProcessError, ValueError):
+                    evidence_errors.append('missing required tool identity: ' + field)
+        junit = pathlib.Path('target/nextest/gate/junit.xml')
+        if os.environ['RECEIPT_JOB'] == 'test':
+            try:
+                cases = list(ET.parse(junit).getroot().iter('testcase'))
+                executed = [c for c in cases if c.find('skipped') is None]
+                receipt['test_count'] = len(executed)
+                receipt['failed_cases'] = [c.attrib for c in cases if c.find('failure') is not None or c.find('error') is not None]
+                if not executed:
+                    evidence_errors.append('empty measured test inventory')
+            except (OSError, ET.ParseError):
+                evidence_errors.append('missing or malformed measured test inventory')
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True) + '\n')
+        if junit.is_file() and os.environ['RECEIPT_JOB'] == 'test':
+            import shutil
+            shutil.copy2(junit, destination / 'junit.xml')
+        if evidence_errors and os.environ['RECEIPT_JOB_STATUS'] == 'success':
+            raise SystemExit('; '.join(evidence_errors))
+        PY_RECEIPT
+    - name: Record disk headroom and remove disposable compiler scratch
+      if: always()
+      run: |
+        df -h /
+        python3 scripts/ci-cache-post-cleanup.py
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      if: always()
+      with:
+        name: pr-${{ github.job }}-${{ runner.os }}
+        path: ${{ runner.temp }}/job-receipt
+        retention-days: 14
+        if-no-files-found: error
   macos-advisory:
     name: macOS advisory results
     if: always()
-    needs: [lint, controls, test, features]
+    needs: [lint, test, features, controls, feature-qualification-core, feature-qualification-sync]
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -538,8 +780,15 @@ jobs:
         run: |
           python3 - <<'PY_CHECK'
           import json, os
-          expected = {'features', 'test', 'lint', 'controls'}
-          needs = json.loads(os.environ['NEEDS_JSON'])
+          expected = {'features', 'test', 'lint', 'controls', 'feature-qualification-core', 'feature-qualification-sync'}
+          def unique(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError('duplicate required job: ' + key)
+                  result[key] = value
+              return result
+          needs = json.loads(os.environ['NEEDS_JSON'], object_pairs_hook=unique)
           if set(needs) != expected or any(row.get('result') != 'success' for row in needs.values()):
               raise SystemExit('required job inventory failed: ' + json.dumps(needs, sort_keys=True))
           print('all required jobs succeeded')
@@ -556,22 +805,9 @@ jobs:
           TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
           REQUESTED_CONTEXTDB_SHA: ${{ inputs.contextdb_sha }}
         run: bash scripts/gate.sh source
-      - name: Free disk space
-        if: runner.os == 'Linux'
-        run: |
-          df -h /
-          sudo docker image prune -a -f || true
-          sudo docker system prune -a -f --volumes || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/az /opt/ghc /usr/local/lib/android /usr/share/dotnet /usr/local/share/boost
-          df -h /
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: 1.94.1
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-        with:
-          cache-bin: false
-          workspaces: workspace/context-graph -> target
-          key: test-integration-and-rest + import-and-cli
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: pr-*
@@ -579,15 +815,7 @@ jobs:
       - name: Verify complete default and feature unions before wall reports
         env:
           TESTED_SHA: ${{ github.event.pull_request.head.sha || inputs.cg_sha || github.sha }}
-        run: bash scripts/gate.sh shard-union-macos
-      - name: Record disk headroom and remove disposable compiler scratch
-        if: always()
-        run: |
-          df -h /
-          python3 scripts/ci-cache-post-cleanup.py
-      - name: Remove disposable compiler scratch
-        if: always()
-        run: python3 scripts/ci-cache-post-cleanup.py
+        run: bash scripts/gate.sh shard-union-macos-isolated
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

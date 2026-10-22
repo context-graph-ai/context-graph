@@ -230,7 +230,6 @@ feature_qualification_sync() {
     feature_docs
 }
 features_tests() {
-    [[ "${RUNNER_OS:-}" == Linux ]] || pending 'feature tests stage requires Linux'
     case "${GATE_SHARD:-}" in
         acceptance|integration-and-rest|import-and-cli) ;;
         *) pending 'feature tests stage requires an exact shard' ;;
@@ -267,7 +266,7 @@ shard_union() {
     local systems=(Linux macOS)
     case "$stage" in
         shard-union-linux|shard-union-linux-isolated) systems=(Linux) ;;
-        shard-union-macos) systems=(macOS) ;;
+        shard-union-macos|shard-union-macos-isolated) systems=(macOS) ;;
         shard-union) ;;
         *) pending 'unknown shard union stage' ;;
     esac
@@ -279,7 +278,7 @@ shard_union() {
     mkdir -p "$repository_root/target/nextest/gate"
     for system in "${systems[@]}"; do
         cp "$RUNNER_TEMP/shard-receipts/default-$system.xml" "$repository_root/target/nextest/gate/junit.xml"
-        if [[ "$stage" == shard-union-linux-isolated ]]; then
+        if [[ "$stage" == shard-union-linux-isolated || "$stage" == shard-union-macos-isolated ]]; then
             default_wall_isolated
         else
             default_wall
@@ -530,7 +529,7 @@ print('local package inspected; no publication performed')
 PY
 }
 case "$stage" in
-    shard-union|shard-union-linux|shard-union-macos|shard-union-linux-isolated) run_stage "$stage" shard_union ;;
+    shard-union|shard-union-linux|shard-union-macos|shard-union-linux-isolated|shard-union-macos-isolated) run_stage "$stage" shard_union ;;
     full)
         cargo fmt --all --check
         cargo clippy --workspace --all-targets -- -D warnings

@@ -514,7 +514,8 @@ jobs:
         with:
           cache-bin: false
           workspaces: workspace/context-graph -> target
-          key: test-catalog-seed-v2-${{ matrix.bundle }}
+          cache-on-failure: true
+          key: test-catalog-seed-v3-${{ matrix.bundle == 'acceptance' && 'narrow' || 'workspace' }}
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         env:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
@@ -654,7 +655,8 @@ jobs:
         with:
           cache-bin: false
           workspaces: workspace/context-graph -> target
-          key: features-catalog-seed-v2-${{ matrix.bundle }}
+          cache-on-failure: true
+          key: features-catalog-seed-v3-workspace
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         env:
           CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache

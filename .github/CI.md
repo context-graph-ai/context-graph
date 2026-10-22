@@ -84,8 +84,9 @@ resolution, so filtering alone does not reduce their compilation closure.
 CI alone sets development and test optimization to level 1 and debug info to 0, with
 debug assertions and overflow checks enabled. Local Cargo profile defaults stay as
 specified in `Cargo.toml`. Linux jobs reclaim preinstalled SDKs with sudo and print
-root disk headroom before and after linking. Disposable `target/tests` trybuild output
-is removed before compiler cache post hooks, including on failure.
+root disk headroom before and after linking. Disposable `target/tests` scratch
+is removed before compiler cache post hooks, including on failure; `target/tests/trybuild`
+stays so the compile-fail dependency build is cached with the rest of `target`.
 
 The macOS default acceptance bundle temporarily records the digest immutability
 compile proof's inner Cargo boundaries under its existing receipt artifact's
@@ -279,7 +280,11 @@ in their respective workflows, on the same selected source commit. The Linux req
 `CI controls` jobs execute the complete `scripts/tests/test_ci_qualification.py`
 module, including all development download controls. Locally, use Python 3.11 or
 newer with `PyYAML==6.0.2` installed and run
-`python3 scripts/tests/test_ci_qualification.py`. These controls use synthetic
+`python3 scripts/tests/test_ci_qualification.py`. The entrypoint runs every collected
+test once, each in its own Python process, several at a time, and fails unless each one
+reports exactly one passing test; naming a test (for example
+`python3 scripts/tests/test_ci_qualification.py StageEvidence`) runs only that selection
+in one process. These controls use synthetic
 compiler and model inputs; Cargo features do not change their inputs. Rust workflow
 guards verify both workflows and their qualification roles without recursively executing the Python suite.
 The jobs need Python and Git, with no Rust compilation or model cache setup, and
@@ -290,12 +295,15 @@ after the unfiltered local run or verified shard union. This permits removal of 
 retired binary while still rejecting a live binary without a recorded ceiling.
 The compatibility gate without nextest skips JUnit-dependent comparisons.
 
-Physical Rust execution uses eleven jobs while retaining twelve logical shard receipts.
-On Linux, each variant runs acceptance, integration and remaining cases, and imports
-and CLI in three independent jobs: six Linux runtime jobs plus two independent compatibility build jobs: eight Linux Rust jobs in total. macOS default runs
-acceptance separately and integration and remaining cases before imports and CLI in
-a shared job; macOS feature execution runs all three stages in one job. Each runtime job seeds and proves the model once and shares its Cargo
-target. `python3 scripts/ci-test-shards.py bundle default` (or `features`) uses
+Each platform runs the same Rust jobs, one per logical shard receipt. Each variant runs
+acceptance, integration and remaining cases, and imports and CLI in three independent
+jobs: six runtime jobs plus two independent compatibility build jobs, eight Rust jobs per
+platform and sixteen in total. Each runtime job seeds and proves the model once and keeps
+its own Cargo target. Jobs that compile the same selection share one compiler cache entry
+per platform (default acceptance compiles the narrow selection; the other default bundles
+compile the workspace; every feature bundle compiles the workspace with event-search test
+support), and a job that fails still saves its compiled dependencies, so a later run does
+not start cold because an earlier one failed. `python3 scripts/ci-test-shards.py bundle default` (or `features`) uses
 `GATE_PHYSICAL_BUNDLE` to select the displayed bundle. Each logical stage retains its
 own `GATE_SHARD`, receipt directory and existing artifact identity. A failed stage
 stops the bundle, preserves its exit status and uploads available evidence; later
@@ -319,18 +327,18 @@ example artifact after a successful build, rejecting malformed or ambiguous outp
 The stage receipt records the actual build arguments, executable path and SHA-256.
 Narrow mode builds `cargo build --locked -p context-graph --example ci_model_seed
 --message-format=json-render-diagnostics`. Its source includes the unchanged private
-catalog helper. Both helpers are excluded from their packages. Compiler seed caches use family v2; the
+catalog helper. Both helpers are excluded from their packages. Compiler seed caches use family v3; the
 OS/source-bound Nomic model cache key is unchanged. Timing improvements require native
 unit-reuse evidence and complete cold/warm hosted measurements.
 
 ## macOS qualification follow-up
 
 Linux is the current required qualification platform. The separate `macOS CI (advisory)`
-workflow preserves macOS lint, default tests, feature tests and complete Python controls:
-five physical jobs (two default, one feature, lint and controls) produce six logical
-Rust receipts. Its `macOS advisory results` aggregate fails on failed, cancelled,
+workflow runs the Linux correctness jobs on `macos-latest` with identical steps: lint,
+complete Python controls, three default bundles, three feature bundles and the two
+compatibility build jobs, ten physical jobs that produce six logical Rust receipts. Its `macOS advisory results` aggregate fails on failed, cancelled,
 skipped, missing or unexpected prerequisites, verifies only macOS receipts and runs
-macOS default accounting. It never enters `PR checks` needs or manual delivery admission.
+macOS default accounting through the isolated audit. It never enters `PR checks` needs or manual delivery admission.
 The legacy local `shard-union` stage still requires twelve receipts; explicit Linux
 and macOS stages each require exactly six, with no fallback to available platforms.
 
@@ -346,7 +354,7 @@ default locator or full Context Graph qualification. Full Context Graph macOS
 consumer qualification, including the integrated default owner/reader locator,
 remains pending. These are open follow-up items, not passing evidence.
 Completion requires identifying and fixing each failure in source, verifying
-locator behavior, running all five macOS jobs with all six valid receipts on the exact
+locator behavior, running all ten macOS jobs with all six valid receipts on the exact
 integrated source, and reviewing the resulting evidence before changing qualification.
 No issue number or hosted green result is claimed.
 
@@ -357,16 +365,16 @@ can extend the dev-push workflow; required-check latency does not establish full
 workflow latency. Manual retry requires exactly eleven successful displayed Linux/source/docs
 checks from `ci.yml`; advisory runs cannot authorize delivery.
 
-The Linux compatibility build jobs are unconditional and independent of the six runtime
-jobs. `feature-qualification-core` runs the original default and minimal library
+The compatibility build jobs are unconditional and independent of the six runtime
+jobs on each platform. `feature-qualification-core` runs the original default and minimal library
 builds. `feature-qualification-sync` runs the original fabric-sync library and CLI
 builds, then feature doctests. `feature-qualification` reproduces both groups in order.
 Each compile job records its selected source, actual commands, compiler identities and
 job result without a shard or nextest inventory. The existing local `features`, sharded
 `features`, `pr` and `extended-public` stages retain all builds, tests and doctests in
-their original order. Only the explicit Linux singleton dispatcher option
-`bundle features --tests-only` selects the internal `features-tests` stage; default,
-macOS and combined bundles reject that option.
+their original order. Only the explicit singleton dispatcher option
+`bundle features --tests-only` selects the internal `features-tests` stage, on either
+platform; default and combined bundles reject that option.
 
 After all six Linux shard receipts verify, `shard-union-linux-isolated` copies the
 complete merged default JUnit, exports `CG_GATE_JUNIT`, compares the historical baseline,
@@ -375,7 +383,8 @@ audit compiles the same `crates/context-graph/tests/test_estate_audit.rs` throug
 `scripts/gate-wall-audit/Cargo.toml`, an independent edition-2024 workspace with only
 the exact root-locked TOML dependency closure. Its ephemeral target is
 `$RUNNER_TEMP/gate-wall-audit-target`. No engine compilation or executable transport is
-needed for this aggregate. Existing local `shard-union`, `shard-union-linux`,
-`shard-union-macos` and default wall-audit routes keep their original behavior.
-macOS commands and coverage remain unchanged. Actual cold compilation, model downloads,
-queues and total hosted completion remain unproved until measured on the final source.
+needed for this aggregate. The macOS aggregate runs
+`shard-union-macos-isolated`, the same audit over the six macOS receipts. Existing local
+`shard-union`, `shard-union-linux`, `shard-union-macos` and default wall-audit routes keep
+their original behavior. Actual cold compilation, model downloads, queues and total hosted
+completion remain unproved until measured on the final source.

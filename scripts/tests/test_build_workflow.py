@@ -528,7 +528,7 @@ def legacy_family(family, workflow, ci, download, readme, advisory=None):
                 'independent required and advisory workflow roles')
         for lane, os_name, aggregate, dependencies in (
                 (required, 'ubuntu-latest', 'required', {'source', 'lint', 'docs', 'controls', 'test', 'features', 'feature-qualification-core', 'feature-qualification-sync'}),
-                (advisory, 'macos-latest', 'macos-advisory', {'lint', 'controls', 'test', 'features'})):
+                (advisory, 'macos-latest', 'macos-advisory', {'lint', 'controls', 'test', 'features', 'feature-qualification-core', 'feature-qualification-sync'})):
             require(set(lane['jobs'].get(aggregate, {}).get('needs', [])) == dependencies,
                     'exact independent platform aggregate dependencies')
             require(('required' in lane['jobs']) == (aggregate == 'required'),
@@ -537,11 +537,7 @@ def legacy_family(family, workflow, ci, download, readme, advisory=None):
                 job = lane['jobs'].get(name, {})
                 expected_matrix = {'os': [os_name]}
                 if name in ('test', 'features'):
-                    bundles = ('acceptance', 'integration-and-rest + import-and-cli')
-                    if os_name == 'ubuntu-latest':
-                        bundles = ('acceptance', 'integration-and-rest', 'import-and-cli')
-                    if name == 'features' and os_name == 'macos-latest':
-                        bundles = ('integration-and-rest + import-and-cli + acceptance',)
+                    bundles = ('acceptance', 'integration-and-rest', 'import-and-cli')
                     expected_matrix = {'include': [{'os': os_name, 'bundle': bundle} for bundle in bundles]}
                 require(job.get('runs-on') == '${{ matrix.os }}' and
                         job.get('strategy', {}).get('matrix') == expected_matrix,

@@ -780,7 +780,9 @@ else: print('public default dependency')
         self.assertEqual(receipt['commands'][0], 'bash scripts/gate.sh features-tests')
         self.assertEqual(receipt['test_count'], 2)
         self.assertEqual(len(receipt['executed_feature_inventory']), 2)
-        for system, shard in [('macOS', 'acceptance'), ('Linux', ''), ('Linux', 'wrong')]:
+        result = self.run_stage('features-tests', **dict(env, RUNNER_OS='macOS'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for system, shard in [('macOS', ''), ('macOS', 'wrong'), ('Linux', ''), ('Linux', 'wrong')]:
             result = self.run_stage('features-tests', **dict(env, RUNNER_OS=system, GATE_SHARD=shard))
             self.assertNotEqual(result.returncode, 0)
         # A successful dispatcher without a new JUnit cannot reuse the preceding measurement.
@@ -817,11 +819,30 @@ else: print('public default dependency')
             'p=pathlib.Path(os.environ["CG_GATE_JUNIT"])\n'
             'assert len(list(ET.parse(p).getroot().iter("testcase"))) == 3\n'
             'print("complete measurement checked",sys.argv[1])\n')
+        isolated_audit = [['test', '--locked', '--manifest-path', 'scripts/gate-wall-audit/Cargo.toml', '--target-dir', str(self.root / 'gate-wall-audit-target'), '--test', 'test_estate_audit', 'gate_wall_seconds_never_exceed_the_frozen_baseline', '--', '--ignored', '--exact']]
         result = self.run_stage('shard-union-linux-isolated')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('Linux features: complete disjoint union', result.stdout)
-        self.assertEqual(self.commands(), [['test', '--locked', '--manifest-path', 'scripts/gate-wall-audit/Cargo.toml', '--target-dir', str(self.root / 'gate-wall-audit-target'), '--test', 'test_estate_audit', 'gate_wall_seconds_never_exceed_the_frozen_baseline', '--', '--ignored', '--exact']])
+        self.assertEqual(self.commands(), isolated_audit)
         self.trace.unlink()
+        # The macOS route verifies only macOS receipts, so Linux receipts alone cannot satisfy it.
+        result = self.run_stage('shard-union-macos-isolated')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.trace.exists())
+        for directory in (path for path in receipts.iterdir() if path.is_dir()):
+            row = json.loads((directory / 'shard.json').read_text()); row['os'] = 'macOS'
+            (directory / 'shard.json').write_text(json.dumps(row))
+        result = self.run_stage('shard-union-macos-isolated')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('macOS features: complete disjoint union', result.stdout)
+        self.assertEqual(self.commands(), isolated_audit)
+        self.trace.unlink()
+        result = self.run_stage('shard-union-linux-isolated')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.trace.exists())
+        for directory in (path for path in receipts.iterdir() if path.is_dir()):
+            row = json.loads((directory / 'shard.json').read_text()); row['os'] = 'Linux'
+            (directory / 'shard.json').write_text(json.dumps(row))
         # A missing or failing sixth feature receipt must stop before any Rust audit.
         path = receipts / 'features-integration-and-rest/shard.json'; original = path.read_text()
         for mutation in ('missing', 'failed', 'wrong identity'):
@@ -839,7 +860,7 @@ else: print('public default dependency')
         if job in ('test', 'features'):
             variant = 'default' if job == 'test' else 'features'
             command = 'python3 scripts/ci-test-shards.py bundle ' + variant
-            if job == 'features' and workflow['name'] == 'Linux CI': command += ' --tests-only'
+            if job == 'features': command += ' --tests-only'
             step = next(s for s in workflow['jobs'][job]['steps'] if s.get('run') == command)
             self.assertNotIn('if', step)
             self.assertNotIn('continue-on-error', step)
@@ -1186,7 +1207,7 @@ class ControlsWorkflow(unittest.TestCase):
             check = workflow['jobs'][aggregate]['steps'][0]['run']
             program = check.split("<<'PY_CHECK'\n", 1)[1].split('PY_CHECK', 1)[0]
             expected = set(workflow['jobs'][aggregate]['needs'])
-            self.assertEqual(expected, {'lint', 'controls', 'test', 'features'} | ({'source', 'docs', 'feature-qualification-core', 'feature-qualification-sync'} if aggregate == 'required' else set()))
+            self.assertEqual(expected, {'lint', 'controls', 'test', 'features', 'feature-qualification-core', 'feature-qualification-sync'} | ({'source', 'docs'} if aggregate == 'required' else set()))
             def succeeds(rows):
                 return subprocess.run(['python3', '-I', '-c', program], env=dict(os.environ, NEEDS_JSON=json.dumps(rows)), capture_output=True).returncode == 0
             rows = {name: {'result': 'success'} for name in expected}
@@ -1248,5 +1269,58 @@ class ControlsWorkflow(unittest.TestCase):
             self.assertFalse(admitted(rows + [{'name': 'lint (macos-latest)', 'conclusion': 'success'}]))
 
 
+def run_each_test_in_its_own_process():
+    """Run every discovered test once, each in its own interpreter, several at a time.
+
+    The suite is unchanged: every test class this module collects is enumerated, each test
+    runs in a fresh process with the same interpreter and environment, and the run fails
+    unless every enumerated test reports exactly one executed and passing test.
+    """
+    import concurrent.futures
+    import sys
+    module = sys.modules[__name__]
+    names = []
+
+    def collect(suite):
+        for item in suite:
+            if isinstance(item, unittest.TestSuite):
+                collect(item)
+            else:
+                cls = type(item)
+                if getattr(module, cls.__name__, None) is not cls:
+                    raise SystemExit('test class is not addressable from this module: ' + cls.__qualname__)
+                names.append(cls.__name__ + '.' + item._testMethodName)
+
+    collect(unittest.defaultTestLoader.loadTestsFromModule(module))
+    if not names or len(set(names)) != len(names):
+        raise SystemExit('empty or duplicate test inventory')
+
+    def execute(name):
+        result = subprocess.run([sys.executable, str(pathlib.Path(__file__).resolve()), name],
+                                capture_output=True, text=True)
+        # unittest reports on stderr; the test's own prints stay on stdout.
+        lines = [line for line in result.stderr.splitlines() if line.strip()]
+        summary = [line for line in lines if line.startswith('Ran ')]
+        passed = (result.returncode == 0 and bool(summary) and summary[-1].startswith('Ran 1 test in ')
+                  and (lines[-1] == 'OK' or lines[-1].startswith('OK (')))
+        return name, passed, result.stdout + result.stderr
+
+    workers = max(2, os.cpu_count() or 2)
+    failures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for name, passed, output in pool.map(execute, names):
+            print(('ok   ' if passed else 'FAIL ') + name, flush=True)
+            if not passed:
+                failures.append(name)
+                print(output, flush=True)
+    print(f'Ran {len(names)} tests in separate processes with {workers} workers; {len(failures)} failed', flush=True)
+    if failures:
+        raise SystemExit('failed tests: ' + ', '.join(failures))
+
+
 if __name__ == '__main__':
-    unittest.main()
+    import sys
+    if len(sys.argv) > 1:
+        unittest.main()
+    else:
+        run_each_test_in_its_own_process()

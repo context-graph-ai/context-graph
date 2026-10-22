@@ -284,8 +284,8 @@ def workflow_receipt(destination, variant, result):
 
 def bundle(variant, tests_only=False):
     selected = PHYSICAL_BUNDLES[os.environ['GATE_PHYSICAL_BUNDLE']]
-    if tests_only and (variant != 'features' or os.environ['RUNNER_OS'] != 'Linux' or len(selected) != 1):
-        raise ValueError('tests-only requires a Linux feature singleton')
+    if tests_only and (variant != 'features' or len(selected) != 1):
+        raise ValueError('tests-only requires a feature singleton')
     if selected == PHYSICAL_BUNDLES['integration-and-rest + import-and-cli + acceptance']:
         if (variant, os.environ['RUNNER_OS']) != ('features', 'macOS'):
             raise ValueError('three-stage bundle requires macOS feature execution')
