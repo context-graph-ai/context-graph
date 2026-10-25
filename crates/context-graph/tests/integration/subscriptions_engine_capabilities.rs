@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -47,18 +47,20 @@ fn insert_invalidation(db: &Database, context_id: Uuid, severity: &str, reason: 
     .expect("insert invalidation");
 }
 
-fn wait_for_count(counter: &AtomicU64, expected: u64) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && counter.load(Ordering::SeqCst) < expected {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+fn wait_for_count(counter: &(Mutex<u64>, Condvar), expected: u64) {
+    let guard = counter.0.lock().expect("delivery counter");
+    let _guard = counter
+        .1
+        .wait_while(guard, |count| *count < expected)
+        .expect("delivery event");
 }
 
-fn wait_for_log(log: &Arc<Mutex<Vec<SinkEvent>>>, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline && log.lock().expect("sink log").len() < expected {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+fn wait_for_log(log: &Arc<(Mutex<Vec<SinkEvent>>, Condvar)>, expected: usize) {
+    let guard = log.0.lock().expect("sink log");
+    let _guard = log
+        .1
+        .wait_while(guard, |events| events.len() < expected)
+        .expect("sink event");
 }
 
 fn wait_for_metric(db: &Database, sink: &str, predicate: impl Fn(u64, u64, u64, u64) -> bool) {
@@ -92,16 +94,17 @@ fn engine_sink_queue_persists_across_reopen_subscriber_re_registers_resumes_deli
     }
 
     let db = Database::open(&path).expect("reopen database");
-    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
     let seen = Arc::clone(&log);
     db.register_sink("slack", None, move |event| {
-        seen.lock().expect("sink log").push(event.clone());
+        seen.0.lock().expect("sink log").push(event.clone());
+        seen.1.notify_all();
         Ok(())
     })
     .expect("register sink");
 
     wait_for_log(&log, 1);
-    let captured = log.lock().expect("sink log");
+    let captured = log.0.lock().expect("sink log");
     assert_eq!(captured.len(), 1);
     assert_eq!(
         captured[0].row_values.get("reason"),
@@ -147,10 +150,11 @@ fn engine_per_sink_queue_isolation_one_sink_panic_does_not_block_other_sink_deli
 
     db.register_sink("slack", None, |_| panic!("expected sink panic"))
         .expect("register panic sink");
-    let audit_count = Arc::new(AtomicU64::new(0));
+    let audit_count = Arc::new((Mutex::new(0), Condvar::new()));
     let seen = Arc::clone(&audit_count);
     db.register_sink("audit", None, move |_| {
-        seen.fetch_add(1, Ordering::SeqCst);
+        *seen.0.lock().expect("delivery counter") += 1;
+        seen.1.notify_all();
         Ok(())
     })
     .expect("register audit sink");
@@ -167,7 +171,7 @@ fn engine_per_sink_queue_isolation_one_sink_panic_does_not_block_other_sink_deli
         queued == 50 && retried > 0 && permanent == 0
     });
 
-    assert_eq!(audit_count.load(Ordering::SeqCst), 50);
+    assert_eq!(*audit_count.0.lock().expect("delivery counter"), 50);
     let audit_metrics = db.sink_metrics_for_test("audit");
     assert_eq!(audit_metrics.delivered, 50);
     assert_eq!(audit_metrics.permanent_failures, 0);
@@ -188,11 +192,12 @@ fn cross_context_isolation_enforced_at_engine_route_not_at_typed_wrapper() {
     declare_event_schema(&db);
 
     let scoped = db.scoped_with_contexts(BTreeSet::from([ContextId::new(ctx_a)]));
-    let log: Arc<Mutex<Vec<SinkEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
     let seen = Arc::clone(&log);
     scoped
         .register_sink("slack", None, move |event| {
-            seen.lock().expect("sink log").push(event.clone());
+            seen.0.lock().expect("sink log").push(event.clone());
+            seen.1.notify_all();
             Ok(())
         })
         .expect("register scoped sink");
@@ -201,7 +206,7 @@ fn cross_context_isolation_enforced_at_engine_route_not_at_typed_wrapper() {
     insert_invalidation(&db, ctx_b, "warning", "foreign");
 
     wait_for_log(&log, 1);
-    let captured = log.lock().expect("sink log");
+    let captured = log.0.lock().expect("sink log");
     assert_eq!(
         captured.len(),
         1,

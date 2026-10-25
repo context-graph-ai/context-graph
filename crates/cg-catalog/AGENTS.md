@@ -44,5 +44,10 @@ Ownership boundaries above are review-only architectural constraints unless a gu
 - Hosted requests follow the attached provider contract:
   `tests/acceptance/generic_llm_endpoint.rs::wire_schema_tracks_the_attached_contract_not_a_constant`.
 
+Test coordination uses `with_lock_wait_observer_for_test` behind `test-support` to observe an
+actual refused lock attempt before blocking acquisition. Keep catalog lock ownership here;
+fixtures wait on that event and explicit HTTP-server completion. Subscription negatives still
+need a substrate dispatch-drain receipt; a timed observation window is not a completion seam.
+
 Fast check: `cargo test -p cg-catalog --test acceptance`.
 Full gate: `scripts/gate.sh` at repository root.

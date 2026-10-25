@@ -87,21 +87,68 @@ fn slow_projection_work_does_not_keep_a_source_read_statement_open() {
         .expect("append source events");
     drop(store);
 
-    let (keep_open, receiver) = channel::<()>();
-    let receiver = Mutex::new(receiver);
-    let wait: Observer = Arc::new(move || {
-        let _ = &keep_open;
-        let _ = receiver
-            .lock()
-            .expect("wait receiver")
-            .recv_timeout(std::time::Duration::from_millis(700));
+    use context_graph::test_support::set_event_search_projection_read_clock_for_test;
+    use contextdb_core::read_contract::{DeadlineClock, DeadlineWait};
+    struct ReadClock {
+        now: AtomicU64,
+        reads: AtomicU64,
+        waiters: Mutex<Vec<std::task::Waker>>,
+    }
+    impl ReadClock {
+        fn advance(&self) {
+            self.now.fetch_add(700, Ordering::SeqCst);
+            let waiters = std::mem::take(&mut *self.waiters.lock().expect("deadline waiters"));
+            for waiter in waiters {
+                waiter.wake();
+            }
+        }
+    }
+    impl DeadlineClock for ReadClock {
+        fn now_ms(&self) -> u64 {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.now.load(Ordering::SeqCst)
+        }
+        fn wait_until(&self, deadline: u64) -> DeadlineWait<'_> {
+            Box::pin(std::future::poll_fn(move |context| {
+                let mut waiters = self.waiters.lock().expect("deadline waiters");
+                if self.now_ms() >= deadline {
+                    std::task::Poll::Ready(())
+                } else {
+                    waiters.push(context.waker().clone());
+                    std::task::Poll::Pending
+                }
+            }))
+        }
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            set_event_search_projection_read_clock_for_test(None);
+            set_event_search_projection_read_deadline_ms_for_test(None);
+        }
+    }
+    let clock = Arc::new(ReadClock {
+        now: AtomicU64::new(0),
+        reads: AtomicU64::new(0),
+        waiters: Mutex::new(Vec::new()),
     });
+    let outside_read = Arc::clone(&clock);
+    let advance: Observer = Arc::new(move || outside_read.advance());
     let embedder = ControlledEmbedder::new();
-    *embedder.embed_observer.lock().expect("observer lock") = Some(wait.clone());
-    after_next_event_search_membership_read_page_for_test(move || wait());
+    *embedder.embed_observer.lock().expect("observer lock") = Some(advance.clone());
+    after_next_event_search_membership_read_page_for_test(move || advance());
+    set_event_search_projection_read_clock_for_test(Some(clock.clone()));
     set_event_search_projection_read_deadline_ms_for_test(Some(500));
+    let _reset = Reset;
     let result = run(&config, context_id, &embedder, 2, OBSERVED_LEASE_MS);
-    set_event_search_projection_read_deadline_ms_for_test(None);
+    assert!(
+        clock.reads.load(Ordering::SeqCst) > 0,
+        "real bounded source reads consumed the substrate deadline clock"
+    );
+    assert!(
+        clock.now.load(Ordering::SeqCst) >= 1_400,
+        "both membership work and inference advanced time beyond a read budget"
+    );
     let receipt = result.expect("bounded source pages survive slow work and slow embeddings");
     assert_eq!(receipt.embedded_event_count, 6);
     assert!(
@@ -3306,26 +3353,34 @@ fn one_concurrent_failure_waits_for_its_held_sibling_commits_nothing_and_retries
     let embedder = ControlledEmbedder::new();
     *embedder.fail_once_on.lock().expect("failure control") = Some('b');
     let (entered_tx, entered_rx) = channel();
+    let entered_order = Arc::new(Mutex::new(entered_tx));
     let (release_tx, release_rx) = channel();
     let release_rx = Arc::new(Mutex::new(release_rx));
     let call_index = Arc::new(AtomicUsize::new(0));
     let held_active = Arc::new(AtomicBool::new(false));
     {
+        let entered_order = Arc::clone(&entered_order);
         let release_rx = Arc::clone(&release_rx);
         let call_index = Arc::clone(&call_index);
         let held_active = Arc::clone(&held_active);
         *embedder.embed_observer.lock().expect("observer lock") = Some(Arc::new(move || {
-            let ordinal = call_index.fetch_add(1, Ordering::SeqCst);
+            // Take the ordinal and announce it under one lock so the channel order is the
+            // ordinal order; two workers racing between the two steps made 1 arrive before 0.
+            let ordinal = {
+                let announce = entered_order.lock().expect("entry order lock");
+                let ordinal = call_index.fetch_add(1, Ordering::SeqCst);
+                if ordinal == 0 {
+                    held_active.store(true, Ordering::SeqCst);
+                }
+                let _ = announce.send(ordinal);
+                ordinal
+            };
             if ordinal == 0 {
-                held_active.store(true, Ordering::SeqCst);
-            }
-            let _ = entered_tx.send(ordinal);
-            if ordinal == 0 {
-                let _ = release_rx.lock().ok().and_then(|receiver| {
-                    receiver
-                        .recv_timeout(std::time::Duration::from_secs(30))
-                        .ok()
-                });
+                release_rx
+                    .lock()
+                    .expect("release receiver")
+                    .recv()
+                    .expect("explicit sibling release");
                 held_active.store(false, Ordering::SeqCst);
             }
         }));
@@ -3356,12 +3411,8 @@ fn one_concurrent_failure_waits_for_its_held_sibling_commits_nothing_and_retries
         outcome
     });
 
-    let first = entered_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .ok();
-    let second = entered_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .ok();
+    let first = entered_rx.recv().ok();
+    let second = entered_rx.recv().ok();
     let returned_while_held = finished_rx.try_recv().is_ok();
     let _ = release_tx.send(());
     let outcome = runner.join();
@@ -4418,9 +4469,7 @@ impl HeldWriter {
             }
         });
         let held = Self(child);
-        observed
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("real writer owns Store");
+        observed.recv().expect("real writer owns Store");
         held
     }
     fn release(mut self) {
@@ -4488,7 +4537,9 @@ fn projection_retries_real_writer_at_claim_renewal_and_commit_without_reembeddin
                 *held.lock().unwrap() = Some(HeldWriter::start(&path));
                 if phase == "renewal" {
                     clock.fetch_add(LEASE_MS / 2, Ordering::SeqCst);
-                    embed_released.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).expect("lease renewal met and released the writer while inference remained held");
+                    embed_released.lock().unwrap().recv().expect(
+                        "lease renewal met and released the writer while inference remained held",
+                    );
                 }
             }));
         }

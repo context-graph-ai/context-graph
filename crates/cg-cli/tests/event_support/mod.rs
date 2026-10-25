@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -107,26 +107,47 @@ impl Drop for TestChild {
     }
 }
 
-/// Observe state until it completes, errors, or spends its bounded allowance.
+struct StateEvents {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    receiver: std::os::unix::net::UnixDatagram,
+}
+
+impl StateEvents {
+    fn new() -> Self {
+        let directory = tempfile::tempdir_in("/tmp").expect("short state event directory");
+        let path = directory.path().join("state.sock");
+        let receiver = std::os::unix::net::UnixDatagram::bind(&path).expect("state event socket");
+        Self {
+            _directory: directory,
+            path,
+            receiver,
+        }
+    }
+}
+
+thread_local! { static STATE_EVENTS: StateEvents = StateEvents::new(); }
+
+pub fn state_event_path() -> PathBuf {
+    STATE_EVENTS.with(|events| events.path.clone())
+}
+
+pub fn write_test_file(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    cg_node_fs::write_test_file_for_test(path, contents)
+}
+
+/// Recheck authoritative state after an explicit fixture write or worker completion.
+/// The old allowance arguments remain for callers; the bundle runner owns failure deadlines.
 pub fn wait_for_state<T, E>(
-    allowance: Duration,
-    interval: Duration,
+    _allowance: Duration,
+    _interval: Duration,
     mut observe: impl FnMut() -> Result<Option<T>, E>,
 ) -> Result<Option<T>, E> {
-    assert!(
-        !interval.is_zero(),
-        "state wait polling interval must be non-zero"
-    );
-    let started = Instant::now();
     loop {
         if let Some(value) = observe()? {
             return Ok(Some(value));
         }
-        let remaining = allowance.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Ok(None);
-        }
-        std::thread::sleep(interval.min(remaining));
+        STATE_EVENTS.with(|events| events.receiver.recv(&mut [0]).expect("fixture state event"));
     }
 }
 
@@ -155,6 +176,7 @@ pub struct Machine {
     pub home: PathBuf,
     pub data_root: PathBuf,
     pub model_cache: PathBuf,
+    state_events_path: PathBuf,
 }
 
 impl Machine {
@@ -167,6 +189,7 @@ impl Machine {
         let model_cache = base.join("empty-model-cache");
         fs::create_dir_all(&model_cache).expect("empty model cache");
         Self {
+            state_events_path: state_event_path(),
             data_root: base.join("data-root"),
             home,
             model_cache,
@@ -207,6 +230,7 @@ impl Machine {
             .args(args)
             .current_dir(cwd)
             .env("CG_DATA_ROOT", &self.data_root)
+            .env("CG_TEST_STATE_EVENTS", &self.state_events_path)
             .env("HOME", &self.home)
             .env("CG_MODEL_CACHE_ROOT", &self.model_cache)
             .env_remove("CLAUDE_CONFIG_DIR")
@@ -331,41 +355,45 @@ impl Machine {
         drop(command);
         drop(slave);
 
-        let transcript = Arc::new(Mutex::new(String::new()));
+        let transcript = Arc::new((
+            Mutex::new((String::new(), false)),
+            std::sync::Condvar::new(),
+        ));
         let reader_transcript = Arc::clone(&transcript);
         let mut master_reader = fs::File::from(master.try_clone().expect("clone pty master"));
         let reader = std::thread::spawn(move || {
             let mut buffer = [0_u8; 1024];
             loop {
-                match master_reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => reader_transcript
-                        .lock()
-                        .expect("transcript lock")
-                        .push_str(&String::from_utf8_lossy(&buffer[..read])),
+                let read = master_reader.read(&mut buffer);
+                let mut state = reader_transcript.0.lock().expect("transcript lock");
+                match read {
+                    Ok(0) | Err(_) => {
+                        state.1 = true;
+                        reader_transcript.1.notify_all();
+                        break;
+                    }
+                    Ok(read) => state.0.push_str(&String::from_utf8_lossy(&buffer[..read])),
                 }
+                reader_transcript.1.notify_all();
             }
         });
         let mut master_writer = fs::File::from(master);
         let mut seen = 0_usize;
         for (index, (prompt, reply)) in answers.iter().enumerate() {
-            let found = wait_for_state(Duration::from_secs(60), Duration::from_millis(20), || {
-                let found = {
-                    let text = transcript.lock().expect("transcript lock");
-                    text[seen..]
-                        .find(prompt)
-                        .map(|index| seen + index + prompt.len())
-                };
-                Ok::<_, ()>(found)
-            })
-            .expect("prompt observation cannot fail");
-            let Some(end) = found else {
-                let _ = child.kill();
-                panic!(
-                    "cg never wrote the terminal prompt {prompt:?}; transcript so far: {:?}",
-                    transcript.lock().expect("transcript lock")
-                );
-            };
+            let mut state = transcript.0.lock().expect("transcript lock");
+            while !state.1 && !state.0[seen..].contains(prompt) {
+                state = transcript.1.wait(state).expect("terminal output event");
+            }
+            let end = state.0[seen..]
+                .find(prompt)
+                .map(|index| seen + index + prompt.len())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "cg closed its terminal before prompt {prompt:?}: {:?}",
+                        state.0
+                    )
+                });
+            drop(state);
             seen = end;
             before_reply(index);
             master_writer
@@ -389,7 +417,7 @@ impl Machine {
         let status = child.wait().expect("wait for cg");
         drop(master_writer);
         let _ = reader.join();
-        let transcript = transcript.lock().expect("transcript lock").clone();
+        let transcript = transcript.0.lock().expect("transcript lock").0.clone();
         (
             Output {
                 code: status.code().unwrap_or(-1),
@@ -433,19 +461,11 @@ impl Machine {
         })
     }
 
-    /// Poll until the detached search worker process has exited: its per-data-root lock can be
-    /// taken again. The worker is another process, so its lock is the state there is to observe.
+    /// The kernel wakes this acquire after the worker releases its lock, even on SIGTERM.
     pub fn wait_for_search_worker_exit(&self) {
         let lock_path = self.data_root.join("event-search-worker.lock");
-        let released = wait_for_state(Duration::from_secs(120), Duration::from_millis(100), || {
-            Ok::<_, ()>(cg_node_fs::acquire_worker_lock(&lock_path).ok())
-        })
-        .expect("worker-lock observation cannot fail");
-        assert!(
-            released.is_some(),
-            "the detached search worker still holds {} after 120 s",
-            lock_path.display()
-        );
+        let _released = cg_node_fs::wait_for_worker_lock_for_test(&lock_path)
+            .expect("detached worker released its lock");
     }
 }
 

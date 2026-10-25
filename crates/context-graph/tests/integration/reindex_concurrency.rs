@@ -40,44 +40,20 @@ struct BlockingReindexState {
 
 impl BlockingReindexControl {
     fn wait_until_calls_at_least(&self, expected_calls: usize) -> bool {
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let mut state = self.state.lock().expect("blocking state");
-        while state.calls < expected_calls {
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let timeout = deadline.saturating_duration_since(now);
-            let (next_state, wait) = self
-                .changed
-                .wait_timeout(state, timeout)
-                .expect("call-count wait");
-            state = next_state;
-            if wait.timed_out() && state.calls < expected_calls {
-                return false;
-            }
-        }
+        let guard = self.state.lock().expect("blocking state");
+        let _guard = self
+            .changed
+            .wait_while(guard, |state| state.calls < expected_calls)
+            .expect("call-count event");
         true
     }
 
     fn wait_until_blocked_on_second_row(&self) -> bool {
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let mut state = self.state.lock().expect("blocking state");
-        while !state.blocked_on_second_row {
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let timeout = deadline.saturating_duration_since(now);
-            let (next_state, wait) = self
-                .changed
-                .wait_timeout(state, timeout)
-                .expect("blocking wait");
-            state = next_state;
-            if wait.timed_out() && !state.blocked_on_second_row {
-                return false;
-            }
-        }
+        let guard = self.state.lock().expect("blocking state");
+        let _guard = self
+            .changed
+            .wait_while(guard, |state| !state.blocked_on_second_row)
+            .expect("second row event");
         true
     }
 

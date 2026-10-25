@@ -43,7 +43,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::channel;
-use std::time::Duration;
 
 use context_graph::{CgError, Store, StoreConfig};
 use contextdb_engine::ReadSession;
@@ -511,14 +510,12 @@ fn a_real_context_graph_open_is_refused_by_the_live_readers_holding_the_store() 
         store
     });
     observed
-        .recv_timeout(Duration::from_secs(10))
+        .recv()
         .expect("real reader refusal reached the shared Store wait");
     assert!(finished.try_recv().is_err());
     first.release();
     second.release();
-    finished
-        .recv_timeout(Duration::from_secs(10))
-        .expect("writer opens after reader release");
+    finished.recv().expect("writer opens after reader release");
     let store = writer.join().unwrap();
     let shared = Store::open(store_config(store_path)).expect("reuse registered writer");
     assert!(std::sync::Arc::ptr_eq(

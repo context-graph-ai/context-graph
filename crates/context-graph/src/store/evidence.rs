@@ -101,14 +101,18 @@ impl Store {
     }
 
     pub fn list_embedding_spaces(&self) -> Result<Vec<EmbeddingSpace>> {
-        let result = self.read_query(
-                "SELECT embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings FROM embedding_spaces",
-                &HashMap::new(),
-            )?;
+        self.embedding_spaces_via(&|sql, params| self.read_query(sql, params))
+    }
+
+    fn embedding_spaces_via(&self, query: &LookupQuery<'_>) -> Result<Vec<EmbeddingSpace>> {
+        let result = query(
+            "SELECT embedding_space_id, dimension, metric, model_family, model_name, model_version, supported_evidence_kinds, default_for_evidence_kind, bindings FROM embedding_spaces",
+            &HashMap::new(),
+        )?;
         let mut spaces = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             let embedding_space_id = get_text(row, &result.columns, "embedding_space_id")?;
-            let mut bindings = self.bindings_for_space(&embedding_space_id)?;
+            let mut bindings = bindings_for_space(query, &embedding_space_id)?;
             if bindings.is_empty() {
                 bindings = bindings_from_json(
                     &embedding_space_id,
@@ -426,12 +430,13 @@ impl Store {
         Ok(rows)
     }
 
+    /// What the observation just recorded raised, read back as that write's own lookup.
     pub(super) fn invalidations_for_observation(
         &self,
         context_id: ContextId,
         observation_id: ObservationId,
     ) -> Result<Vec<Invalidation>> {
-        let result = self.read_query(
+        let result = self.write_lookup(
                 "SELECT id, status, context_id, affected_decision_id, trigger_observation_id, reason, basis_diff, cascade_from, severity, threatened_intention_ids, intention_now_un_served, detected_at, resolved_at, resolution_action, resolution_decision_id FROM invalidations WHERE context_id = $context_id AND trigger_observation_id = $trigger_observation_id",
                 &HashMap::from([
                     ("context_id".to_string(), Value::Uuid(context_id.as_uuid())),
@@ -499,30 +504,6 @@ impl Store {
             }
         }
         unreachable!("bounded update_decision_basis retry loop always returns")
-    }
-
-    fn bindings_for_space(&self, embedding_space_id: &str) -> Result<Vec<EmbeddingSpaceBinding>> {
-        let result = self.read_query(
-                "SELECT embedding_space_id, table_name, vector_column FROM embedding_space_bindings WHERE embedding_space_id = $embedding_space_id",
-                &HashMap::from([(
-                    "embedding_space_id".to_string(),
-                    Value::Text(embedding_space_id.to_string()),
-                )]),
-            )?;
-        let mut bindings = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
-            bindings.push(EmbeddingSpaceBinding {
-                embedding_space_id: get_text(row, &result.columns, "embedding_space_id")?,
-                table_name: get_text(row, &result.columns, "table_name")?,
-                vector_column: get_text(row, &result.columns, "vector_column")?,
-            });
-        }
-        bindings.sort_by(|a, b| {
-            a.table_name
-                .cmp(&b.table_name)
-                .then_with(|| a.vector_column.cmp(&b.vector_column))
-        });
-        Ok(bindings)
     }
 
     fn decode_evidence_with_latest_status(
@@ -684,10 +665,16 @@ impl Store {
     }
 
     pub(super) fn embedding_space_for_id(&self, id: &str) -> Result<EmbeddingSpace> {
-        self.list_embedding_spaces()?
-            .into_iter()
-            .find(|space| space.embedding_space_id == id)
-            .ok_or_else(|| CgError::UnknownEmbeddingSpace { id: id.to_string() })
+        find_embedding_space(self.list_embedding_spaces()?, id)
+    }
+
+    /// The registered space a write is about to use, looked up as the write's own read: a write
+    /// is never refused by the read budget a caller's read is held to.
+    pub(super) fn embedding_space_for_write(&self, id: &str) -> Result<EmbeddingSpace> {
+        find_embedding_space(
+            self.embedding_spaces_via(&|sql, params| self.write_lookup(sql, params))?,
+            id,
+        )
     }
 
     pub(super) fn evidence_status_at_snapshot(
@@ -1275,4 +1262,42 @@ pub(super) fn producer_value(producer: &EvidenceProducer) -> Value {
 
 pub(super) fn properties_value(properties: &BTreeMap<String, JsonValue>) -> Value {
     Value::Json(properties_to_json(properties))
+}
+
+/// One registry statement, run through whichever executor the caller's read or write uses.
+type LookupQuery<'a> =
+    dyn Fn(&str, &HashMap<String, Value>) -> Result<contextdb_engine::QueryResult> + 'a;
+
+fn find_embedding_space(spaces: Vec<EmbeddingSpace>, id: &str) -> Result<EmbeddingSpace> {
+    spaces
+        .into_iter()
+        .find(|space| space.embedding_space_id == id)
+        .ok_or_else(|| CgError::UnknownEmbeddingSpace { id: id.to_string() })
+}
+
+fn bindings_for_space(
+    query: &LookupQuery<'_>,
+    embedding_space_id: &str,
+) -> Result<Vec<EmbeddingSpaceBinding>> {
+    let result = query(
+        "SELECT embedding_space_id, table_name, vector_column FROM embedding_space_bindings WHERE embedding_space_id = $embedding_space_id",
+        &HashMap::from([(
+            "embedding_space_id".to_string(),
+            Value::Text(embedding_space_id.to_string()),
+        )]),
+    )?;
+    let mut bindings = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        bindings.push(EmbeddingSpaceBinding {
+            embedding_space_id: get_text(row, &result.columns, "embedding_space_id")?,
+            table_name: get_text(row, &result.columns, "table_name")?,
+            vector_column: get_text(row, &result.columns, "vector_column")?,
+        });
+    }
+    bindings.sort_by(|a, b| {
+        a.table_name
+            .cmp(&b.table_name)
+            .then_with(|| a.vector_column.cmp(&b.vector_column))
+    });
+    Ok(bindings)
 }

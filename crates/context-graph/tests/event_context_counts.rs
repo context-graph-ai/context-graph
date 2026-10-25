@@ -739,7 +739,7 @@ impl DatabasePlugin for InterleaveOnPurge {
                 .take()
                 .expect("armed once");
             committed
-                .recv_timeout(Duration::from_secs(60))
+                .recv()
                 .expect("the concurrent append commits before the purge runs");
         }
         Ok(())
@@ -764,9 +764,7 @@ impl DatabasePlugin for InterleaveOnPurge {
                 .expect("observed lock")
                 .take()
                 .expect("armed once");
-            observed
-                .recv_timeout(Duration::from_secs(60))
-                .expect("the observer read the count row");
+            observed.recv().expect("the observer read the count row");
         }
     }
 }
@@ -796,9 +794,7 @@ fn append_on_release(
     committed: Sender<()>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        release
-            .recv_timeout(Duration::from_secs(60))
-            .expect("the forget reached its purge");
+        release.recv().expect("the forget reached its purge");
         capture(
             &store,
             context_id,
@@ -854,9 +850,7 @@ fn an_append_committing_before_a_session_forgets_purge_leaves_no_stale_total() {
         let store = store.clone();
         let between = Arc::clone(&between);
         std::thread::spawn(move || {
-            observe_rx
-                .recv_timeout(Duration::from_secs(60))
-                .expect("the purge committed");
+            observe_rx.recv().expect("the purge committed");
             *between.lock().expect("observation lock") = Some(count_row(&store, context_id));
             observed.send(()).expect("report the observation");
         })

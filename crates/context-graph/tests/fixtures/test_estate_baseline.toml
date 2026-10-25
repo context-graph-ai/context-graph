@@ -15,13 +15,13 @@
 "crates/candle-embeddinggemma/src/embeddinggemma.rs" = 1
 "crates/cg-catalog/src/lib.rs" = 2
 "crates/cg-catalog/src/model_connection.rs" = 5
-"crates/cg-catalog/tests/acceptance/concurrency.rs" = 8
+
 "crates/cg-catalog/tests/acceptance/generic_llm_endpoint.rs" = 1
 "crates/cg-catalog/tests/acceptance/license_gate.rs" = 1
 "crates/cg-catalog/tests/acceptance/prefetch_first_touch.rs" = 3
-"crates/cg-catalog/tests/acceptance/swap.rs" = 6
-"crates/cg-catalog/tests/acceptance/sync_arrival.rs" = 3
-"crates/cg-catalog/tests/acceptance/update_check.rs" = 3
+"crates/cg-catalog/tests/acceptance/swap.rs" = 4
+
+"crates/cg-catalog/tests/acceptance/update_check.rs" = 1
 # Event-history production wait and timing sites.
 # None synchronizes a test or persists a timestamp:
 #   history/import.rs:133 Instant::now — the import's elapsed time reported in its receipt
@@ -34,19 +34,19 @@
 #   history/worker.rs:273 thread::sleep — 200 ms backoff while the worker lock is held by another worker
 "crates/cg-cli/src/history/import.rs" = 3
 "crates/cg-cli/src/history/worker.rs" = 5
-"crates/cg-cli/src/main.rs" = 12
+"crates/cg-cli/src/main.rs" = 10
 # Bounded poll of a separate process's observable state with a deadline (bounded process observation):
 #   :995 thread::sleep — 250 ms pause between reads of `cg status` while a background search build
 #   runs, bounded by the outer `wait_for_search_ready` deadline the caller already holds
-"crates/cg-cli/tests/event_history.rs" = 1
+
 "crates/cg-cli/tests/cli_acceptance.rs" = 2
 "crates/cg-cli/tests/cli_model_byok.rs" = 1
 # Shared bounded state observation used by prompt, readiness, and lock waits:
 #   :47/:57 Instant::now, sleep — one operation owns its observation budget and capped pause
-"crates/cg-cli/tests/event_support/mod.rs" = 2
-"crates/cg-cli/tests/command_workflows_cli.rs" = 2
-"crates/cg-cli/tests/support/mod.rs" = 5
-"crates/context-graph/src/capture_sync_status.rs" = 4
+
+
+"crates/cg-cli/tests/support/mod.rs" = 1
+"crates/context-graph/src/capture_sync_status.rs" = 3
 # consumer_read.rs, the read-only reader's bounded wait across a writer opening or closing the store:
 #   :125 Instant::now — the writer-transition deadline (WRITER_TRANSITION_ALLOWANCE)
 #   :141 Instant::now — start of one reopen attempt
@@ -55,7 +55,7 @@
 #   :527 Instant::now — start of one session call, to tell an owner hand-over from a slow answer
 #   :531 Instant::now — deadline check before replacing the session
 "crates/context-graph/src/consumer_read.rs" = 6
-"crates/context-graph/src/embedder/nomic.rs" = 2
+"crates/context-graph/src/embedder/nomic.rs" = 1
 "crates/context-graph/src/ingest.rs" = 6
 # owner_control.rs, the bounded reader-release wait every cg writer uses:
 #   :374 Instant::now — remaining time left before the deadline, checked before waiting at all
@@ -70,11 +70,11 @@
 "crates/context-graph/tests/a_closed_cursor_answers_its_first_page_by_type_not_by_panic.rs" = 2
 "crates/context-graph/tests/a_graph_read_past_the_read_ceiling_answers_what_the_writable_store_answers.rs" = 2
 "crates/context-graph/tests/a_stopped_store_answers_the_typed_graph_reads_without_changing.rs" = 6
-"crates/context-graph/tests/acceptance/capture_progress.rs" = 6
+
 "crates/context-graph/tests/acceptance/context_isolation.rs" = 2
 "crates/context-graph/tests/acceptance/crud.rs" = 3
 "crates/context-graph/tests/acceptance/discovery.rs" = 3
-"crates/context-graph/tests/acceptance/evidence.rs" = 8
+"crates/context-graph/tests/acceptance/evidence.rs" = 4
 "crates/context-graph/tests/acceptance/find_via_digests.rs" = 2
 "crates/context-graph/tests/acceptance/full_ontology_extraction.rs" = 2
 "crates/context-graph/tests/acceptance/graph_context_isolation.rs" = 1
@@ -90,7 +90,7 @@
 "crates/context-graph/tests/acceptance/entity_alert_render.rs" = 1
 "crates/context-graph/tests/acceptance/screenshot_memory_distinguishability.rs" = 1
 "crates/context-graph/tests/acceptance/screenshot_memory_review.rs" = 3
-"crates/context-graph/tests/acceptance/subscriptions.rs" = 13
+"crates/context-graph/tests/acceptance/subscriptions.rs" = 6
 "crates/context-graph/tests/acceptance/temporal.rs" = 1
 "crates/context-graph/tests/acceptance/tier0_capture.rs" = 2
 "crates/context-graph/tests/common/capture_sync_common.rs" = 2
@@ -98,7 +98,7 @@
 "crates/context-graph/tests/compile-fail/fabric_receipt_not_basis.rs" = 1
 # Bounded poll of a separate process's observable state with a deadline (bounded process observation):
 #   :333/:335 Instant::now ×2 — the reopening child process loops until the parent's stop file appears or REOPEN_WINDOW ends
-"crates/context-graph/tests/event_search_read_during_projection.rs" = 2
+
 # waiting_for_readers_never_outlasts_the_allowance: building the deadlines the bounded wait takes
 # (its API is an Instant deadline); nothing measures elapsed time, sleeps, or waits on a lease:
 #   :800 Instant::now — a deadline already spent, to assert an immediate answer
@@ -120,16 +120,34 @@
 "crates/context-graph/tests/integration/precomputed_embedding_ingest.rs" = 1
 "crates/context-graph/tests/integration/producer_diagnostic.rs" = 4
 "crates/context-graph/tests/integration/reindex.rs" = 4
-"crates/context-graph/tests/integration/reindex_concurrency.rs" = 12
+"crates/context-graph/tests/integration/reindex_concurrency.rs" = 8
 "crates/context-graph/tests/integration/schema.rs" = 1
 "crates/context-graph/tests/integration/store_open_runtime_config.rs" = 8
-"crates/context-graph/tests/integration/subscriptions_engine_capabilities.rs" = 10
+"crates/context-graph/tests/integration/subscriptions_engine_capabilities.rs" = 4
 "crates/context-graph/tests/one_writable_open_carries_the_owner_handler_and_the_embedders.rs" = 1
 "crates/context-graph/tests/ui/byok_reply_phrasing_is_not_a_basis.rs" = 1
 "crates/context-graph/tests/ui/no_observation_data_field.rs" = 1
 "crates/context-graph/tests/ui/no_record_observation_data_field.rs" = 1
 "crates/context-graph/tests/ui/usage_is_not_a_basis_input.rs" = 1
 "crates/context-graph/tests/unit/mock_embedder.rs" = 1
+
+# Imported thread sleeps and indirect timed waits, including private test modules.
+# This arm closes spelling gaps in the original raw-clock arm; it may only lower.
+[indirect_timed_wait_sites]
+"crates/cg-catalog/src/model_connection.rs" = 4
+"crates/cg-catalog/tests/acceptance/swap.rs" = 1
+"crates/cg-cli/src/history/worker.rs" = 3
+"crates/cg-cli/src/main.rs" = 2
+"crates/context-graph/src/consumer_read.rs" = 1
+"crates/context-graph/src/owner_control.rs" = 1
+"crates/context-graph/src/store/event_search_projection.rs" = 1
+"crates/context-graph/src/store/open_retry.rs" = 1
+"crates/context-graph/tests/acceptance/subscriptions.rs" = 2
+"crates/context-graph/tests/event_search_live_throughput.rs" = 1
+"crates/context-graph/tests/integration/cluster_aggregate_substrate.rs" = 1
+"crates/context-graph/tests/integration/engine_probes/embedder_concurrency.rs" = 4
+"crates/context-graph/tests/integration/reindex_concurrency.rs" = 1
+"crates/context-graph/tests/integration/subscriptions_engine_capabilities.rs" = 2
 
 [default_tier_test_count]
 # crate (Cargo.toml package name) -> the exact number of #[test]/#[tokio::test] functions in the
@@ -149,8 +167,8 @@
 "cg-node-fs" = 3
 "cg-vision-embedder" = 5
 # Tests in test_estate_audit.rs are excluded from the default-tier inventory.
-"context-graph" = 1338
-"context-graph-cli" = 279
+"context-graph" = 1340
+"context-graph-cli" = 280
 
 [gate_wall_seconds_policy]
 # A test binary's ceiling is `recorded seconds * tolerance_factor + slack_seconds`. Both terms are

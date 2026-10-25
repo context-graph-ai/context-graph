@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use context_graph::{
     AppendEventBatch, CapturedEventAndAnchors, CgError, ConnectorInterpretationRunner,
@@ -25,7 +24,6 @@ use serde_json::json;
 
 const CONNECTOR: &str = "interpretation-claim-concurrency-red";
 const TARGET: &str = "claim-concurrency-v1";
-const CHANNEL_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn config(path: PathBuf) -> StoreConfig {
     StoreConfig {
@@ -300,7 +298,7 @@ impl ReleasedConnectorInterpretation for FirstRunnerMapper {
         self.resume
             .lock()
             .expect("A resume lock")
-            .recv_timeout(CHANNEL_TIMEOUT)
+            .recv()
             .expect("test releases A after B has reclaimed");
         Err(CgError::Engine(
             "late A mapper error after B reclaim".into(),
@@ -357,7 +355,7 @@ impl ReleasedConnectorInterpretation for SecondRunnerMapper {
         self.resume
             .lock()
             .expect("B resume lock")
-            .recv_timeout(CHANNEL_TIMEOUT)
+            .recv()
             .expect("test releases B to commit");
         Ok(effective())
     }
@@ -382,7 +380,7 @@ fn late_a_error_preserves_b_claim(b_completes_before_a_error: bool) {
         ConnectorInterpretationRunner::build(request(a_path, context_id, first))
     });
     let first_claim = a_paused_rx
-        .recv_timeout(CHANNEL_TIMEOUT)
+        .recv()
         .expect("A paused after expiring its real lease with test SQL");
 
     let (b_paused_tx, b_paused_rx) = channel();
@@ -399,7 +397,7 @@ fn late_a_error_preserves_b_claim(b_completes_before_a_error: bool) {
         ConnectorInterpretationRunner::build(request(b_path, context_id, second))
     }));
     let b_claim = b_paused_rx
-        .recv_timeout(CHANNEL_TIMEOUT)
+        .recv()
         .expect("B reclaimed and paused on the renewed real lease");
 
     if b_completes_before_a_error {

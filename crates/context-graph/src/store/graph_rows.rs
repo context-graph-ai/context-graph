@@ -17,6 +17,28 @@ use contextdb_engine::QueryResult;
 
 use crate::Result;
 
+#[cfg(test)]
+thread_local! {
+    static READ_CLOCK: std::cell::RefCell<Option<std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Adapt the substrate's existing deadline seam to a synchronous Store read.
+/// Thread-local and unit-test-only: other stores and production sessions keep their clock.
+#[cfg(test)]
+pub(super) fn with_read_clock_for_test<T>(
+    clock: std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>,
+    read: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            READ_CLOCK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(READ_CLOCK.with(|slot| slot.replace(Some(clock))));
+    read()
+}
+
 /// One executor of a read statement.
 pub(crate) trait GraphRows {
     /// Run one read and hand back the rows the engine answered with.
@@ -35,10 +57,19 @@ impl crate::Store {
         sql: &str,
         params: &HashMap<String, Value>,
     ) -> Result<QueryResult> {
-        let session = self
-            .internal_db()
-            .read_session(self.read_limits())
-            .map_err(super::convert::map_engine_err)?;
+        #[cfg(test)]
+        let clock = READ_CLOCK.with(|slot| slot.borrow().clone());
+        #[cfg(test)]
+        let test_session = clock.map(|clock| {
+            self.internal_db()
+                .read_session_with_clock_for_test(self.read_limits(), clock)
+        });
+        #[cfg(test)]
+        let session =
+            test_session.unwrap_or_else(|| self.internal_db().read_session(self.read_limits()));
+        #[cfg(not(test))]
+        let session = self.internal_db().read_session(self.read_limits());
+        let session = session.map_err(super::convert::map_engine_err)?;
         let mut cursor = session
             .open_cursor(sql, params)
             .map_err(super::convert::map_engine_err)?;
@@ -64,6 +95,41 @@ impl crate::Store {
         let answer = paged?;
         closed?;
         Ok(answer)
+    }
+}
+
+impl crate::Store {
+    /// Run a lookup a write makes for itself — the embedding-space registry, the entity it
+    /// attaches to, what its own commit produced — as an ordinary statement read at the latest
+    /// committed snapshot.
+    ///
+    /// The read budget bounds what a caller's read may cost, and on a file-backed store a bounded
+    /// read also spends that allowance waiting for the commit boundary. A write is not a caller's
+    /// read: while a reindex commits row after row, a lookup charged against that budget would
+    /// refuse the write for time it spent queued behind other commits.
+    pub(crate) fn write_lookup(
+        &self,
+        sql: &str,
+        params: &HashMap<String, Value>,
+    ) -> Result<QueryResult> {
+        self.internal_db()
+            .execute(sql, params)
+            .map_err(super::convert::map_engine_err)
+    }
+
+    /// The typed graph reads, run as a write's own lookups.
+    pub(crate) fn write_lookup_rows(&self) -> WriteLookupRows<'_> {
+        WriteLookupRows(self)
+    }
+}
+
+/// Executor for a typed graph read made on behalf of a write; see [`crate::Store::write_lookup`].
+pub(crate) struct WriteLookupRows<'a>(&'a crate::Store);
+
+impl GraphRows for WriteLookupRows<'_> {
+    fn query_rows(&self, sql: &str, params: &HashMap<String, Value>) -> Result<QueryResult> {
+        self.0.require_application_ready()?;
+        self.0.write_lookup(sql, params)
     }
 }
 

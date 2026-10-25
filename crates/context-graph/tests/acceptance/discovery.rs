@@ -5,7 +5,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use std::time::Duration;
 
 use chrono::Utc;
 use context_graph::*;
@@ -2958,7 +2957,11 @@ fn discovery_pull_side_returns_consistent_view_under_concurrent_writer() {
     let barrier = Arc::new(Barrier::new(2));
     let writer_started = Arc::new(AtomicBool::new(false));
     let writer_done = Arc::new(AtomicBool::new(false));
-    let reader_in_call = Arc::new(AtomicBool::new(false));
+    let rounds = writer_pairs.len();
+    let round_ready = Arc::new(Barrier::new(2));
+    let round_done = Arc::new(Barrier::new(2));
+    let reader_round_ready = Arc::clone(&round_ready);
+    let reader_round_done = Arc::clone(&round_done);
     let reader_store = reopen(&db_path);
     let writer_store = reopen(&db_path);
     let reader_barrier = Arc::clone(&barrier);
@@ -2967,8 +2970,6 @@ fn discovery_pull_side_returns_consistent_view_under_concurrent_writer() {
     let reader_done = Arc::clone(&writer_done);
     let writer_started_flag = Arc::clone(&writer_started);
     let writer_done_flag = Arc::clone(&writer_done);
-    let reader_in_call_flag = Arc::clone(&reader_in_call);
-    let writer_observed_reader = Arc::clone(&reader_in_call);
 
     #[derive(Debug)]
     struct ObservedRead {
@@ -2988,11 +2989,15 @@ fn discovery_pull_side_returns_consistent_view_under_concurrent_writer() {
     let reader = thread::spawn(move || {
         reader_barrier.wait();
         let mut reads = Vec::new();
-        while reads.len() < 150 || !reader_done.load(Ordering::SeqCst) {
+        for read_index in 0..150 {
+            // Each of the first rounds overlaps one real supersede. The extra
+            // rendezvous observes writer completion before the final-state reads.
+            if read_index <= rounds {
+                reader_round_ready.wait();
+            }
             let writer_active_at_start =
                 reader_started.load(Ordering::SeqCst) && !reader_done.load(Ordering::SeqCst);
             let writer_done_before_read = reader_done.load(Ordering::SeqCst);
-            reader_in_call_flag.store(true, Ordering::SeqCst);
             let by_intention = reader_store
                 .by_intention(main_intention_id, DiscoveryFilter::default())
                 .expect("reader by_intention");
@@ -3002,7 +3007,6 @@ fn discovery_pull_side_returns_consistent_view_under_concurrent_writer() {
             let by_entity_intentions = reader_store
                 .by_entity_intentions(entity_id, DiscoveryFilter::default())
                 .expect("reader by_entity_intentions");
-            reader_in_call_flag.store(false, Ordering::SeqCst);
             let writer_done_after_read = reader_done.load(Ordering::SeqCst);
             reads.push(ObservedRead {
                 by_intention_ids: decision_ids(&by_intention),
@@ -3023,22 +3027,20 @@ fn discovery_pull_side_returns_consistent_view_under_concurrent_writer() {
                 writer_done_before_read,
                 writer_done_after_read,
             });
-            if !writer_done_before_read {
-                thread::yield_now();
+            if read_index < rounds {
+                reader_round_done.wait();
             }
         }
         reads
     });
     let writer = thread::spawn(move || {
-        writer_barrier.wait();
-        while !writer_observed_reader.load(Ordering::SeqCst) {
-            thread::yield_now();
-        }
         writer_started_flag.store(true, Ordering::SeqCst);
+        writer_barrier.wait();
         let mut replacements = Vec::new();
         for (n, (decision_id, old_intention_id, new_intention_id)) in
             writer_pairs.into_iter().enumerate()
         {
+            round_ready.wait();
             let replacement = writer_store
                 .supersede_decision(
                     decision_id,
@@ -3056,10 +3058,10 @@ fn discovery_pull_side_returns_consistent_view_under_concurrent_writer() {
                 old_intention_id,
                 new_intention_id,
             ));
-            thread::sleep(Duration::from_millis(2));
-            thread::yield_now();
+            round_done.wait();
         }
         writer_done_flag.store(true, Ordering::SeqCst);
+        round_ready.wait();
         replacements
     });
 

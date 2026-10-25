@@ -179,7 +179,10 @@ fn assert_refused(root: &Path, marker: &str) {
 }
 
 fn assert_committed(root: &Path, revision: &str, expected_fetch: FetchResult) {
-    let catalog = catalog(root);
+    assert_committed_catalog(catalog(root), revision, expected_fetch);
+}
+
+fn assert_committed_catalog(catalog: Catalog, revision: &str, expected_fetch: FetchResult) {
     let directory = catalog.model_dir(NOMIC_ID);
     assert_eq!(
         catalog.fetch(None, NOMIC_ID, OutputMode::Headless).unwrap(),
@@ -237,7 +240,7 @@ fn run_child(arguments: &str) {
         return;
     }
     let mut stream = TcpStream::connect(fields[1]).unwrap();
-    if fields[0] != "independent" {
+    if fields[0] != "independent" && fields[0] != "committed" {
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -257,20 +260,19 @@ fn run_child(arguments: &str) {
         assert_eq!(snapshot(&directory), before);
     } else if fields[0] == "refused" {
         assert_refused(root, ".catalog-publication");
+    } else if fields[0] == "committed" {
+        let notify = stream.try_clone().unwrap();
+        let signalled = std::sync::atomic::AtomicBool::new(false);
+        let catalog = catalog(root).with_lock_wait_observer_for_test(move || {
+            if !signalled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // A separate probe cannot establish that fetch itself waited.
+                let mut notify = &notify;
+                notify.write_all(b"R").unwrap();
+            }
+        });
+        assert_committed_catalog(catalog, "new", FetchResult::AlreadyCachedByConcurrentWinner);
     } else {
-        assert_committed(
-            root,
-            if fields[0] == "independent" {
-                "old"
-            } else {
-                "new"
-            },
-            if fields[0] == "independent" {
-                FetchResult::AlreadyCached
-            } else {
-                FetchResult::AlreadyCachedByConcurrentWinner
-            },
-        );
+        assert_committed(root, "old", FetchResult::AlreadyCached);
     }
     stream.write_all(b"D").unwrap();
 }

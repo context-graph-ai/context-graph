@@ -1,8 +1,7 @@
 use std::fs;
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
 
 use cg_catalog::{
     CredentialSource, DEGRADED_MARKER, ModelConnectionCatalog, PrincipalAwareConfig,
@@ -80,11 +79,12 @@ struct OneShotStub {
     base_url: String,
     received: mpsc::Receiver<Option<CapturedRequest>>,
     handle: thread::JoinHandle<()>,
+    server: Arc<tiny_http::Server>,
 }
 
 impl OneShotStub {
     fn openai_reply(reply: &str) -> Self {
-        let server = tiny_http::Server::http("127.0.0.1:0").expect("stub server starts");
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").expect("stub server starts"));
         let base_url = crate::common::stub_base_url(&server);
         let body = serde_json::json!({
             "choices": [{
@@ -95,8 +95,9 @@ impl OneShotStub {
         })
         .to_string();
         let (sender, received) = mpsc::channel();
+        let worker_server = Arc::clone(&server);
         let handle = thread::spawn(move || {
-            let Some(request) = server.recv_timeout(Duration::from_secs(2)).ok().flatten() else {
+            let Some(request) = worker_server.recv().ok() else {
                 let _ = sender.send(None);
                 return;
             };
@@ -118,14 +119,13 @@ impl OneShotStub {
             base_url,
             received,
             handle,
+            server,
         }
     }
 
     fn join(self) -> Option<CapturedRequest> {
-        let request = self
-            .received
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap_or(None);
+        self.server.unblock();
+        let request = self.received.recv().unwrap_or(None);
         self.handle.join().expect("stub server joins");
         request
     }

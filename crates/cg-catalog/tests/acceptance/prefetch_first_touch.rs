@@ -492,6 +492,7 @@ fn start_nomic_source_override(root: &Path) -> (Arc<AtomicUsize>, CountedNomicFi
 }
 
 struct SourceFixtureServer {
+    server: Arc<tiny_http::Server>,
     shutdown: Arc<AtomicBool>,
     server_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -499,6 +500,7 @@ struct SourceFixtureServer {
 impl SourceFixtureServer {
     fn stop_and_join(&mut self) -> std::thread::Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.server.unblock();
         match self.server_thread.take() {
             Some(server_thread) => server_thread.join(),
             None => Ok(()),
@@ -576,10 +578,12 @@ fn serve_source_fixture_counted(
 ) -> SourceFixtureServer {
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
+    let server = Arc::new(server);
+    let worker_server = Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         while !server_shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     request_count.fetch_add(1, Ordering::SeqCst);
                     let url = request.url().to_string();
                     request_paths
@@ -602,12 +606,12 @@ fn serve_source_fixture_counted(
                     let bytes = fs::read(source_dir.join(filename)).expect("source fixture bytes");
                     let _ = request.respond(tiny_http::Response::from_data(bytes));
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
     });
     SourceFixtureServer {
+        server,
         shutdown,
         server_thread: Some(server_thread),
     }
@@ -629,10 +633,12 @@ fn start_nomic_source_override_without_revision(
     let paths = Arc::clone(&request_paths);
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
+    let server = Arc::new(server);
+    let worker_server = Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         while !server_shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     count.fetch_add(1, Ordering::SeqCst);
                     let url = request.url().to_string();
                     paths.lock().expect("request paths").push(url.clone());
@@ -651,7 +657,6 @@ fn start_nomic_source_override_without_revision(
                         let _ = request.respond(tiny_http::Response::from_data(bytes));
                     }
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
@@ -660,6 +665,7 @@ fn start_nomic_source_override_without_revision(
         request_count,
         request_paths,
         SourceFixtureServer {
+            server,
             shutdown,
             server_thread: Some(server_thread),
         },
@@ -668,7 +674,7 @@ fn start_nomic_source_override_without_revision(
 
 fn first_stderr_line_while_child_is_in_flight(
     child: &mut Child,
-    timeout: std::time::Duration,
+    _timeout: std::time::Duration,
 ) -> String {
     let stderr = child.stderr.take().expect("stderr is piped");
     let (sender, receiver) = mpsc::channel();
@@ -677,7 +683,7 @@ fn first_stderr_line_while_child_is_in_flight(
         let _ = BufReader::new(stderr).read_line(&mut line);
         let _ = sender.send(line);
     });
-    let line = receiver.recv_timeout(timeout);
+    let line = receiver.recv();
     if line.is_err() {
         let _ = child.kill();
     }
@@ -843,9 +849,9 @@ fn first_touch_lazy_fetch_observer_event_payload_carries_resolved_source_and_byt
         catalog.fetch(None, NOMIC_ID, OutputMode::Interactive)
     });
     let started = call_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv()
         .expect("fetch thread reaches catalog.fetch call");
-    let event = event_rx.recv_timeout(Duration::from_millis(250));
+    let event = event_rx.recv();
     assert!(
         event.is_ok(),
         "observer receives progress event before fetch can complete"

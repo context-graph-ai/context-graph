@@ -704,7 +704,7 @@ fn probe_basis_diff_under_concurrent_writer_returns_mvcc_consistent_horizon() {
         let after = reader_committed.load(Ordering::SeqCst);
         diff_tx.send((before, after, diff)).expect("send diff");
     });
-    let received = diff_rx.recv_timeout(std::time::Duration::from_secs(30));
+    let received = diff_rx.recv();
     stop.store(true, Ordering::SeqCst);
     for writer in writers {
         writer.join().expect("writer joined");

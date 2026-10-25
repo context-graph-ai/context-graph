@@ -45,6 +45,7 @@ fn run_controlled_posix_retry(machine: &Machine, cwd: &std::path::Path, retry: &
         .stdin(Stdio::null())
         .env("PATH", controlled_path)
         .env("CG_DATA_ROOT", &machine.data_root)
+        .env("CG_TEST_STATE_EVENTS", event_support::state_event_path())
         .env("HOME", &machine.home)
         .env("CG_MODEL_CACHE_ROOT", &machine.model_cache)
         .env_remove("CLAUDE_CONFIG_DIR")
@@ -78,7 +79,7 @@ struct HandoffWorker {
 ))]
 impl HandoffWorker {
     fn release_pass(&self, pass: usize) {
-        fs::write(
+        event_support::write_test_file(
             self.release.with_file_name(format!("release.{pass}")),
             b"continue\n",
         )
@@ -86,19 +87,11 @@ impl HandoffWorker {
     }
 
     fn release_and_join(&mut self) {
-        fs::write(&self.release, b"continue\n").expect("release the owned handoff worker");
+        event_support::write_test_file(&self.release, b"continue\n")
+            .expect("release the owned handoff worker");
         let mut child = self.child.take().expect("owned handoff worker");
-        match wait_for_state(Duration::from_secs(120), Duration::from_millis(20), || {
-            child.try_wait()
-        }) {
-            Ok(Some(status)) => assert!(status.success(), "owned handoff worker exited {status}"),
-            Ok(None) => {
-                child.kill().expect("stop timed-out owned handoff worker");
-                let status = child.wait().expect("join stopped handoff worker");
-                panic!("owned handoff worker did not exit after release; stopped with {status}");
-            }
-            Err(error) => panic!("poll owned handoff worker: {error}"),
-        }
+        let status = child.wait().expect("join released handoff worker");
+        assert!(status.success(), "owned handoff worker exited {status}");
     }
 }
 
@@ -108,19 +101,11 @@ impl HandoffWorker {
 ))]
 impl Drop for HandoffWorker {
     fn drop(&mut self) {
-        let _ = fs::write(&self.release, b"cleanup\n");
+        let _ = event_support::write_test_file(&self.release, b"cleanup\n");
         let Some(mut child) = self.child.take() else {
             return;
         };
-        match wait_for_state(Duration::from_secs(120), Duration::from_millis(20), || {
-            child.try_wait()
-        }) {
-            Ok(Some(_)) | Err(_) => {}
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+        let _ = child.wait();
     }
 }
 
@@ -167,6 +152,7 @@ fn spawn_handoff_worker(
         .args(["__event-search-worker", &launch_profile])
         .current_dir(project)
         .env("CG_DATA_ROOT", &machine.data_root)
+        .env("CG_TEST_STATE_EVENTS", event_support::state_event_path())
         .env("HOME", &machine.home)
         .env("CG_MODEL_CACHE_ROOT", &machine.model_cache)
         .env("CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER", barrier)
@@ -207,6 +193,7 @@ fn spawn_worker_before_first_assessment(
         .args(["__event-search-worker", &launch_profile])
         .current_dir(project)
         .env("CG_DATA_ROOT", &machine.data_root)
+        .env("CG_TEST_STATE_EVENTS", event_support::state_event_path())
         .env("HOME", &machine.home)
         .env("CG_MODEL_CACHE_ROOT", &machine.model_cache)
         .env("CG_EVENT_SEARCH_TEST_PRE_CATCH_UP_BARRIER", barrier)
@@ -413,7 +400,7 @@ fn cg_import_project_directory_never_sweeps_working_tree_jsonl_or_imports_other_
         &[("other project question", "other project answer")],
     );
     let helper = write_helper_transcript(&history, &project, "sess-one", "helper1", "helper text");
-    fs::write(
+    event_support::write_test_file(
         project.join("stray.jsonl"),
         format!(
             "{}\n",
@@ -696,7 +683,7 @@ fn retry_commands_quote_actual_paths_contexts_and_refusals() {
     fs::rename(&tenant_session_source, &tenant_session)
         .expect("rename controlled tenant session to an injected exact-file target");
     fs::create_dir_all(tenant.data_root.join("cg")).expect("create tenant config directory");
-    fs::write(
+    event_support::write_test_file(
         tenant.data_root.join("cg").join("fabric.toml"),
         "[fabric]\nevent_placement = \"tenant_hub\"\n",
     )
@@ -806,7 +793,7 @@ fn receipt_placeholder_substitution_and_read_retries_preserve_persisted_scope() 
     );
     assert_eq!(imported.code, 0, "{}", imported.describe());
     fs::create_dir_all(machine.data_root.join("cg")).expect("create changed-config directory");
-    fs::write(
+    event_support::write_test_file(
         machine.data_root.join("cg").join("fabric.toml"),
         "[search]\nsessions = 10\norder = \"newest\"\n",
     )
@@ -937,7 +924,7 @@ fn cg_import_continues_past_a_malformed_file_captures_every_other_file_and_repor
     let bad = write_session(&history, &project, "sess-a-bad", &[("first", "second")]);
     let mut bytes = fs::read(&bad).expect("read bad session");
     bytes.extend_from_slice(b"{\"type\": \"user\", not json\n");
-    fs::write(&bad, bytes).expect("corrupt the session tail");
+    event_support::write_test_file(&bad, bytes).expect("corrupt the session tail");
     write_session(
         &history,
         &project,
@@ -1251,7 +1238,8 @@ fn cg_import_search_wait_embedding_failure_returns_durable_capture_receipt_and_t
     for file in ["config.json", "tokenizer.json", "REVISION"] {
         fs::copy(real.join(file), broken.join(file)).expect("copy artifact metadata");
     }
-    fs::write(broken.join("model.safetensors"), vec![7_u8; 2_000_000]).expect("broken weights");
+    event_support::write_test_file(broken.join("model.safetensors"), vec![7_u8; 2_000_000])
+        .expect("broken weights");
     machine.model_cache = machine.root.join("broken-cache");
     let project = machine.project("broken");
     write_session(
@@ -1650,7 +1638,7 @@ fn import_dry_run_verifies_committed_prefixes_reports_what_would_be_captured_and
     )
     .expect("remove scratch session");
     grown.extend_from_slice(&extra);
-    fs::write(&appended, &grown).expect("append records");
+    event_support::write_test_file(&appended, &grown).expect("append records");
     // Change one committed byte inside the recorded text, keeping every record valid JSON so the
     // file is still this project's session.
     let mut changed = fs::read(&rewritten).expect("read rewritten session");
@@ -1659,7 +1647,7 @@ fn import_dry_run_verifies_committed_prefixes_reports_what_would_be_captured_and
         .position(|window| window == b"five")
         .expect("the rewritten session carries its text");
     changed[at + 3] = b'x';
-    fs::write(&rewritten, &changed).expect("rewrite a committed byte");
+    event_support::write_test_file(&rewritten, &changed).expect("rewrite a committed byte");
     write_session(&history, &project, "sess-new", &[("nine", "ten")]);
 
     let before = fingerprint(&machine.root);
@@ -1805,7 +1793,6 @@ fn search_reaches_ready_while_three_readers_poll_the_store_throughout_the_build(
                         "a read is never refused while the projection runs: {}",
                         status.describe()
                     );
-                    std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             });
         }
@@ -1857,7 +1844,7 @@ fn cg_import_reports_search_behind_when_the_worker_lock_cannot_be_opened() {
     // The lock file is present but unopenable by this user: not a lock somebody holds, an
     // unusable one.
     let lock_path = machine.data_root.join("event-search-worker.lock");
-    fs::write(&lock_path, b"").expect("create the worker lock file");
+    event_support::write_test_file(&lock_path, b"").expect("create the worker lock file");
     fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o000))
         .expect("make the worker lock file unopenable");
 
@@ -1918,7 +1905,7 @@ fn cg_import_search_wait_reports_behind_when_the_worker_lock_cannot_be_opened() 
     assert_eq!(deferred.code, 0, "{}", deferred.describe());
 
     let lock_path = machine.data_root.join("event-search-worker.lock");
-    fs::write(&lock_path, b"").expect("create the worker lock file");
+    event_support::write_test_file(&lock_path, b"").expect("create the worker lock file");
     fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o000))
         .expect("make the worker lock file unopenable");
 
@@ -2097,7 +2084,7 @@ fn import_dry_run_refuses_a_recovery_needing_store_without_writing() {
 fn write_passage_override(machine: &Machine, target: i64, hard: i64) {
     let config = machine.data_root.join("cg");
     fs::create_dir_all(&config).expect("cg config directory");
-    fs::write(
+    event_support::write_test_file(
         config.join("fabric.toml"),
         format!("[search.passages]\ntarget_tokens = {target}\nhard_tokens = {hard}\n"),
     )
@@ -2107,7 +2094,7 @@ fn write_passage_override(machine: &Machine, target: i64, hard: i64) {
 fn write_placement_override(machine: &Machine, placement: &str) {
     let config = machine.data_root.join("cg");
     fs::create_dir_all(&config).expect("cg config directory");
-    fs::write(
+    event_support::write_test_file(
         config.join("fabric.toml"),
         format!("[fabric]\nevent_placement = \"{placement}\"\n"),
     )
@@ -2786,7 +2773,7 @@ fn a_default_worker_waits_for_an_orphaned_lease_and_does_not_starve_other_contex
         &generation_id,
         Duration::from_secs(5),
     );
-    fs::write(barrier.path().join("pre-catch-up-release"), b"continue\n")
+    event_support::write_test_file(barrier.path().join("pre-catch-up-release"), b"continue\n")
         .expect("release worker into durable lease");
 
     // The handoff barrier runs after this service pass. It holds the worker before its next
@@ -2814,7 +2801,7 @@ fn a_default_worker_waits_for_an_orphaned_lease_and_does_not_starve_other_contex
         Some(&Value::from("ready")),
         "the leased Context was served before the eligible Context"
     );
-    fs::write(
+    event_support::write_test_file(
         barrier.path().join("release"),
         b"continue after ordered service\n",
     )
@@ -2859,7 +2846,7 @@ fn an_adopted_valid_profile_survives_invalid_config_and_late_work_beyond_three_p
         );
         assert_eq!(capture.code, 0, "{}", capture.describe());
         let barrier = tempfile::tempdir().expect("numbered worker barrier");
-        fs::write(barrier.path().join("numbered-passes"), b"5\n").unwrap();
+        event_support::write_test_file(barrier.path().join("numbered-passes"), b"5\n").unwrap();
         let mut worker = spawn_handoff_worker(&machine, &first_project, barrier.path());
         wait_for_worker_marker(&barrier.path().join("entered.1"));
         let launch = machine.run(&first_project, &["status"]);

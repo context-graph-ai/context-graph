@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(feature = "test-support")]
-use std::time::Duration;
 use std::time::Instant;
 use std::{
     fs as file_system, io,
@@ -1199,12 +1197,15 @@ fn pause_prepared_embedding_for_test() {
         return;
     };
     let directory = PathBuf::from(directory);
-    if file_system::write(directory.join("reached"), b"prepared embedding reached\n").is_err() {
+    if cg_node_fs::write_test_file_for_test(
+        directory.join("reached"),
+        b"prepared embedding reached\n",
+    )
+    .is_err()
+    {
         return;
     }
-    while !directory.join("release").exists() {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    cg_node_fs::wait_for_test_release_for_test(&directory, || directory.join("release").exists());
 }
 
 #[cfg(all(test, context_graph_internal_test_support))]

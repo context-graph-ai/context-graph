@@ -143,7 +143,10 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> i32 {
-    #[cfg(feature = "event-search-test-support")]
+    #[cfg(any(
+        feature = "event-search-test-support",
+        feature = "store-contention-test-support"
+    ))]
     history::apply_store_open_retry_allowance_for_test();
     // The writer's working-memory ceiling is one setting for the whole invocation, not a flag each
     // command admits, so it comes off the argument list before any command parses its own.

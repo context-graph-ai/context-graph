@@ -19,7 +19,7 @@ class SeedArtifact(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.patch = mock.patch.object(seed, 'ROOT', self.root)
         self.patch.start()
         self.addCleanup(self.patch.stop)

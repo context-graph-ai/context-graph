@@ -784,9 +784,83 @@ fn collect_rs_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) 
     }
 }
 
+fn core_source_outside_unit_tests(source: &str) -> String {
+    // rustfmt places a top-level module's closing brace in column zero. Retain
+    // everything after that brace so a later production item is still audited.
+    let mut lines = source.lines().peekable();
+    let mut production = Vec::new();
+    let mut in_unit_tests = false;
+    while let Some(line) = lines.next() {
+        if in_unit_tests {
+            if line == "}" {
+                in_unit_tests = false;
+            }
+        } else if line == "#[cfg(test)]" && lines.peek() == Some(&"mod tests {") {
+            lines.next();
+            in_unit_tests = true;
+        } else {
+            production.push(line);
+        }
+    }
+    production.join("\n")
+}
+
+fn sanctioned_test_thread_local_slot(
+    crate_dir: &std::path::Path,
+    file: &std::path::Path,
+    attribute: &str,
+    line: &str,
+) -> bool {
+    line == "thread_local! {"
+        && [
+            "src/store/event_correlation.rs",
+            "src/store/event_search_projection.rs",
+            "src/store/open_retry.rs",
+            "src/store/event_search_read.rs",
+            "src/store/graph_rows.rs",
+            "src/capture_sync_status.rs",
+        ]
+        .iter()
+        .any(|relative| file == crate_dir.join(relative))
+        && matches!(
+            attribute,
+            "#[cfg(test)]"
+                | "#[cfg(context_graph_internal_test_support)]"
+                | "#[cfg(feature = \"test-support\")]"
+                | "#[cfg(any(context_graph_internal_test_support, feature = \"test-support\"))]"
+                | "#[cfg(all(test, context_graph_internal_test_support))]"
+        )
+}
+
 fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context: &str) {
     let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let src_dir = crate_dir.join("src");
+    let with_unit_tests =
+        "AtomicBefore;\n#[cfg(test)]\nmod tests {\n    AtomicInTest;\n}\nAtomicAfter;";
+    assert_eq!(
+        core_source_outside_unit_tests(with_unit_tests),
+        "AtomicBefore;\nAtomicAfter;"
+    );
+    assert!(core_source_outside_unit_tests("mod tests {\n    Atomic;\n}").contains("Atomic"));
+    assert!(
+        core_source_outside_unit_tests("#[cfg(any(test, not(test)))]\nmod tests {\n    Atomic;\n}")
+            .contains("Atomic")
+    );
+    // A sanctioned file alone never licenses a production global or a broader cfg.
+    for attribute in ["", "#[cfg(any(test, not(test)))]"] {
+        assert!(!sanctioned_test_thread_local_slot(
+            &crate_dir,
+            &crate_dir.join("src/capture_sync_status.rs"),
+            attribute,
+            "thread_local! {",
+        ));
+    }
+    assert!(!sanctioned_test_thread_local_slot(
+        &crate_dir,
+        &crate_dir.join("src/store/evidence.rs"),
+        "#[cfg(test)]",
+        "thread_local! {",
+    ));
     let allowed_lines = [
         "use std::sync::{Arc, Mutex, OnceLock, Weak};",
         "trace: Arc<Mutex<String>>,",
@@ -843,21 +917,9 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("core source");
-        // Sanctioned: `src/store/event_correlation.rs` (the correlation proof observer) and
-        // `src/store/event_search_projection.rs` (the finalization pause) each keep one test hook
-        // in a `thread_local!` slot that only `context_graph_internal_test_support` builds compile.
-        // A hook acts on the production path on that one test thread; it holds no product state,
-        // serializes no contention, and no default build contains it.
-        let sanctioned_test_hook_slot = file == crate_dir.join("src/store/event_correlation.rs")
-            || file == crate_dir.join("src/store/event_search_projection.rs")
-            // Private admission observer, compiled only by the dev-only test-support feature.
-            || file == crate_dir.join("src/store/open_retry.rs")
-            // `src/store/event_search_read.rs` keeps one slot holding the statements the
-            // event-history reads issued on the calling thread, so a proof can assert what a
-            // `find` or a `status` COSTS in statements rather than how long it took. It records
-            // what a read DID; it holds no product state, serializes nothing -- a thread's own
-            // `RefCell`, never a lock -- and only the dev-only test-support feature compiles it.
-            || file == crate_dir.join("src/store/event_search_read.rs");
+        let text = core_source_outside_unit_tests(&text);
+        // Only explicit test configurations may carry these thread-local observers.
+        // They consume canonical clock/read seams and hold no product state.
         // Sanctioned: `src/store/mod.rs` serializes schema installation inside one process with
         // `SCHEMA_INSTALL_LOCK`, the process-local role the store `REGISTRY` already plays: store
         // handles on one path share one Database, and two of them must not interleave DDL. It
@@ -878,7 +940,7 @@ fn assert_no_unsanctioned_app_side_locks_or_global_state_in_core_sources(context
                 && (trimmed.contains("HashMap") || trimmed.contains("BTreeMap"));
             if (global_hash_state || forbidden.iter().any(|forbidden| line.contains(forbidden)))
                 && !allowed_lines.iter().any(|allowed| line.trim() == *allowed)
-                && !(sanctioned_test_hook_slot && trimmed == "thread_local! {")
+                && !sanctioned_test_thread_local_slot(&crate_dir, &file, after, trimmed)
                 && !sanctioned_schema_install_lock
             {
                 panic!(
@@ -2812,6 +2874,7 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
     let committed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (replay_tx, replay_rx) = std::sync::mpsc::channel();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
     let writers = (0..WRITER_COUNT)
         .map(|writer| {
             let config = config.clone();
@@ -2819,6 +2882,7 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
             let stop = std::sync::Arc::clone(&stop);
             let committed = std::sync::Arc::clone(&committed);
             let attempts = std::sync::Arc::clone(&attempts);
+            let progress_tx = progress_tx.clone();
             std::thread::spawn(move || {
                 let store = Store::open(config).expect("writer");
                 barrier.wait();
@@ -2841,35 +2905,18 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
                         .is_ok()
                     {
                         committed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = progress_tx.send(());
                     }
                 }
             })
         })
         .collect::<Vec<_>>();
     barrier.wait();
-    let progress_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let progress_reached = loop {
-        if committed.load(std::sync::atomic::Ordering::SeqCst) >= REQUIRED_COMMITS {
-            break true;
-        }
-        if std::time::Instant::now() >= progress_deadline {
-            break false;
-        }
-        std::thread::yield_now();
-    };
-    match progress_reached {
-        true => {}
-        false => {
-            stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            for writer in writers {
-                writer.join().expect("writer joined after progress timeout");
-            }
-            panic!(
-                "writer flood did not create {REQUIRED_COMMITS} durable observations before replay; committed={}, attempts={}",
-                committed.load(std::sync::atomic::Ordering::SeqCst),
-                attempts.load(std::sync::atomic::Ordering::SeqCst)
-            );
-        }
+    drop(progress_tx);
+    for _ in 0..REQUIRED_COMMITS {
+        progress_rx
+            .recv()
+            .expect("writer committed a durable observation");
     }
     let reader_config = config.clone();
     let reader_committed = std::sync::Arc::clone(&committed);
@@ -2883,7 +2930,7 @@ fn replay_under_concurrent_cross_handle_writer_against_same_entity_returns_singl
             .expect("send replay result");
     });
     let (before_replay, after_replay, replay) = replay_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv()
         .expect("replay returned while writer flood was still active");
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     for writer in writers {
@@ -3656,6 +3703,7 @@ fn basis_diff_under_concurrent_writer_returns_one_consistent_basis_to_current_dr
     let committed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (diff_tx, diff_rx) = std::sync::mpsc::channel();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
     let writers = (0..4)
         .map(|_| {
             let writer_config = config.clone();
@@ -3663,6 +3711,7 @@ fn basis_diff_under_concurrent_writer_returns_one_consistent_basis_to_current_dr
             let writer_stop = std::sync::Arc::clone(&stop);
             let writer_committed = std::sync::Arc::clone(&committed);
             let writer_attempts = std::sync::Arc::clone(&attempts);
+            let progress_tx = progress_tx.clone();
             std::thread::spawn(move || {
                 let store = Store::open(writer_config).expect("writer");
                 writer_barrier.wait();
@@ -3690,35 +3739,18 @@ fn basis_diff_under_concurrent_writer_returns_one_consistent_basis_to_current_dr
                         .is_ok()
                     {
                         writer_committed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = progress_tx.send(());
                     }
                 }
             })
         })
         .collect::<Vec<_>>();
     barrier.wait();
-    let progress_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let progress_reached = loop {
-        if committed.load(std::sync::atomic::Ordering::SeqCst) >= 50 {
-            break true;
-        }
-        if std::time::Instant::now() >= progress_deadline {
-            break false;
-        }
-        std::thread::yield_now();
-    };
-    match progress_reached {
-        true => {}
-        false => {
-            stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            for writer in writers {
-                writer.join().expect("writer joined after progress timeout");
-            }
-            panic!(
-                "writer flood did not create 50 durable snapshots before basis_diff; committed={}, attempts={}",
-                committed.load(std::sync::atomic::Ordering::SeqCst),
-                attempts.load(std::sync::atomic::Ordering::SeqCst)
-            );
-        }
+    drop(progress_tx);
+    for _ in 0..50 {
+        progress_rx
+            .recv()
+            .expect("writer committed a durable snapshot");
     }
     let diff_config = config.clone();
     let diff_committed = std::sync::Arc::clone(&committed);
@@ -3730,7 +3762,7 @@ fn basis_diff_under_concurrent_writer_returns_one_consistent_basis_to_current_dr
         diff_tx.send((before, after, diff)).expect("send diff");
     });
     let (before_diff, after_diff, diff) = diff_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv()
         .expect("basis_diff returned while writer flood was still active");
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
     for writer in writers {

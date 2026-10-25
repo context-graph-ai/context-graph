@@ -34,6 +34,8 @@ trait RecordObservationHooks {
     fn after_state_delta_guards(&mut self) {}
 
     fn conditional_update_conflict(&mut self) {}
+
+    fn before_commit(&mut self) {}
 }
 
 struct NoopRecordObservationHooks;
@@ -46,8 +48,9 @@ impl Store {
     }
 
     // The hook is private and the public entry point always supplies the no-op implementation.
-    // It gives the unit test one exact point after strict snapshot guards are staged and before
-    // the no-op decision, without changing the production operation.
+    // It gives the unit tests exact points after strict snapshot guards are staged and before
+    // the no-op decision, and after every lookup the write makes and before its commit, without
+    // changing the production operation.
     fn record_observation_with_hooks<H: RecordObservationHooks>(
         &self,
         mut input: RecordObservation,
@@ -68,7 +71,10 @@ impl Store {
             .iter()
             .map(|evidence| evidence.id)
             .collect::<HashSet<_>>();
-        let auto_create_entity = if let Some(entity) = self.get_entity(input.entity_id)? {
+        self.observe_read("get_entity");
+        let auto_create_entity = if let Some(entity) =
+            super::entity::get_entity(&self.write_lookup_rows(), input.entity_id)?
+        {
             if entity.context_id != input.context_id {
                 return Err(CgError::CrossContextObservation);
             }
@@ -249,6 +255,7 @@ impl Store {
                 let _ = self.db.rollback(tx);
                 return Err(e);
             }
+            hooks.before_commit();
             if let Err(err) = self.db.commit(tx) {
                 match err {
                     EngineError::ConditionalUpdateConflict { .. } => {
@@ -553,11 +560,7 @@ impl Store {
     ) -> Result<EmbeddingRoute> {
         match embedding.target {
             EmbeddingTarget::Evidence(target_id) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_write(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -585,11 +588,7 @@ impl Store {
                 })
             }
             EmbeddingTarget::EntityReference(_, _) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_write(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -612,11 +611,7 @@ impl Store {
                 })
             }
             EmbeddingTarget::Digest(_) => {
-                let space = self
-                    .embedding_space_for_id(&embedding.embedding_space_id)
-                    .map_err(|_| CgError::UnknownEmbeddingSpace {
-                        id: embedding.embedding_space_id.clone(),
-                    })?;
+                let space = self.embedding_space_for_write(&embedding.embedding_space_id)?;
                 if embedding.vector.len() != space.dimension {
                     return Err(CgError::EmbeddingDimensionMismatch {
                         space_id: embedding.embedding_space_id.clone(),
@@ -1337,7 +1332,7 @@ impl Store {
         query_vector: &[f32],
     ) -> Result<Option<f32>> {
         let space = self
-            .embedding_space_for_id(embedding_space_id)
+            .embedding_space_for_write(embedding_space_id)
             .map_err(|_| CgError::UnknownEmbeddingSpace {
                 id: embedding_space_id.to_string(),
             })?;
@@ -2137,6 +2132,259 @@ mod tests {
         guards_registered: mpsc::Sender<()>,
         release: Option<mpsc::Receiver<()>>,
         conditional_conflicts: usize,
+    }
+
+    #[test]
+    fn embedding_route_lookup_is_the_writes_own_and_keeps_its_typed_refusal() {
+        use contextdb_core::read_contract::{DeadlineClock, DeadlineWait};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+
+        /// Every observation spends a full second, so any read charged to the caller's read
+        /// budget is refused at once.
+        struct ExhaustingReadClock {
+            calls: AtomicU64,
+        }
+        impl DeadlineClock for ExhaustingReadClock {
+            fn now_ms(&self) -> u64 {
+                self.calls.fetch_add(1, Ordering::SeqCst) * 1_000
+            }
+
+            fn wait_until(&self, deadline: u64) -> DeadlineWait<'_> {
+                Box::pin(std::future::poll_fn(move |context| {
+                    if self.now_ms() >= deadline {
+                        std::task::Poll::Ready(())
+                    } else {
+                        context.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                }))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(StoreConfig {
+            db_path: dir.path().join("route-refusal.db"),
+            default_text_embedder: None,
+            ..Default::default()
+        })
+        .expect("open store");
+        store.read_active_time_ms = std::num::NonZeroU64::new(17).unwrap();
+        let input = observation_input(EntityId::new_v7(), ContextId::new_v7(), "test");
+        let embeddings = [
+            EmbeddingTarget::Evidence(input.evidence[0].id),
+            EmbeddingTarget::EntityReference(input.entity_id, None),
+            EmbeddingTarget::Digest(DigestId::new_v7()),
+        ]
+        .map(|target| PrecomputedEmbedding {
+            embedding_space_id: "absent-space".to_string(),
+            target,
+            ..Default::default()
+        });
+        for embedding in &embeddings {
+            let clock = Arc::new(ExhaustingReadClock {
+                calls: AtomicU64::new(0),
+            });
+            let absent = super::super::graph_rows::with_read_clock_for_test(clock.clone(), || {
+                store.validate_embedding_route(&input, embedding, &HashMap::new())
+            });
+            assert!(
+                matches!(&absent, Err(CgError::UnknownEmbeddingSpace { id }) if id == "absent-space")
+                    && clock.calls.load(Ordering::SeqCst) == 0,
+                "the route lookup must answer the absent space without being charged to the read \
+                 budget for {:?}: {absent:?}, read_clock_observations={}",
+                embedding.target,
+                clock.calls.load(Ordering::SeqCst)
+            );
+        }
+        store
+            .internal_db()
+            .close()
+            .expect("close the store's database");
+        for embedding in &embeddings {
+            let refused = store.validate_embedding_route(&input, embedding, &HashMap::new());
+            assert!(
+                matches!(&refused, Err(error) if !matches!(error, CgError::UnknownEmbeddingSpace { .. })),
+                "a refused lookup must survive validation instead of reading as a missing space \
+                 for {:?}: {refused:?}",
+                embedding.target
+            );
+        }
+    }
+
+    /// Holds the first vector-writing commit after arming inside the commit boundary until the
+    /// test releases it, and says while it is holding.
+    struct HoldVectorCommit {
+        armed: std::sync::atomic::AtomicBool,
+        holding: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        held: std::sync::Mutex<Option<mpsc::Sender<()>>>,
+        release: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl contextdb_engine::plugin::DatabasePlugin for HoldVectorCommit {
+        fn pre_commit(
+            &self,
+            ws: &contextdb_tx::WriteSet,
+            _source: contextdb_engine::plugin::CommitSource,
+        ) -> contextdb_core::Result<()> {
+            use std::sync::atomic::Ordering;
+            if ws.vector_inserts.is_empty() || !self.armed.swap(false, Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.holding.store(true, Ordering::SeqCst);
+            if let Some(held) = self.held.lock().expect("held sender").take() {
+                held.send(()).expect("held commit announced");
+            }
+            if let Some(release) = self.release.lock().expect("release receiver").take() {
+                release.recv().expect("held commit released");
+            }
+            self.holding.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A read clock on which time passes only while the commit boundary is held: a bounded read
+    /// waiting for that boundary sees its allowance run out, and nothing else does.
+    struct CommitBoundaryClock {
+        holding: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        observations: std::sync::atomic::AtomicU64,
+        now: std::sync::atomic::AtomicU64,
+    }
+
+    impl contextdb_core::read_contract::DeadlineClock for CommitBoundaryClock {
+        fn now_ms(&self) -> u64 {
+            use std::sync::atomic::Ordering;
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            if self.holding.load(Ordering::SeqCst) {
+                self.now.fetch_add(1_000, Ordering::SeqCst) + 1_000
+            } else {
+                self.now.load(Ordering::SeqCst)
+            }
+        }
+
+        fn wait_until(&self, deadline: u64) -> contextdb_core::read_contract::DeadlineWait<'_> {
+            Box::pin(std::future::poll_fn(move |context| {
+                if self.now_ms() >= deadline {
+                    std::task::Poll::Ready(())
+                } else {
+                    if self.holding.load(std::sync::atomic::Ordering::SeqCst) {
+                        context.waker().wake_by_ref();
+                    }
+                    std::task::Poll::Pending
+                }
+            }))
+        }
+    }
+
+    enum WriterEvent {
+        ReachedCommit,
+        Finished,
+    }
+
+    struct AnnounceCommit(Option<mpsc::Sender<WriterEvent>>);
+
+    impl RecordObservationHooks for AnnounceCommit {
+        fn before_commit(&mut self) {
+            if let Some(events) = self.0.take() {
+                events
+                    .send(WriterEvent::ReachedCommit)
+                    .expect("commit point announced");
+            }
+        }
+    }
+
+    #[test]
+    fn observation_recorded_while_a_reindex_commit_holds_the_commit_boundary_is_not_refused_by_the_read_budget()
+     {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let space = crate::embedding_space::default_text_embedding_space();
+        let holding = Arc::new(AtomicBool::new(false));
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let plugin = Arc::new(HoldVectorCommit {
+            armed: AtomicBool::new(false),
+            holding: Arc::clone(&holding),
+            held: Mutex::new(Some(held_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        let store = Store::open_with_config_inner_with_plugin(
+            StoreConfig {
+                db_path: dir.path().join("reindex-write-budget.db"),
+                default_text_embedder: None,
+                ..Default::default()
+            },
+            false,
+            None,
+            None,
+            super::super::DatabaseOpenExtras::with_plugin(plugin.clone()),
+            vec![crate::EmbedderRegistration {
+                embedder: Arc::new(crate::embedder::mock::MockEmbedder::new(
+                    space.embedding_space_id.clone(),
+                    space.dimension,
+                )),
+                space: space.clone(),
+            }],
+            crate::ConsumerSchema::none(),
+        )
+        .expect("open store");
+        let context_id = ContextId::new_v7();
+        let text_input = |text: &str| {
+            let mut input = observation_input(EntityId::new_v7(), context_id, "screen");
+            input.evidence[0].text_projection = Some(text.to_string());
+            input
+        };
+        store
+            .record_observation(text_input("indexed before the reindex"))
+            .expect("seed an indexed observation");
+
+        plugin.armed.store(true, Ordering::SeqCst);
+        let reindex_store = store.clone();
+        let space_id = space.embedding_space_id.clone();
+        let reindex = std::thread::spawn(move || {
+            reindex_store.reindex_space(&space_id, super::super::ReindexOptions::default())
+        });
+        held_rx
+            .recv()
+            .expect("the reindex commit is holding the commit boundary");
+
+        let (events_tx, events_rx) = mpsc::channel();
+        let writer_store = store.clone();
+        let writer_holding = Arc::clone(&holding);
+        let input = text_input("written during the reindex");
+        let writer = std::thread::spawn(move || {
+            let clock = Arc::new(CommitBoundaryClock {
+                holding: writer_holding,
+                observations: AtomicU64::new(0),
+                now: AtomicU64::new(0),
+            });
+            let mut hooks = AnnounceCommit(Some(events_tx.clone()));
+            let result = super::super::graph_rows::with_read_clock_for_test(clock.clone(), || {
+                writer_store.record_observation_with_hooks(input, &mut hooks)
+            });
+            let _ = events_tx.send(WriterEvent::Finished);
+            (result, clock.observations.load(Ordering::SeqCst))
+        });
+        let first_event = events_rx.recv().expect("writer event");
+        release_tx.send(()).expect("release the reindex commit");
+        let (written, budget_observations) = writer.join().expect("writer thread");
+        let reindexed = reindex.join().expect("reindex thread");
+
+        assert!(
+            matches!(first_event, WriterEvent::ReachedCommit)
+                && written.is_ok()
+                && budget_observations == 0
+                && reindexed.is_ok(),
+            "a write made while a reindex commit holds the commit boundary must finish its lookups \
+             without waiting for that boundary and must never be charged against the read \
+             budget: reached_commit_while_held={}, written={written:?}, \
+             read_budget_clock_observations={budget_observations}, reindexed={reindexed:?}",
+            matches!(first_event, WriterEvent::ReachedCommit),
+        );
     }
 
     impl RecordObservationHooks for SnapshotGuardRaceHook {

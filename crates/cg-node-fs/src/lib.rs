@@ -99,8 +99,10 @@ pub fn write_event_search_worker_policy(root: &Path, contents: &str) -> std::io:
     temporary.as_file().sync_all()?;
     temporary
         .persist(root.join(EVENT_SEARCH_WORKER_POLICY))
-        .map(|_| ())
-        .map_err(|error| error.error)
+        .map_err(|error| error.error)?;
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    notify_test_observers_for_test();
+    Ok(())
 }
 
 /// A held per-data-root worker lock. Dropping it releases the lock. The lock is an OS advisory
@@ -109,6 +111,15 @@ pub fn write_event_search_worker_policy(root: &Path, contents: &str) -> std::io:
 #[derive(Debug)]
 pub struct WorkerLock {
     _file: std::fs::File,
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+impl Drop for WorkerLock {
+    fn drop(&mut self) {
+        use fs4::fs_std::FileExt;
+        let _ = FileExt::unlock(&self._file);
+        notify_test_observers_for_test();
+    }
 }
 
 /// Why the per-data-root worker lock was not taken.
@@ -156,6 +167,21 @@ pub fn acquire_worker_lock(lock_path: &Path) -> Result<WorkerLock, WorkerLockRef
     }
 }
 
+/// Wait for the OS to release this fixture's worker lock, including after a killed child.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn wait_for_worker_lock_for_test(lock_path: &Path) -> std::io::Result<WorkerLock> {
+    use fs4::fs_std::FileExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    file.lock_exclusive()?;
+    Ok(WorkerLock { _file: file })
+}
+
 /// Load a config file's text, mapping a missing file to `Ok(None)` (an absent config is not an
 /// error — the node runs with defaults). Any other IO error surfaces as `Err`.
 pub fn load_text_if_present(path: &Path) -> std::io::Result<Option<String>> {
@@ -175,7 +201,8 @@ pub fn load_text_if_present(path: &Path) -> std::io::Result<Option<String>> {
 /// a container gets killed instead of refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MachineMemory {
-    /// Installed memory, from `/proc/meminfo`. `None` where the platform does not publish it.
+    /// Installed memory, from `/proc/meminfo` on Linux or `hw.memsize` on macOS. `None` where the
+    /// platform does not publish it.
     pub total_bytes: Option<u64>,
     /// The control group's own memory ceiling, when the kernel enforces a finite one.
     pub cgroup_limit_bytes: Option<u64>,
@@ -185,15 +212,48 @@ pub struct MachineMemory {
 ///
 /// Every read is best-effort: a platform that publishes neither number answers `None` for both and
 /// the caller falls back to its own floor rather than failing. Nothing here dereferences a source
-/// reference or reaches the network — these are the kernel's own published files.
+/// reference or reaches the network — these are the kernel's own published memory facts.
 pub fn machine_memory() -> MachineMemory {
     MachineMemory {
-        total_bytes: read_proc_meminfo_total(),
+        total_bytes: read_installed_memory(),
         cgroup_limit_bytes: read_cgroup_memory_limit(),
     }
 }
 
+/// Installed physical memory, in bytes, from the platform's own published source.
+fn read_installed_memory() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        read_macos_memsize()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        read_proc_meminfo_total()
+    }
+}
+
+/// Darwin publishes installed physical memory in bytes as the `hw.memsize` sysctl. The system
+/// utility is addressed by absolute path, so the answer does not depend on the caller's `PATH`,
+/// and no shell is involved.
+#[cfg(target_os = "macos")]
+fn read_macos_memsize() -> Option<u64> {
+    let output = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let bytes = std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    (bytes > 0).then_some(bytes)
+}
+
 /// `MemTotal:` from `/proc/meminfo`, in bytes. The file publishes kibibytes.
+#[cfg(not(target_os = "macos"))]
 fn read_proc_meminfo_total() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let kibibytes = text
@@ -252,4 +312,62 @@ fn legacy_cgroup_memory_limit() -> Option<u64> {
     // v1 spells "no ceiling" as a number near the top of the address space rather than as a word.
     // Anything at or above a pebibyte is that sentinel, not a limit anyone set.
     (bytes < (1 << 50)).then_some(bytes)
+}
+
+/// Level notification after a fixture-visible state change. A full socket already
+/// carries a wakeup; the observer always rereads authoritative state after waking.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn notify_test_observers_for_test() {
+    let Some(address) = std::env::var_os("CG_TEST_STATE_EVENTS") else {
+        return;
+    };
+    let socket = std::os::unix::net::UnixDatagram::unbound().expect("test notification socket");
+    socket
+        .set_nonblocking(true)
+        .expect("nonblocking test notification");
+    let _ = socket.send_to(&[1], address);
+}
+
+/// Replace one fixture marker and wake both its observer and its explicit release waiter.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn write_test_file_for_test(
+    path: impl AsRef<Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    std::fs::write(path, contents)?;
+    notify_test_observers_for_test();
+    if let Some(parent) = path.parent()
+        && let Ok(address) = std::fs::read_to_string(parent.join(".release-event-address"))
+    {
+        let socket = std::os::unix::net::UnixDatagram::unbound()?;
+        socket.set_nonblocking(true)?;
+        let _ = socket.send_to(&[1], address);
+    }
+    Ok(())
+}
+
+/// Drive the existing release predicate after explicit writes, without timer polling.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn wait_for_test_release_for_test(directory: &Path, mut released: impl FnMut() -> bool) {
+    if released() {
+        return;
+    }
+    let socket_dir = tempfile::tempdir_in("/tmp").expect("short release socket directory");
+    let address = socket_dir.path().join("release.sock");
+    let socket = std::os::unix::net::UnixDatagram::bind(&address).expect("release event socket");
+    // Publish before rechecking, closing the race with a parent that has already released.
+    std::fs::write(
+        directory.join(".release-event-address"),
+        address.as_os_str().as_encoded_bytes(),
+    )
+    .expect("publish release address");
+    while !released() {
+        socket
+            .recv(&mut [0])
+            .expect("explicit fixture release event");
+    }
 }
