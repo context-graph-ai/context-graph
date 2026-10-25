@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use context_graph::*;
-use contextdb_core::{Lsn, TxId, Value as DbValue};
+use contextdb_core::{Lsn, TxId, Value as DbValue, Wallclock};
 use contextdb_engine::Database as RawDatabase;
 use serde_json::json;
 use tempfile::TempDir;
@@ -17,7 +17,7 @@ type NewDecisionCollector = (
     ContextId,
     IntentionId,
     EntityId,
-    Arc<Mutex<Vec<NewDecisionPayload>>>,
+    Arc<Collector<NewDecisionPayload>>,
 );
 
 type InvalidationCollector = (
@@ -28,7 +28,7 @@ type InvalidationCollector = (
     EntityId,
     IntentionId,
     DecisionId,
-    Arc<Mutex<Vec<InvalidationDetectedPayload>>>,
+    Arc<Collector<InvalidationDetectedPayload>>,
 );
 
 type ConflictCollector = (
@@ -38,7 +38,7 @@ type ConflictCollector = (
     EntityId,
     IntentionId,
     DecisionId,
-    Arc<Mutex<Vec<ConflictDetectedPayload>>>,
+    Arc<Collector<ConflictDetectedPayload>>,
 );
 
 type PrecedentCollector = (
@@ -47,7 +47,7 @@ type PrecedentCollector = (
     ContextId,
     IntentionId,
     DecisionId,
-    Arc<Mutex<Vec<PrecedentMatchPayload>>>,
+    Arc<Collector<PrecedentMatchPayload>>,
 );
 
 fn fixture() -> (TempDir, PathBuf, Store) {
@@ -143,14 +143,79 @@ fn seed_pending_invalidation_direct(
     .expect("seed invalidation");
 }
 
-fn wait_for_len<T>(items: &Arc<Mutex<Vec<T>>>, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline && items.lock().expect("collector").len() < expected {
-        std::thread::sleep(Duration::from_millis(20));
+/// Collector writes and delivery waits share the same predicate lock. Dropping a
+/// callback's collector guard announces its update without polling a clock.
+struct Collector<T> {
+    items: Mutex<Vec<T>>,
+    changed: Condvar,
+}
+
+struct CollectorGuard<'a, T> {
+    items: MutexGuard<'a, Vec<T>>,
+    changed: &'a Condvar,
+}
+
+impl<T> std::ops::Deref for CollectorGuard<'_, T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
     }
 }
 
-fn assert_no_more<T>(items: &Arc<Mutex<Vec<T>>>, expected: usize) {
+impl<T> std::ops::DerefMut for CollectorGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.items
+    }
+}
+
+impl<T> Drop for CollectorGuard<'_, T> {
+    fn drop(&mut self) {
+        self.changed.notify_all();
+    }
+}
+
+impl<T> Collector<T> {
+    fn new() -> Self {
+        Self {
+            items: Mutex::new(Vec::new()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::result::Result<CollectorGuard<'_, T>, &'static str> {
+        self.items
+            .lock()
+            .map(|items| CollectorGuard {
+                items,
+                changed: &self.changed,
+            })
+            .map_err(|_| "collector lock poisoned")
+    }
+}
+
+fn wait_for_len<T>(items: &Arc<Collector<T>>, expected: usize) {
+    let guard = items.items.lock().expect("collector");
+    let _guard = items
+        .changed
+        .wait_while(guard, |entries| entries.len() < expected)
+        .expect("delivery notification");
+}
+
+fn wait_until_each_reaches<T>(counters: &[Arc<Collector<T>>], expected: usize) {
+    for counter in counters {
+        wait_for_len(counter, expected);
+    }
+}
+
+fn timestamp() -> chrono::DateTime<Utc> {
+    chrono::DateTime::from_timestamp_millis(
+        i64::try_from(Wallclock::now().0).expect("fixture timestamp fits"),
+    )
+    .expect("fixture timestamp is representable")
+}
+
+fn assert_no_more<T>(items: &Arc<Collector<T>>, expected: usize) {
     let deadline = Instant::now() + Duration::from_millis(250);
     while Instant::now() < deadline {
         assert_eq!(items.lock().expect("collector").len(), expected);
@@ -232,7 +297,7 @@ fn reasoning(label: &str) -> Vec<ReasoningStep> {
         details: format!("details-{label}"),
         result: format!("result-{label}"),
         agent_id: Some("subscription-test-agent".to_string()),
-        timestamp: Utc::now(),
+        timestamp: timestamp(),
     }]
 }
 
@@ -290,7 +355,7 @@ fn evidence_ref(observation_id: ObservationId) -> EvidenceRef {
         content_hash: Some(
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),
-        captured_at: Some(Utc::now()),
+        captured_at: Some(timestamp()),
         retention_status: RetentionStatus::RetainedExternal,
         ..Default::default()
     }
@@ -310,7 +375,7 @@ fn observe(
             context_id,
             observation_type: "state-change".to_string(),
             source: "subscription-test".to_string(),
-            observed_at: Utc::now(),
+            observed_at: timestamp(),
             evidence: vec![evidence_ref(observation_id)],
             observed_properties: BTreeMap::new(),
             state_delta: changes,
@@ -325,7 +390,7 @@ fn collect_new_decision() -> NewDecisionCollector {
     let ctx = context(&store, "new-decision").id;
     let intent = intention(&store, ctx, "reload gate policy immediately");
     let ent = entity(&store, ctx, "entry", BTreeMap::new());
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -362,7 +427,7 @@ fn collect_invalidation() -> InvalidationCollector {
             ..Default::default()
         })
         .expect("create decision");
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -390,7 +455,7 @@ fn collect_conflict() -> ConflictCollector {
     store
         .record_outcome(older.id, true, Some("worked".to_string()))
         .expect("older outcome");
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -417,7 +482,7 @@ fn collect_precedent() -> PrecedentCollector {
     store
         .record_outcome(prior.id, true, Some("stayed below limit".to_string()))
         .expect("prior outcome");
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -575,7 +640,7 @@ fn subscribe_invalidation_detected_with_intention_id_filter_only_fires_for_match
             .expect("create decision");
     }
 
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -683,7 +748,7 @@ fn cascade_invalidation_payload_carries_cascade_from_pointer_and_renders_citing_
         Vec::new(),
         vec![direct.id],
     );
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -828,7 +893,7 @@ fn precedent_match_does_not_fire_for_failed_outcome_precedent() {
     store
         .record_outcome(prior.id, false, Some("failed".to_string()))
         .expect("failed outcome");
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -979,7 +1044,7 @@ fn conflict_detected_scoped_to_context_with_engine_metrics_assertion() {
         .expect("b outcome");
     drop(store);
     let store = reopen_scoped(&path, [ctx_a]);
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     let sub = store
         .with_system_principal()
@@ -1080,7 +1145,7 @@ fn precedent_match_trigger_emits_one_event_per_validated_cites_precedent_with_di
         .record_outcome(parent_b.id, true, None)
         .expect("parent b outcome");
 
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -1254,7 +1319,7 @@ fn subscription_filter_context_ids_routes_msp_subscriber_across_authorized_conte
         denied,
         Err(SubscriptionError::ContextNotAuthorized(id)) if id == ctx_d
     ));
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     let sub = scoped
         .with_system_principal()
@@ -1298,7 +1363,7 @@ fn subscribe_scoped_to_context_blocks_other_context_events_with_engine_route_ass
     let ctx_b = context(&store, "b").id;
     drop(store);
     let scoped = reopen_scoped(&path, [ctx_a]);
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     let sub = scoped
         .with_system_principal()
@@ -1352,7 +1417,7 @@ fn subscribe_callback_panic_isolated_other_subscribers_continue_at_n_2() {
             panic!("subscriber panic is isolated by engine");
         })
         .expect("subscribe panicker");
-    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::new(Collector::new());
     let seen_clone = Arc::clone(&seen);
     store
         .with_system_principal()
@@ -1385,18 +1450,19 @@ fn subscribe_callback_panic_isolated_at_n_10_with_seven_panicking_and_three_coun
             })
             .expect("subscribe panicker");
     }
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    for _ in 0..3 {
-        let seen_clone = Arc::clone(&seen);
+    let counters: Vec<Arc<Collector<DecisionId>>> =
+        (0..3).map(|_| Arc::new(Collector::new())).collect();
+    for counter in &counters {
+        let seen = Arc::clone(counter);
         store
             .with_system_principal()
             .subscribe_new_decision(SubscriptionFilter::default(), move |payload| {
-                seen_clone.lock().expect("collector").push(payload.clone());
+                seen.lock().expect("collector").push(payload.decision.id);
                 Ok(())
             })
             .expect("subscribe counter");
     }
-    decision(
+    let created = decision(
         &store,
         ctx,
         "panic-isolated-scale",
@@ -1404,8 +1470,16 @@ fn subscribe_callback_panic_isolated_at_n_10_with_seven_panicking_and_three_coun
         vec![ent],
         vec![],
     );
-    wait_for_len(&seen, 3);
-    assert_eq!(seen.lock().expect("collector").len(), 3);
+    // Each healthy collector notifies after its callback writes the decision.
+    // The seven panicking subscribers cannot satisfy a healthy collector's wait.
+    wait_until_each_reaches(&counters, 1);
+    for (index, counter) in counters.iter().enumerate() {
+        assert_eq!(
+            *counter.lock().expect("collector"),
+            vec![created.id],
+            "counting subscriber {index} must receive exactly the one decision"
+        );
+    }
 }
 
 // Use case: two separate Store instances cannot poison each other's dispatchers.
@@ -1426,7 +1500,7 @@ fn cross_instance_independence_one_store_panic_does_not_affect_parallel_store() 
     let ctx_y = context(&store_y, "healthy-store").id;
     let intent_y = intention(&store_y, ctx_y, "y intent");
     let ent_y = entity(&store_y, ctx_y, "y entity", BTreeMap::new());
-    let seen_y = Arc::new(Mutex::new(Vec::new()));
+    let seen_y = Arc::new(Collector::new());
     let seen_y_clone = Arc::clone(&seen_y);
     store_y
         .with_system_principal()
@@ -1463,8 +1537,8 @@ fn cross_instance_independence_one_store_panic_does_not_affect_parallel_store() 
 #[test]
 fn unsubscribe_stops_events_for_removed_subscription_only_with_engine_metrics() {
     let (_dir, _path, store, ctx, intent, ent, _payloads) = collect_new_decision();
-    let a = Arc::new(Mutex::new(Vec::new()));
-    let b = Arc::new(Mutex::new(Vec::new()));
+    let a = Arc::new(Collector::new());
+    let b = Arc::new(Collector::new());
     let a_seen = Arc::clone(&a);
     let b_seen = Arc::clone(&b);
     let sub_a = store
@@ -1548,7 +1622,7 @@ fn subscription_does_not_fire_when_observation_transaction_rolls_back() {
     seed_pending_invalidation_direct(&path, ctx, dec.id, seed_observation.observation_id);
 
     let store = reopen(&path);
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     store
         .with_system_principal()
@@ -1565,7 +1639,7 @@ fn subscription_does_not_fire_when_observation_transaction_rolls_back() {
         context_id: ctx,
         observation_type: "state-change".to_string(),
         source: "subscription-test".to_string(),
-        observed_at: Utc::now(),
+        observed_at: timestamp(),
         evidence: vec![evidence_ref(attempted_id)],
         observed_properties: BTreeMap::new(),
         state_delta: delta(&[("version", json!("2"))]),
@@ -1609,7 +1683,7 @@ fn subscription_does_not_fire_when_observation_transaction_rolls_back() {
 #[test]
 fn lost_subscription_acknowledgement_retries_one_identity_and_one_receiver_effect() {
     let (_dir, _path, store, ctx, ent, _intent, _dec, _payloads) = collect_invalidation();
-    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(Collector::new());
     let visible_effects = Arc::new(Mutex::new(BTreeSet::new()));
     let attempts_for_handler = Arc::clone(&attempts);
     let effects_for_handler = Arc::clone(&visible_effects);
@@ -1660,7 +1734,7 @@ fn lost_subscription_acknowledgement_retries_one_identity_and_one_receiver_effec
 #[test]
 fn external_handler_without_dedup_reports_uncertain_delivery() {
     let (_dir, _path, store, ctx, ent, _intent, _dec, _payloads) = collect_invalidation();
-    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let attempts = Arc::new(Collector::new());
     let seen = Arc::clone(&attempts);
     let subscription = store
         .with_system_principal()
@@ -1736,7 +1810,7 @@ fn serial_observations_on_same_entity_fire_invalidation_detected_in_observation_
 fn cross_event_fifo_order_new_decision_precedes_invalidation_detected_for_same_decision_lifecycle()
 {
     let (_dir, _path, store, ctx, ent, intent, _dec, invalidations) = collect_invalidation();
-    let new_decisions = Arc::new(Mutex::new(Vec::new()));
+    let new_decisions = Arc::new(Collector::new());
     let seen = Arc::clone(&new_decisions);
     store
         .with_system_principal()
@@ -1815,7 +1889,7 @@ fn subscription_resume_replays_queued_events_after_reopen_on_same_subscription_i
     assert_eq!(before_resume.delivered, 0);
     assert_eq!(before_resume.queued, 1);
 
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     let seen = Arc::clone(&payloads);
     let resumed = store
         .with_system_principal()
@@ -1942,7 +2016,7 @@ fn subscription_resume_replays_queued_events_after_reopen_for_invalidation_confl
     let precedent_before = wait_for_metrics(&store, &precedent_sub, |metrics| metrics.queued == 1);
     assert_eq!(precedent_before.delivered, 0);
 
-    let invalidations = Arc::new(Mutex::new(Vec::new()));
+    let invalidations = Arc::new(Collector::new());
     let seen_invalidations = Arc::clone(&invalidations);
     let resumed_inv = store
         .with_system_principal()
@@ -1960,7 +2034,7 @@ fn subscription_resume_replays_queued_events_after_reopen_for_invalidation_confl
         .expect("resume invalidation");
     assert_eq!(resumed_inv, inv_sub);
 
-    let conflicts = Arc::new(Mutex::new(Vec::new()));
+    let conflicts = Arc::new(Collector::new());
     let seen_conflicts = Arc::clone(&conflicts);
     let resumed_conflict = store
         .with_system_principal()
@@ -1978,7 +2052,7 @@ fn subscription_resume_replays_queued_events_after_reopen_for_invalidation_confl
         .expect("resume conflict");
     assert_eq!(resumed_conflict, conflict_sub);
 
-    let precedents = Arc::new(Mutex::new(Vec::new()));
+    let precedents = Arc::new(Collector::new());
     let seen_precedents = Arc::clone(&precedents);
     let resumed_precedent = store
         .with_system_principal()
@@ -2097,7 +2171,7 @@ fn lifecycle_audit_chain(with_subscriber: bool) -> Vec<NormalizedAuditEntry> {
             ..Default::default()
         })
         .expect("create decision");
-    let payloads = Arc::new(Mutex::new(Vec::new()));
+    let payloads = Arc::new(Collector::new());
     if with_subscriber {
         let seen = Arc::clone(&payloads);
         store

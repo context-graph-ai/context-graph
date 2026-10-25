@@ -1,9 +1,11 @@
+use contextdb_core::Wallclock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use context_graph::ingest::{ConversationExtractor, ExtractionRequest, StructuredHarvest};
-use context_graph::{CaptureProgressEvent, capture_with_progress_observer};
+use context_graph::{CaptureProgressEvent, capture_with_progress_observer_for_test};
 
 use crate::capture_sync_common::{
     TestStore, capture_request, expected_chunk_count, expected_progress_events_for,
@@ -45,10 +47,13 @@ fn long_run_emits_observable_chunk_progress() {
         .into_iter()
         .find(|event| event.chunk_index == blocked_chunk && event.kind.is_in_flight())
         .expect("fixture must expect an in-flight event for the blocked chunk");
-    let run_started = Instant::now();
+    let run_started = 1_000;
+    let clock = Arc::new(AtomicU64::new(run_started));
+    let worker_clock = Arc::clone(&clock);
     let worker_transcript = transcript.clone();
     let worker = std::thread::spawn(move || {
-        capture_with_progress_observer(
+        let _clock = Wallclock::test_clock_guard(move || worker_clock.load(Ordering::SeqCst));
+        capture_with_progress_observer_for_test(
             &worker_store,
             capture_request("tenant-alpha", &worker_transcript),
             worker_extractor.as_ref(),
@@ -59,20 +64,15 @@ fn long_run_emits_observable_chunk_progress() {
         )
     });
     assert!(
-        blocking_extractor.wait_until_started(Duration::from_secs(2)),
+        blocking_extractor.wait_until_started(),
         "capture must reach the blocked chunk extractor before it can complete"
     );
-    let observed_before_release = collect_until_event(
-        &event_rx,
-        &expected_blocked_progress,
-        run_started,
-        Duration::from_secs(2),
-    );
+    let observed_before_release =
+        collect_until_event(&event_rx, &expected_blocked_progress, Duration::ZERO);
     assert_observed_elapsed_is_measured(&observed_before_release);
     let completed_before_release = worker.is_finished();
-    let hold_started = Instant::now();
-    std::thread::sleep(Duration::from_millis(150));
-    let held_for = hold_started.elapsed();
+    let held_for = Duration::from_millis(150);
+    clock.fetch_add(150, Ordering::SeqCst);
     blocking_extractor.release();
     let report = worker
         .join()
@@ -102,7 +102,7 @@ fn long_run_emits_observable_chunk_progress() {
         &observed_events,
         &transcript,
         chunk_window,
-        run_started.elapsed(),
+        Duration::from_millis(clock.load(Ordering::SeqCst) - run_started),
     );
     assert!(
         completed_blocked_chunk.elapsed >= held_for,
@@ -123,8 +123,8 @@ fn long_run_emits_observable_chunk_progress() {
         let store = TestStore::new(label);
         let mut progress = Vec::new();
         let recording_extractor = RecordingExtractor::recording();
-        let run_started = Instant::now();
-        let report = capture_with_progress_observer(
+        let _clock = Wallclock::test_clock_guard(|| 1_000);
+        let report = capture_with_progress_observer_for_test(
             &store.store,
             capture_request("tenant-alpha", &transcript),
             &recording_extractor,
@@ -132,7 +132,7 @@ fn long_run_emits_observable_chunk_progress() {
             |event| progress.push(event),
         )
         .expect("capture succeeds");
-        let wall_elapsed = run_started.elapsed();
+        let wall_elapsed = Duration::ZERO;
 
         assert_progress_sequence(&progress, &transcript, chunk_window, wall_elapsed);
         assert_eq!(
@@ -147,22 +147,14 @@ fn long_run_emits_observable_chunk_progress() {
 fn collect_until_event(
     receiver: &mpsc::Receiver<CaptureProgressEvent>,
     target: &CaptureProgressEvent,
-    run_started: Instant,
-    timeout: Duration,
+    observed_at: Duration,
 ) -> Vec<(CaptureProgressEvent, Duration)> {
-    let deadline = Instant::now() + timeout;
     let mut observed = Vec::new();
-    while Instant::now() < deadline {
-        match receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok(event) => {
-                let is_target = same_progress_shape(&event, target);
-                observed.push((event, run_started.elapsed()));
-                if is_target {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+    for event in receiver {
+        let is_target = same_progress_shape(&event, target);
+        observed.push((event, observed_at));
+        if is_target {
+            break;
         }
     }
     observed
@@ -300,11 +292,11 @@ impl RecordingExtractor {
         }
     }
 
-    fn wait_until_started(&self, timeout: Duration) -> bool {
+    fn wait_until_started(&self) -> bool {
         self.started_rx
             .lock()
             .expect("started receiver lock")
-            .recv_timeout(timeout)
+            .recv()
             .map(|call_index| Some(call_index) == self.block_on_call)
             .unwrap_or(false)
     }

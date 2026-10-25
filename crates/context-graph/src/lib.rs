@@ -104,6 +104,7 @@ pub mod test_support {
     pub use crate::store::event_search_projection::{
         after_next_event_search_membership_read_page_for_test,
         observe_event_search_batch_admission_for_test,
+        set_event_search_projection_read_clock_for_test,
         set_event_search_projection_read_deadline_ms_for_test,
     };
     /// How many Stores the event-search runner has opened on the calling thread.

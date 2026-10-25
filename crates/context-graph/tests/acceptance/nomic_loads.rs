@@ -1276,7 +1276,7 @@ fn cg_github_actions_workflow_runs_on_matrix_of_macos_latest_ubuntu_latest_and_d
         (
             "macos-advisory.yml",
             "macos-latest",
-            "shard-union-macos",
+            "shard-union-macos-isolated",
             "macos-advisory",
         ),
     ] {
@@ -1292,13 +1292,8 @@ fn cg_github_actions_workflow_runs_on_matrix_of_macos_latest_ubuntu_latest_and_d
             let rows = yaml["jobs"][job]["strategy"]["matrix"]["include"]
                 .as_sequence()
                 .unwrap();
-            let expected_bundles = if system == "ubuntu-latest" {
-                vec!["acceptance", "import-and-cli", "integration-and-rest"]
-            } else if job == "features" {
-                vec!["integration-and-rest + import-and-cli + acceptance"]
-            } else {
-                vec!["acceptance", "integration-and-rest + import-and-cli"]
-            };
+            // Both platforms run each logical bundle as its own job.
+            let expected_bundles = vec!["acceptance", "import-and-cli", "integration-and-rest"];
             let mut actual_bundles = rows
                 .iter()
                 .map(|row| row["bundle"].as_str().expect("matrix bundle"))
@@ -1330,7 +1325,7 @@ fn cg_readme_ci_section_documents_two_runner_matrix_and_shared_model_cache_root_
     assert!(lower.contains("continuous integration") || lower.contains("## ci"));
     assert!(readme.contains("Required PR test and feature jobs run on `ubuntu-latest`"));
     assert!(readme.contains(
-        "separate `macOS advisory` workflow retains the same coverage on `macos-latest`"
+        "separate `macOS CI (advisory)` workflow retains the same coverage on `macos-latest`"
     ));
     assert!(readme.contains("`windows-latest` is excluded deliberately"));
     assert!(readme.contains("CG_MODEL_CACHE_ROOT` at runner temporary space"));

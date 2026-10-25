@@ -277,6 +277,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static AFTER_MEMBERSHIP_READ_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static PROJECTION_READ_CLOCK: std::cell::RefCell<Option<std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>>> = const { std::cell::RefCell::new(None) };
     static PROJECTION_READ_ACTIVE_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static BEFORE_FAILURE_RECORD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
@@ -338,6 +339,15 @@ pub fn after_next_event_search_membership_read_page_for_test(hook: impl FnOnce()
 #[doc(hidden)]
 pub fn set_event_search_projection_read_deadline_ms_for_test(active_ms: Option<u64>) {
     PROJECTION_READ_ACTIVE_MS.with(|slot| slot.set(active_ms));
+}
+
+/// Consume the substrate's existing deadline clock seam for projection reads on this thread.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_event_search_projection_read_clock_for_test(
+    clock: Option<std::sync::Arc<dyn contextdb_core::read_contract::DeadlineClock>>,
+) {
+    PROJECTION_READ_CLOCK.with(|slot| *slot.borrow_mut() = clock);
 }
 
 /// Return and reset this thread's source-membership preparation count.
@@ -3803,10 +3813,7 @@ fn capture_search_page(
     ordered: &mut Sha256,
     content: &mut Sha256,
 ) -> Result<()> {
-    let session = store
-        .internal_db()
-        .read_session(read_limits(store, bounds))
-        .map_err(map_engine_err)?;
+    let session = projection_read_session(store, bounds)?;
     for row in rows {
         let raw = captured_raw_from_row(&session, bounds, context_id, columns, row)?;
         let captured_sha256 = captured_source_sha256(
@@ -4840,10 +4847,7 @@ fn load_claimed_member(
     row: &[Value],
     bounds: Bounds,
 ) -> Result<ClaimedEvent> {
-    let session = store
-        .internal_db()
-        .read_session(read_limits(store, bounds))
-        .map_err(map_engine_err)?;
+    let session = projection_read_session(store, bounds)?;
     let membership_id = get_uuid(row, columns, "membership_id")?;
     let ordinal = get_u64(row, columns, "ordinal")?;
     let event_id = crate::EventId::from(get_uuid(row, columns, "event_id")?);
@@ -7954,10 +7958,7 @@ fn stream_rows(
     params: &HashMap<String, Value>,
     mut consume: impl FnMut(&[String], &[Value]) -> Result<()>,
 ) -> Result<()> {
-    let session = store
-        .internal_db()
-        .read_session(read_limits(store, bounds))
-        .map_err(map_engine_err)?;
+    let session = projection_read_session(store, bounds)?;
     let mut cursor = session.open_cursor(sql, params).map_err(map_engine_err)?;
     let read = (|| -> Result<()> {
         let first = cursor.first_page();
@@ -7987,11 +7988,22 @@ fn query_rows(
     sql: &str,
     params: &HashMap<String, Value>,
 ) -> Result<contextdb_engine::QueryResult> {
-    let session = store
+    let session = projection_read_session(store, bounds)?;
+    session.execute(sql, params).map_err(map_engine_err)
+}
+
+fn projection_read_session(store: &Store, bounds: Bounds) -> Result<ReadSession> {
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    if let Some(clock) = PROJECTION_READ_CLOCK.with(|slot| slot.borrow().clone()) {
+        return store
+            .internal_db()
+            .read_session_with_clock_for_test(read_limits(store, bounds), clock)
+            .map_err(map_engine_err);
+    }
+    store
         .internal_db()
         .read_session(read_limits(store, bounds))
-        .map_err(map_engine_err)?;
-    session.execute(sql, params).map_err(map_engine_err)
+        .map_err(map_engine_err)
 }
 
 fn read_limits(store: &Store, bounds: Bounds) -> ReadLimits {

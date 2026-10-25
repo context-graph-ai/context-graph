@@ -105,7 +105,7 @@ const REQUEST_OBSERVER_ENV: &str = "CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER";
 fn request_observer(machine: &Machine, name: &str) -> std::path::PathBuf {
     let path = machine.root.join(name);
     std::fs::create_dir_all(&path).expect("create request observer directory");
-    std::fs::write(path.join("release"), b"do not pause a background worker\n")
+    event_support::write_test_file(path.join("release"), b"do not pause a background worker\n")
         .expect("pre-release the existing handoff barrier");
     path
 }
@@ -129,7 +129,7 @@ fn observed_request_caps(observer: &std::path::Path) -> Vec<usize> {
 fn batch_observer(machine: &Machine, name: &str) -> std::path::PathBuf {
     let path = machine.root.join(name);
     std::fs::create_dir_all(&path).expect("create batch observer directory");
-    std::fs::write(
+    event_support::write_test_file(
         path.join("observe-embedding-worker-batches"),
         b"observe and pause\n",
     )
@@ -195,7 +195,7 @@ fn terminate_observed_background_worker(observer: &std::path::Path) {
 fn write_config(machine: &Machine, body: &str) {
     let config_dir = machine.data_root.join("cg");
     std::fs::create_dir_all(&config_dir).expect("create cg config directory");
-    std::fs::write(config_dir.join("fabric.toml"), body).expect("write cg config");
+    event_support::write_test_file(config_dir.join("fabric.toml"), body).expect("write cg config");
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn deferred_import_never_creates_or_changes_the_active_worker_policy() {
     std::fs::create_dir_all(&config_dir).expect("create cg config directory");
     let config_path = config_dir.join("fabric.toml");
     let configured = "[search]\nembedding_workers = 1\n";
-    std::fs::write(&config_path, configured).expect("write saved worker cap");
+    event_support::write_test_file(&config_path, configured).expect("write saved worker cap");
 
     let imported = machine.run(
         &project,
@@ -249,7 +249,8 @@ fn deferred_import_never_creates_or_changes_the_active_worker_policy() {
     );
 
     let active = r#"{"publication":"active-fixture","embedding_workers":2}"#;
-    std::fs::write(&policy_path, active).expect("seed another build's active policy");
+    event_support::write_test_file(&policy_path, active)
+        .expect("seed another build's active policy");
     let deferred_again = machine.run(
         &project,
         &[
@@ -406,7 +407,29 @@ fn detached_background_import_delivers_default_cap_to_its_production_request_bui
         "background-default-request-session",
         &turns,
     );
-    let observer = batch_observer(&machine, "background-default-observer");
+    // macOS TMPDIR paths can already consume most of a Unix socket address.
+    let observation = tempfile::Builder::new()
+        .prefix("cgb")
+        .tempdir_in("/tmp")
+        .expect("short batch rendezvous directory");
+    let observer = observation.path().to_path_buf();
+    event_support::write_test_file(
+        observer.join("observe-embedding-worker-batches"),
+        b"observe",
+    )
+    .expect("opt into batch observation");
+    let batches = std::os::unix::net::UnixListener::bind(observer.join("batch-events.sock"))
+        .expect("bind batch rendezvous before spawning the worker");
+    let receive_batch = || {
+        use std::io::Read;
+        let (mut stream, _) = batches.accept().expect("batch callback connects");
+        let mut cap = [0; 8];
+        stream.read_exact(&mut cap).expect("batch cap is complete");
+        (
+            stream,
+            usize::try_from(u64::from_le_bytes(cap)).expect("cap fits"),
+        )
+    };
     let imported = machine.run_with_env(
         &project,
         &[
@@ -421,57 +444,34 @@ fn detached_background_import_delivers_default_cap_to_its_production_request_bui
         &observer,
     );
     assert_eq!(imported.code, 0, "{}", imported.describe());
-    let first = wait_for_state(
-        std::time::Duration::from_secs(10),
-        std::time::Duration::from_millis(20),
-        || {
-            let caps = observed_batch_caps(&observer);
-            Ok::<_, ()>((!caps.is_empty()).then_some(caps))
-        },
-    )
-    .expect("first batch observation cannot fail");
-    let (paused, later) = if first.is_some() {
-        let paused = wait_for_state(
-            std::time::Duration::from_secs(10),
-            std::time::Duration::from_millis(20),
-            || Ok::<_, ()>(observer.join("entered").exists().then_some(())),
-        )
-        .expect("batch pause observation cannot fail");
-        // Replace the execution choice while preserving the accepted request's selected
-        // frontiers and saved ceiling. A cap update is not a queue acknowledgement.
-        let mut replacement_policy = worker_policy(&machine.data_root);
-        replacement_policy["publication"] = "replacement".into();
-        replacement_policy["embedding_workers"] = replacement_embedding_workers.into();
-        let replacement =
-            write_event_search_worker_policy(&machine.data_root, &replacement_policy.to_string());
-        assert!(
-            replacement.is_ok(),
-            "replacement worker policy write failed: {replacement:?}"
-        );
-        std::fs::write(
-            observer.join("release"),
-            b"continue after policy replacement\n",
-        )
-        .expect("release owned background worker");
-        let later = wait_for_state(
-            std::time::Duration::from_secs(10),
-            std::time::Duration::from_millis(20),
-            || {
-                let caps = observed_batch_caps(&observer);
-                Ok::<_, ()>((caps.len() >= 2).then_some(caps))
-            },
-        )
-        .expect("later batch observation cannot fail");
-        (paused, later)
-    } else {
-        std::fs::write(
-            observer.join("release"),
-            b"release after missing callback\n",
-        )
-        .expect("release owned background worker after missing callback");
-        (None, None)
-    };
-    terminate_observed_background_worker(&observer);
+    struct StopObservedWorker<'a>(&'a std::path::Path);
+    impl Drop for StopObservedWorker<'_> {
+        fn drop(&mut self) {
+            terminate_observed_background_worker(self.0);
+        }
+    }
+
+    let (mut first_batch, first_cap) = receive_batch();
+    let stop_worker = StopObservedWorker(&observer);
+    assert_eq!(first_cap, initial_embedding_workers);
+    assert_eq!(
+        observed_batch_caps(&observer),
+        vec![initial_embedding_workers]
+    );
+
+    // A callback cannot proceed until this policy is durably replaced and the
+    // test releases it. The next callback announces the resolver's new choice.
+    let mut replacement_policy = worker_policy(&machine.data_root);
+    replacement_policy["publication"] = "replacement".into();
+    replacement_policy["embedding_workers"] = replacement_embedding_workers.into();
+    write_event_search_worker_policy(&machine.data_root, &replacement_policy.to_string())
+        .expect("replace worker policy while its first batch is held");
+    use std::io::Write;
+    first_batch.write_all(&[1]).expect("drive the next batch");
+    let (_held_second_batch, second_cap) = receive_batch();
+    assert_eq!(second_cap, replacement_embedding_workers);
+    let later = observed_batch_caps(&observer);
+    drop(stop_worker);
     machine.wait_for_search_worker_exit();
     assert_eq!(
         observed_request_caps(&observer),
@@ -479,21 +479,8 @@ fn detached_background_import_delivers_default_cap_to_its_production_request_bui
         "the detached worker request builder did not carry the available-CPU default"
     );
     assert_eq!(
-        first,
-        Some(vec![initial_embedding_workers]),
-        "the first detached-worker batch did not receive the available-CPU default"
-    );
-    assert_eq!(
-        paused,
-        Some(()),
-        "the first production batch callback did not pause before policy replacement"
-    );
-    assert_eq!(
         later,
-        Some(vec![
-            initial_embedding_workers,
-            replacement_embedding_workers
-        ]),
+        vec![initial_embedding_workers, replacement_embedding_workers],
         "the detached worker did not apply the replacement cap at its next batch boundary"
     );
 }
@@ -808,7 +795,8 @@ fn already_caught_up_import_does_not_change_an_active_worker_request() {
     assert_eq!(built.code, 0, "{}", built.describe());
     let policy_path = machine.data_root.join(EVENT_SEARCH_WORKER_POLICY);
     let active = r#"{"publication":"active-fixture","embedding_workers":2}"#;
-    std::fs::write(&policy_path, active).expect("seed another active worker request");
+    event_support::write_test_file(&policy_path, active)
+        .expect("seed another active worker request");
 
     let unchanged = machine.run(
         &project,
@@ -914,7 +902,7 @@ fn invalid_search_scope_flags_and_config_are_typed_and_refused_before_writes() {
     );
     let config_dir = machine.data_root.join("cg");
     std::fs::create_dir_all(&config_dir).expect("create cg config directory");
-    std::fs::write(
+    event_support::write_test_file(
         config_dir.join("fabric.toml"),
         "[search]\norder = \"sideways\"\nsessions = 10\n",
     )
@@ -955,7 +943,7 @@ fn invalid_configured_embedding_workers_are_refused_before_event_or_store_writes
         );
         let config_dir = machine.data_root.join("cg");
         std::fs::create_dir_all(&config_dir).expect("create cg config directory");
-        std::fs::write(config_dir.join("fabric.toml"), configured)
+        event_support::write_test_file(config_dir.join("fabric.toml"), configured)
             .expect("write invalid worker policy");
         let before = fingerprint(&machine.data_root);
 
@@ -1188,7 +1176,8 @@ mod request_write_ceilings {
             &[("B request selected before C exists", "B answer")],
         );
         let text = std::fs::read_to_string(&source).expect("B source");
-        std::fs::write(source, text.replace("2026-09-01", "2026-08-01")).expect("B precedes C");
+        event_support::write_test_file(source, text.replace("2026-09-01", "2026-08-01"))
+            .expect("B precedes C");
     }
 
     fn assert_selected_b_and_c_completed(
@@ -1326,8 +1315,11 @@ mod request_write_ceilings {
                     &[("accepted selection", "answer")],
                 );
                 let text = std::fs::read_to_string(&path).unwrap();
-                std::fs::write(path, text.replace("2026-09-01", &format!("2026-09-{day}")))
-                    .unwrap();
+                event_support::write_test_file(
+                    path,
+                    text.replace("2026-09-01", &format!("2026-09-{day}")),
+                )
+                .unwrap();
                 let imported =
                     import_selected(&machine, &project, "stale-selection", HIGH, "1", &observer);
                 assert_eq!(imported.code, 0, "{}", imported.describe());
@@ -1365,9 +1357,10 @@ mod request_write_ceilings {
             let mut selected_envelope: serde_json::Value =
                 serde_json::from_str(&envelope()).unwrap();
             selected_envelope["work_policy"] = accepted[0]["work_policy"].clone();
-            std::fs::write(observer.join("supersede-selected-session"), b"stale-A").unwrap();
+            event_support::write_test_file(observer.join("supersede-selected-session"), b"stale-A")
+                .unwrap();
             std::fs::remove_file(observer.join("release")).unwrap();
-            std::fs::write(observer.join("numbered-passes"), b"4").unwrap();
+            event_support::write_test_file(observer.join("numbered-passes"), b"4").unwrap();
             drop(held);
             let worker = machine.spawn_with_env(
                 &project,
@@ -1401,7 +1394,7 @@ mod request_write_ceilings {
                     assert_eq!(arrival.code, 0, "{}", arrival.describe());
                     assert_eq!(str_at(&arrival.json(), "/search/worker"), "already_running");
                 }
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join(format!("release.{pass}")),
                     b"continue bounded work",
                 )
@@ -1495,8 +1488,9 @@ mod request_write_ceilings {
             }
             write_event_search_worker_policy(&machine.data_root, &shared.to_string()).unwrap();
             std::fs::remove_file(observer.join("release")).unwrap();
-            std::fs::write(observer.join("numbered-passes"), b"2").unwrap();
-            std::fs::write(observer.join("refuse-aggregate-read"), b"refuse").unwrap();
+            event_support::write_test_file(observer.join("numbered-passes"), b"2").unwrap();
+            event_support::write_test_file(observer.join("refuse-aggregate-read"), b"refuse")
+                .unwrap();
             drop(held);
             let worker = machine.spawn_with_envs(
                 &project,
@@ -1504,7 +1498,8 @@ mod request_write_ceilings {
                 &[(REQUEST_OBSERVER_ENV, &observer)],
             );
             await_marker(&observer, "entered.1");
-            std::fs::write(observer.join("release.1"), b"second assessment").unwrap();
+            event_support::write_test_file(observer.join("release.1"), b"second assessment")
+                .unwrap();
             await_marker(&observer, "entered.2");
             let path = write_session(
                 &machine.history_root(),
@@ -1513,7 +1508,7 @@ mod request_write_ceilings {
                 &[("accepted at exhausted assessment", "served answer")],
             );
             let text = std::fs::read_to_string(&path).unwrap();
-            std::fs::write(path, text.replace("2026-09-01", "2026-09-02")).unwrap();
+            event_support::write_test_file(path, text.replace("2026-09-01", "2026-09-02")).unwrap();
             let arrival = import_selected(
                 &machine,
                 &project,
@@ -1530,7 +1525,8 @@ mod request_write_ceilings {
                 original["selected_work"]
             );
             std::fs::remove_file(observer.join("refuse-aggregate-read")).unwrap();
-            std::fs::write(observer.join("release.2"), b"serve new identity").unwrap();
+            event_support::write_test_file(observer.join("release.2"), b"serve new identity")
+                .unwrap();
             let output = worker.wait_with_output().unwrap();
             assert_eq!(output.status.code(), Some(1), "{output:?}");
             assert_eq!(
@@ -1587,7 +1583,7 @@ mod request_write_ceilings {
                 "sessionId": "opaque-selected", "cwd": project.display().to_string(),
                 "timestamp": "2026-09-02T09:00:00Z",
             });
-            std::fs::write(path, format!("{opaque}\n")).unwrap();
+            event_support::write_test_file(path, format!("{opaque}\n")).unwrap();
             let first = import_selected(
                 &machine,
                 &project,
@@ -1633,16 +1629,20 @@ mod request_write_ceilings {
             std::fs::remove_file(observer.join("actual-write-memory-batches")).ok();
             std::fs::remove_file(observer.join("release")).unwrap();
             std::fs::remove_file(observer.join("entered")).ok();
-            std::fs::write(observer.join("numbered-passes"), b"1").unwrap();
+            event_support::write_test_file(observer.join("numbered-passes"), b"1").unwrap();
             let assessment = machine.root.join("completion-read-assessment");
             std::fs::create_dir_all(&assessment).unwrap();
-            std::fs::write(
+            event_support::write_test_file(
                 assessment.join("pre-catch-up-release"),
                 b"initial read may run",
             )
             .unwrap();
             if completion_read {
-                std::fs::write(assessment.join("pause-after-work-assessment"), b"pause").unwrap();
+                event_support::write_test_file(
+                    assessment.join("pause-after-work-assessment"),
+                    b"pause",
+                )
+                .unwrap();
             } else {
                 let db = contextdb_engine::Database::open(machine.db_path()).unwrap();
                 db.execute(
@@ -1703,7 +1703,7 @@ mod request_write_ceilings {
                 )
                 .unwrap();
                 drop(db);
-                std::fs::write(
+                event_support::write_test_file(
                     assessment.join("work-assessment-release"),
                     b"read deleted header",
                 )
@@ -1731,7 +1731,7 @@ mod request_write_ceilings {
             );
             assert_eq!(arrival.code, 0, "{}", arrival.describe());
             assert_eq!(str_at(&arrival.json(), "/search/worker"), "already_running");
-            std::fs::write(observer.join("release.1"), b"serve arrival").unwrap();
+            event_support::write_test_file(observer.join("release.1"), b"serve arrival").unwrap();
             let output = worker.wait_with_output().unwrap();
             assert_eq!(output.status.code(), Some(1), "{output:?}");
             assert_eq!(
@@ -1787,10 +1787,11 @@ mod request_write_ceilings {
                         "sessionId": session, "cwd": project.display().to_string(),
                         "timestamp": format!("2026-09-{:02}T09:00:00Z", index + 1),
                     });
-                    std::fs::write(&path, format!("{opaque}\n")).unwrap();
+                    event_support::write_test_file(&path, format!("{opaque}\n")).unwrap();
                 } else {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    std::fs::write(&path, text.replace("2026-09-01", "2026-09-06")).unwrap();
+                    event_support::write_test_file(&path, text.replace("2026-09-01", "2026-09-06"))
+                        .unwrap();
                 }
                 let imported =
                     import_selected(&machine, &project, "distinct-no-text", HIGH, "1", &observer);
@@ -1904,7 +1905,7 @@ mod request_write_ceilings {
             let mut arrival_frontier = None;
             drop(held);
             if racing {
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join("pause-before-selection-cleanup"),
                     b"pause cleanup",
                 )
@@ -2017,19 +2018,14 @@ mod request_write_ceilings {
                     );
                     assert_selection_row_counts(&machine, 3, if same_context { 5 } else { 4 });
                 }
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join("release-selection-cleanup"),
                     b"serve the arrival",
                 )
                 .unwrap();
             }
             assert_eq!(
-                wait_for_state(Duration::from_secs(30), Duration::from_millis(20), || {
-                    worker
-                        .try_wait()
-                        .map(|status| status.map(|status| status.code()))
-                })
-                .unwrap(),
+                worker.wait().ok().map(|status| status.code()),
                 Some(Some(i32::from(cleanup_failure))),
                 "refused-only worker did not terminate: racing={racing}, cleanup_failure={cleanup_failure}, same_context={same_context}, policy={}, admissions={:?}, cleanup={:?}, projection_error={:?}",
                 worker_policy(&machine.data_root),
@@ -2241,12 +2237,23 @@ mod request_write_ceilings {
                     [0]
                 .clone();
             std::fs::remove_file(observer.join("release")).unwrap();
-            std::fs::write(observer.join("numbered-passes"), b"3").unwrap();
-            std::fs::write(observer.join("refuse-selected-coordination-count"), b"10").unwrap();
-            std::fs::write(observer.join("hold-writer-during-failure-record"), b"hold").unwrap();
+            event_support::write_test_file(observer.join("numbered-passes"), b"3").unwrap();
+            event_support::write_test_file(
+                observer.join("refuse-selected-coordination-count"),
+                b"10",
+            )
+            .unwrap();
+            event_support::write_test_file(
+                observer.join("hold-writer-during-failure-record"),
+                b"hold",
+            )
+            .unwrap();
             if competing_owner {
-                std::fs::write(observer.join("pause-before-failed-worker-relock"), b"pause")
-                    .unwrap();
+                event_support::write_test_file(
+                    observer.join("pause-before-failed-worker-relock"),
+                    b"pause",
+                )
+                .unwrap();
             }
             drop(held);
             let worker = machine.spawn_with_env(
@@ -2264,14 +2271,18 @@ mod request_write_ceilings {
                     ..Default::default()
                 })
                 .expect("external writer owns the failure reopen");
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join("failure-record-continue"),
                     b"refuse failure reopen",
                 )
                 .unwrap();
                 await_marker(&observer, "failure-record-returned");
                 drop(writer);
-                std::fs::write(observer.join("failure-writer-released"), b"released").unwrap();
+                event_support::write_test_file(
+                    observer.join("failure-writer-released"),
+                    b"released",
+                )
+                .unwrap();
                 await_marker(&observer, &format!("entered.{pass}"));
                 for marker in [
                     "failure-record-entered",
@@ -2287,7 +2298,11 @@ mod request_write_ceilings {
                     (10 - pass).to_string()
                 );
                 if pass < 3 {
-                    std::fs::write(observer.join(format!("release.{pass}")), b"retry").unwrap();
+                    event_support::write_test_file(
+                        observer.join(format!("release.{pass}")),
+                        b"retry",
+                    )
+                    .unwrap();
                 }
             }
             let other = if same_context {
@@ -2317,15 +2332,18 @@ mod request_write_ceilings {
             )
             .unwrap();
             std::fs::remove_file(observer.join("hold-writer-during-failure-record")).unwrap();
-            std::fs::write(observer.join("release.3"), b"serve arrival").unwrap();
+            event_support::write_test_file(observer.join("release.3"), b"serve arrival").unwrap();
             let competing_lock = competing_owner.then(|| {
                 await_marker(&observer, "failed-worker-relock-entered");
                 let held = acquire_worker_lock(&machine.data_root.join("event-search-worker.lock"))
                     .expect("competing worker owns the released lock");
                 let startup = machine.run(&project, &["__event-search-worker", &envelope()]);
                 assert_eq!(startup.code, 0, "{}", startup.describe());
-                std::fs::write(observer.join("release-failed-worker-relock"), b"lose lock")
-                    .unwrap();
+                event_support::write_test_file(
+                    observer.join("release-failed-worker-relock"),
+                    b"lose lock",
+                )
+                .unwrap();
                 held
             });
             let output = worker.wait_with_output().unwrap();
@@ -2566,7 +2584,7 @@ mod request_write_ceilings {
                 &[("independent physical selected frontier", "answer")],
             );
             let text = std::fs::read_to_string(&path).unwrap();
-            std::fs::write(path, text.replace("2026-09-01", "2026-09-02")).unwrap();
+            event_support::write_test_file(path, text.replace("2026-09-01", "2026-09-02")).unwrap();
             let independent = import_selected(
                 &machine,
                 &project,
@@ -2590,7 +2608,7 @@ mod request_write_ceilings {
                 requests[0]["memory_refusal"] = serde_json::json!({"Recorded": {"ordinal": 1, "refusal": {"requested_bytes": 42, "limit_bytes": LOW}}});
             }
             write_event_search_worker_policy(&machine.data_root, &accepted.to_string()).unwrap();
-            std::fs::write(
+            event_support::write_test_file(
                 observer.join("refuse-next-selected-memory"),
                 LOW.to_string(),
             )
@@ -2659,6 +2677,14 @@ mod request_write_ceilings {
 
     #[test]
     fn a_completed_newest_one_retry_clears_its_refusal_without_embedding_older_history() {
+        struct ReleaseBackgroundTurn(std::os::unix::net::UnixStream);
+        impl Drop for ReleaseBackgroundTurn {
+            fn drop(&mut self) {
+                use std::io::Write;
+                let _ = self.0.write_all(&[1]);
+            }
+        }
+
         for retired in [false, true] {
             let machine = Machine::with_nomic();
             let project = machine.project("newest-one-refusal");
@@ -2687,13 +2713,13 @@ mod request_write_ceilings {
                     [0]
                 .clone();
             assert_selection_row_counts(&machine, 1, 1);
-            std::fs::write(
+            event_support::write_test_file(
                 observer.join("refuse-next-selected-memory"),
                 LOW.to_string(),
             )
             .unwrap();
             if !retired {
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join("pause-before-selection-cleanup"),
                     b"retain frontier",
                 )
@@ -2723,24 +2749,60 @@ mod request_write_ceilings {
                 refused["pending_background_request"]["write_requests"][0]["selection_retired"],
                 retired
             );
-            let retry = machine.run(
-                &project,
-                &[
-                    "import",
-                    ".",
-                    "--context",
-                    "newest-one-refusal",
-                    "--search",
-                    "wait",
-                    "--search-sessions",
-                    "1",
-                    "--embedding-workers",
-                    "1",
-                    "--write-memory-limit-bytes",
-                    &HIGH.to_string(),
-                ],
-            );
+            // The retry may kick detached housekeeping. Hold that actor at its
+            // existing pre-catch-up seam while asserting the saved request, so
+            // selection retirement cannot race the policy snapshot.
+            let housekeeping_root = tempfile::Builder::new()
+                .prefix("cgh")
+                .tempdir_in("/tmp")
+                .expect("short housekeeping socket directory");
+            let barrier = housekeeping_root.path().to_path_buf();
+            let housekeeping = (!retired).then(|| {
+                std::os::unix::net::UnixListener::bind(barrier.join("pre-catch-up.sock"))
+                    .expect("bind housekeeping rendezvous")
+            });
+            let high = HIGH.to_string();
+            let arguments = [
+                "import",
+                ".",
+                "--context",
+                "newest-one-refusal",
+                "--search",
+                "wait",
+                "--search-sessions",
+                "1",
+                "--embedding-workers",
+                "1",
+                "--write-memory-limit-bytes",
+                &high,
+            ];
+            let retry = if retired {
+                machine.run(&project, &arguments)
+            } else {
+                machine.run_with_env(
+                    &project,
+                    &arguments,
+                    "CG_EVENT_SEARCH_TEST_PRE_CATCH_UP_BARRIER",
+                    &barrier,
+                )
+            };
             assert_eq!(retry.code, 0, "{}", retry.describe());
+            let mut release_background = housekeeping.map(|listener| {
+                let (mut turn, _) = listener.accept().expect("detached housekeeping arrived");
+                use std::io::Read;
+                let mut entered = [0];
+                turn.read_exact(&mut entered).unwrap();
+                assert_eq!(entered, [1], "worker holds its turn before cleanup");
+                // Hold only this turn. Later turns use the pre-released legacy
+                // checkpoint after the socket is unlinked; this connection stays held.
+                std::fs::remove_file(barrier.join("pre-catch-up.sock")).unwrap();
+                event_support::write_test_file(
+                    barrier.join("pre-catch-up-release"),
+                    b"later turns pass",
+                )
+                .unwrap();
+                ReleaseBackgroundTurn(turn)
+            });
             assert_eq!(
                 worker_policy(&machine.data_root)["pending_background_request"],
                 refused["pending_background_request"]
@@ -2764,7 +2826,8 @@ mod request_write_ceilings {
                     )],
                 );
                 let text = std::fs::read_to_string(&newer).unwrap();
-                std::fs::write(newer, text.replace("2026-09-01", "2026-10-01")).unwrap();
+                event_support::write_test_file(newer, text.replace("2026-09-01", "2026-10-01"))
+                    .unwrap();
                 let later = machine.run(
                     &project,
                     &[
@@ -2798,11 +2861,15 @@ mod request_write_ceilings {
                 appended["timestamp"] = "2026-09-02T09:00:00Z".into();
                 appended["message"]["content"] =
                     "deferred beyond the refused capture boundary".into();
-                std::fs::write(&source, format!("{contents}{appended}\n")).unwrap();
+                event_support::write_test_file(&source, format!("{contents}{appended}\n")).unwrap();
                 (4, 5)
             } else {
                 (2, 2)
             };
+            if let Some(release) = release_background.take() {
+                drop(release);
+                machine.wait_for_search_worker_exit();
+            }
             let acknowledged = import_selected(
                 &machine,
                 &project,
@@ -2892,7 +2959,7 @@ mod request_write_ceilings {
         assert_selection_row_counts(&machine, 1, 1);
         assert_completion_row_counts(&machine, 0, 0);
 
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("refuse-next-selected-memory"),
             LOW.to_string(),
         )
@@ -3084,13 +3151,13 @@ mod request_write_ceilings {
                     .unwrap()
             );
             drop(reader);
-            std::fs::write(
+            event_support::write_test_file(
                 observer.join("refuse-next-selected-memory"),
                 LOW.to_string(),
             )
             .unwrap();
             if !retired {
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join("pause-before-selection-cleanup"),
                     b"retain the accepted frontier",
                 )
@@ -3150,7 +3217,7 @@ mod request_write_ceilings {
             let suffix = std::fs::read(&history).unwrap();
             let mut appended = prefix.clone();
             appended.extend(suffix);
-            std::fs::write(&history, appended).unwrap();
+            event_support::write_test_file(&history, appended).unwrap();
             assert!(std::fs::read(&history).unwrap().starts_with(&prefix));
             let held = acquire_worker_lock(&machine.data_root.join("event-search-worker.lock"))
                 .expect("hold fresh narrow request admission");
@@ -3574,13 +3641,13 @@ mod request_write_ceilings {
                     [0]
                 .clone();
             assert_selection_row_counts(&machine, 1, 2);
-            std::fs::write(
+            event_support::write_test_file(
                 observer.join("refuse-next-selected-memory"),
                 LOW.to_string(),
             )
             .unwrap();
             if !retired {
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join("pause-before-selection-cleanup"),
                     b"retain the accepted frontier",
                 )
@@ -3821,7 +3888,7 @@ mod request_write_ceilings {
             );
             assert_eq!(accepted_b.code, 0, "{}", accepted_b.describe());
             std::fs::remove_file(observer_b.join("release")).unwrap();
-            std::fs::write(observer_b.join("numbered-passes"), b"1").unwrap();
+            event_support::write_test_file(observer_b.join("numbered-passes"), b"1").unwrap();
             drop(held);
             let mut worker_b = machine.spawn_with_env(
                 &project_b,
@@ -3902,7 +3969,11 @@ mod request_write_ceilings {
                 acquire_worker_lock(&machine.data_root.join("event-search-worker.lock")).is_err()
             );
             assert_selection_counts(&machine, 0);
-            std::fs::write(observer_b.join("release.1"), b"acknowledge B after unlock").unwrap();
+            event_support::write_test_file(
+                observer_b.join("release.1"),
+                b"acknowledge B after unlock",
+            )
+            .unwrap();
             let output = worker_b.wait_with_output().unwrap();
             assert!(output.status.success(), "{output:?}");
             assert_ready(&machine, &project_a, "acknowledgement-completed-a");
@@ -4095,7 +4166,7 @@ mod request_write_ceilings {
         write_event_search_worker_policy(&machine.data_root, &saved.to_string()).unwrap();
         let old = refuse_queue(&machine, LOW);
         let barrier = request_observer(&machine, "older-import");
-        std::fs::write(
+        event_support::write_test_file(
             barrier.join("pause-before-import-acknowledgement"),
             b"pause after assessment",
         )
@@ -4146,7 +4217,7 @@ mod request_write_ceilings {
             newer_token,
             old["pending_background_request"]["write_requests"][0]["token"]
         );
-        std::fs::write(
+        event_support::write_test_file(
             newer_observer.join("refuse-next-selected-memory"),
             LOW.to_string(),
         )
@@ -4175,7 +4246,7 @@ mod request_write_ceilings {
             newer["pending_background_request"]["write_requests"][0]["refused_memory"],
             true
         );
-        std::fs::write(
+        event_support::write_test_file(
             barrier.join("release-import-acknowledgement"),
             b"acknowledge only observed identities",
         )
@@ -4274,6 +4345,9 @@ mod request_write_ceilings {
         let ready = import(&machine, &old, "old-context", HIGH, &observer);
         assert_eq!(ready.code, 0, "{}", ready.describe());
         machine.wait_for_search_ready(&old, "old-context");
+        // The long worker lock is released before queue acknowledgement. The
+        // initial request must be gone before this case constructs its two new owners.
+        await_acknowledgement(&machine);
         machine.wait_for_search_worker_exit();
         std::fs::remove_file(observer.join("actual-write-memory-batches"))
             .expect("reset admissions");
@@ -4383,7 +4457,7 @@ mod request_write_ceilings {
             &[("D selected in the running request", "D answer")],
         );
         let d_prefix = std::fs::read_to_string(&d).expect("D source");
-        std::fs::write(&d, d_prefix.replace("2026-09-01", "2026-08-01"))
+        event_support::write_test_file(&d, d_prefix.replace("2026-09-01", "2026-08-01"))
             .expect("D follows B in newest order");
         std::fs::create_dir_all(&machine.data_root).expect("queue root");
         let held = acquire_worker_lock(&machine.data_root.join("event-search-worker.lock"))
@@ -4432,7 +4506,8 @@ mod request_write_ceilings {
         );
         let expanded = std::fs::read_to_string(&source).expect("B suffix");
         let suffix = expanded.lines().skip(2).collect::<Vec<_>>().join("\n");
-        std::fs::write(&source, format!("{prefix}{suffix}\n")).expect("append preserves B prefix");
+        event_support::write_test_file(&source, format!("{prefix}{suffix}\n"))
+            .expect("append preserves B prefix");
         let c = write_session(
             &machine.history_root(),
             &project,
@@ -4440,7 +4515,8 @@ mod request_write_ceilings {
             &[("newest C request", "C answer")],
         );
         let c_text = std::fs::read_to_string(&c).expect("C source");
-        std::fs::write(&c, c_text.replace("2026-09-01", "2026-09-02")).expect("C is newest");
+        event_support::write_test_file(&c, c_text.replace("2026-09-01", "2026-09-02"))
+            .expect("C is newest");
         write_config(
             &machine,
             "[search.passages]\ntarget_tokens = 8\nhard_tokens = 64\n",
@@ -4504,7 +4580,7 @@ mod request_write_ceilings {
             2,
         );
         drop(reader);
-        std::fs::write(barrier.join("release"), b"resume P1 publication")
+        event_support::write_test_file(barrier.join("release"), b"resume P1 publication")
             .expect("release embedding");
         let result = worker
             .wait_with_output()
@@ -4569,7 +4645,8 @@ mod request_write_ceilings {
             &[("retained earlier searchable history", "retained answer")],
         );
         let text = std::fs::read_to_string(&a).expect("A source");
-        std::fs::write(&a, text.replace("2026-09-01", "2026-07-01")).expect("A precedes B");
+        event_support::write_test_file(&a, text.replace("2026-09-01", "2026-07-01"))
+            .expect("A precedes B");
         let observer = request_observer(&machine, "retained-profile-observer");
         let imported = import(
             &machine,
@@ -4580,6 +4657,9 @@ mod request_write_ceilings {
         );
         assert_eq!(imported.code, 0, "{}", imported.describe());
         machine.wait_for_search_ready(&project, "retained-profile-selection");
+        // Ready coverage precedes the initial worker's queue acknowledgment.
+        // Retire that request before publishing a tail and replacing its profile.
+        await_acknowledgement(&machine);
         machine.wait_for_search_worker_exit();
         let original = std::fs::read_to_string(&a).expect("captured A prefix");
         write_session(
@@ -4593,7 +4673,7 @@ mod request_write_ceilings {
         );
         let expanded = std::fs::read_to_string(&a).expect("A appended source");
         let suffix = expanded.lines().skip(2).collect::<Vec<_>>().join("\n");
-        std::fs::write(
+        event_support::write_test_file(
             &a,
             format!("{original}{suffix}\n").replace("2026-09-01", "2026-07-01"),
         )
@@ -4736,7 +4816,8 @@ mod request_write_ceilings {
             &[("older unrelated request", "older answer")],
         );
         let text = std::fs::read_to_string(&a).expect("A source");
-        std::fs::write(a, text.replace("2026-09-01", "2026-07-01")).expect("A precedes B");
+        event_support::write_test_file(a, text.replace("2026-09-01", "2026-07-01"))
+            .expect("A precedes B");
         std::fs::create_dir_all(&machine.data_root).expect("queue root");
         let held = acquire_worker_lock(&machine.data_root.join("event-search-worker.lock"))
             .expect("hold claims");
@@ -4923,7 +5004,8 @@ mod request_write_ceilings {
         let original =
             worker_policy(&machine.data_root)["pending_background_request"]["write_requests"][0]
                 .clone();
-        std::fs::write(observer.join("refuse-selected-active-time-count"), b"10").unwrap();
+        event_support::write_test_file(observer.join("refuse-selected-active-time-count"), b"10")
+            .unwrap();
         drop(held);
         let refused = machine.run_with_env(
             &project,
@@ -5046,7 +5128,7 @@ mod request_write_ceilings {
                 "pause after saving the assessed identities",
             ),
         ] {
-            std::fs::write(observer.join(marker), content).unwrap();
+            event_support::write_test_file(observer.join(marker), content).unwrap();
         }
         drop(held);
         let worker = machine.spawn_with_env(
@@ -5080,7 +5162,7 @@ mod request_write_ceilings {
                 )
             })
             .collect::<Vec<_>>();
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("release-aggregate-active-time-refusal"),
             b"refuse observed statement",
         )
@@ -5105,7 +5187,7 @@ mod request_write_ceilings {
         }
         std::fs::remove_file(observer.join("pause-before-aggregate-active-time-refusal")).unwrap();
         std::fs::remove_file(observer.join("pause-after-read-timeout")).unwrap();
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("release-read-timeout-recovery"),
             b"continue remaining accepted work",
         )
@@ -5175,7 +5257,8 @@ mod request_write_ceilings {
                     &observer,
                 );
                 assert_eq!(accepted.code, 0, "{}", accepted.describe());
-                std::fs::write(observer.join(marker), failures.to_string()).unwrap();
+                event_support::write_test_file(observer.join(marker), failures.to_string())
+                    .unwrap();
                 drop(held);
                 let worker = machine.run_with_env(
                     &project,
@@ -5288,12 +5371,12 @@ mod request_write_ceilings {
             &observer,
         );
         assert_eq!(accepted.code, 0, "{}", accepted.describe());
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("refuse-active-time-after-committed-batch"),
             b"one typed refusal",
         )
         .expect("refuse after this request commits its first batch");
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("pause-after-read-timeout"),
             b"restart after committed progress",
         )
@@ -5376,19 +5459,22 @@ mod request_write_ceilings {
                 let project = machine.project("foreground-assessment-recovery");
                 capture_b(&machine, &project);
                 let observer = request_observer(&machine, "foreground-assessment-observer");
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join("refuse-foreground-assessment-active-time-count"),
                     failures.to_string(),
                 )
                 .unwrap();
-                std::fs::write(
+                event_support::write_test_file(
                     observer.join("foreground-assessment-refusal-after-runs"),
                     after_runs.to_string(),
                 )
                 .unwrap();
                 if after_runs == 1 {
-                    std::fs::write(observer.join("refuse-foreground-active-time-count"), b"1")
-                        .unwrap();
+                    event_support::write_test_file(
+                        observer.join("refuse-foreground-active-time-count"),
+                        b"1",
+                    )
+                    .unwrap();
                 }
                 let args = [
                     "import",
@@ -5541,7 +5627,7 @@ mod request_write_ceilings {
             &[("other request", "other answer")],
         );
         let observer = request_observer(&machine, "large-foreground-refusal-observer");
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("refuse-foreground-selection-active-time-count"),
             b"10",
         )
@@ -5591,7 +5677,7 @@ mod request_write_ceilings {
         ];
         let mut last_ordinal = other_refusal["ordinal"].as_u64().unwrap();
         for _ in 0..3 {
-            std::fs::write(
+            event_support::write_test_file(
                 observer.join("refuse-foreground-assessment-active-time-count"),
                 b"10",
             )
@@ -5678,7 +5764,7 @@ mod request_write_ceilings {
             &[("newer selected request", "newer answer")],
         );
         let observer = request_observer(&machine, "foreground-selection-observer");
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("refuse-foreground-selection-active-time-count"),
             b"10",
         )
@@ -5767,8 +5853,9 @@ mod request_write_ceilings {
         let project = machine.project("foreground-read-time-bound");
         capture_b(&machine, &project);
         let observer = request_observer(&machine, "foreground-read-time-bound-observer");
-        std::fs::write(observer.join("refuse-foreground-active-time-count"), b"10").unwrap();
-        std::fs::write(
+        event_support::write_test_file(observer.join("refuse-foreground-active-time-count"), b"10")
+            .unwrap();
+        event_support::write_test_file(
             observer.join("pause-after-foreground-read-timeout"),
             b"pause",
         )
@@ -5813,20 +5900,15 @@ mod request_write_ceilings {
             );
             assert_eq!(capture.code, 0, "{}", capture.describe());
             assert_eq!(u64_at(&capture.json(), "/search/covered_events"), 0);
-            std::fs::write(
+            event_support::write_test_file(
                 observer.join(format!("release-foreground-read-timeout-{remaining}")),
                 b"capture changed without coverage progress",
             )
             .unwrap();
         }
-        assert!(
-            wait_for_state(Duration::from_secs(30), Duration::from_millis(20), || {
-                foreground.try_wait().map(|status| status.map(|_| ()))
-            })
-            .expect("observe the bounded foreground exit")
-            .is_some(),
-            "foreground kept retrying after three refusals without coverage progress"
-        );
+        foreground
+            .wait()
+            .expect("bounded foreground exit after three refusals");
         let output = foreground
             .wait_with_output()
             .expect("foreground terminates at its bound");
@@ -5931,7 +6013,8 @@ mod request_write_ceilings {
             worker_policy(&machine.data_root)["pending_background_request"]["write_requests"][0]
                 .clone();
         assert_eq!(saved["read_timeout_covered_events"], 2);
-        std::fs::write(observer.join("refuse-selected-active-time-count"), b"10").unwrap();
+        event_support::write_test_file(observer.join("refuse-selected-active-time-count"), b"10")
+            .unwrap();
         drop(held);
         let refused = machine.run_with_env(
             &project,
@@ -5979,7 +6062,7 @@ mod request_write_ceilings {
         let observer = request_observer(&machine, "read-time-bound-observer");
         let accepted = import_selected(&machine, &project, "read-time-bound", LOW, "1", &observer);
         assert_eq!(accepted.code, 0, "{}", accepted.describe());
-        std::fs::write(observer.join("refuse-selected-active-time-count"), b"10")
+        event_support::write_test_file(observer.join("refuse-selected-active-time-count"), b"10")
             .expect("more refusals than allowance");
         drop(held);
         let worker = machine.run_with_env(
@@ -6053,8 +6136,9 @@ mod request_write_ceilings {
             worker_policy(&machine.data_root)["pending_background_request"]["write_requests"][0]
                 .clone();
         assert_eq!(accepted_request["read_active_time_ms"], 5000);
-        std::fs::write(observer.join("refuse-selected-active-time-count"), b"10").unwrap();
-        std::fs::write(
+        event_support::write_test_file(observer.join("refuse-selected-active-time-count"), b"10")
+            .unwrap();
+        event_support::write_test_file(
             observer.join("pause-after-read-timeout"),
             b"pause after durable recovery count",
         )
@@ -6171,7 +6255,7 @@ mod request_write_ceilings {
             &observer,
         );
         assert_eq!(accepted.code, 0, "{}", accepted.describe());
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("refuse-coordination-after-committed-batch"),
             b"one typed refusal",
         )
@@ -6248,7 +6332,7 @@ mod request_write_ceilings {
             &observer,
         );
         assert_eq!(accepted.code, 0, "{}", accepted.describe());
-        std::fs::write(observer.join("refuse-selected-coordination-count"), b"10")
+        event_support::write_test_file(observer.join("refuse-selected-coordination-count"), b"10")
             .expect("more refusals than allowance");
         drop(held);
         let worker = machine.run_with_env(
@@ -6331,9 +6415,13 @@ mod request_write_ceilings {
         );
         assert_eq!(later.code, 0, "{}", later.describe());
         std::fs::remove_file(observer.join("release")).expect("pause after refusal");
-        std::fs::write(observer.join("numbered-passes"), b"1").expect("observe first pass");
-        std::fs::write(observer.join("refuse-next-selected-work"), b"typed refusal")
-            .expect("refuse B once");
+        event_support::write_test_file(observer.join("numbered-passes"), b"1")
+            .expect("observe first pass");
+        event_support::write_test_file(
+            observer.join("refuse-next-selected-work"),
+            b"typed refusal",
+        )
+        .expect("refuse B once");
         drop(held);
         let worker = machine.spawn_with_env(
             &project,
@@ -6366,7 +6454,8 @@ mod request_write_ceilings {
             str_at(&status.json(), "/history/search/last_failure")
                 .contains("explicit test refusal")
         );
-        std::fs::write(observer.join("release.1"), b"serve C").expect("release worker");
+        event_support::write_test_file(observer.join("release.1"), b"serve C")
+            .expect("release worker");
         let output = worker.wait_with_output().expect("worker completes");
         assert!(output.status.success(), "{:?}", output);
         assert!(worker_policy(&machine.data_root)["pending_background_request"].is_null());
@@ -6504,7 +6593,8 @@ mod request_write_ceilings {
         );
         let expanded = std::fs::read_to_string(&source).expect("expanded source");
         let suffix = expanded.lines().skip(2).collect::<Vec<_>>().join("\n");
-        std::fs::write(&source, format!("{original}{suffix}\n")).expect("deferred append");
+        event_support::write_test_file(&source, format!("{original}{suffix}\n"))
+            .expect("deferred append");
         let deferred = machine.run(
             &project,
             &[
@@ -6704,7 +6794,7 @@ mod request_write_ceilings {
         );
         let expanded = std::fs::read_to_string(&growing).expect("expanded session");
         let suffix = expanded.lines().skip(2).collect::<Vec<_>>().join("\n");
-        std::fs::write(&growing, format!("{prefix}{suffix}\n"))
+        event_support::write_test_file(&growing, format!("{prefix}{suffix}\n"))
             .expect("append while preserving source prefix");
         let later = import_selected(
             &appended,
@@ -7045,7 +7135,8 @@ mod request_write_ceilings {
         // The active batch has a claim, but embedding retains no writable Store. A second
         // independent capture must still succeed before releasing the first batch.
         let second = import(&machine, &second_project, "second-budget", LOW, &observer);
-        std::fs::write(observer.join("release"), b"continue\n").expect("release active batch");
+        event_support::write_test_file(observer.join("release"), b"continue\n")
+            .expect("release active batch");
         await_acknowledgement(&machine);
         machine.wait_for_search_worker_exit();
         assert_eq!(second.code, 0, "{}", second.describe());
@@ -7082,7 +7173,7 @@ mod request_write_ceilings {
             &[("older request", "older answer")],
         );
         let old_source = std::fs::read_to_string(&old).expect("read old fixture");
-        std::fs::write(old, old_source.replace("2026-09-01", "2026-08-01"))
+        event_support::write_test_file(old, old_source.replace("2026-09-01", "2026-08-01"))
             .expect("order old session first");
         let middle = write_session(
             &scoped.history_root(),
@@ -7091,7 +7182,7 @@ mod request_write_ceilings {
             &[("middle request", "middle answer")],
         );
         let middle_source = std::fs::read_to_string(&middle).expect("read middle fixture");
-        std::fs::write(middle, middle_source.replace("2026-09-01", "2026-08-15"))
+        event_support::write_test_file(middle, middle_source.replace("2026-09-01", "2026-08-15"))
             .expect("keep exclusive work after the first claim");
         write_session(
             &scoped.history_root(),
@@ -7145,7 +7236,7 @@ mod request_write_ceilings {
             REQUEST_OBSERVER_ENV,
             &scope_observer,
         );
-        std::fs::write(scope_observer.join("release"), b"serve both selectors")
+        event_support::write_test_file(scope_observer.join("release"), b"serve both selectors")
             .expect("release scoped claims");
         await_acknowledgement(&scoped);
         scoped.wait_for_search_worker_exit();
@@ -7238,7 +7329,7 @@ mod request_write_ceilings {
         terminate_observed_background_worker(&orphan_pause);
         orphan.wait_for_search_worker_exit();
         let lease_wait = batch_observer(&orphan, "orphan-lease-wait");
-        std::fs::write(lease_wait.join("numbered-passes"), b"1")
+        event_support::write_test_file(lease_wait.join("numbered-passes"), b"1")
             .expect("observe the lease-only pass");
         let resumed = orphan.spawn_with_env(
             &orphan_project,
@@ -7270,7 +7361,7 @@ mod request_write_ceilings {
                 .expect("expire the orphan claim deterministically");
             assert_eq!(changed.rows_affected, 1);
         }
-        std::fs::write(lease_wait.join("release"), b"resume expired claim")
+        event_support::write_test_file(lease_wait.join("release"), b"resume expired claim")
             .expect("release replacement");
         let output = resumed.wait_with_output().expect("replacement completes");
         assert_eq!(
@@ -7294,9 +7385,9 @@ mod request_write_ceilings {
                 &[first_turn],
             );
             let observer = batch_observer(&machine, "shared-budget-pause");
-            std::fs::write(observer.join("numbered-passes"), b"2")
+            event_support::write_test_file(observer.join("numbered-passes"), b"2")
                 .expect("pause after completed pass");
-            std::fs::write(observer.join("release.1"), b"complete first batch\n")
+            event_support::write_test_file(observer.join("release.1"), b"complete first batch\n")
                 .expect("release first claim");
             let first = import(
                 &machine,
@@ -7319,7 +7410,7 @@ mod request_write_ceilings {
                 std::fs::read_to_string(&original).expect("read unchanged captured prefix");
             let suffix = std::fs::read_to_string(&additional).expect("read new source records");
             prefix.push_str(&suffix.replace("additional-session", "shared-session"));
-            std::fs::write(&original, prefix)
+            event_support::write_test_file(&original, prefix)
                 .expect("append without changing captured source identity");
             std::fs::remove_file(additional).expect("remove temporary source fixture");
             let second = import(&machine, &project, "shared-budget", next_limit, &observer);
@@ -7444,7 +7535,7 @@ mod request_write_ceilings {
         }
         write_event_search_worker_policy(&machine.data_root, &pending.to_string())
             .expect("deliver next request ceiling");
-        std::fs::write(
+        event_support::write_test_file(
             observer.join("release"),
             b"finish admitted batch and reopen\n",
         )
@@ -7509,7 +7600,7 @@ mod request_write_ceilings {
         let suffix = std::fs::read(&history).unwrap();
         let mut appended = prefix.clone();
         appended.extend(suffix);
-        std::fs::write(&history, &appended).unwrap();
+        event_support::write_test_file(&history, &appended).unwrap();
         assert!(std::fs::read(&history).unwrap().starts_with(&prefix));
         let retry_observer = request_observer(&machine, "affordable-retry");
         let resumed = import(

@@ -63,6 +63,15 @@ fn busy_statement(store_path: &std::path::Path, readers: [&ParkedReader; 2]) -> 
 
 #[test]
 fn a_command_refused_by_a_reader_held_store_names_the_readers_it_waits_on() {
+    // Detect a missing deterministic drive before parking readers or spending
+    // the production retry allowance. The product assertions below stay intact.
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(
+            cfg!(feature = "store-contention-test-support"),
+            "default reader fixture must compile its retry-allowance drive"
+        );
+    }
     let runtime = runtime_root();
     let data_root = seeded_data_root(runtime.path());
     let store_path = store_path_in(data_root.path());

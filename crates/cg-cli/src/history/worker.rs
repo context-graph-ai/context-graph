@@ -832,11 +832,13 @@ pub(crate) fn pause_before_import_acknowledgement() {
     {
         return;
     }
-    let _ = std::fs::write(
+    let _ = cg_node_fs::write_test_file_for_test(
         directory.join("import-assessment-complete"),
         b"writer released; refusal identities observed",
     );
-    wait_for_test_release(|| directory.join("release-import-acknowledgement").exists());
+    wait_for_test_release(directory, || {
+        directory.join("release-import-acknowledgement").exists()
+    });
 }
 
 fn record_background_memory_refusal(
@@ -1004,11 +1006,11 @@ fn retire_completed_selection(
         feature = "event-search-test-support"
     ))]
     if let Some(directory) = std::env::var_os("CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER") {
-        let _ = std::fs::write(
+        let _ = cg_node_fs::write_test_file_for_test(
             Path::new(&directory).join("cleanup-read-active-time-ms"),
             config.read_active_time_ms.get().to_string(),
         );
-        let _ = std::fs::write(
+        let _ = cg_node_fs::write_test_file_for_test(
             Path::new(&directory).join("cleanup-write-memory-limit"),
             cleanup_limit.get().to_string(),
         );
@@ -1188,11 +1190,13 @@ fn pause_before_selection_cleanup_for_test() {
     if !directory.join("pause-before-selection-cleanup").is_file() {
         return;
     }
-    let _ = std::fs::write(
+    let _ = cg_node_fs::write_test_file_for_test(
         directory.join("selection-cleanup-entered"),
         b"writer released",
     );
-    wait_for_test_release(|| directory.join("release-selection-cleanup").exists());
+    wait_for_test_release(directory, || {
+        directory.join("release-selection-cleanup").exists()
+    });
 }
 
 /// Acknowledge finished requests by identity, leaving later appends and unfinished leased work.
@@ -1272,10 +1276,13 @@ fn pause_after_catch_up_before_unlock() {
     });
     let release = directory.join("release");
     let numbered_release = directory.join(format!("release.{pass}"));
-    if std::fs::write(&entered, b"store closed; worker lock held\n").is_err() {
+    if cg_node_fs::write_test_file_for_test(&entered, b"store closed; worker lock held\n").is_err()
+    {
         return;
     }
-    wait_for_test_release(|| release.exists() || (numbered.is_some() && numbered_release.exists()));
+    wait_for_test_release(&directory, || {
+        release.exists() || (numbered.is_some() && numbered_release.exists())
+    });
 }
 
 /// Test-only rendezvous immediately before the worker asks the store for work. It lets the CLI
@@ -1293,12 +1300,17 @@ fn pause_before_catch_up() {
     if directory.join("pause-after-work-assessment").is_file() {
         return;
     }
-    let entered = directory.join("pre-catch-up-entered");
-    let release = directory.join("pre-catch-up-release");
-    if std::fs::write(&entered, b"worker lock held; work not yet assessed\n").is_err() {
+    if signal_and_wait_for_test(&directory, "pre-catch-up.sock", &[1]) {
         return;
     }
-    wait_for_test_release(|| release.exists());
+    let entered = directory.join("pre-catch-up-entered");
+    let release = directory.join("pre-catch-up-release");
+    if cg_node_fs::write_test_file_for_test(&entered, b"worker lock held; work not yet assessed\n")
+        .is_err()
+    {
+        return;
+    }
+    wait_for_test_release(&directory, || release.exists());
 }
 
 /// Test-only rendezvous after the worker has read its queue but before it opens the store for the
@@ -1316,7 +1328,7 @@ fn pause_after_work_assessment() {
     if !directory.join("pause-after-work-assessment").is_file() {
         return;
     }
-    if std::fs::write(
+    if cg_node_fs::write_test_file_for_test(
         directory.join("work-assessment-complete"),
         b"pending work assessed; projection not opened\n",
     )
@@ -1324,7 +1336,9 @@ fn pause_after_work_assessment() {
     {
         return;
     }
-    wait_for_test_release(|| directory.join("work-assessment-release").exists());
+    wait_for_test_release(&directory, || {
+        directory.join("work-assessment-release").exists()
+    });
 }
 
 /// Test-only rendezvous after foreground handoff owns or delivers every queued request, while the
@@ -1341,7 +1355,7 @@ fn pause_after_foreground_handoff_before_refresh() {
     if !directory.join("pause-after-foreground-handoff").is_file() {
         return;
     }
-    if std::fs::write(
+    if cg_node_fs::write_test_file_for_test(
         directory.join("foreground-handoff-complete"),
         b"queued handoff settled; final status not read\n",
     )
@@ -1349,12 +1363,18 @@ fn pause_after_foreground_handoff_before_refresh() {
     {
         return;
     }
-    wait_for_test_release(|| directory.join("release-final-status").exists());
+    wait_for_test_release(&directory, || {
+        directory.join("release-final-status").exists()
+    });
 }
 
 /// Use the core's existing thread-local allowance override only in a private-feature binary.
 /// Production builds neither compile nor inspect this test marker.
-#[cfg(feature = "event-search-test-support")]
+#[cfg(any(
+    feature = "event-search-test-support",
+    feature = "store-contention-test-support"
+))]
+#[doc(hidden)]
 pub(crate) fn apply_store_open_retry_allowance_for_test() {
     let Some(directory) = std::env::var_os("CG_EVENT_SEARCH_TEST_PRE_CATCH_UP_BARRIER") else {
         return;
@@ -1367,16 +1387,36 @@ pub(crate) fn apply_store_open_retry_allowance_for_test() {
     }
 }
 
+/// An opted-in test drives this background turn through a synchronous signal.
 #[cfg(any(
     context_graph_internal_test_support,
     feature = "event-search-test-support"
 ))]
-fn wait_for_test_release(mut released: impl FnMut() -> bool) {
-    // This is a test-only cross-process condition handshake. The integration harness owns the
-    // bounded test timeout; no local polling clock may disguise a synchronization timeout.
-    while !released() {
-        std::thread::park_timeout(Duration::from_millis(10));
+#[doc(hidden)]
+fn signal_and_wait_for_test(directory: &Path, socket_name: &str, payload: &[u8]) -> bool {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let socket = directory.join(socket_name);
+    if !socket.exists() {
+        return false;
     }
+    let mut stream = UnixStream::connect(socket).expect("connect test rendezvous");
+    stream.write_all(payload).expect("announce test checkpoint");
+    let mut release = [0];
+    stream
+        .read_exact(&mut release)
+        .expect("release test checkpoint");
+    assert_eq!(release, [1]);
+    true
+}
+
+#[cfg(any(
+    context_graph_internal_test_support,
+    feature = "event-search-test-support"
+))]
+fn wait_for_test_release(directory: impl AsRef<std::ffi::OsStr>, released: impl FnMut() -> bool) {
+    cg_node_fs::wait_for_test_release_for_test(Path::new(directory.as_ref()), released);
 }
 
 /// Pause before asking a transient condition again, without letting repeated rechecks spin a CPU.
@@ -1446,7 +1486,7 @@ fn run_request(
         feature = "event-search-test-support"
     ))]
     if let Some(directory) = std::env::var_os("CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER") {
-        let _ = std::fs::write(
+        let _ = cg_node_fs::write_test_file_for_test(
             std::path::PathBuf::from(directory).join("worker-store-write-memory-limit-bytes"),
             request.store.write_memory_limit_bytes.get().to_string(),
         );
@@ -1514,7 +1554,7 @@ fn run_observed_with_embedding_worker_policy(
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .filter(|count| *count > 0)
             {
-                let _ = std::fs::write(&marker, (count - 1).to_string());
+                let _ = cg_node_fs::write_test_file_for_test(&marker, (count - 1).to_string());
                 context_graph::test_support::fail_next_event_search_membership_capture_with_error_for_test(
                     CgError::ReadActiveTimeExceeded { limit_ms: request.store.read_active_time_ms.get() },
                 );
@@ -1527,7 +1567,7 @@ fn run_observed_with_embedding_worker_policy(
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .filter(|count| *count > 0)
             {
-                let _ = std::fs::write(&marker, (count - 1).to_string());
+                let _ = cg_node_fs::write_test_file_for_test(&marker, (count - 1).to_string());
                 context_graph::test_support::fail_next_event_search_membership_capture_with_error_for_test(
                     CgError::ReaderCoordinationUnavailable {
                         operation: "prepare selected search work".into(),
@@ -1577,11 +1617,13 @@ fn run_observed_with_embedding_worker_policy(
     if let Some(directory) = failure_record_barrier.clone() {
         context_graph::test_support::set_store_open_retry_allowance_for_test(Some(Duration::ZERO));
         context_graph::test_support::before_next_event_search_failure_record_for_test(move || {
-            let _ = std::fs::write(
+            let _ = cg_node_fs::write_test_file_for_test(
                 directory.join("failure-record-entered"),
                 b"runner store closed",
             );
-            wait_for_test_release(|| directory.join("failure-record-continue").is_file());
+            wait_for_test_release(&directory, || {
+                directory.join("failure-record-continue").is_file()
+            });
         });
     }
     let observed =
@@ -1737,7 +1779,7 @@ fn run_observed_with_embedding_worker_policy(
     if let Err(error) = &observed.result
         && let Some(directory) = std::env::var_os("CG_EVENT_SEARCH_TEST_HANDOFF_BARRIER")
     {
-        let _ = std::fs::write(
+        let _ = cg_node_fs::write_test_file_for_test(
             Path::new(&directory).join("projection-error"),
             format!("{error:?}"),
         );
@@ -1748,11 +1790,13 @@ fn run_observed_with_embedding_worker_policy(
     ))]
     if let Some(directory) = failure_record_barrier {
         context_graph::test_support::set_store_open_retry_allowance_for_test(None);
-        let _ = std::fs::write(
+        let _ = cg_node_fs::write_test_file_for_test(
             directory.join("failure-record-returned"),
             b"core disposition returned",
         );
-        wait_for_test_release(|| directory.join("failure-writer-released").is_file());
+        wait_for_test_release(&directory, || {
+            directory.join("failure-writer-released").is_file()
+        });
     }
     (observed, admitted.into_inner())
 }
@@ -1783,7 +1827,7 @@ fn observe_write_memory_limit_for_test(context_id: ContextId, limit: NonZeroUsiz
         return;
     };
     let directory = Path::new(&directory);
-    let _ = std::fs::write(
+    let _ = cg_node_fs::write_test_file_for_test(
         directory.join("worker-store-write-memory-limit-bytes"),
         limit.get().to_string(),
     );
@@ -1818,7 +1862,7 @@ fn run_observed_with_fixed_embedding_workers(
                 .parse::<usize>()
                 .ok()
                 .filter(|count| *count > 0)?;
-            std::fs::write(marker, (count - 1).to_string()).ok()?;
+            cg_node_fs::write_test_file_for_test(marker, (count - 1).to_string()).ok()?;
             context_graph::test_support::fail_next_event_search_membership_capture_with_error_for_test(
                 CgError::ReadActiveTimeExceeded { limit_ms: request.store.read_active_time_ms.get() },
             );
@@ -1851,11 +1895,11 @@ fn run_observed_with_fixed_embedding_workers(
             .join("pause-after-foreground-read-timeout")
             .is_file()
     {
-        let _ = std::fs::write(
+        let _ = cg_node_fs::write_test_file_for_test(
             directory.join(format!("foreground-read-timeout-{count}")),
             b"runner released its store",
         );
-        wait_for_test_release(|| {
+        wait_for_test_release(&directory, || {
             directory
                 .join(format!("release-foreground-read-timeout-{count}"))
                 .is_file()
@@ -1911,6 +1955,13 @@ fn observe_embedding_workers_batch_for_test(root: &Path, embedding_workers: NonZ
         let _ = writeln!(file, "{}", embedding_workers.get());
     }
     let _ = root;
+    if signal_and_wait_for_test(
+        directory,
+        "batch-events.sock",
+        &(embedding_workers.get() as u64).to_le_bytes(),
+    ) {
+        return;
+    }
     pause_after_catch_up_before_unlock();
 }
 
@@ -1926,7 +1977,7 @@ fn observe_background_worker_process_group_for_test(process_group: u32) {
     };
     let directory = Path::new(&directory);
     if directory.join("observe-embedding-worker-batches").is_file() {
-        let _ = std::fs::write(
+        let _ = cg_node_fs::write_test_file_for_test(
             directory.join("embedding-worker-process-group"),
             process_group.to_string(),
         );
@@ -2008,17 +2059,17 @@ fn pending_once(
                 .join("pause-before-aggregate-active-time-refusal")
                 .is_file()
             {
-                let _ = std::fs::write(
+                let _ = cg_node_fs::write_test_file_for_test(
                     Path::new(&directory).join("aggregate-active-time-refusal-entered"),
                     b"observed accepted identities",
                 );
-                wait_for_test_release(|| {
+                wait_for_test_release(&directory, || {
                     Path::new(&directory)
                         .join("release-aggregate-active-time-refusal")
                         .is_file()
                 });
             }
-            let _ = std::fs::write(&marker, (count - 1).to_string());
+            let _ = cg_node_fs::write_test_file_for_test(&marker, (count - 1).to_string());
             return Err(CgError::ReadActiveTimeExceeded {
                 limit_ms: active_time_ms.get(),
             });
@@ -2514,7 +2565,8 @@ fn catch_up(
                         .and_then(|value| value.trim().parse::<usize>().ok())
                         .filter(|count| *count > 0)
                     {
-                        let _ = std::fs::write(&marker, (count - 1).to_string());
+                        let _ =
+                            cg_node_fs::write_test_file_for_test(&marker, (count - 1).to_string());
                         return Err(CgError::ReadActiveTimeExceeded {
                             limit_ms: request.read_active_time_ms.get(),
                         });
@@ -2885,11 +2937,13 @@ fn pause_after_read_timeout_for_test(root: &Path) {
     };
     let directory = PathBuf::from(directory);
     if directory.join("pause-after-read-timeout").is_file() {
-        let _ = std::fs::write(
+        let _ = cg_node_fs::write_test_file_for_test(
             directory.join("read-timeout-recovery-entered"),
             db_path(root).as_os_str().as_encoded_bytes(),
         );
-        wait_for_test_release(|| directory.join("release-read-timeout-recovery").is_file());
+        wait_for_test_release(&directory, || {
+            directory.join("release-read-timeout-recovery").is_file()
+        });
     }
 }
 
@@ -3121,8 +3175,13 @@ pub(crate) fn handle_event_search_worker(
                 .join("pause-before-failed-worker-relock")
                 .is_file()
             {
-                let _ = std::fs::write(directory.join("failed-worker-relock-entered"), b"unlocked");
-                wait_for_test_release(|| directory.join("release-failed-worker-relock").is_file());
+                let _ = cg_node_fs::write_test_file_for_test(
+                    directory.join("failed-worker-relock-entered"),
+                    b"unlocked",
+                );
+                wait_for_test_release(&directory, || {
+                    directory.join("release-failed-worker-relock").is_file()
+                });
             }
         }
         let held = if retry_worker_lock {
@@ -3429,7 +3488,7 @@ fn requested_foreground_selection(
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|count| *count > 0)
         {
-            let _ = std::fs::write(marker, (count - 1).to_string());
+            let _ = cg_node_fs::write_test_file_for_test(marker, (count - 1).to_string());
             return Err(CgError::ReadActiveTimeExceeded {
                 limit_ms: crate::read_config::active_time_in_force().get(),
             });
@@ -3468,7 +3527,7 @@ fn requested_foreground_work(
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .filter(|count| *count > 0)
         {
-            let _ = std::fs::write(marker, (count - 1).to_string());
+            let _ = cg_node_fs::write_test_file_for_test(marker, (count - 1).to_string());
             return Err(CgError::ReadActiveTimeExceeded {
                 limit_ms: crate::read_config::active_time_in_force().get(),
             });

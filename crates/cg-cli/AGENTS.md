@@ -48,6 +48,12 @@ Ownership boundaries above are review-only architectural constraints unless a gu
 - Presented help is the public command list; guard
   `tests/help_presents_exactly_the_public_command_list.rs`: `help_presents_exactly_the_public_command_list`.
 
+Worker fixtures use feature-gated Unix socket notifications in `tests/event_support/mod.rs`
+and explicit release events from `cg-node-fs`. Always reread authoritative request state after
+a notification. Worker-lock release precedes queue acknowledgment: await acknowledgment before
+asserting queue membership. The reader-held-store refusal test enables the existing zero-allowance
+test seam through development dependencies; ordinary CLI builds retain their configured allowance.
+
 Fast check: `cargo test -p context-graph-cli --test read_memory_policy`.
 Lifecycle proofs: `cargo nextest run -p context-graph-cli --features event-search-test-support`.
 Full gate: `scripts/gate.sh`; public operator contracts: [CLI reference](../../docs/cli.md).

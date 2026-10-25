@@ -120,9 +120,6 @@ fn forget_keeps_the_reader_coordination_condition_when_erasure_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
-    use std::time::Duration;
-
-    use event_support::wait_for_state;
 
     struct RestoreDirectory(std::path::PathBuf);
     impl Drop for RestoreDirectory {
@@ -133,8 +130,14 @@ fn forget_keeps_the_reader_coordination_condition_when_erasure_is_refused() {
 
     let machine = Machine::without_model();
     let project = machine.project("coordination");
-    let runtime = machine.root.join("runtime");
-    fs::create_dir(&runtime).expect("create isolated coordination root");
+    // The owner channel binds a Unix socket below this directory, and a socket address holds only
+    // about a hundred bytes, so the directory sits under `/tmp` rather than below the long
+    // per-user temporary directory macOS hands out.
+    let runtime_root = tempfile::Builder::new()
+        .prefix("cgr")
+        .tempdir_in("/tmp")
+        .expect("a coordination root short enough for local channel addresses");
+    let runtime = runtime_root.path().to_path_buf();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
         .expect("make coordination root private");
     write_session(
@@ -169,7 +172,7 @@ fn forget_keeps_the_reader_coordination_condition_when_erasure_is_refused() {
 
     let socket = machine.root.join("before-purge.sock");
     let listener = UnixListener::bind(&socket).expect("bind forget barrier");
-    listener.set_nonblocking(true).expect("nonblocking barrier");
+    listener.set_nonblocking(false).expect("blocking barrier");
     let mut child = Command::new(env!("CARGO_BIN_EXE_cg"))
         .args([
             "forget",
@@ -190,16 +193,9 @@ fn forget_keeps_the_reader_coordination_condition_when_erasure_is_refused() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("run forget command");
-    let reached =
-        wait_for_state(
-            Duration::from_secs(10),
-            Duration::from_millis(20),
-            || match listener.accept() {
-                Ok((stream, _)) => Ok::<_, std::io::Error>(Some(stream)),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-                Err(error) => Err(error),
-            },
-        )
+    let reached = listener
+        .accept()
+        .map(|(stream, _)| Some(stream))
         .expect("accept forget barrier");
     let Some(mut stream) = reached else {
         let _ = child.kill();

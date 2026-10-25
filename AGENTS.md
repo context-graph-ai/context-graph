@@ -115,3 +115,10 @@ Performance measurement is manual and lives only in
 
 The guarding tests and local seams are named in each crate's `AGENTS.md`.
 Fast iteration uses the owning guide's command; the full contributor gate remains binding before a done claim.
+
+Tests synchronize on state, counters, or explicit events; never sleep or assert elapsed time.
+Consume `contextdb_core::Wallclock::test_clock_guard` for clock control, and drive background
+work synchronously when its thread cannot see that guard. Lower each removed site's allowance
+in `crates/context-graph/tests/fixtures/test_estate_baseline.toml`;
+`no_new_sleep_or_raw_clock_sites_beyond_the_frozen_baseline` in
+`crates/context-graph/tests/test_estate_audit.rs` rejects new sleep/raw-clock sites and stale allowances.

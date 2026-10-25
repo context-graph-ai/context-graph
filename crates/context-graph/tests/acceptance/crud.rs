@@ -1936,7 +1936,22 @@ fn observation_immutable_mutation_rejected() {
 // Use case: an ingest-pipeline refactor tries to rewrite a Digest's summary; the engine refuses any mutation because every Intention and Decision extracted from that Digest carries a provenance edge back to its bytes.
 #[test]
 fn digest_immutable_no_update_symbol() {
-    trybuild::TestCases::new().compile_fail("tests/ui/no_update_digest.rs");
+    // Proves the public API has no `update_digest` on `Store`. The path `Store::update_digest`
+    // resolves to a public inherent item before any trait item, so it reaches this fallback
+    // constant only while no public inherent `update_digest` exists. Any public inherent
+    // function of that name, generic or not, with or without a receiver, is a function item
+    // that never has this test-private type, and any public inherent constant of that name
+    // has a type this test does not export; either way this binary stops compiling. Private
+    // and `pub(crate)` items are invisible here and are not part of this claim;
+    // `tests/compile_fail.rs` still compiles `tests/ui/no_update_digest.rs` against its
+    // expected diagnostic.
+    struct NoUpdateDigest;
+    #[allow(non_upper_case_globals)]
+    trait UpdateDigestFallback {
+        const update_digest: NoUpdateDigest = NoUpdateDigest;
+    }
+    impl<T> UpdateDigestFallback for T {}
+    let _: NoUpdateDigest = Store::update_digest;
 
     let (_tempdir, db_path, store) = fixture();
     let ctx = ok!(

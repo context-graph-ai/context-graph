@@ -14,6 +14,8 @@ edition = "2024"
 
 [features]
 default = []
+# Private fixture controls, enabled only by this crate's own dev dependency.
+test-support = []
 embeddinggemma-test-support = []
 
 [lib]
@@ -41,6 +43,7 @@ uuid = { workspace = true, features = ["serde", "v4", "v7"] }
 which.workspace = true
 
 [dev-dependencies]
+cg-catalog = { path = ".", features = ["test-support"] }
 candle-embeddinggemma.workspace = true
 chrono.workspace = true
 contextdb-core.workspace = true

@@ -16,7 +16,7 @@ event identity, SQL, or embedding. This crate consumes no ContextDB read route o
 | Latest request replacement | `read_event_search_worker_policy`, `write_event_search_worker_policy` |
 | Published request size ceiling | `EVENT_SEARCH_WORKER_POLICY_MAX_BYTES`; callers reserve space before publication |
 | Serialized request update | `acquire_event_search_worker_policy_update` |
-| Installed/container memory discovery | `machine_memory`; `context_graph::write_budget` chooses the budget |
+| Installed/container memory discovery | `machine_memory` reads installed memory from `/proc/meminfo` on Linux and `sysctl hw.memsize` on macOS, plus any container allowance; `context_graph::write_budget` chooses the budget |
 
 ## Invariants and guards
 
@@ -30,11 +30,18 @@ Ownership boundaries above are review-only architectural constraints unless a gu
 | Requests over 4 KiB are refused without replacing the last valid value. | `crates/cg-node-fs/tests/event_search_worker_policy.rs::policy_record_refuses_more_than_four_kibibytes_without_replacing_the_last_value` |
 | The update guard reads and replaces one bounded record. | `crates/cg-node-fs/tests/event_search_worker_policy.rs::update_guard_reads_and_replaces_one_bounded_record` |
 | Given host and container memory facts, the core budget consumer sizes from the smaller container allowance. | `crates/context-graph/src/write_budget.rs::a_container_on_a_large_host_is_sized_from_the_container_not_the_host` |
+| On Linux and macOS the live probe reports this machine's installed memory, and the budget origin names what was read. | `crates/context-graph/src/write_budget.rs::the_live_probe_reads_this_machine_and_the_origin_names_what_it_read` |
 
 ## Review-only authoring rule
 
 When changing the serialized request-update flow, release its guard before opening a store,
 embedding, starting a process, or acquiring the worker lock. This ordering is an architectural
 code-review constraint; no automated test currently proves it.
+
+Test-only coordination belongs beside these filesystem operations: `test-support` (or the
+internal test cfg) enables marker notifications, explicit release waits, and
+`wait_for_worker_lock_for_test`. The blocking OS lock wait also observes release after a killed
+child. Notifications only wake an observer to reread real state; they do not acknowledge a request
+or establish that its queue entry is gone. Keep these helpers hidden and feature-gated.
 
 Fast check: `cargo test -p cg-node-fs`. Full gate: `scripts/gate.sh` at repository root.

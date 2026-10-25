@@ -257,12 +257,63 @@ pub fn estimate_capture(
     }
 }
 
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+thread_local! {
+    static CAPTURE_PROGRESS_TEST_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn capture_with_progress_observer(
     store: &Store,
     request: CaptureRequest,
     extractor: &dyn ConversationExtractor,
     chunk_window: usize,
+    observer: impl FnMut(CaptureProgressEvent),
+) -> Result<CaptureReport> {
+    capture_with_progress_elapsed(store, request, extractor, chunk_window, observer, || {
+        let started = Instant::now();
+        #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+        let canonical_start = CAPTURE_PROGRESS_TEST_CLOCK
+            .with(|enabled| enabled.get().then(|| contextdb_core::Wallclock::now().0));
+        move || {
+            #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+            if let Some(start) = canonical_start {
+                return Duration::from_millis(
+                    contextdb_core::Wallclock::now().0.saturating_sub(start),
+                );
+            }
+            started.elapsed()
+        }
+    })
+}
+
+/// Synchronous drive of progress timing using the substrate's canonical thread-local clock.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn capture_with_progress_observer_for_test(
+    store: &Store,
+    request: CaptureRequest,
+    extractor: &dyn ConversationExtractor,
+    chunk_window: usize,
+    observer: impl FnMut(CaptureProgressEvent),
+) -> Result<CaptureReport> {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CAPTURE_PROGRESS_TEST_CLOCK.with(|enabled| enabled.set(self.0));
+        }
+    }
+    let _reset = Reset(CAPTURE_PROGRESS_TEST_CLOCK.with(|enabled| enabled.replace(true)));
+    // Exercise the public operation, including its input handling and observer delivery.
+    capture_with_progress_observer(store, request, extractor, chunk_window, observer)
+}
+
+fn capture_with_progress_elapsed<C: Fn() -> Duration>(
+    store: &Store,
+    request: CaptureRequest,
+    extractor: &dyn ConversationExtractor,
+    chunk_window: usize,
     mut observer: impl FnMut(CaptureProgressEvent),
+    start_clock: impl FnOnce() -> C,
 ) -> Result<CaptureReport> {
     let text = request.transcript.as_str();
     if text.trim().is_empty() {
@@ -270,19 +321,19 @@ pub fn capture_with_progress_observer(
     }
     let chunks = transcript_chunks(text, chunk_window);
     let total_chunks = chunks.len();
-    let started = Instant::now();
+    let elapsed = start_clock();
     if total_chunks == 1 {
         observer(progress_event(
             1,
             total_chunks,
-            started.elapsed(),
+            elapsed(),
             ProgressKind::InFlight,
         ));
         let mut report = record_conversation_with_extractor(store, request, extractor)?;
         observer(progress_event(
             1,
             total_chunks,
-            started.elapsed(),
+            elapsed(),
             ProgressKind::Completed,
         ));
         report.resolved_chunk_window = Some(chunk_window.max(1));
@@ -292,11 +343,11 @@ pub fn capture_with_progress_observer(
     let mut per_chunk_usage: Vec<ModelCallUsage> = Vec::new();
     for (index, chunk) in chunks.iter().enumerate() {
         let chunk_index = index + 1;
-        let chunk_started = Instant::now();
+        let chunk_started = elapsed();
         observer(progress_event(
             chunk_index,
             total_chunks,
-            started.elapsed(),
+            elapsed(),
             ProgressKind::InFlight,
         ));
         let harvest = extractor.extract(ExtractionRequest {
@@ -304,7 +355,7 @@ pub fn capture_with_progress_observer(
             transcript: chunk,
             prior_decisions: &[],
         })?;
-        let chunk_elapsed = chunk_started.elapsed();
+        let chunk_elapsed = elapsed().saturating_sub(chunk_started);
         // Drain the extractor's usage records immediately after each chunk.
         // The extractor's internal chunk_index counter resets on each drain,
         // so we assign the authoritative chunk_index from the loop variable.
@@ -333,7 +384,7 @@ pub fn capture_with_progress_observer(
         observer(progress_event(
             chunk_index,
             total_chunks,
-            started.elapsed(),
+            elapsed(),
             ProgressKind::Completed,
         ));
     }

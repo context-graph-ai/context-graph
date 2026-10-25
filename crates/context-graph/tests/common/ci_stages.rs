@@ -22,7 +22,7 @@ pub fn routes_are_executable(script: &str) -> bool {
     let lines = active_lines(script);
     let required = [
         "set -euo pipefail",
-        "shard-union|shard-union-linux|shard-union-macos|shard-union-linux-isolated) run_stage \"$stage\" shard_union ;;",
+        "shard-union|shard-union-linux|shard-union-macos|shard-union-linux-isolated|shard-union-macos-isolated) run_stage \"$stage\" shard_union ;;",
         "trace_stage \"$2\" | tee \"$receipt_output\"",
         "source|lint|docs) run_stage \"$stage\" \"$stage\" ;;",
         "run_stage \"$stage\" \"$stage\" ;;",
@@ -152,7 +152,8 @@ pub fn effective(workflow: &mut Value, script: &str) {
                 "bash scripts/gate.sh shard-union"
                 | "bash scripts/gate.sh shard-union-linux"
                 | "bash scripts/gate.sh shard-union-macos"
-                | "bash scripts/gate.sh shard-union-linux-isolated" => &["shard_union"],
+                | "bash scripts/gate.sh shard-union-linux-isolated"
+                | "bash scripts/gate.sh shard-union-macos-isolated" => &["shard_union"],
                 "bash scripts/gate.sh source" => &["source"],
                 "bash scripts/gate.sh lint" => &["lint_audit", "lint_format", "lint_clippy"],
                 "bash scripts/gate.sh docs" => &["docs"],
@@ -254,7 +255,7 @@ fn model_contract_matches(
         && format!("{:x}", Sha256::digest(helper))
             == "347121a931faee2f0e9a2f4bf0ee9baf7cf3859c06e749954b53845d088db5a4"
         && format!("{:x}", Sha256::digest(manifest))
-            == "664292fa142db458743ea06e595756917fadc8ff7a7fb68f4440112c9a863daa"
+            == "edecf9f1f7ec684692df40dd87be2be24d91d47d780264c5ac40e2575a41e59e"
         && format!("{:x}", Sha256::digest(launcher))
             == "7f8fa9c6efa60180651177d4ea04c75ede06487828a389fe19dceeaa401b97ca"
         && format!("{:x}", Sha256::digest(receipt))
@@ -262,7 +263,7 @@ fn model_contract_matches(
         && format!("{:x}", Sha256::digest(core.0))
             == "9feafef445a5364998c90178048e781f08b9840595a311f9f7bf620b2c0798d9"
         && format!("{:x}", Sha256::digest(core.1))
-            == "125356acd39f98d17aa3806ea4e94d3ae7ad7ba4d00e9399e6a184cf8cd70867"
+            == "b7139130b299fd226fcccabab8c06b0e58c3881577e6aa763ce49421b692cc60"
 }
 
 fn shard_contract_is_frozen(script: &str) -> bool {
@@ -290,7 +291,7 @@ fn shard_contract_is_frozen(script: &str) -> bool {
         ),
         (
             "shard_union",
-            "deea18c7d3ac2a726d5af9f58bfd311143e30e55af0eb4122b77d2f7cfd889ff",
+            "7b70adc5601f3c36f92929ef31961020ca76df6e36fa8d90b12e557763505900",
         ),
         (
             "features",
@@ -318,11 +319,11 @@ fn shard_contract_is_frozen(script: &str) -> bool {
         ),
         (
             "feature_qualification_sync",
-            "664a16d58c155042d7da1f5e2d36dd2fc885ad4fbd88c32a63a03f129fc1eec4",
+            "ca87a5fc7df6047eb0eb40d215da32e69c33fff1025546acb9fc59d82dcd2e2c",
         ),
         (
             "features_tests",
-            "8765584742dc637f7c348fe311cd6677688977b09c6b7eacb2f6183a585394f0",
+            "121125852235a5d9c71f79edd0ec012d1dbc347b779de9f62b6a3fdaa9e077c9",
         ),
         (
             "default_wall_isolated",
@@ -342,11 +343,11 @@ fn shard_contract_is_frozen(script: &str) -> bool {
     }) && format!(
         "{:x}",
         Sha256::digest(include_bytes!("../../../../scripts/ci-test-shards.py"))
-    ) == "fb4a3b06a7ec775b9d5b7d7b333920e7dad25859a9f35ca192ca2cffe7276bec"
+    ) == "02a67a7b222d92aa64144952ceb5d05cbb8069364d85f4311a8557db4c0d294d"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!("../../../../scripts/ci-test-shards.json"))
-        ) == "2a21c8fa764e57e3f1b26b0011555415e469ebc3e16c6c3ea5d0a6f0208c03d5"
+        ) == "0514a0b25b75bdc4d73395b3383cb9870d91218b6ce5ba390af66acda3222459"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!(
@@ -362,28 +363,31 @@ fn shard_contract_is_frozen(script: &str) -> bool {
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!("../../../../Cargo.toml"))
-        ) == "ab995589c0159a218d0fd370a539c2994b6008e7e64b0d3e171062e6e0b11e85"
+        ) == "871a8c130d3dbc7e88d4da615dafdd83ec25cfac85b170cd75f673a0a4d376d7"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!("../../../../Cargo.lock"))
-        ) == "3d835eba6e63d7839a0eb78ca6715fb805a95509a8dcaf0df7fdc699907a9b84"
+        ) == "b44b27b83f71c94adff4eddf806d4d5a9ed3f0535f94c44255cdf149bac1afd2"
         && format!(
             "{:x}",
             Sha256::digest(include_bytes!(
                 "../../../../crates/context-graph/tests/test_estate_audit.rs"
             ))
-        ) == "f4c2a98e24c6cde0802f91f9bbd6a881ca0fe22557e1ac00d5bf5ae2fd1e5a56"
+        ) == "5dc41701ce3faf5d2502b71e3a945e73d07158ec859f476fb58b183e3a8dfb3b"
 }
 
 #[allow(dead_code)]
 pub fn exact_physical_matrix(matrix: &serde_yaml_ng::Mapping) -> bool {
-    let default: Value = serde_yaml_ng::from_str(
+    // Default and feature execution run every logical bundle as its own job on each platform.
+    let physical: Value = serde_yaml_ng::from_str(
         r#"
 include:
   - os: macos-latest
     bundle: acceptance
   - os: macos-latest
-    bundle: integration-and-rest + import-and-cli
+    bundle: integration-and-rest
+  - os: macos-latest
+    bundle: import-and-cli
   - os: ubuntu-latest
     bundle: acceptance
   - os: ubuntu-latest
@@ -392,23 +396,8 @@ include:
     bundle: import-and-cli
 "#,
     )
-    .expect("default physical matrix");
-    let features: Value = serde_yaml_ng::from_str(
-        r#"
-include:
-  - os: macos-latest
-    bundle: integration-and-rest + import-and-cli + acceptance
-  - os: ubuntu-latest
-    bundle: acceptance
-  - os: ubuntu-latest
-    bundle: integration-and-rest
-  - os: ubuntu-latest
-    bundle: import-and-cli
-"#,
-    )
-    .expect("feature physical matrix");
-    same_matrix(&Value::Mapping(matrix.clone()), &default)
-        || same_matrix(&Value::Mapping(matrix.clone()), &features)
+    .expect("physical matrix");
+    same_matrix(&Value::Mapping(matrix.clone()), &physical)
 }
 
 pub const CONTROLS_SETUP: &str = "python3 -m venv \"$RUNNER_TEMP/ci-controls-python\"\n\"$RUNNER_TEMP/ci-controls-python/bin/python\" -m pip install PyYAML==6.0.2";
@@ -637,12 +626,13 @@ pub fn exact_shared_command(run: &str) -> bool {
                 Sha256::digest(include_bytes!(
                     "../../../../scripts/ci-cache-post-cleanup.py"
                 ))
-            ) == "849caa4caee4553e55e5f62c7572e43e29f51b1f901d505ee0b58bbbc0a90844")
+            ) == "610271f4180992976d687716b7a18eeb94e1d395a26fa7a9421ede505dc47824")
         || (([
             "bash scripts/gate.sh shard-union",
             "bash scripts/gate.sh shard-union-linux",
             "bash scripts/gate.sh shard-union-linux-isolated",
             "bash scripts/gate.sh shard-union-macos",
+            "bash scripts/gate.sh shard-union-macos-isolated",
         ]
         .contains(&run.trim())
             || [
@@ -866,7 +856,7 @@ pub fn platform_coverage(mut required: Value, advisory: Value) -> Value {
                 "../../../../.github/workflows/macos-advisory.yml"
             ))
         ),
-        "4ee054c66a544643b33e1285e5524c624c368c452d3ea88407c6b99a1ca726b4"
+        "e036617f82581348085d77a879a9c5a1e7e87ee23902e10e4af35033062bd4c9"
     );
     let frozen_mac: Value = serde_yaml_ng::from_str(include_str!(
         "../../../../.github/workflows/macos-advisory.yml"
@@ -876,8 +866,8 @@ pub fn platform_coverage(mut required: Value, advisory: Value) -> Value {
         advisory, frozen_mac,
         "whole advisory mapping must remain unchanged"
     );
-    assert_eq!(required["name"].as_str(), Some("ci"));
-    assert_eq!(advisory["name"].as_str(), Some("macOS advisory"));
+    assert_eq!(required["name"].as_str(), Some("Linux CI"));
+    assert_eq!(advisory["name"].as_str(), Some("macOS CI (advisory)"));
     for key in ["on", "permissions", "env", "defaults"] {
         assert_eq!(required[key], advisory[key], "platform workflow context");
     }
@@ -950,7 +940,15 @@ pub fn platform_coverage(mut required: Value, advisory: Value) -> Value {
     actual.sort_unstable();
     assert_eq!(
         actual,
-        ["controls", "features", "lint", "macos-advisory", "test"]
+        [
+            "controls",
+            "feature-qualification-core",
+            "feature-qualification-sync",
+            "features",
+            "lint",
+            "macos-advisory",
+            "test"
+        ]
     );
     let compile_core: Value = serde_yaml_ng::from_str(r###"name: Feature compatibility — default and minimal libraries (ubuntu-latest)
 runs-on: ubuntu-latest
@@ -1002,6 +1000,9 @@ steps:
     CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
   with:
     cache-bin: false
+    prefix-key: v1-rust-1.94.1
+    add-rust-environment-hash-key: false
+    save-if: ${{ github.ref == 'refs/heads/dev' }}
     workspaces: workspace/context-graph -> target
     key: feature-qualification-core-v1
 - name: Run feature compatibility qualification
@@ -1082,6 +1083,9 @@ steps:
     CG_MODEL_CACHE_ROOT: ${{ runner.temp }}/cg-model-cache
   with:
     cache-bin: false
+    prefix-key: v1-rust-1.94.1
+    add-rust-environment-hash-key: false
+    save-if: ${{ github.ref == 'refs/heads/dev' }}
     workspaces: workspace/context-graph -> target
     key: feature-qualification-core-v1
 - name: Run feature compatibility qualification
@@ -1110,9 +1114,25 @@ steps:
     path: ${{ runner.temp }}/job-receipt
     retention-days: 14
     if-no-files-found: error
-"###.replace("default and minimal libraries", "sync, CLI and doctests")
+"###.replace("default and minimal libraries", "sync and CLI")
         .replace("feature-qualification-core", "feature-qualification-sync")).unwrap();
     assert_eq!(required["jobs"]["feature-qualification-sync"], compile_sync);
+    // macOS runs both compatibility build jobs unchanged; only the runner and its label differ.
+    for job in ["feature-qualification-core", "feature-qualification-sync"] {
+        let mut expected = required["jobs"][job].clone();
+        expected["runs-on"] = Value::String("macos-latest".into());
+        expected["name"] = Value::String(
+            required["jobs"][job]["name"]
+                .as_str()
+                .unwrap()
+                .replace("(ubuntu-latest)", "(macos-latest)"),
+        );
+        assert_ne!(expected["name"], required["jobs"][job]["name"]);
+        assert_eq!(
+            advisory["jobs"][job], expected,
+            "macOS compatibility job {job}"
+        );
+    }
     for job in ["lint", "controls", "test", "features"] {
         let linux = &required["jobs"][job];
         let mac = &advisory["jobs"][job];
@@ -1121,81 +1141,22 @@ steps:
                 && linux.get("continue-on-error").is_none()
                 && linux.get("needs").is_none()
         );
+        // Every macOS job runs the Linux job's exact steps; only the matrix runner differs.
         let mut comparable = linux.clone();
-        if job == "test" || job == "features" {
-            for stage in ["source", "model-seed", "public-model"] {
-                let command = format!("bash scripts/gate.sh {stage}");
-                let linux_steps = comparable["steps"].as_sequence_mut().unwrap();
-                let matches: Vec<_> = linux_steps
-                    .iter_mut()
-                    .filter(|step| step["run"].as_str().map(str::trim) == Some(command.as_str()))
-                    .collect();
-                assert_eq!(matches.len(), 1);
-                let step = matches.into_iter().next().unwrap();
-                let mac_steps: Vec<_> = mac["steps"]
-                    .as_sequence()
-                    .unwrap()
-                    .iter()
-                    .filter(|step| step["run"].as_str().map(str::trim) == Some(command.as_str()))
-                    .collect();
-                assert_eq!(mac_steps.len(), 1);
-                let mac_step = mac_steps[0];
-                assert_eq!(
-                    step["env"]["GATE_RECEIPT_DIR"].as_str(),
-                    Some("${{ runner.temp }}/job-receipt/${{ matrix.bundle }}")
-                );
-                assert_eq!(
-                    mac_step["env"]["GATE_RECEIPT_DIR"].as_str(),
-                    Some(
-                        "${{ runner.temp }}/job-receipt/${{ contains(matrix.bundle, 'integration-and-rest') && 'integration-and-rest' || 'acceptance' }}"
-                    )
-                );
-                step["env"]["GATE_RECEIPT_DIR"] = mac_step["env"]["GATE_RECEIPT_DIR"].clone();
-                if job == "test" && stage != "source" {
-                    assert_eq!(
-                        step["env"]["GATE_CI_MODEL_MODE"].as_str(),
-                        Some(
-                            "${{ matrix.bundle == 'acceptance' && 'catalog-narrow' || 'catalog-workspace' }}"
-                        )
-                    );
-                    assert_eq!(
-                        mac_step["env"]["GATE_CI_MODEL_MODE"].as_str(),
-                        Some(
-                            "${{ contains(matrix.bundle, 'integration-and-rest') && 'catalog-workspace' || 'catalog-narrow' }}"
-                        )
-                    );
-                    step["env"]["GATE_CI_MODEL_MODE"] =
-                        mac_step["env"]["GATE_CI_MODEL_MODE"].clone();
-                }
-            }
-        }
-        if job == "features" {
-            let steps = comparable["steps"].as_sequence_mut().unwrap();
-            let selected: Vec<_> = steps
-                .iter_mut()
-                .filter(|step| {
-                    step["run"].as_str()
-                        == Some("python3 scripts/ci-test-shards.py bundle features --tests-only")
-                })
-                .collect();
-            assert_eq!(selected.len(), 1);
-            selected.into_iter().next().unwrap()["run"] =
-                Value::String("python3 scripts/ci-test-shards.py bundle features".into());
-        }
         comparable["strategy"]["matrix"] = mac["strategy"]["matrix"].clone();
         assert_eq!(comparable, *mac, "complete platform commands must match");
-        let expected_linux: Value = if job == "lint" || job == "controls" {
-            serde_yaml_ng::from_str("os: [ubuntu-latest]").unwrap()
-        } else {
-            serde_yaml_ng::from_str("include:\n  - os: ubuntu-latest\n    bundle: acceptance\n  - os: ubuntu-latest\n    bundle: integration-and-rest\n  - os: ubuntu-latest\n    bundle: import-and-cli").unwrap()
+        let rows = |system: &str| -> Value {
+            if job == "lint" || job == "controls" {
+                serde_yaml_ng::from_str(&format!("os: [{system}]")).unwrap()
+            } else {
+                serde_yaml_ng::from_str(&format!(
+                    "include:\n  - os: {system}\n    bundle: acceptance\n  - os: {system}\n    bundle: integration-and-rest\n  - os: {system}\n    bundle: import-and-cli"
+                ))
+                .unwrap()
+            }
         };
-        let expected_mac: Value = if job == "lint" || job == "controls" {
-            serde_yaml_ng::from_str("os: [macos-latest]").unwrap()
-        } else if job == "test" {
-            serde_yaml_ng::from_str("include:\n  - os: macos-latest\n    bundle: acceptance\n  - os: macos-latest\n    bundle: integration-and-rest + import-and-cli").unwrap()
-        } else {
-            serde_yaml_ng::from_str("include:\n  - os: macos-latest\n    bundle: integration-and-rest + import-and-cli + acceptance").unwrap()
-        };
+        let expected_linux = rows("ubuntu-latest");
+        let expected_mac = rows("macos-latest");
         assert!(same_matrix(&linux["strategy"]["matrix"], &expected_linux));
         assert!(same_matrix(&mac["strategy"]["matrix"], &expected_mac));
         let key = if job == "lint" || job == "controls" {
@@ -1207,43 +1168,54 @@ steps:
         rows.extend(expected_linux[key].as_sequence().unwrap().clone());
         comparable["strategy"]["matrix"] = linux["strategy"]["matrix"].clone();
         comparable["strategy"]["matrix"][key] = Value::Sequence(rows);
-        if job == "features" {
-            for step in comparable["steps"].as_sequence_mut().unwrap() {
-                if step["run"].as_str() == Some("python3 scripts/ci-test-shards.py bundle features")
-                {
-                    step["run"] = Value::String(
-                        "python3 scripts/ci-test-shards.py bundle features --tests-only".into(),
-                    );
-                }
-            }
-        }
         required["jobs"][job] = comparable;
     }
     let mut expected = advisory["jobs"]["macos-advisory"].clone();
     expected["name"] = Value::String("PR checks".into());
+    let mut mac_needs: Vec<_> = expected["needs"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    mac_needs.sort_unstable();
+    assert_eq!(
+        mac_needs,
+        [
+            "controls",
+            "feature-qualification-core",
+            "feature-qualification-sync",
+            "features",
+            "lint",
+            "test"
+        ]
+    );
     expected["needs"] = serde_yaml_ng::from_str("[source, lint, docs, test, features, controls, feature-qualification-core, feature-qualification-sync]").unwrap();
     let steps = expected["steps"].as_sequence_mut().unwrap();
-    let before = steps.len();
-    steps.retain(|step| {
-        ![
-            "Free disk space",
-            "Record disk headroom and remove disposable compiler scratch",
-            "Remove disposable compiler scratch",
-        ]
-        .contains(&step["name"].as_str().unwrap_or(""))
-            && step["uses"].as_str()
-                != Some("Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c")
-    });
-    assert_eq!(before - steps.len(), 4);
+    // The macOS aggregate requires exactly the macOS jobs, which are the Linux jobs other than
+    // the Linux-only source and documentation checks, and audits the macOS union the same way.
+    let mac_check = REQUIRED_PR_JOB_AGGREGATE_RUN.replace(
+        "expected = {'docs', 'source', 'features',",
+        "expected = {'features',",
+    );
+    assert_ne!(mac_check, REQUIRED_PR_JOB_AGGREGATE_RUN);
+    let mut checks = 0;
+    let mut unions = 0;
     for step in steps {
         if let Some(run) = step["run"].as_str() {
-            step["run"] = Value::String(if run.starts_with("python3 - <<'PY_CHECK'") {
-                REQUIRED_PR_JOB_AGGREGATE_RUN.to_string()
-            } else {
-                run.replace("shard-union-macos", "shard-union-linux-isolated")
-            });
+            if run.starts_with("python3 - <<'PY_CHECK'") {
+                assert_eq!(run.trim(), mac_check.trim(), "macOS aggregate inventory");
+                checks += 1;
+                step["run"] = Value::String(REQUIRED_PR_JOB_AGGREGATE_RUN.to_string());
+            } else if run.contains("shard-union") {
+                assert_eq!(run, "bash scripts/gate.sh shard-union-macos-isolated");
+                unions += 1;
+                step["run"] =
+                    Value::String("bash scripts/gate.sh shard-union-linux-isolated".into());
+            }
         }
     }
+    assert_eq!((checks, unions), (1, 1));
     let mut actual = required["jobs"]["required"].clone();
     for job in [&mut actual, &mut expected] {
         job["needs"]

@@ -335,6 +335,8 @@ pub struct Catalog {
     cache_root: PathBuf,
     scope_key: String,
     progress_observer: Option<Arc<ProgressObserver>>,
+    #[cfg(feature = "test-support")]
+    lock_wait_observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl fmt::Debug for Catalog {
@@ -501,6 +503,24 @@ impl Catalog {
         Self::open_with_scope_against_roots(root.clone(), root, scope_key)
     }
 
+    /// Observe a real refused lock attempt before its blocking acquire.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_lock_wait_observer_for_test(
+        mut self,
+        observer: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.lock_wait_observer = Some(Arc::new(observer));
+        self
+    }
+
+    fn observe_lock_wait_for_test(&self) {
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.lock_wait_observer {
+            observer();
+        }
+    }
+
     /// Opens with the two locations held apart: `data_root` holds the registrations an operator
     /// manages, `cache_root` holds the artifact bytes a fetch downloads. An operator who points
     /// `CG_DATA_ROOT` and `CG_MODEL_CACHE_ROOT` at different directories gets this constructor,
@@ -516,6 +536,8 @@ impl Catalog {
             cache_root: cache_root.into(),
             scope_key: scope_key.into(),
             progress_observer: None,
+            #[cfg(feature = "test-support")]
+            lock_wait_observer: None,
         })
     }
 
@@ -530,6 +552,8 @@ impl Catalog {
             cache_root: root,
             scope_key: scope_key.into(),
             progress_observer: None,
+            #[cfg(feature = "test-support")]
+            lock_wait_observer: None,
         };
         catalog.write_registered_entries(&entries)?;
         Ok(catalog)
@@ -871,6 +895,7 @@ impl Catalog {
         let lock_existed_before = self.model_dir(id).join(".lock").exists();
         let (complete_before, accepted, waited) = {
             let (_lock, waited) = lock_artifact_dir_with_wait(id, &self.model_dir(id), || {
+                self.observe_lock_wait_for_test();
                 // Keep first-touch progress visible while an Apache-model fetch waits for
                 // the cache lock. License-gated fetches must first inspect acceptance.
                 if !spec.requires_manual_acceptance {
@@ -2277,7 +2302,11 @@ impl Catalog {
     }
 
     fn lock_model(&self, id: &str) -> Result<File> {
-        lock_artifact_dir(id, &self.model_dir(id))
+        lock_artifact_dir_with_wait(id, &self.model_dir(id), || {
+            self.observe_lock_wait_for_test();
+            Ok(())
+        })
+        .map(|(file, _)| file)
     }
 
     fn cache_dirs(&self) -> Result<Vec<PathBuf>> {

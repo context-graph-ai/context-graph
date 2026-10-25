@@ -6,7 +6,6 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
 
 use cg_node_fs::{read_event_search_worker_policy, write_event_search_worker_policy};
 use context_graph::embedder::{
@@ -168,8 +167,8 @@ impl Embedder for ControlledEmbedder {
                 .map_err(|_| {
                     context_graph::CgError::Engine("parallelism observer went away".into())
                 })?;
-            held.recv_timeout(Duration::from_secs(30)).map_err(|_| {
-                context_graph::CgError::Engine("parallelism test release timed out".into())
+            held.recv().map_err(|_| {
+                context_graph::CgError::Engine("parallelism test release disconnected".into())
             })?;
         } else {
             self.entered
@@ -194,11 +193,11 @@ fn concurrent_embedding_calls_run_with_one_rayon_helper_each_for_standalone_and_
     let standalone = start_projection(NonZeroUsize::new(2).expect("positive worker cap"), None);
     let first = standalone
         .entered
-        .recv_timeout(Duration::from_secs(10))
+        .recv()
         .expect("standalone first embedding call");
     let second = standalone
         .entered
-        .recv_timeout(Duration::from_secs(10))
+        .recv()
         .expect("standalone second embedding call");
     assert_eq!(
         first.helper_threads, 1,
@@ -220,11 +219,11 @@ fn concurrent_embedding_calls_run_with_one_rayon_helper_each_for_standalone_and_
         start_held_store_projection(NonZeroUsize::new(2).expect("positive worker cap"));
     let first = held_store
         .entered
-        .recv_timeout(Duration::from_secs(10))
+        .recv()
         .expect("held-Store first embedding call");
     let second = held_store
         .entered
-        .recv_timeout(Duration::from_secs(10))
+        .recv()
         .expect("held-Store second embedding call");
     assert_eq!(
         first.helper_threads, 1,
@@ -490,7 +489,7 @@ fn finish_projection_with_held_count(
         call.release();
     }
     while held_observed < expected_held {
-        let Ok(call) = run.entered.recv_timeout(Duration::from_secs(30)) else {
+        let Ok(call) = run.entered.recv() else {
             break;
         };
         if call.release.is_some() {
@@ -511,9 +510,9 @@ fn default_runner_enters_two_embedding_calls_before_either_is_released() {
         return;
     }
     let run = start_projection(available, None);
-    let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
+    let first = run.entered.recv().ok();
     let first_observed = first.is_some();
-    let second = run.entered.recv_timeout(Duration::from_secs(10));
+    let second = run.entered.recv();
     let overlap_observed = second.is_ok();
     let mut observed = first.into_iter().collect::<Vec<_>>();
     if let Ok(second) = second {
@@ -543,14 +542,9 @@ fn default_runner_enters_two_embedding_calls_before_either_is_released() {
 #[test]
 fn embedding_worker_cap_one_keeps_the_second_call_out_until_the_first_returns() {
     let run = start_projection(NonZeroUsize::MIN, None);
-    let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
+    let first = run.entered.recv().ok();
     let first_observed = first.is_some();
-    assert_eq!(
-        run.waves
-            .recv_timeout(Duration::from_secs(10))
-            .expect("wave admission"),
-        1
-    );
+    assert_eq!(run.waves.recv().expect("wave admission"), 1);
     let second_before_release = run.entered.try_recv();
     let overlap_observed = second_before_release.is_ok();
     let mut observed = first.into_iter().collect::<Vec<_>>();
@@ -579,15 +573,10 @@ fn embedding_worker_cap_one_keeps_the_second_call_out_until_the_first_returns() 
 #[test]
 fn embedding_worker_cap_two_enters_two_calls_but_never_a_third_before_release() {
     let run = start_projection(NonZeroUsize::new(2).unwrap(), None);
-    let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
+    let first = run.entered.recv().ok();
     let first_observed = first.is_some();
-    let second = run.entered.recv_timeout(Duration::from_secs(10));
-    assert_eq!(
-        run.waves
-            .recv_timeout(Duration::from_secs(10))
-            .expect("wave admission"),
-        2
-    );
+    let second = run.entered.recv();
+    assert_eq!(run.waves.recv().expect("wave admission"), 2);
     let third_before_release = second
         .as_ref()
         .ok()
@@ -626,11 +615,11 @@ fn embedding_worker_cap_two_enters_two_calls_but_never_a_third_before_release() 
 #[test]
 fn held_store_cap_two_overlaps_two_calls_while_its_claim_lease_stays_live() {
     let run = start_held_store_projection(NonZeroUsize::new(2).unwrap());
-    let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
-    let second = run.entered.recv_timeout(Duration::from_secs(10)).ok();
+    let first = run.entered.recv().ok();
+    let second = run.entered.recv().ok();
     assert_eq!(
         run.waves
-            .recv_timeout(Duration::from_secs(10))
+            .recv()
             .expect("complete held-Store wave admission"),
         2
     );
@@ -667,13 +656,8 @@ fn held_store_cap_two_overlaps_two_calls_while_its_claim_lease_stays_live() {
 #[test]
 fn held_store_cap_one_serializes_calls_while_its_claim_lease_stays_live() {
     let run = start_held_store_projection(NonZeroUsize::MIN);
-    let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
-    assert_eq!(
-        run.waves
-            .recv_timeout(Duration::from_secs(10))
-            .expect("wave admission"),
-        1
-    );
+    let first = run.entered.recv().ok();
+    assert_eq!(run.waves.recv().expect("wave admission"), 1);
     let second_before_release = run.entered.try_recv();
 
     assert!(
@@ -692,7 +676,7 @@ fn held_store_cap_one_serializes_calls_while_its_claim_lease_stays_live() {
     first.expect("checked first call").release();
     let second = run
         .entered
-        .recv_timeout(Duration::from_secs(10))
+        .recv()
         .expect("held Store enters the second call after the first returns");
     second.release();
     assert!(
@@ -708,8 +692,8 @@ fn held_store_cap_one_serializes_calls_while_its_claim_lease_stays_live() {
 fn claim_boundary_resolver_is_called_and_its_worker_cap_is_honored() {
     let resolutions = Arc::new(AtomicUsize::new(0));
     let run = start_projection(NonZeroUsize::MIN, Some(Arc::clone(&resolutions)));
-    let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
-    let second = run.entered.recv_timeout(Duration::from_secs(10));
+    let first = run.entered.recv().ok();
+    let second = run.entered.recv();
     let overlap_observed = second.is_ok();
     let mut observed = first.into_iter().collect::<Vec<_>>();
     if let Ok(second) = second {
@@ -744,7 +728,7 @@ fn standalone_runner_resolves_the_worker_cap_again_for_later_claims() {
     );
     let first = run
         .entered
-        .recv_timeout(Duration::from_secs(10))
+        .recv()
         .expect("fixture enters its first embedding call");
     let (outcome, held_observed) = finish_projection(run, vec![first]);
 
@@ -774,14 +758,12 @@ fn observe_two_passage_batch(
     expect_overlap: bool,
     observed: &mut Vec<EnteredCall>,
 ) -> BatchObservation {
-    let first = entered.recv_timeout(Duration::from_secs(10)).ok();
+    let first = entered.recv().ok();
     let first_entered = first.is_some();
-    let width = waves
-        .recv_timeout(Duration::from_secs(10))
-        .expect("complete wave admission");
+    let width = waves.recv().expect("complete wave admission");
     assert_eq!(width, if expect_overlap { 2 } else { 1 });
     let second = if expect_overlap {
-        entered.recv_timeout(Duration::from_secs(10)).ok()
+        entered.recv().ok()
     } else {
         entered.try_recv().ok()
     };
@@ -800,17 +782,12 @@ fn observe_two_passage_batch(
         call.release();
     }
     let second_after_release = if !overlapped {
-        entered.recv_timeout(Duration::from_secs(10)).ok()
+        entered.recv().ok()
     } else {
         None
     };
     if second_after_release.is_some() {
-        assert_eq!(
-            waves
-                .recv_timeout(Duration::from_secs(10))
-                .expect("serial second wave"),
-            1
-        );
+        assert_eq!(waves.recv().expect("serial second wave"), 1);
     }
     let second_entered = overlapped || second_after_release.is_some();
     if let Some(second) = second_after_release {
@@ -853,7 +830,7 @@ fn changing_cap_run(
     let mut held = Vec::new();
     assert_eq!(
         claim_boundaries
-            .recv_timeout(Duration::from_secs(10))
+            .recv()
             .expect("first actual claim reaches worker-cap callback"),
         expected_caps[0],
     );
@@ -865,7 +842,7 @@ fn changing_cap_run(
     ));
     assert_eq!(
         claim_boundaries
-            .recv_timeout(Duration::from_secs(10))
+            .recv()
             .expect("second actual claim reaches worker-cap callback"),
         expected_caps[1],
     );
@@ -931,14 +908,14 @@ fn standalone_runner_honors_two_then_one_at_successive_two_passage_claims() {
     let mut held = Vec::new();
     assert_eq!(
         claim_boundaries
-            .recv_timeout(Duration::from_secs(10))
+            .recv()
             .expect("first actual claim reaches worker-cap callback"),
         2,
     );
     let first = observe_two_passage_batch(&run.entered, &run.waves, true, &mut held);
     assert_eq!(
         claim_boundaries
-            .recv_timeout(Duration::from_secs(10))
+            .recv()
             .expect("second actual claim reaches worker-cap callback"),
         1,
     );
@@ -993,20 +970,15 @@ fn claim_callback_rereads_the_worker_policy_file_before_the_next_two_passage_bat
         true,
     );
 
-    let first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
-    assert_eq!(
-        run.waves
-            .recv_timeout(Duration::from_secs(10))
-            .expect("first wave admission"),
-        1
-    );
+    let first = run.entered.recv().ok();
+    assert_eq!(run.waves.recv().expect("first wave admission"), 1);
     let first_overlap = run.entered.try_recv().ok();
     let first_overlapped = first_overlap.is_some();
     if let Some(call) = first {
         call.release();
     }
     let first_second = if first_overlap.is_none() {
-        run.entered.recv_timeout(Duration::from_secs(10)).ok()
+        run.entered.recv().ok()
     } else {
         first_overlap
     };
@@ -1016,8 +988,8 @@ fn claim_callback_rereads_the_worker_policy_file_before_the_next_two_passage_bat
     if let Some(call) = first_second {
         call.release();
     }
-    let second_first = run.entered.recv_timeout(Duration::from_secs(10)).ok();
-    let second_second = run.entered.recv_timeout(Duration::from_secs(10)).ok();
+    let second_first = run.entered.recv().ok();
+    let second_second = run.entered.recv().ok();
     let second_first_entered = second_first.is_some();
     let second_overlapped = second_second.is_some();
     if let Some(call) = second_first {

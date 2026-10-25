@@ -52,7 +52,7 @@ struct ReindexCommit<'a> {
 impl Store {
     pub fn reindex_space(&self, embedding_space_id: &str, options: ReindexOptions) -> Result<()> {
         let space = self
-            .embedding_space_for_id(embedding_space_id)
+            .embedding_space_for_write(embedding_space_id)
             .map_err(|_| CgError::UnknownEmbeddingSpace {
                 id: embedding_space_id.to_string(),
             })?;
@@ -485,7 +485,7 @@ impl Store {
         embedding_space_id: &str,
         started_at: TxId,
     ) -> Result<Vec<ReindexCandidate>> {
-        let space = self.embedding_space_for_id(embedding_space_id)?;
+        let space = self.embedding_space_for_write(embedding_space_id)?;
         let bindings = space
             .bindings
             .iter()

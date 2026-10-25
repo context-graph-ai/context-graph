@@ -64,13 +64,13 @@ fn observer(machine: &Machine, name: &str, pause_batches: bool) -> std::path::Pa
     let path = machine.root.join(name);
     std::fs::create_dir_all(&path).expect("create worker observer directory");
     if pause_batches {
-        std::fs::write(
+        event_support::write_test_file(
             path.join("observe-embedding-worker-batches"),
             b"observe and pause\n",
         )
         .expect("enable existing batch observer");
     } else {
-        std::fs::write(path.join("release"), b"do not pause\n")
+        event_support::write_test_file(path.join("release"), b"do not pause\n")
             .expect("pre-release the existing handoff barrier");
     }
     path
@@ -148,7 +148,7 @@ fn queued_forget_uses_configured_cap_and_finishes_after_foreground_releases() {
     );
     let config_dir = machine.data_root.join("cg");
     std::fs::create_dir_all(&config_dir).expect("create config directory");
-    std::fs::write(
+    event_support::write_test_file(
         config_dir.join("fabric.toml"),
         "[search]\nembedding_workers = 2\n",
     )
@@ -214,7 +214,8 @@ fn queued_forget_uses_configured_cap_and_finishes_after_foreground_releases() {
         "already_running"
     );
 
-    std::fs::write(observer.join("release"), b"continue\n").expect("release foreground");
+    event_support::write_test_file(observer.join("release"), b"continue\n")
+        .expect("release foreground");
     let output = foreground
         .wait_with_output()
         .expect("wait for foreground cg");
@@ -311,7 +312,8 @@ fn forget_during_background_work_keeps_the_live_worker_cap() {
         "forget did not leave a background handoff request"
     );
 
-    std::fs::write(observer.join("release"), b"continue\n").expect("release worker");
+    event_support::write_test_file(observer.join("release"), b"continue\n")
+        .expect("release worker");
     terminate_observed_worker(&observer);
     machine.wait_for_search_worker_exit();
 }
@@ -338,7 +340,7 @@ fn fresh_forget_worker_uses_config_not_an_old_one_off_import_cap() {
     );
     let config_dir = machine.data_root.join("cg");
     std::fs::create_dir_all(&config_dir).expect("create config directory");
-    std::fs::write(
+    event_support::write_test_file(
         config_dir.join("fabric.toml"),
         "[search]\nembedding_workers = 2\n",
     )
@@ -415,7 +417,7 @@ fn foreground_wait_keeps_its_cap_when_another_import_publishes() {
     );
     let config_dir = machine.data_root.join("cg");
     std::fs::create_dir_all(&config_dir).expect("create config directory");
-    std::fs::write(
+    event_support::write_test_file(
         config_dir.join("fabric.toml"),
         "[search.passages]\ntarget_tokens = 8\nhard_tokens = 64\n",
     )
@@ -466,7 +468,8 @@ fn foreground_wait_keeps_its_cap_when_another_import_publishes() {
     );
     assert_eq!(policy(&machine.data_root)["embedding_workers"], 2);
 
-    std::fs::write(observer.join("release"), b"continue\n").expect("release foreground");
+    event_support::write_test_file(observer.join("release"), b"continue\n")
+        .expect("release foreground");
     let output = foreground
         .wait_with_output()
         .expect("wait for foreground cg");
@@ -508,7 +511,7 @@ fn queued_import_selection_survives_forget_and_foreground_handoff() {
     let machine = Machine::with_nomic();
     let config_dir = machine.data_root.join("cg");
     std::fs::create_dir_all(&config_dir).expect("create config directory");
-    std::fs::write(
+    event_support::write_test_file(
         config_dir.join("fabric.toml"),
         "[search]\nembedding_workers = 2\n",
     )
@@ -621,7 +624,8 @@ fn queued_import_selection_survives_forget_and_foreground_handoff() {
         3
     );
 
-    std::fs::write(observer.join("release"), b"continue\n").expect("release foreground");
+    event_support::write_test_file(observer.join("release"), b"continue\n")
+        .expect("release foreground");
     let output = foreground
         .wait_with_output()
         .expect("wait for foreground cg");
@@ -667,7 +671,7 @@ fn sigint_foreground_hands_the_queued_request_to_one_background_worker() {
         )],
     );
     let observer = observer(&machine, "sigint-observer", true);
-    std::fs::write(
+    event_support::write_test_file(
         observer.join("pause-after-foreground-handoff"),
         b"pause before final status refresh\n",
     )
@@ -717,7 +721,7 @@ fn sigint_foreground_hands_the_queued_request_to_one_background_worker() {
     assert_eq!(queued.code, 0, "{}", queued.describe());
     assert_eq!(str_at(&queued.json(), "/search/worker"), "already_running");
 
-    std::fs::write(
+    event_support::write_test_file(
         observer.join("release"),
         b"release foreground worker turn\n",
     )
@@ -743,10 +747,7 @@ fn sigint_foreground_hands_the_queued_request_to_one_background_worker() {
         unsafe { libc::kill(foreground.id() as i32, libc::SIGINT) },
         0
     );
-    let exited = wait_for_state(Duration::from_secs(10), Duration::from_millis(20), || {
-        foreground.try_wait()
-    })
-    .expect("foreground exit observation cannot fail");
+    let exited = foreground.wait().ok();
     assert_eq!(
         exited.and_then(|status| status.code()),
         Some(130),
@@ -859,10 +860,7 @@ fn sigint_during_prepared_embedding_hands_off_the_queued_request_once() {
         unsafe { libc::kill(foreground.id() as i32, libc::SIGINT) },
         0
     );
-    let exited = wait_for_state(Duration::from_secs(10), Duration::from_millis(20), || {
-        foreground.try_wait()
-    })
-    .expect("foreground exit observation cannot fail");
+    let exited = foreground.wait().ok();
     assert_eq!(
         exited.and_then(|status| status.code()),
         Some(130),
@@ -871,7 +869,7 @@ fn sigint_during_prepared_embedding_hands_off_the_queued_request_once() {
 
     // The handoff child inherits this test-only barrier. Releasing only after exit proves that the
     // foreground did not need the forward call to finish before it freed the worker turn.
-    std::fs::write(barrier.join("release"), b"release handed-off child\n")
+    event_support::write_test_file(barrier.join("release"), b"release handed-off child\n")
         .expect("release inherited prepared embedding barrier");
     let ready = machine.wait_for_search_ready(&queued_project, "sigint-prepared-queued");
     assert_eq!(
@@ -928,10 +926,7 @@ fn sigint_foreground_without_a_queue_exits_and_releases_its_worker_turn() {
         unsafe { libc::kill(foreground.id() as i32, libc::SIGINT) },
         0
     );
-    let exited = wait_for_state(Duration::from_secs(10), Duration::from_millis(20), || {
-        foreground.try_wait()
-    })
-    .expect("foreground exit observation cannot fail");
+    let exited = foreground.wait().ok();
     assert_eq!(exited.and_then(|status| status.code()), Some(130));
     machine.wait_for_search_worker_exit();
     assert!(policy(&machine.data_root)["pending_background_request"].is_null());
@@ -953,7 +948,7 @@ fn newer_wake_survives_older_final_clear_and_is_serviced() {
     );
     let observer = machine.root.join("newer-wake-observer");
     std::fs::create_dir_all(&observer).expect("create worker observer directory");
-    std::fs::write(observer.join("numbered-passes"), b"2\n")
+    event_support::write_test_file(observer.join("numbered-passes"), b"2\n")
         .expect("pause two completed worker passes");
     let first = machine.run_with_env(
         &project,
@@ -1003,7 +998,8 @@ fn newer_wake_survives_older_final_clear_and_is_serviced() {
         .expect("newer request token")
         .to_owned();
 
-    std::fs::write(observer.join("release.1"), b"allow older clear\n").expect("release older pass");
+    event_support::write_test_file(observer.join("release.1"), b"allow older clear\n")
+        .expect("release older pass");
     let second_pass = wait_for_state(Duration::from_secs(30), Duration::from_millis(20), || {
         Ok::<_, ()>(observer.join("entered.2").exists().then_some(()))
     })
@@ -1011,7 +1007,8 @@ fn newer_wake_survives_older_final_clear_and_is_serviced() {
     let token_after_older_clear = policy(&machine.data_root)["pending_background_request"]["token"]
         .as_str()
         .map(str::to_owned);
-    std::fs::write(observer.join("release.2"), b"allow newer clear\n").expect("release newer pass");
+    event_support::write_test_file(observer.join("release.2"), b"allow newer clear\n")
+        .expect("release newer pass");
     machine.wait_for_search_ready(&project, "newer-wake-final-clear");
     machine.wait_for_search_worker_exit();
 
@@ -1074,9 +1071,9 @@ fn exhausted_writer_refusal_keeps_the_request_until_a_new_same_profile_wake_reac
 
     let barrier = machine.root.join("writer-refusal-barrier");
     std::fs::create_dir_all(&barrier).expect("create writer-refusal barrier");
-    std::fs::write(barrier.join("pause-after-work-assessment"), b"pause\n")
+    event_support::write_test_file(barrier.join("pause-after-work-assessment"), b"pause\n")
         .expect("arm post-assessment rendezvous");
-    std::fs::write(barrier.join("exhaust-store-open-retry"), b"exhaust\n")
+    event_support::write_test_file(barrier.join("exhaust-store-open-retry"), b"exhaust\n")
         .expect("use the core's test-only allowance override");
     let envelope = worker_envelope();
     let mut worker = machine.spawn_with_env(
@@ -1101,15 +1098,12 @@ fn exhausted_writer_refusal_keeps_the_request_until_a_new_same_profile_wake_reac
     let mut writer =
         HoldingChild::hold_as_writer(&machine.db_path(), &runtime, "worker_writer_holder_child");
     writer.wait_until_holding_as_writer();
-    std::fs::write(
+    event_support::write_test_file(
         barrier.join("work-assessment-release"),
         b"attempt projection\n",
     )
     .expect("release projection into writer contention");
-    let exited = wait_for_state(Duration::from_secs(10), Duration::from_millis(20), || {
-        worker.try_wait()
-    })
-    .expect("worker exit observation cannot fail");
+    let exited = worker.wait().ok();
     if exited.is_none() {
         let _ = worker.kill();
         let _ = worker.wait();

@@ -18,9 +18,15 @@
 //!    `Utc::now(` call sites anywhere under `crates/*/src` or `crates/*/tests` — every one of
 //!    them a persisted-timestamp or synchronization call that bypasses the seamed
 //!    `contextdb_core::Wallclock::now()`. A file's live count rising past its baseline, or a new
-//!    file carrying any of these calls at all, fails the audit. The fix is the seam
+//!    file carrying any of these calls at all, fails the audit. Removed sites must also lower
+//!    their allowances in the same change. The fix is the seam
 //!    (`Wallclock::test_clock_guard` for time, a counter/state/event wait for synchronization),
 //!    never raising the number.
+//!    The `indirect_timed_wait_sites` subtable also freezes imported thread sleeps,
+//!    thread parking, and timed channel/condition-variable waits, including private modules.
+//!    Fully qualified sleeps overlap the original arm; both reject increases and stale
+//!    allowances. Both site arms include private modules; only the default-tier test count
+//!    excludes them.
 //! 2. **Default-tier test count per crate.** `[default_tier_test_count]` freezes, per crate, the
 //!    exact number of `#[test]`/`#[tokio::test]` functions that run in the tier `cargo test` runs
 //!    by default — excluding anything gated behind
@@ -62,10 +68,9 @@ use std::path::{Path, PathBuf};
 
 /// Test/src files that never compile in the default tier at all: each is reached only through a
 /// `mod` declaration in its crate's `tests/acceptance/main.rs` or `tests/integration/main.rs`
-/// that itself carries `#[cfg(context_graph_internal_test_support)]`. Their contents — including
-/// any `#[test]` functions and any sleep/clock call sites — are excluded from both counted arms
-/// for the same reason: code that does not compile by default is not part of the default tier to
-/// begin with, not a debt this audit is choosing to forgive.
+/// that itself carries `#[cfg(context_graph_internal_test_support)]`. These files are excluded
+/// only from default-tier test counts. Both timing-site arms include them, so private fixtures
+/// cannot add synchronization debt outside the ratchet.
 const WHOLE_FILE_EXCLUDE: &[&str] = &[
     "crates/context-graph/tests/acceptance/local_entity_face_match_override.rs",
     "crates/context-graph/tests/acceptance/screenshot_memory_distinguishability.rs",
@@ -174,7 +179,35 @@ fn relative(root: &Path, path: &Path) -> String {
 // Arm 1: sleep and raw-clock sites
 // ---------------------------------------------------------------------------------------------
 
+fn sleep_clock_site_count(content: &str) -> usize {
+    SLEEP_CLOCK_NEEDLES
+        .iter()
+        .map(|needle| content.matches(needle).count())
+        .sum()
+}
+
+fn indirect_wait_site_count(content: &str) -> usize {
+    // Include fully qualified sleeps here too; the two site arms overlap.
+    [
+        "thread::sleep(",
+        "thread::park_timeout(",
+        ".wait_timeout(",
+        ".recv_timeout(",
+    ]
+    .iter()
+    .map(|needle| content.matches(needle).count())
+    .sum()
+}
+
 fn count_sleep_clock_sites(root: &Path) -> BTreeMap<String, usize> {
+    count_sites(root, sleep_clock_site_count, true)
+}
+
+fn count_sites(
+    root: &Path,
+    count: fn(&str) -> usize,
+    include_private: bool,
+) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for (_, crate_dir) in crate_dirs(root) {
         for sub in ["src", "tests"] {
@@ -182,16 +215,14 @@ fn count_sleep_clock_sites(root: &Path) -> BTreeMap<String, usize> {
             walk_rs_files(&crate_dir.join(sub), &mut files);
             for file in files {
                 let rel = relative(root, &file);
-                if is_self(&rel) || WHOLE_FILE_EXCLUDE.contains(&rel.as_str()) {
+                if is_self(&rel) || (!include_private && WHOLE_FILE_EXCLUDE.contains(&rel.as_str()))
+                {
                     continue;
                 }
                 let Ok(content) = std::fs::read_to_string(&file) else {
                     continue;
                 };
-                let total: usize = SLEEP_CLOCK_NEEDLES
-                    .iter()
-                    .map(|needle| content.matches(needle).count())
-                    .sum();
+                let total = count(&content);
                 if total > 0 {
                     counts.insert(rel, total);
                 }
@@ -201,32 +232,148 @@ fn count_sleep_clock_sites(root: &Path) -> BTreeMap<String, usize> {
     counts
 }
 
-#[test]
-fn no_new_sleep_or_raw_clock_sites_beyond_the_frozen_baseline() {
-    let root = repository_root();
-    let baseline = load_baseline(&root);
-    let live = count_sleep_clock_sites(&root);
+fn sleep_clock_violations(
+    live: &BTreeMap<String, usize>,
+    baseline: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    site_count_violations(live, baseline, true)
+}
 
+fn site_count_violations(
+    live: &BTreeMap<String, usize>,
+    baseline: &BTreeMap<String, usize>,
+    include_private: bool,
+) -> Vec<String> {
+    let files: std::collections::BTreeSet<_> = live.keys().chain(baseline.keys()).collect();
     let mut violations = Vec::new();
-    for (file, count) in &live {
-        let allowed = baseline
-            .sleep_and_clock_sites
-            .get(file)
-            .copied()
-            .unwrap_or(0);
-        if *count > allowed {
+    for file in files {
+        if !include_private && WHOLE_FILE_EXCLUDE.contains(&file.as_str()) {
+            continue;
+        }
+        let count = live.get(file).copied().unwrap_or(0);
+        let allowed = baseline.get(file).copied().unwrap_or(0);
+        if count > allowed {
             violations.push(format!(
                 "{file}: {count} sleep/raw-clock site(s), baseline allows {allowed} — route \
                  through Wallclock::test_clock_guard (timing) or a counter/state/event wait \
                  (synchronization), never raise the baseline"
             ));
+        } else if count < allowed {
+            violations.push(format!(
+                "{file}: {count} sleep/raw-clock site(s), stale baseline allows {allowed} — \
+                 lower the baseline in the same change that removes a site"
+            ));
         }
     }
+    violations
+}
+
+#[test]
+fn no_new_sleep_or_raw_clock_sites_beyond_the_frozen_baseline() {
+    for needle in SLEEP_CLOCK_NEEDLES {
+        assert_eq!(sleep_clock_site_count(&format!("{needle});")), 1);
+    }
+    // Mutation controls: a new site in an existing file, a new file carrying a
+    // site, and a removed site with an unlowered allowance must all be rejected.
+    let baseline = BTreeMap::from([("existing.rs".to_string(), 1)]);
+    assert!(sleep_clock_violations(&baseline, &baseline).is_empty());
+    let increased = BTreeMap::from([("existing.rs".to_string(), 2)]);
+    assert_eq!(sleep_clock_violations(&increased, &baseline).len(), 1);
+    let mut added = baseline.clone();
+    added.insert("new.rs".to_string(), 1);
+    assert_eq!(sleep_clock_violations(&added, &baseline).len(), 1);
+    assert_eq!(sleep_clock_violations(&BTreeMap::new(), &baseline).len(), 1);
+
+    let root = repository_root();
+    // These converted fixtures used indirect polling/timeouts, which a raw-clock
+    // call-site count cannot see. Keep their synchronization event-driven.
+    let mut policy_violations = Vec::new();
+    for (file, function, forbidden) in [
+        (
+            "crates/cg-cli/tests/import_embedding_workers.rs",
+            "detached_background_import_delivers_default_cap_to_its_production_request_builder",
+            "wait_for_state(",
+        ),
+        (
+            "crates/context-graph/tests/event_search_projection_correctness.rs",
+            "one_concurrent_failure_waits_for_its_held_sibling_commits_nothing_and_retries_cleanly",
+            "recv_timeout(",
+        ),
+        (
+            "crates/cg-cli/tests/event_support/mod.rs",
+            "wait_for_search_worker_exit",
+            "wait_for_state(",
+        ),
+        (
+            "crates/cg-cli/src/history/worker.rs",
+            "wait_for_test_release",
+            "park_timeout(",
+        ),
+        (
+            "crates/context-graph/src/embedder/nomic.rs",
+            "pause_prepared_embedding_for_test",
+            "sleep(",
+        ),
+    ] {
+        let source = std::fs::read_to_string(root.join(file)).expect("guarded fixture source");
+        let signature = format!("fn {function}(");
+        let body = source
+            .split_once(signature.as_str())
+            .expect("guarded fixture is present")
+            .1
+            .split_once("\n}\n")
+            .expect("guarded top-level fixture closes")
+            .0;
+        if body.contains(forbidden) {
+            policy_violations.push(format!(
+                "{function} must use explicit events, not the timing helper {forbidden}"
+            ));
+        }
+    }
+    for needle in [
+        "thread::sleep(",
+        "thread::park_timeout(",
+        ".wait_timeout(",
+        ".recv_timeout(",
+    ] {
+        assert_eq!(indirect_wait_site_count(needle), 1);
+    }
+    assert_eq!(indirect_wait_site_count("std::thread::sleep("), 1);
+    let private = BTreeMap::from([(WHOLE_FILE_EXCLUDE[0].to_string(), 1)]);
+    assert_eq!(sleep_clock_violations(&private, &BTreeMap::new()).len(), 1);
+    assert_eq!(sleep_clock_violations(&BTreeMap::new(), &private).len(), 1);
+    assert_eq!(
+        site_count_violations(&private, &BTreeMap::new(), true).len(),
+        1
+    );
+    assert_eq!(
+        site_count_violations(&BTreeMap::new(), &private, true).len(),
+        1
+    );
+    let fake_provider = std::fs::read_to_string(root.join("crates/cg-cli/tests/support/mod.rs"))
+        .expect("fake provider source");
+    if fake_provider.contains("time.sleep(") {
+        policy_violations.push("fake providers use explicit completion release or an indefinite held call, never a timed sleep".to_string());
+    }
+    let baseline = load_baseline(&root);
+    let indirect = count_sites(&root, indirect_wait_site_count, true);
+    let indirect_violations =
+        site_count_violations(&indirect, &baseline.indirect_timed_wait_sites, true);
+    policy_violations.extend(
+        indirect_violations
+            .into_iter()
+            .map(|message| format!("indirect: {message}")),
+    );
+    let live = count_sleep_clock_sites(&root);
+    policy_violations.extend(sleep_clock_violations(
+        &live,
+        &baseline.sleep_and_clock_sites,
+    ));
     assert!(
-        violations.is_empty(),
-        "test-estate audit: new sleep or raw-clock site(s) beyond \
+        policy_violations.is_empty(),
+        "test-estate audit: new sleep/raw-clock sites or stale allowances in \
          tests/fixtures/test_estate_baseline.toml:\n{}",
-        violations.join("\n")
+        policy_violations.join("\n")
     );
 }
 
@@ -961,7 +1108,7 @@ fn default_measurement_is_wired(ci: &str, dispatcher: &str, gate: &str, stage: &
     let union = body("shard_union");
     let verify = union.find("python3 scripts/ci-test-shards.py verify");
     let copy = union.find("cp \"$RUNNER_TEMP/shard-receipts/default-$system.xml\" \"$repository_root/target/nextest/gate/junit.xml\"");
-    let wall_name = if stage == "shard-union-linux-isolated" {
+    let wall_name = if stage.ends_with("-isolated") {
         "default_wall_isolated"
     } else {
         "default_wall"
@@ -979,7 +1126,7 @@ fn default_measurement_is_wired(ci: &str, dispatcher: &str, gate: &str, stage: &
             .contains("python3 scripts/ci-test-shards.py run default \"$GATE_SHARD\"")
         && union.contains("for system in \"${systems[@]}\"; do")
         && union.contains("shard-union-linux|shard-union-linux-isolated) systems=(Linux) ;;")
-        && union.contains("shard-union-macos) systems=(macOS) ;;")
+        && union.contains("shard-union-macos|shard-union-macos-isolated) systems=(macOS) ;;")
         && union.contains("--system \"${systems[0]}\"")
         && matches!((verify, copy, wall), (Some(v), Some(c), Some(w)) if v < c && c < w)
         && body(wall_name)
@@ -988,7 +1135,7 @@ fn default_measurement_is_wired(ci: &str, dispatcher: &str, gate: &str, stage: &
             .contains("gate_wall_seconds_never_exceed_the_frozen_baseline -- --ignored --exact")
         && body(wall_name)
             .contains("python3 scripts/check-gate-wall-clock.py --junit \"$CG_GATE_JUNIT\"")
-        && (stage != "shard-union-linux-isolated" || body(wall_name).contains(
+        && (!stage.ends_with("-isolated") || body(wall_name).contains(
             "cargo test --locked --manifest-path scripts/gate-wall-audit/Cargo.toml --target-dir \"$RUNNER_TEMP/gate-wall-audit-target\" --test test_estate_audit"))
 }
 
@@ -1062,7 +1209,7 @@ fn the_ignored_wall_clock_arm_is_invoked_by_name_in_the_gate_script_and_ci() {
         (
             std::fs::read_to_string(root.join(".github/workflows/macos-advisory.yml"))
                 .expect("advisory workflow"),
-            "shard-union-macos",
+            "shard-union-macos-isolated",
         ),
     ] {
         assert!(default_measurement_is_wired(
@@ -1190,6 +1337,7 @@ fn the_readme_ci_snippet_names_the_wall_clock_steps_the_workflow_actually_runs()
 
 struct Baseline {
     sleep_and_clock_sites: BTreeMap<String, usize>,
+    indirect_timed_wait_sites: BTreeMap<String, usize>,
     default_tier_test_count: BTreeMap<String, usize>,
     gate_wall_seconds: BTreeMap<String, f64>,
     gate_wall_seconds_tolerance_factor: f64,
@@ -1204,6 +1352,7 @@ fn load_baseline(root: &Path) -> Baseline {
         toml::from_str(&text).unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()));
 
     let sleep_and_clock_sites = table_of_usize(&value, "sleep_and_clock_sites");
+    let indirect_timed_wait_sites = table_of_usize(&value, "indirect_timed_wait_sites");
     let default_tier_test_count = table_of_usize(&value, "default_tier_test_count");
     let gate_wall_seconds = table_of_f64(&value, "gate_wall_seconds");
     let policy = value
@@ -1231,6 +1380,7 @@ fn load_baseline(root: &Path) -> Baseline {
 
     Baseline {
         sleep_and_clock_sites,
+        indirect_timed_wait_sites,
         default_tier_test_count,
         gate_wall_seconds,
         gate_wall_seconds_tolerance_factor,

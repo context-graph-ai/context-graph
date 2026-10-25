@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
-use std::time::Duration;
 
 use context_graph::schema::{DIGEST_VECTOR_DIMENSION, TABLES};
 use contextdb_core::{Error, TxId, Value};
@@ -3144,7 +3143,7 @@ fn combination_invalidate_decision_concurrent_atomic_one_winner_count_invalidati
     let ready = (0..WRITER_COUNT)
         .map(|_| {
             ready_rx
-                .recv_timeout(Duration::from_secs(30))
+                .recv()
                 .expect("all invalidation writers report readiness")
         })
         .collect::<Vec<_>>();

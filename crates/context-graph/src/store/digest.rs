@@ -35,7 +35,7 @@ impl Store {
             });
         }
         let space = self
-            .embedding_space_for_id(&input.embedding.embedding_space_id)
+            .embedding_space_for_write(&input.embedding.embedding_space_id)
             .map_err(|_| CgError::UnknownEmbeddingSpace {
                 id: input.embedding.embedding_space_id.clone(),
             })?;

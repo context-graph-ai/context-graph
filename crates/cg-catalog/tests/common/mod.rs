@@ -177,6 +177,7 @@ pub fn stub_base_url(server: &tiny_http::Server) -> String {
 }
 
 pub struct CountedNomicFixtureServer {
+    server: std::sync::Arc<tiny_http::Server>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     server_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -185,6 +186,7 @@ impl CountedNomicFixtureServer {
     fn stop_and_join(&mut self) -> std::thread::Result<()> {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.server.unblock();
         match self.server_thread.take() {
             Some(server_thread) => server_thread.join(),
             None => Ok(()),
@@ -208,10 +210,12 @@ pub fn serve_nomic_fixture_until_idle_counted(
 ) -> CountedNomicFixtureServer {
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server_shutdown = std::sync::Arc::clone(&shutdown);
+    let server = std::sync::Arc::new(server);
+    let worker_server = std::sync::Arc::clone(&server);
     let server_thread = std::thread::spawn(move || {
         while !server_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            match server.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Some(request)) => {
+            match worker_server.recv() {
+                Ok(request) => {
                     request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let url = request.url().to_string();
                     let filename = ["tokenizer.json", "config.json", "REVISION"]
@@ -222,12 +226,12 @@ pub fn serve_nomic_fixture_until_idle_counted(
                         fs::read(fixture_dir("nomic").join(filename)).expect("fixture bytes");
                     let _ = request.respond(tiny_http::Response::from_data(bytes));
                 }
-                Ok(None) => {}
                 Err(_) => break,
             }
         }
     });
     CountedNomicFixtureServer {
+        server,
         shutdown,
         server_thread: Some(server_thread),
     }
@@ -827,5 +831,157 @@ pub fn acceptance(scope_key: &str) -> AcceptanceRecord {
             .to_string(),
         artifact_sha: FIXTURE_GEMMA_MODEL_SAFETENSORS_SHA.to_string(),
         scope_key: scope_key.to_string(),
+    }
+}
+
+/// Collector writes and delivery waits share the same predicate lock. Dropping a
+/// callback's collector guard announces its update without polling a clock.
+pub struct Collector<T> {
+    items: std::sync::Mutex<Vec<T>>,
+    changed: std::sync::Condvar,
+}
+
+pub struct CollectorGuard<'a, T> {
+    items: std::sync::MutexGuard<'a, Vec<T>>,
+    changed: &'a std::sync::Condvar,
+}
+
+impl<T> std::ops::Deref for CollectorGuard<'_, T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl<T> std::ops::DerefMut for CollectorGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.items
+    }
+}
+
+impl<T> Drop for CollectorGuard<'_, T> {
+    fn drop(&mut self) {
+        self.changed.notify_all();
+    }
+}
+
+impl<T> Collector<T> {
+    pub fn new() -> Self {
+        Self {
+            items: std::sync::Mutex::new(Vec::new()),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    pub fn lock(&self) -> std::result::Result<CollectorGuard<'_, T>, &'static str> {
+        self.items
+            .lock()
+            .map(|items| CollectorGuard {
+                items,
+                changed: &self.changed,
+            })
+            .map_err(|_| "collector lock poisoned")
+    }
+}
+
+pub fn wait_for_len<T>(items: &std::sync::Arc<Collector<T>>, expected: usize) {
+    let guard = items.items.lock().expect("collector");
+    let _guard = items
+        .changed
+        .wait_while(guard, |entries| entries.len() < expected)
+        .expect("delivery notification");
+}
+
+/// A child reports an actual refused OS-lock attempt and waits for the parent.
+/// Sockets live under /tmp so macOS's Unix socket path limit is respected.
+pub struct LockCheckpoint {
+    directory: tempfile::TempDir,
+    listener: std::os::unix::net::UnixListener,
+}
+
+impl LockCheckpoint {
+    pub fn new() -> Self {
+        let directory = tempfile::tempdir_in("/tmp").expect("checkpoint directory");
+        let listener = std::os::unix::net::UnixListener::bind(directory.path().join("lock.sock"))
+            .expect("checkpoint listener");
+        Self {
+            directory,
+            listener,
+        }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.directory.path().join("lock.sock")
+    }
+
+    pub fn entered(&self) -> std::os::unix::net::UnixStream {
+        use std::io::Read;
+        let (mut stream, _) = self.listener.accept().expect("child lock checkpoint");
+        let mut signal = [0];
+        stream
+            .read_exact(&mut signal)
+            .expect("lock refusal announcement");
+        assert_eq!(signal, [1]);
+        stream
+    }
+}
+
+pub fn catalog_with_child_lock_checkpoint(catalog: Catalog) -> Catalog {
+    use std::io::{Read, Write};
+    let Some(path) = std::env::var_os("CG_CATALOG_TEST_LOCK_CHECKPOINT") else {
+        return catalog;
+    };
+    let once = std::sync::atomic::AtomicBool::new(false);
+    catalog.with_lock_wait_observer_for_test(move || {
+        if once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let mut stream = std::os::unix::net::UnixStream::connect(&path).expect("lock checkpoint");
+        stream
+            .write_all(&[1])
+            .expect("announce refused lock attempt");
+        let mut release = [0];
+        stream
+            .read_exact(&mut release)
+            .expect("release lock acquire");
+        assert_eq!(release, [1]);
+    })
+}
+
+pub fn release_lock_checkpoint(mut stream: std::os::unix::net::UnixStream) {
+    use std::io::Write;
+    stream.write_all(&[1]).expect("release child lock acquire");
+}
+
+pub struct FixtureServer {
+    server: std::sync::Arc<tiny_http::Server>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FixtureServer {
+    pub fn from_server(
+        server: std::sync::Arc<tiny_http::Server>,
+        run: impl FnOnce(std::sync::Arc<tiny_http::Server>) + Send + 'static,
+    ) -> Self {
+        let worker = std::sync::Arc::clone(&server);
+        Self {
+            server,
+            thread: Some(std::thread::spawn(move || run(worker))),
+        }
+    }
+
+    pub fn join(mut self) -> std::thread::Result<()> {
+        self.server.unblock();
+        self.thread.take().expect("server thread").join()
+    }
+}
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.server.unblock();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }

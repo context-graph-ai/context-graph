@@ -88,7 +88,7 @@ jobs:
                          and not job.name.startswith('development-binaries / ')]
           expected = {'source', 'docs', 'PR checks',
                       'Feature compatibility — default and minimal libraries (ubuntu-latest)',
-                      'Feature compatibility — sync, CLI and doctests (ubuntu-latest)'}
+                      'Feature compatibility — sync and CLI (ubuntu-latest)'}
           for os_name in ('ubuntu-latest',):
               expected.update({f'lint ({os_name})', f'CI controls ({os_name})'})
               expected.update(f'Default tests — {bundle} ({os_name})' for bundle in

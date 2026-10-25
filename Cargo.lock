@@ -590,6 +590,7 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "candle-embeddinggemma",
+ "cg-catalog",
  "cg-cli-conventions",
  "chrono",
  "context-graph",
@@ -912,7 +913,7 @@ dependencies = [
 [[package]]
 name = "contextdb-core"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "bincode 2.0.1",
  "rand 0.9.4",
@@ -926,9 +927,10 @@ dependencies = [
 [[package]]
 name = "contextdb-engine"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "bao-tree",
+ "base64 0.22.1",
  "bincode 2.0.1",
  "blake3",
  "bytes",
@@ -971,7 +973,7 @@ dependencies = [
 [[package]]
 name = "contextdb-graph"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -982,7 +984,7 @@ dependencies = [
 [[package]]
 name = "contextdb-hnsw"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "anndists",
  "anyhow",
@@ -1006,7 +1008,7 @@ dependencies = [
 [[package]]
 name = "contextdb-parser"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "contextdb-core",
  "pest",
@@ -1016,7 +1018,7 @@ dependencies = [
 [[package]]
 name = "contextdb-planner"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "contextdb-core",
  "contextdb-parser",
@@ -1025,7 +1027,7 @@ dependencies = [
 [[package]]
 name = "contextdb-redb"
 version = "4.1.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "libc",
 ]
@@ -1033,7 +1035,7 @@ dependencies = [
 [[package]]
 name = "contextdb-relational"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "contextdb-core",
  "contextdb-tx",
@@ -1044,7 +1046,7 @@ dependencies = [
 [[package]]
 name = "contextdb-server"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "blake3",
  "clap",
@@ -1072,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "contextdb-tx"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "contextdb-core",
  "parking_lot",
@@ -1081,7 +1083,7 @@ dependencies = [
 [[package]]
 name = "contextdb-vector"
 version = "1.0.0"
-source = "git+https://github.com/context-graph-ai/contextdb?rev=bc9cce955eb85fb1488f5304426eedeb6d97e905#bc9cce955eb85fb1488f5304426eedeb6d97e905"
+source = "git+https://github.com/context-graph-ai/contextdb?rev=56dccfdc905653370a7a6775d0998b1053e5926a#56dccfdc905653370a7a6775d0998b1053e5926a"
 dependencies = [
  "anndists",
  "contextdb-core",
@@ -1284,9 +1286,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -1752,7 +1754,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3836,7 +3838,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4877,7 +4879,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4935,7 +4937,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4946,9 +4948,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -5048,7 +5050,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5512,7 +5514,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5723,9 +5725,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -6442,18 +6444,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.8"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.7"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -6507,7 +6509,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

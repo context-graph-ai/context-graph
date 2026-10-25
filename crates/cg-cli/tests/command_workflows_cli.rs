@@ -292,55 +292,61 @@ fn chat_completion_body(
 
 fn spawn_chat_completion_sequence_server(
     responses: Vec<ChatCompletionStubResponse>,
-) -> (String, mpsc::Receiver<Vec<String>>) {
+) -> (String, mpsc::Receiver<Result<Vec<String>, String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind hosted provider fixture");
-    listener
-        .set_nonblocking(true)
-        .expect("sequence listener nonblocking");
     let address = listener.local_addr().expect("hosted provider address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut requests = Vec::new();
-        for response in responses {
-            let Some(mut stream) = accept_sequence_request(&listener) else {
-                break;
-            };
-            requests.push(read_http_request(&mut stream));
-            write_http_response(&mut stream, response.status, &response.body);
-        }
-        let _ = tx.send(requests);
+        let result = (|| {
+            let mut requests = Vec::new();
+            for (index, response) in responses.into_iter().enumerate() {
+                let context = |err| format!("hosted sequence request {}: {err}", index + 1);
+                let Some(mut stream) = accept_sequence_request(&listener).map_err(context)? else {
+                    break;
+                };
+                requests.push(read_http_request(&mut stream).map_err(context)?);
+                write_http_response(&mut stream, response.status, &response.body)
+                    .map_err(context)?;
+            }
+            Ok(requests)
+        })();
+        let _ = tx.send(result);
     });
     (format!("http://{address}/v1"), rx)
 }
 
-fn accept_sequence_request(listener: &TcpListener) -> Option<TcpStream> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => return Some(stream),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => return None,
-        }
-    }
+fn accept_sequence_request(listener: &TcpListener) -> Result<Option<TcpStream>, String> {
+    listener
+        .accept()
+        .map(|(stream, _)| Some(stream))
+        .map_err(|err| format!("accept provider request: {err}"))
 }
 
-fn read_http_request(stream: &mut TcpStream) -> String {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|err| format!("clone provider stream: {err}"))?,
+    );
     let mut first_line = String::new();
-    reader
+    if reader
         .read_line(&mut first_line)
-        .expect("read provider request line");
+        .map_err(|err| format!("read provider request line: {err}"))?
+        == 0
+    {
+        return Err("read provider request line: client disconnected".to_string());
+    }
     let mut request = first_line;
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
-        let bytes = reader.read_line(&mut line).expect("read provider header");
-        if bytes == 0 || line == "\r\n" {
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|err| format!("read provider header: {err}"))?;
+        if bytes == 0 {
+            return Err("read provider header: client disconnected".to_string());
+        }
+        if line == "\r\n" {
             request.push_str("\r\n");
             break;
         }
@@ -355,13 +361,13 @@ fn read_http_request(stream: &mut TcpStream) -> String {
         let mut request_body = vec![0; content_length];
         reader
             .read_exact(&mut request_body)
-            .expect("read provider request body");
+            .map_err(|err| format!("read provider request body: {err}"))?;
         request.push_str(&String::from_utf8_lossy(&request_body));
     }
-    request
+    Ok(request)
 }
 
-fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) {
+fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) -> Result<(), String> {
     let body = body.to_string();
     let reason = if status == 400 { "Bad Request" } else { "OK" };
     let response = format!(
@@ -371,11 +377,13 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) {
     );
     stream
         .write_all(response.as_bytes())
-        .expect("write provider response");
+        .map_err(|err| format!("write provider response: {err}"))
 }
 
-fn hosted_requests(rx: mpsc::Receiver<Vec<String>>) -> Vec<String> {
-    rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default()
+fn hosted_requests(rx: mpsc::Receiver<Result<Vec<String>, String>>) -> Vec<String> {
+    rx.recv()
+        .expect("collect hosted sequence requests")
+        .unwrap_or_else(|err| panic!("hosted sequence server failed: {err}"))
 }
 
 fn hosted_request_body(request: &str) -> Value {
@@ -2376,7 +2384,7 @@ fn hosted_record_usage_receipt_flows_through_connected_extractor() {
         transcript,
     );
     let request = provider_requests
-        .recv_timeout(Duration::from_secs(5))
+        .recv()
         .expect("record must call the configured hosted provider through ConnectedModelExtractor");
     assert!(
         request.contains("hosted usage flows through connected extractor"),

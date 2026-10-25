@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,7 @@ struct StagedDuplicateHandleProbe {
     observed: Mutex<Vec<ObservedDuplicateHandleWrite>>,
     evidence_insert_queries: AtomicUsize,
     handle_insert_queries: AtomicUsize,
+    handle_queries_changed: (Mutex<()>, Condvar),
     first_full_precommit_seen: AtomicBool,
     first_full_precommit_open: AtomicBool,
     concurrent_writer_reached_handle_sql: AtomicBool,
@@ -273,14 +274,12 @@ impl StagedDuplicateHandleProbe {
                     .is_ok()
             {
                 self.first_full_precommit_open.store(true, Ordering::SeqCst);
-                for _ in 0..200 {
-                    if self.handle_insert_queries.load(Ordering::SeqCst) >= 2 {
-                        self.concurrent_writer_reached_handle_sql
-                            .store(true, Ordering::SeqCst);
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
+                // Both real handle statements have reached on_query before either
+                // may commit; never wait while holding the engine's pre-commit fences.
+                self.concurrent_writer_reached_handle_sql.store(
+                    self.handle_insert_queries.load(Ordering::SeqCst) >= 2,
+                    Ordering::SeqCst,
+                );
                 self.first_full_precommit_open
                     .store(false, Ordering::SeqCst);
             }
@@ -298,10 +297,25 @@ impl DatabasePlugin for StagedDuplicateHandleProbe {
             self.evidence_insert_queries.fetch_add(1, Ordering::SeqCst);
         }
         if sql.starts_with("INSERT INTO evidence_embedding_handles ") {
+            let mut guard = self
+                .handle_queries_changed
+                .0
+                .lock()
+                .expect("handle query gate");
             let count = self.handle_insert_queries.fetch_add(1, Ordering::SeqCst) + 1;
             if count >= 2 && self.first_full_precommit_open.load(Ordering::SeqCst) {
                 self.concurrent_writer_reached_handle_sql
                     .store(true, Ordering::SeqCst);
+            }
+            self.handle_queries_changed.1.notify_all();
+            // Park before executing either handle INSERT, so the second writer
+            // cannot need a read fence already held by the first pre_commit.
+            while self.handle_insert_queries.load(Ordering::SeqCst) < 2 {
+                guard = self
+                    .handle_queries_changed
+                    .1
+                    .wait(guard)
+                    .expect("both real handle SQL statements admitted");
             }
         }
         Ok(())

@@ -69,6 +69,18 @@ Ownership boundaries above are review-only architectural constraints unless a gu
   `src/store/mod.rs`, and feature-gated bundled artifact IO in `src/embedder/nomic.rs`.
   Ordinary node filesystem work belongs to `cg-node-fs`; adding core IO requires an explicit placement decision.
 
+Embedding-route validation preserves typed lookup refusals; only an absent space yields
+`UnknownEmbeddingSpace`. Guard: `src/store/observation.rs::tests::embedding_route_lookup_is_the_writes_own_and_keeps_its_typed_refusal`.
+A write's own lookups (`Store::write_lookup` in `src/store/graph_rows.rs`) are statement reads, never
+charged to the caller read budget, so a write during a reindex is not refused for time spent queued
+behind its commits. Guard: `src/store/observation.rs::tests::observation_recorded_while_a_reindex_commit_holds_the_commit_boundary_is_not_refused_by_the_read_budget`.
+For deterministic reads, adapt ContextDB's existing `DeadlineClock` through the test-only
+`src/store/graph_rows.rs` seam. For background capture, use the synchronous test drive in
+`src/capture_sync_status.rs`, with the canonical Wallclock guard on the executing thread.
+Both timing-site arms in `tests/test_estate_audit.rs` include private test modules; only default-tier
+test counting excludes them. Never park a fixture in a pre-commit callback while its sibling
+needs an engine read fence; rendezvous before the real statements enter that commit phase.
+
 Fast check: `cargo test -p context-graph --test event_capture --test read_memory_policy`.
 Full gate: `scripts/gate.sh`. Public contracts live in [library API](../../docs/library-api.md)
 and [CLI reference](../../docs/cli.md); preserve the README doctest shim in `src/lib.rs`.
