@@ -17,6 +17,8 @@ mod event_history_status;
 mod event_import;
 pub(crate) mod event_interpretation;
 pub(crate) mod event_search_projection;
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) mod event_search_projection_correctness;
 pub(crate) mod event_search_read;
 pub(crate) mod evidence;
 pub(crate) mod graph_rows;
@@ -87,6 +89,10 @@ pub use self::event_search_projection::{
     fail_next_event_search_membership_capture_for_test,
     fail_next_event_search_membership_capture_with_error_for_test,
     take_event_search_membership_captures_for_test,
+};
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub use self::event_search_projection::{
+    EventSearchGenerationVerification, advance_bound_interpretation_stamp_for_test,
 };
 // The read door holds a declaration to the persisted table too, and must decide that the same way
 // this door does: one conversion from declared text to the store's own scope vocabulary.
@@ -242,6 +248,26 @@ impl Store {
             None,
             None,
             DatabaseOpenExtras::default(),
+            registrations,
+            ConsumerSchema::none(),
+        )
+    }
+
+    pub(crate) fn open_with_projection_vector_session(
+        config: StoreConfig,
+        registrations: Vec<EmbedderRegistration>,
+        session: Arc<contextdb_engine::WriterVectorSession>,
+    ) -> Result<Self> {
+        let extras = DatabaseOpenExtras {
+            vector_session: Some(session),
+            ..DatabaseOpenExtras::default()
+        };
+        Self::open_with_config_inner_with_plugin(
+            config,
+            false,
+            None,
+            None,
+            extras,
             registrations,
             ConsumerSchema::none(),
         )
@@ -965,6 +991,7 @@ impl graph_rows::GraphRows for Store {
 #[derive(Clone, Default)]
 pub(crate) struct DatabaseOpenExtras {
     plugin: Option<Arc<dyn DatabasePlugin>>,
+    vector_session: Option<Arc<contextdb_engine::WriterVectorSession>>,
     owner_control: Option<ControlHandler>,
     /// Whether this open may bring the store into existence. The default is the creating
     /// disposition every opener that came before has always had.
@@ -979,6 +1006,7 @@ impl DatabaseOpenExtras {
     pub(crate) fn with_plugin(plugin: Arc<dyn DatabasePlugin>) -> Self {
         Self {
             plugin: Some(plugin),
+            vector_session: None,
             owner_control: None,
             open_disposition: OpenDisposition::default(),
         }
@@ -987,6 +1015,7 @@ impl DatabaseOpenExtras {
     fn with_owner_control(handler: ControlHandler) -> Self {
         Self {
             plugin: None,
+            vector_session: None,
             owner_control: Some(handler),
             open_disposition: OpenDisposition::default(),
         }
@@ -996,6 +1025,7 @@ impl DatabaseOpenExtras {
     fn existing_only() -> Self {
         Self {
             plugin: None,
+            vector_session: None,
             owner_control: None,
             open_disposition: OpenDisposition::ExistingOnly,
         }
@@ -1067,17 +1097,25 @@ fn open_bootstrapped_database(
                 && !replace_shared_handle
                 && let Some(existing) = guard.get(db_path).and_then(Weak::upgrade)
             {
+                if let Some(session) = &extras.vector_session {
+                    existing.reattach_writer_vector_session(session);
+                }
                 return Ok((guard, existing, true));
             }
             let db = Arc::new(
-                Database::open_with_options(
-                    db_path,
-                    extras.open_options(
+                {
+                    let options = extras.open_options(
                         config.read_memory_limit_bytes,
                         config.read_active_time_ms,
                         config.write_memory_limit_bytes,
-                    ),
-                )
+                    );
+                    match &extras.vector_session {
+                        Some(session) => {
+                            Database::open_with_writer_vector_session(db_path, options, session)
+                        }
+                        None => Database::open_with_options(db_path, options),
+                    }
+                }
                 .map_err(|error| extras.map_refusal(db_path, error))?,
             );
             Ok((guard, db, false))

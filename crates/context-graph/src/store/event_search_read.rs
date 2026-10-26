@@ -193,6 +193,18 @@ fn record_statement(sql: &str) {
 #[inline(always)]
 fn record_statement(_sql: &str) {}
 
+/// One statement the projection executed outside the read doors below, charged to this thread's
+/// open recording like a read through them. Compiled out of every build without the test seam.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(crate) fn record_executed_statement(sql: &str, trace: &contextdb_engine::QueryTrace) {
+    record_statement(sql);
+    let _ = record_cursor_trace(|| Ok(trace));
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+#[inline(always)]
+pub(crate) fn record_executed_statement(_sql: &str, _trace: &contextdb_engine::QueryTrace) {}
+
 impl EventSearchRows for Store {
     fn query_rows(
         &self,

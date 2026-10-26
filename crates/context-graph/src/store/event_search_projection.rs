@@ -55,6 +55,44 @@ fn open_for_run(
     )
 }
 
+fn open_for_run_with_vector_session(
+    config: &crate::StoreConfig,
+    embedder: &crate::EmbedderRegistration,
+    session: &std::sync::Arc<contextdb_engine::WriterVectorSession>,
+) -> Result<Store> {
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    STORE_OPENS.with(|opens| opens.set(opens.get() + 1));
+    super::open_retry::retry(
+        &config.db_path,
+        super::open_retry::Contention::Writer,
+        || {
+            Store::open_with_projection_vector_session(
+                config.clone(),
+                vec![embedder.clone()],
+                session.clone(),
+            )
+        },
+    )
+}
+
+fn carry_projection_vector_tail(
+    store: &Store,
+    generation: &Generation,
+    session: &contextdb_engine::WriterVectorSession,
+) {
+    let partition = contextdb_engine::VectorPartitionRef::new(
+        contextdb_core::VectorIndexRef::new("event_search_passages", "vector_text"),
+        contextdb_core::VectorPartitionKey::from_values(&[
+            Value::Uuid(generation.context_id.as_uuid()),
+            Value::Uuid(generation.id.as_uuid()),
+        ])
+        .expect("UUID partition components"),
+    );
+    store
+        .internal_db()
+        .detach_writer_vector_session(session, &partition);
+}
+
 /// Admission shared by every projection door that has selected an event-search registration.
 /// Capability support stays a typed embedder condition; a supported embedder's finite ceiling is
 /// then checked without normalizing the caller's profile.
@@ -152,7 +190,7 @@ impl HeldClaim {
 /// that has already been taken over is left alone. A late result carrying this token is still
 /// refused afterwards, because the commit path requires its own lease row to still be there.
 ///
-/// Best effort by nature: a process that is killed outright releases nothing, and its lease expiry
+/// Best effort by nature: a process that is killed outright releases its kernel presence; lease expiry
 /// remains the backstop.
 fn release_claim(
     config: &crate::StoreConfig,
@@ -177,9 +215,8 @@ fn release_claim_in(store: &Store, held: &HeldClaim) {
 /// retryable stale claim; the caller must surface it instead of hiding failed cleanup behind the
 /// next claim attempt.
 fn try_release_claim_in(store: &Store, held: &HeldClaim) -> Result<()> {
-    store
-        .internal_db()
-        .execute(
+    release_claim_presence(store.db_path(), &held.owner_token);
+    execute_counted(store,
         "DELETE FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id AND owner_token = $owner_token AND lease_epoch = $lease_epoch",
         &HashMap::from([
             (
@@ -199,6 +236,36 @@ fn try_release_claim_in(store: &Store, held: &HeldClaim) -> Result<()> {
     )
         .map(|_| ())
         .map_err(map_engine_err)
+}
+
+/// An unexpired lease blocks another worker only while its process still holds presence.
+/// Memory stores and platforms without holder locks retain the lease's existing TTL contract.
+fn claim_owner_live(store: &Store, owner: &str, expires_at: i64, now: i64) -> Result<bool> {
+    if expires_at <= now {
+        return Ok(false);
+    }
+    #[cfg(target_os = "linux")]
+    if store.db_path() != std::path::Path::new(":memory:") {
+        let token = uuid::Uuid::parse_str(owner)
+            .map_err(|_| CgError::Engine("invalid event-search claim owner token".into()))?;
+        return contextdb_engine::persistence::holder_presence::probe(
+            store.db_path(),
+            *token.as_bytes(),
+        )
+        .map(|holder| holder == contextdb_engine::persistence::holder_presence::Holder::Present)
+        .map_err(map_engine_err);
+    }
+    let _ = (store, owner);
+    Ok(true)
+}
+
+fn release_claim_presence(store_path: &std::path::Path, owner: &str) {
+    if let Ok(token) = uuid::Uuid::parse_str(owner) {
+        let _ = contextdb_engine::persistence::holder_presence::release_kept(
+            store_path,
+            *token.as_bytes(),
+        );
+    }
 }
 
 /// The claim's current expiry and renewal, carried through preparation and every embed call.
@@ -235,9 +302,7 @@ fn renew_claim(store: &Store, held: &HeldClaim, expires_at: i64, bounds: Bounds)
                 .map_err(|_| CgError::Engine("event-search lease exceeds TIMESTAMP".into()))?,
         )
         .ok_or_else(|| CgError::Engine("event-search lease expiry exhausted TIMESTAMP".into()))?;
-    let updated = store
-        .internal_db()
-        .execute(
+    let updated = execute_counted(store,
             "UPDATE event_search_leases SET expires_at = $renewed WHERE context_id = $context_id AND generation_id = $generation_id AND owner_token = $owner_token AND lease_epoch = $lease_epoch AND expires_at = $expires_at",
             &HashMap::from([
                 ("renewed".to_string(), Value::Timestamp(renewed)),
@@ -258,7 +323,7 @@ fn renew_claim(store: &Store, held: &HeldClaim, expires_at: i64, bounds: Bounds)
             ]),
         )
         .map_err(map_engine_err)?;
-    if updated.rows_affected() != 1 {
+    if updated.rows_affected != 1 {
         return Err(stale_claim(
             "event-search claim was taken over while embedding",
         ));
@@ -347,6 +412,43 @@ pub fn set_event_search_projection_read_deadline_ms_for_test(active_ms: Option<u
 #[doc(hidden)]
 pub fn take_event_search_membership_captures_for_test() -> usize {
     MEMBERSHIP_CAPTURES.with(|count| count.replace(0))
+}
+
+/// Move the connector's active, ready interpretation generation forward by one ordinal while it
+/// stays a completely sealed ready input (`event_count`, `capture_ordinal` and `build_ordinal`
+/// advance together) and no event is appended: the stamp a search generation was certified
+/// against no longer describes it, while the Context's event revision and the interpretation
+/// binding are unchanged. The product's own builds seal a new generation instead; this fixture
+/// isolates the stamp half of completion's reuse check.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[doc(hidden)]
+pub fn advance_bound_interpretation_stamp_for_test(
+    store: &Store,
+    context_id: crate::ContextId,
+    connector_id: &str,
+) -> Result<()> {
+    let params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("connector_id".into(), Value::Text(connector_id.into())),
+    ]);
+    let head = execute_counted(store,
+            "SELECT generation_id FROM event_interpretation_heads WHERE context_id = $context_id AND connector_id = $connector_id",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+    let row = head
+        .rows
+        .first()
+        .ok_or_else(|| CgError::Engine("the connector has no active interpretation".into()))?;
+    let id = get_uuid(row, &head.columns, "generation_id")?;
+    let mut params = params;
+    params.insert("id".into(), Value::Uuid(id));
+    execute_counted(store,
+            "UPDATE event_interpretation_generations SET event_count = event_count + 1, capture_ordinal = capture_ordinal + 1, build_ordinal = build_ordinal + 1 WHERE context_id = $context_id AND connector_id = $connector_id AND id = $id AND state = 'ready'",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+    Ok(())
 }
 
 /// Run one rendezvous immediately before the next matching-attempt failure write.
@@ -544,6 +646,7 @@ struct Generation {
     ordered_source_set_sha256: String,
     source_content_sha256: String,
     target: SourceSnapshot,
+    certified: Option<CaptureCertificate>,
     started_at: TxId,
     attempt_tx: Option<TxId>,
     attempt_token: Option<uuid::Uuid>,
@@ -574,6 +677,15 @@ struct SourceSnapshot {
     event_count: u64,
     ordered_source_set_sha256: String,
     source_content_sha256: String,
+}
+
+/// The Context revision and interpretation stamp a membership capture was certified against.
+/// Completion reuses the capture while both are unchanged, and refuses to finalize past a
+/// revision the capture never saw.
+#[derive(Clone, Debug, PartialEq)]
+struct CaptureCertificate {
+    revision: TxId,
+    stamp: JsonValue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -686,8 +798,8 @@ impl SessionWorkSet {
 
 enum ClaimResult {
     Work(Box<Claim>),
-    Complete,
-    ScopeComplete,
+    /// No selected stream has pending work; completion decides whether the generation is done.
+    NoPendingWork,
 }
 
 enum FinishResult {
@@ -783,8 +895,8 @@ pub(crate) fn catch_up_standalone_with_batch_limits(
     ) -> Result<NonZeroUsize>,
 ) -> EventSearchRunOutcome {
     let mut observations = RunObservations::default();
-    let mut result = validate_profile_for_registration(&request.profile, &request.embedder)
-        .and_then(|()| {
+    let result =
+        validate_profile_for_registration(&request.profile, &request.embedder).and_then(|()| {
             catch_up_standalone_run(
                 &mut request,
                 policy,
@@ -795,6 +907,17 @@ pub(crate) fn catch_up_standalone_with_batch_limits(
                 &mut observations,
             )
         });
+    let mut result = match result {
+        Err(error) if is_unit_cut(&error) => open_for_run(&request.store, &request.embedder)
+            .and_then(|store| {
+                let context_ids = request.contexts.context_ids();
+                let context_id = *context_ids.first().ok_or_else(|| {
+                    CgError::Engine("a cut projection run names no Context".into())
+                })?;
+                unit_cut_receipt(&store, context_id, &request.profile)
+            }),
+        other => other,
+    };
     let failure_disposition = match &result {
         Ok(_) => EventSearchFailureDisposition::NoFailure,
         Err(error) => persist_run_failure(
@@ -827,8 +950,8 @@ pub(crate) fn catch_up_standalone_with_selected_work(
 ) -> EventSearchRunOutcome {
     let request_limit = request.store.write_memory_limit_bytes;
     let mut observations = RunObservations::default();
-    let mut result = validate_profile_for_registration(&request.profile, &request.embedder)
-        .and_then(|()| {
+    let result =
+        validate_profile_for_registration(&request.profile, &request.embedder).and_then(|()| {
             catch_up_standalone_run(
                 &mut request,
                 policy,
@@ -839,6 +962,17 @@ pub(crate) fn catch_up_standalone_with_selected_work(
                 &mut observations,
             )
         });
+    let mut result = match result {
+        Err(error) if is_unit_cut(&error) => open_for_run(&request.store, &request.embedder)
+            .and_then(|store| {
+                let context_ids = request.contexts.context_ids();
+                let context_id = *context_ids.first().ok_or_else(|| {
+                    CgError::Engine("a cut projection run names no Context".into())
+                })?;
+                unit_cut_receipt(&store, context_id, &request.profile)
+            }),
+        other => other,
+    };
     let failure_disposition = match &result {
         Ok(_) => EventSearchFailureDisposition::NoFailure,
         Err(error) => persist_run_failure(
@@ -910,9 +1044,7 @@ fn record_run_failure(
     attempt: ProjectionAttempt,
     reason: &str,
 ) -> Result<EventSearchFailureDisposition> {
-    let updated = store
-        .internal_db()
-        .execute(
+    let updated = execute_counted(store,
             "UPDATE event_search_generations SET sanitized_failure = $failure WHERE context_id = $context_id AND id = $id AND last_attempt_at = $attempt AND last_attempt_token = $attempt_token",
             &HashMap::from([
                 ("failure".into(), Value::Text(reason.to_string())),
@@ -923,7 +1055,7 @@ fn record_run_failure(
             ]),
         )
         .map_err(map_engine_err)?;
-    match updated.rows_affected() {
+    match updated.rows_affected {
         1 => Ok(EventSearchFailureDisposition::Recorded),
         0 => Ok(EventSearchFailureDisposition::Stale),
         count => Err(CgError::Engine(format!(
@@ -966,15 +1098,15 @@ fn write_generation_attempt(
             ("context_id".into(), Value::Uuid(context_id.as_uuid())),
             ("id".into(), Value::Uuid(id.as_uuid())),
         ]);
-        let generation = store.internal_db().execute_in_tx(tx,
+        let generation = execute_in_tx_counted(store, tx,
             "SELECT last_attempt_at, last_attempt_token FROM event_search_generations WHERE context_id = $context_id AND id = $id", &params).map_err(map_engine_err)?;
         let row = generation
-            .rows()
+            .rows
             .first()
             .ok_or_else(|| stale_claim("event-search generation disappeared before attempt"))?;
         let conditions = exact_conditions(
             row,
-            generation.columns(),
+            &generation.columns,
             &["last_attempt_at", "last_attempt_token"],
         )?;
         if !store
@@ -992,17 +1124,22 @@ fn write_generation_attempt(
                 "event-search attempt changed before resumption",
             ));
         }
-        let lease = store.internal_db().execute_in_tx(tx,
+        let lease = execute_in_tx_counted(store, tx,
             "SELECT owner_token, lease_epoch, expires_at FROM event_search_leases WHERE context_id = $context_id AND generation_id = $id", &params).map_err(map_engine_err)?;
-        if let Some(row) = lease.rows().first() {
-            if get_timestamp(row, lease.columns(), "expires_at")? > now_millis()? {
+        if let Some(row) = lease.rows.first() {
+            if claim_owner_live(
+                store,
+                &get_text(row, &lease.columns, "owner_token")?,
+                get_timestamp(row, &lease.columns, "expires_at")?,
+                now_millis()?,
+            )? {
                 return Err(stale_claim(
                     "another event-search worker owns the unexpired claim",
                 ));
             }
             let conditions = exact_conditions(
                 row,
-                lease.columns(),
+                &lease.columns,
                 &["owner_token", "lease_epoch", "expires_at"],
             )?;
             if !store
@@ -1026,9 +1163,9 @@ fn write_generation_attempt(
             "failure".into(),
             failure.map_or(Value::Null, |reason| Value::Text(reason.to_string())),
         );
-        let updated = store.internal_db().execute_in_tx(tx,
+        let updated = execute_in_tx_counted(store, tx,
             "UPDATE event_search_generations SET last_attempt_at = $attempt, last_attempt_token = $attempt_token, sanitized_failure = $failure WHERE context_id = $context_id AND id = $id", &params).map_err(map_engine_err)?;
-        if updated.rows_affected() != 1 {
+        if updated.rows_affected != 1 {
             return Err(stale_claim(
                 "event-search generation disappeared while its attempt was recorded",
             ));
@@ -1067,9 +1204,7 @@ fn read_committed_attempt(
     generation_id: EventSearchGenerationId,
     token: uuid::Uuid,
 ) -> Result<(ProjectionAttempt, TxId)> {
-    let result = store
-        .internal_db()
-        .execute(
+    let result = execute_counted(store,
             "SELECT started_at, last_attempt_at FROM event_search_generations WHERE context_id = $context_id AND id = $id AND last_attempt_token = $attempt_token",
             &HashMap::from([
                 ("context_id".into(), Value::Uuid(context_id.as_uuid())),
@@ -1078,10 +1213,10 @@ fn read_committed_attempt(
             ]),
         )
         .map_err(map_engine_err)?;
-    let row = result.rows().first().ok_or_else(|| {
+    let row = result.rows.first().ok_or_else(|| {
         stale_claim("event-search attempt was superseded before committed timestamp readback")
     })?;
-    if result.rows().len() != 1 {
+    if result.rows.len() != 1 {
         return Err(stale_claim(
             "event-search attempt ownership token was not unique",
         ));
@@ -1090,10 +1225,10 @@ fn read_committed_attempt(
         ProjectionAttempt {
             context_id,
             generation_id,
-            tx: get_txid(row, result.columns(), "last_attempt_at")?,
+            tx: get_txid(row, &result.columns, "last_attempt_at")?,
             token,
         },
-        get_txid(row, result.columns(), "started_at")?,
+        get_txid(row, &result.columns, "started_at")?,
     ))
 }
 
@@ -1108,9 +1243,7 @@ fn read_committed_completion(store: &Store, generation: &Generation) -> Result<T
             "event-search generation has no completed attempt ownership token",
         ));
     };
-    let result = store
-        .internal_db()
-        .execute(
+    let result = execute_counted(store,
             "SELECT completed_at FROM event_search_generations WHERE context_id = $context_id AND id = $id AND last_attempt_at = $attempt AND last_attempt_token = $attempt_token",
             &HashMap::from([
                 (
@@ -1123,15 +1256,15 @@ fn read_committed_completion(store: &Store, generation: &Generation) -> Result<T
             ]),
         )
         .map_err(map_engine_err)?;
-    let row = result.rows().first().ok_or_else(|| {
+    let row = result.rows.first().ok_or_else(|| {
         stale_claim("event-search attempt was superseded before completion timestamp readback")
     })?;
-    if result.rows().len() != 1 {
+    if result.rows.len() != 1 {
         return Err(stale_claim(
             "event-search completion ownership token was not unique",
         ));
     }
-    get_optional_txid(row, result.columns(), "completed_at")?.ok_or_else(|| {
+    get_optional_txid(row, &result.columns, "completed_at")?.ok_or_else(|| {
         stale_claim("event-search ready generation has no committed completion transaction")
     })
 }
@@ -1151,6 +1284,7 @@ fn catch_up_standalone_run(
     mut resolve_selected_limit: Option<&mut SelectedBatchLimitResolver<'_>>,
     observations: &mut RunObservations,
 ) -> Result<EventSearchBuildReceipt> {
+    let vector_session = std::sync::Arc::new(contextdb_engine::WriterVectorSession::default());
     let context_ids = request.contexts.context_ids();
     if context_ids.len() != 1 {
         return Err(CgError::Engine(
@@ -1172,7 +1306,8 @@ fn catch_up_standalone_run(
         Some(resolve) => resolve(None)?.memory_limit_bytes,
         None => resolve_write_memory_limit(&|_| Ok(true))?,
     };
-    let store = open_for_run(&request.store, &request.embedder)?;
+    let store =
+        open_for_run_with_vector_session(&request.store, &request.embedder, &vector_session)?;
     let mut generation = measured(&mut observations.event_read, || {
         ensure_generation(
             &store,
@@ -1200,14 +1335,20 @@ fn catch_up_standalone_run(
     loop {
         let mut store = match open.take() {
             Some(store) => store,
-            None => open_for_run(&request.store, &request.embedder)?,
+            None => open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?,
         };
         let mut pending = measured(&mut observations.event_read, || {
             first_pending_stream(&store, &generation, &session_work, bounds)
         })?;
         let limit = if let Some(resolve) = resolve_selected_limit.as_mut() {
             let applies = |request_id| match &pending {
-                Some(pending) => selected_frontier(&store, context_id, request_id, pending),
+                Some(pending) => {
+                    selected_frontier(&store, context_id, generation.id, request_id, pending)
+                }
                 None => Ok(None),
             };
             let admitted = resolve(pending.as_ref().map(|pending| EventSearchPendingBatch {
@@ -1240,9 +1381,14 @@ fn catch_up_standalone_run(
             resolve_write_memory_limit(&|_| Ok(true))?
         };
         if limit != request.store.write_memory_limit_bytes {
+            carry_projection_vector_tail(&store, &generation, &vector_session);
             drop(store);
             request.store.write_memory_limit_bytes = limit;
-            store = open_for_run(&request.store, &request.embedder)?;
+            store = open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?;
         }
         #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
         if let Some(pending) = &pending {
@@ -1318,6 +1464,7 @@ fn catch_up_standalone_run(
                 FinishResult::Rebuild => unreachable!("rebuild handled while Store was open"),
             }
         };
+        carry_projection_vector_tail(&store, &generation, &vector_session);
         drop(store);
         let embedding_workers = resolve_embedding_workers();
 
@@ -1329,8 +1476,18 @@ fn catch_up_standalone_run(
             if !renewal_due(expires_at, bounds)? {
                 return Ok(expires_at);
             }
-            let store = open_for_run(&request.store, &request.embedder)?;
-            renew_claim(&store, &held, expires_at, bounds)
+            let store = open_for_run_with_vector_session(
+                &request.store,
+                &request.embedder,
+                &vector_session,
+            )?;
+            let result = renew_claim(&store, &held, expires_at, bounds);
+            if result.is_ok() {
+                carry_projection_vector_tail(&store, &generation, &vector_session);
+            } else {
+                vector_session.clear();
+            }
+            result
         };
         let rendered = render_and_embed(
             *claim,
@@ -1345,14 +1502,20 @@ fn catch_up_standalone_run(
             Ok(Rendered::Batch(built)) => *built,
             Ok(Rendered::OverPassageBound { fitting_events }) => {
                 // Nothing was embedded: let the claim go and take the events that fit.
-                let store = open_for_run(&request.store, &request.embedder)?;
+                let store = open_for_run_with_vector_session(
+                    &request.store,
+                    &request.embedder,
+                    &vector_session,
+                )?;
                 release_claim_in(&store, &held);
                 event_limit = fitting_events;
                 open = Some(store);
                 continue;
             }
             Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
+                release_claim_presence(&request.store.db_path, &held.owner_token);
                 // The claim was taken over while this run embedded; nothing is left to release.
+                vector_session.clear();
                 retries += 1;
                 continue;
             }
@@ -1362,7 +1525,11 @@ fn catch_up_standalone_run(
             }
         };
         let rendered_passages = built.passages.len();
-        let store = match open_for_run(&request.store, &request.embedder) {
+        let store = match open_for_run_with_vector_session(
+            &request.store,
+            &request.embedder,
+            &vector_session,
+        ) {
             Ok(store) => store,
             Err(error) => {
                 release_claim(&request.store, &request.embedder, &held);
@@ -1382,6 +1549,7 @@ fn catch_up_standalone_run(
             // a real takeover remains untouched because the exact delete no longer matches.
             if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) {
                 try_release_claim_in(&store, &held)?;
+                vector_session.clear();
                 retries += 1;
                 open = Some(store);
                 continue;
@@ -1578,6 +1746,7 @@ fn run_with_store(
                     continue;
                 }
                 Err(error) if retries < MAX_STALE_RETRIES as u64 && is_stale_claim(&error) => {
+                    release_claim_presence(store.db_path(), &held.owner_token);
                     retries += 1;
                     continue;
                 }
@@ -1600,6 +1769,11 @@ fn run_with_store(
             }
         }
     })();
+    // A test cut stops the run after a durable unit; it is no failure, and the next call resumes.
+    let result = match result {
+        Err(error) if is_unit_cut(&error) => unit_cut_receipt(store, context_id, &profile),
+        other => other,
+    };
     if let (Err(error), Some(attempt)) = (&result, observations.attempt)
         && !is_stale_claim(error)
     {
@@ -1611,31 +1785,37 @@ fn run_with_store(
     })
 }
 
-/// Leave every passage vector partition with a complete maintained graph before a projection
-/// reports ready. ContextDB builds and repairs vector graphs only through maintenance, never inside
-/// a write or a query, and persists them with the store; so a find after this, including the first
-/// find of a fresh process, searches a built graph instead of falling back to exact work or refusing
-/// for want of one. Each maintenance cycle builds every partition still missing its graph; a cycle
-/// that builds nothing while partitions remain is reported rather than retried.
+/// Publish durable graph coverage for every completed passage. The finite
+/// maintenance scheduler owns queued replacement work after import readiness.
 fn maintain_passage_vectors(store: &Store) -> Result<()> {
     loop {
+        let before = store
+            .db
+            .persist_import_vector_tails()
+            .map_err(map_engine_err)?;
         let vector = store
             .db
             .run_maintenance_cycle()
             .map_err(map_engine_err)?
             .vector;
-        if vector.remaining_partitions == 0 {
-            return Ok(());
-        }
         if let Some(failure) = vector.first_failure {
             return Err(CgError::Engine(format!(
                 "the search index for {} passage partitions could not be built: {failure:?}",
                 vector.remaining_partitions
             )));
         }
-        if vector.built_partitions == 0 {
+        // A replacement can publish during this finite wake. Validate and
+        // cover that committed catalog before reporting the import ready.
+        let after = store
+            .db
+            .persist_import_vector_tails()
+            .map_err(map_engine_err)?;
+        if after || vector.remaining_partitions == 0 {
+            return Ok(());
+        }
+        if before && vector.built_partitions == 0 {
             return Err(CgError::Engine(format!(
-                "the search index for {} passage partitions was not built by maintenance",
+                "durable passage graph coverage was lost while maintenance remained queued for {} partitions",
                 vector.remaining_partitions
             )));
         }
@@ -1649,6 +1829,68 @@ impl Store {
     #[doc(hidden)]
     pub fn maintain_event_search_vectors_for_test(&self) -> Result<()> {
         maintain_passage_vectors(self)
+    }
+}
+
+/// The full membership verification of one event-search generation.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSearchGenerationVerification {
+    pub member_count: u64,
+    pub ordered_source_set_sha256: String,
+    pub source_content_sha256: String,
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+impl Store {
+    /// Recompute a generation's membership chain from every persisted member's fields, refuse any
+    /// member whose stored chain value differs, and refuse a generation whose carried digests or
+    /// capture ordinal differ from the recomputed chain. Ordinary capture never runs this full walk;
+    /// every full capture runs the same fold. Test support only: the Store's public surface is
+    /// pinned (tests/acceptance/nomic_loads.rs).
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    pub fn verify_event_search_generation(
+        &self,
+        context_id: crate::ContextId,
+        generation_id: uuid::Uuid,
+    ) -> Result<EventSearchGenerationVerification> {
+        let generation_id = EventSearchGenerationId::from(generation_id);
+        let bounds = bounds(1024, 1024, usize::MAX, 60_000);
+        let folded = fold_source_membership(self, context_id, generation_id, bounds)?;
+        let generation = query_rows(
+            self,
+            bounds,
+            "SELECT capture_ordinal, capture_ordered_sha256, capture_content_sha256 FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("id".into(), Value::Uuid(generation_id.as_uuid())),
+            ]),
+        )?;
+        let row = generation.rows.first().ok_or(CgError::NotFound {
+            id: Some(generation_id.as_uuid().to_string()),
+            missing: Some("event-search generation"),
+        })?;
+        let capture_ordinal = get_u64(row, &generation.columns, "capture_ordinal")?;
+        let carried = MembershipChain::carried(
+            get_text(row, &generation.columns, "capture_ordered_sha256")?,
+            get_text(row, &generation.columns, "capture_content_sha256")?,
+            capture_ordinal,
+        );
+        let recomputed = MembershipChain {
+            ordered: folded.ordered_source_set_sha256.clone(),
+            content: folded.source_content_sha256.clone(),
+        };
+        if capture_ordinal != folded.event_count || carried.as_ref() != Some(&recomputed) {
+            return Err(CgError::Engine(format!(
+                "{MEMBERSHIP_CHAIN_CORRUPT}generation {} carries digests or a capture ordinal that differ from its members",
+                generation_id.as_uuid()
+            )));
+        }
+        Ok(EventSearchGenerationVerification {
+            member_count: folded.event_count,
+            ordered_source_set_sha256: folded.ordered_source_set_sha256,
+            source_content_sha256: folded.source_content_sha256,
+        })
     }
 }
 
@@ -1690,10 +1932,10 @@ pub(crate) fn persist_selected_work(
     let id = uuid::Uuid::new_v4();
     let tx = store.begin_tx()?;
     let result = (|| -> Result<()> {
-        store.internal_db().execute_in_tx(tx, "INSERT INTO event_search_request_headers (context_id, request_id) VALUES ($context_id, $request_id)",
-            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("request_id".into(), Value::Uuid(id))])).map_err(map_engine_err)?;
+        execute_in_tx_counted(store, tx, "INSERT INTO event_search_request_headers (context_id, request_id, observed_generation_id, observed_policy) VALUES ($context_id, $request_id, $observed, $policy)",
+            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("request_id".into(), Value::Uuid(id)), ("observed".into(), selected.observed_generation_id.map_or(Value::Null, Value::Uuid)), ("policy".into(), observed_policy_value(selected.observed_policy)?)])).map_err(map_engine_err)?;
         for (ordinal, stream) in selected.streams.iter().enumerate() {
-            store.internal_db().execute_in_tx(tx,
+            execute_in_tx_counted(store, tx,
                 "INSERT INTO event_search_request_selections (context_id, request_id, ordinal, connector_id, session_ref, source_instance_ref, frontier) VALUES ($context_id, $request_id, $ordinal, $connector, $session, $source, $frontier)",
                 &HashMap::from([
                     ("context_id".into(), Value::Uuid(context_id.as_uuid())),
@@ -1741,14 +1983,14 @@ pub(crate) fn persist_selected_work_with_retained_requests(
                 "SELECT renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile FROM event_search_generations WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("id".into(), Value::Uuid(generation_id))]),
             )?;
-            let Some(generation_row) = generation.rows().first() else {
+            let Some(generation_row) = generation.rows.first() else {
                 return Err(stale_claim("queued retention generation disappeared"));
             };
-            if get_text(generation_row, generation.columns(), "renderer_id")? == EVENT_SEARCH_RENDERER_ID
-                && get_text(generation_row, generation.columns(), "renderer_version")? == EVENT_SEARCH_RENDERER_VERSION
-                && get_json(generation_row, generation.columns(), "renderer_profile")? == desired_profile
-                && get_text(generation_row, generation.columns(), "embedding_space_id")? == desired_spec.embedding_space_id
-                && get_text(generation_row, generation.columns(), "encoding_profile")? == desired_spec.encoding_profile_id
+            if get_text(generation_row, &generation.columns, "renderer_id")? == EVENT_SEARCH_RENDERER_ID
+                && get_text(generation_row, &generation.columns, "renderer_version")? == EVENT_SEARCH_RENDERER_VERSION
+                && get_json(generation_row, &generation.columns, "renderer_profile")? == desired_profile
+                && get_text(generation_row, &generation.columns, "embedding_space_id")? == desired_spec.embedding_space_id
+                && get_text(generation_row, &generation.columns, "encoding_profile")? == desired_spec.encoding_profile_id
             {
                 return Ok(());
             }
@@ -1762,7 +2004,7 @@ pub(crate) fn persist_selected_work_with_retained_requests(
                         ("owner_token".into(), Value::Text(owner_token.clone())),
                     ]),
                 )?;
-                if !header.rows().is_empty() {
+                if !header.rows.is_empty() {
                     running_requests.insert(*request_id);
                 }
             }
@@ -1819,9 +2061,9 @@ fn load_work_frontiers(
             "event_search_request_selections",
         )
     };
-    let header = source.query_rows(&format!("SELECT request_id FROM {headers} WHERE context_id = $context_id AND request_id = $request_id"),
+    let header = source.query_rows(&format!("SELECT request_id, observed_generation_id, observed_policy FROM {headers} WHERE context_id = $context_id AND request_id = $request_id"),
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("request_id".into(), Value::Uuid(request_id))]))?;
-    if header.rows().is_empty() {
+    if header.rows.is_empty() {
         return Err(CgError::Engine(
             if refusal {
                 "retired search refusal has no durable selected-work identity"
@@ -1840,9 +2082,18 @@ fn load_work_frontiers(
             Ok(())
         },
     )?;
+    let observed_generation_id =
+        get_optional_uuid(&header.rows[0], &header.columns, "observed_generation_id")?;
+    let observed_policy =
+        match get_optional_text(&header.rows[0], &header.columns, "observed_policy")? {
+            Some(policy) => Some(serde_json::from_str(&policy).map_err(json_error)?),
+            None => None,
+        };
     Ok(EventSearchSelectedWork {
         request_id: Some(request_id),
         streams,
+        observed_generation_id,
+        observed_policy,
     })
 }
 
@@ -1859,17 +2110,23 @@ pub(crate) fn preserve_refusal_work(
     ]);
     if !store.query_rows(
         "SELECT request_id FROM event_search_refusal_headers WHERE context_id = $context_id AND request_id = $request_id", &params,
-    )?.rows().is_empty() {
+    )?.rows.is_empty() {
         return Ok(());
     }
     let selected = load_selected_work(store, context_id, request_id)?;
     let tx = store.begin_tx()?;
     let result = (|| -> Result<()> {
-        store.internal_db().execute_in_tx(tx,
-            "INSERT INTO event_search_refusal_headers (context_id, request_id) VALUES ($context_id, $request_id)", &params,
+        execute_in_tx_counted(store, tx,
+            "INSERT INTO event_search_refusal_headers (context_id, request_id, observed_generation_id, observed_policy) VALUES ($context_id, $request_id, $observed, $policy)",
+            &{
+                let mut values = params.clone();
+                values.insert("observed".into(), selected.observed_generation_id.map_or(Value::Null, Value::Uuid));
+                values.insert("policy".into(), observed_policy_value(selected.observed_policy)?);
+                values
+            },
         ).map_err(map_engine_err)?;
         for (ordinal, stream) in selected.streams.iter().enumerate() {
-            store.internal_db().execute_in_tx(tx,
+            execute_in_tx_counted(store, tx,
                 "INSERT INTO event_search_refusal_frontiers (context_id, request_id, ordinal, connector_id, session_ref, source_instance_ref, frontier) VALUES ($context_id, $request_id, $ordinal, $connector, $session, $source, $frontier)",
                 &HashMap::from([
                     ("context_id".into(), Value::Uuid(context_id.as_uuid())),
@@ -1919,11 +2176,11 @@ fn release_work_frontiers(
     let tx = store.begin_tx()?;
     let result = (|| -> Result<()> {
         for id in requests {
-            store.internal_db().execute_in_tx(tx,
+            execute_in_tx_counted(store, tx,
                 &format!("DELETE FROM {frontiers} WHERE context_id = $context_id AND request_id = $request_id"),
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("request_id".into(), Value::Uuid(*id))]),
             ).map_err(map_engine_err)?;
-            store.internal_db().execute_in_tx(tx, &format!("DELETE FROM {headers} WHERE context_id = $context_id AND request_id = $request_id"),
+            execute_in_tx_counted(store, tx, &format!("DELETE FROM {headers} WHERE context_id = $context_id AND request_id = $request_id"),
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("request_id".into(), Value::Uuid(*id))])).map_err(map_engine_err)?;
         }
         Ok(())
@@ -1972,19 +2229,19 @@ fn reconcile_work_frontiers(store: &Store, retained: &[uuid::Uuid], refusal: boo
             &format!("SELECT context_id, request_id FROM {headers}{predicate} LIMIT 64"),
             &params,
         )?;
-        if rows.rows().is_empty() {
+        if rows.rows.is_empty() {
             return Ok(());
         }
         let mut retired = BTreeMap::<crate::ContextId, Vec<uuid::Uuid>>::new();
-        for row in rows.rows() {
+        for row in &rows.rows {
             retired
                 .entry(crate::ContextId::from(get_uuid(
                     row,
-                    rows.columns(),
+                    &rows.columns,
                     "context_id",
                 )?))
                 .or_default()
-                .push(get_uuid(row, rows.columns(), "request_id")?);
+                .push(get_uuid(row, &rows.columns, "request_id")?);
         }
         for (context_id, requests) in retired {
             release_work_frontiers(store, context_id, &requests, refusal)?;
@@ -1992,12 +2249,30 @@ fn reconcile_work_frontiers(store: &Store, retained: &[uuid::Uuid], refusal: boo
     }
 }
 
+/// The frontier a saved request selects for `pending` in the run's generation: its listed frontier
+/// in the generation it observed; in any other generation the request re-selected its work, so it
+/// owns the stream with no frontier of its own (its ceiling still applies).
 fn selected_frontier(
     source: &dyn EventSearchRows,
     context_id: crate::ContextId,
+    run_generation_id: EventSearchGenerationId,
     request_id: uuid::Uuid,
     pending: &PendingStream,
 ) -> Result<Option<u64>> {
+    let header = source.query_rows(
+        "SELECT observed_generation_id FROM event_search_request_headers WHERE context_id = $context_id AND request_id = $request_id",
+        &HashMap::from([
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("request_id".into(), Value::Uuid(request_id)),
+        ]),
+    )?;
+    let observed = match header.rows.first() {
+        Some(row) => get_optional_uuid(row, &header.columns, "observed_generation_id")?,
+        None => None,
+    };
+    if observed.is_some_and(|observed| observed != run_generation_id.as_uuid()) {
+        return Ok(Some(u64::MAX));
+    }
     let row = source.query_rows(
         "SELECT frontier FROM event_search_request_selections WHERE context_id = $context_id AND request_id = $request_id AND connector_id = $connector AND session_ref = $session AND source_instance_ref = $source",
         &HashMap::from([
@@ -2005,9 +2280,9 @@ fn selected_frontier(
             ("connector".into(), Value::Text(pending.connector_id.clone())), ("session".into(), Value::Text(pending.session_ref.clone())), ("source".into(), Value::Text(pending.source_instance_ref.clone())),
         ]),
     )?;
-    row.rows()
+    row.rows
         .first()
-        .map(|value| get_u64(value, row.columns(), "frontier"))
+        .map(|value| get_u64(value, &row.columns, "frontier"))
         .transpose()
 }
 
@@ -2034,17 +2309,14 @@ pub(crate) fn set_stream_pending_in_tx(
         ("session".into(), Value::Text(session.into())),
         ("pending".into(), Value::Bool(pending)),
     ]);
-    let existing = store.internal_db().execute_in_tx(tx,
+    let existing = execute_in_tx_counted(store, tx,
         "SELECT pending FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session", &params).map_err(map_engine_err)?;
-    let statement = if existing.rows().is_empty() {
+    let statement = if existing.rows.is_empty() {
         "INSERT INTO event_search_pending_streams (context_id, generation_id, connector_id, source_instance_ref, session_ref, pending) VALUES ($context_id, $generation_id, $connector, $source, $session, $pending)"
     } else {
         "UPDATE event_search_pending_streams SET pending = $pending WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session"
     };
-    store
-        .internal_db()
-        .execute_in_tx(tx, statement, &params)
-        .map_err(map_engine_err)?;
+    execute_in_tx_counted(store, tx, statement, &params).map_err(map_engine_err)?;
     Ok(())
 }
 
@@ -2055,24 +2327,23 @@ pub(crate) fn mark_captured_stream_pending_in_tx(
 ) -> Result<()> {
     let params = HashMap::from([("context_id".into(), Value::Uuid(event.context_id.as_uuid()))]);
     let mut targets = BTreeSet::from([UNASSIGNED_SEARCH_GENERATION]);
-    let head = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
-            &params,
-        )
-        .map_err(map_engine_err)?;
-    for row in head.rows() {
-        targets.insert(get_uuid(row, head.columns(), "generation_id")?);
+    let head = execute_in_tx_counted(
+        store,
+        tx,
+        "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+        &params,
+    )
+    .map_err(map_engine_err)?;
+    for row in &head.rows {
+        targets.insert(get_uuid(row, &head.columns, "generation_id")?);
     }
     for state in ["capturing", "building"] {
         let mut params = params.clone();
         params.insert("state".into(), Value::Text(state.into()));
-        let jobs = store.internal_db().execute_in_tx(tx,
+        let jobs = execute_in_tx_counted(store, tx,
             "SELECT id FROM event_search_generations WHERE context_id = $context_id AND state = $state", &params).map_err(map_engine_err)?;
-        for row in jobs.rows() {
-            targets.insert(get_uuid(row, jobs.columns(), "id")?);
+        for row in &jobs.rows {
+            targets.insert(get_uuid(row, &jobs.columns, "id")?);
         }
     }
     for target in targets {
@@ -2086,6 +2357,24 @@ pub(crate) fn mark_captured_stream_pending_in_tx(
             &event.session_ref,
             true,
         )?;
+        if target == UNASSIGNED_SEARCH_GENERATION {
+            continue;
+        }
+        // The capture mark names this append, so a capture that read the stream before it commits
+        // cannot clear the mark and leave these events uncaptured.
+        execute_in_tx_counted(store,
+                tx,
+                "UPDATE event_search_pending_streams SET capture_open = true, capture_pending_tx = $tx WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+                &HashMap::from([
+                    ("tx".into(), Value::TxId(tx)),
+                    ("context_id".into(), Value::Uuid(event.context_id.as_uuid())),
+                    ("generation_id".into(), Value::Uuid(target)),
+                    ("connector".into(), Value::Text(event.connector_id.clone())),
+                    ("source".into(), Value::Text(event.source_instance_ref.clone())),
+                    ("session".into(), Value::Text(event.session_ref.clone())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
     }
     Ok(())
 }
@@ -2110,9 +2399,9 @@ pub(crate) fn select_work_for_spec(
         &params,
     )?;
     let mut target = head
-        .rows()
+        .rows
         .first()
-        .map(|row| get_uuid(row, head.columns(), "generation_id"))
+        .map(|row| get_uuid(row, &head.columns, "generation_id"))
         .transpose()?;
     if let Some(spec) = spec {
         spec.profile.validate()?;
@@ -2133,16 +2422,16 @@ pub(crate) fn select_work_for_spec(
         ]);
         let job = source.query_rows(
             "SELECT id FROM event_search_generations WHERE context_id = $context_id AND renderer_profile = $profile AND embedding_space_id = $space AND encoding_profile = $encoding AND state != $ready AND state != $failed AND state != $retired ORDER BY started_at DESC, id DESC LIMIT 1", &job_params)?;
-        if let Some(row) = job.rows().first() {
-            target = Some(get_uuid(row, job.columns(), "id")?);
+        if let Some(row) = job.rows.first() {
+            target = Some(get_uuid(row, &job.columns, "id")?);
         }
     }
     if target.is_none() && spec.is_none() {
         let job = source.query_rows(
             "SELECT id FROM event_search_generations WHERE context_id = $context_id AND (state = $capturing OR state = $building) ORDER BY started_at DESC, id DESC LIMIT 1",
             &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("capturing".into(), Value::Text("capturing".into())), ("building".into(), Value::Text("building".into()))]))?;
-        if let Some(row) = job.rows().first() {
-            target = Some(get_uuid(row, job.columns(), "id")?);
+        if let Some(row) = job.rows.first() {
+            target = Some(get_uuid(row, &job.columns, "id")?);
         }
     }
     let mut target_connectors = BTreeSet::new();
@@ -2151,9 +2440,9 @@ pub(crate) fn select_work_for_spec(
         let row = source.query_rows(
             "SELECT renderer_profile, embedding_space_id, encoding_profile, interpretation_snapshot FROM event_search_generations WHERE id = $id",
             &HashMap::from([("id".into(), Value::Uuid(target))]))?;
-        compatible = match row.rows().first() {
+        compatible = match row.rows.first() {
             Some(value) => {
-                let saved = get_json(value, row.columns(), "interpretation_snapshot")?;
+                let saved = get_json(value, &row.columns, "interpretation_snapshot")?;
                 let saved_bindings = bindings_from_snapshot(&saved)?;
                 target_connectors.extend(saved_bindings.keys().cloned());
                 let mut live_bindings = BTreeMap::new();
@@ -2168,11 +2457,11 @@ pub(crate) fn select_work_for_spec(
                 snapshot_json(&live_bindings) == saved
                     && spec
                         .map(|spec| -> Result<bool> {
-                            Ok(get_json(value, row.columns(), "renderer_profile")?
+                            Ok(get_json(value, &row.columns, "renderer_profile")?
                                 == serde_json::to_value(&spec.profile).map_err(json_error)?
-                                && get_text(value, row.columns(), "embedding_space_id")?
+                                && get_text(value, &row.columns, "embedding_space_id")?
                                     == spec.embedding_space_id
-                                && get_text(value, row.columns(), "encoding_profile")?
+                                && get_text(value, &row.columns, "encoding_profile")?
                                     == spec.encoding_profile_id)
                         })
                         .transpose()?
@@ -2188,7 +2477,7 @@ pub(crate) fn select_work_for_spec(
         None
     };
     let mut candidates = BTreeSet::new();
-    let mut complete = BTreeSet::new();
+    let mut observed_generation_id = None;
     if compatible {
         for generation_id in BTreeSet::from([
             target.unwrap_or(UNASSIGNED_SEARCH_GENERATION),
@@ -2204,23 +2493,14 @@ pub(crate) fn select_work_for_spec(
                     Ok(())
                 })?;
         }
-        // A request records every stream its policy selects for its target, complete ones
-        // included: refusal acknowledgement and saved ceilings match the identities the request
-        // observed. A completed stream keeps its cleared marker, so it is read from the marker
-        // index; one outside the selected sessions is retained at its published frontier below.
-        // Without a target spec this is the bounded pending selection: pending streams only.
+        // A request lists the streams with pending work. When it targets a generation with this
+        // spec, the streams that generation has already completed stay complete there (its
+        // cursors only advance), so the request records the generation instead of listing every
+        // completed stream: refusal acknowledgement and saved ceilings check the listed frontiers
+        // plus that generation (`selected_work_complete`), and an import does not reread the
+        // completed history. Without a target spec this is the bounded pending selection.
         if let (Some(target), Some(_)) = (target, spec) {
-            let mut params = params.clone();
-            params.insert("generation_id".into(), Value::Uuid(target));
-            params.insert("pending".into(), Value::Bool(false));
-            source.stream_rows(
-                "SELECT connector_id, session_ref, source_instance_ref FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND pending = $pending ORDER BY connector_id ASC, session_ref ASC, source_instance_ref ASC",
-                &params, &mut |columns, row| {
-                    let stream = (get_text(row, columns, "connector_id")?, get_text(row, columns, "session_ref")?, get_text(row, columns, "source_instance_ref")?);
-                    candidates.insert(stream.clone());
-                    complete.insert(stream);
-                    Ok(())
-                })?;
+            observed_generation_id = Some(target);
         }
     }
     if target.is_some()
@@ -2231,23 +2511,25 @@ pub(crate) fn select_work_for_spec(
         compatible = false;
     }
     if !compatible || (target.is_none() && candidates.is_empty()) {
+        // The fallback lists every captured stream, so nothing is implied by a generation.
+        observed_generation_id = None;
         candidates.clear();
         // A replacement target has no cursor: every captured stream is pending for that job.
         let groups = source.query_rows(
             "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref", &params)?;
-        for row in groups.rows() {
-            let connector = get_text(row, groups.columns(), "connector_id")?;
-            let stream = get_text(row, groups.columns(), "source_instance_ref")?;
+        for row in &groups.rows {
+            let connector = get_text(row, &groups.columns, "connector_id")?;
+            let stream = get_text(row, &groups.columns, "source_instance_ref")?;
             let newest = source.query_rows(
                 "SELECT session_ref FROM events WHERE context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1",
                 &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid())), ("connector".into(), Value::Text(connector.clone())), ("source".into(), Value::Text(stream.clone()))]))?;
             let newest_row = newest
-                .rows()
+                .rows
                 .first()
                 .ok_or_else(|| CgError::Engine("captured group has no newest event".into()))?;
             candidates.insert((
                 connector,
-                get_text(newest_row, newest.columns(), "session_ref")?,
+                get_text(newest_row, &newest.columns, "session_ref")?,
                 stream,
             ));
         }
@@ -2269,51 +2551,49 @@ pub(crate) fn select_work_for_spec(
             .as_ref()
             .is_some_and(|selected| !selected.rank.contains_key(&session_key))
         {
-            if compatible
-                && !complete.contains(&(connector.clone(), session.clone(), stream.clone()))
-            {
+            if compatible {
                 continue;
             }
             // Replacement rebuilds, and a request's completed streams outside its selected
             // sessions, keep previously published history at its committed frontier; newer
             // capture outside the requested scope remains deferred.
-            let Some(head_row) = head.rows().first() else {
+            let Some(head_row) = head.rows.first() else {
                 continue;
             };
             let mut prior_params = params.clone();
             prior_params.insert(
                 "generation_id".into(),
-                Value::Uuid(get_uuid(head_row, head.columns(), "generation_id")?),
+                Value::Uuid(get_uuid(head_row, &head.columns, "generation_id")?),
             );
             let progress = source.query_rows(
                 "SELECT is_published, searchable_event_count FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND session_ref = $session", &prior_params)?;
-            let Some(progress_row) = progress.rows().first() else {
+            let Some(progress_row) = progress.rows.first() else {
                 continue;
             };
-            if !get_bool(progress_row, progress.columns(), "is_published")?
-                || get_u64(progress_row, progress.columns(), "searchable_event_count")? == 0
+            if !get_bool(progress_row, &progress.columns, "is_published")?
+                || get_u64(progress_row, &progress.columns, "searchable_event_count")? == 0
             {
                 continue;
             }
             let cursor = source.query_rows(
                 "SELECT committed_sequence FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session", &prior_params)?;
-            let Some(cursor_row) = cursor.rows().first() else {
+            let Some(cursor_row) = cursor.rows.first() else {
                 continue;
             };
-            retained_frontier = Some(get_u64(cursor_row, cursor.columns(), "committed_sequence")?);
+            retained_frontier = Some(get_u64(cursor_row, &cursor.columns, "committed_sequence")?);
         }
         let session_row = source.query_rows(
             "SELECT latest_occurred_at FROM event_context_sessions WHERE context_id = $context_id AND connector_id = $connector AND session_ref = $session", &params)?;
         let occurred = session_row
-            .rows()
+            .rows
             .first()
-            .map(|row| get_optional_timestamp(row, session_row.columns(), "latest_occurred_at"))
+            .map(|row| get_optional_timestamp(row, &session_row.columns, "latest_occurred_at"))
             .transpose()?
             .flatten();
         let newest = source.query_rows(
             "SELECT seq FROM events WHERE context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1", &params)?;
         let row = newest
-            .rows()
+            .rows
             .first()
             .ok_or_else(|| CgError::Engine("pending stream has no newest event".into()))?;
         streams.push((
@@ -2322,7 +2602,7 @@ pub(crate) fn select_work_for_spec(
                 connector_id: connector,
                 session_ref: session,
                 source_instance_ref: stream,
-                frontier: retained_frontier.unwrap_or(get_u64(row, newest.columns(), "seq")?),
+                frontier: retained_frontier.unwrap_or(get_u64(row, &newest.columns, "seq")?),
             },
         ));
     }
@@ -2352,6 +2632,16 @@ pub(crate) fn select_work_for_spec(
     Ok(EventSearchSelectedWork {
         request_id: None,
         streams: streams.into_iter().map(|(_, stream)| stream).collect(),
+        observed_policy: observed_generation_id.map(|_| policy),
+        observed_generation_id,
+    })
+}
+
+fn observed_policy_value(policy: Option<EventSearchWorkPolicy>) -> Result<Value> {
+    policy.map_or(Ok(Value::Null), |policy| {
+        serde_json::to_string(&policy)
+            .map(Value::Text)
+            .map_err(json_error)
     })
 }
 
@@ -2362,7 +2652,9 @@ pub(crate) fn selected_work_complete(
     selected: &EventSearchSelectedWork,
 ) -> Result<bool> {
     spec.profile.validate()?;
-    if selected.streams.is_empty() {
+    // An empty listing is complete only when it lists the whole selection; one that implies an
+    // observed generation's completed streams still checks that generation below.
+    if selected.streams.is_empty() && selected.observed_generation_id.is_none() {
         return Ok(true);
     }
     let connectors = event_connectors(source, context_id)?;
@@ -2383,12 +2675,29 @@ pub(crate) fn selected_work_complete(
         true,
     )?
     else {
-        return Ok(selected.streams.is_empty());
+        return Ok(selected.streams.is_empty() && selected.observed_generation_id.is_none());
     };
     if !generation_is_head(source, context_id, generation.id)? {
         return Ok(false);
     }
-    for stream in &selected.streams {
+    // A request is bound to the generation it observed, and against that generation its
+    // completed streams stay complete (its cursors only advance). Against any other head it is
+    // complete once its own policy, re-selected against that head, has no pending stream: the
+    // same pending-only selection an import makes, never a walk of the observed history.
+    if selected
+        .observed_generation_id
+        .is_some_and(|observed| observed != generation.id.as_uuid())
+    {
+        let Some(policy) = selected.observed_policy else {
+            return Ok(false);
+        };
+        return Ok(
+            select_work_for_spec(source, context_id, policy, Some(spec))?
+                .streams
+                .is_empty(),
+        );
+    }
+    let committed_at = |stream: &EventSearchSelectedStream| -> Result<bool> {
         let rows = source.query_rows(
             "SELECT committed_sequence FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session",
             &HashMap::from([
@@ -2399,16 +2708,18 @@ pub(crate) fn selected_work_complete(
                 ("session".into(), Value::Text(stream.session_ref.clone())),
             ]),
         )?;
-        if !rows
-            .rows()
+        Ok(rows
+            .rows
             .first()
             .map(|row| {
-                get_u64(row, rows.columns(), "committed_sequence")
+                get_u64(row, &rows.columns, "committed_sequence")
                     .map(|committed| committed >= stream.frontier)
             })
             .transpose()?
-            .unwrap_or(false)
-        {
+            .unwrap_or(false))
+    };
+    for stream in &selected.streams {
+        if !committed_at(stream)? {
             return Ok(false);
         }
     }
@@ -2544,9 +2855,9 @@ pub(crate) fn persisted_work_policies(
         ),
         &params,
     )?;
-    for row in answer.rows() {
-        let context_id = crate::ContextId::from(get_uuid(row, answer.columns(), "context_id")?);
-        policies.insert(context_id, work_policy_from_row(row, answer.columns())?);
+    for row in &answer.rows {
+        let context_id = crate::ContextId::from(get_uuid(row, &answer.columns, "context_id")?);
+        policies.insert(context_id, work_policy_from_row(row, &answer.columns)?);
     }
     for context_id in context_ids {
         policies
@@ -2824,10 +3135,10 @@ pub(crate) fn policy_coverage_for(
         &params,
     )?;
     let mut covered = HashMap::new();
-    for row in generations.rows() {
+    for row in &generations.rows {
         covered.insert(
-            crate::ContextId::from(get_uuid(row, generations.columns(), "context_id")?),
-            get_u64(row, generations.columns(), "searchable_event_count")?,
+            crate::ContextId::from(get_uuid(row, &generations.columns, "context_id")?),
+            get_u64(row, &generations.columns, "searchable_event_count")?,
         );
     }
 
@@ -2947,6 +3258,19 @@ fn selected_session_work_for_run(
     policy: EventSearchWorkPolicy,
     selected_work: Option<&EventSearchSelectedWork>,
 ) -> Result<SessionWorkSet> {
+    // A saved request is bound to the generation it observed. Run against any other (a
+    // replacement), it re-selects under its policy here; the replacement still requires the
+    // active head's published sessions before it can activate.
+    let selected_work = selected_work.filter(|work| {
+        work.observed_generation_id
+            .is_none_or(|observed| observed == generation_id.as_uuid())
+    });
+    if selected_work.is_none()
+        && policy.sessions == EventSearchSessionScope::All
+        && let Some(work) = steady_all_session_work(store, context_id, generation_id, policy)?
+    {
+        return Ok(work);
+    }
     let mut selected = if selected_work.is_some() {
         session_work_set(Vec::new())
     } else {
@@ -2983,12 +3307,12 @@ fn selected_session_work_for_run(
                     &params,
                 )?;
                 let row = progress
-                    .rows()
+                    .rows
                     .first()
                     .ok_or_else(|| stale_claim("selected session has no captured progress"))?;
                 selected.events.insert(
                     key.clone(),
-                    get_u64(row, progress.columns(), "committed_event_count")?,
+                    get_u64(row, &progress.columns, "committed_event_count")?,
                 );
             }
             let cursor = store.query_rows(
@@ -2996,13 +3320,19 @@ fn selected_session_work_for_run(
                 &params,
             )?;
             let cursor_row = cursor
-                .rows()
+                .rows
                 .first()
                 .ok_or_else(|| stale_claim("selected stream has no initialized cursor"))?;
-            let committed = get_u64(cursor_row, cursor.columns(), "committed_sequence")?;
+            let committed = get_u64(cursor_row, &cursor.columns, "committed_sequence")?;
+            if stream.frontier <= committed {
+                // Nothing past the committed position is selected: the stream adds no pending
+                // events, so its completed history is not counted again.
+                frontiers.insert((key, stream.source_instance_ref.clone()), stream.frontier);
+                continue;
+            }
             let selected_count = selected_events_through(|sql| {
                 let rows = store.query_rows(sql, &params)?;
-                get_u64(&rows.rows()[0], rows.columns(), "event_count")
+                get_u64(&rows.rows[0], &rows.columns, "event_count")
             })?;
             let overlap = if committed == 0 {
                 0
@@ -3017,7 +3347,7 @@ fn selected_session_work_for_run(
                 );
                 selected_events_through(|sql| {
                     let rows = store.query_rows(sql, &committed_params)?;
-                    get_u64(&rows.rows()[0], rows.columns(), "event_count")
+                    get_u64(&rows.rows[0], &rows.columns, "event_count")
                 })?
             };
             let pending = selected_count.checked_sub(overlap).ok_or_else(|| {
@@ -3038,6 +3368,208 @@ fn selected_session_work_for_run(
     selected_session_work_from_selection(store, context_id, generation_id, selected)
 }
 
+/// The all-sessions scope once this generation is the search head. Every session captured before
+/// the head was installed is already required, so the run marks only sessions captured since (found
+/// through the `is_required` index) and ranks only sessions that have a pending stream, in the
+/// scope's declared order: dated sessions by recency, then undated ones, ties by connector and
+/// session. No completed session is read. `None` sends every other state through the full
+/// reconciliation in `selected_session_work_from_selection`.
+///
+/// The returned set ranks and counts the pending sessions only; a run without selected frontiers
+/// reads nothing else from it.
+fn steady_all_session_work(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    policy: EventSearchWorkPolicy,
+) -> Result<Option<SessionWorkSet>> {
+    let context = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+    let head = execute_counted(
+        store,
+        "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+        &context,
+    )
+    .map_err(map_engine_err)?;
+    let Some(row) = head.rows.first() else {
+        return Ok(None);
+    };
+    if EventSearchGenerationId::from(get_uuid(row, &head.columns, "generation_id")?)
+        != generation_id
+    {
+        return Ok(None);
+    }
+    let captured = |key: &SessionKey| -> Result<Option<CapturedSessionRow>> {
+        let answer = EventSearchRows::query_rows(
+            store,
+            "SELECT event_count, latest_occurred_at FROM event_context_sessions WHERE context_id = $context_id AND connector_id = $connector_id AND session_ref = $session",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("connector_id".into(), Value::Text(key.connector_id.clone())),
+                ("session".into(), Value::Text(key.session_ref.clone())),
+            ]),
+        )?;
+        let Some(row) = answer.rows.first() else {
+            return Ok(None);
+        };
+        let latest_occurred_at = match row.get(column_index(&answer.columns, "latest_occurred_at")?)
+        {
+            Some(Value::Timestamp(value) | Value::Int64(value)) => Some(*value),
+            _ => None,
+        };
+        Ok(Some(CapturedSessionRow {
+            key: key.clone(),
+            events: get_u64(row, &answer.columns, "event_count")?,
+            latest_occurred_at,
+        }))
+    };
+    let generation = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+        ("flag".into(), Value::Bool(false)),
+    ]);
+    let mut unrequired = Vec::new();
+    store.stream_rows(
+        "SELECT connector_id, session_ref FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND is_required = $flag",
+        &generation,
+        &mut |columns, row| {
+            unrequired.push(SessionKey {
+                connector_id: get_text(row, columns, "connector_id")?,
+                session_ref: get_text(row, columns, "session_ref")?,
+            });
+            Ok(())
+        },
+    )?;
+    let mut newly_required = BTreeSet::new();
+    for key in unrequired {
+        if captured(&key)?.is_some() {
+            newly_required.insert(key);
+        }
+    }
+    if !newly_required.is_empty() {
+        persist_required_sessions(store, context_id, generation_id, &newly_required)?;
+    }
+    let mut pending = BTreeSet::new();
+    let mut pending_params = generation;
+    pending_params.insert("flag".into(), Value::Bool(true));
+    store.stream_rows(
+        "SELECT connector_id, session_ref FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND pending = $flag",
+        &pending_params,
+        &mut |columns, row| {
+            pending.insert(SessionKey {
+                connector_id: get_text(row, columns, "connector_id")?,
+                session_ref: get_text(row, columns, "session_ref")?,
+            });
+            Ok(())
+        },
+    )?;
+    let mut dated = Vec::new();
+    let mut undated = Vec::new();
+    let mut outstanding = BTreeSet::new();
+    for key in &pending {
+        if let Some(row) = captured(key)? {
+            outstanding.insert(row.key.clone());
+            if row.latest_occurred_at.is_some() {
+                dated.push(row);
+            } else {
+                undated.push(row);
+            }
+        }
+    }
+    reconcile_all_sessions_required_total(store, context_id, generation_id, &outstanding)?;
+    dated.sort_by(|left, right| {
+        let by_time = left.latest_occurred_at.cmp(&right.latest_occurred_at);
+        let by_time = match policy.order {
+            EventSearchOrder::Newest => by_time.reverse(),
+            EventSearchOrder::Oldest => by_time,
+        };
+        by_time.then_with(|| left.key.cmp(&right.key))
+    });
+    undated.sort_by(|left, right| left.key.cmp(&right.key));
+    dated.extend(undated);
+    Ok(Some(session_work_set(dated)))
+}
+
+/// Set the all-sessions required total to every committed event plus the outstanding events of
+/// each session with a pending stream. Every session is required in this scope, a session without
+/// a pending stream has committed all its events, and the generation's eligible and excluded
+/// totals are the committed events of every session; so only pending sessions are read. This also
+/// repairs a total an earlier selected run narrowed while its sessions stayed marked required.
+fn reconcile_all_sessions_required_total(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    outstanding: &BTreeSet<SessionKey>,
+) -> Result<()> {
+    let tx = store.begin_tx()?;
+    let result = (|| -> Result<()> {
+        let generation = execute_in_tx_counted(
+            store,
+            tx,
+            "SELECT required_event_count, eligible_event_count, excluded_event_count FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("id".into(), Value::Uuid(generation_id.as_uuid())),
+            ]),
+        )
+        .map_err(map_engine_err)?;
+        let row = generation.rows.first().ok_or_else(|| {
+            stale_claim("event-search generation disappeared while its required scope was recorded")
+        })?;
+        let current = get_u64(row, &generation.columns, "required_event_count")?;
+        let mut required = get_u64(row, &generation.columns, "eligible_event_count")?
+            .checked_add(get_u64(row, &generation.columns, "excluded_event_count")?)
+            .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
+        for key in outstanding {
+            let progress = execute_in_tx_counted(
+                store,
+                tx,
+                "SELECT event_count, committed_event_count FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
+                &HashMap::from([
+                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                    ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                    ("connector_id".into(), Value::Text(key.connector_id.clone())),
+                    ("session".into(), Value::Text(key.session_ref.clone())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+            let Some(progress_row) = progress.rows.first() else {
+                continue;
+            };
+            let remaining = get_u64(progress_row, &progress.columns, "event_count")?
+                .checked_sub(get_u64(
+                    progress_row,
+                    &progress.columns,
+                    "committed_event_count",
+                )?)
+                .ok_or_else(|| {
+                    stale_claim("event-search session committed more events than it captured")
+                })?;
+            required = required
+                .checked_add(remaining)
+                .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
+        }
+        if required != current {
+            execute_in_tx_counted(
+                store,
+                tx,
+                "UPDATE event_search_generations SET required_event_count = $required_events WHERE context_id = $context_id AND id = $id",
+                &HashMap::from([
+                    ("required_events".into(), integer(required, "required event count")?),
+                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                    ("id".into(), Value::Uuid(generation_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = store.internal_db().rollback(tx);
+        return Err(error);
+    }
+    store.internal_db().commit(tx).map_err(map_engine_err)
+}
+
 fn selected_session_work(
     store: &Store,
     context_id: crate::ContextId,
@@ -3054,59 +3586,59 @@ fn selected_session_work_from_selection(
     generation_id: EventSearchGenerationId,
     selected: SessionWorkSet,
 ) -> Result<SessionWorkSet> {
+    if selected.frontiers.is_some() {
+        // A run with selected frontiers claims only the selected streams, so its work set is the
+        // selection itself; the other sessions' progress is neither paged nor recounted.
+        persist_selected_required_sessions(store, context_id, generation_id, &selected)?;
+        return Ok(selected);
+    }
     let mut required = selected.events.keys().cloned().collect::<BTreeSet<_>>();
-    let head = store
-        .internal_db()
-        .execute(
-            "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
-            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        )
-        .map_err(map_engine_err)?;
-    if let Some(row) = head.rows().first() {
-        let active = EventSearchGenerationId::from(get_uuid(row, head.columns(), "generation_id")?);
+    let head = execute_counted(
+        store,
+        "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )
+    .map_err(map_engine_err)?;
+    if let Some(row) = head.rows.first() {
+        let active = EventSearchGenerationId::from(get_uuid(row, &head.columns, "generation_id")?);
         if active != generation_id && selected.frontiers.is_none() {
-            store.stream_rows(
-                "SELECT connector_id, session_ref FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND is_published = $published AND searchable_event_count > $zero ORDER BY connector_id ASC, session_ref ASC",
-                &HashMap::from([
-                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                    ("generation_id".into(), Value::Uuid(active.as_uuid())),
-                    ("published".into(), Value::Bool(true)),
-                    ("zero".into(), Value::Int64(0)),
-                ]),
+            page_session_progress(
+                store,
+                context_id,
+                active,
+                "is_published, searchable_event_count",
                 &mut |columns, row| {
-                    required.insert(SessionKey {
-                        connector_id: get_text(row, columns, "connector_id")?,
-                        session_ref: get_text(row, columns, "session_ref")?,
-                    });
+                    if get_bool(row, columns, "is_published")?
+                        && get_u64(row, columns, "searchable_event_count")? > 0
+                    {
+                        required.insert(SessionKey {
+                            connector_id: get_text(row, columns, "connector_id")?,
+                            session_ref: get_text(row, columns, "session_ref")?,
+                        });
+                    }
                     Ok(())
                 },
             )?;
         }
     }
-    persist_required_sessions(
+    persist_required_sessions(store, context_id, generation_id, &required)?;
+
+    let mut counts = BTreeMap::new();
+    page_session_progress(
         store,
         context_id,
         generation_id,
-        &required,
-        selected.frontiers.as_ref().map(|_| &selected.events),
-    )?;
-
-    let mut counts = BTreeMap::new();
-    store.stream_rows(
-        "SELECT connector_id, session_ref, event_count FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND is_required = $required ORDER BY connector_id ASC, session_ref ASC",
-        &HashMap::from([
-            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-            ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
-            ("required".into(), Value::Bool(true)),
-        ]),
+        "is_required, event_count",
         &mut |columns, row| {
-            counts.insert(
-                SessionKey {
-                    connector_id: get_text(row, columns, "connector_id")?,
-                    session_ref: get_text(row, columns, "session_ref")?,
-                },
-                get_u64(row, columns, "event_count")?,
-            );
+            if get_bool(row, columns, "is_required")? {
+                counts.insert(
+                    SessionKey {
+                        connector_id: get_text(row, columns, "connector_id")?,
+                        session_ref: get_text(row, columns, "session_ref")?,
+                    },
+                    get_u64(row, columns, "event_count")?,
+                );
+            }
             Ok(())
         },
     )?;
@@ -3140,16 +3672,81 @@ fn selected_session_work_from_selection(
     })
 }
 
+/// Rows of one generation's session progress in primary-key order, read in bounded pages by strict
+/// `(connector_id, session_ref)` continuation seeks with no flag predicate: the caller filters each
+/// page after it is read, so sessions that do not match never enlarge a unit.
+fn page_session_progress(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    columns: &str,
+    visit: &mut ProgressRowVisitor<'_>,
+) -> Result<()> {
+    const SESSION_PAGE: usize = 256;
+    let base = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+    ]);
+    let select = format!(
+        "SELECT connector_id, session_ref, {columns} FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id"
+    );
+    let mut key: Option<(String, String)> = None;
+    loop {
+        tally_reset();
+        let branches = match &key {
+            None => vec![KeyBranch::new("", Vec::new())],
+            Some((connector, session)) => vec![
+                KeyBranch::new(
+                    " AND connector_id = $after_connector AND session_ref > $after_session",
+                    vec![
+                        ("after_connector", Value::Text(connector.clone())),
+                        ("after_session", Value::Text(session.clone())),
+                    ],
+                ),
+                KeyBranch::new(
+                    " AND connector_id > $after_connector",
+                    vec![("after_connector", Value::Text(connector.clone()))],
+                ),
+            ],
+        };
+        let page = read_branches(
+            &mut |sql, params| {
+                let answer = EventSearchRows::query_rows(store, sql, params)?;
+                tally_examined(answer.trace.rows_examined);
+                Ok(answer)
+            },
+            &select,
+            "connector_id ASC, session_ref ASC",
+            &base,
+            &branches,
+            SESSION_PAGE,
+        )?;
+        let before = format!("{key:?}");
+        for row in &page.rows {
+            visit(&page.columns, row)?;
+            key = Some((
+                get_text(row, &page.columns, "connector_id")?,
+                get_text(row, &page.columns, "session_ref")?,
+            ));
+        }
+        note_unit(UnitFold::Pending, page.rows.len() as u64, false, || {
+            (before, format!("{key:?}"))
+        })?;
+        if page.rows.len() < SESSION_PAGE {
+            return Ok(());
+        }
+    }
+}
+
 fn persist_required_sessions(
     store: &Store,
     context_id: crate::ContextId,
     generation_id: EventSearchGenerationId,
     required: &BTreeSet<SessionKey>,
-    selected_counts: Option<&BTreeMap<SessionKey, u64>>,
 ) -> Result<()> {
     let tx = store.begin_tx()?;
     let result = (|| -> Result<()> {
-        let generation = store.internal_db().execute_in_tx(
+        let generation = execute_in_tx_counted(store,
             tx,
             "SELECT required_event_count FROM event_search_generations WHERE context_id = $context_id AND id = $id",
             &HashMap::from([
@@ -3157,10 +3754,10 @@ fn persist_required_sessions(
                 ("id".into(), Value::Uuid(generation_id.as_uuid())),
             ]),
         ).map_err(map_engine_err)?;
-        let row = generation.rows().first().ok_or_else(|| {
+        let row = generation.rows.first().ok_or_else(|| {
             stale_claim("event-search generation disappeared while its required scope was recorded")
         })?;
-        let mut required_events = get_u64(row, generation.columns(), "required_event_count")?;
+        let mut required_events = get_u64(row, &generation.columns, "required_event_count")?;
         for key in required {
             let params = HashMap::from([
                 ("context_id".into(), Value::Uuid(context_id.as_uuid())),
@@ -3168,19 +3765,19 @@ fn persist_required_sessions(
                 ("connector_id".into(), Value::Text(key.connector_id.clone())),
                 ("session".into(), Value::Text(key.session_ref.clone())),
             ]);
-            let progress = store.internal_db().execute_in_tx(
+            let progress = execute_in_tx_counted(store,
                 tx,
                 "SELECT event_count, is_required FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
                 &params,
             ).map_err(map_engine_err)?;
-            let progress_row = progress.rows().first().ok_or_else(|| {
+            let progress_row = progress.rows.first().ok_or_else(|| {
                 stale_claim("required event-search session is absent from the captured generation")
             })?;
-            if !get_bool(progress_row, progress.columns(), "is_required")? {
+            if !get_bool(progress_row, &progress.columns, "is_required")? {
                 required_events = required_events
-                    .checked_add(get_u64(progress_row, progress.columns(), "event_count")?)
+                    .checked_add(get_u64(progress_row, &progress.columns, "event_count")?)
                     .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
-                store.internal_db().execute_in_tx(
+                execute_in_tx_counted(store,
                     tx,
                     "UPDATE event_search_session_progress SET is_required = $required WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
                     &{
@@ -3191,27 +3788,7 @@ fn persist_required_sessions(
                 ).map_err(map_engine_err)?;
             }
         }
-        if let Some(selected_counts) = selected_counts {
-            required_events = 0;
-            store.stream_rows(
-                "SELECT connector_id, session_ref, committed_event_count FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id",
-                &HashMap::from([
-                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                    ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
-                ]),
-                &mut |columns, row| {
-                    let key = SessionKey {
-                        connector_id: get_text(row, columns, "connector_id")?,
-                        session_ref: get_text(row, columns, "session_ref")?,
-                    };
-                    required_events = required_events.checked_add(get_u64(row, columns, "committed_event_count")?
-                        .max(selected_counts.get(&key).copied().unwrap_or(0)))
-                        .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
-                    Ok(())
-                },
-            )?;
-        }
-        store.internal_db().execute_in_tx(
+        execute_in_tx_counted(store,
             tx,
             "UPDATE event_search_generations SET required_event_count = $required_events WHERE context_id = $context_id AND id = $id",
             &HashMap::from([
@@ -3220,6 +3797,93 @@ fn persist_required_sessions(
                 ("id".into(), Value::Uuid(generation_id.as_uuid())),
             ]),
         ).map_err(map_engine_err)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = store.internal_db().rollback(tx);
+        return Err(error);
+    }
+    store.internal_db().commit(tx).map_err(map_engine_err)
+}
+
+/// Record a selected request's sessions as required and set the generation's required total to
+/// every committed event plus the events this request selects past each selected session's
+/// committed count. The generation's eligible and excluded totals are the committed events of every
+/// session (each batch commit adds the same counts to both), so no other session is read.
+fn persist_selected_required_sessions(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    work: &SessionWorkSet,
+) -> Result<()> {
+    let selected = &work.events;
+    let tx = store.begin_tx()?;
+    let result = (|| -> Result<()> {
+        let generation = execute_in_tx_counted(
+            store,
+            tx,
+            "SELECT eligible_event_count, excluded_event_count FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("id".into(), Value::Uuid(generation_id.as_uuid())),
+            ]),
+        )
+        .map_err(map_engine_err)?;
+        let row = generation.rows.first().ok_or_else(|| {
+            stale_claim("event-search generation disappeared while its required scope was recorded")
+        })?;
+        let mut required_events = get_u64(row, &generation.columns, "eligible_event_count")?
+            .checked_add(get_u64(row, &generation.columns, "excluded_event_count")?)
+            .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
+        for (key, selected_events) in selected {
+            let params = HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                ("connector_id".into(), Value::Text(key.connector_id.clone())),
+                ("session".into(), Value::Text(key.session_ref.clone())),
+            ]);
+            let progress = execute_in_tx_counted(
+                store,
+                tx,
+                "SELECT committed_event_count, is_required FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+            let progress_row = progress.rows.first().ok_or_else(|| {
+                stale_claim("required event-search session is absent from the captured generation")
+            })?;
+            let committed = get_u64(progress_row, &progress.columns, "committed_event_count")?;
+            let beyond = selected_events.checked_sub(committed).ok_or_else(|| {
+                stale_claim("selected session count is smaller than its committed count")
+            })?;
+            required_events = required_events
+                .checked_add(beyond)
+                .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
+            if !get_bool(progress_row, &progress.columns, "is_required")? {
+                execute_in_tx_counted(
+                    store,
+                    tx,
+                    "UPDATE event_search_session_progress SET is_required = $required WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
+                    &{
+                        let mut values = params;
+                        values.insert("required".into(), Value::Bool(true));
+                        values
+                    },
+                )
+                .map_err(map_engine_err)?;
+            }
+        }
+        execute_in_tx_counted(
+            store,
+            tx,
+            "UPDATE event_search_generations SET required_event_count = $required_events WHERE context_id = $context_id AND id = $id",
+            &HashMap::from([
+                ("required_events".into(), integer(required_events, "required event count")?),
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("id".into(), Value::Uuid(generation_id.as_uuid())),
+            ]),
+        )
+        .map_err(map_engine_err)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -3238,8 +3902,8 @@ fn generation_is_head(
         "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
-    Ok(head.rows().first().is_some_and(|row| {
-        get_uuid(row, head.columns(), "generation_id").ok() == Some(generation_id.as_uuid())
+    Ok(head.rows.first().is_some_and(|row| {
+        get_uuid(row, &head.columns, "generation_id").ok() == Some(generation_id.as_uuid())
     }))
 }
 
@@ -3338,23 +4002,19 @@ pub(crate) fn persist_work_policy(
     ]);
     let tx = store.begin_tx()?;
     let write = (|| -> Result<()> {
-        let existing = store
-            .internal_db()
-            .execute_in_tx(
-                tx,
-                "SELECT context_id FROM event_search_work_policies WHERE context_id = $context_id",
-                &params,
-            )
-            .map_err(map_engine_err)?;
-        let sql = if existing.rows().is_empty() {
+        let existing = execute_in_tx_counted(
+            store,
+            tx,
+            "SELECT context_id FROM event_search_work_policies WHERE context_id = $context_id",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+        let sql = if existing.rows.is_empty() {
             "INSERT INTO event_search_work_policies (context_id, search_order, search_sessions) VALUES ($context_id, $search_order, $search_sessions)"
         } else {
             "UPDATE event_search_work_policies SET search_order = $search_order, search_sessions = $search_sessions WHERE context_id = $context_id"
         };
-        store
-            .internal_db()
-            .execute_in_tx(tx, sql, &params)
-            .map_err(map_engine_err)?;
+        execute_in_tx_counted(store, tx, sql, &params).map_err(map_engine_err)?;
         Ok(())
     })();
     if let Err(error) = write {
@@ -3373,31 +4033,12 @@ pub(crate) fn live_projection_lease(
         "SELECT expires_at FROM event_search_leases WHERE context_id = $context_id",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
-    for row in leases.rows() {
-        if get_timestamp(row, leases.columns(), "expires_at")? > now_ms {
+    for row in &leases.rows {
+        if get_timestamp(row, &leases.columns, "expires_at")? > now_ms {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-pub(crate) fn committed_generation_coverage(
-    source: &dyn EventSearchRows,
-    context_id: crate::ContextId,
-    generation_id: EventSearchGenerationId,
-) -> Result<u64> {
-    let answer = source.query_rows(
-        "SELECT COUNT(*) AS n FROM event_search_source_events INNER JOIN event_search_cursors ON event_search_source_events.context_id = event_search_cursors.context_id AND event_search_source_events.generation_id = event_search_cursors.generation_id AND event_search_source_events.connector_id = event_search_cursors.connector_id AND event_search_source_events.source_instance_ref = event_search_cursors.source_instance_ref AND event_search_source_events.session_ref = event_search_cursors.session_ref WHERE event_search_source_events.context_id = $context_id AND event_search_source_events.generation_id = $generation_id AND event_search_source_events.source_sequence <= event_search_cursors.committed_sequence",
-        &HashMap::from([
-            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-            ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
-        ]),
-    )?;
-    let row = answer
-        .rows()
-        .first()
-        .ok_or_else(|| CgError::Engine("event-search coverage count returned no row".into()))?;
-    get_u64(row, answer.columns(), "n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3451,8 +4092,14 @@ fn ensure_generation(
         existing.attempt_tx = Some(projection_attempt.tx);
         existing.attempt_token = Some(projection_attempt.token);
         *attempt = Some(projection_attempt);
-        let captured =
-            capture_source_membership(store, context_id, &bindings, Some(existing.id), bounds)?;
+        let (captured, certified) = capture_source_membership(
+            store,
+            context_id,
+            &bindings,
+            Some(existing.id),
+            existing.attempt_token,
+            bounds,
+        )?;
         if was_capturing {
             finalize_capture_attempt(store, context_id, existing.id, &captured)?;
             existing.event_count = captured.event_count;
@@ -3460,6 +4107,7 @@ fn ensure_generation(
             existing.source_content_sha256 = captured.source_content_sha256.clone();
         }
         existing.target = captured;
+        existing.certified = certified;
         return Ok(existing);
     }
 
@@ -3475,7 +4123,14 @@ fn ensure_generation(
         profile,
     )?;
     *attempt = Some(projection_attempt);
-    let captured = capture_source_membership(store, context_id, &bindings, Some(id), bounds)?;
+    let (captured, certified) = capture_source_membership(
+        store,
+        context_id,
+        &bindings,
+        Some(id),
+        Some(projection_attempt.token),
+        bounds,
+    )?;
     finalize_capture_attempt(store, context_id, id, &captured)?;
     Ok(Generation {
         id,
@@ -3486,6 +4141,7 @@ fn ensure_generation(
         ordered_source_set_sha256: captured.ordered_source_set_sha256.clone(),
         source_content_sha256: captured.source_content_sha256.clone(),
         target: captured,
+        certified,
         started_at,
         attempt_tx: Some(projection_attempt.tx),
         attempt_token: Some(projection_attempt.token),
@@ -3499,7 +4155,8 @@ fn ensure_event_context_revision(store: &Store, context_id: crate::ContextId) ->
     for attempt in 0..=MAX_STALE_RETRIES {
         let tx = store.begin_tx()?;
         let params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
-        let existing = match store.internal_db().execute_in_tx(
+        let existing = match execute_in_tx_counted(
+            store,
             tx,
             "SELECT revision_tx FROM event_context_revisions WHERE context_id = $context_id",
             &params,
@@ -3510,21 +4167,22 @@ fn ensure_event_context_revision(store: &Store, context_id: crate::ContextId) ->
                 return Err(map_engine_err(error));
             }
         };
-        if let Some(row) = existing.rows().first() {
-            if existing.rows().len() != 1 {
+        if let Some(row) = existing.rows.first() {
+            if existing.rows.len() != 1 {
                 let _ = store.internal_db().rollback(tx);
                 return Err(CgError::Engine(
                     "the event Context revision primary key returned more than one row".into(),
                 ));
             }
-            if let Err(error) = get_txid(row, existing.columns(), "revision_tx") {
+            if let Err(error) = get_txid(row, &existing.columns, "revision_tx") {
                 let _ = store.internal_db().rollback(tx);
                 return Err(error);
             }
             store.internal_db().rollback(tx).map_err(map_engine_err)?;
             return Ok(());
         }
-        let inserted = store.internal_db().execute_in_tx(
+        let inserted = execute_in_tx_counted(
+            store,
             tx,
             "INSERT INTO event_context_revisions (context_id, revision_tx) VALUES ($context_id, $revision_tx)",
             &HashMap::from([
@@ -3590,7 +4248,8 @@ fn insert_capture_attempt(
     let attempt_token = uuid::Uuid::now_v7();
     let tx = store.begin_tx()?;
     let placeholder = format!("capturing:{}", id.as_uuid());
-    let result = store.internal_db().execute_in_tx(
+    let result = execute_in_tx_counted(
+        store,
         tx,
         "INSERT INTO event_search_generations (id, context_id, interpretation_generation_id, interpretation_snapshot, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, failed_event_count, passage_count, started_at, last_attempt_at, last_attempt_token, completed_at, sanitized_failure) VALUES ($id, $context_id, $interpretation_generation_id, $snapshot, $snapshot_sha256, $zero, $ordered_sha256, $source_sha256, $zero, $renderer_id, $renderer_version, $profile, $space, $encoding, $state, $zero, $zero, $zero, $zero, $zero, $zero, $started_at, $started_at, $attempt_token, $null, $null)",
         &HashMap::from([
@@ -3647,20 +4306,20 @@ fn insert_capture_attempt(
             ));
         }
         let params = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
-        let groups = store.internal_db().execute_in_tx(tx,
+        let groups = execute_in_tx_counted(store, tx,
             "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref", &params).map_err(map_engine_err)?;
-        for row in groups.rows() {
-            let connector = get_text(row, groups.columns(), "connector_id")?;
-            let source = get_text(row, groups.columns(), "source_instance_ref")?;
+        for row in &groups.rows {
+            let connector = get_text(row, &groups.columns, "connector_id")?;
+            let source = get_text(row, &groups.columns, "source_instance_ref")?;
             let mut latest_params = params.clone();
             latest_params.insert("connector".into(), Value::Text(connector.clone()));
             latest_params.insert("source".into(), Value::Text(source.clone()));
-            let newest = store.internal_db().execute_in_tx(tx,
+            let newest = execute_in_tx_counted(store, tx,
                 "SELECT session_ref FROM events WHERE context_id = $context_id AND connector_id = $connector AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1", &latest_params).map_err(map_engine_err)?;
-            let latest = newest.rows().first().ok_or_else(|| {
+            let latest = newest.rows.first().ok_or_else(|| {
                 stale_claim("captured stream disappeared during target enrollment")
             })?;
-            let session = get_text(latest, newest.columns(), "session_ref")?;
+            let session = get_text(latest, &newest.columns, "session_ref")?;
             set_stream_pending_in_tx(
                 store,
                 tx,
@@ -3705,9 +4364,7 @@ fn finalize_capture_attempt(
 ) -> Result<()> {
     let tx = store.begin_tx()?;
     let result = (|| -> Result<()> {
-        let generation = store
-            .internal_db()
-            .execute_in_tx(
+        let generation = execute_in_tx_counted(store,
                 tx,
                 "SELECT context_id, capture_ordinal, state FROM event_search_generations WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([
@@ -3717,20 +4374,18 @@ fn finalize_capture_attempt(
             )
             .map_err(map_engine_err)?;
         let row = generation
-            .rows()
+            .rows
             .first()
             .ok_or_else(|| stale_claim("event-search capture attempt disappeared"))?;
-        if generation.rows().len() != 1
-            || get_u64(row, generation.columns(), "capture_ordinal")? != snapshot.event_count
-            || get_text(row, generation.columns(), "state")? != "capturing"
+        if generation.rows.len() != 1
+            || get_u64(row, &generation.columns, "capture_ordinal")? != snapshot.event_count
+            || get_text(row, &generation.columns, "state")? != "capturing"
         {
             return Err(stale_claim(
                 "event-search capture membership did not seal exactly",
             ));
         }
-        store
-            .internal_db()
-            .execute_in_tx(
+        execute_in_tx_counted(store,
                 tx,
                 "UPDATE event_search_generations SET event_count = $event_count, ordered_source_set_sha256 = $ordered_sha256, source_content_sha256 = $source_sha256, state = $state WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([
@@ -3840,46 +4495,46 @@ fn current_ready_head(
         "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
-    let Some(head_row) = head.rows().first() else {
+    let Some(head_row) = head.rows.first() else {
         return Ok(None);
     };
-    if head.rows().len() != 1 {
+    if head.rows.len() != 1 {
         return Err(stale_claim("event-search current head is not unique"));
     }
-    let id = EventSearchGenerationId::from(get_uuid(head_row, head.columns(), "generation_id")?);
+    let id = EventSearchGenerationId::from(get_uuid(head_row, &head.columns, "generation_id")?);
     let result = store.query_rows(
         "SELECT context_id, interpretation_snapshot, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, started_at FROM event_search_generations WHERE id = $id",
         &HashMap::from([("id".into(), Value::Uuid(id.as_uuid()))]),
     )?;
-    let Some(row) = result.rows().first() else {
+    let Some(row) = result.rows.first() else {
         return Err(stale_claim(
             "event-search current head generation disappeared",
         ));
     };
-    if result.rows().len() != 1 {
+    if result.rows.len() != 1 {
         return Err(stale_claim(
             "event-search current head generation is not unique",
         ));
     }
-    let persisted_snapshot = get_json(row, result.columns(), "interpretation_snapshot")?;
-    let event_count = get_u64(row, result.columns(), "event_count")?;
-    let ordered_source_set_sha256 = get_text(row, result.columns(), "ordered_source_set_sha256")?;
-    let source_content_sha256 = get_text(row, result.columns(), "source_content_sha256")?;
-    if get_uuid(row, result.columns(), "context_id")? != context_id.as_uuid()
-        || get_text(row, result.columns(), "state")? != "ready"
-        || get_text(row, result.columns(), "interpretation_snapshot_sha256")? != snapshot_sha256
+    let persisted_snapshot = get_json(row, &result.columns, "interpretation_snapshot")?;
+    let event_count = get_u64(row, &result.columns, "event_count")?;
+    let ordered_source_set_sha256 = get_text(row, &result.columns, "ordered_source_set_sha256")?;
+    let source_content_sha256 = get_text(row, &result.columns, "source_content_sha256")?;
+    if get_uuid(row, &result.columns, "context_id")? != context_id.as_uuid()
+        || get_text(row, &result.columns, "state")? != "ready"
+        || get_text(row, &result.columns, "interpretation_snapshot_sha256")? != snapshot_sha256
         || persisted_snapshot != *snapshot
         || hash_json(&persisted_snapshot) != snapshot_sha256
-        || get_text(row, result.columns(), "renderer_id")? != EVENT_SEARCH_RENDERER_ID
-        || get_text(row, result.columns(), "renderer_version")? != EVENT_SEARCH_RENDERER_VERSION
-        || get_json(row, result.columns(), "renderer_profile")?
+        || get_text(row, &result.columns, "renderer_id")? != EVENT_SEARCH_RENDERER_ID
+        || get_text(row, &result.columns, "renderer_version")? != EVENT_SEARCH_RENDERER_VERSION
+        || get_json(row, &result.columns, "renderer_profile")?
             != serde_json::to_value(&spec.profile).map_err(json_error)?
-        || get_text(row, result.columns(), "embedding_space_id")? != spec.embedding_space_id
-        || get_text(row, result.columns(), "encoding_profile")? != spec.encoding_profile_id.clone()
+        || get_text(row, &result.columns, "embedding_space_id")? != spec.embedding_space_id
+        || get_text(row, &result.columns, "encoding_profile")? != spec.encoding_profile_id.clone()
     {
         return Ok(None);
     }
-    if get_u64(row, result.columns(), "capture_ordinal")? < event_count {
+    if get_u64(row, &result.columns, "capture_ordinal")? < event_count {
         return Err(stale_claim(
             "event-search ready head capture ordinal trails its searchable watermark",
         ));
@@ -3898,7 +4553,8 @@ fn current_ready_head(
                 ordered_source_set_sha256,
                 source_content_sha256,
             },
-            started_at: get_txid(row, result.columns(), "started_at")?,
+            certified: None,
+            started_at: get_txid(row, &result.columns, "started_at")?,
             attempt_tx: None,
             attempt_token: None,
             pending_dual_head_activation: false,
@@ -3949,25 +4605,25 @@ fn incomplete_generation(
             ("retired".into(), Value::Text("retired".into())),
         ]),
     )?;
-    let Some(row) = result.rows().first() else {
+    let Some(row) = result.rows.first() else {
         return Ok(None);
     };
-    let state = get_text(row, result.columns(), "state")?;
+    let state = get_text(row, &result.columns, "state")?;
     if state != "capturing" && state != "building" {
         return Ok(None);
     }
-    let persisted_snapshot = get_json(row, result.columns(), "interpretation_snapshot")?;
+    let persisted_snapshot = get_json(row, &result.columns, "interpretation_snapshot")?;
     if persisted_snapshot != *snapshot || hash_json(&persisted_snapshot) != snapshot_sha256 {
         return Err(stale_claim(
             "incomplete event-search generation snapshot changed under its identity",
         ));
     }
-    let event_count = get_u64(row, result.columns(), "event_count")?;
-    let ordered_source_set_sha256 = get_text(row, result.columns(), "ordered_source_set_sha256")?;
-    let source_content_sha256 = get_text(row, result.columns(), "source_content_sha256")?;
+    let event_count = get_u64(row, &result.columns, "event_count")?;
+    let ordered_source_set_sha256 = get_text(row, &result.columns, "ordered_source_set_sha256")?;
+    let source_content_sha256 = get_text(row, &result.columns, "source_content_sha256")?;
     Ok(Some((
         Generation {
-            id: EventSearchGenerationId::from(get_uuid(row, result.columns(), "id")?),
+            id: EventSearchGenerationId::from(get_uuid(row, &result.columns, "id")?),
             context_id,
             bindings: bindings_from_snapshot(&persisted_snapshot)?,
             snapshot_sha256: snapshot_sha256.into(),
@@ -3979,7 +4635,8 @@ fn incomplete_generation(
                 ordered_source_set_sha256,
                 source_content_sha256,
             },
-            started_at: get_txid(row, result.columns(), "started_at")?,
+            certified: None,
+            started_at: get_txid(row, &result.columns, "started_at")?,
             attempt_tx: None,
             attempt_token: None,
             pending_dual_head_activation: false,
@@ -3990,18 +4647,20 @@ fn incomplete_generation(
     )))
 }
 
+/// The connectors with captured events in the Context: one row per connector, answered from the
+/// declared `(context_id, connector_id)` maintained count rather than one row per stream.
 fn event_connectors(
     source: &dyn EventSearchRows,
     context_id: crate::ContextId,
 ) -> Result<BTreeSet<String>> {
     let answer = source.query_rows(
-        "SELECT connector_id, source_instance_ref, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id, source_instance_ref",
+        "SELECT connector_id, COUNT(*) AS event_count FROM events WHERE context_id = $context_id GROUP BY connector_id",
         &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
     )?;
     answer
-        .rows()
+        .rows
         .iter()
-        .map(|row| get_text(row, answer.columns(), "connector_id"))
+        .map(|row| get_text(row, &answer.columns, "connector_id"))
         .collect()
 }
 
@@ -4038,17 +4697,17 @@ fn explicit_staged_connector(
             ("id".into(), Value::Uuid(id.as_uuid())),
         ]),
     )?;
-    let row = result.rows().first().ok_or(CgError::NotFound {
+    let row = result.rows.first().ok_or(CgError::NotFound {
         id: Some(id.to_string()),
         missing: Some("interpretation generation"),
     })?;
-    if result.rows().len() != 1 {
+    if result.rows.len() != 1 {
         return Err(CgError::Engine(
             "explicit interpretation generation lookup was not unique".into(),
         ));
     }
-    validate_ready_interpretation_row(row, result.columns(), id)?;
-    get_text(row, result.columns(), "connector_id")
+    validate_ready_interpretation_row(row, &result.columns, id)?;
+    get_text(row, &result.columns, "connector_id")
 }
 
 fn resolve_search_binding(
@@ -4063,15 +4722,15 @@ fn resolve_search_binding(
             ("connector_id".into(), Value::Text(connector.into())),
         ]),
     )?;
-    let Some(row) = head.rows().first() else {
+    let Some(row) = head.rows.first() else {
         return Ok(InterpretationProvenance::CapturedBase);
     };
-    if head.rows().len() != 1 {
+    if head.rows.len() != 1 {
         return Err(CgError::Engine(
             "active interpretation head lookup was not unique".into(),
         ));
     }
-    let id = InterpretationGenerationId::from(get_uuid(row, head.columns(), "generation_id")?);
+    let id = InterpretationGenerationId::from(get_uuid(row, &head.columns, "generation_id")?);
     validate_ready_interpretation(store, context_id, connector, id)?;
     Ok(InterpretationProvenance::Active(id))
 }
@@ -4090,16 +4749,16 @@ fn validate_ready_interpretation(
             ("id".into(), Value::Uuid(id.as_uuid())),
         ]),
     )?;
-    let row = result.rows().first().ok_or(CgError::NotFound {
+    let row = result.rows.first().ok_or(CgError::NotFound {
         id: Some(id.to_string()),
         missing: Some("ready interpretation generation"),
     })?;
-    if result.rows().len() != 1 {
+    if result.rows.len() != 1 {
         return Err(CgError::Engine(
             "selected interpretation generation lookup was not unique".into(),
         ));
     }
-    validate_ready_interpretation_row(row, result.columns(), id)
+    validate_ready_interpretation_row(row, &result.columns, id)
 }
 
 fn validate_ready_interpretation_row(
@@ -4180,8 +4839,9 @@ fn capture_source_membership(
     context_id: crate::ContextId,
     bindings: &BTreeMap<String, InterpretationBinding>,
     generation_id: Option<EventSearchGenerationId>,
+    attempt_token: Option<uuid::Uuid>,
     bounds: Bounds,
-) -> Result<SourceSnapshot> {
+) -> Result<(SourceSnapshot, Option<CaptureCertificate>)> {
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     {
         MEMBERSHIP_CAPTURES.with(|count| count.set(count.get() + 1));
@@ -4190,127 +4850,125 @@ fn capture_source_membership(
             return Err(reason);
         }
     }
-    let mut next_ordinal = generation_id
-        .map(|generation_id| {
-            generation_capture_high_water(store, context_id, generation_id, bounds)
-        })
-        .transpose()?
-        .unwrap_or(0);
-    let starting_events = captured_event_counts(store, &[context_id])?
-        .get(&context_id)
-        .map_or(0, |counts| counts.captured);
-    let mut count = 0_u64;
-    let mut ordered = Sha256::new();
-    ordered.update(b"context-graph/event-search-ordered-source-set/v1");
-    let mut content = Sha256::new();
-    content.update(b"context-graph/event-search-source-content/v1");
-    let captured = (|| -> Result<()> {
-        let mut after: Option<(String, String, u64)> = None;
-        loop {
-            // Materialize one configured event batch before decoding or persisting any member.
-            // Membership work can take much longer than the engine's read-statement lifetime.
-            let mut params =
-                HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
-            let continuation = if let Some((connector, source, seq)) = &after {
-                params.insert("after_connector".into(), Value::Text(connector.clone()));
-                params.insert("after_source".into(), Value::Text(source.clone()));
-                params.insert("after_seq".into(), integer(*seq, "capture sequence")?);
-                " AND (connector_id > $after_connector OR (connector_id = $after_connector AND source_instance_ref > $after_source) OR (connector_id = $after_connector AND source_instance_ref = $after_source AND seq > $after_seq))"
-            } else {
-                ""
-            };
-            let page = query_rows(
-                store,
-                bounds,
-                &format!(
-                    "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id{continuation} ORDER BY connector_id ASC, source_instance_ref ASC, seq ASC LIMIT {}",
-                    bounds.events.max(1)
-                ),
-                &params,
-            )?;
-            #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
-            AFTER_MEMBERSHIP_READ_PAGE.with(|slot| {
-                if let Some(hook) = slot.borrow_mut().take() {
-                    hook();
-                }
-            });
-            let Some(last) = page.rows().last() else {
-                break;
-            };
-            after = Some((
-                get_text(last, page.columns(), "connector_id")?,
-                get_text(last, page.columns(), "source_instance_ref")?,
-                get_u64(last, page.columns(), "seq")?,
-            ));
-            let page_len = page.rows().len();
-            capture_search_page(
-                store,
-                context_id,
-                bindings,
-                generation_id,
-                bounds,
-                page.columns(),
-                page.rows(),
-                &mut count,
-                &mut next_ordinal,
-                &mut ordered,
-                &mut content,
-            )?;
-            if page_len < bounds.events.max(1) {
-                break;
-            }
-        }
-        Ok(())
-    })();
-    captured?;
-    let current_events = captured_event_counts(store, &[context_id])?
-        .get(&context_id)
-        .map_or(0, |counts| counts.captured);
-    if current_events != starting_events {
-        return Err(stale_claim(
-            "captured events changed while event-search membership was paged",
+    let Some(generation_id) = generation_id else {
+        return Ok((
+            observe_source_membership(store, context_id, bindings, bounds)?,
+            None,
         ));
-    }
-    let observed = SourceSnapshot {
-        event_count: count,
-        ordered_source_set_sha256: finish_hash(ordered),
-        source_content_sha256: finish_hash(content),
     };
-    if let Some(generation_id) = generation_id {
-        let persisted = fold_source_membership(store, context_id, generation_id, bounds)?;
-        let capture_high_water =
-            generation_capture_high_water(store, context_id, generation_id, bounds)?;
-        if persisted.event_count != observed.event_count
-            || capture_high_water != persisted.event_count
-        {
-            return Err(stale_claim(
-                "event-search persisted membership differs from the fixed source snapshot",
-            ));
-        }
-        Ok(persisted)
-    } else {
-        Ok(observed)
+    let snapshot_sha256 = hash_json(&snapshot_json(bindings));
+    match capture_incremental_membership(
+        store,
+        context_id,
+        bindings,
+        generation_id,
+        &snapshot_sha256,
+        attempt_token,
+        bounds,
+    )? {
+        Some(captured) => Ok((captured.0, Some(captured.1))),
+        None => capture_full_membership(
+            store,
+            context_id,
+            bindings,
+            generation_id,
+            &snapshot_sha256,
+            attempt_token,
+            bounds,
+        )
+        .map(|(snapshot, certificate)| (snapshot, Some(certificate))),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn capture_search_page(
+/// Which bound interpretation versions a generation's retained members were last verified
+/// against: per connector, the ready interpretation generation and its capture/build progress, or
+/// null for the captured base. This is mutable verification progress, kept apart from the binding
+/// identity that decides reuse and rebuild.
+fn current_interpretation_stamp(
     store: &Store,
     context_id: crate::ContextId,
     bindings: &BTreeMap<String, InterpretationBinding>,
-    generation_id: Option<EventSearchGenerationId>,
+    bounds: Bounds,
+) -> Result<JsonValue> {
+    let mut stamp = JsonMap::new();
+    for (connector, binding) in bindings {
+        let value = match binding.generation_id() {
+            None => JsonValue::Null,
+            Some(id) => {
+                let result = query_rows(
+                    store,
+                    bounds,
+                    "SELECT capture_ordinal, build_ordinal FROM event_interpretation_generations WHERE context_id = $context_id AND id = $id",
+                    &HashMap::from([
+                        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                        ("id".into(), Value::Uuid(id.as_uuid())),
+                    ]),
+                )?;
+                let row = result
+                    .rows
+                    .first()
+                    .ok_or_else(|| stale_claim("bound interpretation generation disappeared"))?;
+                json!({
+                    "generation_id": id.to_string(),
+                    "capture_ordinal": get_u64(row, &result.columns, "capture_ordinal")?,
+                    "build_ordinal": get_u64(row, &result.columns, "build_ordinal")?,
+                })
+            }
+        };
+        stamp.insert(connector.clone(), value);
+    }
+    Ok(canonicalize_json(&JsonValue::Object(stamp)))
+}
+
+fn read_event_context_revision(
+    store: &Store,
+    context_id: crate::ContextId,
+    bounds: Bounds,
+) -> Result<TxId> {
+    let result = query_rows(
+        store,
+        bounds,
+        "SELECT revision_tx FROM event_context_revisions WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )?;
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| stale_claim("event Context revision disappeared before capture"))?;
+    get_txid(row, &result.columns, "revision_tx")
+}
+
+fn count_rows(
+    store: &Store,
+    bounds: Bounds,
+    sql: &str,
+    params: &HashMap<String, Value>,
+) -> Result<u64> {
+    let result = query_rows(store, bounds, sql, params)?;
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| CgError::Engine("event-search count returned no row".into()))?;
+    get_u64(row, &result.columns, "n")
+}
+
+/// Members of one page of events, decoded and resolved against the bindings, with successive
+/// ordinals from `first_ordinal`. Nothing is persisted here.
+fn claimed_members_from_rows(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
     bounds: Bounds,
     columns: &[String],
     rows: &[Vec<Value>],
-    count: &mut u64,
-    next_ordinal: &mut u64,
-    ordered: &mut Sha256,
-    content: &mut Sha256,
-) -> Result<()> {
+    first_ordinal: u64,
+) -> Result<Vec<ClaimedEvent>> {
     let session = store
         .internal_db()
         .read_session(read_limits(store, bounds))
         .map_err(map_engine_err)?;
+    let mut members = Vec::with_capacity(rows.len());
+    let mut ordinal = first_ordinal;
     for row in rows {
         let raw = captured_raw_from_row(&session, bounds, context_id, columns, row)?;
         let captured_sha256 = captured_source_sha256(
@@ -4321,54 +4979,1567 @@ fn capture_search_page(
         );
         let (event, effective_generation_id, effective_sha256) =
             effective_captured_event(&session, bindings, raw.event, &captured_sha256)?;
-        let candidate = ClaimedEvent {
+        members.push(ClaimedEvent {
             membership_id: uuid::Uuid::now_v7(),
-            ordinal: generation_id.map_or(*count, |_| *next_ordinal),
+            ordinal,
             event,
             effective_interpretation_generation_id: effective_generation_id,
             captured_source_sha256: captured_sha256,
             effective_source_sha256: effective_sha256,
+        });
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| CgError::Engine("event-search capture ordinal exhausted u64".into()))?;
+    }
+    Ok(members)
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn after_membership_read_page() {
+    AFTER_MEMBERSHIP_READ_PAGE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+fn after_membership_read_page() {}
+
+/// Which capture a pass performs: the full verifying capture, or the extension by the streams
+/// append marked since the last certified capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapturePassKind {
+    Full,
+    Incremental,
+}
+
+impl CapturePassKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
+/// One source stream a capture pass is reading inside its frozen frontier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureStream {
+    connector_id: String,
+    source_instance_ref: String,
+    session_ref: String,
+    upper_seq: u64,
+    frozen_count: u64,
+    marked_tx: Option<TxId>,
+    /// Members the stream already had when this pass reached it.
+    base: u64,
+    /// The last sequence read; the next read starts strictly after it.
+    after_seq: u64,
+    /// Events of the stream this pass has read, at or below `upper_seq`.
+    seen: u64,
+    /// The stream was already captured to its frontier by an earlier manifest row of this pass;
+    /// this row only closes its own capture mark.
+    already_captured: bool,
+}
+
+/// The saved state of one capture pass, committed with every unit as the generation's `capture`
+/// fold. Phase `manifest` enumerates and freezes the pass's input; phase `capture` reads inside it.
+#[derive(Clone, Debug)]
+struct CapturePass {
+    row: Option<FoldRow>,
+    kind: CapturePassKind,
+    manifest_complete: bool,
+    /// The Context revision when the pass began. Certification reconciles the whole Context's event
+    /// count with the members only when no append landed since.
+    revision: u64,
+    stamp: JsonValue,
+    /// The last manifest key enumerated (manifest phase) or consumed (capture phase).
+    key: Option<(String, String, String)>,
+    /// The stream frozen last during enumeration, reused by its further capture marks.
+    frozen_stream: Option<(String, String, u64, u64)>,
+    current: Option<CaptureStream>,
+    captured_stream: Option<(String, String)>,
+    /// Sum of the frozen event counts of a full pass's streams.
+    frozen_total: u64,
+}
+
+fn key_json(key: &Option<(String, String, String)>) -> JsonValue {
+    match key {
+        Some((connector, source, session)) => json!([connector, source, session]),
+        None => JsonValue::Null,
+    }
+}
+
+fn key_from_json(value: Option<&JsonValue>) -> Result<Option<(String, String, String)>> {
+    let invalid = || CgError::Engine("event-search capture key is not well formed".into());
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Array(parts)) if parts.len() == 3 => {
+            let part = |at: usize| parts[at].as_str().map(str::to_string).ok_or_else(invalid);
+            Ok(Some((part(0)?, part(1)?, part(2)?)))
+        }
+        Some(_) => Err(invalid()),
+    }
+}
+
+impl CapturePass {
+    fn fresh(kind: CapturePassKind, revision: TxId, stamp: JsonValue) -> Self {
+        Self {
+            row: None,
+            kind,
+            manifest_complete: false,
+            revision: revision.0,
+            stamp,
+            key: None,
+            frozen_stream: None,
+            current: None,
+            captured_stream: None,
+            frozen_total: 0,
+        }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        json!({
+            "kind": self.kind.as_str(),
+            "manifest_complete": self.manifest_complete,
+            "revision": self.revision,
+            "stamp": self.stamp.clone(),
+            "key": key_json(&self.key),
+            "frozen_stream": self.frozen_stream.as_ref().map(|(connector, source, upper, frozen)| {
+                json!([connector, source, upper, frozen])
+            }),
+            "current": self.current.as_ref().map(|stream| json!({
+                "connector_id": stream.connector_id,
+                "source_instance_ref": stream.source_instance_ref,
+                "session_ref": stream.session_ref,
+                "upper_seq": stream.upper_seq,
+                "frozen_count": stream.frozen_count,
+                "marked_tx": stream.marked_tx.map(|tx| tx.0),
+                "base": stream.base,
+                "after_seq": stream.after_seq,
+                "seen": stream.seen,
+                "already_captured": stream.already_captured,
+            })),
+            "captured_stream": self.captured_stream.as_ref().map(|(connector, source)| {
+                json!([connector, source])
+            }),
+            "frozen_total": self.frozen_total,
+        })
+    }
+
+    fn from_row(row: FoldRow) -> Result<Self> {
+        let state = &row.state;
+        let invalid =
+            || CgError::Engine("event-search capture pass state is not well formed".into());
+        let kind = match json_text(state, "kind")?.as_str() {
+            "full" => CapturePassKind::Full,
+            "incremental" => CapturePassKind::Incremental,
+            _ => return Err(invalid()),
         };
-        let member = if let Some(generation_id) = generation_id {
-            let member = reuse_or_persist_search_membership(
+        let frozen_stream = match state.get("frozen_stream") {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::Array(parts)) if parts.len() == 4 => Some((
+                parts[0].as_str().ok_or_else(invalid)?.to_string(),
+                parts[1].as_str().ok_or_else(invalid)?.to_string(),
+                parts[2].as_u64().ok_or_else(invalid)?,
+                parts[3].as_u64().ok_or_else(invalid)?,
+            )),
+            Some(_) => return Err(invalid()),
+        };
+        let current = match state.get("current") {
+            None | Some(JsonValue::Null) => None,
+            Some(stream) => Some(CaptureStream {
+                connector_id: json_text(stream, "connector_id")?,
+                source_instance_ref: json_text(stream, "source_instance_ref")?,
+                session_ref: json_text(stream, "session_ref")?,
+                upper_seq: json_u64(stream, "upper_seq")?,
+                frozen_count: json_u64(stream, "frozen_count")?,
+                marked_tx: stream
+                    .get("marked_tx")
+                    .and_then(JsonValue::as_u64)
+                    .map(TxId),
+                base: json_u64(stream, "base")?,
+                after_seq: json_u64(stream, "after_seq")?,
+                seen: json_u64(stream, "seen")?,
+                already_captured: stream
+                    .get("already_captured")
+                    .and_then(JsonValue::as_bool)
+                    .ok_or_else(invalid)?,
+            }),
+        };
+        let captured_stream = match state.get("captured_stream") {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::Array(parts)) if parts.len() == 2 => Some((
+                parts[0].as_str().ok_or_else(invalid)?.to_string(),
+                parts[1].as_str().ok_or_else(invalid)?.to_string(),
+            )),
+            Some(_) => return Err(invalid()),
+        };
+        Ok(Self {
+            kind,
+            manifest_complete: state
+                .get("manifest_complete")
+                .and_then(JsonValue::as_bool)
+                .ok_or_else(invalid)?,
+            revision: json_u64(state, "revision")?,
+            stamp: state.get("stamp").cloned().ok_or_else(invalid)?,
+            key: key_from_json(state.get("key"))?,
+            frozen_stream,
+            current,
+            captured_stream,
+            frozen_total: json_u64(state, "frozen_total")?,
+            row: Some(row),
+        })
+    }
+
+    fn frontier(&self) -> String {
+        format!(
+            "{:?}",
+            (
+                self.kind,
+                self.manifest_complete,
+                &self.key,
+                self.current.as_ref().map(|stream| (
+                    &stream.connector_id,
+                    &stream.source_instance_ref,
+                    stream.after_seq
+                )),
+            )
+        )
+    }
+}
+
+/// How a capture pass ended.
+enum CapturePassEnd {
+    Certified(SourceSnapshot, CaptureCertificate),
+    /// The members do not reconcile with the frozen input; an incremental pass falls back to the
+    /// full verifying capture.
+    Unreconciled,
+}
+
+/// Branches continuing strictly after `(connector, source, session)` in that key order, each an
+/// equality prefix plus one trailing range so the engine seeks past the consumed keys.
+fn three_key_branches(key: &Option<(String, String, String)>) -> Vec<KeyBranch> {
+    match key {
+        None => vec![KeyBranch::new("", Vec::new())],
+        Some((connector, source, session)) => vec![
+            KeyBranch::new(
+                " AND connector_id = $after_connector AND source_instance_ref = $after_source AND session_ref > $after_session",
+                vec![
+                    ("after_connector", Value::Text(connector.clone())),
+                    ("after_source", Value::Text(source.clone())),
+                    ("after_session", Value::Text(session.clone())),
+                ],
+            ),
+            KeyBranch::new(
+                " AND connector_id = $after_connector AND source_instance_ref > $after_source",
+                vec![
+                    ("after_connector", Value::Text(connector.clone())),
+                    ("after_source", Value::Text(source.clone())),
+                ],
+            ),
+            KeyBranch::new(
+                " AND connector_id > $after_connector",
+                vec![("after_connector", Value::Text(connector.clone()))],
+            ),
+        ],
+    }
+}
+
+/// Branches continuing strictly before the stream `(connector, source)` in descending key order.
+fn stream_branches_descending(stream: Option<(&str, &str)>) -> Vec<KeyBranch> {
+    match stream {
+        None => vec![KeyBranch::new("", Vec::new())],
+        Some((connector, source)) => vec![
+            KeyBranch::new(
+                " AND connector_id = $after_connector AND source_instance_ref < $after_source",
+                vec![
+                    ("after_connector", Value::Text(connector.to_string())),
+                    ("after_source", Value::Text(source.to_string())),
+                ],
+            ),
+            KeyBranch::new(
+                " AND connector_id < $after_connector",
+                vec![("after_connector", Value::Text(connector.to_string()))],
+            ),
+        ],
+    }
+}
+
+/// Branches continuing strictly after the stream `(connector, source)`.
+fn stream_branches(stream: Option<(&str, &str)>) -> Vec<KeyBranch> {
+    match stream {
+        None => vec![KeyBranch::new("", Vec::new())],
+        Some((connector, source)) => vec![
+            KeyBranch::new(
+                " AND connector_id = $after_connector AND source_instance_ref > $after_source",
+                vec![
+                    ("after_connector", Value::Text(connector.to_string())),
+                    ("after_source", Value::Text(source.to_string())),
+                ],
+            ),
+            KeyBranch::new(
+                " AND connector_id > $after_connector",
+                vec![("after_connector", Value::Text(connector.to_string()))],
+            ),
+        ],
+    }
+}
+
+fn stream_params(
+    context_id: crate::ContextId,
+    connector: &str,
+    source: &str,
+) -> HashMap<String, Value> {
+    HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("connector_id".into(), Value::Text(connector.into())),
+        ("source".into(), Value::Text(source.into())),
+    ])
+}
+
+/// Freeze one stream's frontier: its newest sequence and its event count. The count is the
+/// engine-maintained per-stream count, read before and after the newest sequence; equal counts mean
+/// no append to the stream committed between them, so the pair describes one population.
+fn freeze_stream(
+    store: &Store,
+    bounds: Bounds,
+    context_id: crate::ContextId,
+    connector: &str,
+    source: &str,
+) -> Result<(u64, u64)> {
+    let params = stream_params(context_id, connector, source);
+    let count = || -> Result<u64> {
+        let counted = query_rows(
+            store,
+            bounds,
+            "SELECT COUNT(*) AS n FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source",
+            &params,
+        )?;
+        Ok(counted
+            .rows
+            .first()
+            .map(|row| get_u64(row, &counted.columns, "n"))
+            .transpose()?
+            .unwrap_or(0))
+    };
+    for _ in 0..=MAX_STALE_RETRIES {
+        let before = count()?;
+        let newest = query_rows(
+            store,
+            bounds,
+            "SELECT seq FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1",
+            &params,
+        )?;
+        let upper = newest
+            .rows
+            .first()
+            .map(|row| get_u64(row, &newest.columns, "seq"))
+            .transpose()?
+            .ok_or_else(|| stale_claim("an enumerated source stream has no events"))?;
+        if count()? == before {
+            return Ok((upper, before));
+        }
+    }
+    Err(stale_claim(
+        "appends to a source stream kept moving while its capture frontier was frozen",
+    ))
+}
+
+/// Run a capture pass to its end, one bounded unit at a time.
+#[allow(clippy::too_many_arguments)]
+fn run_capture_pass(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    generation_id: EventSearchGenerationId,
+    snapshot_sha256: &str,
+    attempt_token: Option<uuid::Uuid>,
+    bounds: Bounds,
+    mut pass: CapturePass,
+) -> Result<CapturePassEnd> {
+    let token = attempt_token.unwrap_or_else(uuid::Uuid::now_v7);
+    let (mut capture_ordinal, mut chain) =
+        carried_generation_chain(store, context_id, generation_id, bounds)?;
+    loop {
+        if !pass.manifest_complete {
+            pass = capture_manifest_unit(
                 store,
                 context_id,
                 generation_id,
-                &candidate,
+                snapshot_sha256,
+                attempt_token,
+                token,
                 bounds,
+                pass,
             )?;
-            *next_ordinal =
-                (*next_ordinal).max(member.ordinal.checked_add(1).ok_or_else(|| {
-                    CgError::Engine("event-search capture ordinal exhausted u64".into())
-                })?);
-            member
-        } else {
-            candidate
-        };
-        if generation_id.is_none() {
-            hash_part(ordered, &member.ordinal.to_be_bytes());
-            hash_part(ordered, member.event.id.as_uuid().as_bytes());
-            hash_part(ordered, member.event.connector_id.as_bytes());
-            hash_part(ordered, member.event.source_instance_ref.as_bytes());
-            hash_part(ordered, member.event.session_ref.as_bytes());
-            hash_part(ordered, &member.event.seq.to_be_bytes());
-            hash_part(ordered, member.captured_source_sha256.as_bytes());
-            hash_part(content, member.effective_source_sha256.as_bytes());
+            continue;
         }
-        *count = count
-            .checked_add(1)
-            .ok_or_else(|| CgError::Engine("event-search source count exhausted u64".into()))?;
+        match capture_read_unit(
+            store,
+            context_id,
+            bindings,
+            generation_id,
+            snapshot_sha256,
+            attempt_token,
+            token,
+            bounds,
+            pass,
+            &mut capture_ordinal,
+            &mut chain,
+        )? {
+            CaptureStep::Continue(next) => pass = *next,
+            CaptureStep::Exhausted(last) => {
+                return certify_capture_pass(
+                    store,
+                    context_id,
+                    generation_id,
+                    snapshot_sha256,
+                    attempt_token,
+                    &last,
+                    capture_ordinal,
+                    &chain,
+                    bounds,
+                );
+            }
+            CaptureStep::Unreconciled => return Ok(CapturePassEnd::Unreconciled),
+        }
+    }
+}
+
+fn carried_generation_chain(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    bounds: Bounds,
+) -> Result<(u64, MembershipChain)> {
+    let generation = query_rows(
+        store,
+        bounds,
+        "SELECT capture_ordinal, capture_ordered_sha256, capture_content_sha256 FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+        &HashMap::from([
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("id".into(), Value::Uuid(generation_id.as_uuid())),
+        ]),
+    )?;
+    let row = generation
+        .rows
+        .first()
+        .ok_or_else(|| stale_claim("event-search capture generation disappeared"))?;
+    let capture_ordinal = get_u64(row, &generation.columns, "capture_ordinal")?;
+    let chain = MembershipChain::carried(
+        get_text(row, &generation.columns, "capture_ordered_sha256")?,
+        get_text(row, &generation.columns, "capture_content_sha256")?,
+        capture_ordinal,
+    )
+    .ok_or_else(|| stale_claim("event-search generation carries no membership chain"))?;
+    Ok((capture_ordinal, chain))
+}
+
+/// One enumerating unit: find and freeze the next streams (full pass) or capture marks
+/// (incremental pass) by bounded reads, then commit them into the manifest with the pass state in
+/// one fenced transaction.
+#[allow(clippy::too_many_arguments)]
+fn capture_manifest_unit(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    snapshot_sha256: &str,
+    attempt_token: Option<uuid::Uuid>,
+    token: uuid::Uuid,
+    bounds: Bounds,
+    pass: CapturePass,
+) -> Result<CapturePass> {
+    tally_reset();
+    let before = pass.frontier();
+    let mut next = pass.clone();
+    let mut returned = 0_u64;
+    // (connector, source, session, upper, frozen, marked_tx)
+    let mut frozen_rows: Vec<(String, String, String, u64, u64, Option<TxId>)> = Vec::new();
+    match next.kind {
+        CapturePassKind::Full => {
+            // One stream per unit. Streams are enumerated in descending key order so the seek that
+            // finds the next stream also returns its newest sequence; the manifest is a set, and
+            // the capture phase walks it in ascending key order.
+            let base = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+            let stream = next
+                .key
+                .as_ref()
+                .map(|(connector, source, _)| (connector.as_str(), source.as_str()));
+            let page = read_branches(
+                &mut unit_reader(store, bounds),
+                "SELECT connector_id, source_instance_ref, seq FROM events WHERE context_id = $context_id",
+                "connector_id DESC, source_instance_ref DESC, seq DESC",
+                &base,
+                &stream_branches_descending(stream),
+                1,
+            )?;
+            match page.rows.first() {
+                None => {
+                    next.manifest_complete = true;
+                    next.key = None;
+                }
+                Some(row) => {
+                    returned += 1;
+                    let connector = get_text(row, &page.columns, "connector_id")?;
+                    let source = get_text(row, &page.columns, "source_instance_ref")?;
+                    let upper = get_u64(row, &page.columns, "seq")?;
+                    // The engine-maintained stream count. An append between the seek and this count
+                    // makes the stream fail its reconciliation, which discards the pass.
+                    let counted = query_rows(
+                        store,
+                        bounds,
+                        "SELECT COUNT(*) AS n FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source",
+                        &stream_params(context_id, &connector, &source),
+                    )?;
+                    let frozen = counted
+                        .rows
+                        .first()
+                        .map(|row| get_u64(row, &counted.columns, "n"))
+                        .transpose()?
+                        .unwrap_or(0);
+                    next.frozen_total = next.frozen_total.checked_add(frozen).ok_or_else(|| {
+                        CgError::Engine("event-search frozen event count exhausted u64".into())
+                    })?;
+                    frozen_rows.push((
+                        connector.clone(),
+                        source.clone(),
+                        String::new(),
+                        upper,
+                        frozen,
+                        None,
+                    ));
+                    next.key = Some((connector, source, String::new()));
+                }
+            }
+        }
+        CapturePassKind::Incremental => {
+            // One capture mark per unit.
+            let limit = 1;
+            let base = HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                ("open".into(), Value::Bool(true)),
+            ]);
+            let page = read_branches(
+                &mut unit_reader(store, bounds),
+                "SELECT connector_id, source_instance_ref, session_ref, capture_pending_tx FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND capture_open = $open",
+                "connector_id ASC, source_instance_ref ASC, session_ref ASC",
+                &base,
+                &three_key_branches(&next.key),
+                limit,
+            )?;
+            returned = page.rows.len() as u64;
+            for mark in &page.rows {
+                let connector = get_text(mark, &page.columns, "connector_id")?;
+                let source = get_text(mark, &page.columns, "source_instance_ref")?;
+                let session = get_text(mark, &page.columns, "session_ref")?;
+                let marked_tx = get_optional_txid(mark, &page.columns, "capture_pending_tx")?;
+                let (upper, frozen) = match &next.frozen_stream {
+                    Some((frozen_connector, frozen_source, upper, frozen))
+                        if *frozen_connector == connector && *frozen_source == source =>
+                    {
+                        (*upper, *frozen)
+                    }
+                    _ => {
+                        let (upper, frozen) =
+                            freeze_stream(store, bounds, context_id, &connector, &source)?;
+                        next.frozen_stream =
+                            Some((connector.clone(), source.clone(), upper, frozen));
+                        (upper, frozen)
+                    }
+                };
+                frozen_rows.push((
+                    connector.clone(),
+                    source.clone(),
+                    session.clone(),
+                    upper,
+                    frozen,
+                    marked_tx,
+                ));
+                next.key = Some((connector, source, session));
+            }
+            if page.rows.len() < limit {
+                next.manifest_complete = true;
+                next.key = None;
+                next.frozen_stream = None;
+            }
+        }
+    }
+    if frozen_rows.is_empty() && next.manifest_complete {
+        // The enumeration found nothing further. That discovery commits with the pass's next unit
+        // (its first capture unit, or certification), so it is not a unit of its own; a crash before
+        // then repeats only this bounded read.
+        note_unit(UnitFold::Capture, returned, false, || {
+            (before, next.frontier())
+        })?;
+        return Ok(next);
+    }
+    let state = next.to_json();
+    let committed = commit_unit(store, |tx| {
+        let passage_revision = guard_fold_generation_in_tx(
+            store,
+            tx,
+            context_id,
+            generation_id,
+            snapshot_sha256,
+            attempt_token,
+            false,
+        )?;
+        for (connector, source, session, upper, frozen, marked_tx) in &frozen_rows {
+            execute_in_tx_tallied(store, tx,
+                    "INSERT INTO event_search_capture_manifest (context_id, generation_id, connector_id, source_instance_ref, session_ref, upper_seq, frozen_count, marked_tx) VALUES ($context_id, $generation_id, $connector_id, $source, $session, $upper, $frozen, $marked_tx)",
+                    &HashMap::from([
+                        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                        ("connector_id".into(), Value::Text(connector.clone())),
+                        ("source".into(), Value::Text(source.clone())),
+                        ("session".into(), Value::Text(session.clone())),
+                        ("upper".into(), integer(*upper, "frozen sequence")?),
+                        ("frozen".into(), integer(*frozen, "frozen event count")?),
+                        (
+                            "marked_tx".into(),
+                            marked_tx.map_or(Ok(Value::Null), |tx| integer(tx.0, "capture mark"))?,
+                        ),
+                    ]),
+                )
+                .map_err(map_engine_err)?;
+        }
+        save_fold_row_in_tx(
+            store,
+            tx,
+            context_id,
+            generation_id,
+            CAPTURE_FOLD,
+            pass.row.as_ref(),
+            token,
+            passage_revision,
+            false,
+            state,
+        )
+    });
+    next.row = Some(refused_unit(UnitFold::Capture, &before, committed)?);
+    note_unit(UnitFold::Capture, returned, true, || {
+        (before, next.frontier())
+    })?;
+    Ok(next)
+}
+
+enum CaptureStep {
+    Continue(Box<CapturePass>),
+    /// The manifest is consumed; the pass is ready to certify.
+    Exhausted(Box<CapturePass>),
+    Unreconciled,
+}
+
+/// One capturing unit: take the next manifest row (or continue the current stream), read the
+/// stream's next events strictly after the saved sequence and at or below its frozen frontier, and
+/// commit the new members, the generation's chain, the manifest consumption, the closed capture
+/// mark and the pass state in one transaction.
+#[allow(clippy::too_many_arguments)]
+fn capture_read_unit(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    generation_id: EventSearchGenerationId,
+    snapshot_sha256: &str,
+    attempt_token: Option<uuid::Uuid>,
+    token: uuid::Uuid,
+    bounds: Bounds,
+    pass: CapturePass,
+    capture_ordinal: &mut u64,
+    chain: &mut MembershipChain,
+) -> Result<CaptureStep> {
+    tally_reset();
+    let before = pass.frontier();
+    let allowance = bounds.events.max(1);
+    let mut returned = 0_u64;
+    let generation_params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+    ]);
+    let mut stream = match pass.current.clone() {
+        Some(stream) => stream,
+        None => {
+            let page = read_branches(
+                &mut unit_reader(store, bounds),
+                "SELECT connector_id, source_instance_ref, session_ref, upper_seq, frozen_count, marked_tx FROM event_search_capture_manifest WHERE context_id = $context_id AND generation_id = $generation_id",
+                "connector_id ASC, source_instance_ref ASC, session_ref ASC",
+                &generation_params,
+                &three_key_branches(&pass.key),
+                1,
+            )?;
+            let Some(row) = page.rows.first() else {
+                return Ok(CaptureStep::Exhausted(Box::new(pass)));
+            };
+            returned += 1;
+            let connector_id = get_text(row, &page.columns, "connector_id")?;
+            let source_instance_ref = get_text(row, &page.columns, "source_instance_ref")?;
+            let already_captured = pass.captured_stream.as_ref()
+                == Some(&(connector_id.clone(), source_instance_ref.clone()));
+            let (base, after_seq) = if already_captured || pass.kind == CapturePassKind::Full {
+                (0, 0)
+            } else {
+                let params = HashMap::from([
+                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                    ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                    ("connector_id".into(), Value::Text(connector_id.clone())),
+                    ("source".into(), Value::Text(source_instance_ref.clone())),
+                ]);
+                let newest = query_rows(
+                    store,
+                    bounds,
+                    "SELECT source_sequence FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source ORDER BY source_sequence DESC LIMIT 1",
+                    &params,
+                )?;
+                let after = newest
+                    .rows
+                    .first()
+                    .map(|row| get_u64(row, &newest.columns, "source_sequence"))
+                    .transpose()?
+                    .unwrap_or(0);
+                let members = count_rows(
+                    store,
+                    bounds,
+                    "SELECT COUNT(*) AS n FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source",
+                    &params,
+                )?;
+                (members, after)
+            };
+            CaptureStream {
+                connector_id,
+                source_instance_ref,
+                session_ref: get_text(row, &page.columns, "session_ref")?,
+                upper_seq: get_u64(row, &page.columns, "upper_seq")?,
+                frozen_count: get_u64(row, &page.columns, "frozen_count")?,
+                marked_tx: get_optional_u64(row, &page.columns, "marked_tx")?.map(TxId),
+                base,
+                after_seq,
+                seen: 0,
+                already_captured,
+            }
+        }
+    };
+    let mut appended = Vec::new();
+    let mut exhausted = stream.already_captured || stream.after_seq >= stream.upper_seq;
+    if !exhausted {
+        let remaining = allowance.saturating_sub(returned as usize).max(1);
+        let mut params = stream_params(
+            context_id,
+            &stream.connector_id,
+            &stream.source_instance_ref,
+        );
+        params.insert(
+            "after_seq".into(),
+            integer(stream.after_seq, "capture sequence")?,
+        );
+        params.insert(
+            "upper_seq".into(),
+            integer(stream.upper_seq, "frozen sequence")?,
+        );
+        let (page, more) = first_page_within_bytes(
+            store,
+            bounds,
+            &format!(
+                "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source AND seq > $after_seq AND seq <= $upper_seq ORDER BY seq ASC LIMIT {remaining}"
+            ),
+            &params,
+            remaining,
+        )?;
+        after_membership_read_page();
+        returned = returned.saturating_add(page.rows.len() as u64);
+        if let Some(last) = page.rows.last() {
+            stream.after_seq = get_u64(last, page.columns(), "seq")?;
+        }
+        stream.seen = stream
+            .seen
+            .checked_add(page.rows.len() as u64)
+            .ok_or_else(|| CgError::Engine("event-search capture count exhausted u64".into()))?;
+        // A page stopped by its byte bound has more; a page that filled its row limit may have more.
+        exhausted = stream.after_seq >= stream.upper_seq || (!more && page.rows.len() < remaining);
+        let candidates = claimed_members_from_rows(
+            store,
+            context_id,
+            bindings,
+            bounds,
+            page.columns(),
+            page.rows(),
+            0,
+        )?;
+        for mut candidate in candidates {
+            if pass.kind == CapturePassKind::Full
+                && retained_search_membership(store, context_id, generation_id, &candidate, bounds)?
+                    .is_some()
+            {
+                continue;
+            }
+            candidate.ordinal = capture_ordinal
+                .checked_add(appended.len() as u64)
+                .ok_or_else(|| {
+                    CgError::Engine("event-search capture ordinal exhausted u64".into())
+                })?;
+            appended.push(candidate);
+        }
+    }
+    if exhausted
+        && !stream.already_captured
+        && stream
+            .base
+            .checked_add(stream.seen)
+            .is_none_or(|members| members != stream.frozen_count)
+    {
+        // The stream's members do not account for exactly its events at the frozen frontier.
+        // An incremental pass falls back to the full verifying capture; a full pass is discarded
+        // and the caller's retry freezes a fresh manifest.
+        return Ok(CaptureStep::Unreconciled);
+    }
+    let mut next = pass.clone();
+    let committed = commit_unit(store, |tx| {
+        let passage_revision = guard_fold_generation_in_tx(
+            store,
+            tx,
+            context_id,
+            generation_id,
+            snapshot_sha256,
+            attempt_token,
+            false,
+        )?;
+        let manifest_key = HashMap::from([
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+            (
+                "connector_id".into(),
+                Value::Text(stream.connector_id.clone()),
+            ),
+            (
+                "source".into(),
+                Value::Text(stream.source_instance_ref.clone()),
+            ),
+            ("session".into(), Value::Text(stream.session_ref.clone())),
+        ]);
+        let manifest = execute_in_tx_tallied(store, tx,
+                "SELECT upper_seq, frozen_count FROM event_search_capture_manifest WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session",
+                &manifest_key,
+            )
+            .map_err(map_engine_err)?;
+        let frozen = manifest
+            .rows
+            .first()
+            .ok_or_else(|| stale_claim("event-search capture manifest changed under its unit"))?;
+        if get_u64(frozen, &manifest.columns, "upper_seq")? != stream.upper_seq
+            || get_u64(frozen, &manifest.columns, "frozen_count")? != stream.frozen_count
+        {
+            return Err(stale_claim(
+                "event-search capture frontier changed under its unit",
+            ));
+        }
+        let new_chain = persist_search_member_page_in_tx(
+            store,
+            tx,
+            context_id,
+            generation_id,
+            &appended,
+            chain,
+        )?;
+        if exhausted {
+            if next.kind == CapturePassKind::Incremental {
+                close_capture_mark_in_tx(store, tx, &manifest_key, stream.marked_tx)?;
+            }
+            let deleted = execute_in_tx_tallied(store, tx,
+                    "DELETE FROM event_search_capture_manifest WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session",
+                    &manifest_key,
+                )
+                .map_err(map_engine_err)?;
+            if deleted.rows_affected != 1 {
+                return Err(stale_claim("event-search capture manifest row disappeared"));
+            }
+            next.current = None;
+            next.key = Some((
+                stream.connector_id.clone(),
+                stream.source_instance_ref.clone(),
+                stream.session_ref.clone(),
+            ));
+            next.captured_stream = Some((
+                stream.connector_id.clone(),
+                stream.source_instance_ref.clone(),
+            ));
+        } else {
+            next.current = Some(stream.clone());
+        }
+        let row = save_fold_row_in_tx(
+            store,
+            tx,
+            context_id,
+            generation_id,
+            CAPTURE_FOLD,
+            pass.row.as_ref(),
+            token,
+            passage_revision,
+            false,
+            next.to_json(),
+        )?;
+        Ok((new_chain, row))
+    });
+    let (new_chain, row) = refused_unit(UnitFold::Capture, &before, committed)?;
+    *capture_ordinal = capture_ordinal
+        .checked_add(appended.len() as u64)
+        .ok_or_else(|| CgError::Engine("event-search capture ordinal exhausted u64".into()))?;
+    *chain = new_chain;
+    next.row = Some(row);
+    note_unit(UnitFold::Capture, returned, true, || {
+        (before, next.frontier())
+    })?;
+    Ok(CaptureStep::Continue(Box::new(next)))
+}
+
+/// Clear one capture mark inside the unit's transaction, only when it still names the append it
+/// named when its stream's frontier froze. A mark rewritten since names an append past the frontier
+/// and stays open for the next capture pass.
+fn close_capture_mark_in_tx(
+    store: &Store,
+    tx: TxId,
+    manifest_key: &HashMap<String, Value>,
+    marked_tx: Option<TxId>,
+) -> Result<()> {
+    let params = HashMap::from([
+        ("context_id".into(), manifest_key["context_id"].clone()),
+        (
+            "generation_id".into(),
+            manifest_key["generation_id"].clone(),
+        ),
+        ("connector".into(), manifest_key["connector_id"].clone()),
+        ("source".into(), manifest_key["source"].clone()),
+        ("session".into(), manifest_key["session"].clone()),
+    ]);
+    let current = execute_in_tx_tallied(store, tx,
+            "SELECT capture_open, capture_pending_tx FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+    let Some(row) = current.rows.first() else {
+        return Ok(());
+    };
+    let now = get_optional_txid(row, &current.columns, "capture_pending_tx")?;
+    if !get_bool(row, &current.columns, "capture_open")? || now != marked_tx {
+        return Ok(());
+    }
+    execute_in_tx_tallied(store, tx,
+            "UPDATE event_search_pending_streams SET capture_open = false, capture_pending_tx = NULL WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+    Ok(())
+}
+
+/// Certify a consumed capture pass and publish the interpretation stamp its members were verified
+/// against, consuming the pass's progress in the same transaction. When no append landed since the
+/// pass began, the whole Context's event count must equal the members, exactly as before. When
+/// appends landed, each one left its stream marked for the next pass, the pass reconciled every
+/// stream it read with its frozen count, and a full pass's members must equal its frozen total.
+/// Every bound interpretation generation must still be at the stamped progress.
+#[allow(clippy::too_many_arguments)]
+fn certify_capture_pass(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    snapshot_sha256: &str,
+    attempt_token: Option<uuid::Uuid>,
+    pass: &CapturePass,
+    capture_ordinal: u64,
+    chain: &MembershipChain,
+    bounds: Bounds,
+) -> Result<CapturePassEnd> {
+    // The engine-maintained Context count, read outside the transaction where it is one entry; the
+    // transaction below uses it only when the Context revision is still the one the pass began at,
+    // which proves no append committed since.
+    let context_events = count_rows(
+        store,
+        bounds,
+        "SELECT COUNT(*) AS n FROM events WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )?;
+    let tx = store.begin_tx()?;
+    let result = (|| -> Result<bool> {
+        guard_fold_generation_in_tx(
+            store,
+            tx,
+            context_id,
+            generation_id,
+            snapshot_sha256,
+            attempt_token,
+            false,
+        )?;
+        let context = Value::Uuid(context_id.as_uuid());
+        let params = HashMap::from([
+            ("context_id".into(), context.clone()),
+            ("id".into(), Value::Uuid(generation_id.as_uuid())),
+        ]);
+        let generation = execute_in_tx_counted(store,
+                tx,
+                "SELECT capture_ordinal FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+                &params,
+            )
+            .map_err(map_engine_err)?;
+        let row = generation
+            .rows
+            .first()
+            .ok_or_else(|| stale_claim("event-search capture generation disappeared"))?;
+        if get_u64(row, &generation.columns, "capture_ordinal")? != capture_ordinal
+            || !store
+                .internal_db()
+                .guard_row_conditions_in_tx(
+                    tx,
+                    "event_search_generations",
+                    "id",
+                    &Value::Uuid(generation_id.as_uuid()),
+                    &[(
+                        "capture_ordinal".into(),
+                        integer(capture_ordinal, "capture ordinal")?,
+                    )],
+                )
+                .map_err(map_engine_err)?
+        {
+            return Err(stale_claim(
+                "event-search generation changed before capture certification",
+            ));
+        }
+        let revision = execute_in_tx_counted(
+            store,
+            tx,
+            "SELECT revision_tx FROM event_context_revisions WHERE context_id = $context_id",
+            &params,
+        )
+        .map_err(map_engine_err)?;
+        let revision = revision
+            .rows
+            .first()
+            .map(|row| get_txid(row, &revision.columns, "revision_tx"))
+            .transpose()?
+            .ok_or_else(|| stale_claim("event Context revision disappeared before capture"))?;
+        if revision.0 == pass.revision {
+            if !store
+                .internal_db()
+                .guard_row_conditions_in_tx(
+                    tx,
+                    "event_context_revisions",
+                    "context_id",
+                    &context,
+                    &[("revision_tx".into(), Value::TxId(revision))],
+                )
+                .map_err(map_engine_err)?
+            {
+                return Err(stale_claim(
+                    "captured events changed while event-search membership was certified",
+                ));
+            }
+            if context_events != capture_ordinal {
+                return Ok(false);
+            }
+        } else if pass.kind == CapturePassKind::Full && pass.frozen_total != capture_ordinal {
+            return Ok(false);
+        }
+        if let JsonValue::Object(bound) = &pass.stamp {
+            for value in bound.values() {
+                let JsonValue::Object(entry) = value else {
+                    continue;
+                };
+                let id = entry
+                    .get("generation_id")
+                    .and_then(JsonValue::as_str)
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    .ok_or_else(|| {
+                        CgError::Engine("interpretation stamp lacks its generation".into())
+                    })?;
+                let ordinal = |name: &str| -> Result<Value> {
+                    entry
+                        .get(name)
+                        .and_then(JsonValue::as_u64)
+                        .ok_or_else(|| {
+                            CgError::Engine(format!("interpretation stamp lacks {name}"))
+                        })
+                        .and_then(|value| integer(value, name))
+                };
+                if !store
+                    .internal_db()
+                    .guard_row_conditions_in_tx(
+                        tx,
+                        "event_interpretation_generations",
+                        "id",
+                        &Value::Uuid(id),
+                        &[
+                            ("capture_ordinal".into(), ordinal("capture_ordinal")?),
+                            ("build_ordinal".into(), ordinal("build_ordinal")?),
+                        ],
+                    )
+                    .map_err(map_engine_err)?
+                {
+                    return Err(stale_claim(
+                        "bound interpretation advanced before capture certification",
+                    ));
+                }
+            }
+        }
+        let mut update = params;
+        update.insert("stamp".into(), Value::Json(pass.stamp.clone()));
+        execute_in_tx_counted(store,
+                tx,
+                "UPDATE event_search_generations SET interpretation_verified_stamp = $stamp WHERE context_id = $context_id AND id = $id",
+                &update,
+            )
+            .map_err(map_engine_err)?;
+        if let Some(row) = &pass.row {
+            delete_fold_row_in_tx(store, tx, row)?;
+        }
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => {
+            store
+                .internal_db()
+                .commit(tx)
+                .map_err(|error| match error {
+                    EngineError::ConditionalUpdateConflict { .. } => stale_claim(
+                        "captured events changed while event-search membership was certified",
+                    ),
+                    other => map_engine_err(other),
+                })?;
+            Ok(CapturePassEnd::Certified(
+                chain.membership_source_snapshot(capture_ordinal),
+                CaptureCertificate {
+                    revision: TxId(pass.revision),
+                    stamp: pass.stamp.clone(),
+                },
+            ))
+        }
+        Ok(false) => {
+            let _ = store.internal_db().rollback(tx);
+            Ok(CapturePassEnd::Unreconciled)
+        }
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            Err(error)
+        }
+    }
+}
+
+/// Discard an abandoned capture pass: consume its manifest in bounded units, then its progress.
+fn reset_capture_pass(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    bounds: Bounds,
+    row: Option<FoldRow>,
+) -> Result<()> {
+    let generation_params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+    ]);
+    let mut key: Option<(String, String, String)> = None;
+    loop {
+        let page = read_branches(
+            &mut unit_reader(store, bounds),
+            "SELECT connector_id, source_instance_ref, session_ref FROM event_search_capture_manifest WHERE context_id = $context_id AND generation_id = $generation_id",
+            "connector_id ASC, source_instance_ref ASC, session_ref ASC",
+            &generation_params,
+            &three_key_branches(&key),
+            bounds.events.max(1),
+        )?;
+        if page.rows.is_empty() {
+            break;
+        }
+        let before = format!("{key:?}");
+        commit_unit(store, |tx| {
+            for manifest in &page.rows {
+                let mut params = generation_params.clone();
+                params.insert(
+                    "connector_id".into(),
+                    Value::Text(get_text(manifest, &page.columns, "connector_id")?),
+                );
+                params.insert(
+                    "source".into(),
+                    Value::Text(get_text(manifest, &page.columns, "source_instance_ref")?),
+                );
+                params.insert(
+                    "session".into(),
+                    Value::Text(get_text(manifest, &page.columns, "session_ref")?),
+                );
+                execute_in_tx_tallied(store, tx,
+                        "DELETE FROM event_search_capture_manifest WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session",
+                        &params,
+                    )
+                    .map_err(map_engine_err)?;
+            }
+            Ok(())
+        })?;
+        let last = page.rows.last().expect("page is not empty");
+        key = Some((
+            get_text(last, &page.columns, "connector_id")?,
+            get_text(last, &page.columns, "source_instance_ref")?,
+            get_text(last, &page.columns, "session_ref")?,
+        ));
+        note_unit(UnitFold::Capture, page.rows.len() as u64, true, || {
+            (before, format!("{key:?}"))
+        })?;
+    }
+    if let Some(row) = row {
+        commit_unit(store, |tx| delete_fold_row_in_tx(store, tx, &row))?;
     }
     Ok(())
 }
 
-fn reuse_or_persist_search_membership(
+/// Extend a generation's membership with only the events appended since its last certified
+/// capture: the streams append left capture marks on, each frozen at its frontier when the pass
+/// enumerated it, read in `(connector_id, source_instance_ref, seq)` order past the stream's
+/// captured maximum. That is exactly the order a full walk gives newly encountered events, so
+/// ordinals and chained digests equal a full capture's from the same persisted prefix. An append
+/// landing past a frozen frontier keeps its mark and is captured by the next pass.
+///
+/// Returns `None` whenever the incremental path cannot certify the result — a generation still in
+/// its first capture, interpretation progress not yet verified, a carried digest that disagrees with
+/// the last member, or counts that do not reconcile — and the caller then runs the full verifying
+/// capture.
+#[allow(clippy::too_many_arguments)]
+fn capture_incremental_membership(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    generation_id: EventSearchGenerationId,
+    snapshot_sha256: &str,
+    attempt_token: Option<uuid::Uuid>,
+    bounds: Bounds,
+) -> Result<Option<(SourceSnapshot, CaptureCertificate)>> {
+    let generation_params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+    ]);
+    let generation = query_rows(
+        store,
+        bounds,
+        "SELECT capture_ordinal, state, capture_ordered_sha256, capture_content_sha256, interpretation_verified_stamp FROM event_search_generations WHERE context_id = $context_id AND id = $generation_id",
+        &generation_params,
+    )?;
+    let row = generation
+        .rows
+        .first()
+        .ok_or_else(|| stale_claim("event-search capture generation disappeared"))?;
+    if get_text(row, &generation.columns, "state")? == "capturing" {
+        return Ok(None);
+    }
+    let verified = match row.get(column_index(
+        &generation.columns,
+        "interpretation_verified_stamp",
+    )?) {
+        Some(Value::Json(value)) => canonicalize_json(value),
+        _ => return Ok(None),
+    };
+    let stamp = current_interpretation_stamp(store, context_id, bindings, bounds)?;
+    if verified != stamp {
+        return Ok(None);
+    }
+    let capture_ordinal = get_u64(row, &generation.columns, "capture_ordinal")?;
+    let Some(chain) = MembershipChain::carried(
+        get_text(row, &generation.columns, "capture_ordered_sha256")?,
+        get_text(row, &generation.columns, "capture_content_sha256")?,
+        capture_ordinal,
+    ) else {
+        return Ok(None);
+    };
+    if capture_ordinal > 0 {
+        let last = query_rows(
+            store,
+            bounds,
+            "SELECT ordinal, ordered_after, content_after FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY ordinal DESC LIMIT 1",
+            &generation_params,
+        )?;
+        let Some(last) = last.rows.first().map(|row| (row, &last.columns)) else {
+            return Ok(None);
+        };
+        if get_u64(last.0, last.1, "ordinal")?.checked_add(1) != Some(capture_ordinal)
+            || get_text(last.0, last.1, "ordered_after")? != chain.ordered
+            || get_text(last.0, last.1, "content_after")? != chain.content
+        {
+            // The carried digest disagrees with the last member: never extend it. The full
+            // verifier recomputes the chain from member fields and refuses a corrupted member.
+            return Ok(None);
+        }
+    }
+    let pass = match load_fold_row(store, bounds, context_id, generation_id, CAPTURE_FOLD)? {
+        Some(row) => {
+            let saved = CapturePass::from_row(row.clone())?;
+            match saved.kind {
+                // A full pass in flight finishes as a full pass.
+                CapturePassKind::Full => return Ok(None),
+                CapturePassKind::Incremental if saved.stamp == stamp => saved,
+                CapturePassKind::Incremental => {
+                    reset_capture_pass(store, context_id, generation_id, bounds, Some(row))?;
+                    CapturePass::fresh(
+                        CapturePassKind::Incremental,
+                        read_event_context_revision(store, context_id, bounds)?,
+                        stamp,
+                    )
+                }
+            }
+        }
+        None => CapturePass::fresh(
+            CapturePassKind::Incremental,
+            read_event_context_revision(store, context_id, bounds)?,
+            stamp,
+        ),
+    };
+    match run_capture_pass(
+        store,
+        context_id,
+        bindings,
+        generation_id,
+        snapshot_sha256,
+        attempt_token,
+        bounds,
+        pass,
+    )? {
+        CapturePassEnd::Certified(snapshot, certificate) => Ok(Some((snapshot, certificate))),
+        CapturePassEnd::Unreconciled => {
+            let row = load_fold_row(store, bounds, context_id, generation_id, CAPTURE_FOLD)?;
+            reset_capture_pass(store, context_id, generation_id, bounds, row)?;
+            Ok(None)
+        }
+    }
+}
+
+/// The full verifying capture: fold and verify every persisted member's chain, then read every
+/// stream of the Context inside its frozen frontier in `(connector_id, source_instance_ref, seq)`
+/// order, re-verify each retained member against it, append the new ones in that order, then
+/// certify and publish the stamp. This is the path for a generation's first capture, interpretation
+/// progress not yet verified, a carried digest that disagrees with its members, and counts that did
+/// not reconcile. Each step is a bounded unit whose progress commits with it, so an interrupted pass
+/// resumes, under this attempt or a later one, at its saved key.
+#[allow(clippy::too_many_arguments)]
+fn capture_full_membership(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    generation_id: EventSearchGenerationId,
+    snapshot_sha256: &str,
+    attempt_token: Option<uuid::Uuid>,
+    bounds: Bounds,
+) -> Result<(SourceSnapshot, CaptureCertificate)> {
+    let stamp = current_interpretation_stamp(store, context_id, bindings, bounds)?;
+    let saved = match load_fold_row(store, bounds, context_id, generation_id, CAPTURE_FOLD)? {
+        Some(row) => {
+            let saved = CapturePass::from_row(row.clone())?;
+            if saved.kind == CapturePassKind::Full && saved.stamp == stamp {
+                Some(saved)
+            } else {
+                reset_capture_pass(store, context_id, generation_id, bounds, Some(row))?;
+                None
+            }
+        }
+        None => None,
+    };
+    let pass = match saved {
+        Some(saved) => saved,
+        None => {
+            let next_ordinal =
+                generation_capture_high_water(store, context_id, generation_id, bounds)?;
+            let (persisted, verified) = verify_membership_durably(
+                store,
+                context_id,
+                generation_id,
+                snapshot_sha256,
+                attempt_token,
+                bounds,
+                next_ordinal,
+            )?;
+            if persisted.event_count != next_ordinal {
+                return Err(stale_claim(
+                    "event-search persisted membership differs from its capture ordinal",
+                ));
+            }
+            let chain = MembershipChain {
+                ordered: persisted.ordered_source_set_sha256,
+                content: persisted.source_content_sha256,
+            };
+            reseal_generation_chain(
+                store,
+                context_id,
+                generation_id,
+                next_ordinal,
+                &chain,
+                verified.as_ref(),
+            )?;
+            CapturePass::fresh(
+                CapturePassKind::Full,
+                read_event_context_revision(store, context_id, bounds)?,
+                stamp,
+            )
+        }
+    };
+    match run_capture_pass(
+        store,
+        context_id,
+        bindings,
+        generation_id,
+        snapshot_sha256,
+        attempt_token,
+        bounds,
+        pass,
+    )? {
+        CapturePassEnd::Certified(snapshot, certificate) => Ok((snapshot, certificate)),
+        CapturePassEnd::Unreconciled => {
+            let row = load_fold_row(store, bounds, context_id, generation_id, CAPTURE_FOLD)?;
+            reset_capture_pass(store, context_id, generation_id, bounds, row)?;
+            Err(stale_claim(
+                "event-search persisted membership differs from the fixed source snapshot",
+            ))
+        }
+    }
+}
+
+/// Make the generation's carried digests equal the chain just verified from its members, and
+/// consume the verification's saved progress in the same transaction. Guarded on the capture
+/// ordinal the fold saw; a no-op on the digests when they already agree.
+fn reseal_generation_chain(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    capture_ordinal: u64,
+    chain: &MembershipChain,
+    verified: Option<&FoldRow>,
+) -> Result<()> {
+    let tx = store.begin_tx()?;
+    let result = (|| -> Result<()> {
+        if !store
+            .internal_db()
+            .guard_row_conditions_in_tx(
+                tx,
+                "event_search_generations",
+                "id",
+                &Value::Uuid(generation_id.as_uuid()),
+                &[(
+                    "capture_ordinal".into(),
+                    integer(capture_ordinal, "capture ordinal")?,
+                )],
+            )
+            .map_err(map_engine_err)?
+        {
+            return Err(stale_claim(
+                "event-search generation changed before its chain was resealed",
+            ));
+        }
+        execute_in_tx_counted(store,
+                tx,
+                "UPDATE event_search_generations SET capture_ordered_sha256 = $ordered, capture_content_sha256 = $content WHERE context_id = $context_id AND id = $id",
+                &HashMap::from([
+                    ("ordered".into(), Value::Text(chain.ordered.clone())),
+                    ("content".into(), Value::Text(chain.content.clone())),
+                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                    ("id".into(), Value::Uuid(generation_id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
+        if let Some(verified) = verified {
+            delete_fold_row_in_tx(store, tx, verified)?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => store.internal_db().commit(tx).map_err(map_engine_err),
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            Err(error)
+        }
+    }
+}
+
+/// The membership a capture would assign with no generation to persist into: every event in walk
+/// order, ordinals from zero. Streams are enumerated by one-row seeks and each is read inside the
+/// newest sequence it had when it was reached, in bounded units held in memory.
+fn observe_source_membership(
+    store: &Store,
+    context_id: crate::ContextId,
+    bindings: &BTreeMap<String, InterpretationBinding>,
+    bounds: Bounds,
+) -> Result<SourceSnapshot> {
+    let limit = bounds.events.max(1);
+    let base = HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]);
+    let mut count = 0_u64;
+    let mut chain = MembershipChain::start();
+    let mut stream: Option<(String, String)> = None;
+    loop {
+        tally_reset();
+        let page = read_branches(
+            &mut unit_reader(store, bounds),
+            "SELECT connector_id, source_instance_ref FROM events WHERE context_id = $context_id",
+            "connector_id ASC, source_instance_ref ASC, seq ASC",
+            &base,
+            &stream_branches(
+                stream
+                    .as_ref()
+                    .map(|(connector, source)| (connector.as_str(), source.as_str())),
+            ),
+            1,
+        )?;
+        let Some(row) = page.rows.first() else { break };
+        let connector = get_text(row, &page.columns, "connector_id")?;
+        let source = get_text(row, &page.columns, "source_instance_ref")?;
+        let (upper, _) = freeze_stream(store, bounds, context_id, &connector, &source)?;
+        note_unit(UnitFold::Capture, 1, false, || {
+            (
+                format!("{stream:?}"),
+                format!("{:?}", (&connector, &source)),
+            )
+        })?;
+        let mut after = 0_u64;
+        loop {
+            tally_reset();
+            let mut params = stream_params(context_id, &connector, &source);
+            params.insert("after_seq".into(), integer(after, "capture sequence")?);
+            params.insert("upper_seq".into(), integer(upper, "frozen sequence")?);
+            let (events, more) = first_page_within_bytes(
+                store,
+                bounds,
+                &format!(
+                    "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source AND seq > $after_seq AND seq <= $upper_seq ORDER BY seq ASC LIMIT {limit}"
+                ),
+                &params,
+                limit,
+            )?;
+            after_membership_read_page();
+            let before = after;
+            if let Some(last) = events.rows.last() {
+                after = get_u64(last, &events.columns, "seq")?;
+            }
+            for member in claimed_members_from_rows(
+                store,
+                context_id,
+                bindings,
+                bounds,
+                &events.columns,
+                &events.rows,
+                count,
+            )? {
+                chain = chain.extend(&member);
+                count += 1;
+            }
+            note_unit(UnitFold::Capture, events.rows.len() as u64, false, || {
+                (format!("{before:?}"), format!("{after:?}"))
+            })?;
+            if after >= upper || (!more && events.rows.len() < limit) {
+                break;
+            }
+        }
+        stream = Some((connector, source));
+    }
+    Ok(chain.membership_source_snapshot(count))
+}
+
+fn retained_search_membership(
     store: &Store,
     context_id: crate::ContextId,
     generation_id: EventSearchGenerationId,
     member: &ClaimedEvent,
     bounds: Bounds,
-) -> Result<ClaimedEvent> {
+) -> Result<Option<ClaimedEvent>> {
     let result = query_rows(
         store,
         bounds,
@@ -4381,24 +6552,24 @@ fn reuse_or_persist_search_membership(
             ("event_id".into(), Value::Uuid(member.event.id.as_uuid())),
         ]),
     )?;
-    if let Some(row) = result.rows().first() {
-        if result.rows().len() != 1
-            || get_uuid(row, result.columns(), "context_id")? != context_id.as_uuid()
-            || get_uuid(row, result.columns(), "generation_id")? != generation_id.as_uuid()
-            || get_uuid(row, result.columns(), "event_id")? != member.event.id.as_uuid()
-            || get_text(row, result.columns(), "connector_id")? != member.event.connector_id
-            || get_text(row, result.columns(), "source_instance_ref")?
+    if let Some(row) = result.rows.first() {
+        if result.rows.len() != 1
+            || get_uuid(row, &result.columns, "context_id")? != context_id.as_uuid()
+            || get_uuid(row, &result.columns, "generation_id")? != generation_id.as_uuid()
+            || get_uuid(row, &result.columns, "event_id")? != member.event.id.as_uuid()
+            || get_text(row, &result.columns, "connector_id")? != member.event.connector_id
+            || get_text(row, &result.columns, "source_instance_ref")?
                 != member.event.source_instance_ref
-            || get_text(row, result.columns(), "session_ref")? != member.event.session_ref
-            || get_u64(row, result.columns(), "source_sequence")? != member.event.seq
+            || get_text(row, &result.columns, "session_ref")? != member.event.session_ref
+            || get_u64(row, &result.columns, "source_sequence")? != member.event.seq
             || get_optional_interpretation_id(
                 row,
-                result.columns(),
+                &result.columns,
                 "effective_interpretation_generation_id",
             )? != member.effective_interpretation_generation_id
-            || get_text(row, result.columns(), "captured_source_sha256")?
+            || get_text(row, &result.columns, "captured_source_sha256")?
                 != member.captured_source_sha256
-            || get_text(row, result.columns(), "effective_source_sha256")?
+            || get_text(row, &result.columns, "effective_source_sha256")?
                 != member.effective_source_sha256
         {
             return Err(stale_claim(
@@ -4406,12 +6577,11 @@ fn reuse_or_persist_search_membership(
             ));
         }
         let mut retained = member.clone();
-        retained.membership_id = get_uuid(row, result.columns(), "membership_id")?;
-        retained.ordinal = get_u64(row, result.columns(), "ordinal")?;
-        return Ok(retained);
+        retained.membership_id = get_uuid(row, &result.columns, "membership_id")?;
+        retained.ordinal = get_u64(row, &result.columns, "ordinal")?;
+        return Ok(Some(retained));
     }
-    persist_search_membership(store, context_id, generation_id, member)?;
-    Ok(member.clone())
+    Ok(None)
 }
 
 fn generation_capture_high_water(
@@ -4430,84 +6600,299 @@ fn generation_capture_high_water(
         ]),
     )?;
     let row = result
-        .rows()
+        .rows
         .first()
         .ok_or_else(|| stale_claim("event-search capture generation disappeared"))?;
-    if result.rows().len() != 1
-        || get_uuid(row, result.columns(), "context_id")? != context_id.as_uuid()
+    if result.rows.len() != 1
+        || get_uuid(row, &result.columns, "context_id")? != context_id.as_uuid()
     {
         return Err(stale_claim(
             "event-search capture generation lookup was not unique",
         ));
     }
-    get_u64(row, result.columns(), "capture_ordinal")
+    get_u64(row, &result.columns, "capture_ordinal")
 }
 
+const ORDERED_SOURCE_SET_DOMAIN: &[u8] = b"context-graph/event-search-ordered-source-set/v1";
+const SOURCE_CONTENT_DOMAIN: &[u8] = b"context-graph/event-search-source-content/v1";
+/// Prefix of every refusal for persisted membership whose stored chain does not match its fields.
+const MEMBERSHIP_CHAIN_CORRUPT: &str = "event-search membership chain is corrupted: ";
+
+/// The generation's two membership digests as per-member chains. Each member's value commits to
+/// its predecessor's, so a capture extends the stored value with only the members it appends, and a
+/// fold over the persisted members in ordinal order reproduces it exactly. The value depends only on
+/// the ordered member list, never on how capture runs were split. An empty membership hashes the
+/// bare domain, as before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MembershipChain {
+    ordered: String,
+    content: String,
+}
+
+impl MembershipChain {
+    fn start() -> Self {
+        let mut ordered = Sha256::new();
+        ordered.update(ORDERED_SOURCE_SET_DOMAIN);
+        let mut content = Sha256::new();
+        content.update(SOURCE_CONTENT_DOMAIN);
+        Self {
+            ordered: finish_hash(ordered),
+            content: finish_hash(content),
+        }
+    }
+
+    /// The carried value of a generation row; an untouched generation carries empty text.
+    fn carried(ordered: String, content: String, capture_ordinal: u64) -> Option<Self> {
+        if ordered.is_empty() && content.is_empty() {
+            return (capture_ordinal == 0).then(Self::start);
+        }
+        Some(Self { ordered, content })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extend_parts(
+        &self,
+        ordinal: u64,
+        event_id: uuid::Uuid,
+        connector_id: &str,
+        source_instance_ref: &str,
+        session_ref: &str,
+        source_sequence: u64,
+        captured_source_sha256: &str,
+        effective_source_sha256: &str,
+    ) -> Self {
+        let mut ordered = Sha256::new();
+        ordered.update(ORDERED_SOURCE_SET_DOMAIN);
+        hash_part(&mut ordered, self.ordered.as_bytes());
+        hash_part(&mut ordered, &ordinal.to_be_bytes());
+        hash_part(&mut ordered, event_id.as_bytes());
+        hash_part(&mut ordered, connector_id.as_bytes());
+        hash_part(&mut ordered, source_instance_ref.as_bytes());
+        hash_part(&mut ordered, session_ref.as_bytes());
+        hash_part(&mut ordered, &source_sequence.to_be_bytes());
+        hash_part(&mut ordered, captured_source_sha256.as_bytes());
+        let mut content = Sha256::new();
+        content.update(SOURCE_CONTENT_DOMAIN);
+        hash_part(&mut content, self.content.as_bytes());
+        hash_part(&mut content, effective_source_sha256.as_bytes());
+        Self {
+            ordered: finish_hash(ordered),
+            content: finish_hash(content),
+        }
+    }
+
+    fn extend(&self, member: &ClaimedEvent) -> Self {
+        self.extend_parts(
+            member.ordinal,
+            member.event.id.as_uuid(),
+            &member.event.connector_id,
+            &member.event.source_instance_ref,
+            &member.event.session_ref,
+            member.event.seq,
+            &member.captured_source_sha256,
+            &member.effective_source_sha256,
+        )
+    }
+
+    fn membership_source_snapshot(&self, event_count: u64) -> SourceSnapshot {
+        SourceSnapshot {
+            event_count,
+            ordered_source_set_sha256: self.ordered.clone(),
+            source_content_sha256: self.content.clone(),
+        }
+    }
+}
+
+/// Recompute the membership chain from every persisted member's fields in ordinal order and refuse
+/// any member whose stored chain value differs. This is the full verifier: it runs on every full
+/// capture and on explicit verification, never on the ordinary incremental path. It reads in
+/// bounded ordinal units and keeps its continuation in memory; a full capture uses
+/// [`verify_membership_durably`], which commits the same continuation with each unit.
 fn fold_source_membership(
     store: &Store,
     context_id: crate::ContextId,
     generation_id: EventSearchGenerationId,
     bounds: Bounds,
 ) -> Result<SourceSnapshot> {
-    let mut count = 0_u64;
-    let mut ordered = Sha256::new();
-    ordered.update(b"context-graph/event-search-ordered-source-set/v1");
-    let mut content = Sha256::new();
-    content.update(b"context-graph/event-search-source-content/v1");
-    stream_rows(
+    let mut next = 0_u64;
+    let mut chain = MembershipChain::start();
+    loop {
+        let unit = membership_unit(store, context_id, generation_id, bounds, next, None, &chain)?;
+        let before = next;
+        next = unit.next;
+        chain = unit.chain;
+        note_unit(UnitFold::Capture, unit.returned, false, || {
+            (format!("{before:?}"), format!("{next:?}"))
+        })?;
+        if unit.exhausted {
+            return Ok(chain.membership_source_snapshot(next));
+        }
+    }
+}
+
+/// One verified unit of the membership fold.
+struct MembershipUnit {
+    next: u64,
+    chain: MembershipChain,
+    returned: u64,
+    exhausted: bool,
+}
+
+/// Verify members from ordinal `next` (below `ceiling`, when given) for at most one event batch:
+/// one primary-key seek past the verified prefix, never a scan of it.
+fn membership_unit(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    bounds: Bounds,
+    next: u64,
+    ceiling: Option<u64>,
+    chain: &MembershipChain,
+) -> Result<MembershipUnit> {
+    tally_reset();
+    let limit = bounds.events.max(1);
+    let mut params = HashMap::from([
+        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+        ("next".into(), integer(next, "membership ordinal")?),
+    ]);
+    let upper = if let Some(ceiling) = ceiling {
+        params.insert("ceiling".into(), integer(ceiling, "membership ceiling")?);
+        " AND ordinal < $ceiling"
+    } else {
+        ""
+    };
+    let result = query_rows(
         store,
         bounds,
         &format!(
-            "SELECT {SOURCE_MEMBER_COLUMNS} FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id ORDER BY ordinal ASC"
+            "SELECT {SOURCE_MEMBER_COLUMNS}, ordered_after, content_after FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND ordinal >= $next{upper} ORDER BY ordinal ASC LIMIT {limit}"
         ),
-        &HashMap::from([
-            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-            ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
-        ]),
-        |columns, row| {
-            let ordinal = get_u64(row, columns, "ordinal")?;
-            if ordinal != count {
-                return Err(stale_claim(
-                    "event-search persisted membership has an ordinal gap",
-                ));
-            }
-            hash_part(&mut ordered, &ordinal.to_be_bytes());
-            hash_part(&mut ordered, get_uuid(row, columns, "event_id")?.as_bytes());
-            hash_part(
-                &mut ordered,
-                get_text(row, columns, "connector_id")?.as_bytes(),
-            );
-            hash_part(
-                &mut ordered,
-                get_text(row, columns, "source_instance_ref")?.as_bytes(),
-            );
-            hash_part(
-                &mut ordered,
-                get_text(row, columns, "session_ref")?.as_bytes(),
-            );
-            hash_part(
-                &mut ordered,
-                &get_u64(row, columns, "source_sequence")?.to_be_bytes(),
-            );
-            hash_part(
-                &mut ordered,
-                get_text(row, columns, "captured_source_sha256")?.as_bytes(),
-            );
-            hash_part(
-                &mut content,
-                get_text(row, columns, "effective_source_sha256")?.as_bytes(),
-            );
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| CgError::Engine("event-search source count exhausted u64".into()))?;
-            Ok(())
-        },
+        &params,
     )?;
-    Ok(SourceSnapshot {
-        event_count: count,
-        ordered_source_set_sha256: finish_hash(ordered),
-        source_content_sha256: finish_hash(content),
+    let columns = &result.columns;
+    let mut expected = next;
+    let mut chain = chain.clone();
+    for row in &result.rows {
+        let ordinal = get_u64(row, columns, "ordinal")?;
+        if ordinal != expected {
+            return Err(stale_claim(
+                "event-search persisted membership has an ordinal gap",
+            ));
+        }
+        chain = chain.extend_parts(
+            ordinal,
+            get_uuid(row, columns, "event_id")?,
+            &get_text(row, columns, "connector_id")?,
+            &get_text(row, columns, "source_instance_ref")?,
+            &get_text(row, columns, "session_ref")?,
+            get_u64(row, columns, "source_sequence")?,
+            &get_text(row, columns, "captured_source_sha256")?,
+            &get_text(row, columns, "effective_source_sha256")?,
+        );
+        if get_text(row, columns, "ordered_after")? != chain.ordered
+            || get_text(row, columns, "content_after")? != chain.content
+        {
+            return Err(CgError::Engine(format!(
+                "{MEMBERSHIP_CHAIN_CORRUPT}member {ordinal} of generation {} does not match its stored chain value",
+                generation_id.as_uuid()
+            )));
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| CgError::Engine("event-search source count exhausted u64".into()))?;
+    }
+    Ok(MembershipUnit {
+        next: expected,
+        chain,
+        returned: result.rows.len() as u64,
+        exhausted: result.rows.len() < limit,
     })
+}
+
+/// The full capture's verification of the persisted prefix `[0, ceiling)`, committing its
+/// continuation (next ordinal and both chain values) with every unit. A retry, under this attempt
+/// or a later one, resumes after the verified prefix: members are immutable, and forget purges the
+/// generation together with this progress. The saved prefix is consumed by the transaction that
+/// reseals the generation's carried chain.
+fn verify_membership_durably(
+    store: &Store,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    snapshot_sha256: &str,
+    attempt_token: Option<uuid::Uuid>,
+    bounds: Bounds,
+    ceiling: u64,
+) -> Result<(SourceSnapshot, Option<FoldRow>)> {
+    let mut row = load_fold_row(store, bounds, context_id, generation_id, MEMBERSHIP_FOLD)?;
+    let (mut next, mut chain) = match &row {
+        Some(saved) if json_u64(&saved.state, "next")? <= ceiling => (
+            json_u64(&saved.state, "next")?,
+            MembershipChain {
+                ordered: json_text(&saved.state, "ordered")?,
+                content: json_text(&saved.state, "content")?,
+            },
+        ),
+        _ => (0, MembershipChain::start()),
+    };
+    let token = attempt_token.unwrap_or_else(uuid::Uuid::now_v7);
+    while next < ceiling {
+        let unit = membership_unit(
+            store,
+            context_id,
+            generation_id,
+            bounds,
+            next,
+            Some(ceiling),
+            &chain,
+        )?;
+        if unit.next == next {
+            return Err(stale_claim(
+                "event-search persisted membership ended before its capture ordinal",
+            ));
+        }
+        let state = json!({
+            "next": unit.next,
+            "ordered": unit.chain.ordered.clone(),
+            "content": unit.chain.content.clone(),
+        });
+        let prior = row.clone();
+        let before = next;
+        let committed = commit_unit(store, |tx| {
+            let passage_revision = guard_fold_generation_in_tx(
+                store,
+                tx,
+                context_id,
+                generation_id,
+                snapshot_sha256,
+                attempt_token,
+                false,
+            )?;
+            save_fold_row_in_tx(
+                store,
+                tx,
+                context_id,
+                generation_id,
+                MEMBERSHIP_FOLD,
+                prior.as_ref(),
+                token,
+                passage_revision,
+                false,
+                state,
+            )
+        });
+        row = Some(refused_unit(
+            UnitFold::Capture,
+            &format!("{before:?}"),
+            committed,
+        )?);
+        next = unit.next;
+        chain = unit.chain;
+        note_unit(UnitFold::Capture, unit.returned, true, || {
+            (format!("{before:?}"), format!("{next:?}"))
+        })?;
+    }
+    Ok((chain.membership_source_snapshot(next), row))
 }
 
 fn captured_raw_from_row(
@@ -4563,6 +6948,11 @@ fn captured_raw_from_row(
         }
         Ok(())
     })();
+    super::event_search_read::record_executed_statement(
+        "SELECT captured anchors FROM event_anchors",
+        cursor.trace(),
+    );
+    tally_examined(cursor.trace().rows_examined);
     let closed = cursor.close().map_err(map_engine_err);
     read?;
     closed?;
@@ -4628,6 +7018,7 @@ fn effective_captured_event(
             &params,
         )
         .map_err(map_engine_err)?;
+    tally_examined(membership.trace().rows_examined);
     let Some(member) = membership.rows().first() else {
         let hash = effective_source_hash(&event, None, None);
         return Ok((event, None, hash));
@@ -4645,6 +7036,7 @@ fn effective_captured_event(
             &params,
         )
         .map_err(map_engine_err)?;
+    tally_examined(effective.trace().rows_examined);
     let row = effective
         .rows()
         .first()
@@ -4675,19 +7067,23 @@ fn effective_source_hash(
     ]))
 }
 
-fn persist_search_membership(
+/// Append one page of new members, their chain values, the generation's capture ordinal and its
+/// carried digests inside the caller's unit transaction. The generation is guarded on its ordinal,
+/// state and carried digests, so a page applies only on top of exactly the chain it extends.
+fn persist_search_member_page_in_tx(
     store: &Store,
+    tx: TxId,
     context_id: crate::ContextId,
     generation_id: EventSearchGenerationId,
-    member: &ClaimedEvent,
-) -> Result<()> {
-    let tx = store.begin_tx()?;
-    let result = (|| -> Result<()> {
-        let generation = store
-            .internal_db()
-            .execute_in_tx(
-                tx,
-                "SELECT context_id, capture_ordinal, state FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+    members: &[ClaimedEvent],
+    before: &MembershipChain,
+) -> Result<MembershipChain> {
+    let Some(first) = members.first() else {
+        return Ok(before.clone());
+    };
+    {
+        let generation = execute_in_tx_tallied(store, tx,
+                "SELECT context_id, capture_ordinal, state, capture_ordered_sha256, capture_content_sha256 FROM event_search_generations WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([
                     ("context_id".into(), Value::Uuid(context_id.as_uuid())),
                     ("id".into(), Value::Uuid(generation_id.as_uuid())),
@@ -4695,12 +7091,19 @@ fn persist_search_membership(
             )
             .map_err(map_engine_err)?;
         let row = generation
-            .rows()
+            .rows
             .first()
             .ok_or_else(|| stale_claim("event-search capture attempt disappeared"))?;
-        let state = get_text(row, generation.columns(), "state")?;
-        if generation.rows().len() != 1
-            || get_u64(row, generation.columns(), "capture_ordinal")? != member.ordinal
+        let state = get_text(row, &generation.columns, "state")?;
+        let capture_ordinal = get_u64(row, &generation.columns, "capture_ordinal")?;
+        let carried = MembershipChain::carried(
+            get_text(row, &generation.columns, "capture_ordered_sha256")?,
+            get_text(row, &generation.columns, "capture_content_sha256")?,
+            capture_ordinal,
+        );
+        if generation.rows.len() != 1
+            || capture_ordinal != first.ordinal
+            || carried.as_ref() != Some(before)
             || (state != "capturing" && state != "building" && state != "ready")
         {
             return Err(stale_claim(
@@ -4708,16 +7111,15 @@ fn persist_search_membership(
             ));
         }
         if state == "ready" {
-            let head = store
-                .internal_db()
-                .execute_in_tx(
-                    tx,
-                    "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
-                    &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-                )
-                .map_err(map_engine_err)?;
-            if head.rows().len() != 1
-                || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
+            let head = execute_in_tx_tallied(
+                store,
+                tx,
+                "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+                &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+            )
+            .map_err(map_engine_err)?;
+            if head.rows.len() != 1
+                || get_uuid(&head.rows[0], &head.columns, "generation_id")?
                     != generation_id.as_uuid()
             {
                 return Err(stale_claim(
@@ -4727,8 +7129,14 @@ fn persist_search_membership(
         }
         let generation_guard = exact_conditions(
             row,
-            generation.columns(),
-            &["context_id", "capture_ordinal", "state"],
+            &generation.columns,
+            &[
+                "context_id",
+                "capture_ordinal",
+                "state",
+                "capture_ordered_sha256",
+                "capture_content_sha256",
+            ],
         )?;
         if !store
             .internal_db()
@@ -4745,78 +7153,74 @@ fn persist_search_membership(
                 "event-search generation changed during membership append",
             ));
         }
-        store
-            .internal_db()
-            .execute_in_tx(
+        let mut chain = before.clone();
+        let mut expected = first.ordinal;
+        for member in members {
+            if member.ordinal != expected {
+                return Err(CgError::Engine(
+                    "event-search membership page is not contiguous".into(),
+                ));
+            }
+            chain = chain.extend(member);
+            execute_in_tx_tallied(store, tx,
+                    "INSERT INTO event_search_source_events (membership_id, context_id, generation_id, ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, effective_interpretation_generation_id, captured_source_sha256, effective_source_sha256, ordered_after, content_after) VALUES ($membership_id, $context_id, $generation_id, $ordinal, $event_id, $connector_id, $source, $session, $sequence, $effective_generation_id, $captured_sha256, $effective_sha256, $ordered_after, $content_after)",
+                    &HashMap::from([
+                        ("membership_id".into(), Value::Uuid(member.membership_id)),
+                        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                        ("ordinal".into(), integer(member.ordinal, "capture ordinal")?),
+                        ("event_id".into(), Value::Uuid(member.event.id.as_uuid())),
+                        ("connector_id".into(), Value::Text(member.event.connector_id.clone())),
+                        ("source".into(), Value::Text(member.event.source_instance_ref.clone())),
+                        ("session".into(), Value::Text(member.event.session_ref.clone())),
+                        ("sequence".into(), integer(member.event.seq, "source sequence")?),
+                        (
+                            "effective_generation_id".into(),
+                            member
+                                .effective_interpretation_generation_id
+                                .map(|id| Value::Uuid(id.as_uuid()))
+                                .unwrap_or(Value::Null),
+                        ),
+                        (
+                            "captured_sha256".into(),
+                            Value::Text(member.captured_source_sha256.clone()),
+                        ),
+                        (
+                            "effective_sha256".into(),
+                            Value::Text(member.effective_source_sha256.clone()),
+                        ),
+                        ("ordered_after".into(), Value::Text(chain.ordered.clone())),
+                        ("content_after".into(), Value::Text(chain.content.clone())),
+                    ]),
+                )
+                .map_err(map_engine_err)?;
+            update_generation_session_capture_in_tx(store, tx, context_id, generation_id, member)?;
+            ensure_generation_cursor_in_tx(
+                store,
                 tx,
-                "INSERT INTO event_search_source_events (membership_id, context_id, generation_id, ordinal, event_id, connector_id, source_instance_ref, session_ref, source_sequence, effective_interpretation_generation_id, captured_source_sha256, effective_source_sha256) VALUES ($membership_id, $context_id, $generation_id, $ordinal, $event_id, $connector_id, $source, $session, $sequence, $effective_generation_id, $captured_sha256, $effective_sha256)",
+                context_id,
+                generation_id,
+                &member.event.connector_id,
+                &member.event.source_instance_ref,
+                &member.event.session_ref,
+            )?;
+            expected = expected.checked_add(1).ok_or_else(|| {
+                CgError::Engine("event-search capture ordinal exhausted u64".into())
+            })?;
+        }
+        execute_in_tx_tallied(store, tx,
+                "UPDATE event_search_generations SET capture_ordinal = $next_ordinal, capture_ordered_sha256 = $ordered, capture_content_sha256 = $content WHERE context_id = $context_id AND id = $id",
                 &HashMap::from([
-                    ("membership_id".into(), Value::Uuid(member.membership_id)),
-                    ("context_id".into(), Value::Uuid(context_id.as_uuid())),
-                    ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
-                    ("ordinal".into(), integer(member.ordinal, "capture ordinal")?),
-                    ("event_id".into(), Value::Uuid(member.event.id.as_uuid())),
-                    ("connector_id".into(), Value::Text(member.event.connector_id.clone())),
-                    ("source".into(), Value::Text(member.event.source_instance_ref.clone())),
-                    ("session".into(), Value::Text(member.event.session_ref.clone())),
-                    ("sequence".into(), integer(member.event.seq, "source sequence")?),
-                    (
-                        "effective_generation_id".into(),
-                        member
-                            .effective_interpretation_generation_id
-                            .map(|id| Value::Uuid(id.as_uuid()))
-                            .unwrap_or(Value::Null),
-                    ),
-                    (
-                        "captured_sha256".into(),
-                        Value::Text(member.captured_source_sha256.clone()),
-                    ),
-                    (
-                        "effective_sha256".into(),
-                        Value::Text(member.effective_source_sha256.clone()),
-                    ),
-                ]),
-            )
-            .map_err(map_engine_err)?;
-        update_generation_session_capture_in_tx(store, tx, context_id, generation_id, member)?;
-        ensure_generation_cursor_in_tx(
-            store,
-            tx,
-            context_id,
-            generation_id,
-            &member.event.connector_id,
-            &member.event.source_instance_ref,
-            &member.event.session_ref,
-        )?;
-        store
-            .internal_db()
-            .execute_in_tx(
-                tx,
-                "UPDATE event_search_generations SET capture_ordinal = $next_ordinal WHERE context_id = $context_id AND id = $id",
-                &HashMap::from([
-                    (
-                        "next_ordinal".into(),
-                        integer(
-                            member.ordinal.checked_add(1).ok_or_else(|| {
-                                CgError::Engine(
-                                    "event-search capture ordinal exhausted u64".into(),
-                                )
-                            })?,
-                            "capture ordinal",
-                        )?,
-                    ),
+                    ("next_ordinal".into(), integer(expected, "capture ordinal")?),
+                    ("ordered".into(), Value::Text(chain.ordered.clone())),
+                    ("content".into(), Value::Text(chain.content.clone())),
                     ("context_id".into(), Value::Uuid(context_id.as_uuid())),
                     ("id".into(), Value::Uuid(generation_id.as_uuid())),
                 ]),
             )
             .map_err(map_engine_err)?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let _ = store.internal_db().rollback(tx);
-        return Err(error);
+        Ok(chain)
     }
-    store.internal_db().commit(tx).map_err(map_engine_err)
 }
 
 fn update_generation_session_capture_in_tx(
@@ -4838,43 +7242,36 @@ fn update_generation_session_capture_in_tx(
             Value::Text(member.event.session_ref.clone()),
         ),
     ]);
-    let existing = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
+    let existing = execute_in_tx_tallied(store, tx,
             "SELECT event_count, is_required FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
             &params,
         )
         .map_err(map_engine_err)?;
-    if let Some(row) = existing.rows().first() {
-        if existing.rows().len() != 1 {
+    if let Some(row) = existing.rows.first() {
+        if existing.rows.len() != 1 {
             return Err(stale_claim(
                 "event-search session progress primary key returned more than one row",
             ));
         }
-        let next = get_u64(row, existing.columns(), "event_count")?
+        let next = get_u64(row, &existing.columns, "event_count")?
             .checked_add(1)
             .ok_or_else(|| CgError::Engine("event-search session count exhausted u64".into()))?;
         let mut values = params.clone();
         values.insert("event_count".into(), integer(next, "session event count")?);
-        store
-            .internal_db()
-            .execute_in_tx(
-                tx,
+        execute_in_tx_tallied(store, tx,
                 "UPDATE event_search_session_progress SET event_count = $event_count WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
                 &values,
             )
             .map_err(map_engine_err)?;
-        if get_bool(row, existing.columns(), "is_required")? {
-            let generation = store.internal_db().execute_in_tx(
-                tx,
+        if get_bool(row, &existing.columns, "is_required")? {
+            let generation = execute_in_tx_tallied(store, tx,
                 "SELECT required_event_count FROM event_search_generations WHERE context_id = $context_id AND id = $generation_id",
                 &params,
             ).map_err(map_engine_err)?;
-            let generation_row = generation.rows().first().ok_or_else(|| {
+            let generation_row = generation.rows.first().ok_or_else(|| {
                 stale_claim("event-search generation disappeared while required capture grew")
             })?;
-            let required = get_u64(generation_row, generation.columns(), "required_event_count")?
+            let required = get_u64(generation_row, &generation.columns, "required_event_count")?
                 .checked_add(1)
                 .ok_or_else(|| CgError::Engine("required event count exhausted u64".into()))?;
             let mut values = params.clone();
@@ -4882,8 +7279,7 @@ fn update_generation_session_capture_in_tx(
                 "required_events".into(),
                 integer(required, "required event count")?,
             );
-            store.internal_db().execute_in_tx(
-                tx,
+            execute_in_tx_tallied(store, tx,
                 "UPDATE event_search_generations SET required_event_count = $required_events WHERE context_id = $context_id AND id = $generation_id",
                 &values,
             ).map_err(map_engine_err)?;
@@ -4895,10 +7291,7 @@ fn update_generation_session_capture_in_tx(
             ("zero".into(), Value::Int64(0)),
             ("false".into(), Value::Bool(false)),
         ]);
-        store
-            .internal_db()
-            .execute_in_tx(
-                tx,
+        execute_in_tx_tallied(store, tx,
                 "INSERT INTO event_search_session_progress (context_id, generation_id, connector_id, session_ref, event_count, committed_event_count, eligible_event_count, excluded_event_count, searchable_event_count, no_searchable_text_event_count, is_required, is_published) VALUES ($context_id, $generation_id, $connector_id, $session, $one, $zero, $zero, $zero, $zero, $zero, $false, $false)",
                 &values,
             )
@@ -4923,15 +7316,12 @@ fn ensure_generation_cursor_in_tx(
         ("source".into(), Value::Text(source.into())),
         ("session".into(), Value::Text(session.into())),
     ]);
-    let existing = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
+    let existing = execute_in_tx_tallied(store, tx,
             "SELECT committed_sequence FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session",
             &params,
         )
         .map_err(map_engine_err)?;
-    if !existing.rows().is_empty() {
+    if !existing.rows.is_empty() {
         return Ok(());
     }
     let mut values = params;
@@ -4941,10 +7331,7 @@ fn ensure_generation_cursor_in_tx(
         ("watermark".into(), Value::Text(String::new())),
         ("updated_at".into(), Value::TxId(tx)),
     ]);
-    store
-        .internal_db()
-        .execute_in_tx(
-            tx,
+    execute_in_tx_tallied(store, tx,
             "INSERT INTO event_search_cursors (context_id, generation_id, connector_id, source_instance_ref, session_ref, committed_sequence, open_tail_start_sequence, open_tail_members, open_tail_passage_id, watermark_sha256, updated_at) VALUES ($context_id, $generation_id, $connector_id, $source, $session, $committed, NULL, $empty_tail, NULL, $watermark, $updated_at)",
             &values,
         )
@@ -4992,13 +7379,7 @@ fn claim_pending_batch(
     #[cfg(feature = "test-support")]
     LOADED_EVENT_ROWS.with(|rows| rows.set(0));
     let Some(pending) = pending else {
-        return if committed_generation_coverage(store, generation.context_id, generation.id)?
-            == generation.target.event_count
-        {
-            Ok(ClaimResult::Complete)
-        } else {
-            Ok(ClaimResult::ScopeComplete)
-        };
+        return Ok(ClaimResult::NoPendingWork);
     };
     let PendingStream {
         publication_event_count,
@@ -5033,11 +7414,11 @@ fn claim_pending_batch(
     )?;
     let mut events = Vec::new();
     let mut used = 0_usize;
-    for row in result.rows() {
-        let member_connector = get_text(row, result.columns(), "connector_id")?;
-        let member_source = get_text(row, result.columns(), "source_instance_ref")?;
-        let member_session = get_text(row, result.columns(), "session_ref")?;
-        let member_sequence = get_u64(row, result.columns(), "source_sequence")?;
+    for row in &result.rows {
+        let member_connector = get_text(row, &result.columns, "connector_id")?;
+        let member_source = get_text(row, &result.columns, "source_instance_ref")?;
+        let member_session = get_text(row, &result.columns, "session_ref")?;
+        let member_sequence = get_u64(row, &result.columns, "source_sequence")?;
         if member_connector != connector || member_source != source {
             return Err(stale_claim(
                 "event-search source claim crossed its selected stream",
@@ -5049,7 +7430,7 @@ fn claim_pending_batch(
         {
             break;
         }
-        let event = load_claimed_member(store, generation, result.columns(), row, bounds)?;
+        let event = load_claimed_member(store, generation, &result.columns, row, bounds)?;
         let measured = event_body(&event.event)
             .map(|body| event_prefix(&event.event).len().saturating_add(body.len()))
             .unwrap_or(0);
@@ -5126,7 +7507,22 @@ fn claim_pending_batch(
     });
     let cursor_sha256 = claim_hash(open_tail_events.iter().chain(events.iter()));
     let passage_ordinal = generation_passage_count(store, generation.id, bounds)?;
-    let owner_token = uuid::Uuid::now_v7().to_string();
+    let owner = uuid::Uuid::now_v7();
+    let owner_token = owner.to_string();
+    // Acquire presence before publishing the lease. The kept guard spans Store closes and
+    // unwinding inside this still-live process; SIGKILL releases it in the kernel.
+    #[cfg(target_os = "linux")]
+    let presence = if store.db_path() == std::path::Path::new(":memory:") {
+        None
+    } else {
+        Some(
+            contextdb_engine::persistence::holder_presence::hold(
+                store.db_path(),
+                *owner.as_bytes(),
+            )
+            .map_err(map_engine_err)?,
+        )
+    };
     let now = now_millis()?;
     let expires_at = now
         .checked_add(
@@ -5139,7 +7535,7 @@ fn claim_pending_batch(
         let _ = store.internal_db().rollback(tx);
         return Err(error);
     }
-    let existing = store.internal_db().execute_in_tx(
+    let existing = execute_in_tx_counted(store,
         tx,
         "SELECT owner_token, lease_epoch, expires_at FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id",
         &HashMap::from([
@@ -5147,18 +7543,23 @@ fn claim_pending_batch(
             ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
         ]),
     ).map_err(map_engine_err)?;
-    let lease_epoch = if let Some(row) = existing.rows().first() {
-        let persisted_expiry = get_timestamp(row, existing.columns(), "expires_at")?;
-        if persisted_expiry > now {
+    let lease_epoch = if let Some(row) = existing.rows.first() {
+        let persisted_expiry = get_timestamp(row, &existing.columns, "expires_at")?;
+        if claim_owner_live(
+            store,
+            &get_text(row, &existing.columns, "owner_token")?,
+            persisted_expiry,
+            now,
+        )? {
             let _ = store.internal_db().rollback(tx);
             return Err(stale_claim(
                 "another event-search worker owns the unexpired claim",
             ));
         }
-        let epoch = get_i64(row, existing.columns(), "lease_epoch")?
+        let epoch = get_i64(row, &existing.columns, "lease_epoch")?
             .checked_add(1)
             .ok_or_else(|| CgError::Engine("event-search lease epoch exhausted INTEGER".into()))?;
-        store.internal_db().execute_in_tx(
+        execute_in_tx_counted(store,
             tx,
             "DELETE FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id",
             &HashMap::from([
@@ -5170,11 +7571,15 @@ fn claim_pending_batch(
     } else {
         1
     };
-    let insert = store.internal_db().execute_in_tx(
+    let insert = execute_in_tx_counted(
+        store,
         tx,
         "INSERT INTO event_search_leases (context_id, generation_id, owner_token, lease_epoch, claimed_connector_id, claimed_source_instance_ref, claimed_start_sequence, claimed_end_sequence, cursor_sha256, expires_at) VALUES ($context_id, $generation_id, $owner_token, $lease_epoch, $connector_id, $source, $start, $end, $cursor_sha256, $expires_at)",
         &HashMap::from([
-            ("context_id".into(), Value::Uuid(generation.context_id.as_uuid())),
+            (
+                "context_id".into(),
+                Value::Uuid(generation.context_id.as_uuid()),
+            ),
             ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
             ("owner_token".into(), Value::Text(owner_token.clone())),
             ("lease_epoch".into(), Value::Int64(lease_epoch)),
@@ -5191,7 +7596,7 @@ fn claim_pending_batch(
         return Err(map_engine_err(error));
     }
     if let Some(request_id) = selected_request_id {
-        let associated = store.internal_db().execute_in_tx(
+        let associated = execute_in_tx_counted(store,
             tx,
             "UPDATE event_search_request_headers SET running_generation_id = $generation_id, running_owner_token = $owner_token WHERE context_id = $context_id AND request_id = $request_id",
             &HashMap::from([
@@ -5202,7 +7607,7 @@ fn claim_pending_batch(
             ]),
         ).map_err(map_engine_err);
         match associated {
-            Ok(updated) if updated.rows_affected() == 1 => {}
+            Ok(updated) if updated.rows_affected == 1 => {}
             Ok(_) => {
                 let _ = store.internal_db().rollback(tx);
                 return Err(stale_claim(
@@ -5216,6 +7621,10 @@ fn claim_pending_batch(
         }
     }
     store.internal_db().commit(tx).map_err(map_engine_err)?;
+    #[cfg(target_os = "linux")]
+    if let Some(presence) = presence {
+        presence.keep(*owner.as_bytes()).map_err(map_engine_err)?;
+    }
     Ok(ClaimResult::Work(Box::new(Claim {
         publication_event_count,
         generation: generation.clone(),
@@ -5275,9 +7684,7 @@ fn guard_generation_for_claim_in_tx(
     generation: &Generation,
 ) -> Result<()> {
     guard_attempt_in_tx(store, tx, generation)?;
-    let result = store
-        .internal_db()
-        .execute_in_tx(
+    let result = execute_in_tx_counted(store,
             tx,
             "SELECT context_id, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, state FROM event_search_generations WHERE id = $id",
             &HashMap::from([(
@@ -5287,24 +7694,24 @@ fn guard_generation_for_claim_in_tx(
         )
         .map_err(map_engine_err)?;
     let row = result
-        .rows()
+        .rows
         .first()
         .ok_or_else(|| stale_claim("event-search generation disappeared before claim"))?;
-    if result.rows().len() != 1
-        || get_uuid(row, result.columns(), "context_id")? != generation.context_id.as_uuid()
-        || get_u64(row, result.columns(), "event_count")? != generation.event_count
-        || get_text(row, result.columns(), "ordered_source_set_sha256")?
+    if result.rows.len() != 1
+        || get_uuid(row, &result.columns, "context_id")? != generation.context_id.as_uuid()
+        || get_u64(row, &result.columns, "event_count")? != generation.event_count
+        || get_text(row, &result.columns, "ordered_source_set_sha256")?
             != generation.ordered_source_set_sha256
-        || get_text(row, result.columns(), "source_content_sha256")?
+        || get_text(row, &result.columns, "source_content_sha256")?
             != generation.source_content_sha256
-        || get_u64(row, result.columns(), "capture_ordinal")? != generation.target.event_count
-        || get_text(row, result.columns(), "state")? != generation.expected_state()
+        || get_u64(row, &result.columns, "capture_ordinal")? != generation.target.event_count
+        || get_text(row, &result.columns, "state")? != generation.expected_state()
     {
         return Err(stale_claim("event-search generation changed before claim"));
     }
     let conditions = exact_conditions(
         row,
-        result.columns(),
+        &result.columns,
         &[
             "context_id",
             "event_count",
@@ -5328,20 +7735,18 @@ fn guard_generation_for_claim_in_tx(
         return Err(stale_claim("event-search generation changed during claim"));
     }
     if generation.mode == GenerationMode::ExtendReady {
-        let head = store
-            .internal_db()
-            .execute_in_tx(
-                tx,
-                "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
-                &HashMap::from([(
-                    "context_id".into(),
-                    Value::Uuid(generation.context_id.as_uuid()),
-                )]),
-            )
-            .map_err(map_engine_err)?;
-        if head.rows().len() != 1
-            || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
-                != generation.id.as_uuid()
+        let head = execute_in_tx_counted(
+            store,
+            tx,
+            "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+            &HashMap::from([(
+                "context_id".into(),
+                Value::Uuid(generation.context_id.as_uuid()),
+            )]),
+        )
+        .map_err(map_engine_err)?;
+        if head.rows.len() != 1
+            || get_uuid(&head.rows[0], &head.columns, "generation_id")? != generation.id.as_uuid()
         {
             return Err(stale_claim(
                 "event-search ready generation stopped being the current head before claim",
@@ -5438,130 +7843,188 @@ fn load_claimed_member(
     })
 }
 
+/// The pending stream the runner claims next: the lowest (selected-session rank, first pending
+/// source ordinal) over the generation's pending streams. Discovery pages the pending-stream index
+/// in `(connector_id, session_ref, source_instance_ref)` order by strict continuation seeks, each
+/// unit spending at most one event batch of examined entries (a stream row and its two one-row
+/// lookups cost three), and carries the best candidate between units. It commits nothing; a crash
+/// repeats it under the same per-unit bound.
 fn first_pending_stream(
     store: &Store,
     generation: &Generation,
     sessions: &SessionWorkSet,
     bounds: Bounds,
 ) -> Result<Option<PendingStream>> {
-    let mut pending = None;
+    let mut pending: Option<PendingStream> = None;
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     let mut stream_rows_examined = 0;
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     let mut cursor_lookups = 0;
-    stream_rows(
-        store,
-        bounds,
-        "SELECT connector_id, source_instance_ref, session_ref FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND pending = $pending ORDER BY connector_id ASC, session_ref ASC, source_instance_ref ASC",
-        &HashMap::from([
-            ("pending".into(), Value::Bool(true)),
-            (
-                "context_id".into(),
-                Value::Uuid(generation.context_id.as_uuid()),
-            ),
-            ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
-        ]),
-        |columns, row| {
-            #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
-            {
-                stream_rows_examined += 1;
-            }
-            let connector = get_text(row, columns, "connector_id")?;
-            let source = get_text(row, columns, "source_instance_ref")?;
-            let session = get_text(row, columns, "session_ref")?;
-            let Some(candidate_rank) = sessions.rank(&connector, &session) else {
-                return Ok(());
-            };
-            let cursor = query_rows(
-                store,
-                bounds,
-                "SELECT committed_sequence, open_tail_start_sequence, open_tail_members, open_tail_passage_id FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
-                &HashMap::from([
-                    (
-                        "context_id".into(),
-                        Value::Uuid(generation.context_id.as_uuid()),
-                    ),
-                    ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
-                    ("connector".into(), Value::Text(connector.clone())),
-                    ("source".into(), Value::Text(source.clone())),
-                    ("session".into(), Value::Text(session.clone())),
-                ]),
-            )?;
-            // A stream captured after membership preparation is marked pending before its
-            // membership and cursor exist. It is pending work, not a stale claim: the no-claim
-            // path prepares its membership and cursor, then discovery finds it here.
-            let Some(row) = cursor.rows().first() else {
-                return Ok(());
-            };
-            let columns = cursor.columns();
-            let committed = get_u64(row, columns, "committed_sequence")?;
-            let key = SessionKey {
-                connector_id: connector.clone(),
-                session_ref: session.clone(),
-            };
-            let through_sequence = match &sessions.frontiers {
-                Some(frontiers) => match frontiers.get(&(key.clone(), source.clone())) {
-                    Some(frontier) if *frontier > committed => Some(*frontier),
-                    _ => return Ok(()),
-                },
-                None => None,
-            };
-            #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
-            {
-                cursor_lookups += 1;
-            }
-            let first = query_rows(
-                store,
-                bounds,
-                FIRST_PENDING_SOURCE_STATEMENT,
-                &HashMap::from([
-                    (
-                        "context_id".into(),
-                        Value::Uuid(generation.context_id.as_uuid()),
-                    ),
-                    ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
-                    ("connector_id".into(), Value::Text(connector.clone())),
-                    ("source".into(), Value::Text(source.clone())),
-                    ("session".into(), Value::Text(session.clone())),
-                    (
-                        "committed".into(),
-                        integer(committed, "cursor committed sequence")?,
-                    ),
-                ]),
-            )?;
-            if let Some(candidate) = first.rows().first() {
-                let candidate = PendingStream {
-                    publication_event_count: sessions
-                        .frontiers
-                        .as_ref()
-                        .and_then(|_| sessions.events.get(&key).copied()),
-                    through_sequence,
-                    start_ordinal: get_u64(candidate, first.columns(), "ordinal")?,
-                    connector_id: connector,
-                    source_instance_ref: source,
-                    session_ref: session,
-                    committed_sequence: committed,
-                    open_tail_start_sequence: get_optional_u64(
-                        row,
-                        columns,
-                        "open_tail_start_sequence",
-                    )?,
-                    open_tail_members: decode_tail_members(row, columns)?,
-                    open_tail_passage_id: get_optional_uuid(row, columns, "open_tail_passage_id")?,
-                };
-                if pending.as_ref().is_none_or(|current: &PendingStream| {
-                    let current_rank = sessions
-                        .rank(&current.connector_id, &current.session_ref)
-                        .expect("pending streams belong to selected sessions");
-                    (candidate_rank, candidate.start_ordinal)
-                        < (current_rank, current.start_ordinal)
-                }) {
-                    pending = Some(candidate);
+    let per_unit = (bounds.events / 3).max(1);
+    let base = HashMap::from([
+        ("pending".into(), Value::Bool(true)),
+        (
+            "context_id".into(),
+            Value::Uuid(generation.context_id.as_uuid()),
+        ),
+        ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
+    ]);
+    let mut key: Option<(String, String, String)> = None;
+    loop {
+        tally_reset();
+        let branches = match &key {
+            None => vec![KeyBranch::new("", Vec::new())],
+            Some((connector, session, source)) => vec![
+                KeyBranch::new(
+                    " AND connector_id = $after_connector AND session_ref = $after_session AND source_instance_ref > $after_source",
+                    vec![
+                        ("after_connector", Value::Text(connector.clone())),
+                        ("after_session", Value::Text(session.clone())),
+                        ("after_source", Value::Text(source.clone())),
+                    ],
+                ),
+                KeyBranch::new(
+                    " AND connector_id = $after_connector AND session_ref > $after_session",
+                    vec![
+                        ("after_connector", Value::Text(connector.clone())),
+                        ("after_session", Value::Text(session.clone())),
+                    ],
+                ),
+                KeyBranch::new(
+                    " AND connector_id > $after_connector",
+                    vec![("after_connector", Value::Text(connector.clone()))],
+                ),
+            ],
+        };
+        let page = read_branches(
+            &mut unit_reader(store, bounds),
+            "SELECT connector_id, source_instance_ref, session_ref FROM event_search_pending_streams WHERE context_id = $context_id AND generation_id = $generation_id AND pending = $pending",
+            "connector_id ASC, session_ref ASC, source_instance_ref ASC",
+            &base,
+            &branches,
+            per_unit,
+        )?;
+        let before = format!("{key:?}");
+        let columns = page.columns.clone();
+        for row in &page.rows {
+            key = Some((
+                get_text(row, &columns, "connector_id")?,
+                get_text(row, &columns, "session_ref")?,
+                get_text(row, &columns, "source_instance_ref")?,
+            ));
+            let mut visit = |columns: &[String], row: &[Value]| -> Result<()> {
+                #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+                {
+                    stream_rows_examined += 1;
                 }
-            }
-            Ok(())
-        },
-    )?;
+                let connector = get_text(row, columns, "connector_id")?;
+                let source = get_text(row, columns, "source_instance_ref")?;
+                let session = get_text(row, columns, "session_ref")?;
+                let Some(candidate_rank) = sessions.rank(&connector, &session) else {
+                    return Ok(());
+                };
+                let cursor = query_rows(
+                    store,
+                    bounds,
+                    "SELECT committed_sequence, open_tail_start_sequence, open_tail_members, open_tail_passage_id FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector AND source_instance_ref = $source AND session_ref = $session",
+                    &HashMap::from([
+                        (
+                            "context_id".into(),
+                            Value::Uuid(generation.context_id.as_uuid()),
+                        ),
+                        ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
+                        ("connector".into(), Value::Text(connector.clone())),
+                        ("source".into(), Value::Text(source.clone())),
+                        ("session".into(), Value::Text(session.clone())),
+                    ]),
+                )?;
+                // A stream captured after membership preparation is marked pending before its
+                // membership and cursor exist. It is pending work, not a stale claim: the no-claim
+                // path prepares its membership and cursor, then discovery finds it here.
+                let Some(row) = cursor.rows.first() else {
+                    return Ok(());
+                };
+                let columns = &cursor.columns;
+                let committed = get_u64(row, columns, "committed_sequence")?;
+                let key = SessionKey {
+                    connector_id: connector.clone(),
+                    session_ref: session.clone(),
+                };
+                let through_sequence = match &sessions.frontiers {
+                    Some(frontiers) => match frontiers.get(&(key.clone(), source.clone())) {
+                        Some(frontier) if *frontier > committed => Some(*frontier),
+                        _ => return Ok(()),
+                    },
+                    None => None,
+                };
+                #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+                {
+                    cursor_lookups += 1;
+                }
+                let first = query_rows(
+                    store,
+                    bounds,
+                    FIRST_PENDING_SOURCE_STATEMENT,
+                    &HashMap::from([
+                        (
+                            "context_id".into(),
+                            Value::Uuid(generation.context_id.as_uuid()),
+                        ),
+                        ("generation_id".into(), Value::Uuid(generation.id.as_uuid())),
+                        ("connector_id".into(), Value::Text(connector.clone())),
+                        ("source".into(), Value::Text(source.clone())),
+                        ("session".into(), Value::Text(session.clone())),
+                        (
+                            "committed".into(),
+                            integer(committed, "cursor committed sequence")?,
+                        ),
+                    ]),
+                )?;
+                if let Some(candidate) = first.rows.first() {
+                    let candidate = PendingStream {
+                        publication_event_count: sessions
+                            .frontiers
+                            .as_ref()
+                            .and_then(|_| sessions.events.get(&key).copied()),
+                        through_sequence,
+                        start_ordinal: get_u64(candidate, first.columns(), "ordinal")?,
+                        connector_id: connector,
+                        source_instance_ref: source,
+                        session_ref: session,
+                        committed_sequence: committed,
+                        open_tail_start_sequence: get_optional_u64(
+                            row,
+                            columns,
+                            "open_tail_start_sequence",
+                        )?,
+                        open_tail_members: decode_tail_members(row, columns)?,
+                        open_tail_passage_id: get_optional_uuid(
+                            row,
+                            columns,
+                            "open_tail_passage_id",
+                        )?,
+                    };
+                    if pending.as_ref().is_none_or(|current: &PendingStream| {
+                        let current_rank = sessions
+                            .rank(&current.connector_id, &current.session_ref)
+                            .expect("pending streams belong to selected sessions");
+                        (candidate_rank, candidate.start_ordinal)
+                            < (current_rank, current.start_ordinal)
+                    }) {
+                        pending = Some(candidate);
+                    }
+                }
+                Ok(())
+            };
+            visit(&columns, row)?;
+        }
+        note_unit(UnitFold::Pending, page.rows.len() as u64, false, || {
+            (before, format!("{key:?}"))
+        })?;
+        if page.rows.len() < per_unit {
+            break;
+        }
+    }
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     observe_event_search_discovery_for_test(stream_rows_examined, cursor_lookups);
     Ok(pending)
@@ -5596,15 +8059,15 @@ fn reopenable_tail_start(
         ]),
     )?;
     let row = result
-        .rows()
+        .rows
         .first()
         .ok_or_else(|| stale_claim("event-search open tail member disappeared"))?;
-    if result.rows().len() != 1 {
+    if result.rows.len() != 1 {
         return Err(stale_claim(
             "event-search open tail member lookup was not unique",
         ));
     }
-    if get_text(row, result.columns(), "session_ref")? == session {
+    if get_text(row, &result.columns, "session_ref")? == session {
         Ok(Some(start))
     } else {
         Ok(None)
@@ -5651,12 +8114,12 @@ fn load_open_tail(
                 ("member".into(), Value::Uuid(*member)),
             ]),
         )?;
-        let [row] = result.rows() else {
+        let [row] = result.rows.as_slice() else {
             return Err(stale_claim(
                 "event-search open tail member disappeared or is not unique",
             ));
         };
-        let event = load_claimed_member(store, generation, result.columns(), row, bounds)?;
+        let event = load_claimed_member(store, generation, &result.columns, row, bounds)?;
         if event.membership_id != *member
             || event.event.connector_id != connector
             || event.event.source_instance_ref != source
@@ -5767,7 +8230,7 @@ fn has_later_session_event(
             ("after".into(), integer(after, "claimed sequence")?),
         ]),
     )?;
-    Ok(!result.rows().is_empty())
+    Ok(!result.rows.is_empty())
 }
 
 fn generation_passage_count(
@@ -5782,9 +8245,9 @@ fn generation_passage_count(
         &HashMap::from([("id".into(), Value::Uuid(id.as_uuid()))]),
     )?;
     result
-        .rows()
+        .rows
         .first()
-        .map(|row| get_u64(row, result.columns(), "passage_count"))
+        .map(|row| get_u64(row, &result.columns, "passage_count"))
         .transpose()?
         .ok_or(CgError::NotFound {
             id: Some(id.to_string()),
@@ -6438,20 +8901,47 @@ fn embed_passages(
 ) -> Result<Vec<BuiltPassage>> {
     let mut order = (0..pending.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| pending[*index].prepared.token_count());
-    let helper_pools = concurrent_embedding_helper_pools(embedding_workers, pending.len())?;
-    let result = measured(&mut observations.embed, || {
-        embed_passages_in_waves(
-            &pending,
-            &order,
-            lease,
-            registration,
-            embedding_workers,
-            bounds,
-            &mut observations.embedding_invocations,
-            helper_pools.as_deref(),
-        )
-    });
-    let outputs = result?;
+
+    let is_canonical = registration.space.embedding_space_id
+        == crate::embedding_space::BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID;
+    let canonical_batch = if is_canonical {
+        crate::embedder::verify_event_history_authority(
+            registration.embedder.as_ref(),
+            crate::embedding_space::BuiltinSpaceRegistry::EVENT_HISTORY_DOCUMENT_QUERY_ID,
+        )?
+    } else {
+        false
+    };
+
+    let outputs = if canonical_batch {
+        let helper_pool = canonical_batch_helper_pool(embedding_workers)?;
+        measured(&mut observations.embed, || {
+            embed_passages_batched(
+                &pending,
+                &order,
+                lease,
+                registration,
+                embedding_workers,
+                bounds,
+                &mut observations.embedding_invocations,
+                helper_pool.as_ref(),
+            )
+        })?
+    } else {
+        let helper_pools = concurrent_embedding_helper_pools(embedding_workers, pending.len())?;
+        measured(&mut observations.embed, || {
+            embed_passages_in_waves(
+                &pending,
+                &order,
+                lease,
+                registration,
+                embedding_workers,
+                bounds,
+                &mut observations.embedding_invocations,
+                helper_pools.as_deref(),
+            )
+        })?
+    };
 
     pending
         .into_iter()
@@ -6462,6 +8952,171 @@ fn embed_passages(
             validate_passage_embedding(output, pending, registration)
         })
         .collect()
+}
+
+/// Construct one reusable Rayon thread pool for canonical batch embedding, bounded by the
+/// requested worker concurrency and the available CPU parallelism.
+///
+/// Serial embedding (`embedding_workers == 1`) returns `None` to preserve existing serial
+/// execution semantics without Rayon installation.
+fn canonical_batch_helper_pool(
+    embedding_workers: NonZeroUsize,
+) -> Result<Option<rayon::ThreadPool>> {
+    if embedding_workers.get() <= 1 {
+        return Ok(None);
+    }
+    let available = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    let threads = embedding_workers.get().min(available);
+    if threads <= 1 {
+        return Ok(None);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|error| {
+            CgError::Engine(format!(
+                "event-search canonical batch helper pool could not start: {error}"
+            ))
+        })?;
+    Ok(Some(pool))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn embed_passages_batched(
+    pending: &[PendingPassage],
+    order: &[usize],
+    lease: &mut LeaseRenewal<'_>,
+    registration: &crate::EmbedderRegistration,
+    embedding_workers: NonZeroUsize,
+    bounds: Bounds,
+    entered_calls: &mut u64,
+    helper_pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<Option<crate::EmbeddingOutput>>> {
+    let mut outputs = (0..pending.len()).map(|_| None).collect::<Vec<_>>();
+    for wave in order.chunks(embedding_workers.get()) {
+        lease.keep()?;
+        run_batched_wave(
+            pending,
+            wave,
+            lease,
+            registration,
+            bounds,
+            entered_calls,
+            helper_pool,
+            &mut outputs,
+        )?;
+    }
+    Ok(outputs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_batched_wave(
+    pending: &[PendingPassage],
+    wave: &[usize],
+    lease: &mut LeaseRenewal<'_>,
+    registration: &crate::EmbedderRegistration,
+    bounds: Bounds,
+    entered_calls: &mut u64,
+    helper_pool: Option<&rayon::ThreadPool>,
+    outputs: &mut [Option<crate::EmbeddingOutput>],
+) -> Result<()> {
+    let mut first_worker_error = None;
+    let mut first_lease_error = None;
+    let mut panic = None;
+    std::thread::scope(|scope| {
+        let (completed, completions) = sync_channel(1);
+        let prepared_batch: Vec<crate::embedder::PreparedEventSearchDocument> = wave
+            .iter()
+            .map(|&index| pending[index].prepared.clone())
+            .collect();
+        let spawn = std::thread::Builder::new()
+            .name("event-search-canonical-batch-embedding".into())
+            .spawn_scoped(scope, move || {
+                let result = match helper_pool {
+                    Some(pool) => pool.install(|| {
+                        registration
+                            .embedder
+                            .embed_prepared_documents(&prepared_batch)
+                    }),
+                    None => registration
+                        .embedder
+                        .embed_prepared_documents(&prepared_batch),
+                };
+                drop(prepared_batch);
+                let _ = completed.send(result);
+            });
+        let handle = match spawn {
+            Ok(handle) => {
+                *entered_calls += 1;
+                handle
+            }
+            Err(error) => {
+                first_worker_error = Some(CgError::Engine(format!(
+                    "event-search batch embedding worker could not start: {error}"
+                )));
+                return;
+            }
+        };
+
+        let mut received = false;
+        while !received {
+            match completions.recv_timeout(lease_poll_interval(bounds)) {
+                Ok(result) => {
+                    received = true;
+                    match result {
+                        Ok(batch_outputs) => {
+                            if batch_outputs.len() != wave.len() {
+                                first_worker_error.get_or_insert_with(|| {
+                                    CgError::Engine(format!(
+                                        "event-search embedder returned the wrong number of passage vectors: expected {}, got {}",
+                                        wave.len(),
+                                        batch_outputs.len()
+                                    ))
+                                });
+                            } else if first_worker_error.is_none() {
+                                for (offset, output) in batch_outputs.into_iter().enumerate() {
+                                    let index = wave[offset];
+                                    match validate_passage_embedding_output(&output, registration) {
+                                        Ok(()) if first_lease_error.is_none() => {
+                                            outputs[index] = Some(output);
+                                        }
+                                        Ok(()) => {}
+                                        Err(error) => {
+                                            first_worker_error = Some(error);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            first_worker_error.get_or_insert(error);
+                        }
+                    }
+                    if let Err(error) = lease.keep() {
+                        first_lease_error.get_or_insert(error);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Err(error) = lease.keep() {
+                        first_lease_error.get_or_insert(error);
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if let Err(payload) = handle.join()
+            && panic.is_none()
+        {
+            panic = Some(payload);
+        }
+    });
+    if let Some(payload) = panic {
+        std::panic::resume_unwind(payload);
+    }
+    first_worker_error.or(first_lease_error).map_or(Ok(()), Err)
 }
 
 /// Construct one reusable single-thread Rayon pool for every concurrent passage worker.
@@ -6709,6 +9364,7 @@ fn commit_batch(
             other => map_engine_err(other),
         })
     })?;
+    release_claim_presence(store.db_path(), &built.claim.owner_token);
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     if let Some(hook) = AFTER_BATCH_COMMIT.with(|slot| slot.borrow_mut().take()) {
         hook(store);
@@ -6730,7 +9386,7 @@ fn commit_batch_in_tx(
     if now_millis()? >= claim.expires_at {
         return Err(stale_claim("event-search claim expired before commit"));
     }
-    let lease = store.internal_db().execute_in_tx(
+    let lease = execute_in_tx_counted(store,
         tx,
         "SELECT generation_id, context_id, owner_token, lease_epoch, claimed_connector_id, claimed_source_instance_ref, claimed_start_sequence, claimed_end_sequence, cursor_sha256, expires_at FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id",
         &HashMap::from([
@@ -6739,25 +9395,25 @@ fn commit_batch_in_tx(
         ]),
     ).map_err(map_engine_err)?;
     let row = lease
-        .rows()
+        .rows
         .first()
         .ok_or_else(|| stale_claim("event-search claim no longer exists"))?;
-    if lease.rows().len() != 1
-        || get_text(row, lease.columns(), "owner_token")? != claim.owner_token
-        || get_i64(row, lease.columns(), "lease_epoch")? != claim.lease_epoch
-        || get_text(row, lease.columns(), "claimed_connector_id")? != claim.connector_id
-        || get_text(row, lease.columns(), "claimed_source_instance_ref")?
+    if lease.rows.len() != 1
+        || get_text(row, &lease.columns, "owner_token")? != claim.owner_token
+        || get_i64(row, &lease.columns, "lease_epoch")? != claim.lease_epoch
+        || get_text(row, &lease.columns, "claimed_connector_id")? != claim.connector_id
+        || get_text(row, &lease.columns, "claimed_source_instance_ref")?
             != claim.source_instance_ref
-        || get_u64(row, lease.columns(), "claimed_start_sequence")? != claim.start_sequence
-        || get_u64(row, lease.columns(), "claimed_end_sequence")? != claim.end_sequence
-        || get_text(row, lease.columns(), "cursor_sha256")? != claim.cursor_sha256
-        || get_timestamp(row, lease.columns(), "expires_at")? != claim.expires_at
+        || get_u64(row, &lease.columns, "claimed_start_sequence")? != claim.start_sequence
+        || get_u64(row, &lease.columns, "claimed_end_sequence")? != claim.end_sequence
+        || get_text(row, &lease.columns, "cursor_sha256")? != claim.cursor_sha256
+        || get_timestamp(row, &lease.columns, "expires_at")? != claim.expires_at
     {
         return Err(stale_claim("event-search claim ownership or range changed"));
     }
     let guard_values = exact_conditions(
         row,
-        lease.columns(),
+        &lease.columns,
         &[
             "context_id",
             "owner_token",
@@ -6784,54 +9440,50 @@ fn commit_batch_in_tx(
         return Err(stale_claim("event-search claim changed during commit"));
     }
 
-    let generation = store.internal_db().execute_in_tx(
+    let generation = execute_in_tx_counted(store,
         tx,
-        "SELECT context_id, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, required_event_count, searchable_event_count, searchable_excluded_event_count, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, passage_count FROM event_search_generations WHERE id = $id",
+        "SELECT context_id, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, required_event_count, searchable_event_count, searchable_excluded_event_count, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, passage_count, passage_revision FROM event_search_generations WHERE id = $id",
         &HashMap::from([("id".into(), Value::Uuid(claim.generation.id.as_uuid()))]),
     ).map_err(map_engine_err)?;
     let generation_row = generation
-        .rows()
+        .rows
         .first()
         .ok_or_else(|| stale_claim("event-search generation disappeared"))?;
-    if get_uuid(generation_row, generation.columns(), "context_id")?
+    if get_uuid(generation_row, &generation.columns, "context_id")?
         != claim.generation.context_id.as_uuid()
         || get_text(
             generation_row,
-            generation.columns(),
+            &generation.columns,
             "interpretation_snapshot_sha256",
         )? != claim.generation.snapshot_sha256
-        || get_u64(generation_row, generation.columns(), "event_count")?
+        || get_u64(generation_row, &generation.columns, "event_count")?
             != claim.generation.event_count
         || get_text(
             generation_row,
-            generation.columns(),
+            &generation.columns,
             "ordered_source_set_sha256",
         )? != claim.generation.ordered_source_set_sha256
-        || get_text(
-            generation_row,
-            generation.columns(),
-            "source_content_sha256",
-        )? != claim.generation.source_content_sha256
-        || get_u64(generation_row, generation.columns(), "capture_ordinal")?
+        || get_text(generation_row, &generation.columns, "source_content_sha256")?
+            != claim.generation.source_content_sha256
+        || get_u64(generation_row, &generation.columns, "capture_ordinal")?
             != claim.generation.target.event_count
-        || get_text(generation_row, generation.columns(), "renderer_id")?
-            != EVENT_SEARCH_RENDERER_ID
-        || get_text(generation_row, generation.columns(), "renderer_version")?
+        || get_text(generation_row, &generation.columns, "renderer_id")? != EVENT_SEARCH_RENDERER_ID
+        || get_text(generation_row, &generation.columns, "renderer_version")?
             != EVENT_SEARCH_RENDERER_VERSION
-        || get_json(generation_row, generation.columns(), "renderer_profile")?
+        || get_json(generation_row, &generation.columns, "renderer_profile")?
             != serde_json::to_value(profile).map_err(json_error)?
-        || get_text(generation_row, generation.columns(), "embedding_space_id")?
+        || get_text(generation_row, &generation.columns, "embedding_space_id")?
             != registration.space.embedding_space_id
-        || get_text(generation_row, generation.columns(), "encoding_profile")?
+        || get_text(generation_row, &generation.columns, "encoding_profile")?
             != registration.embedder.encoding_profile_id()
-        || get_text(generation_row, generation.columns(), "state")?
+        || get_text(generation_row, &generation.columns, "state")?
             != claim.generation.expected_state()
     {
         return Err(stale_claim("event-search generation changed before commit"));
     }
     let generation_guard = exact_conditions(
         generation_row,
-        generation.columns(),
+        &generation.columns,
         &[
             "context_id",
             "interpretation_snapshot_sha256",
@@ -6869,19 +9521,18 @@ fn commit_batch_in_tx(
         return Err(stale_claim("event-search generation changed during commit"));
     }
     if claim.generation.mode == GenerationMode::ExtendReady {
-        let head = store
-            .internal_db()
-            .execute_in_tx(
-                tx,
-                "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
-                &HashMap::from([(
-                    "context_id".into(),
-                    Value::Uuid(claim.generation.context_id.as_uuid()),
-                )]),
-            )
-            .map_err(map_engine_err)?;
-        if head.rows().len() != 1
-            || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
+        let head = execute_in_tx_counted(
+            store,
+            tx,
+            "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+            &HashMap::from([(
+                "context_id".into(),
+                Value::Uuid(claim.generation.context_id.as_uuid()),
+            )]),
+        )
+        .map_err(map_engine_err)?;
+        if head.rows.len() != 1
+            || get_uuid(&head.rows[0], &head.columns, "generation_id")?
                 != claim.generation.id.as_uuid()
         {
             return Err(stale_claim(
@@ -6897,7 +9548,7 @@ fn commit_batch_in_tx(
         ));
     }
 
-    let progress = store.internal_db().execute_in_tx(
+    let progress = execute_in_tx_counted(store,
         tx,
         "SELECT context_id, generation_id, connector_id, session_ref, event_count, committed_event_count, eligible_event_count, excluded_event_count, searchable_event_count, no_searchable_text_event_count, is_required, is_published FROM event_search_session_progress WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
         &HashMap::from([
@@ -6907,25 +9558,25 @@ fn commit_batch_in_tx(
             ("session".into(), Value::Text(claim.session_ref.clone())),
         ]),
     ).map_err(map_engine_err)?;
-    let progress_row = progress.rows().first().ok_or_else(|| {
+    let progress_row = progress.rows.first().ok_or_else(|| {
         stale_claim("event-search claimed session has no transactional progress row")
     })?;
-    if progress.rows().len() != 1 || !get_bool(progress_row, progress.columns(), "is_required")? {
+    if progress.rows.len() != 1 || !get_bool(progress_row, &progress.columns, "is_required")? {
         return Err(stale_claim(
             "event-search claimed session is no longer in the required scope",
         ));
     }
-    let session_event_count = get_u64(progress_row, progress.columns(), "event_count")?;
-    let prior_committed = get_u64(progress_row, progress.columns(), "committed_event_count")?;
-    let prior_eligible = get_u64(progress_row, progress.columns(), "eligible_event_count")?;
-    let prior_excluded = get_u64(progress_row, progress.columns(), "excluded_event_count")?;
-    let prior_searchable = get_u64(progress_row, progress.columns(), "searchable_event_count")?;
+    let session_event_count = get_u64(progress_row, &progress.columns, "event_count")?;
+    let prior_committed = get_u64(progress_row, &progress.columns, "committed_event_count")?;
+    let prior_eligible = get_u64(progress_row, &progress.columns, "eligible_event_count")?;
+    let prior_excluded = get_u64(progress_row, &progress.columns, "excluded_event_count")?;
+    let prior_searchable = get_u64(progress_row, &progress.columns, "searchable_event_count")?;
     let prior_no_text = get_u64(
         progress_row,
-        progress.columns(),
+        &progress.columns,
         "no_searchable_text_event_count",
     )?;
-    let session_was_published = get_bool(progress_row, progress.columns(), "is_published")?;
+    let session_was_published = get_bool(progress_row, &progress.columns, "is_published")?;
     let committed = prior_committed
         .checked_add(built.eligible_events)
         .and_then(|count| count.checked_add(built.excluded_events))
@@ -6952,7 +9603,7 @@ fn commit_batch_in_tx(
     let replacement_is_searchable = session_was_published;
     for passage in &built.passages {
         measured(&mut observations.vector_insert, || {
-            store.internal_db().execute_in_tx(
+            execute_in_tx_counted(store,
             tx,
             "INSERT INTO event_search_passages (id, context_id, generation_id, connector_id, session_ref, source_instance_ref, passage_ordinal, first_event_sequence, last_event_sequence, rendered_text, content_sha256, vector_text, dimension, is_current, is_searchable, created_at) VALUES ($id, $context_id, $generation_id, $connector_id, $session, $source, $ordinal, $first, $last, $text, $sha, $vector, $dimension, $current, $searchable, $created_at)",
             &HashMap::from([
@@ -6979,7 +9630,7 @@ fn commit_batch_in_tx(
         ).map_err(map_engine_err)
         })?;
         for source in &passage.sources {
-            store.internal_db().execute_in_tx(
+            execute_in_tx_counted(store,
                 tx,
                 "INSERT INTO event_search_passage_sources (context_id, generation_id, passage_id, event_id, connector_id, session_ref, source_instance_ref, source_order, event_start_byte, event_end_byte, passage_start_byte, passage_end_byte) VALUES ($context_id, $generation_id, $passage_id, $event_id, $connector_id, $session, $source, $source_order, $event_start, $event_end, $passage_start, $passage_end)",
                 &HashMap::from([
@@ -6998,7 +9649,7 @@ fn commit_batch_in_tx(
                 ]),
             ).map_err(map_engine_err)?;
         }
-        store.internal_db().execute_in_tx(
+        execute_in_tx_counted(store,
             tx,
             "INSERT INTO event_search_embedding_handles (id, context_id, generation_id, passage_id, embedding_space_id, produced_by, producer_system, created_at) VALUES ($id, $context_id, $generation_id, $passage_id, $space, $producer, $producer_system, $created_at)",
             &HashMap::from([
@@ -7030,17 +9681,16 @@ fn commit_batch_in_tx(
                     "event-search open tail changed before atomic retirement",
                 ));
             }
-            store
-                .internal_db()
-                .execute_in_tx(
-                    tx,
-                    "UPDATE event_search_passages SET is_current = $current WHERE id = $id",
-                    &HashMap::from([
-                        ("current".into(), Value::Bool(false)),
-                        ("id".into(), Value::Uuid(superseded.id.as_uuid())),
-                    ]),
-                )
-                .map_err(map_engine_err)?;
+            execute_in_tx_counted(
+                store,
+                tx,
+                "UPDATE event_search_passages SET is_current = $current WHERE id = $id",
+                &HashMap::from([
+                    ("current".into(), Value::Bool(false)),
+                    ("id".into(), Value::Uuid(superseded.id.as_uuid())),
+                ]),
+            )
+            .map_err(map_engine_err)?;
         }
     }
     // The tail passage is the final group emitted at session end while its tail can reopen. A claim
@@ -7063,7 +9713,7 @@ fn commit_batch_in_tx(
         &built.next_open_tail_members,
         next_open_tail_passage_id,
     )?;
-    store.internal_db().execute_in_tx(
+    execute_in_tx_counted(store,
         tx,
         "UPDATE event_search_session_progress SET committed_event_count = $committed, eligible_event_count = $eligible, excluded_event_count = $excluded, searchable_event_count = $searchable, no_searchable_text_event_count = $no_text, is_published = $published WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
         &HashMap::from([
@@ -7086,11 +9736,14 @@ fn commit_batch_in_tx(
         ]),
     ).map_err(map_engine_err)?;
     if session_is_published {
-        store
-            .internal_db()
-            .execute_in_tx(
+        // Bind `is_current` so each statement seeks the session's passages through the full
+        // `(context_id, generation_id, is_current, session_ref)` index prefix rather than walking
+        // every passage of the generation; current and retired passages are both marked.
+        for current in [true, false] {
+            execute_in_tx_counted(
+                store,
                 tx,
-                "UPDATE event_search_passages SET is_searchable = $searchable WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND session_ref = $session",
+                "UPDATE event_search_passages SET is_searchable = $searchable WHERE context_id = $context_id AND generation_id = $generation_id AND is_current = $current AND session_ref = $session AND connector_id = $connector_id",
                 &HashMap::from([
                     ("searchable".into(), Value::Bool(true)),
                     (
@@ -7101,6 +9754,7 @@ fn commit_batch_in_tx(
                         "generation_id".into(),
                         Value::Uuid(claim.generation.id.as_uuid()),
                     ),
+                    ("current".into(), Value::Bool(current)),
                     (
                         "connector_id".into(),
                         Value::Text(claim.connector_id.clone()),
@@ -7109,6 +9763,7 @@ fn commit_batch_in_tx(
                 ]),
             )
             .map_err(map_engine_err)?;
+        }
         if !claim.generation.pending_dual_head_activation {
             activate_search_head_for_published_session_in_tx(
                 store,
@@ -7118,36 +9773,42 @@ fn commit_batch_in_tx(
             )?;
         }
     }
-    let eligible = get_u64(generation_row, generation.columns(), "eligible_event_count")?
+    let eligible = get_u64(generation_row, &generation.columns, "eligible_event_count")?
         .checked_add(built.eligible_events)
         .ok_or_else(|| CgError::Engine("eligible event count exhausted u64".into()))?;
-    let excluded = get_u64(generation_row, generation.columns(), "excluded_event_count")?
+    let excluded = get_u64(generation_row, &generation.columns, "excluded_event_count")?
         .checked_add(built.excluded_events)
         .ok_or_else(|| CgError::Engine("excluded event count exhausted u64".into()))?;
     let searchable = get_u64(
         generation_row,
-        generation.columns(),
+        &generation.columns,
         "searchable_event_count",
     )?
     .checked_add(session_searchable.saturating_sub(prior_searchable))
     .ok_or_else(|| CgError::Engine("searchable event count exhausted u64".into()))?;
     let searchable_excluded = get_u64(
         generation_row,
-        generation.columns(),
+        &generation.columns,
         "searchable_excluded_event_count",
     )?
     .checked_add(session_no_text.saturating_sub(prior_no_text))
     .ok_or_else(|| CgError::Engine("searchable excluded count exhausted u64".into()))?;
-    let passage_count = get_u64(generation_row, generation.columns(), "passage_count")?
+    // Every insertion or retirement of a passage moves the generation's passage revision in the
+    // same transaction, so a saved or completed passage fold can tell its population changed.
+    let passage_revision = get_u64(generation_row, &generation.columns, "passage_revision")?
+        .checked_add(u64::from(!built.passages.is_empty()))
+        .ok_or_else(|| CgError::Engine("passage revision exhausted u64".into()))?;
+    let passage_count = get_u64(generation_row, &generation.columns, "passage_count")?
         .checked_add(
             u64::try_from(built.passages.len())
                 .map_err(|_| CgError::Engine("passage count exceeds u64".into()))?,
         )
         .ok_or_else(|| CgError::Engine("passage count exhausted u64".into()))?;
-    store.internal_db().execute_in_tx(
+    execute_in_tx_counted(store,
         tx,
-        "UPDATE event_search_generations SET searchable_event_count = $searchable, searchable_excluded_event_count = $searchable_excluded, eligible_event_count = $eligible, rendered_event_count = $eligible, embedded_event_count = $eligible, excluded_event_count = $excluded, passage_count = $passage_count WHERE id = $id",
+        "UPDATE event_search_generations SET searchable_event_count = $searchable, searchable_excluded_event_count = $searchable_excluded, eligible_event_count = $eligible, rendered_event_count = $eligible, embedded_event_count = $eligible, excluded_event_count = $excluded, passage_count = $passage_count, passage_revision = $passage_revision WHERE id = $id",
         &HashMap::from([
+            ("passage_revision".into(), integer(passage_revision, "passage revision")?),
             ("searchable".into(), integer(searchable, "searchable count")?),
             (
                 "searchable_excluded".into(),
@@ -7159,7 +9820,17 @@ fn commit_batch_in_tx(
             ("id".into(), Value::Uuid(claim.generation.id.as_uuid())),
         ]),
     ).map_err(map_engine_err)?;
-    let deleted = store.internal_db().execute_in_tx(
+    if !built.passages.is_empty() {
+        carry_unchanged_passage_fold_prefix_in_tx(
+            store,
+            tx,
+            claim,
+            built,
+            get_u64(generation_row, &generation.columns, "passage_revision")?,
+            passage_revision,
+        )?;
+    }
+    let deleted = execute_in_tx_counted(store,
         tx,
         "DELETE FROM event_search_leases WHERE context_id = $context_id AND generation_id = $generation_id AND owner_token = $owner_token AND lease_epoch = $lease_epoch",
         &HashMap::from([
@@ -7169,7 +9840,7 @@ fn commit_batch_in_tx(
             ("lease_epoch".into(), Value::Int64(claim.lease_epoch)),
         ]),
     ).map_err(map_engine_err)?;
-    if deleted.rows_affected() != 1 {
+    if deleted.rows_affected != 1 {
         return Err(stale_claim(
             "event-search owned claim disappeared before its committed lease deletion",
         ));
@@ -7190,9 +9861,7 @@ fn reload_claimed_events_in_tx(
             .saturating_add(claim.events.len()),
     );
     for expected in claim.open_tail_events.iter().chain(claim.events.iter()) {
-        let membership = store
-            .internal_db()
-            .execute_in_tx(
+        let membership = execute_in_tx_counted(store,
                 tx,
                 &format!(
                     "SELECT context_id, generation_id, {SOURCE_MEMBER_COLUMNS} FROM event_search_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND ordinal = $ordinal"
@@ -7211,34 +9880,32 @@ fn reload_claimed_events_in_tx(
             )
             .map_err(map_engine_err)?;
         let member_row = membership
-            .rows()
+            .rows
             .first()
             .ok_or_else(|| stale_claim("sealed event-search membership disappeared"))?;
-        if membership.rows().len() != 1
-            || get_uuid(member_row, membership.columns(), "membership_id")?
-                != expected.membership_id
-            || get_uuid(member_row, membership.columns(), "context_id")?
+        if membership.rows.len() != 1
+            || get_uuid(member_row, &membership.columns, "membership_id")? != expected.membership_id
+            || get_uuid(member_row, &membership.columns, "context_id")?
                 != claim.generation.context_id.as_uuid()
-            || get_uuid(member_row, membership.columns(), "generation_id")?
+            || get_uuid(member_row, &membership.columns, "generation_id")?
                 != claim.generation.id.as_uuid()
-            || get_u64(member_row, membership.columns(), "ordinal")? != expected.ordinal
-            || get_uuid(member_row, membership.columns(), "event_id")?
-                != expected.event.id.as_uuid()
-            || get_text(member_row, membership.columns(), "connector_id")?
+            || get_u64(member_row, &membership.columns, "ordinal")? != expected.ordinal
+            || get_uuid(member_row, &membership.columns, "event_id")? != expected.event.id.as_uuid()
+            || get_text(member_row, &membership.columns, "connector_id")?
                 != expected.event.connector_id
-            || get_text(member_row, membership.columns(), "source_instance_ref")?
+            || get_text(member_row, &membership.columns, "source_instance_ref")?
                 != expected.event.source_instance_ref
-            || get_text(member_row, membership.columns(), "session_ref")?
+            || get_text(member_row, &membership.columns, "session_ref")?
                 != expected.event.session_ref
-            || get_u64(member_row, membership.columns(), "source_sequence")? != expected.event.seq
+            || get_u64(member_row, &membership.columns, "source_sequence")? != expected.event.seq
             || get_optional_interpretation_id(
                 member_row,
-                membership.columns(),
+                &membership.columns,
                 "effective_interpretation_generation_id",
             )? != expected.effective_interpretation_generation_id
-            || get_text(member_row, membership.columns(), "captured_source_sha256")?
+            || get_text(member_row, &membership.columns, "captured_source_sha256")?
                 != expected.captured_source_sha256
-            || get_text(member_row, membership.columns(), "effective_source_sha256")?
+            || get_text(member_row, &membership.columns, "effective_source_sha256")?
                 != expected.effective_source_sha256
         {
             return Err(stale_claim(
@@ -7247,7 +9914,7 @@ fn reload_claimed_events_in_tx(
         }
         let member_guard = exact_conditions(
             member_row,
-            membership.columns(),
+            &membership.columns,
             &[
                 "context_id",
                 "generation_id",
@@ -7291,9 +9958,7 @@ fn reload_claimed_member_input_in_tx(
     expected: &ClaimedEvent,
     bounds: Bounds,
 ) -> Result<ClaimedEvent> {
-    let event_result = store
-        .internal_db()
-        .execute_in_tx(
+    let event_result = execute_in_tx_counted(store,
             tx,
             &format!(
                 "SELECT {CAPTURED_EVENT_COLUMNS} FROM events WHERE context_id = $context_id AND id = $event_id"
@@ -7308,21 +9973,19 @@ fn reload_claimed_member_input_in_tx(
         )
         .map_err(map_engine_err)?;
     let event_row = event_result
-        .rows()
+        .rows
         .first()
         .ok_or_else(|| stale_claim("sealed event-search source event disappeared"))?;
-    if event_result.rows().len() != 1 {
+    if event_result.rows.len() != 1 {
         return Err(stale_claim(
             "sealed event-search source event lookup was not unique",
         ));
     }
-    let mut event = decode_event(event_result.columns(), event_row)?;
+    let mut event = decode_event(&event_result.columns, event_row)?;
     let anchor_limit = usize::try_from(expected.event.anchor_count)
         .unwrap_or(usize::MAX.saturating_sub(1))
         .saturating_add(1);
-    let anchors = store
-        .internal_db()
-        .execute_in_tx(
+    let anchors = execute_in_tx_counted(store,
             tx,
             &format!(
                 "SELECT {CAPTURED_ANCHOR_COLUMNS} FROM event_anchors WHERE event_id = $event_id AND context_id = $context_id ORDER BY declaration_version ASC, key ASC, identity_value ASC LIMIT {anchor_limit}"
@@ -7337,7 +10000,7 @@ fn reload_claimed_member_input_in_tx(
         )
         .map_err(map_engine_err)?;
     let anchor_bytes = canonical_json_bytes(
-        &serde_json::to_value((anchors.columns(), anchors.rows()))
+        &serde_json::to_value((&anchors.columns, &anchors.rows))
             .expect("persisted anchor values always serialize"),
     )
     .len();
@@ -7347,10 +10010,10 @@ fn reload_claimed_member_input_in_tx(
         ));
     }
     let captured_sha256 = captured_source_sha256(
-        event_result.columns(),
+        &event_result.columns,
         event_row,
-        anchors.columns(),
-        anchors.rows(),
+        &anchors.columns,
+        &anchors.rows,
     );
     if captured_sha256 != expected.captured_source_sha256 {
         return Err(stale_claim(
@@ -7367,42 +10030,34 @@ fn reload_claimed_member_input_in_tx(
             ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
             ("event_id".into(), Value::Uuid(expected.event.id.as_uuid())),
         ]);
-        let source_member = store
-            .internal_db()
-            .execute_in_tx(
+        let source_member = execute_in_tx_counted(store,
                 tx,
                 "SELECT source_row_sha256 FROM event_interpretation_source_events WHERE context_id = $context_id AND generation_id = $generation_id AND event_id = $event_id",
                 &params,
             )
             .map_err(map_engine_err)?;
-        let source_row = source_member.rows().first().ok_or_else(|| {
+        let source_row = source_member.rows.first().ok_or_else(|| {
             stale_claim("selected interpretation membership disappeared before commit")
         })?;
-        if source_member.rows().len() != 1
-            || get_text(source_row, source_member.columns(), "source_row_sha256")?
-                != captured_sha256
+        if source_member.rows.len() != 1
+            || get_text(source_row, &source_member.columns, "source_row_sha256")? != captured_sha256
         {
             return Err(stale_claim(
                 "selected interpretation membership changed before commit",
             ));
         }
-        let effective = store
-            .internal_db()
-            .execute_in_tx(
+        let effective = execute_in_tx_counted(store,
                 tx,
                 "SELECT captured_content_sha256, occurred_at, author, kind, render_role, interaction_ref, text, payload, anchors, coverage, effective_sha256 FROM event_interpretation_values WHERE context_id = $context_id AND generation_id = $generation_id AND event_id = $event_id",
                 &params,
             )
             .map_err(map_engine_err)?;
-        let effective_row = effective.rows().first().ok_or_else(|| {
+        let effective_row = effective.rows.first().ok_or_else(|| {
             stale_claim("selected interpretation value disappeared before commit")
         })?;
-        if effective.rows().len() != 1
-            || get_text(
-                effective_row,
-                effective.columns(),
-                "captured_content_sha256",
-            )? != event.content_hash
+        if effective.rows.len() != 1
+            || get_text(effective_row, &effective.columns, "captured_content_sha256")?
+                != event.content_hash
         {
             return Err(stale_claim(
                 "selected interpretation value changed before commit",
@@ -7410,10 +10065,10 @@ fn reload_claimed_member_input_in_tx(
         }
         effective_row_sha256 = Some(get_text(
             effective_row,
-            effective.columns(),
+            &effective.columns,
             "effective_sha256",
         )?);
-        apply_effective_row(&mut event, effective.columns(), effective_row)?;
+        apply_effective_row(&mut event, &effective.columns, effective_row)?;
     }
     let effective_sha256 = effective_source_hash(
         &event,
@@ -7497,28 +10152,26 @@ fn upsert_cursor_in_tx(
         ),
         ("updated_at".into(), Value::TxId(tx)),
     ]);
-    let existing = store.internal_db().execute_in_tx(
+    let existing = execute_in_tx_counted(store,
         tx,
         "SELECT committed_sequence, open_tail_start_sequence, open_tail_members, open_tail_passage_id FROM event_search_cursors WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session",
         &params,
     ).map_err(map_engine_err)?;
-    let Some(row) = existing.rows().first() else {
+    let Some(row) = existing.rows.first() else {
         return Err(stale_claim("event-search cursor disappeared before commit"));
     };
-    if get_u64(row, existing.columns(), "committed_sequence")? != claim.prior_committed_sequence
-        || get_optional_u64(row, existing.columns(), "open_tail_start_sequence")?
+    if get_u64(row, &existing.columns, "committed_sequence")? != claim.prior_committed_sequence
+        || get_optional_u64(row, &existing.columns, "open_tail_start_sequence")?
             != claim.prior_open_tail_start_sequence
-        || decode_tail_members(row, existing.columns())? != claim.prior_open_tail_members
-        || get_optional_uuid(row, existing.columns(), "open_tail_passage_id")?
+        || decode_tail_members(row, &existing.columns)? != claim.prior_open_tail_members
+        || get_optional_uuid(row, &existing.columns, "open_tail_passage_id")?
             != claim.prior_open_tail_passage_id
     {
         return Err(stale_claim(
             "event-search cursor or open tail changed before commit",
         ));
     }
-    store
-        .internal_db()
-        .execute_in_tx(
+    execute_in_tx_counted(store,
             tx,
             "UPDATE event_search_cursors SET committed_sequence = $committed, open_tail_start_sequence = $open_tail, open_tail_members = $open_tail_members, open_tail_passage_id = $open_tail_passage, watermark_sha256 = $watermark, updated_at = $updated_at WHERE context_id = $context_id AND generation_id = $generation_id AND connector_id = $connector_id AND source_instance_ref = $source AND session_ref = $session",
             &params,
@@ -7527,13 +10180,13 @@ fn upsert_cursor_in_tx(
     if guard_event_context_revision_in_tx(store, tx, claim.generation.context_id)?.is_none() {
         return Err(stale_claim("capture changed while clearing pending stream"));
     }
-    let newest = store.internal_db().execute_in_tx(tx,
+    let newest = execute_in_tx_counted(store, tx,
         "SELECT seq FROM events WHERE context_id = $context_id AND connector_id = $connector_id AND source_instance_ref = $source ORDER BY seq DESC LIMIT 1", &params).map_err(map_engine_err)?;
     let row = newest
-        .rows()
+        .rows
         .first()
         .ok_or_else(|| stale_claim("claimed source disappeared before pending marker update"))?;
-    let pending = claim.end_sequence < get_u64(row, newest.columns(), "seq")?;
+    let pending = claim.end_sequence < get_u64(row, &newest.columns, "seq")?;
     for target in [claim.generation.id.as_uuid(), UNASSIGNED_SEARCH_GENERATION] {
         set_stream_pending_in_tx(
             store,
@@ -7579,18 +10232,36 @@ fn finish_or_continue(
     if hash_json(&snapshot_json(&bindings)) != generation.snapshot_sha256 {
         return Ok(FinishResult::Rebuild);
     }
-    let target = measured(&mut observations.event_read, || {
-        capture_source_membership(
-            store,
-            generation.context_id,
-            &bindings,
-            Some(generation.id),
-            bounds,
-        )
-    })?;
+    // The run's certified capture still describes the Context when neither its event revision nor
+    // the bound interpretations moved; anything else captures again. Completion re-checks the
+    // revision under its own guard.
+    let unchanged = match &generation.certified {
+        Some(certificate) => {
+            read_event_context_revision(store, generation.context_id, bounds)?
+                == certificate.revision
+                && current_interpretation_stamp(store, generation.context_id, &bindings, bounds)?
+                    == certificate.stamp
+        }
+        None => false,
+    };
+    let (target, certified) = if unchanged {
+        (generation.target.clone(), generation.certified.clone())
+    } else {
+        measured(&mut observations.event_read, || {
+            capture_source_membership(
+                store,
+                generation.context_id,
+                &bindings,
+                Some(generation.id),
+                generation.attempt_token,
+                bounds,
+            )
+        })?
+    };
     let mut next = generation.clone();
     next.bindings = bindings;
     next.target = target;
+    next.certified = certified;
     if next.target != generation.target {
         return Ok(FinishResult::Continue(Box::new(next)));
     }
@@ -7623,37 +10294,37 @@ fn finish_stable(
         let _ = store.internal_db().rollback(tx);
         return Err(error);
     }
-    let result = store.internal_db().execute_in_tx(
+    let result = execute_in_tx_counted(store,
         tx,
         "SELECT context_id, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, renderer_id, renderer_version, renderer_profile, embedding_space_id, encoding_profile, state, required_event_count, searchable_event_count, searchable_excluded_event_count, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, failed_event_count, passage_count, completed_at FROM event_search_generations WHERE id = $id",
         &HashMap::from([("id".into(), Value::Uuid(generation.id.as_uuid()))]),
     ).map_err(map_engine_err)?;
-    let row = result.rows().first().ok_or(CgError::NotFound {
+    let row = result.rows.first().ok_or(CgError::NotFound {
         id: Some(generation.id.to_string()),
         missing: Some("event search generation"),
     })?;
-    let eligible = get_u64(row, result.columns(), "eligible_event_count")?;
-    let excluded = get_u64(row, result.columns(), "excluded_event_count")?;
-    let required = get_u64(row, result.columns(), "required_event_count")?;
-    let searchable = get_u64(row, result.columns(), "searchable_event_count")?;
-    let searchable_excluded = get_u64(row, result.columns(), "searchable_excluded_event_count")?;
-    let state = get_text(row, result.columns(), "state")?;
-    if get_uuid(row, result.columns(), "context_id")? != generation.context_id.as_uuid()
-        || get_text(row, result.columns(), "interpretation_snapshot_sha256")?
+    let eligible = get_u64(row, &result.columns, "eligible_event_count")?;
+    let excluded = get_u64(row, &result.columns, "excluded_event_count")?;
+    let required = get_u64(row, &result.columns, "required_event_count")?;
+    let searchable = get_u64(row, &result.columns, "searchable_event_count")?;
+    let searchable_excluded = get_u64(row, &result.columns, "searchable_excluded_event_count")?;
+    let state = get_text(row, &result.columns, "state")?;
+    if get_uuid(row, &result.columns, "context_id")? != generation.context_id.as_uuid()
+        || get_text(row, &result.columns, "interpretation_snapshot_sha256")?
             != generation.snapshot_sha256
-        || get_u64(row, result.columns(), "event_count")? != generation.event_count
-        || get_u64(row, result.columns(), "capture_ordinal")? != generation.target.event_count
-        || get_text(row, result.columns(), "ordered_source_set_sha256")?
+        || get_u64(row, &result.columns, "event_count")? != generation.event_count
+        || get_u64(row, &result.columns, "capture_ordinal")? != generation.target.event_count
+        || get_text(row, &result.columns, "ordered_source_set_sha256")?
             != generation.ordered_source_set_sha256
-        || get_text(row, result.columns(), "source_content_sha256")?
+        || get_text(row, &result.columns, "source_content_sha256")?
             != generation.source_content_sha256
-        || get_text(row, result.columns(), "renderer_id")? != EVENT_SEARCH_RENDERER_ID
-        || get_text(row, result.columns(), "renderer_version")? != EVENT_SEARCH_RENDERER_VERSION
-        || get_json(row, result.columns(), "renderer_profile")?
+        || get_text(row, &result.columns, "renderer_id")? != EVENT_SEARCH_RENDERER_ID
+        || get_text(row, &result.columns, "renderer_version")? != EVENT_SEARCH_RENDERER_VERSION
+        || get_json(row, &result.columns, "renderer_profile")?
             != serde_json::to_value(profile).map_err(json_error)?
-        || get_text(row, result.columns(), "embedding_space_id")?
+        || get_text(row, &result.columns, "embedding_space_id")?
             != registration.space.embedding_space_id
-        || get_text(row, result.columns(), "encoding_profile")?
+        || get_text(row, &result.columns, "encoding_profile")?
             != registration.embedder.encoding_profile_id()
         || state != generation.expected_state()
         || eligible.checked_add(excluded) != Some(required)
@@ -7666,7 +10337,7 @@ fn finish_stable(
     }
     let finish_guard = exact_conditions(
         row,
-        result.columns(),
+        &result.columns,
         &[
             "context_id",
             "interpretation_snapshot_sha256",
@@ -7720,23 +10391,32 @@ fn finish_stable(
             return Err(error);
         }
     };
-    let live_count = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "SELECT COUNT(*) AS event_count FROM events WHERE context_id = $context_id",
-            &HashMap::from([(
-                "context_id".into(),
-                Value::Uuid(generation.context_id.as_uuid()),
-            )]),
-        )
-        .map_err(map_engine_err)?;
+    // Never finalize past a revision the certified capture did not see: the next pass captures
+    // the newer events first.
+    if generation
+        .certified
+        .as_ref()
+        .is_some_and(|certificate| certificate.revision != event_revision)
+    {
+        let _ = store.internal_db().rollback(tx);
+        return Ok(None);
+    }
+    let live_count = execute_in_tx_counted(
+        store,
+        tx,
+        "SELECT COUNT(*) AS event_count FROM events WHERE context_id = $context_id",
+        &HashMap::from([(
+            "context_id".into(),
+            Value::Uuid(generation.context_id.as_uuid()),
+        )]),
+    )
+    .map_err(map_engine_err)?;
     let live_row = live_count
-        .rows()
+        .rows
         .first()
         .ok_or_else(|| stale_claim("event-search final source count returned no row"))?;
-    if live_count.rows().len() != 1
-        || get_u64(live_row, live_count.columns(), "event_count")? != generation.target.event_count
+    if live_count.rows.len() != 1
+        || get_u64(live_row, &live_count.columns, "event_count")? != generation.target.event_count
     {
         let _ = store.internal_db().rollback(tx);
         return Ok(None);
@@ -7754,11 +10434,11 @@ fn finish_stable(
         && generation.target.ordered_source_set_sha256 == generation.ordered_source_set_sha256
         && generation.target.source_content_sha256 == generation.source_content_sha256;
     if unchanged_ready {
-        get_optional_txid(row, result.columns(), "completed_at")?.ok_or_else(|| {
+        get_optional_txid(row, &result.columns, "completed_at")?.ok_or_else(|| {
             stale_claim("event-search ready generation has no completion transaction")
         })?;
     } else {
-        store.internal_db().execute_in_tx(
+        execute_in_tx_counted(store,
             tx,
             "UPDATE event_search_generations SET event_count = $event_count, ordered_source_set_sha256 = $ordered_sha256, source_content_sha256 = $source_sha256, state = $state, completed_at = $completed_at WHERE id = $id",
             &HashMap::from([
@@ -7780,7 +10460,7 @@ fn finish_stable(
             ]),
         ).map_err(map_engine_err)?;
     }
-    let finalized = store.internal_db().execute_in_tx(
+    let finalized = execute_in_tx_counted(store,
         tx,
         "UPDATE event_search_generations SET finalized_event_revision_tx = $revision_tx, sanitized_failure = NULL WHERE id = $id",
         &HashMap::from([
@@ -7788,7 +10468,7 @@ fn finish_stable(
             ("id".into(), Value::Uuid(generation.id.as_uuid())),
         ]),
     ).map_err(map_engine_err)?;
-    if finalized.rows_affected() != 1 {
+    if finalized.rows_affected != 1 {
         let _ = store.internal_db().rollback(tx);
         return Err(stale_claim(
             "event-search generation disappeared before recording its event revision",
@@ -7806,9 +10486,9 @@ fn finish_stable(
         // active head, even when the final call observes that same head already installed.
         true
     };
-    let rendered = get_u64(row, result.columns(), "rendered_event_count")?;
-    let embedded = get_u64(row, result.columns(), "embedded_event_count")?;
-    let failed = get_u64(row, result.columns(), "failed_event_count")?;
+    let rendered = get_u64(row, &result.columns, "rendered_event_count")?;
+    let embedded = get_u64(row, &result.columns, "embedded_event_count")?;
+    let failed = get_u64(row, &result.columns, "failed_event_count")?;
     #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     if let Some(hook) = BEFORE_COMPLETION_COMMIT.with(|slot| slot.borrow_mut().take()) {
         hook(store);
@@ -7830,7 +10510,7 @@ fn finish_stable(
     }
     let completed_at = read_committed_completion(store, generation)?;
     let (generation_content_sha256, active_passage_count) =
-        fold_current_generation_passages(store, generation.id, bounds)?;
+        fold_current_generation_passages(store, generation, bounds)?;
     Ok(Some(EventSearchBuildReceipt {
         context_id: generation.context_id,
         generation_id: generation.id,
@@ -7873,25 +10553,24 @@ fn guard_event_context_revision_in_tx(
     tx: TxId,
     context_id: crate::ContextId,
 ) -> Result<Option<TxId>> {
-    let result = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "SELECT revision_tx FROM event_context_revisions WHERE context_id = $context_id",
-            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        )
-        .map_err(map_engine_err)?;
-    let Some(row) = result.rows().first() else {
+    let result = execute_in_tx_counted(
+        store,
+        tx,
+        "SELECT revision_tx FROM event_context_revisions WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )
+    .map_err(map_engine_err)?;
+    let Some(row) = result.rows.first() else {
         return Err(stale_claim(
             "event Context revision disappeared before completion",
         ));
     };
-    if result.rows().len() != 1 {
+    if result.rows.len() != 1 {
         return Err(stale_claim(
             "event Context revision primary key returned more than one row",
         ));
     }
-    let revision = get_txid(row, result.columns(), "revision_tx")?;
+    let revision = get_txid(row, &result.columns, "revision_tx")?;
     let guarded = store
         .internal_db()
         .guard_row_conditions_in_tx(
@@ -7916,28 +10595,24 @@ fn activate_search_head_in_tx(
         ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
         ("activated_at".into(), Value::TxId(tx)),
     ]);
-    let existing = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
-            &params,
-        )
-        .map_err(map_engine_err)?;
-    if existing.rows().first().is_some_and(|row| {
-        get_uuid(row, existing.columns(), "generation_id").ok() == Some(generation_id.as_uuid())
+    let existing = execute_in_tx_counted(
+        store,
+        tx,
+        "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+        &params,
+    )
+    .map_err(map_engine_err)?;
+    if existing.rows.first().is_some_and(|row| {
+        get_uuid(row, &existing.columns, "generation_id").ok() == Some(generation_id.as_uuid())
     }) {
         return Ok(false);
     }
-    let sql = if existing.rows().is_empty() {
+    let sql = if existing.rows.is_empty() {
         "INSERT INTO event_search_heads (context_id, generation_id, activated_at) VALUES ($context_id, $generation_id, $activated_at)"
     } else {
         "UPDATE event_search_heads SET generation_id = $generation_id, activated_at = $activated_at WHERE context_id = $context_id"
     };
-    store
-        .internal_db()
-        .execute_in_tx(tx, sql, &params)
-        .map_err(map_engine_err)?;
+    execute_in_tx_counted(store, tx, sql, &params).map_err(map_engine_err)?;
     Ok(true)
 }
 
@@ -7950,17 +10625,16 @@ fn activate_search_head_for_published_session_in_tx(
     context_id: crate::ContextId,
     generation_id: EventSearchGenerationId,
 ) -> Result<()> {
-    let existing = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
-            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        )
-        .map_err(map_engine_err)?;
-    if existing.rows().is_empty()
-        || existing.rows().first().is_some_and(|row| {
-            get_uuid(row, existing.columns(), "generation_id").ok() == Some(generation_id.as_uuid())
+    let existing = execute_in_tx_counted(
+        store,
+        tx,
+        "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )
+    .map_err(map_engine_err)?;
+    if existing.rows.is_empty()
+        || existing.rows.first().is_some_and(|row| {
+            get_uuid(row, &existing.columns, "generation_id").ok() == Some(generation_id.as_uuid())
         })
     {
         activate_search_head_in_tx(store, tx, context_id, generation_id)?;
@@ -7999,16 +10673,14 @@ pub(super) fn check_staged_search_in_tx(
 ) -> Result<StagedSearchCheck> {
     use InterpretationActivationRefusalReason as Refusal;
 
-    let result = store
-        .internal_db()
-        .execute_in_tx(
+    let result = execute_in_tx_counted(store,
             tx,
             "SELECT context_id, interpretation_generation_id, interpretation_snapshot, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, capture_ordinal, state, required_event_count, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, failed_event_count, passage_count, completed_at, finalized_event_revision_tx, sanitized_failure FROM event_search_generations WHERE id = $id",
             &HashMap::from([("id".into(), Value::Uuid(search_generation_id.as_uuid()))]),
         )
         .map_err(map_engine_err)?;
-    let row = match result.rows() {
-        [row] if get_uuid(row, result.columns(), "context_id")? == context_id.as_uuid() => row,
+    let row = match result.rows.as_slice() {
+        [row] if get_uuid(row, &result.columns, "context_id")? == context_id.as_uuid() => row,
         _ => {
             return Err(CgError::NotFound {
                 id: Some(search_generation_id.to_string()),
@@ -8016,7 +10688,7 @@ pub(super) fn check_staged_search_in_tx(
             });
         }
     };
-    let columns = result.columns();
+    let columns = &result.columns;
     let ready = get_text(row, columns, "state")? == "ready"
         && get_optional_txid(row, columns, "completed_at")?.is_some()
         && get_optional_text(row, columns, "sanitized_failure")?.is_none();
@@ -8066,9 +10738,7 @@ pub(super) fn check_staged_search_in_tx(
         if connector == connector_id {
             continue;
         }
-        let head = store
-            .internal_db()
-            .execute_in_tx(
+        let head = execute_in_tx_counted(store,
                 tx,
                 "SELECT generation_id FROM event_interpretation_heads WHERE context_id = $context_id AND connector_id = $connector_id",
                 &HashMap::from([
@@ -8078,9 +10748,9 @@ pub(super) fn check_staged_search_in_tx(
             )
             .map_err(map_engine_err)?;
         let current = head
-            .rows()
+            .rows
             .first()
-            .map(|row| get_uuid(row, head.columns(), "generation_id"))
+            .map(|row| get_uuid(row, &head.columns, "generation_id"))
             .transpose()?;
         let unchanged = match binding.provenance {
             InterpretationProvenance::CapturedBase => current.is_none(),
@@ -8106,38 +10776,34 @@ pub(super) fn check_staged_search_in_tx(
         ));
     }
 
-    let revision = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "SELECT revision_tx FROM event_context_revisions WHERE context_id = $context_id",
-            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        )
-        .map_err(map_engine_err)?;
+    let revision = execute_in_tx_counted(
+        store,
+        tx,
+        "SELECT revision_tx FROM event_context_revisions WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )
+    .map_err(map_engine_err)?;
     let live_revision = revision
-        .rows()
+        .rows
         .first()
-        .map(|row| get_txid(row, revision.columns(), "revision_tx"))
+        .map(|row| get_txid(row, &revision.columns, "revision_tx"))
         .transpose()?;
-    if revision.rows().len() != 1 || live_revision != Some(finalized_revision) {
+    if revision.rows.len() != 1 || live_revision != Some(finalized_revision) {
         return Ok(StagedSearchCheck::Refused(Refusal::SourceWatermarkMismatch));
     }
-    let live_count = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "SELECT COUNT(*) AS event_count FROM events WHERE context_id = $context_id",
-            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        )
-        .map_err(map_engine_err)?;
-    match live_count.rows() {
-        [count] if get_u64(count, live_count.columns(), "event_count")? == event_count => {}
+    let live_count = execute_in_tx_counted(
+        store,
+        tx,
+        "SELECT COUNT(*) AS event_count FROM events WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )
+    .map_err(map_engine_err)?;
+    match live_count.rows.as_slice() {
+        [count] if get_u64(count, &live_count.columns, "event_count")? == event_count => {}
         _ => return Ok(StagedSearchCheck::Refused(Refusal::SourceWatermarkMismatch)),
     }
 
-    let passages = store
-        .internal_db()
-        .execute_in_tx(
+    let passages = execute_in_tx_counted(store,
             tx,
             "SELECT COUNT(*) AS passage_count FROM event_search_passages WHERE generation_id = $generation_id AND is_current = $current",
             &HashMap::from([
@@ -8150,27 +10816,26 @@ pub(super) fn check_staged_search_in_tx(
         )
         .map_err(map_engine_err)?;
     let passage_count = passages
-        .rows()
+        .rows
         .first()
-        .map(|row| get_u64(row, passages.columns(), "passage_count"))
+        .map(|row| get_u64(row, &passages.columns, "passage_count"))
         .transpose()?
         .ok_or_else(|| stale_claim("event-search passage count returned no row"))?;
 
-    let head = store
-        .internal_db()
-        .execute_in_tx(
-            tx,
-            "SELECT generation_id, activated_at FROM event_search_heads WHERE context_id = $context_id",
-            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
-        )
-        .map_err(map_engine_err)?;
+    let head = execute_in_tx_counted(
+        store,
+        tx,
+        "SELECT generation_id, activated_at FROM event_search_heads WHERE context_id = $context_id",
+        &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+    )
+    .map_err(map_engine_err)?;
     let previous_head = head
-        .rows()
+        .rows
         .first()
         .map(|row| {
             Ok::<_, CgError>((
-                EventSearchGenerationId::from(get_uuid(row, head.columns(), "generation_id")?),
-                get_txid(row, head.columns(), "activated_at")?,
+                EventSearchGenerationId::from(get_uuid(row, &head.columns, "generation_id")?),
+                get_txid(row, &head.columns, "activated_at")?,
             ))
         })
         .transpose()?;
@@ -8263,9 +10928,7 @@ pub(super) fn activate_staged_search_in_tx(
     activation: &StagedSearchActivation,
 ) -> Result<()> {
     if let Some((snapshot, snapshot_sha256)) = &activation.promoted_snapshot {
-        let promoted = store
-            .internal_db()
-            .execute_in_tx(
+        let promoted = execute_in_tx_counted(store,
                 tx,
                 "UPDATE event_search_generations SET interpretation_snapshot = $snapshot, interpretation_snapshot_sha256 = $snapshot_sha256 WHERE id = $id",
                 &HashMap::from([
@@ -8278,16 +10941,14 @@ pub(super) fn activate_staged_search_in_tx(
                 ]),
             )
             .map_err(map_engine_err)?;
-        if promoted.rows_affected() != 1 {
+        if promoted.rows_affected != 1 {
             return Err(stale_claim(
                 "activated event-search generation disappeared before its snapshot was promoted",
             ));
         }
     }
     if !activate_search_head_in_tx(store, tx, activation.context_id, activation.generation_id)? {
-        let restamped = store
-            .internal_db()
-            .execute_in_tx(
+        let restamped = execute_in_tx_counted(store,
                 tx,
                 "UPDATE event_search_heads SET activated_at = $activated_at WHERE context_id = $context_id",
                 &HashMap::from([
@@ -8299,7 +10960,7 @@ pub(super) fn activate_staged_search_in_tx(
                 ]),
             )
             .map_err(map_engine_err)?;
-        if restamped.rows_affected() != 1 {
+        if restamped.rows_affected != 1 {
             return Err(stale_claim(
                 "event-search head disappeared before activation restamped it",
             ));
@@ -8314,20 +10975,18 @@ fn guard_final_interpretations_in_tx(
     generation: &Generation,
 ) -> Result<()> {
     if generation.mode == GenerationMode::ExtendReady {
-        let head = store
-            .internal_db()
-            .execute_in_tx(
-                tx,
-                "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
-                &HashMap::from([(
-                    "context_id".into(),
-                    Value::Uuid(generation.context_id.as_uuid()),
-                )]),
-            )
-            .map_err(map_engine_err)?;
-        if head.rows().len() != 1
-            || get_uuid(&head.rows()[0], head.columns(), "generation_id")?
-                != generation.id.as_uuid()
+        let head = execute_in_tx_counted(
+            store,
+            tx,
+            "SELECT generation_id FROM event_search_heads WHERE context_id = $context_id",
+            &HashMap::from([(
+                "context_id".into(),
+                Value::Uuid(generation.context_id.as_uuid()),
+            )]),
+        )
+        .map_err(map_engine_err)?;
+        if head.rows.len() != 1
+            || get_uuid(&head.rows[0], &head.columns, "generation_id")? != generation.id.as_uuid()
         {
             return Err(stale_claim(
                 "event-search ready generation stopped being the current head before completion",
@@ -8337,9 +10996,7 @@ fn guard_final_interpretations_in_tx(
     for (connector, binding) in &generation.bindings {
         match binding.provenance {
             InterpretationProvenance::CapturedBase | InterpretationProvenance::Active(_) => {
-                let head = store
-                    .internal_db()
-                    .execute_in_tx(
+                let head = execute_in_tx_counted(store,
                         tx,
                         "SELECT generation_id FROM event_interpretation_heads WHERE context_id = $context_id AND connector_id = $connector_id",
                         &HashMap::from([
@@ -8352,10 +11009,10 @@ fn guard_final_interpretations_in_tx(
                     )
                     .map_err(map_engine_err)?;
                 match binding.provenance {
-                    InterpretationProvenance::CapturedBase if head.rows().is_empty() => {}
+                    InterpretationProvenance::CapturedBase if head.rows.is_empty() => {}
                     InterpretationProvenance::Active(id)
-                        if head.rows().len() == 1
-                            && get_uuid(&head.rows()[0], head.columns(), "generation_id")?
+                        if head.rows.len() == 1
+                            && get_uuid(&head.rows[0], &head.columns, "generation_id")?
                                 == id.as_uuid() => {}
                     _ => {
                         return Err(stale_claim(
@@ -8365,9 +11022,7 @@ fn guard_final_interpretations_in_tx(
                 }
             }
             InterpretationProvenance::ExplicitStaged(id) => {
-                let selected = store
-                    .internal_db()
-                    .execute_in_tx(
+                let selected = execute_in_tx_counted(store,
                         tx,
                         "SELECT event_count, capture_ordinal, build_ordinal, state FROM event_interpretation_generations WHERE context_id = $context_id AND connector_id = $connector_id AND id = $id",
                         &HashMap::from([
@@ -8380,58 +11035,270 @@ fn guard_final_interpretations_in_tx(
                         ]),
                     )
                     .map_err(map_engine_err)?;
-                let row = selected.rows().first().ok_or_else(|| {
+                let row = selected.rows.first().ok_or_else(|| {
                     stale_claim("explicit interpretation input disappeared before completion")
                 })?;
-                if selected.rows().len() != 1 {
+                if selected.rows.len() != 1 {
                     return Err(stale_claim(
                         "explicit interpretation input changed before completion",
                     ));
                 }
-                validate_ready_interpretation_row(row, selected.columns(), id)?;
+                validate_ready_interpretation_row(row, &selected.columns, id)?;
             }
         }
     }
     Ok(())
 }
 
+/// Move a verified SHA prefix across an append in the same transaction as its passages.
+/// A replacement inside that prefix invalidates it; no interior SHA contribution is subtracted.
+fn carry_unchanged_passage_fold_prefix_in_tx(
+    store: &Store,
+    tx: TxId,
+    claim: &Claim,
+    built: &BuiltBatch,
+    prior_revision: u64,
+    next_revision: u64,
+) -> Result<()> {
+    let result = execute_in_tx_tallied(
+        store,
+        tx,
+        "SELECT id, attempt_token, unit, passage_revision, complete, state FROM event_search_fold_progress WHERE context_id = $context_id AND generation_id = $generation_id AND fold = $fold",
+        &HashMap::from([
+            ("context_id".into(), Value::Uuid(claim.generation.context_id.as_uuid())),
+            ("generation_id".into(), Value::Uuid(claim.generation.id.as_uuid())),
+            ("fold".into(), Value::Text(PASSAGE_FOLD.into())),
+        ]),
+    ).map_err(map_engine_err)?;
+    let Some(row) = result.rows.first() else {
+        return Ok(());
+    };
+    let prior = FoldRow {
+        id: get_uuid(row, &result.columns, "id")?,
+        attempt_token: get_uuid(row, &result.columns, "attempt_token")?,
+        unit: get_u64(row, &result.columns, "unit")?,
+        passage_revision: get_u64(row, &result.columns, "passage_revision")?,
+        complete: get_bool(row, &result.columns, "complete")?,
+        state: get_json(row, &result.columns, "state")?,
+    };
+    if prior.passage_revision != prior_revision {
+        return Ok(());
+    }
+    let previous = prior.state.get("previous").and_then(JsonValue::as_u64);
+    if previous.is_some_and(|previous| {
+        built
+            .passages
+            .iter()
+            .any(|passage| passage.ordinal <= previous)
+            || claim.superseded_tail.iter().any(|passage| {
+                let Some((_, Value::Int64(ordinal))) = passage
+                    .conditions
+                    .iter()
+                    .find(|(name, _)| name == "passage_ordinal")
+                else {
+                    return true;
+                };
+                u64::try_from(*ordinal)
+                    .ok()
+                    .is_none_or(|ordinal| ordinal <= previous)
+            })
+    }) {
+        return Ok(());
+    }
+    let mut state = prior.state.clone();
+    state
+        .as_object_mut()
+        .ok_or_else(|| CgError::Engine("passage fold state is not an object".into()))?
+        .remove("digest");
+    save_fold_row_in_tx(
+        store,
+        tx,
+        claim.generation.context_id,
+        claim.generation.id,
+        PASSAGE_FOLD,
+        Some(&prior),
+        prior.attempt_token,
+        next_revision,
+        false,
+        state,
+    )?;
+    Ok(())
+}
+
+/// The generation's current-passage digest and count behind its build receipt, folded in bounded
+/// units of at most one passage batch over `(passage_ordinal, id)`: a strict continuation of
+/// equality-prefix seeks on the current-passage index, so retired passages are never examined and a
+/// duplicate ordinal is always read beside its twin and refused. Progress, the running digest and
+/// the passage revision it was read under commit with every unit. A completed result is reused only
+/// while the generation's passage revision is unchanged. A passage commit carries a verified
+/// unchanged prefix to its new revision atomically; a retirement inside that prefix restarts it.
 fn fold_current_generation_passages(
     store: &Store,
-    id: EventSearchGenerationId,
+    generation: &Generation,
     bounds: Bounds,
 ) -> Result<(String, u64)> {
-    let mut digest = Sha256::new();
-    digest.update(b"context-graph/event-search-generation/v1");
-    let mut count = 0_u64;
-    let mut previous = None;
-    stream_rows(
-        store,
-        bounds,
-        "SELECT passage_ordinal, content_sha256 FROM event_search_passages WHERE generation_id = $generation_id AND is_current = $current ORDER BY passage_ordinal ASC",
-        &HashMap::from([
-            ("generation_id".into(), Value::Uuid(id.as_uuid())),
-            ("current".into(), Value::Bool(true)),
-        ]),
-        |columns, row| {
-            let ordinal = get_u64(row, columns, "passage_ordinal")?;
-            if previous.is_some_and(|prior| ordinal <= prior) {
-                return Err(stale_claim(
-                    "current event-search passage ordinals are not strictly increasing",
-                ));
+    let context_id = generation.context_id;
+    let id = generation.id;
+    let token = generation.attempt_token.unwrap_or_else(uuid::Uuid::now_v7);
+    // One unit is at most one passage batch, and never more rows than a read may return.
+    let limit = bounds.passages.min(bounds.events).max(1);
+    let base = HashMap::from([
+        ("generation_id".into(), Value::Uuid(id.as_uuid())),
+        ("current".into(), Value::Bool(true)),
+    ]);
+    let mut row = load_fold_row(store, bounds, context_id, id, PASSAGE_FOLD)?;
+    'fold: loop {
+        let revision = commit_unit(store, |tx| {
+            guard_fold_generation_in_tx(
+                store,
+                tx,
+                context_id,
+                id,
+                &generation.snapshot_sha256,
+                generation.attempt_token,
+                true,
+            )
+        })?;
+        let saved = row
+            .as_ref()
+            .filter(|saved| saved.passage_revision == revision);
+        if let Some(saved) = saved
+            && saved.complete
+        {
+            return Ok((
+                json_text(&saved.state, "digest")?,
+                json_u64(&saved.state, "count")?,
+            ));
+        }
+        let (mut digest, mut count, mut previous, mut last) = match saved {
+            Some(saved) => (
+                ResumableSha256::from_json(
+                    saved
+                        .state
+                        .get("sha")
+                        .ok_or_else(|| CgError::Engine("passage fold lacks its digest".into()))?,
+                )?,
+                json_u64(&saved.state, "count")?,
+                saved.state.get("previous").and_then(JsonValue::as_u64),
+                match (
+                    saved.state.get("last_ordinal").and_then(JsonValue::as_u64),
+                    json_optional_text(&saved.state, "last_id"),
+                ) {
+                    (Some(ordinal), Some(last_id)) => Some((
+                        ordinal,
+                        uuid::Uuid::parse_str(&last_id).map_err(|_| {
+                            CgError::Engine("passage fold key is not a passage id".into())
+                        })?,
+                    )),
+                    _ => None,
+                },
+            ),
+            None => {
+                let mut digest = ResumableSha256::new();
+                digest.update(b"context-graph/event-search-generation/v1");
+                (digest, 0, None, None)
             }
-            previous = Some(ordinal);
-            hash_part(&mut digest, &ordinal.to_be_bytes());
-            hash_part(
-                &mut digest,
-                get_text(row, columns, "content_sha256")?.as_bytes(),
-            );
-            count = count.checked_add(1).ok_or_else(|| {
-                CgError::Engine("active event-search passage count exhausted u64".into())
+        };
+        loop {
+            tally_reset();
+            let branches = match last {
+                None => vec![KeyBranch::new("", Vec::new())],
+                Some((ordinal, last_id)) => vec![
+                    KeyBranch::new(
+                        " AND passage_ordinal = $after_ordinal AND id > $after_id",
+                        vec![
+                            ("after_ordinal", integer(ordinal, "passage ordinal")?),
+                            ("after_id", Value::Uuid(last_id)),
+                        ],
+                    ),
+                    KeyBranch::new(
+                        " AND passage_ordinal > $after_ordinal",
+                        vec![("after_ordinal", integer(ordinal, "passage ordinal")?)],
+                    ),
+                ],
+            };
+            let page = read_branches(
+                &mut unit_reader(store, bounds),
+                "SELECT passage_ordinal, id, content_sha256 FROM event_search_passages WHERE generation_id = $generation_id AND is_current = $current",
+                "passage_ordinal ASC, id ASC",
+                &base,
+                &branches,
+                limit,
+            )?;
+            let before = format!("{last:?}");
+            for passage in &page.rows {
+                let ordinal = get_u64(passage, &page.columns, "passage_ordinal")?;
+                if previous.is_some_and(|prior| ordinal <= prior) {
+                    note_unit(UnitFold::Passages, page.rows.len() as u64, false, || {
+                        (before.clone(), format!("{last:?}"))
+                    })?;
+                    return Err(stale_claim(
+                        "current event-search passage ordinals are not strictly increasing",
+                    ));
+                }
+                previous = Some(ordinal);
+                digest.part(&ordinal.to_be_bytes());
+                digest.part(get_text(passage, &page.columns, "content_sha256")?.as_bytes());
+                count = count.checked_add(1).ok_or_else(|| {
+                    CgError::Engine("active event-search passage count exhausted u64".into())
+                })?;
+                last = Some((ordinal, get_uuid(passage, &page.columns, "id")?));
+            }
+            let complete = page.rows.len() < limit;
+            let mut state = json!({
+                "sha": digest.to_json(),
+                "count": count,
+                "previous": previous,
+                "last_ordinal": last.map(|(ordinal, _)| ordinal),
+                "last_id": last.map(|(_, last_id)| last_id.to_string()),
+            });
+            if complete {
+                state["digest"] = JsonValue::String(digest.clone().finish());
+            }
+            let prior = row.clone();
+            let saved = commit_unit(store, |tx| {
+                let now = guard_fold_generation_in_tx(
+                    store,
+                    tx,
+                    context_id,
+                    id,
+                    &generation.snapshot_sha256,
+                    generation.attempt_token,
+                    true,
+                )?;
+                if now != revision {
+                    return Ok(None);
+                }
+                save_fold_row_in_tx(
+                    store,
+                    tx,
+                    context_id,
+                    id,
+                    PASSAGE_FOLD,
+                    prior.as_ref(),
+                    token,
+                    revision,
+                    complete,
+                    state.clone(),
+                )
+                .map(Some)
+            });
+            let saved = refused_unit(UnitFold::Passages, &before, saved)?;
+            let Some(saved) = saved else {
+                // A passage commit may have advanced an unchanged prefix. Reload its guarded
+                // successor before continuing under the new revision.
+                row = load_fold_row(store, bounds, context_id, id, PASSAGE_FOLD)?;
+                continue 'fold;
+            };
+            row = Some(saved);
+            note_unit(UnitFold::Passages, page.rows.len() as u64, true, || {
+                (before, format!("{last:?}"))
             })?;
-            Ok(())
-        },
-    )?;
-    Ok((finish_hash(digest), count))
+            if complete {
+                return Ok((digest.finish(), count));
+            }
+        }
+    }
 }
 
 fn event_body(event: &ConversationEvent) -> Option<String> {
@@ -8559,6 +11426,7 @@ fn stream_rows(
         }
         Ok(())
     })();
+    super::event_search_read::record_executed_statement(sql, cursor.trace());
     let closed = cursor.close().map_err(map_engine_err);
     read?;
     closed
@@ -8569,12 +11437,97 @@ fn query_rows(
     bounds: Bounds,
     sql: &str,
     params: &HashMap<String, Value>,
-) -> Result<contextdb_engine::QueryResult> {
+) -> Result<crate::consumer_read::ConsumerQueryResult> {
     let session = store
         .internal_db()
         .read_session(read_limits(store, bounds))
         .map_err(map_engine_err)?;
-    session.execute(sql, params).map_err(map_engine_err)
+    let answer = session.execute(sql, params).map_err(map_engine_err)?;
+    let answer = crate::consumer_read::ConsumerQueryResult::copy_from(&answer);
+    super::event_search_read::record_executed_statement(sql, &answer.trace);
+    tally_examined(answer.trace.rows_examined);
+    Ok(answer)
+}
+
+/// Every statement the projection executes directly, charged to a test recording when one is open.
+fn execute_counted(
+    store: &Store,
+    sql: &str,
+    params: &HashMap<String, Value>,
+) -> std::result::Result<crate::consumer_read::ConsumerQueryResult, EngineError> {
+    let answer = store.internal_db().execute(sql, params)?;
+    let answer = crate::consumer_read::ConsumerQueryResult::copy_from(&answer);
+    super::event_search_read::record_executed_statement(sql, &answer.trace);
+    Ok(answer)
+}
+
+/// Every statement the projection executes inside a transaction, charged to a test recording
+/// when one is open.
+fn execute_in_tx_counted(
+    store: &Store,
+    tx: TxId,
+    sql: &str,
+    params: &HashMap<String, Value>,
+) -> std::result::Result<crate::consumer_read::ConsumerQueryResult, EngineError> {
+    let answer = store.internal_db().execute_in_tx(tx, sql, params)?;
+    let answer = crate::consumer_read::ConsumerQueryResult::copy_from(&answer);
+    super::event_search_read::record_executed_statement(sql, &answer.trace);
+    Ok(answer)
+}
+
+/// One statement of a unit's commit transaction, its examined entries charged to the unit's receipt
+/// like the unit's reads: the fences' generation, manifest and fold reads and the member writes.
+fn execute_in_tx_tallied(
+    store: &Store,
+    tx: TxId,
+    sql: &str,
+    params: &HashMap<String, Value>,
+) -> std::result::Result<crate::consumer_read::ConsumerQueryResult, EngineError> {
+    let answer = execute_in_tx_counted(store, tx, sql, params)?;
+    tally_examined(answer.trace.rows_examined);
+    Ok(answer)
+}
+
+/// One page of an ordered event range: at most `limit` rows and at most the read's answer bytes (the
+/// engine's cursor stops before the row that would pass the byte bound and keeps it for the next
+/// page). Only the first page is taken, then the cursor is closed. A single row larger than the
+/// bound keeps the engine's typed refusal. Returns the page, whether rows remain past it, and the
+/// entries the engine examined.
+fn first_page_within_bytes(
+    store: &Store,
+    bounds: Bounds,
+    sql: &str,
+    params: &HashMap<String, Value>,
+    limit: usize,
+) -> Result<(crate::consumer_read::ConsumerQueryResult, bool)> {
+    let mut limits = read_limits(store, bounds);
+    let rows = u64::try_from(limit.max(1)).unwrap_or(u64::MAX);
+    limits.cursor_page_rows = limits
+        .cursor_page_rows
+        .max(rows)
+        .min(limits.result_rows.max(rows));
+    limits.result_rows = limits.result_rows.max(rows);
+    // The page's byte bound is the read's own answer ceiling; the batch byte bound limits rendering
+    // and embedding work, and one captured event may legitimately be larger than it.
+    limits.cursor_page_bytes = limits.result_bytes;
+    let session = store
+        .internal_db()
+        .read_session(limits)
+        .map_err(map_engine_err)?;
+    let cursor = session.open_cursor(sql, params).map_err(map_engine_err)?;
+    let first = cursor.first_page();
+    let answer = crate::consumer_read::ConsumerQueryResult {
+        columns: first.columns().to_vec(),
+        rows: first.rows().to_vec(),
+        rows_affected: 0,
+        trace: cursor.trace().clone(),
+        cascade: None,
+    };
+    let more = first.has_more();
+    super::event_search_read::record_executed_statement(sql, &answer.trace);
+    tally_examined(answer.trace.rows_examined);
+    cursor.close().map_err(map_engine_err)?;
+    Ok((answer, more))
 }
 
 fn read_limits(store: &Store, bounds: Bounds) -> ReadLimits {
@@ -8595,6 +11548,675 @@ fn read_limits(store: &Store, bounds: Bounds) -> ReadLimits {
         .min(u64::try_from(bounds.events).unwrap_or(u64::MAX))
         .max(1);
     limits
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bounded read units
+// ---------------------------------------------------------------------------------------------
+//
+// A projection read never opens one cursor over a whole Context or generation. Each read unit is a
+// few statements of one key continuation, each an equality prefix plus at most one trailing range
+// under a LIMIT, so the engine seeks to the saved key instead of filtering the completed prefix. A
+// larger Context means more units, never a larger one. Folds whose progress must survive a crash
+// keep it in `event_search_fold_progress`, committed with each unit.
+
+/// The fold a bounded projection read unit serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnitFold {
+    Capture,
+    Pending,
+    Passages,
+}
+
+// Per-thread state of the bounded-unit test seams in `event_search_projection_correctness`: the
+// pending cut, the durable units counted toward it, the receipts recorded and each fold's next
+// unit index. Test-support builds only; they hold no product state.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+thread_local! {
+    pub(super) static UNIT_CUT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    pub(super) static DURABLE_UNITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    pub(super) static RECEIPTS: std::cell::RefCell<
+        Vec<super::event_search_projection_correctness::ProjectionUnitReceipt>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+    pub(super) static UNIT_INDEXES: std::cell::RefCell<[u32; 3]> =
+        const { std::cell::RefCell::new([0; 3]) };
+    static UNIT_TALLY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Add one statement's examined entries to the current unit's receipt.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn tally_examined(entries: u64) {
+    UNIT_TALLY.with(|tally| tally.set(tally.get().saturating_add(entries)));
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+#[inline(always)]
+fn tally_examined(_entries: u64) {}
+
+/// Start a unit's receipt: entries examined by reads outside any unit are not its work.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn tally_reset() {
+    UNIT_TALLY.with(|tally| tally.set(0));
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+#[inline(always)]
+fn tally_reset() {}
+
+/// Record one read unit's receipt with every entry its statements examined since the unit began.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn note_unit(
+    fold: UnitFold,
+    returned: u64,
+    durable: bool,
+    frontiers: impl FnOnce() -> (String, String),
+) -> Result<()> {
+    let examined = UNIT_TALLY.with(|tally| tally.replace(0));
+    super::event_search_projection_correctness::record_unit(
+        fold, examined, returned, durable, frontiers,
+    )
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+#[inline(always)]
+fn note_unit(
+    _fold: UnitFold,
+    _returned: u64,
+    _durable: bool,
+    _frontiers: impl FnOnce() -> (String, String),
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn is_unit_cut(error: &CgError) -> bool {
+    super::event_search_projection_correctness::is_unit_cut(error)
+}
+
+#[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
+#[inline(always)]
+fn is_unit_cut(_error: &CgError) -> bool {
+    false
+}
+
+/// The receipt a run returns when a test cut stopped it after a durable unit: the newest generation
+/// of the Context as committed (`Ready` only when its completion already committed).
+fn unit_cut_receipt(
+    store: &Store,
+    context_id: crate::ContextId,
+    profile: &EventSearchProfile,
+) -> Result<EventSearchBuildReceipt> {
+    let result = execute_counted(store,
+            "SELECT id, state, interpretation_snapshot_sha256, event_count, ordered_source_set_sha256, source_content_sha256, embedding_space_id, encoding_profile, eligible_event_count, rendered_event_count, embedded_event_count, excluded_event_count, failed_event_count, passage_count, started_at FROM event_search_generations WHERE context_id = $context_id ORDER BY started_at DESC LIMIT 1",
+            &HashMap::from([("context_id".into(), Value::Uuid(context_id.as_uuid()))]),
+        )
+        .map_err(map_engine_err)?;
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| stale_claim("a cut projection run left no generation"))?;
+    let columns = &result.columns;
+    Ok(EventSearchBuildReceipt {
+        context_id,
+        generation_id: EventSearchGenerationId::from(get_uuid(row, columns, "id")?),
+        interpretation_snapshot_sha256: get_text(row, columns, "interpretation_snapshot_sha256")?,
+        interpretation_generation_ids: Vec::new(),
+        source_watermark: EventWatermark {
+            event_count: get_u64(row, columns, "event_count")?,
+            ordered_source_set_sha256: get_text(row, columns, "ordered_source_set_sha256")?,
+        },
+        source_content_sha256: get_text(row, columns, "source_content_sha256")?,
+        generation_content_sha256: String::new(),
+        renderer_id: EVENT_SEARCH_RENDERER_ID.into(),
+        renderer_version: EVENT_SEARCH_RENDERER_VERSION.into(),
+        profile: profile.clone(),
+        embedding_space_id: get_text(row, columns, "embedding_space_id")?,
+        encoding_profile_id: get_text(row, columns, "encoding_profile")?,
+        eligible_event_count: get_u64(row, columns, "eligible_event_count")?,
+        rendered_event_count: get_u64(row, columns, "rendered_event_count")?,
+        embedded_event_count: get_u64(row, columns, "embedded_event_count")?,
+        excluded_event_count: get_u64(row, columns, "excluded_event_count")?,
+        failed_event_count: get_u64(row, columns, "failed_event_count")?,
+        passage_count: get_u64(row, columns, "passage_count")?,
+        retry_count: 0,
+        failure_count: 0,
+        state: if get_text(row, columns, "state")? == "ready" {
+            EventSearchGenerationState::Ready
+        } else {
+            EventSearchGenerationState::Building
+        },
+        active_generation_changed: false,
+        started_at: get_txid(row, columns, "started_at")?,
+        completed_at: None,
+        timings: EventSearchBuildTimings::default(),
+        sanitized_failure: None,
+    })
+}
+
+/// Runs one statement of a read unit and returns the engine's answer with its trace.
+type UnitExecutor<'a> = dyn FnMut(&str, &HashMap<String, Value>) -> Result<crate::consumer_read::ConsumerQueryResult>
+    + 'a;
+
+/// Visits one row of a paged read.
+type ProgressRowVisitor<'a> = dyn FnMut(&[String], &[Value]) -> Result<()> + 'a;
+
+/// One disjoint range of an ordered key continuation.
+struct KeyBranch {
+    predicate: String,
+    params: Vec<(String, Value)>,
+}
+
+impl KeyBranch {
+    fn new(predicate: &str, params: Vec<(&str, Value)>) -> Self {
+        Self {
+            predicate: predicate.to_string(),
+            params: params
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+        }
+    }
+}
+
+/// The rows of one read unit.
+struct UnitPage {
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+}
+
+/// Read the branches in order, each `SELECT ... WHERE <base> AND <branch> ORDER BY <order> LIMIT
+/// <remaining>`, sharing one row allowance. Branches are disjoint and ordered, so their
+/// concatenation is the next `limit` rows of the continuation.
+fn read_branches(
+    execute: &mut UnitExecutor<'_>,
+    select: &str,
+    order: &str,
+    base: &HashMap<String, Value>,
+    branches: &[KeyBranch],
+    limit: usize,
+) -> Result<UnitPage> {
+    let mut page = UnitPage {
+        columns: Vec::new(),
+        rows: Vec::new(),
+    };
+    for branch in branches {
+        let remaining = limit.saturating_sub(page.rows.len());
+        if remaining == 0 {
+            break;
+        }
+        let mut params = base.clone();
+        params.extend(branch.params.iter().cloned());
+        let bound = format!("{select}{}", branch.predicate);
+        let result = execute(
+            &format!(
+                "{bound} ORDER BY {} LIMIT {remaining}",
+                order_after_bound_columns(order, &bound)
+            ),
+            &params,
+        )?;
+        if page.columns.is_empty() {
+            page.columns = result.columns;
+        }
+        page.rows.extend(result.rows);
+    }
+    Ok(page)
+}
+
+/// The branch's ORDER BY without its leading columns the branch binds by equality. Those columns
+/// are constant within the branch, so the order is unchanged; naming them makes the engine walk the
+/// whole equality prefix instead of seeking to the trailing range.
+fn order_after_bound_columns(order: &str, bound: &str) -> String {
+    let columns = order.split(", ").collect::<Vec<_>>();
+    let first_free = columns
+        .iter()
+        .position(|column| {
+            let name = column.split_whitespace().next().unwrap_or_default();
+            !bound.contains(&format!(" {name} = $"))
+        })
+        .unwrap_or(columns.len().saturating_sub(1));
+    columns[first_free..].join(", ")
+}
+
+fn unit_reader<'a>(
+    store: &'a Store,
+    bounds: Bounds,
+) -> impl FnMut(&str, &HashMap<String, Value>) -> Result<crate::consumer_read::ConsumerQueryResult> + 'a
+{
+    move |sql, params| query_rows(store, bounds, sql, params)
+}
+
+const MEMBERSHIP_FOLD: &str = "membership";
+const CAPTURE_FOLD: &str = "capture";
+const PASSAGE_FOLD: &str = "passages";
+
+/// The saved progress of one fold of one generation.
+#[derive(Debug, Clone)]
+struct FoldRow {
+    id: uuid::Uuid,
+    attempt_token: uuid::Uuid,
+    unit: u64,
+    passage_revision: u64,
+    complete: bool,
+    state: JsonValue,
+}
+
+fn load_fold_row(
+    store: &Store,
+    bounds: Bounds,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    fold: &str,
+) -> Result<Option<FoldRow>> {
+    let result = query_rows(
+        store,
+        bounds,
+        "SELECT id, attempt_token, unit, passage_revision, complete, state FROM event_search_fold_progress WHERE context_id = $context_id AND generation_id = $generation_id AND fold = $fold",
+        &HashMap::from([
+            ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+            ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+            ("fold".into(), Value::Text(fold.into())),
+        ]),
+    )?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let columns = &result.columns;
+    Ok(Some(FoldRow {
+        id: get_uuid(row, columns, "id")?,
+        attempt_token: get_uuid(row, columns, "attempt_token")?,
+        unit: get_u64(row, columns, "unit")?,
+        passage_revision: get_u64(row, columns, "passage_revision")?,
+        complete: get_bool(row, columns, "complete")?,
+        state: get_json(row, columns, "state")?,
+    }))
+}
+
+/// Commit one unit's fold progress in `tx`: guarded on exactly the row the unit started from (its
+/// unit counter and attempt token), or inserted when the fold had no row. A row saved by an earlier
+/// attempt is adopted by rewriting its token; a competing writer's commit fails the guard.
+#[allow(clippy::too_many_arguments)]
+fn save_fold_row_in_tx(
+    store: &Store,
+    tx: TxId,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    fold: &str,
+    prior: Option<&FoldRow>,
+    attempt_token: uuid::Uuid,
+    passage_revision: u64,
+    complete: bool,
+    state: JsonValue,
+) -> Result<FoldRow> {
+    match prior {
+        Some(prior) => {
+            if !store
+                .internal_db()
+                .guard_row_conditions_in_tx(
+                    tx,
+                    "event_search_fold_progress",
+                    "id",
+                    &Value::Uuid(prior.id),
+                    &[
+                        ("unit".into(), integer(prior.unit, "fold unit")?),
+                        ("attempt_token".into(), Value::Uuid(prior.attempt_token)),
+                    ],
+                )
+                .map_err(map_engine_err)?
+            {
+                return Err(stale_claim(
+                    "event-search fold progress changed under its unit",
+                ));
+            }
+            let unit = prior
+                .unit
+                .checked_add(1)
+                .ok_or_else(|| CgError::Engine("event-search fold unit exhausted u64".into()))?;
+            let updated = execute_in_tx_tallied(store, tx,
+                    "UPDATE event_search_fold_progress SET attempt_token = $token, unit = $unit, passage_revision = $passage_revision, complete = $complete, state = $state WHERE id = $id",
+                    &HashMap::from([
+                        ("token".into(), Value::Uuid(attempt_token)),
+                        ("unit".into(), integer(unit, "fold unit")?),
+                        (
+                            "passage_revision".into(),
+                            integer(passage_revision, "passage revision")?,
+                        ),
+                        ("complete".into(), Value::Bool(complete)),
+                        ("state".into(), Value::Json(state.clone())),
+                        ("id".into(), Value::Uuid(prior.id)),
+                    ]),
+                )
+                .map_err(map_engine_err)?;
+            if updated.rows_affected != 1 {
+                return Err(stale_claim(
+                    "event-search fold progress disappeared under its unit",
+                ));
+            }
+            Ok(FoldRow {
+                id: prior.id,
+                attempt_token,
+                unit,
+                passage_revision,
+                complete,
+                state,
+            })
+        }
+        None => {
+            let id = uuid::Uuid::now_v7();
+            execute_in_tx_tallied(store, tx,
+                    "INSERT INTO event_search_fold_progress (id, context_id, generation_id, fold, attempt_token, unit, passage_revision, complete, state) VALUES ($id, $context_id, $generation_id, $fold, $token, $unit, $passage_revision, $complete, $state)",
+                    &HashMap::from([
+                        ("id".into(), Value::Uuid(id)),
+                        ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                        ("generation_id".into(), Value::Uuid(generation_id.as_uuid())),
+                        ("fold".into(), Value::Text(fold.into())),
+                        ("token".into(), Value::Uuid(attempt_token)),
+                        ("unit".into(), Value::Int64(0)),
+                        (
+                            "passage_revision".into(),
+                            integer(passage_revision, "passage revision")?,
+                        ),
+                        ("complete".into(), Value::Bool(complete)),
+                        ("state".into(), Value::Json(state.clone())),
+                    ]),
+                )
+                .map_err(|error| match error {
+                    EngineError::UniqueViolation { .. } => {
+                        stale_claim("another attempt started this event-search fold")
+                    }
+                    other => map_engine_err(other),
+                })?;
+            Ok(FoldRow {
+                id,
+                attempt_token,
+                unit: 0,
+                passage_revision,
+                complete,
+                state,
+            })
+        }
+    }
+}
+
+/// Delete a fold's progress in `tx`, guarded on the row as last read.
+fn delete_fold_row_in_tx(store: &Store, tx: TxId, row: &FoldRow) -> Result<()> {
+    if !store
+        .internal_db()
+        .guard_row_conditions_in_tx(
+            tx,
+            "event_search_fold_progress",
+            "id",
+            &Value::Uuid(row.id),
+            &[
+                ("unit".into(), integer(row.unit, "fold unit")?),
+                ("attempt_token".into(), Value::Uuid(row.attempt_token)),
+            ],
+        )
+        .map_err(map_engine_err)?
+    {
+        return Err(stale_claim(
+            "event-search fold progress changed before it was consumed",
+        ));
+    }
+    execute_in_tx_tallied(
+        store,
+        tx,
+        "DELETE FROM event_search_fold_progress WHERE id = $id",
+        &HashMap::from([("id".into(), Value::Uuid(row.id))]),
+    )
+    .map_err(map_engine_err)?;
+    Ok(())
+}
+
+/// The fences a fold unit commits under: the generation still exists with the identity the fold
+/// read it under, (when the caller owns an attempt) that attempt is still the generation's, and
+/// (for the passage fold) its passage revision is the one the unit read under. Returns the
+/// generation's passage revision.
+fn guard_fold_generation_in_tx(
+    store: &Store,
+    tx: TxId,
+    context_id: crate::ContextId,
+    generation_id: EventSearchGenerationId,
+    snapshot_sha256: &str,
+    attempt_token: Option<uuid::Uuid>,
+    fence_passages: bool,
+) -> Result<u64> {
+    let result = execute_in_tx_tallied(store, tx,
+            "SELECT interpretation_snapshot_sha256, last_attempt_token, passage_revision FROM event_search_generations WHERE context_id = $context_id AND id = $id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(context_id.as_uuid())),
+                ("id".into(), Value::Uuid(generation_id.as_uuid())),
+            ]),
+        )
+        .map_err(map_engine_err)?;
+    let row = result
+        .rows
+        .first()
+        .ok_or_else(|| stale_claim("event-search generation disappeared under its fold"))?;
+    if get_text(row, &result.columns, "interpretation_snapshot_sha256")? != snapshot_sha256 {
+        return Err(stale_claim(
+            "event-search generation identity changed under its fold",
+        ));
+    }
+    let mut conditions = vec![(
+        "interpretation_snapshot_sha256".to_string(),
+        Value::Text(snapshot_sha256.to_string()),
+    )];
+    if let Some(token) = attempt_token {
+        if get_uuid(row, &result.columns, "last_attempt_token")? != token {
+            return Err(stale_claim(
+                "event-search attempt was superseded under its fold",
+            ));
+        }
+        conditions.push(("last_attempt_token".into(), Value::Uuid(token)));
+    }
+    let passage_revision = get_u64(row, &result.columns, "passage_revision")?;
+    if fence_passages {
+        conditions.push((
+            "passage_revision".into(),
+            integer(passage_revision, "passage revision")?,
+        ));
+    }
+    if !store
+        .internal_db()
+        .guard_row_conditions_in_tx(
+            tx,
+            "event_search_generations",
+            "id",
+            &Value::Uuid(generation_id.as_uuid()),
+            &conditions,
+        )
+        .map_err(map_engine_err)?
+    {
+        return Err(stale_claim(
+            "event-search generation changed under its fold",
+        ));
+    }
+    Ok(passage_revision)
+}
+
+/// Pass a unit's commit result through, recording a non-durable receipt when the unit was refused
+/// before its progress committed (a fence tripped, or the commit lost to a competing writer).
+fn refused_unit<T>(fold: UnitFold, before: &str, committed: Result<T>) -> Result<T> {
+    committed.inspect_err(|_| {
+        let _ = note_unit(fold, 0, false, || {
+            (before.to_string(), "refused".to_string())
+        });
+    })
+}
+
+/// Commit `work` in one transaction, mapping a conditional-update conflict to a stale fold.
+fn commit_unit<T>(store: &Store, work: impl FnOnce(TxId) -> Result<T>) -> Result<T> {
+    let tx = store.begin_tx()?;
+    match work(tx) {
+        Ok(value) => {
+            store
+                .internal_db()
+                .commit(tx)
+                .map_err(|error| match error {
+                    EngineError::ConditionalUpdateConflict { .. } => {
+                        stale_claim("event-search fold unit lost a concurrent commit")
+                    }
+                    other => map_engine_err(other),
+                })?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = store.internal_db().rollback(tx);
+            Err(error)
+        }
+    }
+}
+
+/// SHA-256 whose running state can be saved between read units and resumed in another process.
+/// It produces exactly the standard digest of everything fed to it, however the input was split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumableSha256 {
+    state: [u32; 8],
+    length: u64,
+    tail: Vec<u8>,
+}
+
+const SHA256_INITIAL_STATE: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+
+impl ResumableSha256 {
+    fn new() -> Self {
+        Self {
+            state: SHA256_INITIAL_STATE,
+            length: 0,
+            tail: Vec::with_capacity(64),
+        }
+    }
+
+    fn update(&mut self, mut bytes: &[u8]) {
+        self.length = self.length.wrapping_add(bytes.len() as u64);
+        if !self.tail.is_empty() {
+            let take = (64 - self.tail.len()).min(bytes.len());
+            self.tail.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.tail.len() < 64 {
+                return;
+            }
+            let block = std::mem::take(&mut self.tail);
+            self.compress(&block);
+        }
+        let whole = bytes.len() - bytes.len() % 64;
+        if whole > 0 {
+            self.compress(&bytes[..whole]);
+        }
+        self.tail.extend_from_slice(&bytes[whole..]);
+    }
+
+    fn compress(&mut self, blocks: &[u8]) {
+        let blocks = blocks
+            .chunks_exact(64)
+            .map(|block| *sha2::digest::generic_array::GenericArray::from_slice(block))
+            .collect::<Vec<_>>();
+        sha2::compress256(&mut self.state, &blocks);
+    }
+
+    fn part(&mut self, bytes: &[u8]) {
+        self.update(&(bytes.len() as u64).to_be_bytes());
+        self.update(bytes);
+    }
+
+    fn finish(mut self) -> String {
+        let bits = self.length.wrapping_mul(8);
+        let mut padding = vec![0x80_u8];
+        let used = (self.tail.len() + 1) % 64;
+        let zeros = if used <= 56 { 56 - used } else { 120 - used };
+        padding.extend(std::iter::repeat_n(0_u8, zeros));
+        padding.extend_from_slice(&bits.to_be_bytes());
+        let length = self.length;
+        self.update(&padding);
+        self.length = length;
+        debug_assert!(self.tail.is_empty());
+        self.state
+            .iter()
+            .map(|word| format!("{word:08x}"))
+            .collect::<String>()
+    }
+
+    /// Fixed-width hex for the chaining words and length, so the saved state's size never depends
+    /// on the digest's values.
+    fn to_json(&self) -> JsonValue {
+        json!({
+            "state": self.state.iter().map(|word| format!("{word:08x}")).collect::<String>(),
+            "length": format!("{:016x}", self.length),
+            "tail": self.tail.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        })
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self> {
+        let invalid = || CgError::Engine("event-search digest state is not well formed".into());
+        let words = value
+            .get("state")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(invalid)?;
+        if words.len() != 64 || !words.is_ascii() {
+            return Err(invalid());
+        }
+        let mut state = [0_u32; 8];
+        for (index, slot) in state.iter_mut().enumerate() {
+            *slot =
+                u32::from_str_radix(&words[index * 8..index * 8 + 8], 16).map_err(|_| invalid())?;
+        }
+        let length = value
+            .get("length")
+            .and_then(JsonValue::as_str)
+            .filter(|length| length.len() == 16)
+            .and_then(|length| u64::from_str_radix(length, 16).ok())
+            .ok_or_else(invalid)?;
+        let tail_hex = value
+            .get("tail")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(invalid)?;
+        if tail_hex.len() % 2 != 0 || tail_hex.len() >= 128 {
+            return Err(invalid());
+        }
+        let tail = (0..tail_hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&tail_hex[at..at + 2], 16).map_err(|_| invalid()))
+            .collect::<Result<Vec<_>>>()?;
+        if length % 64 != tail.len() as u64 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            state,
+            length,
+            tail,
+        })
+    }
+}
+
+fn json_u64(state: &JsonValue, name: &str) -> Result<u64> {
+    state
+        .get(name)
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| CgError::Engine(format!("event-search fold state lacks {name}")))
+}
+
+fn json_text(state: &JsonValue, name: &str) -> Result<String> {
+    state
+        .get(name)
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| CgError::Engine(format!("event-search fold state lacks {name}")))
+}
+
+fn json_optional_text(state: &JsonValue, name: &str) -> Option<String> {
+    state
+        .get(name)
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
 }
 
 fn exact_conditions(
@@ -9009,6 +12631,7 @@ mod bounded_preparation_tests {
                     ordered_source_set_sha256: String::new(),
                     source_content_sha256: String::new(),
                 },
+                certified: None,
                 started_at: TxId(1),
                 attempt_tx: None,
                 attempt_token: None,
@@ -9046,7 +12669,7 @@ mod bounded_preparation_tests {
         }
     }
 
-    // Independent pre-repair oracle: consider all endpoints in reverse order without pruning,
+    // Independent exhaustive oracle: consider all endpoints in reverse order without pruning,
     // then filter ALL original spans for overlap. No bound, index or optimized helper.
     fn exhaustive_ranges(
         embedder: &dyn Embedder,
@@ -9749,7 +13372,9 @@ fn assert_session_read_work_for_test(
             .expect("discover the selected pending tail");
         eprintln!(
             "pending_discovery: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
-            discovery.trace().rows_examined, discovery.trace().index_used, discovery.trace().sort_elided
+            discovery.trace().rows_examined,
+            discovery.trace().index_used,
+            discovery.trace().sort_elided
         );
         assert_eq!(
             discovery.trace().index_used.as_deref(),
@@ -9758,7 +13383,12 @@ fn assert_session_read_work_for_test(
             discovery.trace()
         );
         assert!(discovery.trace().sort_elided, "{:#?}", discovery.trace());
-        assert_eq!(discovery.trace().rows_examined, 1, "{:#?}", discovery.trace());
+        assert_eq!(
+            discovery.trace().rows_examined,
+            1,
+            "{:#?}",
+            discovery.trace()
+        );
         assert_eq!(
             discovery.rows(),
             vec![vec![Value::Int64(completed + 4 * neighbours + 1)]]
@@ -9784,7 +13414,8 @@ fn assert_session_read_work_for_test(
         );
         eprintln!(
             "source_position: completed={completed}, neighbours={neighbours}, examined={}, index={:?}",
-            source_position.trace().rows_examined, source_position.trace().index_used
+            source_position.trace().rows_examined,
+            source_position.trace().index_used
         );
         params.insert("after".into(), Value::Int64(completed));
         let later = session
@@ -9792,7 +13423,9 @@ fn assert_session_read_work_for_test(
             .unwrap();
         eprintln!(
             "has_later: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
-            later.trace().rows_examined, later.trace().index_used, later.trace().sort_elided
+            later.trace().rows_examined,
+            later.trace().index_used,
+            later.trace().sort_elided
         );
         assert_eq!(later.trace().rows_examined, 1);
         assert_eq!(
@@ -9825,7 +13458,9 @@ fn assert_session_read_work_for_test(
         }
         eprintln!(
             "claim_batch_examines_only_pending_tail: completed={completed}, neighbours={neighbours}, examined={}, index={:?}, sort_elided={}",
-            claim.trace().rows_examined, claim.trace().index_used, claim.trace().sort_elided
+            claim.trace().rows_examined,
+            claim.trace().index_used,
+            claim.trace().sort_elided
         );
         assert_eq!(
             claim.trace().index_used.as_deref(),

@@ -58,6 +58,16 @@ pub struct EventSearchSelectedWork {
     /// Durable identity when loaded from an accepted request; absent for an unsaved selection.
     pub(crate) request_id: Option<uuid::Uuid>,
     pub streams: Vec<EventSearchSelectedStream>,
+    /// The search generation the selection observed. Streams it had already completed are not
+    /// listed: a generation's cursors only advance, so they stay complete there. Against any other
+    /// generation the request re-selects under `observed_policy`. `None` means `streams` lists the
+    /// whole selection.
+    #[serde(default)]
+    pub(crate) observed_generation_id: Option<uuid::Uuid>,
+    /// The policy the selection was made under; a run or assessment against a generation other
+    /// than the observed one re-selects under it.
+    #[serde(default)]
+    pub(crate) observed_policy: Option<EventSearchWorkPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,7 +272,7 @@ pub struct EventSearchBuildRequest {
 #[derive(Debug, Clone)]
 pub struct EventSearchRebuildRequest {
     pub context_id: ContextId,
-    /// An explicit staged interpretation target. Its connector lookup is pending implementation.
+    /// An explicit staged interpretation target. Connector lookup is unsupported.
     pub interpretation_generation_id: Option<InterpretationGenerationId>,
     pub embedder: EmbedderRegistration,
     pub profile: EventSearchProfile,
@@ -864,7 +874,7 @@ impl ConsumerReader {
         crate::store::event_search_projection::event_search_work(self, selector, spec, policy)
     }
 
-    /// Future read-only find callers open the reader first, then attach the exact event-history
+    /// Read-only find callers open the reader first, then attach the exact event-history
     /// registration without writing the Store.
     pub fn attach_event_search_embedder_registrations(
         &mut self,

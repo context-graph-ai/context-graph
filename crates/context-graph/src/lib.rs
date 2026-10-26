@@ -101,6 +101,9 @@ pub mod test_support {
         observe_event_search_batch_admission_for_test,
         set_event_search_projection_read_deadline_ms_for_test,
     };
+    pub use crate::store::event_search_projection_correctness::{
+        set_projection_unit_cut, take_projection_unit_receipts,
+    };
     /// How many Stores the event-search runner has opened on the calling thread.
     pub use crate::store::event_search_store_opens_for_test;
 
@@ -114,6 +117,7 @@ pub mod test_support {
 
     /// Failure-ownership controls for the projection's internal regression suite.
     pub use crate::store::{
+        advance_bound_interpretation_stamp_for_test,
         after_next_event_search_attempt_commit_before_readback_for_test,
         after_next_event_search_completion_commit_before_readback_for_test,
         before_next_event_search_attempt_commit_for_test,

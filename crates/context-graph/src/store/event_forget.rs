@@ -209,6 +209,8 @@ pub struct RetiredInterpretation {
 /// Context-wide derived tables, listed children first.
 const CONTEXT_DERIVED_TABLES: &[&str] = &[
     "event_context_counts",
+    "event_search_fold_progress",
+    "event_search_capture_manifest",
     "event_search_heads",
     "event_search_work_policies",
     "event_search_leases",

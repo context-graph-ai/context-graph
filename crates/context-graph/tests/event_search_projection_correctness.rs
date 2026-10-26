@@ -5956,3 +5956,6 @@ fn recent_coverage_reads_only_selected_progress_keys() {
         "forty then one hundred sixty total sessions keep the same ten keyed progress probes and charged bytes"
     );
 }
+
+#[path = "event_search_guards/incremental_source_and_passage_fold_guard.rs"]
+mod incremental_source_and_passage_fold_guard;
