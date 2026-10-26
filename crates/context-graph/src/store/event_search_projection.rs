@@ -5577,6 +5577,8 @@ fn capture_manifest_unit(
         return Ok(next);
     }
     let state = next.to_json();
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    pause_before_unit_commit(store);
     let committed = commit_unit(store, |tx| {
         let passage_revision = guard_fold_generation_in_tx(
             store,
@@ -5795,6 +5797,8 @@ fn capture_read_unit(
         return Ok(CaptureStep::Unreconciled);
     }
     let mut next = pass.clone();
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+    pause_before_unit_commit(store);
     let committed = commit_unit(store, |tx| {
         let passage_revision = guard_fold_generation_in_tx(
             store,
@@ -6861,6 +6865,8 @@ fn verify_membership_durably(
         });
         let prior = row.clone();
         let before = next;
+        #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+        pause_before_unit_commit(store);
         let committed = commit_unit(store, |tx| {
             let passage_revision = guard_fold_generation_in_tx(
                 store,
@@ -11571,6 +11577,10 @@ pub(crate) enum UnitFold {
     Passages,
 }
 
+/// What the pause seam runs inside the paused unit, with the run's Store.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+pub(super) type PauseInterleave = Box<dyn FnOnce(&Store)>;
+
 // Per-thread state of the bounded-unit test seams in `event_search_projection_correctness`: the
 // pending cut, the durable units counted toward it, the receipts recorded and each fold's next
 // unit index. Test-support builds only; they hold no product state.
@@ -11583,6 +11593,11 @@ thread_local! {
     > = const { std::cell::RefCell::new(Vec::new()) };
     pub(super) static UNIT_INDEXES: std::cell::RefCell<[u32; 3]> =
         const { std::cell::RefCell::new([0; 3]) };
+    pub(super) static PAUSE_BEFORE_COMMIT: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+    pub(super) static UNITS_BEFORE_PAUSE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    pub(super) static PAUSE_INTERLEAVE: std::cell::RefCell<Option<PauseInterleave>> =
+        const { std::cell::RefCell::new(None) };
     static UNIT_TALLY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -11605,6 +11620,30 @@ fn tally_reset() {
 #[cfg(not(any(context_graph_internal_test_support, feature = "test-support")))]
 #[inline(always)]
 fn tally_reset() {}
+
+/// Called by every durable unit after its reads and before it opens its commit transaction. When the
+/// pause seam is armed and this is the unit it names, the seam's interleave runs here, on this
+/// thread, with the run's Store; then the unit carries on into its own commit with the inputs it
+/// read under, so that commit's production fences decide whether the interleaved change refuses it.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
+fn pause_before_unit_commit(store: &Store) {
+    let Some(after) = PAUSE_BEFORE_COMMIT.with(std::cell::Cell::get) else {
+        return;
+    };
+    let reached = UNITS_BEFORE_PAUSE.with(|count| {
+        let next = count.get().saturating_add(1);
+        count.set(next);
+        next
+    });
+    if reached < after {
+        return;
+    }
+    PAUSE_BEFORE_COMMIT.with(|pause| pause.set(None));
+    UNITS_BEFORE_PAUSE.with(|count| count.set(0));
+    if let Some(interleave) = PAUSE_INTERLEAVE.with(|slot| slot.borrow_mut().take()) {
+        interleave(store);
+    }
+}
 
 /// Record one read unit's receipt with every entry its statements examined since the unit began.
 #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]

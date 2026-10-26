@@ -10,7 +10,7 @@
 use std::cell::Cell;
 
 use super::event_search_projection::UnitFold;
-use crate::{CgError, Result};
+use crate::{CgError, Result, Store};
 
 /// Which fold a projection unit belongs to.
 ///
@@ -44,7 +44,10 @@ pub struct ProjectionUnitReceipt {
 
 // The per-thread slots live beside the projection's other test hook slots in the projection
 // module, which is the sanctioned site for them; this module only reads and writes them.
-use super::event_search_projection::{DURABLE_UNITS, RECEIPTS, UNIT_CUT, UNIT_INDEXES};
+use super::event_search_projection::{
+    DURABLE_UNITS, PAUSE_BEFORE_COMMIT, PAUSE_INTERLEAVE, RECEIPTS, UNIT_CUT, UNIT_INDEXES,
+    UNITS_BEFORE_PAUSE,
+};
 
 /// Stop the next projection run on this thread right after its `n`-th durable unit commit. The run
 /// returns `Ok` with the newest generation's receipt as committed and does no further work; the cut
@@ -53,6 +56,21 @@ use super::event_search_projection::{DURABLE_UNITS, RECEIPTS, UNIT_CUT, UNIT_IND
 pub fn set_projection_unit_cut(after_durable_units: Option<u32>) {
     DURABLE_UNITS.with(|count| count.set(0));
     UNIT_CUT.with(|cut| cut.set(after_durable_units));
+}
+
+/// Pause the next projection run on this thread inside its `n`-th durable unit, after the unit's
+/// reads and before it opens its commit transaction, and run `interleave` there with the run's
+/// Store. The unit then commits exactly as it would have: with the generation identity, attempt
+/// token, fold row, manifest frontier and passage revision it read under, through its production
+/// fences. A change the interleave made that those fences catch refuses the unit with the stale
+/// claim; a change they miss commits. The pause is spent when it fires.
+pub fn pause_projection_unit_before_commit(
+    after_units: u32,
+    interleave: impl FnOnce(&Store) + 'static,
+) {
+    UNITS_BEFORE_PAUSE.with(|count| count.set(0));
+    PAUSE_INTERLEAVE.with(|slot| *slot.borrow_mut() = Some(Box::new(interleave)));
+    PAUSE_BEFORE_COMMIT.with(|pause| pause.set(Some(after_units)));
 }
 
 /// Drain the unit receipts recorded on this thread since the last take.

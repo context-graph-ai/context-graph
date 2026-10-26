@@ -37,9 +37,9 @@ use context_graph::test_support::{
     clear_event_search_discovery_observations_for_test,
     event_search_discovery_observations_for_test,
     fail_next_event_search_membership_capture_for_test,
-    pause_next_event_search_finalization_for_test,
-    set_event_search_projection_read_deadline_ms_for_test,
-    take_event_search_membership_captures_for_test,
+    pause_next_event_search_finalization_for_test, pause_projection_unit_before_commit,
+    set_event_search_projection_read_deadline_ms_for_test, set_projection_unit_cut,
+    take_event_search_membership_captures_for_test, take_projection_unit_receipts,
 };
 use context_graph::{
     AppendEventBatch, CgError, ContextId, ContextSelector, CreateContext, DistanceMetric, Embedder,
@@ -48,8 +48,8 @@ use context_graph::{
     EventSearchBuildRequest, EventSearchFailureDisposition, EventSearchFilter, EventSearchOrder,
     EventSearchProfile, EventSearchProjectionRunner, EventSearchRebuildRequest,
     EventSearchRunRequest, EventSearchSessionScope, EventSearchWorkAssessment,
-    EventSearchWorkPolicy, EventSearchWorkSpec, EvidenceKind, EvidenceProducer, Result, Store,
-    StoreConfig, event_history_reader_declaration,
+    EventSearchWorkPolicy, EventSearchWorkSpec, EvidenceKind, EvidenceProducer, ForgetSelection,
+    Result, Store, StoreConfig, event_history_reader_declaration,
 };
 use contextdb_core::{Value, Wallclock};
 use serde_json::json;
@@ -5962,3 +5962,167 @@ mod incremental_source_and_passage_fold_guard;
 
 #[path = "event_search_guards/context_forget_resume_guard.rs"]
 mod context_forget_resume_guard;
+
+fn append_sparse_projection_stream(store: &Store, context_id: ContextId, source: &str, count: u64) {
+    let events = (1..=count)
+        .map(|ordinal| {
+            let mut event = draft(
+                &format!("{source}-event-{ordinal}"),
+                ordinal,
+                EventRenderRole::HumanMessage,
+                "short searchable event",
+            );
+            event.session_ref = "one-large-session".into();
+            if ordinal % 64 != 1 {
+                event.text = None;
+                event.render_role = EventRenderRole::Metadata;
+            }
+            event
+        })
+        .collect();
+    store
+        .append_event_batch(AppendEventBatch::live(
+            context_id,
+            declaration(),
+            source,
+            events,
+        ))
+        .expect("append sparse large-session fixture events");
+}
+
+/// CG-090: forget purges the generation's fold progress and frozen manifest, and a unit in flight
+/// across the forget is refused at its commit with the stale claim.
+#[test]
+fn forget_purges_fold_progress_and_fences_an_in_flight_unit() {
+    let embedder = ControlledEmbedder::new();
+    // Forget the selected session after a durable unit. It purges the partial generation and both
+    // persisted fold inputs, so a later call cannot adopt stale progress.
+    let forget_root = tempfile::tempdir().unwrap();
+    let forget_cfg = config(forget_root.path().join("cg090-forget.db"));
+    let forget_store = open(&forget_cfg);
+    let forget_context = create_context(&forget_store);
+    append_sparse_projection_stream(&forget_store, forget_context, "forget", 300);
+    drop(forget_store);
+    set_projection_unit_cut(Some(1));
+    let partial = run(
+        &forget_cfg,
+        forget_context,
+        &embedder,
+        256,
+        OBSERVED_LEASE_MS,
+    )
+    .unwrap();
+    let before_forget = take_projection_unit_receipts();
+    assert_eq!(before_forget.iter().filter(|row| row.durable).count(), 1);
+    let forget_store = open(&forget_cfg);
+    forget_store
+        .forget_event_history(ForgetSelection::Session {
+            context_id: forget_context,
+            connector_id: CONNECTOR.into(),
+            session_ref: "one-large-session".into(),
+        })
+        .unwrap();
+    let remaining_progress = forget_store
+        .execute_sql_for_test(
+            "SELECT id FROM event_search_fold_progress WHERE context_id = $context_id AND generation_id = $generation_id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(forget_context.as_uuid())),
+                (
+                    "generation_id".into(),
+                    Value::Uuid(partial.generation_id.as_uuid()),
+                ),
+            ]),
+        )
+        .unwrap()
+        .rows().to_vec();
+    let remaining_manifest = forget_store
+        .execute_sql_for_test(
+            "SELECT connector_id FROM event_search_capture_manifest WHERE context_id = $context_id AND generation_id = $generation_id",
+            &HashMap::from([
+                ("context_id".into(), Value::Uuid(forget_context.as_uuid())),
+                (
+                    "generation_id".into(),
+                    Value::Uuid(partial.generation_id.as_uuid()),
+                ),
+            ]),
+        )
+        .unwrap()
+        .rows().to_vec();
+    assert!(remaining_progress.is_empty());
+    assert!(remaining_manifest.is_empty());
+    drop(forget_store);
+    set_projection_unit_cut(None);
+
+    // Forget while a unit is in flight. The pause seam stops the run inside the named unit after its
+    // reads, the forget runs there, and the unit then continues into its own production commit with
+    // the generation, attempt, fold row and manifest frontier it read under. Its fences must refuse
+    // it; were they gone, the unit would commit into the forgotten generation. Unit 1 is the
+    // manifest unit, whose only fence is the generation re-read (it has no prior fold row and no
+    // frozen frontier yet); unit 2 is the first capture page, fenced by the generation, its fold
+    // row's compare-and-set and its manifest frontier.
+    for paused_unit in [1, 2] {
+        let fence_root = tempfile::tempdir().unwrap();
+        let fence_cfg = config(fence_root.path().join("cg090-in-flight-forget.db"));
+        let fence_store = open(&fence_cfg);
+        let fence_context = create_context(&fence_store);
+        append_sparse_projection_stream(&fence_store, fence_context, "in-flight", 300);
+        drop(fence_store);
+        let forgotten = Rc::new(RefCell::new(None));
+        let forgotten_in_flight = forgotten.clone();
+        pause_projection_unit_before_commit(paused_unit, move |store| {
+            let receipt = store
+                .forget_event_history(ForgetSelection::Session {
+                    context_id: fence_context,
+                    connector_id: CONNECTOR.into(),
+                    session_ref: "one-large-session".into(),
+                })
+                .expect("forget the session while a unit is in flight");
+            *forgotten_in_flight.borrow_mut() = Some(receipt.events);
+        });
+        match run(&fence_cfg, fence_context, &embedder, 256, OBSERVED_LEASE_MS) {
+            Err(CgError::Engine(reason)) => assert!(
+                reason.starts_with("event-search claim refused:"),
+                "unit {paused_unit} is refused with the stale claim: {reason}"
+            ),
+            other => panic!("unit {paused_unit} must be fenced after forget: {other:?}"),
+        }
+        assert_eq!(
+            *forgotten.borrow(),
+            Some(300),
+            "the forget ran inside unit {paused_unit}"
+        );
+        let fenced = take_projection_unit_receipts();
+        assert_eq!(
+            fenced.iter().filter(|row| row.durable).count(),
+            paused_unit as usize - 1,
+            "only the units before the paused one committed: {fenced:?}"
+        );
+        assert!(
+            fenced
+                .last()
+                .is_some_and(|row| !row.durable && row.frontier_after == "refused"),
+            "the paused unit's commit was refused: {fenced:?}"
+        );
+        let fence_store = open(&fence_cfg);
+        let params = HashMap::from([("context_id".into(), Value::Uuid(fence_context.as_uuid()))]);
+        for table in [
+            "event_search_fold_progress",
+            "event_search_capture_manifest",
+            "event_search_source_events",
+            "event_search_generations",
+        ] {
+            assert!(
+                fence_store
+                    .execute_sql_for_test(
+                        &format!("SELECT context_id FROM {table} WHERE context_id = $context_id"),
+                        &params,
+                    )
+                    .unwrap()
+                    .rows()
+                    .is_empty(),
+                "the refused unit {paused_unit} left nothing in {table}"
+            );
+        }
+        drop(fence_store);
+    }
+}

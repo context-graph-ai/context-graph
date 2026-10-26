@@ -102,7 +102,7 @@ pub mod test_support {
         set_event_search_projection_read_deadline_ms_for_test,
     };
     pub use crate::store::event_search_projection_correctness::{
-        set_projection_unit_cut, take_projection_unit_receipts,
+        pause_projection_unit_before_commit, set_projection_unit_cut, take_projection_unit_receipts,
     };
     /// How many Stores the event-search runner has opened on the calling thread.
     pub use crate::store::event_search_store_opens_for_test;
