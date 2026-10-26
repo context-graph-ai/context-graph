@@ -124,6 +124,26 @@ fn one_new_source_keeps_prior_passages_and_reads_only_the_incremental_suffix() {
             "the carried prefix and new suffix produce the complete published fold"
         );
         assert_eq!(after.passage_count, rows.rows().len() as u64);
+
+        let verified = store
+            .verify_event_search_generation(context, after.generation_id.as_uuid())
+            .expect("the full verifier accepts the completed prefix and new source");
+        assert_eq!(
+            verified.member_count,
+            u64::try_from((history + 1) * 6).unwrap(),
+            "full verification includes all six captured events of every fixture source"
+        );
+        assert_eq!(
+            verified.ordered_source_set_sha256, after.source_watermark.ordered_source_set_sha256,
+            "the full membership walk agrees with the published source identities"
+        );
+        assert_eq!(
+            verified.source_content_sha256, after.source_content_sha256,
+            "the full membership walk agrees with the published source content"
+        );
+        assert_eq!(verified.ordered_source_set_sha256.len(), 64);
+        assert_eq!(verified.source_content_sha256.len(), 64);
+        eprintln!("full generation verification: {verified:?}");
         (examined, embedded, by_sql)
     };
     let small = measure(3);
