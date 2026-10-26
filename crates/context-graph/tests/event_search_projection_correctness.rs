@@ -5959,3 +5959,6 @@ fn recent_coverage_reads_only_selected_progress_keys() {
 
 #[path = "event_search_guards/incremental_source_and_passage_fold_guard.rs"]
 mod incremental_source_and_passage_fold_guard;
+
+#[path = "event_search_guards/context_forget_resume_guard.rs"]
+mod context_forget_resume_guard;

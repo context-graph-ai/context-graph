@@ -6708,6 +6708,7 @@ impl MembershipChain {
 /// capture and on explicit verification, never on the ordinary incremental path. It reads in
 /// bounded ordinal units and keeps its continuation in memory; a full capture uses
 /// [`verify_membership_durably`], which commits the same continuation with each unit.
+#[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
 fn fold_source_membership(
     store: &Store,
     context_id: crate::ContextId,
@@ -6735,6 +6736,7 @@ struct MembershipUnit {
     next: u64,
     chain: MembershipChain,
     returned: u64,
+    #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
     exhausted: bool,
 }
 
@@ -6806,6 +6808,7 @@ fn membership_unit(
         next: expected,
         chain,
         returned: result.rows.len() as u64,
+        #[cfg(any(context_graph_internal_test_support, feature = "test-support"))]
         exhausted: result.rows.len() < limit,
     })
 }
